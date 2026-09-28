@@ -23,6 +23,7 @@ const function = @import("function.zig");
 const types = @import("types.zig");
 const verify = @import("verify.zig");
 const bitcode = @import("bitcode.zig");
+const nvfp4 = @import("nvfp4.zig");
 
 const Function = function.Function;
 const Value = function.Value;
@@ -31,7 +32,7 @@ const Inst = function.Inst;
 const BinOp = function.BinOp;
 const MatMul = function.MatMul;
 
-const LowFloatBuilder = struct {
+const NumericBuilder = struct {
     func: *Function,
     out: *std.ArrayList(Inst),
     allocator: std.mem.Allocator,
@@ -41,49 +42,56 @@ const LowFloatBuilder = struct {
     f32_t: types.Type,
     bool_t: types.Type,
 
-    fn emit(self: LowFloatBuilder, ty: types.Type, opcode: function.Opcode) std.mem.Allocator.Error!Value {
+    fn emit(self: NumericBuilder, ty: types.Type, opcode: function.Opcode) std.mem.Allocator.Error!Value {
         const value = try self.func.createInst(ty, opcode);
         try self.out.append(self.allocator, self.func.definingInst(value).?);
         return value;
     }
 
-    fn constant(self: LowFloatBuilder, value: u32) std.mem.Allocator.Error!Value {
+    fn constant(self: NumericBuilder, value: u32) std.mem.Allocator.Error!Value {
         return self.emit(self.u32_t, .{ .iconst = value });
     }
 
-    fn binary(self: LowFloatBuilder, op: BinOp, lhs: Value, rhs: Value) std.mem.Allocator.Error!Value {
+    fn binary(self: NumericBuilder, op: BinOp, lhs: Value, rhs: Value) std.mem.Allocator.Error!Value {
         return self.emit(self.u32_t, .{ .arith = .{ .op = op, .lhs = lhs, .rhs = rhs } });
     }
 
-    fn compare(self: LowFloatBuilder, op: function.CmpOp, lhs: Value, rhs: Value) std.mem.Allocator.Error!Value {
+    fn floatBinary(self: NumericBuilder, op: BinOp, lhs: Value, rhs: Value) std.mem.Allocator.Error!Value {
+        std.debug.assert(op == .mul or op == .div);
+        std.debug.assert(self.func.valueType(lhs) == self.f32_t);
+        std.debug.assert(self.func.valueType(rhs) == self.f32_t);
+        return self.emit(self.f32_t, .{ .arith = .{ .op = op, .lhs = lhs, .rhs = rhs } });
+    }
+
+    fn compare(self: NumericBuilder, op: function.CmpOp, lhs: Value, rhs: Value) std.mem.Allocator.Error!Value {
         return self.emit(self.bool_t, .{ .icmp = .{ .op = op, .lhs = lhs, .rhs = rhs } });
     }
 
-    fn select(self: LowFloatBuilder, cond: Value, then_value: Value, else_value: Value) std.mem.Allocator.Error!Value {
+    fn select(self: NumericBuilder, cond: Value, then_value: Value, else_value: Value) std.mem.Allocator.Error!Value {
         return self.emit(self.u32_t, .{ .select = .{ .cond = cond, .then = then_value, .@"else" = else_value } });
     }
 
-    fn convert(self: LowFloatBuilder, ty: types.Type, value: Value) std.mem.Allocator.Error!Value {
+    fn convert(self: NumericBuilder, ty: types.Type, value: Value) std.mem.Allocator.Error!Value {
         return self.emit(ty, .{ .convert = .{ .value = value } });
     }
 
-    fn reinterpret(self: LowFloatBuilder, ty: types.Type, value: Value) std.mem.Allocator.Error!Value {
+    fn reinterpret(self: NumericBuilder, ty: types.Type, value: Value) std.mem.Allocator.Error!Value {
         return self.emit(ty, .{ .unary = .{ .op = .reinterpret, .value = value } });
     }
 
-    fn masked(self: LowFloatBuilder, value: Value, mask: u32) std.mem.Allocator.Error!Value {
+    fn masked(self: NumericBuilder, value: Value, mask: u32) std.mem.Allocator.Error!Value {
         return self.binary(.bit_and, value, try self.constant(mask));
     }
 
-    fn shifted(self: LowFloatBuilder, op: BinOp, value: Value, amount: u32) std.mem.Allocator.Error!Value {
+    fn shifted(self: NumericBuilder, op: BinOp, value: Value, amount: u32) std.mem.Allocator.Error!Value {
         return self.binary(op, value, try self.constant(amount));
     }
 
-    fn equalConstant(self: LowFloatBuilder, value: Value, expected: u32) std.mem.Allocator.Error!Value {
+    fn equalConstant(self: NumericBuilder, value: Value, expected: u32) std.mem.Allocator.Error!Value {
         return self.compare(.eq, value, try self.constant(expected));
     }
 
-    fn roundRight(self: LowFloatBuilder, value: Value, shift: Value) std.mem.Allocator.Error!Value {
+    fn roundRight(self: NumericBuilder, value: Value, shift: Value) std.mem.Allocator.Error!Value {
         const one = try self.constant(1);
         const retained = try self.binary(.shr, value, shift);
         const shifted_one = try self.binary(.shl, one, shift);
@@ -139,7 +147,7 @@ pub fn expandLowFloat(allocator: std.mem.Allocator, func: *Function) std.mem.All
         defer allocator.free(original);
         var out: std.ArrayList(Inst) = .empty;
         defer out.deinit(allocator);
-        const builder: LowFloatBuilder = .{
+        const builder: NumericBuilder = .{
             .func = func,
             .out = &out,
             .allocator = allocator,
@@ -171,7 +179,161 @@ pub fn expandLowFloat(allocator: std.mem.Allocator, func: *Function) std.mem.All
     return changed;
 }
 
-fn expandDecodeLowFloat(builder: LowFloatBuilder, conversion: function.LowFloatConvert) std.mem.Allocator.Error!Value {
+/// Replace scalar NVFP4 conversions with integer classification and ordered f32 scale operations.
+pub fn expandNvFp4(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator.Error!bool {
+    var has_nvfp4 = false;
+    for (0..func.blockCount()) |block_index| {
+        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+            .dequantize_nvfp4, .quantize_nvfp4 => {
+                has_nvfp4 = true;
+                break;
+            },
+            else => {},
+        };
+        if (has_nvfp4) break;
+    }
+    if (!has_nvfp4) return false;
+
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const bool_t = try func.types.intern(.bool);
+
+    for (0..func.blockCount()) |block_index| {
+        const block: Block = @enumFromInt(block_index);
+        var contains_nvfp4 = false;
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+            .dequantize_nvfp4, .quantize_nvfp4 => contains_nvfp4 = true,
+            else => {},
+        };
+        if (!contains_nvfp4) continue;
+
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        var out: std.ArrayList(Inst) = .empty;
+        defer out.deinit(allocator);
+        const builder: NumericBuilder = .{
+            .func = func,
+            .out = &out,
+            .allocator = allocator,
+            .u8_t = u8_t,
+            .u16_t = u16_t,
+            .u32_t = u32_t,
+            .f32_t = f32_t,
+            .bool_t = bool_t,
+        };
+
+        for (original) |inst| switch (func.opcode(inst)) {
+            .dequantize_nvfp4 => |conversion| {
+                const old_result = func.instResult(inst).?;
+                const expanded = try expandDequantizeNvFp4(builder, conversion);
+                func.replaceAllUses(old_result, expanded.result);
+                func.retargetAttrs(.{ .inst = inst }, .{ .inst = expanded.semantic_inst });
+                func.retargetAttrs(.{ .value = old_result }, .{ .value = expanded.result });
+            },
+            .quantize_nvfp4 => |conversion| {
+                const old_result = func.instResult(inst).?;
+                const expanded = try expandQuantizeNvFp4(builder, conversion);
+                func.replaceAllUses(old_result, expanded.result);
+                func.retargetAttrs(.{ .inst = inst }, .{ .inst = expanded.semantic_inst });
+                func.retargetAttrs(.{ .value = old_result }, .{ .value = expanded.result });
+            },
+            else => try out.append(allocator, inst),
+        };
+        try func.setBlockInsts(block, out.items);
+    }
+    return true;
+}
+
+const NvFp4Expansion = struct {
+    result: Value,
+    semantic_inst: Inst,
+};
+
+fn scaleOp(application: nvfp4.ScaleApplication, inverse: bool) BinOp {
+    return switch (application) {
+        .multiply => if (inverse) .div else .mul,
+        .divide => if (inverse) .mul else .div,
+    };
+}
+
+fn expandDequantizeNvFp4(builder: NumericBuilder, conversion: function.NvFp4Convert) std.mem.Allocator.Error!NvFp4Expansion {
+    const carrier = try builder.convert(builder.u32_t, conversion.value);
+    const nibble = try builder.masked(carrier, 0x0f);
+    const sign = try builder.shifted(.shl, try builder.masked(nibble, 0x08), 28);
+    const magnitude_index = try builder.masked(nibble, 0x07);
+    var magnitude = try builder.constant(0);
+    const magnitude_bits = [_]u32{
+        0x3f00_0000,
+        0x3f80_0000,
+        0x3fc0_0000,
+        0x4000_0000,
+        0x4040_0000,
+        0x4080_0000,
+        0x40c0_0000,
+    };
+    for (magnitude_bits, 1..) |bits, index| {
+        magnitude = try builder.select(
+            try builder.equalConstant(magnitude_index, @intCast(index)),
+            try builder.constant(bits),
+            magnitude,
+        );
+    }
+    const value_bits = try builder.binary(.bit_or, sign, magnitude);
+    const value = try builder.reinterpret(builder.f32_t, value_bits);
+
+    const block_payload = try builder.convert(builder.u32_t, conversion.block_scale);
+    const block_bits = try decodeE4M3(builder, block_payload);
+    const block_scale = try builder.reinterpret(builder.f32_t, block_bits);
+    const local = try builder.floatBinary(scaleOp(conversion.block_application, false), value, block_scale);
+    const scaled = try builder.floatBinary(scaleOp(conversion.global_application, false), local, conversion.global_scale);
+    const semantic_inst = builder.func.definingInst(scaled).?;
+
+    // This bit round trip blocks a backend from fusing the final scale with an original consumer.
+    const scaled_bits = try builder.reinterpret(builder.u32_t, scaled);
+    const result = try builder.reinterpret(builder.f32_t, scaled_bits);
+    return .{ .result = result, .semantic_inst = semantic_inst };
+}
+
+fn expandQuantizeNvFp4(builder: NumericBuilder, conversion: function.NvFp4Convert) std.mem.Allocator.Error!NvFp4Expansion {
+    const block_payload = try builder.convert(builder.u32_t, conversion.block_scale);
+    const block_bits = try decodeE4M3(builder, block_payload);
+    const block_scale = try builder.reinterpret(builder.f32_t, block_bits);
+    const global_unscaled = try builder.floatBinary(scaleOp(conversion.global_application, true), conversion.value, conversion.global_scale);
+    const local_unscaled = try builder.floatBinary(scaleOp(conversion.block_application, true), global_unscaled, block_scale);
+    const bits = try builder.reinterpret(builder.u32_t, local_unscaled);
+    const semantic_inst = builder.func.definingInst(bits).?;
+
+    const sign = try builder.masked(try builder.shifted(.shr, bits, 28), 0x08);
+    const magnitude = try builder.masked(bits, 0x7fff_ffff);
+    var payload = try builder.constant(0x07);
+    const thresholds = [_]struct { relation: function.CmpOp, bits: u32, payload: u32 }{
+        .{ .relation = .le, .bits = 0x40a0_0000, .payload = 0x06 },
+        .{ .relation = .lt, .bits = 0x4060_0000, .payload = 0x05 },
+        .{ .relation = .le, .bits = 0x4020_0000, .payload = 0x04 },
+        .{ .relation = .lt, .bits = 0x3fe0_0000, .payload = 0x03 },
+        .{ .relation = .le, .bits = 0x3fa0_0000, .payload = 0x02 },
+        .{ .relation = .lt, .bits = 0x3f40_0000, .payload = 0x01 },
+        .{ .relation = .le, .bits = 0x3e80_0000, .payload = 0x00 },
+    };
+    for (thresholds) |threshold| {
+        payload = try builder.select(
+            try builder.compare(threshold.relation, magnitude, try builder.constant(threshold.bits)),
+            try builder.constant(threshold.payload),
+            payload,
+        );
+    }
+    const signed_payload = try builder.binary(.bit_or, sign, payload);
+    const is_nan = try builder.compare(.gt, magnitude, try builder.constant(0x7f80_0000));
+    const canonical = try builder.select(is_nan, try builder.constant(0x07), signed_payload);
+    return .{
+        .result = try builder.convert(builder.u8_t, canonical),
+        .semantic_inst = semantic_inst,
+    };
+}
+
+fn expandDecodeLowFloat(builder: NumericBuilder, conversion: function.LowFloatConvert) std.mem.Allocator.Error!Value {
     const payload = try builder.convert(builder.u32_t, conversion.value);
     const bits = switch (conversion.format) {
         .bf16 => try builder.shifted(.shl, payload, 16),
@@ -181,7 +343,7 @@ fn expandDecodeLowFloat(builder: LowFloatBuilder, conversion: function.LowFloatC
     return builder.reinterpret(builder.f32_t, bits);
 }
 
-fn decodeE4M3(builder: LowFloatBuilder, payload: Value) std.mem.Allocator.Error!Value {
+fn decodeE4M3(builder: NumericBuilder, payload: Value) std.mem.Allocator.Error!Value {
     const sign = try builder.shifted(.shl, try builder.masked(payload, 0x80), 24);
     const exponent = try builder.masked(try builder.shifted(.shr, payload, 3), 0x0f);
     const fraction = try builder.masked(payload, 0x07);
@@ -205,7 +367,7 @@ fn decodeE4M3(builder: LowFloatBuilder, payload: Value) std.mem.Allocator.Error!
     return builder.select(is_nan, nan, finite);
 }
 
-fn decodeE5M2(builder: LowFloatBuilder, payload: Value) std.mem.Allocator.Error!Value {
+fn decodeE5M2(builder: NumericBuilder, payload: Value) std.mem.Allocator.Error!Value {
     const sign = try builder.shifted(.shl, try builder.masked(payload, 0x80), 24);
     const exponent = try builder.masked(try builder.shifted(.shr, payload, 2), 0x1f);
     const fraction = try builder.masked(payload, 0x03);
@@ -227,7 +389,7 @@ fn decodeE5M2(builder: LowFloatBuilder, payload: Value) std.mem.Allocator.Error!
     return builder.select(try builder.equalConstant(exponent, 0x1f), special, finite);
 }
 
-fn expandEncodeLowFloat(builder: LowFloatBuilder, conversion: function.LowFloatConvert, old_inst: Inst) std.mem.Allocator.Error!Value {
+fn expandEncodeLowFloat(builder: NumericBuilder, conversion: function.LowFloatConvert, old_inst: Inst) std.mem.Allocator.Error!Value {
     const bits = try builder.reinterpret(builder.u32_t, conversion.value);
     builder.func.retargetAttrs(.{ .inst = old_inst }, .{ .inst = builder.func.definingInst(bits).? });
     const payload = switch (conversion.format) {
@@ -238,7 +400,7 @@ fn expandEncodeLowFloat(builder: LowFloatBuilder, conversion: function.LowFloatC
     return builder.convert(if (conversion.format == .bf16) builder.u16_t else builder.u8_t, payload);
 }
 
-fn encodeBf16(builder: LowFloatBuilder, bits: Value) std.mem.Allocator.Error!Value {
+fn encodeBf16(builder: NumericBuilder, bits: Value) std.mem.Allocator.Error!Value {
     const exponent = try builder.masked(bits, 0x7f80_0000);
     const fraction = try builder.masked(bits, 0x007f_ffff);
     const retained = try builder.shifted(.shr, bits, 16);
@@ -249,7 +411,7 @@ fn encodeBf16(builder: LowFloatBuilder, bits: Value) std.mem.Allocator.Error!Val
     return builder.select(try builder.equalConstant(exponent, 0x7f80_0000), special, rounded);
 }
 
-fn encodeFp8(builder: LowFloatBuilder, bits: Value, e4m3: bool) std.mem.Allocator.Error!Value {
+fn encodeFp8(builder: NumericBuilder, bits: Value, e4m3: bool) std.mem.Allocator.Error!Value {
     const sign = try builder.masked(try builder.shifted(.shr, bits, 24), 0x80);
     const source_exponent = try builder.masked(try builder.shifted(.shr, bits, 23), 0xff);
     const source_fraction = try builder.masked(bits, 0x007f_ffff);
@@ -291,6 +453,306 @@ fn encodeFp8(builder: LowFloatBuilder, bits: Value, e4m3: bool) std.mem.Allocato
     const special = try builder.select(try builder.compare(.ne, source_fraction, try builder.constant(0)), nan, infinity);
     const non_special = try builder.select(try builder.equalConstant(source_exponent, 0), sign, finite);
     return builder.select(try builder.equalConstant(source_exponent, 0xff), special, non_special);
+}
+
+fn appendNvFp4Fixture(
+    func: *Function,
+    block: Block,
+    dequantize_direction: bool,
+    block_application: nvfp4.ScaleApplication,
+    global_application: nvfp4.ScaleApplication,
+) !Value {
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const payload = try func.appendBlockParam(block, u8_t);
+    const block_scale = try func.appendBlockParam(block, u8_t);
+    const value = try func.appendBlockParam(block, f32_t);
+    const global_scale = try func.appendBlockParam(block, f32_t);
+    const conversion: function.NvFp4Convert = .{
+        .value = if (dequantize_direction) payload else value,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = block_application,
+        .global_application = global_application,
+    };
+    return func.appendInst(block, if (dequantize_direction) f32_t else u8_t, if (dequantize_direction)
+        .{ .dequantize_nvfp4 = conversion }
+    else
+        .{ .quantize_nvfp4 = conversion });
+}
+
+fn constantU32(func: *const Function, value: Value) ?u32 {
+    const inst = func.definingInst(value) orelse return null;
+    return switch (func.opcode(inst)) {
+        .iconst => |constant| @bitCast(@as(i32, @truncate(constant))),
+        else => null,
+    };
+}
+
+test "expandNvFp4 emits ordered integer classification and two f32 scale operations" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |dequantize_direction| {
+        inline for (.{ nvfp4.ScaleApplication.multiply, nvfp4.ScaleApplication.divide }) |block_application| {
+            inline for (.{ nvfp4.ScaleApplication.multiply, nvfp4.ScaleApplication.divide }) |global_application| {
+                var func = Function.init(allocator);
+                defer func.deinit();
+                const block = try func.appendBlock();
+                const original = try appendNvFp4Fixture(&func, block, dequantize_direction, block_application, global_application);
+                func.setTerminator(block, .{ .ret = function.Ret.one(original) });
+                const original_params = try allocator.dupe(Value, func.blockParams(block));
+                defer allocator.free(original_params);
+
+                try std.testing.expect(try expandNvFp4(allocator, &func));
+                try std.testing.expect(!(try expandNvFp4(allocator, &func)));
+                var diags = try verify.verify(allocator, &func, .low);
+                defer diags.deinit();
+                try std.testing.expect(diags.ok());
+
+                var float_arith: [2]Inst = undefined;
+                var float_arith_count: usize = 0;
+                var carrier_masked = false;
+                for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+                    .dequantize_nvfp4, .quantize_nvfp4, .decode_low_float, .encode_low_float, .call, .call_indirect => return error.TestUnexpectedResult,
+                    .arith => |arith| {
+                        const result = func.instResult(inst).?;
+                        if (func.valueType(result) == try func.types.intern(.{ .float = .f32 })) {
+                            try std.testing.expect(float_arith_count < float_arith.len);
+                            float_arith[float_arith_count] = inst;
+                            float_arith_count += 1;
+                        } else if (dequantize_direction and arith.op == .bit_and and
+                            constantU32(&func, arith.rhs) == 0x0f)
+                        {
+                            const widened_inst = func.definingInst(arith.lhs) orelse continue;
+                            carrier_masked = carrier_masked or switch (func.opcode(widened_inst)) {
+                                .convert => |conversion| conversion.value == original_params[0],
+                                else => false,
+                            };
+                        }
+                    },
+                    .icmp => |compare| {
+                        try std.testing.expect(func.types.type_kind(func.valueType(compare.lhs)) == .int);
+                        try std.testing.expect(func.types.type_kind(func.valueType(compare.rhs)) == .int);
+                    },
+                    .select => |select| {
+                        try std.testing.expect(func.types.type_kind(func.valueType(select.then)) == .int);
+                        try std.testing.expect(func.types.type_kind(func.valueType(select.@"else")) == .int);
+                    },
+                    .convert => |conversion| {
+                        try std.testing.expect(func.types.type_kind(func.valueType(conversion.value)) == .int);
+                        try std.testing.expect(func.types.type_kind(func.valueType(func.instResult(inst).?)) == .int);
+                    },
+                    .unary => |unary| try std.testing.expectEqual(function.UnaryOp.reinterpret, unary.op),
+                    else => {},
+                };
+                try std.testing.expectEqual(@as(usize, 2), float_arith_count);
+                const first_result = func.instResult(float_arith[0]).?;
+                const first = func.opcode(float_arith[0]).arith;
+                const second = func.opcode(float_arith[1]).arith;
+                try std.testing.expectEqual(first_result, second.lhs);
+                try std.testing.expectEqual(
+                    scaleOp(if (dequantize_direction) block_application else global_application, !dequantize_direction),
+                    first.op,
+                );
+                try std.testing.expectEqual(
+                    scaleOp(if (dequantize_direction) global_application else block_application, !dequantize_direction),
+                    second.op,
+                );
+
+                const replacement = func.terminator(block).?.ret.values[0];
+                if (dequantize_direction) {
+                    try std.testing.expect(carrier_masked);
+                    const final_reinterpret = func.opcode(func.definingInst(replacement).?).unary;
+                    const bits_reinterpret = func.opcode(func.definingInst(final_reinterpret.value).?).unary;
+                    try std.testing.expectEqual(first_result, second.lhs);
+                    try std.testing.expectEqual(func.instResult(float_arith[1]).?, bits_reinterpret.value);
+                } else {
+                    const narrow = func.opcode(func.definingInst(replacement).?).convert;
+                    try std.testing.expectEqual(.int, std.meta.activeTag(func.types.type_kind(func.valueType(narrow.value))));
+                    try std.testing.expectEqual(@as(u16, 8), func.types.type_kind(func.valueType(replacement)).int.bits);
+                }
+            }
+        }
+    }
+}
+
+test "expandNvFp4 preserves program order and replaces uses across blocks" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const entry = try func.appendBlock();
+    const next = try func.appendBlock();
+    const first = try appendNvFp4Fixture(&func, entry, true, .multiply, .divide);
+    const entry_params = func.blockParams(entry);
+    const addend = entry_params[2];
+    const sum = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = first, .rhs = addend } });
+    try func.setJump(entry, next, &.{ sum, entry_params[1], entry_params[3] });
+    const forwarded = try func.appendBlockParam(next, f32_t);
+    const next_block_scale = try func.appendBlockParam(next, func.valueType(entry_params[1]));
+    const next_global_scale = try func.appendBlockParam(next, f32_t);
+    const second = try func.appendInst(next, try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } }), .{ .quantize_nvfp4 = .{
+        .value = forwarded,
+        .block_scale = next_block_scale,
+        .global_scale = next_global_scale,
+        .block_application = .divide,
+        .global_application = .multiply,
+    } });
+    func.setTerminator(next, .{ .ret = function.Ret.one(second) });
+
+    try std.testing.expect(try expandNvFp4(allocator, &func));
+    var diags = try verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+    for (0..func.blockCount()) |block_index| {
+        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+            .dequantize_nvfp4, .quantize_nvfp4 => return error.TestUnexpectedResult,
+            else => {},
+        };
+    }
+    const jump_arg = func.blockArgs(func.terminator(entry).?.jump)[0];
+    try std.testing.expectEqual(sum, jump_arg);
+    try std.testing.expect(func.opcode(func.definingInst(sum).?).arith.lhs != first);
+}
+
+test "expandNvFp4 preserves program order and replaces uses for multiple conversions in one block" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const first = try appendNvFp4Fixture(&func, block, true, .multiply, .divide);
+    const second = try appendNvFp4Fixture(&func, block, true, .divide, .multiply);
+    const sum = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = first, .rhs = second } });
+    func.setTerminator(block, .{ .ret = function.Ret.one(sum) });
+
+    try std.testing.expect(try expandNvFp4(allocator, &func));
+    var diags = try verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+
+    var float_ops: [5]BinOp = undefined;
+    var float_op_count: usize = 0;
+    for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+        .dequantize_nvfp4, .quantize_nvfp4 => return error.TestUnexpectedResult,
+        .arith => |arith| if (func.valueType(func.instResult(inst).?) == f32_t) {
+            try std.testing.expect(float_op_count < float_ops.len);
+            float_ops[float_op_count] = arith.op;
+            float_op_count += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(float_ops.len, float_op_count);
+    try std.testing.expectEqualSlices(BinOp, &.{ .mul, .div, .div, .mul, .add }, &float_ops);
+
+    const rewritten_sum = func.opcode(func.definingInst(sum).?).arith;
+    try std.testing.expect(rewritten_sum.lhs != first);
+    try std.testing.expect(rewritten_sum.rhs != second);
+    const instructions = func.blockInsts(block);
+    const first_at = std.mem.indexOfScalar(Inst, instructions, func.definingInst(rewritten_sum.lhs).?).?;
+    const second_at = std.mem.indexOfScalar(Inst, instructions, func.definingInst(rewritten_sum.rhs).?).?;
+    const sum_at = std.mem.indexOfScalar(Inst, instructions, func.definingInst(sum).?).?;
+    try std.testing.expect(first_at < second_at);
+    try std.testing.expect(second_at < sum_at);
+}
+
+test "expandNvFp4 migrates attributes to semantic boundaries" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |dequantize_direction| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const block = try func.appendBlock();
+        const original = try appendNvFp4Fixture(&func, block, dequantize_direction, .multiply, .divide);
+        const original_inst = func.definingInst(original).?;
+        try func.addAttr(.{ .inst = original_inst }, .{ .custom = .{
+            .namespace = "debug",
+            .key = "line",
+            .value = .{ .int = 43 },
+        } });
+        try func.addAttr(.{ .value = original }, .{ .custom = .{
+            .namespace = "test",
+            .key = "semantic",
+            .value = .flag,
+        } });
+        func.setTerminator(block, .{ .ret = function.Ret.one(original) });
+
+        try std.testing.expect(try expandNvFp4(allocator, &func));
+        const replacement = func.terminator(block).?.ret.values[0];
+        var value_attrs = func.attributesOf(.{ .value = replacement });
+        try std.testing.expectEqualStrings("semantic", value_attrs.next().?.custom.key);
+        var old_value_attrs = func.attributesOf(.{ .value = original });
+        var old_inst_attrs = func.attributesOf(.{ .inst = original_inst });
+        try std.testing.expect(old_value_attrs.next() == null);
+        try std.testing.expect(old_inst_attrs.next() == null);
+
+        var boundary: ?Inst = null;
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+            .arith => |arith| if (dequantize_direction and
+                func.valueType(func.instResult(inst).?) == try func.types.intern(.{ .float = .f32 }) and
+                (arith.op == .mul or arith.op == .div))
+            {
+                boundary = inst;
+            },
+            .unary => |unary| if (!dequantize_direction and unary.op == .reinterpret and
+                func.types.type_kind(func.valueType(func.instResult(inst).?)) == .int)
+            {
+                boundary = inst;
+            },
+            else => {},
+        };
+        try std.testing.expect(boundary != null);
+        var inst_attrs = func.attributesOf(.{ .inst = boundary.? });
+        try std.testing.expectEqualStrings("line", inst_attrs.next().?.custom.key);
+    }
+}
+
+test "expandNvFp4 keeps reinterpret barriers before original add and subtract consumers" {
+    const allocator = std.testing.allocator;
+    inline for (.{ BinOp.add, BinOp.sub }) |consumer_op| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const decoded = try appendNvFp4Fixture(&func, block, true, .multiply, .multiply);
+        const addend = func.blockParams(block)[2];
+        const consumed = try func.appendInst(block, f32_t, .{ .arith = .{ .op = consumer_op, .lhs = decoded, .rhs = addend } });
+        func.setTerminator(block, .{ .ret = function.Ret.one(consumed) });
+
+        try std.testing.expect(try expandNvFp4(allocator, &func));
+        const consumer = func.opcode(func.definingInst(consumed).?).arith;
+        const final_reinterpret = func.opcode(func.definingInst(consumer.lhs).?).unary;
+        const bits_reinterpret = func.opcode(func.definingInst(final_reinterpret.value).?).unary;
+        const final_scale = func.opcode(func.definingInst(bits_reinterpret.value).?).arith;
+        try std.testing.expectEqual(function.UnaryOp.reinterpret, final_reinterpret.op);
+        try std.testing.expectEqual(function.UnaryOp.reinterpret, bits_reinterpret.op);
+        try std.testing.expectEqual(BinOp.mul, final_scale.op);
+    }
+}
+
+test "expandNvFp4 leaves unrelated logical IR unchanged" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const value = try func.appendInst(block, u32_t, .{ .iconst = 43 });
+    try func.addAttr(.{ .value = value }, .{ .custom = .{
+        .namespace = "test",
+        .key = "unchanged",
+        .value = .flag,
+    } });
+    func.setTerminator(block, .{ .ret = function.Ret.one(value) });
+    const before = try bitcode.encode(allocator, &func);
+    defer allocator.free(before);
+    const text_before = try std.fmt.allocPrint(allocator, "{f}", .{func});
+    defer allocator.free(text_before);
+
+    try std.testing.expect(!(try expandNvFp4(allocator, &func)));
+    const after = try bitcode.encode(allocator, &func);
+    defer allocator.free(after);
+    const text_after = try std.fmt.allocPrint(allocator, "{f}", .{func});
+    defer allocator.free(text_after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expectEqualStrings(text_before, text_after);
 }
 
 fn appendLowFloatFixture(func: *Function, block: Block, format: function.LowFloatFormat) ![2]Value {

@@ -512,6 +512,43 @@ pub fn reHomeCountForTest(allocator: std.mem.Allocator, func: *const Function) E
     return forEachWimmerSegments(allocator, func, count.f);
 }
 
+/// Test hook: expand NVFP4 through the production shared pass, allocate the
+/// resulting scalar IR with Wimmer, and count integer and f32 values which own a
+/// real spill segment. Fresh SSA definitions start in registers by allocator
+/// invariant, so these slots demonstrate pressure-driven operand reloads or
+/// later result spills without changing allocation policy for the test.
+pub fn nvFp4SpillCountsForTest(allocator: std.mem.Allocator, func: *const Function) Error!struct { integer: usize, float: usize } {
+    var work = try func.clone(allocator);
+    defer work.deinit();
+    _ = try ir.expand.expandNvFp4(allocator, &work);
+    try ir.critical_edge.splitCriticalEdges(allocator, &work);
+    var desc = try x86_64RegDescription(allocator, &work);
+    defer desc.deinit(allocator);
+    var walloc = try wimmer.allocate(allocator, &work, &desc);
+    defer walloc.deinit(allocator);
+
+    var counts = .{ .integer = @as(usize, 0), .float = @as(usize, 0) };
+    var it = walloc.segments.iterator();
+    while (it.next()) |entry| {
+        var has_slot = false;
+        for (entry.value_ptr.*) |segment| {
+            if (segment.loc == .slot) {
+                has_slot = true;
+                break;
+            }
+        }
+        if (!has_slot) continue;
+        switch (work.types.type_kind(work.valueType(entry.key_ptr.*))) {
+            .int => counts.integer += 1,
+            .float => |kind| if (kind == .f32) {
+                counts.float += 1;
+            },
+            else => {},
+        }
+    }
+    return counts;
+}
+
 /// Compile `func` to machine code plus its call relocations. The caller owns the
 /// result. This function delegates to `compileWithCaps` with the inert (all-false)
 /// `ModelCaps`, so it produces the same bytes no matter what `compileWithCaps` grows
@@ -556,6 +593,7 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
     var work = try func.clone(allocator);
     defer work.deinit();
 
+    _ = try ir.expand.expandNvFp4(allocator, &work);
     _ = try ir.expand.expandLowFloat(allocator, &work);
 
     // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls before

@@ -3560,6 +3560,7 @@ fn compileFunctionInternal(allocator: std.mem.Allocator, func: *const Function, 
     var work = try func.clone(allocator);
     defer work.deinit();
 
+    _ = try ir.expand.expandNvFp4(allocator, &work);
     _ = try ir.expand.expandLowFloat(allocator, &work);
 
     // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls on the clone,

@@ -85,6 +85,81 @@ fn pressureReference(input: u8) u32 {
     return result;
 }
 
+fn buildNvFp4SpillPressure(func: *Function) !void {
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const bool_t = try func.types.intern(.bool);
+    const block = try func.appendBlock();
+    const input = try func.appendBlockParam(block, u8_t);
+    const anchor_bits = try func.appendInst(block, u32_t, .{ .convert = .{ .value = input } });
+    var reinterpret_sources: [reinterpret_pressure_lanes]ir.function.Value = undefined;
+    for (&reinterpret_sources, 0..) |*source, index| {
+        const mask = try func.appendInst(block, u32_t, .{ .iconst = @intCast(0x3000 + index * 37) });
+        source.* = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = anchor_bits, .rhs = mask } });
+    }
+    var select_conds: [select_pressure_lanes]ir.function.Value = undefined;
+    var select_thens: [select_pressure_lanes]ir.function.Value = undefined;
+    var select_elses: [select_pressure_lanes]ir.function.Value = undefined;
+    for (0..select_pressure_lanes) |index| {
+        const match = try func.appendInst(block, u8_t, .{ .iconst = @intCast(index) });
+        select_conds[index] = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = input, .rhs = match } });
+        const then_mask = try func.appendInst(block, u32_t, .{ .iconst = @intCast(0x1000 + index * 17) });
+        const else_mask = try func.appendInst(block, u32_t, .{ .iconst = @intCast(0x2000 + index * 29) });
+        select_thens[index] = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = anchor_bits, .rhs = then_mask } });
+        select_elses[index] = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = anchor_bits, .rhs = else_mask } });
+    }
+    var payloads: [low_float_pressure_lanes]ir.function.Value = undefined;
+    for (&payloads, 0..) |*payload, index| payload.* = try func.appendArithImm(block, u8_t, .add, input, @intCast(index));
+    var select_results: [select_pressure_lanes]ir.function.Value = undefined;
+    for (&select_results, select_conds, select_thens, select_elses) |*result, cond, then_value, else_value| {
+        result.* = try func.appendInst(block, u32_t, .{ .select = .{ .cond = cond, .then = then_value, .@"else" = else_value } });
+    }
+    var reinterpret_floats: [reinterpret_pressure_lanes]ir.function.Value = undefined;
+    for (&reinterpret_floats, reinterpret_sources) |*value, source| value.* = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = source } });
+
+    const block_scale = try func.appendInst(block, u8_t, .{ .iconst = 0x38 });
+    const global_scale = try func.appendInst(block, f32_t, .{ .fconst = 1.0 });
+    var decoded: [low_float_pressure_lanes]ir.function.Value = undefined;
+    for (&decoded, payloads) |*value, payload| value.* = try func.appendInst(block, f32_t, .{ .dequantize_nvfp4 = .{
+        .value = payload,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .multiply,
+        .global_application = .multiply,
+    } });
+    var reinterpret_roundtrips: [reinterpret_pressure_lanes]ir.function.Value = undefined;
+    for (&reinterpret_roundtrips, reinterpret_floats) |*value, source| value.* = try func.appendInst(block, u32_t, .{ .unary = .{ .op = .reinterpret, .value = source } });
+    var encoded: [low_float_pressure_lanes]ir.function.Value = undefined;
+    for (&encoded, decoded) |*payload, value| payload.* = try func.appendInst(block, u8_t, .{ .quantize_nvfp4 = .{
+        .value = value,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .multiply,
+        .global_application = .multiply,
+    } });
+
+    var result = try func.appendInst(block, u32_t, .{ .convert = .{ .value = encoded[0] } });
+    for (encoded[1..]) |payload| {
+        const wide = try func.appendInst(block, u32_t, .{ .convert = .{ .value = payload } });
+        result = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = result, .rhs = wide } });
+    }
+    for (reinterpret_roundtrips) |roundtrip| result = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = result, .rhs = roundtrip } });
+    for (select_results) |selected| result = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = result, .rhs = selected } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+}
+
+fn nvfp4PressureReference(input: u8) u32 {
+    var result: u32 = 0;
+    for (0..select_pressure_lanes) |index| {
+        const mask: u32 = if (input == index) @intCast(0x1000 + index * 17) else @intCast(0x2000 + index * 29);
+        result ^= @as(u32, input) ^ mask;
+    }
+    for (0..reinterpret_pressure_lanes) |index| result ^= @as(u32, input) ^ @as(u32, @intCast(0x3000 + index * 37));
+    for (0..low_float_pressure_lanes) |index| result ^= (@as(u32, input) + @as(u32, @intCast(index))) & 0x0f;
+    return result;
+}
+
 fn buildIntToFloatBits(func: *Function) !void {
     const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const f32_t = try func.types.intern(.{ .float = .f32 });
@@ -163,6 +238,35 @@ test "qemu-user-riscv low float production expansion executes through spilled se
             else => return err,
         };
         try std.testing.expectEqual(@as(i64, pressureReference(input)), got);
+    }
+}
+
+test "qemu-user-riscv nvfp4 production expansion executes with integer and float spills" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildNvFp4SpillPressure(&func);
+
+    var evidence: isel.LowFloatSpillEvidence = .{};
+    var compiled = try isel.compileFunctionWithLowFloatSpillEvidence(allocator, &func, .{}, &evidence);
+    defer compiled.deinit(allocator);
+    try std.testing.expect(evidence.int_spill_count > 0);
+    try std.testing.expect(evidence.float_spill_count > 0);
+    try std.testing.expect(evidence.split_action_count > 0);
+    try std.testing.expect(evidence.select_condition_spilled_at_use);
+    try std.testing.expect(evidence.select_then_spilled_at_use);
+    try std.testing.expect(evidence.select_else_spilled_at_use);
+    try std.testing.expect(evidence.select_result_has_slot);
+    try std.testing.expect(evidence.select_operands_and_result);
+    try std.testing.expect(evidence.u32_to_f32_source_and_result);
+    try std.testing.expect(evidence.f32_to_u32_source_and_result);
+
+    for ([_]u8{ 0, 1, 17, 64, 127, 191 }) |input| {
+        const got = harness.runCode(std.testing.io, allocator, compiled.code, &.{input}, harness.qemu_user) catch |err| switch (err) {
+            error.SkipZigTest => return error.SkipZigTest,
+            else => return err,
+        };
+        try std.testing.expectEqual(@as(i64, nvfp4PressureReference(input)), got);
     }
 }
 

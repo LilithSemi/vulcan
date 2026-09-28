@@ -251,6 +251,190 @@ test "x86_64 native low float expansion survives integer spill pressure" {
     }
 }
 
+test "x86_64 native NVFP4 packed memory crosses a scale block and preserves its tail sibling" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const element_count = 19;
+    const packed_count = (element_count + 1) / 2;
+    var func = ir.function.Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const packed_input = try func.appendBlockParam(block, ptr_t);
+    const scales = try func.appendBlockParam(block, ptr_t);
+    const global_bits = try func.appendBlockParam(block, u32_t);
+    const decoded_output = try func.appendBlockParam(block, ptr_t);
+    const float_input = try func.appendBlockParam(block, ptr_t);
+    const packed_output = try func.appendBlockParam(block, ptr_t);
+    const global_scale_value = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = global_bits } });
+    for (0..element_count) |index| {
+        const packed_at = if (index < 2) packed_input else try func.appendArithImm(block, ptr_t, .add, packed_input, @intCast(index / 2));
+        const scale_at = if (index < 16) scales else try func.appendArithImm(block, ptr_t, .add, scales, @intCast(index / 16));
+        const packed_byte = try func.appendInst(block, u8_t, .{ .load = .{ .ptr = packed_at } });
+        const packed_wide = try func.appendInst(block, u32_t, .{ .convert = .{ .value = packed_byte } });
+        const positioned = if (index & 1 == 0)
+            packed_wide
+        else
+            try func.appendArithImm(block, u32_t, .shr, packed_wide, 4);
+        const nibble_wide = try func.appendArithImm(block, u32_t, .bit_and, positioned, 0x0f);
+        const nibble = try func.appendInst(block, u8_t, .{ .convert = .{ .value = nibble_wide } });
+        const block_scale = try func.appendInst(block, u8_t, .{ .load = .{ .ptr = scale_at } });
+        const decoded = try func.appendInst(block, f32_t, .{ .dequantize_nvfp4 = .{
+            .value = nibble,
+            .block_scale = block_scale,
+            .global_scale = global_scale_value,
+            .block_application = .multiply,
+            .global_application = .divide,
+        } });
+        const decoded_at = if (index == 0) decoded_output else try func.appendArithImm(block, ptr_t, .add, decoded_output, @intCast(index * 4));
+        try func.appendStore(block, decoded, decoded_at);
+
+        const float_at = if (index == 0) float_input else try func.appendArithImm(block, ptr_t, .add, float_input, @intCast(index * 4));
+        const source = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = float_at } });
+        const encoded = try func.appendInst(block, u8_t, .{ .quantize_nvfp4 = .{
+            .value = source,
+            .block_scale = block_scale,
+            .global_scale = global_scale_value,
+            .block_application = .divide,
+            .global_application = .multiply,
+        } });
+        const encoded_wide = try func.appendInst(block, u32_t, .{ .convert = .{ .value = encoded } });
+        const output_at = if (index < 2) packed_output else try func.appendArithImm(block, ptr_t, .add, packed_output, @intCast(index / 2));
+        const old_byte = try func.appendInst(block, u8_t, .{ .load = .{ .ptr = output_at } });
+        const old_wide = try func.appendInst(block, u32_t, .{ .convert = .{ .value = old_byte } });
+        const preserved = try func.appendArithImm(block, u32_t, .bit_and, old_wide, if (index & 1 == 0) 0xf0 else 0x0f);
+        const placed = if (index & 1 == 0)
+            encoded_wide
+        else
+            try func.appendArithImm(block, u32_t, .shl, encoded_wide, 4);
+        const combined = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_or, .lhs = preserved, .rhs = placed } });
+        const output_byte = try func.appendInst(block, u8_t, .{ .convert = .{ .value = combined } });
+        try func.appendStore(block, output_byte, output_at);
+    }
+    func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const run = buffer.entry(*const fn (*const u8, *const u8, u32, *u32, *const u32, *u8) callconv(.c) void, 0);
+    const packed_values = [_]u8{ 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x21, 0x43 };
+    const scale_values = [_]u8{ 0x39, 0xb8 };
+    const global_scale_bits: u32 = 0x3f40_0000;
+    const source_bits = [_]u32{
+        0x0000_0000, 0x8000_0000, 0x3e80_0000, 0x3e80_0001, 0x3f40_0000,
+        0x3f40_0001, 0x3fa0_0000, 0x3fa0_0001, 0x3fe0_0000, 0x4020_0000,
+        0x4060_0000, 0x40a0_0000, 0x7f7f_ffff, 0xff7f_ffff, 0x7f80_0000,
+        0xff80_0000, 0x7f80_0001, 0xff80_0001, 0x7fc0_1234,
+    };
+    var decoded_bits = [_]u32{0} ** element_count;
+    var output = [_]u8{0xa5} ** packed_count;
+    var expected_output = output;
+    run(&packed_values[0], &scale_values[0], global_scale_bits, &decoded_bits[0], &source_bits[0], &output[0]);
+    const global_scale: f32 = @bitCast(global_scale_bits);
+    for (0..element_count) |index| {
+        const payload = if (index & 1 == 0) packed_values[index / 2] & 0x0f else packed_values[index / 2] >> 4;
+        const scale = scale_values[index / 16];
+        const expected_decoded = ir.nvfp4.dequantize(payload, scale, global_scale, .multiply, .divide);
+        if (std.math.isNan(expected_decoded)) {
+            try std.testing.expect(std.math.isNan(@as(f32, @bitCast(decoded_bits[index]))));
+        } else {
+            try std.testing.expectEqual(@as(u32, @bitCast(expected_decoded)), decoded_bits[index]);
+        }
+        const encoded = ir.nvfp4.quantize(@bitCast(source_bits[index]), scale, global_scale, .divide, .multiply);
+        if (index & 1 == 0) {
+            expected_output[index / 2] = (expected_output[index / 2] & 0xf0) | encoded;
+        } else {
+            expected_output[index / 2] = (expected_output[index / 2] & 0x0f) | (encoded << 4);
+        }
+    }
+    try std.testing.expectEqualSlices(u8, &expected_output, &output);
+    try std.testing.expectEqual(@as(u8, 0xa0), output[packed_count - 1] & 0xf0);
+}
+
+test "x86_64 native NVFP4 expansion survives integer and float spill pressure" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const lane_count = 24;
+    const block_scales = [_]u8{ 0x38, 0x39, 0xb8, 0x40 };
+    var func = ir.function.Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const input = try func.appendBlockParam(block, u32_t);
+    const global_bits = try func.appendInst(block, u32_t, .{ .iconst = 0x3fc0_0000 });
+    const global_scale = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = global_bits } });
+
+    // Define every carrier before conversion so the source bank exceeds the GPR
+    // set. Keep every decoded result alive until the second loop so the f32 bank
+    // independently exceeds the XMM set. Wimmer starts fresh definitions in
+    // registers; the allocator hook therefore observes later spill segments.
+    var carriers: [lane_count]ir.function.Value = undefined;
+    var scales: [lane_count]ir.function.Value = undefined;
+    for (0..lane_count) |index| {
+        const salt = try func.appendInst(block, u32_t, .{ .iconst = @as(i64, @intCast(index * 0x10203)) });
+        const mixed = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = input, .rhs = salt } });
+        carriers[index] = try func.appendInst(block, u8_t, .{ .convert = .{ .value = mixed } });
+        scales[index] = try func.appendInst(block, u8_t, .{ .iconst = block_scales[index % block_scales.len] });
+    }
+
+    var decoded: [lane_count]ir.function.Value = undefined;
+    for (0..lane_count) |index| {
+        const block_application: ir.nvfp4.ScaleApplication = if (index & 1 == 0) .multiply else .divide;
+        const global_application: ir.nvfp4.ScaleApplication = if (index & 2 == 0) .multiply else .divide;
+        decoded[index] = try func.appendInst(block, f32_t, .{ .dequantize_nvfp4 = .{
+            .value = carriers[index],
+            .block_scale = scales[index],
+            .global_scale = global_scale,
+            .block_application = block_application,
+            .global_application = global_application,
+        } });
+    }
+
+    var encoded: [lane_count]ir.function.Value = undefined;
+    for (0..lane_count) |index| {
+        const block_application: ir.nvfp4.ScaleApplication = if (index & 1 == 0) .multiply else .divide;
+        const global_application: ir.nvfp4.ScaleApplication = if (index & 2 == 0) .multiply else .divide;
+        const payload = try func.appendInst(block, u8_t, .{ .quantize_nvfp4 = .{
+            .value = decoded[index],
+            .block_scale = scales[index],
+            .global_scale = global_scale,
+            .block_application = block_application,
+            .global_application = global_application,
+        } });
+        encoded[index] = try func.appendInst(block, u32_t, .{ .convert = .{ .value = payload } });
+    }
+    var digest = encoded[0];
+    for (encoded[1..]) |payload| {
+        digest = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = digest, .rhs = payload } });
+    }
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(digest) });
+
+    const spills = try isel.nvFp4SpillCountsForTest(allocator, &func);
+    try std.testing.expect(spills.integer > 0);
+    try std.testing.expect(spills.float > 0);
+    var code = try LowFloatCode.init(allocator, &func);
+    defer code.deinit();
+    const inputs = [_]u32{ 0, 0x1234_5678, 0xffff_ffff };
+    for (inputs) |input_bits| {
+        var expected: u32 = 0;
+        for (0..lane_count) |index| {
+            const carrier: u8 = @truncate(input_bits ^ @as(u32, @intCast(index * 0x10203)));
+            const block_scale = block_scales[index % block_scales.len];
+            const block_application: ir.nvfp4.ScaleApplication = if (index & 1 == 0) .multiply else .divide;
+            const global_application: ir.nvfp4.ScaleApplication = if (index & 2 == 0) .multiply else .divide;
+            const value = ir.nvfp4.dequantize(carrier, block_scale, @bitCast(@as(u32, 0x3fc0_0000)), block_application, global_application);
+            expected ^= ir.nvfp4.quantize(value, block_scale, @bitCast(@as(u32, 0x3fc0_0000)), block_application, global_application);
+        }
+        try std.testing.expectEqual(expected, code.call(input_bits));
+    }
+}
+
 test "module disasm: linked functions get labels and a resolved, named call" {
     const a = std.testing.allocator;
     const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
