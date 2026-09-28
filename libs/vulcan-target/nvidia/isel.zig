@@ -614,6 +614,7 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
             .decode_low_float, .encode_low_float => return error.Unsupported,
+            .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
             else => {},
         };
     }
@@ -4695,6 +4696,11 @@ fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, po
         .extract => |e| markUse(last_use, e.aggregate, pos),
         .convert => |cv| markUse(last_use, cv.value, pos),
         .decode_low_float, .encode_low_float => |cv| markUse(last_use, cv.value, pos),
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+            markUse(last_use, cv.value, pos);
+            markUse(last_use, cv.block_scale, pos);
+            markUse(last_use, cv.global_scale, pos);
+        },
         .unary => |u| markUse(last_use, u.value, pos),
         .load => |ld| markUse(last_use, ld.ptr, pos),
         .store => |st| {
@@ -4766,6 +4772,11 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) vo
         .extract => |e| setUsed(row, e.aggregate),
         .convert => |cv| setUsed(row, cv.value),
         .decode_low_float, .encode_low_float => |cv| setUsed(row, cv.value),
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+            setUsed(row, cv.value);
+            setUsed(row, cv.block_scale);
+            setUsed(row, cv.global_scale);
+        },
         .unary => |u| setUsed(row, u.value),
         .load => |ld| setUsed(row, ld.ptr),
         .store => |st| {
@@ -5822,6 +5833,30 @@ test "both low float directions are rejected before machine emission" {
         const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
         func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
         try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+    }
+}
+
+test "both nvfp4 directions are rejected before emission without mutating caller IR" {
+    const allocator = testing.allocator;
+    inline for (.{ true, false }) |dequantize| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const payload = try func.appendBlockParam(block, u8_t);
+        const block_scale = try func.appendBlockParam(block, u8_t);
+        const value = try func.appendBlockParam(block, f32_t);
+        const global_scale = try func.appendBlockParam(block, f32_t);
+        const conversion: ir.function.NvFp4Convert = .{ .value = if (dequantize) payload else value, .block_scale = block_scale, .global_scale = global_scale, .block_application = .multiply, .global_application = .divide };
+        const result = try func.appendInst(block, if (dequantize) f32_t else u8_t, if (dequantize) .{ .dequantize_nvfp4 = conversion } else .{ .quantize_nvfp4 = conversion });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+        const before = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(before);
+        try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+        const after = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(after);
+        try testing.expectEqualSlices(u8, before, after);
     }
 }
 

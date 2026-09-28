@@ -7,6 +7,7 @@ const std = @import("std");
 const function = @import("function.zig");
 const types = @import("types.zig");
 const attribute = @import("attribute.zig");
+const nvfp4 = @import("nvfp4.zig");
 
 const Function = function.Function;
 const Block = function.Block;
@@ -757,6 +758,43 @@ const FunctionParser = struct {
                 try self.func.appendInst(block, ty, .{ .decode_low_float = conversion })
             else
                 try self.func.appendInst(block, ty, .{ .encode_low_float = conversion });
+            try self.recordValue(result);
+            return result;
+        }
+        if (std.mem.eql(u8, op, "dequantize_nvfp4") or
+            std.mem.eql(u8, op, "quantize_nvfp4"))
+        {
+            self.skipWs();
+            const block_application = std.meta.stringToEnum(nvfp4.ScaleApplication, self.readWord()) orelse
+                return error.InvalidSyntax;
+            self.skipWs();
+            try self.eat(',');
+            self.skipWs();
+            const global_application = std.meta.stringToEnum(nvfp4.ScaleApplication, self.readWord()) orelse
+                return error.InvalidSyntax;
+            var operands: [3]Value = undefined;
+            for (&operands) |*operand| {
+                self.skipWs();
+                try self.eat(',');
+                self.skipWs();
+                operand.* = try self.parseValueRef();
+            }
+            const dequantize_direction = std.mem.eql(u8, op, "dequantize_nvfp4");
+            const ty = if (dequantize_direction)
+                try self.func.types.intern(.{ .float = .f32 })
+            else
+                try self.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+            const conversion: function.NvFp4Convert = .{
+                .value = operands[0],
+                .block_scale = operands[1],
+                .global_scale = operands[2],
+                .block_application = block_application,
+                .global_application = global_application,
+            };
+            const result = if (dequantize_direction)
+                try self.func.appendInst(block, ty, .{ .dequantize_nvfp4 = conversion })
+            else
+                try self.func.appendInst(block, ty, .{ .quantize_nvfp4 = conversion });
             try self.recordValue(result);
             return result;
         }
@@ -1918,4 +1956,56 @@ test "low float conversions print parse and verify in every format and direction
 
     const bad = "fn {\n  block0(v0: u8):\n    let v1 = decode_low_float e4m3, v0\n    ret v1\n}";
     try std.testing.expectError(error.InvalidSyntax, parse(std.testing.allocator, bad));
+}
+
+test "NVFP4 conversions print parse and verify every policy pair" {
+    const verify = @import("verify.zig");
+    const text =
+        \\fn {
+        \\  block0(v0: u8, v1: u8, v2: f32):
+        \\    #![test.inst]
+        \\    #[test.result]
+        \\    let v3 = dequantize_nvfp4 multiply, multiply, v0, v1, v2
+        \\    let v4 = dequantize_nvfp4 multiply, divide, v0, v1, v2
+        \\    let v5 = quantize_nvfp4 divide, multiply, v3, v1, v2
+        \\    let v6 = quantize_nvfp4 divide, divide, v4, v1, v2
+        \\    ret v6
+        \\}
+    ;
+    var func = try parse(std.testing.allocator, text);
+    defer func.deinit();
+    try std.testing.expectFmt(text, "{f}", .{func});
+    var diags = try verify.verify(std.testing.allocator, &func, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+
+    const insts = func.blockInsts(@enumFromInt(0));
+    var inst_attrs = func.attributesOf(.{ .inst = insts[0] });
+    try std.testing.expectEqualStrings("inst", inst_attrs.next().?.custom.key);
+    var result_attrs = func.attributesOf(.{ .value = func.instResult(insts[0]).? });
+    try std.testing.expectEqualStrings("result", result_attrs.next().?.custom.key);
+    try std.testing.expectEqual(nvfp4.ScaleApplication.multiply, func.opcode(insts[0]).dequantize_nvfp4.block_application);
+    try std.testing.expectEqual(nvfp4.ScaleApplication.divide, func.opcode(insts[1]).dequantize_nvfp4.global_application);
+    try std.testing.expectEqual(nvfp4.ScaleApplication.divide, func.opcode(insts[2]).quantize_nvfp4.block_application);
+    try std.testing.expectEqual(nvfp4.ScaleApplication.divide, func.opcode(insts[3]).quantize_nvfp4.global_application);
+}
+
+test "NVFP4 parser rejects malformed policies and operand counts" {
+    const prefix = "fn {\n  block0(v0: u8, v1: u8, v2: f32):\n    let v3 = ";
+    const suffix = "\n    ret v0\n}";
+    const bodies = [_][]const u8{
+        "dequantize_nvfp4 multiply, v0, v1, v2",
+        "dequantize_nvfp4 multiply, divide, multiply, v0, v1, v2",
+        "dequantize_nvfp4 unknown, divide, v0, v1, v2",
+        "dequantize_nvfp4 multiply, unknown, v0, v1, v2",
+        "dequantize_nvfp4 multiply, divide, v0, v1",
+        "dequantize_nvfp4 multiply, divide, v0, v1, v2, v0",
+        "quantize_nvfp4 multiply, divide, v2, v1",
+        "quantize_nvfp4 multiply, divide, v2, v1, v2, v0",
+    };
+    for (bodies) |body| {
+        const text = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, body, suffix });
+        defer std.testing.allocator.free(text);
+        try std.testing.expectError(error.InvalidSyntax, parse(std.testing.allocator, text));
+    }
 }

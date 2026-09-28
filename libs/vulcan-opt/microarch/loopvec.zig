@@ -440,6 +440,7 @@ fn usesValue(func: *const Function, inst: Inst, v: Value) bool {
         .select => |s| s.cond == v or s.then == v or s.@"else" == v,
         .convert => |c| c.value == v,
         .decode_low_float, .encode_low_float => |c| c.value == v,
+        .dequantize_nvfp4, .quantize_nvfp4 => |c| c.value == v or c.block_scale == v or c.global_scale == v,
         .unary => |u| u.value == v,
         .load => |l| l.ptr == v,
         .store => |s| s.value == v or s.ptr == v,
@@ -548,6 +549,8 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         .atomic_rmw,
         .decode_low_float,
         .encode_low_float,
+        .dequantize_nvfp4,
+        .quantize_nvfp4,
         // A barrier joins them: vectorizing by V divides the trip count by V, so the loop
         // would meet V times fewer than the source says.
         //

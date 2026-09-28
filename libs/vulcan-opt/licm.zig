@@ -29,7 +29,7 @@ fn nonTrapping(op: BinOp) bool {
 /// Whether an instruction may be hoisted out of a loop if it is invariant.
 fn hoistable(opcode: ir.function.Opcode) bool {
     return switch (opcode) {
-        .iconst, .fconst, .fconst128, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .unary, .extract, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .extract, .global_addr, .dot => true,
         .arith => |a| nonTrapping(a.op),
         .arith_imm => |a| nonTrapping(a.op),
         .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => false,
@@ -62,6 +62,7 @@ fn operandsInvariant(func: *const Function, inst: Inst, invariant: []const bool)
         .select => |s| inv(invariant, s.cond) and inv(invariant, s.then) and inv(invariant, s.@"else"),
         .convert => |cv| inv(invariant, cv.value),
         .decode_low_float, .encode_low_float => |cv| inv(invariant, cv.value),
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| inv(invariant, cv.value) and inv(invariant, cv.block_scale) and inv(invariant, cv.global_scale),
         .unary => |u| inv(invariant, u.value),
         .extract => |e| inv(invariant, e.aggregate),
         .dot => |d| inv(invariant, d.acc) and inv(invariant, d.a) and inv(invariant, d.b),
@@ -171,6 +172,37 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 fn isHoisted(list: []const Hoist, inst: Inst) bool {
     for (list) |h| if (h.inst == inst) return true;
     return false;
+}
+
+test "nvfp4 is hoistable only when all three operands are invariant" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const payload = try func.appendBlockParam(block, u8_t);
+    const block_scale = try func.appendBlockParam(block, u8_t);
+    const global_scale = try func.appendBlockParam(block, f32_t);
+    const result = try func.appendInst(block, f32_t, .{ .dequantize_nvfp4 = .{
+        .value = payload,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .multiply,
+        .global_application = .divide,
+    } });
+    const inst = func.definingInst(result).?;
+    try std.testing.expect(hoistable(func.opcode(inst)));
+
+    const invariant = try allocator.alloc(bool, func.valueCount());
+    defer allocator.free(invariant);
+    @memset(invariant, true);
+    try std.testing.expect(operandsInvariant(&func, inst, invariant));
+    inline for (.{ payload, block_scale, global_scale }) |operand| {
+        invariant[@intFromEnum(operand)] = false;
+        try std.testing.expect(!operandsInvariant(&func, inst, invariant));
+        invariant[@intFromEnum(operand)] = true;
+    }
 }
 
 test "hoists a loop-invariant product to the preheader" {

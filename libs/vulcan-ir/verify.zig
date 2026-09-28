@@ -130,6 +130,12 @@ fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocat
                 .encode_low_float => |cv| if (lowFloatOperandsMismatch(func, inst, cv, false)) {
                     try diags.add(.{ .operand_type_mismatch = func.instResult(inst) orelse cv.value });
                 },
+                .dequantize_nvfp4 => |cv| if (nvFp4OperandsMismatch(func, inst, cv, true)) {
+                    try diags.add(.{ .operand_type_mismatch = func.instResult(inst) orelse cv.value });
+                },
+                .quantize_nvfp4 => |cv| if (nvFp4OperandsMismatch(func, inst, cv, false)) {
+                    try diags.add(.{ .operand_type_mismatch = func.instResult(inst) orelse cv.value });
+                },
                 // matmul has no result value, so a mismatch is reported against
                 // `c` (the pointer the tile is written to).
                 .matmul => |mm| if (matmulOperandsMismatch(func, mm)) {
@@ -222,6 +228,18 @@ fn lowFloatOperandsMismatch(
     }
     return !isF32(func, func.valueType(conversion.value)) or
         !isUnsignedIntOfBits(func, func.valueType(result), payload_bits);
+}
+
+fn nvFp4OperandsMismatch(func: *const Function, inst: function.Inst, conversion: function.NvFp4Convert, dequantize_direction: bool) bool {
+    const result = func.instResult(inst) orelse return true;
+    if (!isUnsignedIntOfBits(func, func.valueType(conversion.block_scale), 8) or
+        !isF32(func, func.valueType(conversion.global_scale))) return true;
+    if (dequantize_direction) {
+        return !isUnsignedIntOfBits(func, func.valueType(conversion.value), 8) or
+            !isF32(func, func.valueType(result));
+    }
+    return !isF32(func, func.valueType(conversion.value)) or
+        !isUnsignedIntOfBits(func, func.valueType(result), 8);
 }
 
 fn isUnsignedIntOfBits(func: *const Function, ty: Type, bits: u16) bool {
@@ -497,6 +515,11 @@ fn checkDominance(func: *const Function, diags: *Diagnostics) std.mem.Allocator.
                 .extract => |ex| try checkUse(&dominance, def_block, diags, ex.aggregate, bi),
                 .convert => |cv| try checkUse(&dominance, def_block, diags, cv.value, bi),
                 .decode_low_float, .encode_low_float => |cv| try checkUse(&dominance, def_block, diags, cv.value, bi),
+                .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+                    try checkUse(&dominance, def_block, diags, cv.value, bi);
+                    try checkUse(&dominance, def_block, diags, cv.block_scale, bi);
+                    try checkUse(&dominance, def_block, diags, cv.global_scale, bi);
+                },
                 .unary => |u| try checkUse(&dominance, def_block, diags, u.value, bi),
                 .load => |ld| try checkUse(&dominance, def_block, diags, ld.ptr, bi),
                 .store => |st| {
@@ -1398,5 +1421,118 @@ test "low float verifier checks dominance in both directions" {
         defer diags.deinit();
         try std.testing.expect(!diags.ok());
         try std.testing.expectEqual(Diagnostic{ .not_dominated = .{ .value = source, .block = merge } }, diags.items()[0]);
+    }
+}
+
+test "NVFP4 verifier checks every operand and result independently" {
+    const allocator = std.testing.allocator;
+    const Field = enum { value, block_scale, global_scale, result, missing_result };
+    inline for (.{ true, false }) |dequantize_direction| {
+        inline for (.{ Field.value, Field.block_scale, Field.global_scale, Field.result, Field.missing_result }) |field| {
+            var func = Function.init(allocator);
+            defer func.deinit();
+            const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+            const f32_t = try func.types.intern(.{ .float = .f32 });
+            const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+            const f64_t = try func.types.intern(.{ .float = .f64 });
+            const block = try func.appendBlock();
+            const value = try func.appendBlockParam(block, if (field == .value)
+                (if (dequantize_direction) f32_t else u8_t)
+            else if (dequantize_direction) u8_t else f32_t);
+            const block_scale = try func.appendBlockParam(block, if (field == .block_scale) i8_t else u8_t);
+            const global_scale = try func.appendBlockParam(block, if (field == .global_scale) u8_t else f32_t);
+            const conversion: function.NvFp4Convert = .{
+                .value = value,
+                .block_scale = block_scale,
+                .global_scale = global_scale,
+                .block_application = .multiply,
+                .global_application = .divide,
+            };
+            const op: function.Opcode = if (dequantize_direction)
+                .{ .dequantize_nvfp4 = conversion }
+            else
+                .{ .quantize_nvfp4 = conversion };
+            const result: ?Value = if (field == .missing_result) blk: {
+                _ = try func.appendStmtRaw(block, op);
+                break :blk null;
+            } else try func.appendInst(block, if (field == .result)
+                (if (dequantize_direction) u8_t else f64_t)
+            else if (dequantize_direction) f32_t else u8_t, op);
+            func.setTerminator(block, .{ .ret = if (result) |r| function.Ret.one(r) else function.Ret.none() });
+            var diags = try verify(allocator, &func, .high);
+            defer diags.deinit();
+            try std.testing.expect(!diags.ok());
+        }
+    }
+
+    inline for (.{ true, false }) |dequantize_direction| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const value = try func.appendBlockParam(block, if (dequantize_direction) u8_t else f32_t);
+        const block_scale = try func.appendBlockParam(block, u8_t);
+        const global_scale = try func.appendBlockParam(block, f32_t);
+        const conversion: function.NvFp4Convert = .{
+            .value = value,
+            .block_scale = block_scale,
+            .global_scale = global_scale,
+            .block_application = .multiply,
+            .global_application = .divide,
+        };
+        const result = try func.appendInst(block, if (dequantize_direction) f32_t else u8_t, if (dequantize_direction)
+            .{ .dequantize_nvfp4 = conversion }
+        else
+            .{ .quantize_nvfp4 = conversion });
+        func.setTerminator(block, .{ .ret = function.Ret.one(result) });
+        var diags = try verify(allocator, &func, .high);
+        defer diags.deinit();
+        try std.testing.expect(diags.ok());
+    }
+}
+
+test "NVFP4 verifier checks dominance of all three operands" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |dequantize_direction| {
+        inline for (0..3) |bad_operand| {
+            var func = Function.init(allocator);
+            defer func.deinit();
+            const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+            const f32_t = try func.types.intern(.{ .float = .f32 });
+            const entry = try func.appendBlock();
+            const sibling = try func.appendBlock();
+            const merge = try func.appendBlock();
+            const good_value = try func.appendBlockParam(entry, if (dequantize_direction) u8_t else f32_t);
+            const good_block = try func.appendBlockParam(entry, u8_t);
+            const good_global = try func.appendBlockParam(entry, f32_t);
+            const bad_value = try func.appendBlockParam(sibling, if (dequantize_direction) u8_t else f32_t);
+            const bad_block = try func.appendBlockParam(sibling, u8_t);
+            const bad_global = try func.appendBlockParam(sibling, f32_t);
+            try func.setJump(entry, merge, &.{});
+            try func.setJump(sibling, merge, &.{});
+            const conversion: function.NvFp4Convert = .{
+                .value = if (bad_operand == 0) bad_value else good_value,
+                .block_scale = if (bad_operand == 1) bad_block else good_block,
+                .global_scale = if (bad_operand == 2) bad_global else good_global,
+                .block_application = .multiply,
+                .global_application = .divide,
+            };
+            const result = try func.appendInst(merge, if (dequantize_direction) f32_t else u8_t, if (dequantize_direction)
+                .{ .dequantize_nvfp4 = conversion }
+            else
+                .{ .quantize_nvfp4 = conversion });
+            func.setTerminator(merge, .{ .ret = function.Ret.one(result) });
+            var diags = try verify(allocator, &func, .high);
+            defer diags.deinit();
+            try std.testing.expect(!diags.ok());
+            const bad = switch (bad_operand) {
+                0 => bad_value,
+                1 => bad_block,
+                2 => bad_global,
+                else => unreachable,
+            };
+            try std.testing.expectEqual(Diagnostic{ .not_dominated = .{ .value = bad, .block = merge } }, diags.items()[0]);
+        }
     }
 }

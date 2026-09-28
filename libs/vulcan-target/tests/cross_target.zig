@@ -32,6 +32,46 @@ fn buildMain(allocator: std.mem.Allocator) !Function {
     return f;
 }
 
+fn buildNvFp4(allocator: std.mem.Allocator, dequantize: bool) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const payload = try func.appendBlockParam(block, u8_t);
+    const block_scale = try func.appendBlockParam(block, u8_t);
+    const value = try func.appendBlockParam(block, f32_t);
+    const global_scale = try func.appendBlockParam(block, f32_t);
+    const conversion: ir.function.NvFp4Convert = .{
+        .value = if (dequantize) payload else value,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .multiply,
+        .global_application = .divide,
+    };
+    const result = try func.appendInst(block, if (dequantize) f32_t else u8_t, if (dequantize) .{ .dequantize_nvfp4 = conversion } else .{ .quantize_nvfp4 = conversion });
+    try func.addAttr(.{ .inst = func.definingInst(result).? }, .{ .custom = .{ .namespace = "debug", .key = "nvfp4", .value = .{ .int = 42 } } });
+    try func.addAttr(.{ .value = result }, .{ .custom = .{ .namespace = "test", .key = "live", .value = .flag } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    return func;
+}
+
+test "all scalar machine targets reject both nvfp4 directions without mutating caller IR" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |dequantize| {
+        var func = try buildNvFp4(allocator, dequantize);
+        defer func.deinit();
+        const before = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(before);
+        inline for (.{ .x86, .x86_64, .aarch64, .riscv64 }) |arch| {
+            try std.testing.expectError(error.Unsupported, target.native.writeObjectDataFor(allocator, arch, &.{.{ .name = "convert", .func = &func }}, &.{}));
+            const after = try ir.bitcode.encode(allocator, &func);
+            defer allocator.free(after);
+            try std.testing.expectEqualSlices(u8, before, after);
+        }
+    }
+}
+
 /// Run `argv[0]`, already on PATH, or a native `./a.elf`, against `elf` written to a
 /// fresh tmp dir, and return its exit code. Returns `error.SkipZigTest` when the
 /// runner, `qemu-<arch>` when `argv[0]` names one, is not installed.

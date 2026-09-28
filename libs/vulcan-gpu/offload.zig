@@ -161,6 +161,7 @@ pub fn lowerToLoopNest(
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
             .decode_low_float, .encode_low_float => return error.Unsupported,
+            .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
             else => {},
         };
     }
@@ -748,6 +749,39 @@ test "both low float directions are rejected before loop-nest construction" {
         try kernel.appendStore(entry, result, output);
         kernel.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
         try std.testing.expectError(error.Unsupported, lowerToLoopNest(allocator, &kernel, .{ 1, 1, 1 }));
+    }
+}
+
+test "both nvfp4 directions are rejected before loop-nest construction" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |dequantize| {
+        var kernel = Function.init(allocator);
+        defer kernel.deinit();
+        const u8_t = try kernel.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const f32_t = try kernel.types.intern(.{ .float = .f32 });
+        const ptr_t = try kernel.types.ptrGlobal();
+        const entry = try kernel.appendBlock();
+        const payload = try kernel.appendBlockParam(entry, u8_t);
+        const block_scale = try kernel.appendBlockParam(entry, u8_t);
+        const value = try kernel.appendBlockParam(entry, f32_t);
+        const global_scale = try kernel.appendBlockParam(entry, f32_t);
+        const output = try kernel.appendBlockParam(entry, ptr_t);
+        const conversion: ir.function.NvFp4Convert = .{
+            .value = if (dequantize) payload else value,
+            .block_scale = block_scale,
+            .global_scale = global_scale,
+            .block_application = .multiply,
+            .global_application = .divide,
+        };
+        const result = try kernel.appendInst(entry, if (dequantize) f32_t else u8_t, if (dequantize) .{ .dequantize_nvfp4 = conversion } else .{ .quantize_nvfp4 = conversion });
+        try kernel.appendStore(entry, result, output);
+        kernel.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+        const before = try ir.bitcode.encode(allocator, &kernel);
+        defer allocator.free(before);
+        try std.testing.expectError(error.Unsupported, lowerToLoopNest(allocator, &kernel, .{ 1, 1, 1 }));
+        const after = try ir.bitcode.encode(allocator, &kernel);
+        defer allocator.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
     }
 }
 

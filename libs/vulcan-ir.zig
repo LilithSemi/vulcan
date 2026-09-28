@@ -7,6 +7,7 @@ const std = @import("std");
 pub const entity = @import("vulcan-ir/entity.zig");
 pub const types = @import("vulcan-ir/types.zig");
 pub const low_float = @import("vulcan-ir/low_float.zig");
+pub const nvfp4 = @import("vulcan-ir/nvfp4.zig");
 pub const function = @import("vulcan-ir/function.zig");
 pub const builder = @import("vulcan-ir/builder.zig");
 pub const parser = @import("vulcan-ir/parser.zig");

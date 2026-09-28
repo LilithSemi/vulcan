@@ -125,7 +125,7 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         },
         .select => |x| .{ .kind = .select, .a = vn(canon, x.cond), .b = vn(canon, x.then), .c = vn(canon, x.@"else") },
         .convert => |x| .{ .kind = .convert, .sub = @intFromEnum(func.valueType(result)), .a = vn(canon, x.value) },
-        .decode_low_float, .encode_low_float => null,
+        .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4 => null,
         .unary => |x| .{ .kind = .unary, .sub = @intFromEnum(func.valueType(result)), .a = vn(canon, x.value), .b = @intFromEnum(x.op) },
         .extract => |x| .{ .kind = .extract, .sub = x.index, .a = vn(canon, x.aggregate) },
         // `via_got` must be part of the key, not just `symbol`: a direct global_addr and a
@@ -189,6 +189,11 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
             .extract => |*e| e.aggregate = sub(canon, e.aggregate),
             .convert => |*cv| cv.value = sub(canon, cv.value),
             .decode_low_float, .encode_low_float => |*cv| cv.value = sub(canon, cv.value),
+            .dequantize_nvfp4, .quantize_nvfp4 => |*cv| {
+                cv.value = sub(canon, cv.value);
+                cv.block_scale = sub(canon, cv.block_scale);
+                cv.global_scale = sub(canon, cv.global_scale);
+            },
             .unary => |*u| u.value = sub(canon, u.value),
             .load => |*l| l.ptr = sub(canon, l.ptr),
             .store => |*st| {
@@ -324,6 +329,44 @@ test "gvn deliberately leaves low float conversions distinct" {
     try std.testing.expectEqual(ir.function.LowFloatFormat.f8_e5m2, func.opcode(func.definingInst(encoded_other).?).encode_low_float.format);
     try std.testing.expectEqual(ir.function.LowFloatFormat.f8_e4m3, func.opcode(func.definingInst(decoded_b).?).decode_low_float.format);
     try std.testing.expectEqual(ir.function.LowFloatFormat.f8_e5m2, func.opcode(func.definingInst(decoded_other).?).decode_low_float.format);
+}
+
+test "gvn deliberately leaves nvfp4 conversions distinct" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const payload = try func.appendBlockParam(block, u8_t);
+    const block_scale = try func.appendBlockParam(block, u8_t);
+    const global_scale = try func.appendBlockParam(block, f32_t);
+    const conversion: ir.function.NvFp4Convert = .{
+        .value = payload,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .multiply,
+        .global_application = .divide,
+    };
+    const decoded_a = try func.appendInst(block, f32_t, .{ .dequantize_nvfp4 = conversion });
+    const decoded_b = try func.appendInst(block, f32_t, .{ .dequantize_nvfp4 = conversion });
+    const encode_conversion: ir.function.NvFp4Convert = .{
+        .value = decoded_a,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .divide,
+        .global_application = .multiply,
+    };
+    const encoded_a = try func.appendInst(block, u8_t, .{ .quantize_nvfp4 = encode_conversion });
+    const encoded_b = try func.appendInst(block, u8_t, .{ .quantize_nvfp4 = encode_conversion });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(encoded_b) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+    try std.testing.expect(decoded_a != decoded_b);
+    try std.testing.expect(encoded_a != encoded_b);
+    try std.testing.expectEqual(encoded_b, func.terminator(block).?.ret.values[0]);
 }
 
 test "gvn does not merge a direct and a via_got global_addr of the same symbol" {

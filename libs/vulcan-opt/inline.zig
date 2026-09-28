@@ -217,6 +217,8 @@ fn mapOpcode(caller: *Function, callee: *const Function, vmap: std.AutoHashMapUn
         .convert => |cv| .{ .convert = .{ .value = m(vmap, cv.value) } },
         .decode_low_float => |cv| .{ .decode_low_float = .{ .value = m(vmap, cv.value), .format = cv.format } },
         .encode_low_float => |cv| .{ .encode_low_float = .{ .value = m(vmap, cv.value), .format = cv.format } },
+        .dequantize_nvfp4 => |cv| .{ .dequantize_nvfp4 = .{ .value = m(vmap, cv.value), .block_scale = m(vmap, cv.block_scale), .global_scale = m(vmap, cv.global_scale), .block_application = cv.block_application, .global_application = cv.global_application } },
+        .quantize_nvfp4 => |cv| .{ .quantize_nvfp4 = .{ .value = m(vmap, cv.value), .block_scale = m(vmap, cv.block_scale), .global_scale = m(vmap, cv.global_scale), .block_application = cv.block_application, .global_application = cv.global_application } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = m(vmap, u.value) } },
         // `volatile` is an observable side effect, not a hint. A callee that reads an MMIO
         // register keeps that read observable after it is inlined, so carry the flag.
@@ -283,6 +285,11 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
             .extract => |*e| e.aggregate = r(from, to, e.aggregate),
             .convert => |*cv| cv.value = r(from, to, cv.value),
             .decode_low_float, .encode_low_float => |*cv| cv.value = r(from, to, cv.value),
+            .dequantize_nvfp4, .quantize_nvfp4 => |*cv| {
+                cv.value = r(from, to, cv.value);
+                cv.block_scale = r(from, to, cv.block_scale);
+                cv.global_scale = r(from, to, cv.global_scale);
+            },
             .unary => |*u| u.value = r(from, to, u.value),
             .load => |*l| l.ptr = r(from, to, l.ptr),
             .store => |*st| {
@@ -715,6 +722,62 @@ test "inlining preserves low float directions formats and remapped operands" {
     try std.testing.expectEqual(input, encoded.?.value);
     const encoded_inst = caller.definingInst(decoded.?.value).?;
     try std.testing.expect(caller.opcode(encoded_inst) == .encode_low_float);
+}
+
+test "inlining remaps all nvfp4 operands and preserves policies" {
+    const allocator = std.testing.allocator;
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    const cu8 = try callee.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const cf32 = try callee.types.intern(.{ .float = .f32 });
+    const cb = try callee.appendBlock();
+    const payload = try callee.appendBlockParam(cb, cu8);
+    const block_scale = try callee.appendBlockParam(cb, cu8);
+    const global_scale = try callee.appendBlockParam(cb, cf32);
+    const decoded = try callee.appendInst(cb, cf32, .{ .dequantize_nvfp4 = .{
+        .value = payload,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .multiply,
+        .global_application = .divide,
+    } });
+    const encoded = try callee.appendInst(cb, cu8, .{ .quantize_nvfp4 = .{
+        .value = decoded,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .divide,
+        .global_application = .multiply,
+    } });
+    callee.setTerminator(cb, .{ .ret = ir.function.Ret.one(encoded) });
+
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const u8_t = try caller.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try caller.types.intern(.{ .float = .f32 });
+    const block = try caller.appendBlock();
+    const p = try caller.appendBlockParam(block, u8_t);
+    const bs = try caller.appendBlockParam(block, u8_t);
+    const gs = try caller.appendBlockParam(block, f32_t);
+    const call = try caller.appendCall(block, u8_t, "nvfp4", &.{ p, bs, gs });
+    caller.setTerminator(block, .{ .ret = ir.function.Ret.one(call) });
+    var lookup_context = TestLookup{ .callee = &callee, .name = "nvfp4" };
+    try std.testing.expect(try run(allocator, &caller, .{ .context = &lookup_context, .func = TestLookup.get }));
+
+    var saw_decode = false;
+    var saw_encode = false;
+    var remapped_decode: ?Value = null;
+    for (0..caller.blockCount()) |bi| for (caller.blockInsts(@enumFromInt(bi))) |inst| switch (caller.opcode(inst)) {
+        .dequantize_nvfp4 => |cv| {
+            saw_decode = cv.value == p and cv.block_scale == bs and cv.global_scale == gs and cv.block_application == .multiply and cv.global_application == .divide;
+            remapped_decode = caller.instResult(inst).?;
+        },
+        .quantize_nvfp4 => |cv| {
+            saw_encode = remapped_decode != null and cv.value == remapped_decode.? and cv.block_scale == bs and cv.global_scale == gs and cv.block_application == .divide and cv.global_application == .multiply;
+        },
+        .call => return error.TestUnexpectedResult,
+        else => {},
+    };
+    try std.testing.expect(saw_decode and saw_encode);
 }
 
 test "inlines a multi-block, two-return callee (the call is replaced by cloned control flow)" {

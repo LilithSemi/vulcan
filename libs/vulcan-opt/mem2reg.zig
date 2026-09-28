@@ -545,6 +545,11 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
             .extract => |e| esc(promotable, e.aggregate),
             .convert => |cv| esc(promotable, cv.value),
             .decode_low_float, .encode_low_float => |cv| esc(promotable, cv.value),
+            .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+                esc(promotable, cv.value);
+                esc(promotable, cv.block_scale);
+                esc(promotable, cv.global_scale);
+            },
             .unary => |u| esc(promotable, u.value),
             .prefetch => |pf| esc(promotable, pf.ptr),
             // SM12 T3: unlike `load`/`store`'s `ptr` (a sanctioned dereference), `list` is the

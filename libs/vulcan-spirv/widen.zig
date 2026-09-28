@@ -364,6 +364,8 @@ fn emitArm(func: *Function, out: *std.ArrayListUnmanaged(Inst), visited: []bool,
             .atomic_rmw,
             .decode_low_float,
             .encode_low_float,
+            .dequantize_nvfp4,
+            .quantize_nvfp4,
             .matmul,
             .va_start,
             .va_arg,
@@ -436,7 +438,7 @@ fn widenFlattened(func: *Function) Error!void {
             .iconst => try new_insts.append(func.allocator, inst),
             // SPIR-V has no 128-bit float, so a shader holding one cannot widen.
             .fconst128 => return error.NotWidenable,
-            .decode_low_float, .encode_low_float => return error.NotWidenable,
+            .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4 => return error.NotWidenable,
             .fconst => {
                 const cval = func.instResult(inst).?;
                 try new_insts.append(func.allocator, inst);

@@ -458,6 +458,8 @@ fn hasWriteBetween(func: *const Function, block: Block, lo: usize, hi: usize) bo
             .convert,
             .decode_low_float,
             .encode_low_float,
+            .dequantize_nvfp4,
+            .quantize_nvfp4,
             .unary,
             .alloca,
             .global_addr,
@@ -595,6 +597,8 @@ fn resultsAreCoalesceableStores(func: *const Function, block: Block, results: []
             .convert,
             .decode_low_float,
             .encode_low_float,
+            .dequantize_nvfp4,
+            .quantize_nvfp4,
             .unary,
             .alloca,
             .global_addr,
@@ -652,6 +656,11 @@ fn valueUseCount(func: *const Function, v: Value) usize {
                 },
                 .decode_low_float, .encode_low_float => |x| if (x.value == v) {
                     n += 1;
+                },
+                .dequantize_nvfp4, .quantize_nvfp4 => |x| {
+                    if (x.value == v) n += 1;
+                    if (x.block_scale == v) n += 1;
+                    if (x.global_scale == v) n += 1;
                 },
                 .unary => |x| if (x.value == v) {
                     n += 1;
@@ -859,6 +868,8 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
                 .convert,
                 .decode_low_float,
                 .encode_low_float,
+                .dequantize_nvfp4,
+                .quantize_nvfp4,
                 .unary,
                 .alloca,
                 .global_addr,
@@ -959,7 +970,7 @@ fn cleanup(allocator: std.mem.Allocator, func: *Function, coalesced_loads: *cons
 /// loads/stores/prefetch/calls/`if` are impure and kept (coalesced loads are handled separately).
 fn isPure(op: ir.function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .dot => true,
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
@@ -1005,6 +1016,11 @@ fn countUses(func: *const Function, uses: []u32) void {
                 .extract => |x| uses[@intFromEnum(x.aggregate)] += 1,
                 .convert => |x| uses[@intFromEnum(x.value)] += 1,
                 .decode_low_float, .encode_low_float => |x| uses[@intFromEnum(x.value)] += 1,
+                .dequantize_nvfp4, .quantize_nvfp4 => |x| {
+                    uses[@intFromEnum(x.value)] += 1;
+                    uses[@intFromEnum(x.block_scale)] += 1;
+                    uses[@intFromEnum(x.global_scale)] += 1;
+                },
                 .unary => |x| uses[@intFromEnum(x.value)] += 1,
                 .load => |x| uses[@intFromEnum(x.ptr)] += 1,
                 .store => |x| {

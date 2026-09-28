@@ -1419,6 +1419,7 @@ fn lowerDirectCall(allocator: std.mem.Allocator, ctx: *Ctx, c: ir.function.Call,
 fn unhandledStatement(op_code: ir.function.Opcode) Error {
     return switch (op_code) {
         .decode_low_float, .encode_low_float => error.Unsupported,
+        .dequantize_nvfp4, .quantize_nvfp4 => error.Unsupported,
         // A tile multiply writes memory at `c`. This backend has no tile-multiply lowering
         // (`expand.zig` rewrites a matmul into scalar loops for a target without one), so it
         // fails closed rather than dropping the write.
@@ -2086,6 +2087,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             std.mem.writeInt(u32, ctx.code.items[jmp_at..][0..4], @bitCast(end_rel), .little);
         },
         .decode_low_float, .encode_low_float => return error.Unsupported,
+        .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
         .convert => |cv| {
             // Numeric conversions: int to float or back (32-bit int, f32, or
             // f64), int to int (low bits), and f32 to f64 or back.
@@ -3511,6 +3513,11 @@ fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const ad
         .extract => |e| f(ctx, e.aggregate, false),
         .convert => |cv| f(ctx, cv.value, false),
         .decode_low_float, .encode_low_float => |cv| f(ctx, cv.value, false),
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+            f(ctx, cv.value, false);
+            f(ctx, cv.block_scale, false);
+            f(ctx, cv.global_scale, false);
+        },
         .unary => |u| f(ctx, u.value, false),
         // A folded load/store attributes its pointer use to the fold base,
         // the add's lhs, not the add's own result, so the base stays live

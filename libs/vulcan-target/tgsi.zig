@@ -819,6 +819,7 @@ pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
                 line += 1;
             },
             .decode_low_float, .encode_low_float => return error.Unsupported,
+            .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
             .icmp => |cmp| {
                 // A comparison -> a TGSI set-op producing an integer boolean (~0/0).
                 const r = result orelse return error.Unsupported;
@@ -1440,6 +1441,36 @@ test "both low float directions are independently rejected in supported fragment
         try func.appendStore(block, result, output);
         func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
         try testing.expectError(error.Unsupported, lower(allocator, &func));
+    }
+}
+
+test "both nvfp4 directions reject live attributed shaders without mutation" {
+    const allocator = testing.allocator;
+    inline for (.{ true, false }) |dequantize| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "stage", .value = .{ .string = "fragment" } } });
+        const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const block = try func.appendBlock();
+        const payload = try func.appendBlockParam(block, u8_t);
+        const block_scale = try func.appendBlockParam(block, u8_t);
+        const value = try func.appendBlockParam(block, f32_t);
+        const global_scale = try func.appendBlockParam(block, f32_t);
+        try func.addAttr(.{ .value = payload }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = ATTR_GENERIC0 } } });
+        const conversion: ir.function.NvFp4Convert = .{ .value = if (dequantize) payload else value, .block_scale = block_scale, .global_scale = global_scale, .block_application = .multiply, .global_application = .divide };
+        const result = try func.appendInst(block, if (dequantize) f32_t else u8_t, if (dequantize) .{ .dequantize_nvfp4 = conversion } else .{ .quantize_nvfp4 = conversion });
+        const output = try func.appendInst(block, i32_t, .{ .iconst = 0 });
+        try func.addAttr(.{ .value = output }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = 0 } } });
+        try func.appendStore(block, result, output);
+        func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+        const before = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(before);
+        try testing.expectError(error.Unsupported, lower(allocator, &func));
+        const after = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(after);
+        try testing.expectEqualSlices(u8, before, after);
     }
 }
 

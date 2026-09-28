@@ -13,7 +13,7 @@ pub const pass_def = pass.Pass{ .name = "dce", .run = run };
 /// Whether an instruction has no side effects, so it may be dropped when unused.
 fn isPure(op: ir.function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .dot => true,
         // A prefetch hint has no result but must be kept, like a store. A
         // matmul writes the `c` memory, likewise kept.
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
@@ -60,6 +60,11 @@ pub fn countUses(func: *const Function, uses: []u32) void {
                 .extract => |e| uses[@intFromEnum(e.aggregate)] += 1,
                 .convert => |cv| uses[@intFromEnum(cv.value)] += 1,
                 .decode_low_float, .encode_low_float => |cv| uses[@intFromEnum(cv.value)] += 1,
+                .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+                    uses[@intFromEnum(cv.value)] += 1;
+                    uses[@intFromEnum(cv.block_scale)] += 1;
+                    uses[@intFromEnum(cv.global_scale)] += 1;
+                },
                 .unary => |u| uses[@intFromEnum(u.value)] += 1,
                 .load => |l| uses[@intFromEnum(l.ptr)] += 1,
                 .store => |st| {
@@ -272,4 +277,36 @@ test "low float conversion liveness controls dead code elimination" {
     try std.testing.expect(try run(allocator, &func, &analyses));
     try std.testing.expectEqual(@as(usize, 1), func.blockInsts(block).len);
     try std.testing.expectEqual(ir.function.LowFloatFormat.f8_e4m3, func.opcode(func.blockInsts(block)[0]).decode_low_float.format);
+}
+
+test "nvfp4 conversion liveness counts every operand and removes an unused conversion" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const payload = try func.appendInst(block, u8_t, .{ .iconst = 1 });
+    const block_scale = try func.appendInst(block, u8_t, .{ .iconst = 2 });
+    const global_scale = try func.appendInst(block, f32_t, .{ .fconst = 3.0 });
+    const conversion: ir.function.NvFp4Convert = .{
+        .value = payload,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .multiply,
+        .global_application = .divide,
+    };
+    const live = try func.appendInst(block, f32_t, .{ .dequantize_nvfp4 = conversion });
+    _ = try func.appendInst(block, f32_t, .{ .dequantize_nvfp4 = conversion });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(live) });
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+    // Each defining constant is live only through a different NVFP4 operand. Omitting any
+    // operand from the use count lets DCE erase its definition and makes this assertion fail.
+    try std.testing.expectEqual(@as(usize, 4), func.blockInsts(block).len);
+    const kept = func.opcode(func.blockInsts(block)[3]).dequantize_nvfp4;
+    try std.testing.expectEqual(payload, kept.value);
+    try std.testing.expectEqual(block_scale, kept.block_scale);
+    try std.testing.expectEqual(global_scale, kept.global_scale);
 }

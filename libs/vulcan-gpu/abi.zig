@@ -370,7 +370,7 @@ pub fn layoutSharedFrame(allocator: std.mem.Allocator, func: *const Function, a:
             const al = switch (func.opcode(inst)) {
                 .alloca => |al| al,
                 .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select => continue,
-                .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .unary, .global_addr => continue,
+                .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .global_addr => continue,
                 .call, .call_indirect, .load, .store, .prefetch, .@"if" => continue,
                 .va_start, .va_arg, .va_end, .dot, .matmul, .barrier, .atomic_rmw => continue,
             };

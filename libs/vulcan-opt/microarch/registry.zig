@@ -31,7 +31,7 @@ fn altraLatency(op: ir.function.Opcode) u32 {
         .arith => |a| altraArith(a.op),
         .arith_imm => |a| altraArith(a.op),
         .load => 4,
-        .convert, .decode_low_float, .encode_low_float, .unary => 3,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 3,
         // A dot is a multiply-class op (4-way multiply-accumulate), grouped with `mul`.
         .dot => 4,
         // A matmul (et-soc tensor tile) is a big multicycle op, priced well above a
@@ -84,7 +84,7 @@ fn altraThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // Pipelined load-to-use: latency 4, but one independent load issues per mem port per cycle.
         .load => 1,
         // Pipelined FP/SIMD converts and unary FP ops.
-        .convert, .decode_low_float, .encode_low_float, .unary => 1,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         // NEON dotprod is a pipelined multiply-accumulate: one issues per cycle.
         .dot => 1,
         // A matmul is not native here; a placeholder, non-pipelined (== latency).
@@ -118,7 +118,7 @@ fn cascadelakeLatency(op: ir.function.Opcode) u32 {
         .arith => |a| cascadelakeArith(a.op),
         .arith_imm => |a| cascadelakeArith(a.op),
         .load => 5, // L1 ~4.7 corrected
-        .convert, .decode_low_float, .encode_low_float, .unary => 4,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 4,
         .dot => 3, // mul-class
         .matmul => 64, // non-native placeholder
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
@@ -155,7 +155,7 @@ fn cascadelakeThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .arith => |a| cascadelakeArithThroughput(a.op, elem_float),
         .arith_imm => |a| cascadelakeArithThroughput(a.op, elem_float),
         .load => 1,
-        .convert, .decode_low_float, .encode_low_float, .unary => 1,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         .dot => 1,
         .matmul => 64,
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
@@ -187,7 +187,7 @@ fn etsocLatency(op: ir.function.Opcode) u32 {
         .arith => |a| etsocArith(a.op),
         .arith_imm => |a| etsocArith(a.op),
         .load => 4,
-        .convert, .decode_low_float, .encode_low_float, .unary => 7,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 7,
         // A dot is a multiply-class op (4-way multiply-accumulate), grouped with `mul`.
         .dot => 8,
         // The et-soc fixed-tile matmul: the real tensor CSR-write sequence (load, wait,
@@ -238,7 +238,7 @@ fn etsocThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // Pipelined load-to-use (latency 4, throughput 1).
         .load => 1,
         // Pipelined VPU converts / unary FP.
-        .convert, .decode_low_float, .encode_low_float, .unary => 1,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         // The dot macro is an async multicycle MulDiv-class op: throughput == latency (never used by SLP).
         .dot => 8,
         // Matmul is the async CSR-write tensor sequence: non-pipelined, throughput == latency.
@@ -274,7 +274,7 @@ fn riverInorderLatency(op: ir.function.Opcode) u32 {
         .arith => |a| riverInorderArith(a.op),
         .arith_imm => |a| riverInorderArith(a.op),
         .load => 2,
-        .convert, .decode_low_float, .encode_low_float, .unary => 2,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 2,
         // A dot is a multiply-class op (4-way multiply-accumulate), grouped with `mul`.
         // River carries no dotprod feature today; this is a placeholder in case one is added.
         .dot => 3,
@@ -313,7 +313,7 @@ fn riverMacroLatency(op: ir.function.Opcode) u32 {
         .arith => |a| riverMacroArith(a.op),
         .arith_imm => |a| riverMacroArith(a.op),
         .load => 3,
-        .convert, .decode_low_float, .encode_low_float, .unary => 2,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 2,
         // A dot is a multiply-class op (4-way multiply-accumulate), grouped with `mul`.
         // River carries no dotprod feature today; this is a placeholder in case one is added.
         .dot => 3,
@@ -355,7 +355,7 @@ fn riverInorderThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .arith => |a| riverInorderArithThroughput(a.op, elem_float),
         .arith_imm => |a| riverInorderArithThroughput(a.op, elem_float),
         .load => 1, // pipelined load-to-use (latency 2)
-        .convert, .decode_low_float, .encode_low_float, .unary => 1,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         .dot => 3, // mul-class placeholder, non-pipelined here
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
@@ -395,7 +395,7 @@ fn riverPipelinedThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .arith => |a| riverPipelinedArithThroughput(a.op, elem_float),
         .arith_imm => |a| riverPipelinedArithThroughput(a.op, elem_float),
         .load => 1,
-        .convert, .decode_low_float, .encode_low_float, .unary => 1,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         .dot => 1, // pipelined mul-accumulate on the wider profile
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
@@ -457,7 +457,7 @@ fn sm120Latency(op: ir.function.Opcode) u32 {
         // nvidia/schedule.zig), which means there IS no fixed number: the result lands an unknown
         // number of cycles after issue and the hardware needs a scoreboard, not a stall count. 8 is
         // a placeholder that says "more than an ALU op" and nothing more.
-        .convert, .decode_low_float, .encode_low_float, .unary => 8,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 8,
         // ISETP and SEL are ordinary fixed-pipe ALU instructions, unlike the bookkeeping group.
         .icmp, .select => 4,
         // A BAR.SYNC waits for the slowest warp of the workgroup to arrive. That is a property of
@@ -501,7 +501,7 @@ fn sm120Throughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // The load/store unit accepts a new request while earlier ones are outstanding. THIS is the
         // number the unroll rule is built on: independent loads cost issue slots, not latencies.
         .load, .atomic_rmw => 1,
-        .convert, .decode_low_float, .encode_low_float, .unary => 1,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         .icmp, .select => 1,
         // A barrier is not pipelined: a second one cannot start before the first releases.
         .barrier => 32,
@@ -525,7 +525,7 @@ fn unitOfShared(op: ir.function.Opcode) UnitClass {
         .arith => |a| sharedArithUnit(a.op),
         .arith_imm => |a| sharedArithUnit(a.op),
         .icmp, .select, .iconst, .fconst, .fconst128, .global_addr => .alu,
-        .convert, .decode_low_float, .encode_low_float => .fpsimd,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4 => .fpsimd,
         .unary => |u| switch (u.op) {
             .reinterpret => .alu,
             .sqrt, .ceil, .floor, .trunc, .nearest => .fpsimd,

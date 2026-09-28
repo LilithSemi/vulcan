@@ -190,6 +190,11 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
             .extract => |*e| e.aggregate = sub(subst, e.aggregate),
             .convert => |*cv| cv.value = sub(subst, cv.value),
             .decode_low_float, .encode_low_float => |*cv| cv.value = sub(subst, cv.value),
+            .dequantize_nvfp4, .quantize_nvfp4 => |*cv| {
+                cv.value = sub(subst, cv.value);
+                cv.block_scale = sub(subst, cv.block_scale);
+                cv.global_scale = sub(subst, cv.global_scale);
+            },
             .unary => |*u| u.value = sub(subst, u.value),
             .load => |*l| l.ptr = sub(subst, l.ptr),
             .store => |*st| {

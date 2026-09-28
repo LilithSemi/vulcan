@@ -149,6 +149,8 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         .convert,
         .decode_low_float,
         .encode_low_float,
+        .dequantize_nvfp4,
+        .quantize_nvfp4,
         .unary,
         .alloca,
         .global_addr,
@@ -163,7 +165,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
             if (if_inst != null) return null;
             if_inst = inst;
         },
-        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .unary => {},
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => {},
         else => return null, // impure/memory op in the header
     };
     const iff = if_inst orelse return null;
@@ -520,6 +522,8 @@ fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Va
         .convert => |c| .{ .convert = .{ .value = rv(vmap, c.value) } },
         .decode_low_float => |c| .{ .decode_low_float = .{ .value = rv(vmap, c.value), .format = c.format } },
         .encode_low_float => |c| .{ .encode_low_float = .{ .value = rv(vmap, c.value), .format = c.format } },
+        .dequantize_nvfp4 => |c| .{ .dequantize_nvfp4 = .{ .value = rv(vmap, c.value), .block_scale = rv(vmap, c.block_scale), .global_scale = rv(vmap, c.global_scale), .block_application = c.block_application, .global_application = c.global_application } },
+        .quantize_nvfp4 => |c| .{ .quantize_nvfp4 = .{ .value = rv(vmap, c.value), .block_scale = rv(vmap, c.block_scale), .global_scale = rv(vmap, c.global_scale), .block_application = c.block_application, .global_application = c.global_application } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = rv(vmap, u.value) } },
         .extract => |e| .{ .extract = .{ .aggregate = rv(vmap, e.aggregate), .index = e.index } },
         .load => |l| .{ .load = .{ .ptr = rv(vmap, l.ptr), .@"volatile" = l.@"volatile" } },
@@ -597,6 +601,11 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
             .extract => |x| bump(counts, x.aggregate),
             .convert => |x| bump(counts, x.value),
             .decode_low_float, .encode_low_float => |x| bump(counts, x.value),
+            .dequantize_nvfp4, .quantize_nvfp4 => |x| {
+                bump(counts, x.value);
+                bump(counts, x.block_scale);
+                bump(counts, x.global_scale);
+            },
             .unary => |x| bump(counts, x.value),
             .load => |x| bump(counts, x.ptr),
             .store => |x| {

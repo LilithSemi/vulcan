@@ -111,6 +111,8 @@ fn rebuildOpcode(
         .convert => |cv| .{ .convert = .{ .value = remapValue(value_map, cv.value) } },
         .decode_low_float => |cv| .{ .decode_low_float = .{ .value = remapValue(value_map, cv.value), .format = cv.format } },
         .encode_low_float => |cv| .{ .encode_low_float = .{ .value = remapValue(value_map, cv.value), .format = cv.format } },
+        .dequantize_nvfp4 => |cv| .{ .dequantize_nvfp4 = .{ .value = remapValue(value_map, cv.value), .block_scale = remapValue(value_map, cv.block_scale), .global_scale = remapValue(value_map, cv.global_scale), .block_application = cv.block_application, .global_application = cv.global_application } },
+        .quantize_nvfp4 => |cv| .{ .quantize_nvfp4 = .{ .value = remapValue(value_map, cv.value), .block_scale = remapValue(value_map, cv.block_scale), .global_scale = remapValue(value_map, cv.global_scale), .block_application = cv.block_application, .global_application = cv.global_application } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = remapValue(value_map, u.value) } },
         .alloca => |a| .{ .alloca = .{ .elem = a.elem } },
         // Only `args` (and `target`/`ret_dest`) are Values. `is_variadic`/`num_fixed` and
@@ -207,6 +209,47 @@ fn rebuildOpcode(
             } };
         },
     };
+}
+
+test "unroll rebuild remaps every nvfp4 operand and preserves policies" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const old_value = try func.appendBlockParam(block, f32_t);
+    const old_block = try func.appendBlockParam(block, u8_t);
+    const old_global = try func.appendBlockParam(block, f32_t);
+    const new_value = try func.appendBlockParam(block, f32_t);
+    const new_block = try func.appendBlockParam(block, u8_t);
+    const new_global = try func.appendBlockParam(block, f32_t);
+    var values: ValueMap = .empty;
+    defer values.deinit(allocator);
+    try values.put(allocator, old_value, new_value);
+    try values.put(allocator, old_block, new_block);
+    try values.put(allocator, old_global, new_global);
+    var blocks: BlockMap = .empty;
+    defer blocks.deinit(allocator);
+    var scratch: std.ArrayList(Value) = .empty;
+    defer scratch.deinit(allocator);
+
+    inline for (.{ false, true }) |quantize| {
+        const conversion: ir.function.NvFp4Convert = .{
+            .value = old_value,
+            .block_scale = old_block,
+            .global_scale = old_global,
+            .block_application = .divide,
+            .global_application = .multiply,
+        };
+        const rebuilt = try rebuildOpcode(&func, if (quantize) .{ .quantize_nvfp4 = conversion } else .{ .dequantize_nvfp4 = conversion }, &values, &blocks, &scratch, allocator);
+        const got = if (quantize) rebuilt.quantize_nvfp4 else rebuilt.dequantize_nvfp4;
+        try std.testing.expectEqual(new_value, got.value);
+        try std.testing.expectEqual(new_block, got.block_scale);
+        try std.testing.expectEqual(new_global, got.global_scale);
+        try std.testing.expectEqual(.divide, got.block_application);
+        try std.testing.expectEqual(.multiply, got.global_application);
+    }
 }
 
 /// Deep-copies `blocks` into `func`, remapping every Value operand through
@@ -683,7 +726,7 @@ fn eligible(
                 if (idx != h_insts.len - 1) return null; // the `if` must end the block
                 if_inst = inst;
             },
-            .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .unary, .extract, .struct_new, .dot => {},
+            .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .extract, .struct_new, .dot => {},
             // load/store/call/call_indirect/alloca/global_addr are impure or memory ops.
             else => return null,
         }
@@ -1362,6 +1405,7 @@ fn instUsesValue(func: *const Function, inst: Inst, value: Value) bool {
         .extract => |x| x.aggregate == value,
         .convert => |x| x.value == value,
         .decode_low_float, .encode_low_float => |x| x.value == value,
+        .dequantize_nvfp4, .quantize_nvfp4 => |x| x.value == value or x.block_scale == value or x.global_scale == value,
         .unary => |x| x.value == value,
         .load => |x| x.ptr == value,
         .store => |x| x.value == value or x.ptr == value,
@@ -1539,6 +1583,11 @@ fn collectOperands(
             .extract => |x| try set.put(a, x.aggregate, {}),
             .convert => |x| try set.put(a, x.value, {}),
             .decode_low_float, .encode_low_float => |x| try set.put(a, x.value, {}),
+            .dequantize_nvfp4, .quantize_nvfp4 => |x| {
+                try set.put(a, x.value, {});
+                try set.put(a, x.block_scale, {});
+                try set.put(a, x.global_scale, {});
+            },
             .unary => |x| try set.put(a, x.value, {}),
             .load => |x| try set.put(a, x.ptr, {}),
             .store => |x| {
@@ -1613,6 +1662,11 @@ fn replaceInBlock(func: *Function, block: Block, from: Value, to: Value) void {
             .extract => |*x| x.aggregate = rep(from, to, x.aggregate),
             .convert => |*x| x.value = rep(from, to, x.value),
             .decode_low_float, .encode_low_float => |*x| x.value = rep(from, to, x.value),
+            .dequantize_nvfp4, .quantize_nvfp4 => |*x| {
+                x.value = rep(from, to, x.value);
+                x.block_scale = rep(from, to, x.block_scale);
+                x.global_scale = rep(from, to, x.global_scale);
+            },
             .unary => |*x| x.value = rep(from, to, x.value),
             .load => |*x| x.ptr = rep(from, to, x.ptr),
             .store => |*x| {

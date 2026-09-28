@@ -888,6 +888,7 @@ fn emitInst(
 
     switch (op) {
         .decode_low_float, .encode_low_float => return error.Unsupported,
+        .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
         // Wasm has no 128-bit float to hold one in.
         .fconst128 => return error.Unsupported,
         .iconst => |val| {
@@ -1612,6 +1613,30 @@ test "both low float directions are rejected while their results are live" {
         const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
         func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
         try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func, null));
+    }
+}
+
+test "both nvfp4 directions are rejected live without mutating caller IR" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |dequantize| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const payload = try func.appendBlockParam(block, u8_t);
+        const block_scale = try func.appendBlockParam(block, u8_t);
+        const value = try func.appendBlockParam(block, f32_t);
+        const global_scale = try func.appendBlockParam(block, f32_t);
+        const conversion: ir.function.NvFp4Convert = .{ .value = if (dequantize) payload else value, .block_scale = block_scale, .global_scale = global_scale, .block_application = .multiply, .global_application = .divide };
+        const result = try func.appendInst(block, if (dequantize) f32_t else u8_t, if (dequantize) .{ .dequantize_nvfp4 = conversion } else .{ .quantize_nvfp4 = conversion });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+        const before = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(before);
+        try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func, null));
+        const after = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
     }
 }
 

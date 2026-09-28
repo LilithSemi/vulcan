@@ -28,7 +28,7 @@ const UnitClass = mm.UnitClass;
 /// Model.
 fn movable(op: ir.function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .dot => true,
         // matmul writes the `c` memory: a barrier, like store/prefetch, not reordered.
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // SM12 T3: `va_start`/`va_arg`/`va_end` all read/mutate the `va_list` object at
@@ -78,6 +78,11 @@ fn collectOperands(
         .extract => |e| try buf.append(allocator, e.aggregate),
         .convert => |cv| try buf.append(allocator, cv.value),
         .decode_low_float, .encode_low_float => |cv| try buf.append(allocator, cv.value),
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+            try buf.append(allocator, cv.value);
+            try buf.append(allocator, cv.block_scale);
+            try buf.append(allocator, cv.global_scale);
+        },
         .unary => |u| try buf.append(allocator, u.value),
         .struct_new => |sn| for (func.valueList(sn.fields)) |f| try buf.append(allocator, f),
         .call => |c| for (func.valueList(c.args)) |a| try buf.append(allocator, a),
@@ -110,6 +115,29 @@ fn collectOperands(
             for (func.valueList(cf.@"else".args)) |a| try buf.append(allocator, a);
         },
     }
+}
+
+test "scheduler records every nvfp4 dependency in operand order" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const payload = try func.appendBlockParam(block, u8_t);
+    const block_scale = try func.appendBlockParam(block, u8_t);
+    const global_scale = try func.appendBlockParam(block, f32_t);
+    const result = try func.appendInst(block, f32_t, .{ .dequantize_nvfp4 = .{
+        .value = payload,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .multiply,
+        .global_application = .divide,
+    } });
+    var operands: std.ArrayList(Value) = .empty;
+    defer operands.deinit(allocator);
+    try collectOperands(allocator, &func, func.definingInst(result).?, &operands);
+    try std.testing.expectEqualSlices(Value, &.{ payload, block_scale, global_scale }, operands.items);
 }
 
 /// The per-cycle port capacity for a unit class. A class with a 0 count (or `.none`) is treated as
@@ -594,7 +622,7 @@ fn windowTestLatency(op: ir.function.Opcode) u32 {
             .mul, .mulh => 5,
             .div, .rem, .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
         },
-        .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end, .barrier, .atomic_rmw => 1,
+        .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end, .barrier, .atomic_rmw => 1,
     };
 }
 fn windowTestUnit(op: ir.function.Opcode) UnitClass {

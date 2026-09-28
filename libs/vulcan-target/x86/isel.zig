@@ -326,6 +326,7 @@ fn rebindSymbolName(func: *const Function, name: []const u8) []const u8 {
 fn unhandledStatement(op_code: ir.function.Opcode) Error {
     return switch (op_code) {
         .decode_low_float, .encode_low_float => error.Unsupported,
+        .dequantize_nvfp4, .quantize_nvfp4 => error.Unsupported,
         // A tile multiply writes memory at `c`. This backend has no tile-multiply lowering, so
         // it fails closed rather than dropping the write.
         .matmul,
@@ -427,6 +428,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
     const result = func.instResult(inst) orelse return unhandledStatement(func.opcode(inst));
     switch (func.opcode(inst)) {
         .decode_low_float, .encode_low_float => return error.Unsupported,
+        .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
         .iconst => |c| {
             const rd = ctx.dst(result, scratch1);
             try ctx.put(allocator, encode.movImm(rd, @intCast(c)));
@@ -1541,6 +1543,11 @@ fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const ad
         .extract => |e| f(ctx, e.aggregate, false),
         .convert => |cv| f(ctx, cv.value, false),
         .decode_low_float, .encode_low_float => |cv| f(ctx, cv.value, false),
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+            f(ctx, cv.value, false);
+            f(ctx, cv.block_scale, false);
+            f(ctx, cv.global_scale, false);
+        },
         .unary => |u| f(ctx, u.value, false),
         .load => f(ctx, fold.baseOf(func, inst), false),
         .store => |st| {

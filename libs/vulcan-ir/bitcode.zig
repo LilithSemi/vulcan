@@ -12,6 +12,7 @@ const function = @import("function.zig");
 const types = @import("types.zig");
 const parser = @import("parser.zig");
 const attribute = @import("attribute.zig");
+const nvfp4 = @import("nvfp4.zig");
 
 const Function = function.Function;
 const Value = function.Value;
@@ -96,6 +97,8 @@ const op_barrier: u8 = 24;
 const op_atomic_rmw: u8 = 25;
 const op_decode_low_float: u8 = 26;
 const op_encode_low_float: u8 = 27;
+const op_dequantize_nvfp4: u8 = 28;
+const op_quantize_nvfp4: u8 = 29;
 
 // An `atomic_rmw` record flag bit: the compare operand follows the two ordinary operand
 // slots. Written from the field and read back into it, so a record round-trips whatever the
@@ -424,6 +427,21 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
             try w.u8v(op_encode_low_float);
             try w.u8v(@intFromEnum(cv.format));
             try w.u32v(sv(serial, cv.value));
+        },
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+            comptime {
+                std.debug.assert(@intFromEnum(nvfp4.ScaleApplication.multiply) == 0);
+                std.debug.assert(@intFromEnum(nvfp4.ScaleApplication.divide) == 1);
+            }
+            try w.u8v(if (std.meta.activeTag(func.opcode(inst)) == .dequantize_nvfp4)
+                op_dequantize_nvfp4
+            else
+                op_quantize_nvfp4);
+            try w.u8v(@intFromEnum(cv.block_application));
+            try w.u8v(@intFromEnum(cv.global_application));
+            try w.u32v(sv(serial, cv.value));
+            try w.u32v(sv(serial, cv.block_scale));
+            try w.u32v(sv(serial, cv.global_scale));
         },
         .unary => |u| {
             try w.u8v(op_unary);
@@ -913,6 +931,11 @@ const Fixup = struct {
                     .extract => |*e| e.aggregate = next(&i, self.slots, serial),
                     .convert => |*cv| cv.value = next(&i, self.slots, serial),
                     .decode_low_float, .encode_low_float => |*cv| cv.value = next(&i, self.slots, serial),
+                    .dequantize_nvfp4, .quantize_nvfp4 => |*cv| {
+                        cv.value = next(&i, self.slots, serial);
+                        cv.block_scale = next(&i, self.slots, serial);
+                        cv.global_scale = next(&i, self.slots, serial);
+                    },
                     .unary => |*u| u.value = next(&i, self.slots, serial),
                     .load => |*l| l.ptr = next(&i, self.slots, serial),
                     .store => |*st| {
@@ -991,6 +1014,14 @@ fn canonicalLowFloatResult(
     };
 }
 
+fn canonicalNvFp4Result(func: *const Function, result_type: Type, dequantize_direction: bool) bool {
+    return switch (func.types.type_kind(result_type)) {
+        .float => |float| dequantize_direction and float == .f32,
+        .int => |int| !dequantize_direction and int.signedness == .unsigned and int.bits == 8,
+        else => false,
+    };
+}
+
 fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, block_count: u32, dummy: Value, serial: *std.ArrayList(Value), inst_serial: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), allocator: std.mem.Allocator) Error!void {
     const has_result = (try r.take(u8)) != 0;
     const rty: Type = if (has_result) try mapType(type_map, type_map.len, try r.take(u32)) else undefined;
@@ -1059,6 +1090,30 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
                 try appendRes(func, block, serial, rty, .{ .decode_low_float = conversion })
             else
                 try appendRes(func, block, serial, rty, .{ .encode_low_float = conversion });
+        },
+        op_dequantize_nvfp4, op_quantize_nvfp4 => blk: {
+            if (!has_result) return error.MalformedBitcode;
+            const block_application = std.enums.fromInt(nvfp4.ScaleApplication, try r.take(u8)) orelse
+                return error.MalformedBitcode;
+            const global_application = std.enums.fromInt(nvfp4.ScaleApplication, try r.take(u8)) orelse
+                return error.MalformedBitcode;
+            const dequantize_direction = tag == op_dequantize_nvfp4;
+            if (!canonicalNvFp4Result(func, rty, dequantize_direction))
+                return error.MalformedBitcode;
+            try slots.append(allocator, try r.take(u32));
+            try slots.append(allocator, try r.take(u32));
+            try slots.append(allocator, try r.take(u32));
+            const conversion: function.NvFp4Convert = .{
+                .value = dummy,
+                .block_scale = dummy,
+                .global_scale = dummy,
+                .block_application = block_application,
+                .global_application = global_application,
+            };
+            break :blk if (dequantize_direction)
+                try appendRes(func, block, serial, rty, .{ .dequantize_nvfp4 = conversion })
+            else
+                try appendRes(func, block, serial, rty, .{ .quantize_nvfp4 = conversion });
         },
         op_unary => blk: {
             const uop = std.enums.fromInt(function.UnaryOp, try r.take(u8)) orelse return error.MalformedBitcode;
@@ -1536,6 +1591,126 @@ test "low float bitcode pins tags and rejects malformed records" {
                     try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed));
                 }
                 try std.testing.expectError(error.MalformedBitcode, decode(allocator, bytes[0 .. at + 3]));
+            }
+        }
+    }
+}
+
+test "NVFP4 bitcode pins fields and rejects every malformed record field" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(u8, 28), op_dequantize_nvfp4);
+    try std.testing.expectEqual(@as(u8, 29), op_quantize_nvfp4);
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(nvfp4.ScaleApplication.multiply));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(nvfp4.ScaleApplication.divide));
+
+    inline for (.{ true, false }) |dequantize_direction| {
+        inline for (.{ nvfp4.ScaleApplication.multiply, nvfp4.ScaleApplication.divide }) |block_application| {
+            inline for (.{ nvfp4.ScaleApplication.multiply, nvfp4.ScaleApplication.divide }) |global_application| {
+                var func = Function.init(allocator);
+                defer func.deinit();
+                const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+                const f32_t = try func.types.intern(.{ .float = .f32 });
+                const block = try func.appendBlock();
+                const value = try func.appendBlockParam(block, if (dequantize_direction) u8_t else f32_t);
+                const block_scale = try func.appendBlockParam(block, u8_t);
+                const global_scale = try func.appendBlockParam(block, f32_t);
+                const conversion: function.NvFp4Convert = .{
+                    .value = value,
+                    .block_scale = block_scale,
+                    .global_scale = global_scale,
+                    .block_application = block_application,
+                    .global_application = global_application,
+                };
+                const result = try func.appendInst(block, if (dequantize_direction) f32_t else u8_t, if (dequantize_direction)
+                    .{ .dequantize_nvfp4 = conversion }
+                else
+                    .{ .quantize_nvfp4 = conversion });
+                const inst = func.definingInst(result).?;
+                try func.addAttr(.{ .inst = inst }, .{ .custom = .{
+                    .namespace = "test",
+                    .key = "nvfp4",
+                    .value = .flag,
+                } });
+                try func.addAttr(.{ .value = result }, .{ .custom = .{
+                    .namespace = "test",
+                    .key = "result",
+                    .value = .flag,
+                } });
+                func.setTerminator(block, .{ .ret = function.Ret.one(result) });
+
+                const bytes = try encode(allocator, &func);
+                defer allocator.free(bytes);
+                var decoded = try decode(allocator, bytes);
+                defer decoded.deinit();
+                const decoded_inst = decoded.blockInsts(@enumFromInt(0))[0];
+                const decoded_result = decoded.instResult(decoded_inst).?;
+                const decoded_conversion = switch (decoded.opcode(decoded_inst)) {
+                    .dequantize_nvfp4 => |cv| cv,
+                    .quantize_nvfp4 => |cv| cv,
+                    else => return error.TestUnexpectedResult,
+                };
+                const params = decoded.blockParams(@enumFromInt(0));
+                try std.testing.expectEqual(params[0], decoded_conversion.value);
+                try std.testing.expectEqual(params[1], decoded_conversion.block_scale);
+                try std.testing.expectEqual(params[2], decoded_conversion.global_scale);
+                try std.testing.expectEqual(block_application, decoded_conversion.block_application);
+                try std.testing.expectEqual(global_application, decoded_conversion.global_application);
+                var inst_attrs = decoded.attributesOf(.{ .inst = decoded_inst });
+                try std.testing.expect(inst_attrs.next() != null);
+                var result_attrs = decoded.attributesOf(.{ .value = decoded_result });
+                try std.testing.expect(result_attrs.next() != null);
+
+                const tag = if (dequantize_direction) op_dequantize_nvfp4 else op_quantize_nvfp4;
+                const pattern = [_]u8{
+                    tag,
+                    @intFromEnum(block_application),
+                    @intFromEnum(global_application),
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    2,
+                    0,
+                    0,
+                    0,
+                };
+                const at = std.mem.indexOf(u8, bytes, &pattern) orelse return error.TestUnexpectedResult;
+                if (block_application == .multiply and global_application == .multiply) {
+                    {
+                        var malformed: std.ArrayList(u8) = .empty;
+                        defer malformed.deinit(allocator);
+                        try malformed.appendSlice(allocator, bytes[0 .. at - 5]);
+                        try malformed.append(allocator, 0);
+                        try malformed.appendSlice(allocator, bytes[at..]);
+                        try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed.items));
+                    }
+                    for ([_]usize{ at + 1, at + 2 }) |policy_at| {
+                        const malformed = try allocator.dupe(u8, bytes);
+                        defer allocator.free(malformed);
+                        malformed[policy_at] = 2;
+                        try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed));
+                    }
+                    {
+                        const malformed = try allocator.dupe(u8, bytes);
+                        defer allocator.free(malformed);
+                        const wrong_type: u32 = @intFromEnum(if (dequantize_direction) u8_t else f32_t);
+                        std.mem.writeInt(u32, @ptrCast(malformed[at - 4 .. at].ptr), wrong_type, .little);
+                        try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed));
+                    }
+                    for ([_]usize{ at + 3, at + 7, at + 11 }) |serial_at| {
+                        const malformed = try allocator.dupe(u8, bytes);
+                        defer allocator.free(malformed);
+                        @memset(malformed[serial_at .. serial_at + 4], 0xff);
+                        try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed));
+                    }
+                    for ([_]usize{ at + 2, at + 3, at + 7, at + 11, at + 15 }) |end| {
+                        try std.testing.expectError(error.MalformedBitcode, decode(allocator, bytes[0..end]));
+                    }
+                }
             }
         }
     }

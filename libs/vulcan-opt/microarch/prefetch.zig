@@ -113,7 +113,7 @@ fn loopShape(func: *const Function, all_loops: []const loops.Loop, loop: *const 
                 if (idx != h_insts.len - 1) return null; // the `if` must end the block
                 if_inst = inst;
             },
-            .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .unary, .extract, .struct_new => {},
+            .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .extract, .struct_new => {},
             // load/store/prefetch/call/call_indirect/alloca/global_addr are impure or memory ops.
             else => return null,
         }

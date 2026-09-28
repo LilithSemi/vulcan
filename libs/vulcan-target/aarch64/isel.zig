@@ -1401,6 +1401,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
                 },
                 .decode_low_float, .encode_low_float => return error.Unsupported,
+                .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
                 .convert => |cv| {
                     const result = func.instResult(inst).?;
                     // Any conversion touching f128 has no aarch64 form; the softfp pass rewrites it
@@ -3450,6 +3451,11 @@ fn forEachOperand(
         .extract => |e| f(ctx, e.aggregate, false),
         .convert => |cv| f(ctx, cv.value, false),
         .decode_low_float, .encode_low_float => |cv| f(ctx, cv.value, false),
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+            f(ctx, cv.value, false);
+            f(ctx, cv.block_scale, false);
+            f(ctx, cv.global_scale, false);
+        },
         .unary => |u| f(ctx, u.value, false),
         // A folded load/store attributes its POINTER use to the fold BASE (the add's lhs), not the
         // raw ptr, so the base's live range reaches the mem op (including cross-block) and the dead
@@ -3900,6 +3906,11 @@ fn usesOfInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
         .decode_low_float, .encode_low_float => |cv| {
             if (cv.value == v) c += 1;
         },
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+            if (cv.value == v) c += 1;
+            if (cv.block_scale == v) c += 1;
+            if (cv.global_scale == v) c += 1;
+        },
         .unary => |u| {
             if (u.value == v) c += 1;
         },
@@ -4000,6 +4011,11 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, fold: *const ad
         .extract => |e| setUsed(row, e.aggregate),
         .convert => |cv| setUsed(row, cv.value),
         .decode_low_float, .encode_low_float => |cv| setUsed(row, cv.value),
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+            setUsed(row, cv.value);
+            setUsed(row, cv.block_scale);
+            setUsed(row, cv.global_scale);
+        },
         .unary => |u| setUsed(row, u.value),
         // Same fold reroute as `forEachOperand`: a folded mem op's pointer use is the fold base, so
         // the base's cross-block liveness reaches the mem op. `baseOf` is the raw ptr when unfolded.

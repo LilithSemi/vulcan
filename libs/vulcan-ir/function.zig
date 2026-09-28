@@ -7,6 +7,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const attribute = @import("attribute.zig");
 const low_float = @import("low_float.zig");
+const nvfp4 = @import("nvfp4.zig");
 
 const Type = types.Type;
 const TypeTable = types.TypeTable;
@@ -109,6 +110,14 @@ pub const LowFloatFormat = low_float.Format;
 pub const LowFloatConvert = struct {
     value: Value,
     format: LowFloatFormat,
+};
+
+pub const NvFp4Convert = struct {
+    value: Value,
+    block_scale: Value,
+    global_scale: Value,
+    block_application: nvfp4.ScaleApplication,
+    global_application: nvfp4.ScaleApplication,
 };
 
 /// A single-operand operation. `reinterpret` reinterprets the bits as the result
@@ -568,6 +577,8 @@ pub const Opcode = union(enum) {
     convert: Convert,
     decode_low_float: LowFloatConvert,
     encode_low_float: LowFloatConvert,
+    dequantize_nvfp4: NvFp4Convert,
+    quantize_nvfp4: NvFp4Convert,
     /// A single-operand op (bit reinterpret, or floating-point math) on the result type.
     unary: Unary,
     /// Reserve a stack slot and produce its address. Result type is `ptr`.
@@ -1396,6 +1407,11 @@ pub const Function = struct {
                 .extract => |*e| e.aggregate = r(from, to, e.aggregate),
                 .convert => |*cv| cv.value = r(from, to, cv.value),
                 .decode_low_float, .encode_low_float => |*cv| cv.value = r(from, to, cv.value),
+                .dequantize_nvfp4, .quantize_nvfp4 => |*cv| {
+                    cv.value = r(from, to, cv.value);
+                    cv.block_scale = r(from, to, cv.block_scale);
+                    cv.global_scale = r(from, to, cv.global_scale);
+                },
                 .unary => |*u| u.value = r(from, to, u.value),
                 .load => |*l| l.ptr = r(from, to, l.ptr),
                 .store => |*st| {
@@ -1655,6 +1671,20 @@ pub const Function = struct {
             .convert => |cv| .{ .convert = .{ .value = remapValue(map, cv.value) } },
             .decode_low_float => |cv| .{ .decode_low_float = .{ .value = remapValue(map, cv.value), .format = cv.format } },
             .encode_low_float => |cv| .{ .encode_low_float = .{ .value = remapValue(map, cv.value), .format = cv.format } },
+            .dequantize_nvfp4 => |cv| .{ .dequantize_nvfp4 = .{
+                .value = remapValue(map, cv.value),
+                .block_scale = remapValue(map, cv.block_scale),
+                .global_scale = remapValue(map, cv.global_scale),
+                .block_application = cv.block_application,
+                .global_application = cv.global_application,
+            } },
+            .quantize_nvfp4 => |cv| .{ .quantize_nvfp4 = .{
+                .value = remapValue(map, cv.value),
+                .block_scale = remapValue(map, cv.block_scale),
+                .global_scale = remapValue(map, cv.global_scale),
+                .block_application = cv.block_application,
+                .global_application = cv.global_application,
+            } },
             .unary => |u| .{ .unary = .{ .op = u.op, .value = remapValue(map, u.value) } },
             .call => |c| .{ .call = .{
                 .symbol = c.symbol,
@@ -2140,6 +2170,15 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
             self.valueName(data.result.?),
             @tagName(cv.format),
             self.valueName(cv.value),
+        }),
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| try w.print("let v{d} = {s} {s}, {s}, v{d}, v{d}, v{d}", .{
+            self.valueName(data.result.?),
+            if (std.meta.activeTag(data.op) == .dequantize_nvfp4) "dequantize_nvfp4" else "quantize_nvfp4",
+            @tagName(cv.block_application),
+            @tagName(cv.global_application),
+            self.valueName(cv.value),
+            self.valueName(cv.block_scale),
+            self.valueName(cv.global_scale),
         }),
         .unary => |u| try w.print("let v{d} = {s} {f}, v{d}", .{
             self.valueName(data.result.?),
@@ -3078,6 +3117,81 @@ test "cloneBlock remaps low float operands without changing formats" {
     try std.testing.expectEqual(map.get(payload).?, decode_op.value);
     try std.testing.expect(encode_op.value != input);
     try std.testing.expect(decode_op.value != payload);
+}
+
+test "NVFP4 replacement and clone cover every operand and policy" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const src = try func.appendBlock();
+    const payload = try func.appendBlockParam(src, u8_t);
+    const block_scale = try func.appendBlockParam(src, u8_t);
+    const global_scale = try func.appendBlockParam(src, f32_t);
+    const decoded = try func.appendInst(src, f32_t, .{ .dequantize_nvfp4 = .{
+        .value = payload,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .multiply,
+        .global_application = .divide,
+    } });
+    const decoded_inst = func.definingInst(decoded).?;
+    try func.addAttr(.{ .inst = decoded_inst }, .{ .custom = .{
+        .namespace = "test",
+        .key = "nvfp4_inst",
+        .value = .flag,
+    } });
+    try func.addAttr(.{ .value = decoded }, .{ .custom = .{
+        .namespace = "test",
+        .key = "nvfp4_result",
+        .value = .flag,
+    } });
+    _ = try func.appendInst(src, u8_t, .{ .quantize_nvfp4 = .{
+        .value = decoded,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .divide,
+        .global_application = .multiply,
+    } });
+
+    var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer map.deinit(allocator);
+    const dst = try func.cloneBlock(allocator, src, &map);
+    const copied = func.blockInsts(dst);
+    const dequantize = func.opcode(copied[0]).dequantize_nvfp4;
+    const quantize = func.opcode(copied[1]).quantize_nvfp4;
+    try std.testing.expectEqual(map.get(payload).?, dequantize.value);
+    try std.testing.expectEqual(map.get(block_scale).?, dequantize.block_scale);
+    try std.testing.expectEqual(map.get(global_scale).?, dequantize.global_scale);
+    try std.testing.expectEqual(nvfp4.ScaleApplication.multiply, dequantize.block_application);
+    try std.testing.expectEqual(nvfp4.ScaleApplication.divide, dequantize.global_application);
+    try std.testing.expectEqual(map.get(decoded).?, quantize.value);
+    try std.testing.expectEqual(map.get(block_scale).?, quantize.block_scale);
+    try std.testing.expectEqual(map.get(global_scale).?, quantize.global_scale);
+    try std.testing.expectEqual(nvfp4.ScaleApplication.divide, quantize.block_application);
+    try std.testing.expectEqual(nvfp4.ScaleApplication.multiply, quantize.global_application);
+    var inst_attrs = func.attributesOf(.{ .inst = copied[0] });
+    try std.testing.expectEqualStrings("nvfp4_inst", inst_attrs.next().?.custom.key);
+    var result_attrs = func.attributesOf(.{ .value = map.get(decoded).? });
+    try std.testing.expectEqualStrings("nvfp4_result", result_attrs.next().?.custom.key);
+
+    const fresh_payload = try func.appendBlockParam(dst, u8_t);
+    const fresh_block = try func.appendBlockParam(dst, u8_t);
+    const fresh_global = try func.appendBlockParam(dst, f32_t);
+    const fresh_value = try func.appendBlockParam(dst, f32_t);
+    func.replaceAllUses(map.get(payload).?, fresh_payload);
+    func.replaceAllUses(map.get(block_scale).?, fresh_block);
+    func.replaceAllUses(map.get(global_scale).?, fresh_global);
+    func.replaceAllUses(map.get(decoded).?, fresh_value);
+    const replaced = func.opcode(copied[0]).dequantize_nvfp4;
+    try std.testing.expectEqual(fresh_payload, replaced.value);
+    try std.testing.expectEqual(fresh_block, replaced.block_scale);
+    try std.testing.expectEqual(fresh_global, replaced.global_scale);
+    const replaced_quantize = func.opcode(copied[1]).quantize_nvfp4;
+    try std.testing.expectEqual(fresh_value, replaced_quantize.value);
+    try std.testing.expectEqual(fresh_block, replaced_quantize.block_scale);
+    try std.testing.expectEqual(fresh_global, replaced_quantize.global_scale);
 }
 
 test "cloneBlock remaps a ret terminator's value" {

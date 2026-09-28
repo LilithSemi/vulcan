@@ -663,6 +663,8 @@ fn isScaling(opcode: ir.function.Opcode) bool {
         .convert,
         .decode_low_float,
         .encode_low_float,
+        .dequantize_nvfp4,
+        .quantize_nvfp4,
         .unary,
         .alloca,
         .call,

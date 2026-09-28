@@ -587,6 +587,8 @@ fn stepOf(ctx: *const LoopCtx, hp: Value, next: Value) ?Step {
         .convert,
         .decode_low_float,
         .encode_low_float,
+        .dequantize_nvfp4,
+        .quantize_nvfp4,
         .unary,
         .alloca,
         .call,
@@ -628,6 +630,8 @@ fn affineOf(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, inst: Inst
         .convert,
         .decode_low_float,
         .encode_low_float,
+        .dequantize_nvfp4,
+        .quantize_nvfp4,
         .unary,
         .alloca,
         .call,
@@ -810,6 +814,8 @@ fn countUses(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
                 .convert,
                 .decode_low_float,
                 .encode_low_float,
+                .dequantize_nvfp4,
+                .quantize_nvfp4,
                 .unary,
                 .alloca,
                 .call,
@@ -853,6 +859,11 @@ fn appendOperands(allocator: std.mem.Allocator, func: *const Function, inst: Ins
         .extract => |e| try out.append(allocator, e.aggregate),
         .convert => |c| try out.append(allocator, c.value),
         .decode_low_float, .encode_low_float => |c| try out.append(allocator, c.value),
+        .dequantize_nvfp4, .quantize_nvfp4 => |c| {
+            try out.append(allocator, c.value);
+            try out.append(allocator, c.block_scale);
+            try out.append(allocator, c.global_scale);
+        },
         .unary => |u| try out.append(allocator, u.value),
         .call => |c| {
             try out.appendSlice(allocator, func.valueList(c.args));

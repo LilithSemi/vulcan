@@ -2058,6 +2058,11 @@ fn usesInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
         .decode_low_float, .encode_low_float => |cv| {
             if (cv.value == v) c += 1;
         },
+        .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+            if (cv.value == v) c += 1;
+            if (cv.block_scale == v) c += 1;
+            if (cv.global_scale == v) c += 1;
+        },
         .load => |l| {
             if (l.ptr == v) c += 1;
         },
@@ -4148,6 +4153,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             }
             switch (func.opcode(inst)) {
                 .decode_low_float, .encode_low_float => return error.Unsupported,
+                .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
                 .arith => |a| {
                     // Fused multiply-add/sub: when this is a scalar float `mul` that is the
                     // single-use, immediately-preceding operand of the next add/sub, skip its

@@ -101,7 +101,7 @@ pub fn twoWayIf(func: *const Function, bi: usize) ?ir.function.If {
                 return cf;
             },
             .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select => {},
-            .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .unary, .alloca => {},
+            .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca => {},
             .call, .call_indirect, .global_addr, .load, .store, .prefetch => {},
             .va_start, .va_arg, .va_end, .dot, .matmul, .barrier, .atomic_rmw => {},
         }
@@ -130,6 +130,7 @@ fn operandsDiverge(func: *const Function, divergent: []const bool, op: ir.functi
         .select => |s| d(divergent, s.cond) or d(divergent, s.then) or d(divergent, s.@"else"),
         .convert => |c| d(divergent, c.value),
         .decode_low_float, .encode_low_float => |c| d(divergent, c.value),
+        .dequantize_nvfp4, .quantize_nvfp4 => |c| d(divergent, c.value) or d(divergent, c.block_scale) or d(divergent, c.global_scale),
         .unary => |u| d(divergent, u.value),
         .extract => |e| d(divergent, e.aggregate),
         .dot => |x| d(divergent, x.acc) or d(divergent, x.a) or d(divergent, x.b),
@@ -237,7 +238,7 @@ pub fn analyze(allocator: std.mem.Allocator, func: *const Function) Error!Unifor
                         propagateEdge(func, divergent, cf.@"else", &changed);
                     },
                     .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select => {},
-                    .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .unary, .alloca => {},
+                    .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca => {},
                     .call, .call_indirect, .global_addr, .load, .store, .prefetch => {},
                     .va_start, .va_arg, .va_end, .dot, .matmul, .barrier, .atomic_rmw => {},
                 }
