@@ -611,6 +611,12 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
     // and compileKernel, which calls this function.
     if (ir.function.functionUsesF16(func)) return error.Unsupported;
     if (ir.function.functionUsesF128(func)) return error.Unsupported;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+            .decode_low_float, .encode_low_float => return error.Unsupported,
+            else => {},
+        };
+    }
 
     const nblocks = func.blockCount();
     if (nblocks == 0) return error.Unsupported;
@@ -4688,6 +4694,7 @@ fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, po
         },
         .extract => |e| markUse(last_use, e.aggregate, pos),
         .convert => |cv| markUse(last_use, cv.value, pos),
+        .decode_low_float, .encode_low_float => |cv| markUse(last_use, cv.value, pos),
         .unary => |u| markUse(last_use, u.value, pos),
         .load => |ld| markUse(last_use, ld.ptr, pos),
         .store => |st| {
@@ -4758,6 +4765,7 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) vo
         },
         .extract => |e| setUsed(row, e.aggregate),
         .convert => |cv| setUsed(row, cv.value),
+        .decode_low_float, .encode_low_float => |cv| setUsed(row, cv.value),
         .unary => |u| setUsed(row, u.value),
         .load => |ld| setUsed(row, ld.ptr),
         .store => |st| {
@@ -5799,6 +5807,22 @@ test "an f16 function is rejected cleanly, not miscompiled as f64" {
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "both low float directions are rejected before machine emission" {
+    const allocator = testing.allocator;
+    inline for (.{ true, false }) |decode_direction| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const source = try func.appendBlockParam(block, if (decode_direction) u16_t else f32_t);
+        const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = .bf16 };
+        const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+        try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+    }
 }
 
 test "compiles control flow: a max via if and a merge block" {

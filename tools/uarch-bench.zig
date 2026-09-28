@@ -508,7 +508,7 @@ fn customLatency(op: ir.function.Opcode) u32 {
         .arith => |a| customArith(a.op),
         .arith_imm => |a| customArith(a.op),
         .load => 3,
-        .convert, .unary => 2,
+        .convert, .decode_low_float, .encode_low_float, .unary => 2,
         // A dot is a multiply-class op (4-way multiply-accumulate), grouped with `mul`.
         .dot => 3,
         // This fictional part carries no tensor unit; a placeholder in case one is added.
@@ -541,7 +541,7 @@ fn customThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .arith => |a| customArithThroughput(a.op, elem_float),
         .arith_imm => |a| customArithThroughput(a.op, elem_float),
         .load => 1,
-        .convert, .unary => 1,
+        .convert, .decode_low_float, .encode_low_float, .unary => 1,
         .dot => 3,
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
@@ -557,7 +557,7 @@ fn customUnit(op: ir.function.Opcode) opt.microarch.UnitClass {
         .arith => |a| customArithUnit(a.op),
         .arith_imm => |a| customArithUnit(a.op),
         .icmp, .select, .iconst, .fconst, .fconst128, .global_addr => .alu,
-        .convert => .fpsimd,
+        .convert, .decode_low_float, .encode_low_float => .fpsimd,
         .unary => |u| switch (u.op) {
             .reinterpret => .alu,
             .sqrt, .ceil, .floor, .trunc, .nearest => .fpsimd,

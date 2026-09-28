@@ -94,6 +94,8 @@ const op_va_end: u8 = 22;
 const op_fconst128: u8 = 23;
 const op_barrier: u8 = 24;
 const op_atomic_rmw: u8 = 25;
+const op_decode_low_float: u8 = 26;
+const op_encode_low_float: u8 = 27;
 
 // An `atomic_rmw` record flag bit: the compare operand follows the two ordinary operand
 // slots. Written from the field and read back into it, so a record round-trips whatever the
@@ -406,6 +408,21 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
         },
         .convert => |cv| {
             try w.u8v(op_convert);
+            try w.u32v(sv(serial, cv.value));
+        },
+        .decode_low_float => |cv| {
+            try w.u8v(op_decode_low_float);
+            comptime {
+                std.debug.assert(@intFromEnum(function.LowFloatFormat.bf16) == 0);
+                std.debug.assert(@intFromEnum(function.LowFloatFormat.f8_e4m3) == 1);
+                std.debug.assert(@intFromEnum(function.LowFloatFormat.f8_e5m2) == 2);
+            }
+            try w.u8v(@intFromEnum(cv.format));
+            try w.u32v(sv(serial, cv.value));
+        },
+        .encode_low_float => |cv| {
+            try w.u8v(op_encode_low_float);
+            try w.u8v(@intFromEnum(cv.format));
             try w.u32v(sv(serial, cv.value));
         },
         .unary => |u| {
@@ -895,6 +912,7 @@ const Fixup = struct {
                     },
                     .extract => |*e| e.aggregate = next(&i, self.slots, serial),
                     .convert => |*cv| cv.value = next(&i, self.slots, serial),
+                    .decode_low_float, .encode_low_float => |*cv| cv.value = next(&i, self.slots, serial),
                     .unary => |*u| u.value = next(&i, self.slots, serial),
                     .load => |*l| l.ptr = next(&i, self.slots, serial),
                     .store => |*st| {
@@ -959,6 +977,20 @@ const Fixup = struct {
     }
 };
 
+fn canonicalLowFloatResult(
+    func: *const Function,
+    result_type: Type,
+    format: function.LowFloatFormat,
+    decode_direction: bool,
+) bool {
+    return switch (func.types.type_kind(result_type)) {
+        .float => |float| decode_direction and float == .f32,
+        .int => |int| !decode_direction and int.signedness == .unsigned and
+            int.bits == format.payloadBits(),
+        else => false,
+    };
+}
+
 fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, block_count: u32, dummy: Value, serial: *std.ArrayList(Value), inst_serial: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), allocator: std.mem.Allocator) Error!void {
     const has_result = (try r.take(u8)) != 0;
     const rty: Type = if (has_result) try mapType(type_map, type_map.len, try r.take(u32)) else undefined;
@@ -1014,6 +1046,19 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
         op_convert => blk: {
             try slots.append(allocator, try r.take(u32));
             break :blk try appendRes(func, block, serial, rty, .{ .convert = .{ .value = dummy } });
+        },
+        op_decode_low_float, op_encode_low_float => blk: {
+            if (!has_result) return error.MalformedBitcode;
+            const format = std.enums.fromInt(function.LowFloatFormat, try r.take(u8)) orelse
+                return error.MalformedBitcode;
+            if (!canonicalLowFloatResult(func, rty, format, tag == op_decode_low_float))
+                return error.MalformedBitcode;
+            try slots.append(allocator, try r.take(u32));
+            const conversion: function.LowFloatConvert = .{ .value = dummy, .format = format };
+            break :blk if (tag == op_decode_low_float)
+                try appendRes(func, block, serial, rty, .{ .decode_low_float = conversion })
+            else
+                try appendRes(func, block, serial, rty, .{ .encode_low_float = conversion });
         },
         op_unary => blk: {
             const uop = std.enums.fromInt(function.UnaryOp, try r.take(u8)) orelse return error.MalformedBitcode;
@@ -1374,6 +1419,126 @@ test "round-trips a prefetch through bitcode" {
     const b = try std.fmt.allocPrint(allocator, "{f}", .{decoded});
     defer allocator.free(b);
     try std.testing.expectEqualStrings(a, b);
+}
+
+test "low float bitcode pins tags and rejects malformed records" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(u8, 26), op_decode_low_float);
+    try std.testing.expectEqual(@as(u8, 27), op_encode_low_float);
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(function.LowFloatFormat.bf16));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(function.LowFloatFormat.f8_e4m3));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(function.LowFloatFormat.f8_e5m2));
+
+    const formats = [_]function.LowFloatFormat{ .bf16, .f8_e4m3, .f8_e5m2 };
+    inline for (.{ true, false }) |decode_direction| {
+        for (formats) |format| {
+            var func = Function.init(allocator);
+            defer func.deinit();
+            const payload_t = try func.types.intern(.{ .int = .{
+                .signedness = .unsigned,
+                .bits = format.payloadBits(),
+            } });
+            const f32_t = try func.types.intern(.{ .float = .f32 });
+            const block = try func.appendBlock();
+            const source = try func.appendBlockParam(block, if (decode_direction) payload_t else f32_t);
+            const conversion: function.LowFloatConvert = .{ .value = source, .format = format };
+            const result = try func.appendInst(
+                block,
+                if (decode_direction) f32_t else payload_t,
+                if (decode_direction)
+                    .{ .decode_low_float = conversion }
+                else
+                    .{ .encode_low_float = conversion },
+            );
+            func.setTerminator(block, .{ .ret = function.Ret.one(result) });
+
+            const bytes = try encode(allocator, &func);
+            defer allocator.free(bytes);
+            var decoded = try decode(allocator, bytes);
+            defer decoded.deinit();
+
+            const decoded_block: Block = @enumFromInt(0);
+            const decoded_inst = decoded.blockInsts(decoded_block)[0];
+            const decoded_result = decoded.instResult(decoded_inst).?;
+            const decoded_source = decoded.blockParams(decoded_block)[0];
+            const expected_result_t = if (decode_direction)
+                try decoded.types.intern(.{ .float = .f32 })
+            else
+                try decoded.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = format.payloadBits() } });
+            try std.testing.expectEqual(expected_result_t, decoded.valueType(decoded_result));
+            switch (decoded.opcode(decoded_inst)) {
+                .decode_low_float => |cv| {
+                    try std.testing.expect(decode_direction);
+                    try std.testing.expectEqual(format, cv.format);
+                    try std.testing.expectEqual(decoded_source, cv.value);
+                },
+                .encode_low_float => |cv| {
+                    try std.testing.expect(!decode_direction);
+                    try std.testing.expectEqual(format, cv.format);
+                    try std.testing.expectEqual(decoded_source, cv.value);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+
+            const tag = if (decode_direction) op_decode_low_float else op_encode_low_float;
+            var record_at: ?usize = null;
+            var i: usize = 5;
+            while (i + 5 < bytes.len) : (i += 1) {
+                if (bytes[i] == tag and bytes[i + 1] == @intFromEnum(format) and
+                    std.mem.eql(u8, bytes[i + 2 .. i + 6], &std.mem.toBytes(@as(u32, 0))))
+                {
+                    record_at = i;
+                    break;
+                }
+            }
+            try std.testing.expect(record_at != null);
+            const at = record_at.?;
+            try std.testing.expectEqual(@as(u8, 1), bytes[at - 5]);
+
+            // Every patch alters only the named field of an otherwise valid record.
+            if (format == .bf16) {
+                {
+                    const malformed = try allocator.dupe(u8, bytes);
+                    defer allocator.free(malformed);
+                    malformed[at] = 0xff;
+                    try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed));
+                }
+                {
+                    const malformed = try allocator.dupe(u8, bytes);
+                    defer allocator.free(malformed);
+                    malformed[at + 1] = 0xff;
+                    try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed));
+                }
+                {
+                    var malformed: std.ArrayList(u8) = .empty;
+                    defer malformed.deinit(allocator);
+                    try malformed.appendSlice(allocator, bytes[0 .. at - 5]);
+                    try malformed.append(allocator, 0);
+                    // A result-less record has no result-type field: the opcode follows the
+                    // zero has-result byte immediately. Leaving the old four type bytes in
+                    // place would only exercise unknown-opcode handling instead of this
+                    // opcode's explicit missing-result guard.
+                    try malformed.appendSlice(allocator, bytes[at..]);
+                    try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed.items));
+                }
+                {
+                    const malformed = try allocator.dupe(u8, bytes);
+                    defer allocator.free(malformed);
+                    const wrong_result_type: u32 = @intFromEnum(if (decode_direction) payload_t else f32_t);
+                    std.mem.writeInt(u32, @ptrCast(malformed[at - 4 .. at].ptr), wrong_result_type, .little);
+                    try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed));
+                }
+                {
+                    const malformed = try allocator.dupe(u8, bytes);
+                    defer allocator.free(malformed);
+                    @memset(malformed[at + 2 .. at + 6], 0xff);
+                    try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed));
+                }
+                try std.testing.expectError(error.MalformedBitcode, decode(allocator, bytes[0 .. at + 3]));
+            }
+        }
+    }
 }
 
 test "round-trips va_start/va_arg/va_end through bitcode" {

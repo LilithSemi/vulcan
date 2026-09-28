@@ -147,6 +147,8 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         .struct_new,
         .extract,
         .convert,
+        .decode_low_float,
+        .encode_low_float,
         .unary,
         .alloca,
         .global_addr,
@@ -161,7 +163,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
             if (if_inst != null) return null;
             if_inst = inst;
         },
-        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .unary => {},
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .unary => {},
         else => return null, // impure/memory op in the header
     };
     const iff = if_inst orelse return null;
@@ -516,6 +518,8 @@ fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Va
         .icmp => |c| .{ .icmp = .{ .op = c.op, .lhs = rv(vmap, c.lhs), .rhs = rv(vmap, c.rhs) } },
         .select => |s| .{ .select = .{ .cond = rv(vmap, s.cond), .then = rv(vmap, s.then), .@"else" = rv(vmap, s.@"else") } },
         .convert => |c| .{ .convert = .{ .value = rv(vmap, c.value) } },
+        .decode_low_float => |c| .{ .decode_low_float = .{ .value = rv(vmap, c.value), .format = c.format } },
+        .encode_low_float => |c| .{ .encode_low_float = .{ .value = rv(vmap, c.value), .format = c.format } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = rv(vmap, u.value) } },
         .extract => |e| .{ .extract = .{ .aggregate = rv(vmap, e.aggregate), .index = e.index } },
         .load => |l| .{ .load = .{ .ptr = rv(vmap, l.ptr), .@"volatile" = l.@"volatile" } },
@@ -592,6 +596,7 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
             },
             .extract => |x| bump(counts, x.aggregate),
             .convert => |x| bump(counts, x.value),
+            .decode_low_float, .encode_low_float => |x| bump(counts, x.value),
             .unary => |x| bump(counts, x.value),
             .load => |x| bump(counts, x.ptr),
             .store => |x| {

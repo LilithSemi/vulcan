@@ -439,6 +439,7 @@ fn usesValue(func: *const Function, inst: Inst, v: Value) bool {
         .icmp => |c| c.lhs == v or c.rhs == v,
         .select => |s| s.cond == v or s.then == v or s.@"else" == v,
         .convert => |c| c.value == v,
+        .decode_low_float, .encode_low_float => |c| c.value == v,
         .unary => |u| u.value == v,
         .load => |l| l.ptr == v,
         .store => |s| s.value == v or s.ptr == v,
@@ -545,6 +546,8 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         // times fewer read-modify-writes, and `applyReduction` does not clone this body at
         // all, so the write would happen only in the scalar remainder.
         .atomic_rmw,
+        .decode_low_float,
+        .encode_low_float,
         // A barrier joins them: vectorizing by V divides the trip count by V, so the loop
         // would meet V times fewer than the source says.
         //

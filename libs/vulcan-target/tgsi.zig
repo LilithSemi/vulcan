@@ -818,6 +818,7 @@ pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
                 try body.put("\n");
                 line += 1;
             },
+            .decode_low_float, .encode_low_float => return error.Unsupported,
             .icmp => |cmp| {
                 // A comparison -> a TGSI set-op producing an integer boolean (~0/0).
                 const r = result orelse return error.Unsupported;
@@ -1411,6 +1412,35 @@ test "an f16 function is rejected cleanly, not miscompiled as f64" {
     // No `stage` attr is set here on purpose: the f16 gate must fire before `stageOf`
     // is even consulted, so this proves the gate is the very first thing `lower` does.
     try testing.expectError(error.Unsupported, lower(allocator, &func));
+}
+
+test "both low float directions are independently rejected in supported fragment shapes" {
+    const allocator = testing.allocator;
+    inline for (.{ true, false }) |decode_direction| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "stage", .value = .{ .string = "fragment" } } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const block = try func.appendBlock();
+        const input = try func.appendBlockParam(block, if (decode_direction) u8_t else f32_t);
+        try func.addAttr(.{ .value = input }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = ATTR_GENERIC0 } } });
+        const conversion: ir.function.LowFloatConvert = .{ .value = input, .format = .f8_e4m3 };
+        const result = try func.appendInst(
+            block,
+            if (decode_direction) f32_t else u8_t,
+            if (decode_direction)
+                .{ .decode_low_float = conversion }
+            else
+                .{ .encode_low_float = conversion },
+        );
+        const output = try func.appendInst(block, i32_t, .{ .iconst = 0 });
+        try func.addAttr(.{ .value = output }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = 0 } } });
+        try func.appendStore(block, result, output);
+        func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+        try testing.expectError(error.Unsupported, lower(allocator, &func));
+    }
 }
 
 test "lower an add-with-constant vertex shader (arith_imm + fconst pool) to TGSI" {

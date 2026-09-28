@@ -734,6 +734,32 @@ const FunctionParser = struct {
             try self.recordValue(result);
             return result;
         }
+        if (std.mem.eql(u8, op, "decode_low_float") or
+            std.mem.eql(u8, op, "encode_low_float"))
+        {
+            self.skipWs();
+            const format = std.meta.stringToEnum(function.LowFloatFormat, self.readWord()) orelse
+                return error.InvalidSyntax;
+            self.skipWs();
+            try self.eat(',');
+            self.skipWs();
+            const value = try self.parseValueRef();
+            const decode_direction = std.mem.eql(u8, op, "decode_low_float");
+            const ty = if (decode_direction)
+                try self.func.types.intern(.{ .float = .f32 })
+            else
+                try self.func.types.intern(.{ .int = .{
+                    .signedness = .unsigned,
+                    .bits = format.payloadBits(),
+                } });
+            const conversion: function.LowFloatConvert = .{ .value = value, .format = format };
+            const result = if (decode_direction)
+                try self.func.appendInst(block, ty, .{ .decode_low_float = conversion })
+            else
+                try self.func.appendInst(block, ty, .{ .encode_low_float = conversion });
+            try self.recordValue(result);
+            return result;
+        }
         if (std.mem.eql(u8, op, "struct")) {
             self.skipWs();
             try self.eat('{');
@@ -1857,4 +1883,39 @@ test "verify rejects each broken atomic operand shape" {
             };
         }
     }
+}
+
+test "low float conversions print parse and verify in every format and direction" {
+    const verify = @import("verify.zig");
+    const text =
+        \\fn {
+        \\  block0(v0: u16, v1: u8, v2: f32):
+        \\    let v3 = decode_low_float bf16, v0
+        \\    let v4 = decode_low_float f8_e4m3, v1
+        \\    let v5 = decode_low_float f8_e5m2, v1
+        \\    let v6 = encode_low_float bf16, v2
+        \\    let v7 = encode_low_float f8_e4m3, v2
+        \\    let v8 = encode_low_float f8_e5m2, v2
+        \\    ret v3
+        \\}
+    ;
+    var func = try parse(std.testing.allocator, text);
+    defer func.deinit();
+    try std.testing.expectFmt(text, "{f}", .{func});
+    var diags = try verify.verify(std.testing.allocator, &func, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+
+    const insts = func.blockInsts(@enumFromInt(0));
+    inline for (.{
+        function.LowFloatFormat.bf16,
+        function.LowFloatFormat.f8_e4m3,
+        function.LowFloatFormat.f8_e5m2,
+    }, 0..) |format, index| {
+        try std.testing.expectEqual(format, func.opcode(insts[index]).decode_low_float.format);
+        try std.testing.expectEqual(format, func.opcode(insts[index + 3]).encode_low_float.format);
+    }
+
+    const bad = "fn {\n  block0(v0: u8):\n    let v1 = decode_low_float e4m3, v0\n    ret v1\n}";
+    try std.testing.expectError(error.InvalidSyntax, parse(std.testing.allocator, bad));
 }

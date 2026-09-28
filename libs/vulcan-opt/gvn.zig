@@ -125,6 +125,7 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         },
         .select => |x| .{ .kind = .select, .a = vn(canon, x.cond), .b = vn(canon, x.then), .c = vn(canon, x.@"else") },
         .convert => |x| .{ .kind = .convert, .sub = @intFromEnum(func.valueType(result)), .a = vn(canon, x.value) },
+        .decode_low_float, .encode_low_float => null,
         .unary => |x| .{ .kind = .unary, .sub = @intFromEnum(func.valueType(result)), .a = vn(canon, x.value), .b = @intFromEnum(x.op) },
         .extract => |x| .{ .kind = .extract, .sub = x.index, .a = vn(canon, x.aggregate) },
         // `via_got` must be part of the key, not just `symbol`: a direct global_addr and a
@@ -187,6 +188,7 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
             },
             .extract => |*e| e.aggregate = sub(canon, e.aggregate),
             .convert => |*cv| cv.value = sub(canon, cv.value),
+            .decode_low_float, .encode_low_float => |*cv| cv.value = sub(canon, cv.value),
             .unary => |*u| u.value = sub(canon, u.value),
             .load => |*l| l.ptr = sub(canon, l.ptr),
             .store => |*st| {
@@ -288,6 +290,40 @@ test "cse does not reuse across a non-dominating block" {
     // b1 does not dominate b2, so e2 cannot reuse e1: nothing changes.
     try std.testing.expect(!try run(allocator, &func, &analyses));
     try std.testing.expectEqual(e2, func.terminator(b2).?.ret.values[0]);
+}
+
+test "gvn deliberately leaves low float conversions distinct" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const block = try func.appendBlock();
+    const input = try func.appendBlockParam(block, f32_t);
+    const encoded_a = try func.appendInst(block, u8_t, .{ .encode_low_float = .{ .value = input, .format = .f8_e4m3 } });
+    const encoded_b = try func.appendInst(block, u8_t, .{ .encode_low_float = .{ .value = input, .format = .f8_e4m3 } });
+    const encoded_other = try func.appendInst(block, u8_t, .{ .encode_low_float = .{ .value = input, .format = .f8_e5m2 } });
+    const decoded_a = try func.appendInst(block, f32_t, .{ .decode_low_float = .{ .value = encoded_a, .format = .f8_e4m3 } });
+    const decoded_b = try func.appendInst(block, f32_t, .{ .decode_low_float = .{ .value = encoded_a, .format = .f8_e4m3 } });
+    const decoded_other = try func.appendInst(block, f32_t, .{ .decode_low_float = .{ .value = encoded_other, .format = .f8_e5m2 } });
+    const same_sum = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = decoded_a, .rhs = decoded_b } });
+    const total = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = same_sum, .rhs = decoded_other } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(total) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+
+    const sum = func.opcode(func.definingInst(same_sum).?).arith;
+    try std.testing.expectEqual(decoded_a, sum.lhs);
+    try std.testing.expectEqual(decoded_b, sum.rhs);
+    try std.testing.expect(sum.lhs != sum.rhs);
+    try std.testing.expect(encoded_a != encoded_b);
+    try std.testing.expectEqual(ir.function.LowFloatFormat.f8_e4m3, func.opcode(func.definingInst(encoded_b).?).encode_low_float.format);
+    try std.testing.expectEqual(ir.function.LowFloatFormat.f8_e5m2, func.opcode(func.definingInst(encoded_other).?).encode_low_float.format);
+    try std.testing.expectEqual(ir.function.LowFloatFormat.f8_e4m3, func.opcode(func.definingInst(decoded_b).?).decode_low_float.format);
+    try std.testing.expectEqual(ir.function.LowFloatFormat.f8_e5m2, func.opcode(func.definingInst(decoded_other).?).decode_low_float.format);
 }
 
 test "gvn does not merge a direct and a via_got global_addr of the same symbol" {

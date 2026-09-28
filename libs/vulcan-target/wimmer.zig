@@ -394,6 +394,7 @@ fn visitOperands(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn
         },
         .extract => |e| f(ctx, e.aggregate, false),
         .convert => |cv| f(ctx, cv.value, false),
+        .decode_low_float, .encode_low_float => |cv| f(ctx, cv.value, false),
         .unary => |u| f(ctx, u.value, false),
         .load => |l| f(ctx, l.ptr, false),
         .store => |st| {

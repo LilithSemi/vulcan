@@ -1416,6 +1416,7 @@ fn lowerDirectCall(allocator: std.mem.Allocator, ctx: *Ctx, c: ir.function.Call,
 /// never sees one. The switch here is exhaustive, so a new opcode must make a decision.
 fn unhandledStatement(op_code: ir.function.Opcode) Error {
     return switch (op_code) {
+        .decode_low_float, .encode_low_float => error.Unsupported,
         // A tile multiply writes memory at `c`. This backend has no tile-multiply lowering
         // (`expand.zig` rewrites a matmul into scalar loops for a target without one), so it
         // fails closed rather than dropping the write.
@@ -2082,6 +2083,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             const end_rel: i32 = @intCast(@as(i64, @intCast(ctx.code.items.len)) - @as(i64, @intCast(jmp_at + 4)));
             std.mem.writeInt(u32, ctx.code.items[jmp_at..][0..4], @bitCast(end_rel), .little);
         },
+        .decode_low_float, .encode_low_float => return error.Unsupported,
         .convert => |cv| {
             // Numeric conversions: int to float or back (32-bit int, f32, or
             // f64), int to int (low bits), and f32 to f64 or back.
@@ -3506,6 +3508,7 @@ fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const ad
         },
         .extract => |e| f(ctx, e.aggregate, false),
         .convert => |cv| f(ctx, cv.value, false),
+        .decode_low_float, .encode_low_float => |cv| f(ctx, cv.value, false),
         .unary => |u| f(ctx, u.value, false),
         // A folded load/store attributes its pointer use to the fold base,
         // the add's lhs, not the add's own result, so the base stays live
@@ -4164,6 +4167,22 @@ test "a barrier is rejected, not dropped like a prefetch" {
     func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+}
+
+test "both low float directions are rejected while their results are live" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |decode_direction| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const source = try func.appendBlockParam(block, if (decode_direction) u16_t else f32_t);
+        const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = .bf16 };
+        const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+        try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+    }
 }
 
 test "a matmul is refused, not a panic on the result unwrap" {

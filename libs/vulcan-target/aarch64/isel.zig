@@ -1398,6 +1398,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try storeResult(allocator, &code, ctx, result, rd);
                     }
                 },
+                .decode_low_float, .encode_low_float => return error.Unsupported,
                 .convert => |cv| {
                     const result = func.instResult(inst).?;
                     // Any conversion touching f128 has no aarch64 form; the softfp pass rewrites it
@@ -3446,6 +3447,7 @@ fn forEachOperand(
         },
         .extract => |e| f(ctx, e.aggregate, false),
         .convert => |cv| f(ctx, cv.value, false),
+        .decode_low_float, .encode_low_float => |cv| f(ctx, cv.value, false),
         .unary => |u| f(ctx, u.value, false),
         // A folded load/store attributes its POINTER use to the fold BASE (the add's lhs), not the
         // raw ptr, so the base's live range reaches the mem op (including cross-block) and the dead
@@ -3893,6 +3895,9 @@ fn usesOfInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
         .convert => |cv| {
             if (cv.value == v) c += 1;
         },
+        .decode_low_float, .encode_low_float => |cv| {
+            if (cv.value == v) c += 1;
+        },
         .unary => |u| {
             if (u.value == v) c += 1;
         },
@@ -3992,6 +3997,7 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, fold: *const ad
         },
         .extract => |e| setUsed(row, e.aggregate),
         .convert => |cv| setUsed(row, cv.value),
+        .decode_low_float, .encode_low_float => |cv| setUsed(row, cv.value),
         .unary => |u| setUsed(row, u.value),
         // Same fold reroute as `forEachOperand`: a folded mem op's pointer use is the fold base, so
         // the base's cross-block liveness reaches the mem op. `baseOf` is the raw ptr when unfolded.
@@ -4711,6 +4717,22 @@ test "a barrier is rejected, not dropped like a prefetch" {
     func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+}
+
+test "both low float directions are rejected while their results are live" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |decode_direction| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const source = try func.appendBlockParam(block, if (decode_direction) u16_t else f32_t);
+        const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = .bf16 };
+        const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+        try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+    }
 }
 
 test "an atomic is rejected, not dropped like a prefetch" {

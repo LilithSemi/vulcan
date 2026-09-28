@@ -6,6 +6,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const attribute = @import("attribute.zig");
+const low_float = @import("low_float.zig");
 
 const Type = types.Type;
 const TypeTable = types.TypeTable;
@@ -102,6 +103,13 @@ pub const Extract = struct { aggregate: Value, index: u32 };
 /// Convert a value to the instruction's result type (int<->float). The
 /// direction is read from the source value's type versus the result type.
 pub const Convert = struct { value: Value };
+
+pub const LowFloatFormat = low_float.Format;
+
+pub const LowFloatConvert = struct {
+    value: Value,
+    format: LowFloatFormat,
+};
 
 /// A single-operand operation. `reinterpret` reinterprets the bits as the result
 /// type (int<->float, same width), the rest are floating-point math on the result
@@ -558,6 +566,8 @@ pub const Opcode = union(enum) {
     extract: Extract,
     /// Convert a value to the result type (int<->float numeric conversion).
     convert: Convert,
+    decode_low_float: LowFloatConvert,
+    encode_low_float: LowFloatConvert,
     /// A single-operand op (bit reinterpret, or floating-point math) on the result type.
     unary: Unary,
     /// Reserve a stack slot and produce its address. Result type is `ptr`.
@@ -1377,6 +1387,7 @@ pub const Function = struct {
                 },
                 .extract => |*e| e.aggregate = r(from, to, e.aggregate),
                 .convert => |*cv| cv.value = r(from, to, cv.value),
+                .decode_low_float, .encode_low_float => |*cv| cv.value = r(from, to, cv.value),
                 .unary => |*u| u.value = r(from, to, u.value),
                 .load => |*l| l.ptr = r(from, to, l.ptr),
                 .store => |*st| {
@@ -1634,6 +1645,8 @@ pub const Function = struct {
             .struct_new => |sn| .{ .struct_new = .{ .fields = try self.remapValueList(allocator, sn.fields, map) } },
             .extract => |ex| .{ .extract = .{ .aggregate = remapValue(map, ex.aggregate), .index = ex.index } },
             .convert => |cv| .{ .convert = .{ .value = remapValue(map, cv.value) } },
+            .decode_low_float => |cv| .{ .decode_low_float = .{ .value = remapValue(map, cv.value), .format = cv.format } },
+            .encode_low_float => |cv| .{ .encode_low_float = .{ .value = remapValue(map, cv.value), .format = cv.format } },
             .unary => |u| .{ .unary = .{ .op = u.op, .value = remapValue(map, u.value) } },
             .call => |c| .{ .call = .{
                 .symbol = c.symbol,
@@ -2108,6 +2121,16 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
         .convert => |cv| try w.print("let v{d} = convert {f}, v{d}", .{
             self.valueName(data.result.?),
             self.types.fmt(self.valueType(data.result.?)),
+            self.valueName(cv.value),
+        }),
+        .decode_low_float => |cv| try w.print("let v{d} = decode_low_float {s}, v{d}", .{
+            self.valueName(data.result.?),
+            @tagName(cv.format),
+            self.valueName(cv.value),
+        }),
+        .encode_low_float => |cv| try w.print("let v{d} = encode_low_float {s}, v{d}", .{
+            self.valueName(data.result.?),
+            @tagName(cv.format),
             self.valueName(cv.value),
         }),
         .unary => |u| try w.print("let v{d} = {s} {f}, v{d}", .{
@@ -3015,6 +3038,38 @@ test "cloneBlock leaves external references unchanged" {
     const dst_arith = func.opcode(func.blockInsts(dst)[0]).arith;
     try std.testing.expectEqual(map.get(p).?, dst_arith.lhs); // in-src operand: remapped
     try std.testing.expectEqual(ext, dst_arith.rhs); // external operand: identical, unchanged
+}
+
+test "cloneBlock remaps low float operands without changing formats" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const src = try func.appendBlock();
+    const input = try func.appendBlockParam(src, f32_t);
+    const payload = try func.appendInst(src, u8_t, .{ .encode_low_float = .{
+        .value = input,
+        .format = .f8_e4m3,
+    } });
+    _ = try func.appendInst(src, f32_t, .{ .decode_low_float = .{
+        .value = payload,
+        .format = .f8_e5m2,
+    } });
+
+    var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer map.deinit(allocator);
+    const dst = try func.cloneBlock(allocator, src, &map);
+    const insts = func.blockInsts(dst);
+    const encode_op = func.opcode(insts[0]).encode_low_float;
+    const decode_op = func.opcode(insts[1]).decode_low_float;
+    try std.testing.expectEqual(LowFloatFormat.f8_e4m3, encode_op.format);
+    try std.testing.expectEqual(LowFloatFormat.f8_e5m2, decode_op.format);
+    try std.testing.expectEqual(map.get(input).?, encode_op.value);
+    try std.testing.expectEqual(map.get(payload).?, decode_op.value);
+    try std.testing.expect(encode_op.value != input);
+    try std.testing.expect(decode_op.value != payload);
 }
 
 test "cloneBlock remaps a ret terminator's value" {

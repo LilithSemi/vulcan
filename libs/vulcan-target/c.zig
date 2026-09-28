@@ -361,6 +361,7 @@ const Emitter = struct {
         const op = func.opcode(inst);
         const res = func.instResult(inst);
         switch (op) {
+            .decode_low_float, .encode_low_float => return error.Unsupported,
             .iconst => |val| try self.print("    v{d} = {d};\n", .{ self.name(res.?), val }),
             .fconst => |val| try self.emitFconst(res.?, val),
             // The u128 payload is the binary128 bit pattern; decode it and print the
@@ -903,6 +904,22 @@ test "a barrier is rejected, not emitted as a silent no-op" {
     func.setTerminator(entry, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "sync"));
+}
+
+test "both low float directions are rejected while their results are live" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |decode_direction| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const source = try func.appendBlockParam(block, if (decode_direction) u16_t else f32_t);
+        const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = .bf16 };
+        const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+        try std.testing.expectError(error.Unsupported, emitFunction(allocator, &func, "low_float"));
+    }
 }
 
 test "an atomic is rejected, not emitted as a plain read-modify-write" {

@@ -189,6 +189,7 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
             },
             .extract => |*e| e.aggregate = sub(subst, e.aggregate),
             .convert => |*cv| cv.value = sub(subst, cv.value),
+            .decode_low_float, .encode_low_float => |*cv| cv.value = sub(subst, cv.value),
             .unary => |*u| u.value = sub(subst, u.value),
             .load => |*l| l.ptr = sub(subst, l.ptr),
             .store => |*st| {

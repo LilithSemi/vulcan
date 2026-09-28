@@ -158,6 +158,12 @@ pub fn lowerToLoopNest(
     block: [3]u32,
 ) Error!Function {
     if (func.blockCount() == 0) return error.Unsupported;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+            .decode_low_float, .encode_low_float => return error.Unsupported,
+            else => {},
+        };
+    }
     if (returnsValue(func)) return error.Unsupported;
     if (entryIsBranchTarget(func)) return error.Unsupported;
     if (hasBlockAttribute(func)) return error.Unsupported;
@@ -724,6 +730,25 @@ test "a value-returning kernel is rejected" {
         error.Unsupported,
         lowerToLoopNest(allocator, &kernel, .{ 1, 1, 1 }),
     );
+}
+
+test "both low float directions are rejected before loop-nest construction" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |decode_direction| {
+        var kernel = Function.init(allocator);
+        defer kernel.deinit();
+        const u16_t = try kernel.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+        const f32_t = try kernel.types.intern(.{ .float = .f32 });
+        const ptr_t = try kernel.types.ptrGlobal();
+        const entry = try kernel.appendBlock();
+        const source = try kernel.appendBlockParam(entry, if (decode_direction) u16_t else f32_t);
+        const output = try kernel.appendBlockParam(entry, ptr_t);
+        const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = .bf16 };
+        const result = try kernel.appendInst(entry, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
+        try kernel.appendStore(entry, result, output);
+        kernel.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+        try std.testing.expectError(error.Unsupported, lowerToLoopNest(allocator, &kernel, .{ 1, 1, 1 }));
+    }
 }
 
 test "a builtin parameter that is not a 32-bit integer is rejected" {

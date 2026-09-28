@@ -661,6 +661,8 @@ fn isScaling(opcode: ir.function.Opcode) bool {
         .struct_new,
         .extract,
         .convert,
+        .decode_low_float,
+        .encode_low_float,
         .unary,
         .alloca,
         .call,

@@ -102,6 +102,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 .struct_new,
                 .extract,
                 .convert,
+                .decode_low_float,
+                .encode_low_float,
                 .unary,
                 .alloca,
                 .global_addr,

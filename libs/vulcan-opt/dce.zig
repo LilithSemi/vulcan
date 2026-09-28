@@ -13,7 +13,7 @@ pub const pass_def = pass.Pass{ .name = "dce", .run = run };
 /// Whether an instruction has no side effects, so it may be dropped when unused.
 fn isPure(op: ir.function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .unary, .alloca, .global_addr, .dot => true,
         // A prefetch hint has no result but must be kept, like a store. A
         // matmul writes the `c` memory, likewise kept.
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
@@ -59,6 +59,7 @@ pub fn countUses(func: *const Function, uses: []u32) void {
                 },
                 .extract => |e| uses[@intFromEnum(e.aggregate)] += 1,
                 .convert => |cv| uses[@intFromEnum(cv.value)] += 1,
+                .decode_low_float, .encode_low_float => |cv| uses[@intFromEnum(cv.value)] += 1,
                 .unary => |u| uses[@intFromEnum(u.value)] += 1,
                 .load => |l| uses[@intFromEnum(l.ptr)] += 1,
                 .store => |st| {
@@ -253,4 +254,22 @@ test "keeps both forms of an atomic, read result or not" {
     try std.testing.expectEqual(used, func.instResult(insts[0]).?);
     try std.testing.expect(func.opcode(insts[1]) == .atomic_rmw);
     try std.testing.expect(func.opcode(insts[2]) == .atomic_rmw);
+}
+
+test "low float conversion liveness controls dead code elimination" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const payload = try func.appendBlockParam(block, u8_t);
+    const live = try func.appendInst(block, f32_t, .{ .decode_low_float = .{ .value = payload, .format = .f8_e4m3 } });
+    _ = try func.appendInst(block, f32_t, .{ .decode_low_float = .{ .value = payload, .format = .f8_e5m2 } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(live) });
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+    try std.testing.expectEqual(@as(usize, 1), func.blockInsts(block).len);
+    try std.testing.expectEqual(ir.function.LowFloatFormat.f8_e4m3, func.opcode(func.blockInsts(block)[0]).decode_low_float.format);
 }

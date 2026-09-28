@@ -362,6 +362,8 @@ fn emitArm(func: *Function, out: *std.ArrayListUnmanaged(Inst), visited: []bool,
             // today they cannot reach the emitted function either way. These arms are the
             // FIRST refusal, not the only one. Do not read them as the guard.
             .atomic_rmw,
+            .decode_low_float,
+            .encode_low_float,
             .matmul,
             .va_start,
             .va_arg,
@@ -434,6 +436,7 @@ fn widenFlattened(func: *Function) Error!void {
             .iconst => try new_insts.append(func.allocator, inst),
             // SPIR-V has no 128-bit float, so a shader holding one cannot widen.
             .fconst128 => return error.NotWidenable,
+            .decode_low_float, .encode_low_float => return error.NotWidenable,
             .fconst => {
                 const cval = func.instResult(inst).?;
                 try new_insts.append(func.allocator, inst);

@@ -180,6 +180,7 @@ fn countUses(func: *const Function, uses: []u32) void {
                 },
                 .extract => |e| uses[@intFromEnum(e.aggregate)] += 1,
                 .convert => |cv| uses[@intFromEnum(cv.value)] += 1,
+                .decode_low_float, .encode_low_float => |cv| uses[@intFromEnum(cv.value)] += 1,
                 .unary => |u| uses[@intFromEnum(u.value)] += 1,
                 .load => |l| uses[@intFromEnum(l.ptr)] += 1,
                 .store => |st| {

@@ -109,6 +109,8 @@ fn rebuildOpcode(
             .index = e.index,
         } },
         .convert => |cv| .{ .convert = .{ .value = remapValue(value_map, cv.value) } },
+        .decode_low_float => |cv| .{ .decode_low_float = .{ .value = remapValue(value_map, cv.value), .format = cv.format } },
+        .encode_low_float => |cv| .{ .encode_low_float = .{ .value = remapValue(value_map, cv.value), .format = cv.format } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = remapValue(value_map, u.value) } },
         .alloca => |a| .{ .alloca = .{ .elem = a.elem } },
         // Only `args` (and `target`/`ret_dest`) are Values. `is_variadic`/`num_fixed` and
@@ -681,7 +683,7 @@ fn eligible(
                 if (idx != h_insts.len - 1) return null; // the `if` must end the block
                 if_inst = inst;
             },
-            .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .unary, .extract, .struct_new, .dot => {},
+            .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .unary, .extract, .struct_new, .dot => {},
             // load/store/call/call_indirect/alloca/global_addr are impure or memory ops.
             else => return null,
         }
@@ -1359,6 +1361,7 @@ fn instUsesValue(func: *const Function, inst: Inst, value: Value) bool {
         .select => |x| x.cond == value or x.then == value or x.@"else" == value,
         .extract => |x| x.aggregate == value,
         .convert => |x| x.value == value,
+        .decode_low_float, .encode_low_float => |x| x.value == value,
         .unary => |x| x.value == value,
         .load => |x| x.ptr == value,
         .store => |x| x.value == value or x.ptr == value,
@@ -1535,6 +1538,7 @@ fn collectOperands(
             },
             .extract => |x| try set.put(a, x.aggregate, {}),
             .convert => |x| try set.put(a, x.value, {}),
+            .decode_low_float, .encode_low_float => |x| try set.put(a, x.value, {}),
             .unary => |x| try set.put(a, x.value, {}),
             .load => |x| try set.put(a, x.ptr, {}),
             .store => |x| {
@@ -1608,6 +1612,7 @@ fn replaceInBlock(func: *Function, block: Block, from: Value, to: Value) void {
             },
             .extract => |*x| x.aggregate = rep(from, to, x.aggregate),
             .convert => |*x| x.value = rep(from, to, x.value),
+            .decode_low_float, .encode_low_float => |*x| x.value = rep(from, to, x.value),
             .unary => |*x| x.value = rep(from, to, x.value),
             .load => |*x| x.ptr = rep(from, to, x.ptr),
             .store => |*x| {

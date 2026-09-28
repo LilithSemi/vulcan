@@ -124,6 +124,12 @@ fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocat
                 .dot => |d| if (dotOperandsMismatch(func, inst, d)) {
                     if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
                 },
+                .decode_low_float => |cv| if (lowFloatOperandsMismatch(func, inst, cv, true)) {
+                    try diags.add(.{ .operand_type_mismatch = func.instResult(inst) orelse cv.value });
+                },
+                .encode_low_float => |cv| if (lowFloatOperandsMismatch(func, inst, cv, false)) {
+                    try diags.add(.{ .operand_type_mismatch = func.instResult(inst) orelse cv.value });
+                },
                 // matmul has no result value, so a mismatch is reported against
                 // `c` (the pointer the tile is written to).
                 .matmul => |mm| if (matmulOperandsMismatch(func, mm)) {
@@ -200,6 +206,36 @@ fn isMemoryOp(op: Opcode) bool {
 /// which must always be the address of a `va_list` object.
 fn isPtrValue(func: *const Function, v: Value) bool {
     return func.types.type_kind(func.valueType(v)) == .ptr;
+}
+
+fn lowFloatOperandsMismatch(
+    func: *const Function,
+    inst: function.Inst,
+    conversion: function.LowFloatConvert,
+    decode_direction: bool,
+) bool {
+    const result = func.instResult(inst) orelse return true;
+    const payload_bits = conversion.format.payloadBits();
+    if (decode_direction) {
+        return !isUnsignedIntOfBits(func, func.valueType(conversion.value), payload_bits) or
+            !isF32(func, func.valueType(result));
+    }
+    return !isF32(func, func.valueType(conversion.value)) or
+        !isUnsignedIntOfBits(func, func.valueType(result), payload_bits);
+}
+
+fn isUnsignedIntOfBits(func: *const Function, ty: Type, bits: u16) bool {
+    return switch (func.types.type_kind(ty)) {
+        .int => |int| int.signedness == .unsigned and int.bits == bits,
+        else => false,
+    };
+}
+
+fn isF32(func: *const Function, ty: Type) bool {
+    return switch (func.types.type_kind(ty)) {
+        .float => |float| float == .f32,
+        else => false,
+    };
 }
 
 /// Whether an `atomic_rmw`'s operands break one of the four rules `AtomicRmw` states.
@@ -460,6 +496,7 @@ fn checkDominance(func: *const Function, diags: *Diagnostics) std.mem.Allocator.
                 },
                 .extract => |ex| try checkUse(&dominance, def_block, diags, ex.aggregate, bi),
                 .convert => |cv| try checkUse(&dominance, def_block, diags, cv.value, bi),
+                .decode_low_float, .encode_low_float => |cv| try checkUse(&dominance, def_block, diags, cv.value, bi),
                 .unary => |u| try checkUse(&dominance, def_block, diags, u.value, bi),
                 .load => |ld| try checkUse(&dominance, def_block, diags, ld.ptr, bi),
                 .store => |st| {
@@ -1237,4 +1274,129 @@ test "an endian tag on an atomic is reported as misplaced" {
     try std.testing.expect(!d.ok());
     try std.testing.expectEqual(@as(usize, 1), d.count()); // the store's tag is fine
     try std.testing.expectEqual(Diagnostic{ .misplaced_endian = .{ .inst = atomic_inst } }, d.items()[0]);
+}
+
+test "low float verifier rejects every wrong scalar and composite type class" {
+    const allocator = std.testing.allocator;
+    const Wrong = enum { bool, ptr, f16, f64, f128, signed8, signed16, u8, u16, u32, vector, array, aggregate };
+    const Side = enum { source, result };
+    const cases = [_]struct {
+        format: function.LowFloatFormat,
+        decode_direction: bool,
+        side: Side,
+        wrong: Wrong,
+    }{
+        .{ .format = .bf16, .decode_direction = true, .side = .source, .wrong = .signed16 },
+        .{ .format = .bf16, .decode_direction = true, .side = .source, .wrong = .u8 },
+        .{ .format = .bf16, .decode_direction = true, .side = .source, .wrong = .u32 },
+        .{ .format = .f8_e4m3, .decode_direction = true, .side = .source, .wrong = .signed8 },
+        .{ .format = .f8_e4m3, .decode_direction = true, .side = .source, .wrong = .u16 },
+        .{ .format = .f8_e4m3, .decode_direction = true, .side = .source, .wrong = .bool },
+        .{ .format = .f8_e4m3, .decode_direction = true, .side = .source, .wrong = .ptr },
+        .{ .format = .f8_e4m3, .decode_direction = true, .side = .source, .wrong = .f16 },
+        .{ .format = .f8_e4m3, .decode_direction = true, .side = .source, .wrong = .f64 },
+        .{ .format = .f8_e4m3, .decode_direction = true, .side = .source, .wrong = .f128 },
+        .{ .format = .f8_e4m3, .decode_direction = true, .side = .source, .wrong = .vector },
+        .{ .format = .f8_e4m3, .decode_direction = true, .side = .source, .wrong = .array },
+        .{ .format = .f8_e4m3, .decode_direction = true, .side = .source, .wrong = .aggregate },
+        .{ .format = .f8_e5m2, .decode_direction = true, .side = .result, .wrong = .bool },
+        .{ .format = .f8_e5m2, .decode_direction = true, .side = .result, .wrong = .ptr },
+        .{ .format = .f8_e5m2, .decode_direction = true, .side = .result, .wrong = .f16 },
+        .{ .format = .f8_e5m2, .decode_direction = true, .side = .result, .wrong = .f64 },
+        .{ .format = .f8_e5m2, .decode_direction = true, .side = .result, .wrong = .f128 },
+        .{ .format = .f8_e5m2, .decode_direction = true, .side = .result, .wrong = .u8 },
+        .{ .format = .f8_e5m2, .decode_direction = true, .side = .result, .wrong = .vector },
+        .{ .format = .f8_e5m2, .decode_direction = true, .side = .result, .wrong = .array },
+        .{ .format = .f8_e5m2, .decode_direction = true, .side = .result, .wrong = .aggregate },
+        .{ .format = .f8_e4m3, .decode_direction = false, .side = .source, .wrong = .bool },
+        .{ .format = .f8_e4m3, .decode_direction = false, .side = .source, .wrong = .ptr },
+        .{ .format = .f8_e4m3, .decode_direction = false, .side = .source, .wrong = .f16 },
+        .{ .format = .f8_e4m3, .decode_direction = false, .side = .source, .wrong = .f64 },
+        .{ .format = .f8_e4m3, .decode_direction = false, .side = .source, .wrong = .f128 },
+        .{ .format = .f8_e4m3, .decode_direction = false, .side = .source, .wrong = .u8 },
+        .{ .format = .f8_e4m3, .decode_direction = false, .side = .source, .wrong = .vector },
+        .{ .format = .f8_e4m3, .decode_direction = false, .side = .source, .wrong = .array },
+        .{ .format = .f8_e4m3, .decode_direction = false, .side = .source, .wrong = .aggregate },
+        .{ .format = .f8_e5m2, .decode_direction = false, .side = .result, .wrong = .bool },
+        .{ .format = .f8_e5m2, .decode_direction = false, .side = .result, .wrong = .ptr },
+        .{ .format = .f8_e5m2, .decode_direction = false, .side = .result, .wrong = .f16 },
+        .{ .format = .f8_e5m2, .decode_direction = false, .side = .result, .wrong = .f64 },
+        .{ .format = .f8_e5m2, .decode_direction = false, .side = .result, .wrong = .f128 },
+        .{ .format = .f8_e5m2, .decode_direction = false, .side = .result, .wrong = .signed8 },
+        .{ .format = .f8_e5m2, .decode_direction = false, .side = .result, .wrong = .u16 },
+        .{ .format = .f8_e5m2, .decode_direction = false, .side = .result, .wrong = .vector },
+        .{ .format = .f8_e5m2, .decode_direction = false, .side = .result, .wrong = .array },
+        .{ .format = .f8_e5m2, .decode_direction = false, .side = .result, .wrong = .aggregate },
+        .{ .format = .bf16, .decode_direction = false, .side = .result, .wrong = .signed16 },
+        .{ .format = .bf16, .decode_direction = false, .side = .result, .wrong = .u8 },
+        .{ .format = .bf16, .decode_direction = false, .side = .result, .wrong = .u32 },
+    };
+    for (cases) |case| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const wrong_type = try switch (case.wrong) {
+            .bool => func.types.intern(.bool),
+            .ptr => func.types.intern(.{ .ptr = .global }),
+            .f16 => func.types.intern(.{ .float = .f16 }),
+            .f64 => func.types.intern(.{ .float = .f64 }),
+            .f128 => func.types.intern(.{ .float = .f128 }),
+            .signed8 => func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } }),
+            .signed16 => func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 16 } }),
+            .u8 => func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } }),
+            .u16 => func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } }),
+            .u32 => func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } }),
+            .vector => func.types.intern(.{ .vector = .{ .len = 4, .elem = u8_t } }),
+            .array => func.types.intern(.{ .array = .{ .len = 4, .elem = u8_t } }),
+            .aggregate => func.types.intern(.{ .@"struct" = &.{u8_t} }),
+        };
+        const payload_type = try func.types.intern(.{ .int = .{
+            .signedness = .unsigned,
+            .bits = case.format.payloadBits(),
+        } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const source_type = if (case.side == .source) wrong_type else if (case.decode_direction) payload_type else f32_t;
+        const result_type = if (case.side == .result) wrong_type else if (case.decode_direction) f32_t else payload_type;
+        const block = try func.appendBlock();
+        const source = try func.appendBlockParam(block, source_type);
+        const conversion: function.LowFloatConvert = .{ .value = source, .format = case.format };
+        const result = if (case.decode_direction)
+            try func.appendInst(block, result_type, .{ .decode_low_float = conversion })
+        else
+            try func.appendInst(block, result_type, .{ .encode_low_float = conversion });
+        func.setTerminator(block, .{ .ret = function.Ret.one(result) });
+        var diags = try verify(allocator, &func, .high);
+        defer diags.deinit();
+        try std.testing.expect(!diags.ok());
+        try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = result }, diags.items()[0]);
+    }
+}
+
+test "low float verifier checks dominance in both directions" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |decode_direction| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const entry = try func.appendBlock();
+        const left = try func.appendBlock();
+        const merge = try func.appendBlock();
+        const source = try func.appendBlockParam(left, if (decode_direction) u8_t else f32_t);
+        try func.setJump(entry, merge, &.{});
+        try func.setJump(left, merge, &.{});
+        const result = try func.appendInst(
+            merge,
+            if (decode_direction) f32_t else u8_t,
+            if (decode_direction)
+                .{ .decode_low_float = .{ .value = source, .format = .f8_e5m2 } }
+            else
+                .{ .encode_low_float = .{ .value = source, .format = .f8_e5m2 } },
+        );
+        func.setTerminator(merge, .{ .ret = function.Ret.one(result) });
+        var diags = try verify(allocator, &func, .high);
+        defer diags.deinit();
+        try std.testing.expect(!diags.ok());
+        try std.testing.expectEqual(Diagnostic{ .not_dominated = .{ .value = source, .block = merge } }, diags.items()[0]);
+    }
 }

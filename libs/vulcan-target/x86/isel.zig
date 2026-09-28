@@ -325,6 +325,7 @@ fn rebindSymbolName(func: *const Function, name: []const u8) []const u8 {
 /// never sees one. The switch here is exhaustive, so a new opcode must make a decision.
 fn unhandledStatement(op_code: ir.function.Opcode) Error {
     return switch (op_code) {
+        .decode_low_float, .encode_low_float => error.Unsupported,
         // A tile multiply writes memory at `c`. This backend has no tile-multiply lowering, so
         // it fails closed rather than dropping the write.
         .matmul,
@@ -425,6 +426,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
     }
     const result = func.instResult(inst) orelse return unhandledStatement(func.opcode(inst));
     switch (func.opcode(inst)) {
+        .decode_low_float, .encode_low_float => return error.Unsupported,
         .iconst => |c| {
             const rd = ctx.dst(result, scratch1);
             try ctx.put(allocator, encode.movImm(rd, @intCast(c)));
@@ -1538,6 +1540,7 @@ fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const ad
         },
         .extract => |e| f(ctx, e.aggregate, false),
         .convert => |cv| f(ctx, cv.value, false),
+        .decode_low_float, .encode_low_float => |cv| f(ctx, cv.value, false),
         .unary => |u| f(ctx, u.value, false),
         .load => f(ctx, fold.baseOf(func, inst), false),
         .store => |st| {
@@ -1882,6 +1885,22 @@ test "a barrier is rejected, not dropped like a prefetch" {
     func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+}
+
+test "both low float directions are rejected while their results are live" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |decode_direction| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const source = try func.appendBlockParam(block, if (decode_direction) u16_t else f32_t);
+        const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = .bf16 };
+        const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+        try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+    }
 }
 
 test "matmul, prefetch and a void call are refused, not a panic on the result unwrap" {

@@ -940,6 +940,8 @@ const Emitter = struct {
             .struct_new,
             .extract,
             .convert,
+            .decode_low_float,
+            .encode_low_float,
             .unary,
             .alloca,
             .global_addr,
@@ -974,6 +976,7 @@ const Emitter = struct {
                 const val = self.idFor(c.value);
                 try self.emit(&self.body, opcode, &.{ ty, self.idFor(result), val });
             },
+            .decode_low_float, .encode_low_float => return error.UnsupportedConstruct,
             .icmp => |c| {
                 const operand_kind = self.func.types.type_kind(self.func.valueType(c.lhs));
                 const opcode = cmpOpcode(operand_kind, c.op);
@@ -1546,6 +1549,22 @@ test "a barrier is refused, not silently dropped" {
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
 
     try testing.expectError(error.UnsupportedConstruct, emitModule(allocator, &func, "sync"));
+}
+
+test "both low float directions are refused while their results are live" {
+    const allocator = testing.allocator;
+    inline for (.{ true, false }) |decode_direction| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const source = try func.appendBlockParam(block, if (decode_direction) u16_t else f32_t);
+        const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = .bf16 };
+        const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+        try testing.expectError(error.UnsupportedConstruct, emitModule(allocator, &func, "low_float"));
+    }
 }
 
 test "a store is refused, not silently dropped" {

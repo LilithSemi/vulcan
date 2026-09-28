@@ -215,6 +215,8 @@ fn mapOpcode(caller: *Function, callee: *const Function, vmap: std.AutoHashMapUn
         .icmp => |c| .{ .icmp = .{ .op = c.op, .lhs = m(vmap, c.lhs), .rhs = m(vmap, c.rhs) } },
         .select => |s| .{ .select = .{ .cond = m(vmap, s.cond), .then = m(vmap, s.then), .@"else" = m(vmap, s.@"else") } },
         .convert => |cv| .{ .convert = .{ .value = m(vmap, cv.value) } },
+        .decode_low_float => |cv| .{ .decode_low_float = .{ .value = m(vmap, cv.value), .format = cv.format } },
+        .encode_low_float => |cv| .{ .encode_low_float = .{ .value = m(vmap, cv.value), .format = cv.format } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = m(vmap, u.value) } },
         // `volatile` is an observable side effect, not a hint. A callee that reads an MMIO
         // register keeps that read observable after it is inlined, so carry the flag.
@@ -280,6 +282,7 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
             },
             .extract => |*e| e.aggregate = r(from, to, e.aggregate),
             .convert => |*cv| cv.value = r(from, to, cv.value),
+            .decode_low_float, .encode_low_float => |*cv| cv.value = r(from, to, cv.value),
             .unary => |*u| u.value = r(from, to, u.value),
             .load => |*l| l.ptr = r(from, to, l.ptr),
             .store => |*st| {
@@ -658,6 +661,60 @@ test "inlines a leaf helper and replaces the call result" {
     // The call is gone, replaced by the cloned mul/add, and `r` adds 1 to the
     // inlined sum.
     for (caller.blockInsts(b)) |inst| try std.testing.expect(caller.opcode(inst) != .call);
+}
+
+test "inlining preserves low float directions formats and remapped operands" {
+    const allocator = std.testing.allocator;
+    const f32_kind = ir.types.TypeKind{ .float = .f32 };
+    const u8_kind = ir.types.TypeKind{ .int = .{ .signedness = .unsigned, .bits = 8 } };
+
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const f32_t = try callee.types.intern(f32_kind);
+        const u8_t = try callee.types.intern(u8_kind);
+        const block = try callee.appendBlock();
+        const input = try callee.appendBlockParam(block, f32_t);
+        const payload = try callee.appendInst(block, u8_t, .{ .encode_low_float = .{
+            .value = input,
+            .format = .f8_e4m3,
+        } });
+        const output = try callee.appendInst(block, f32_t, .{ .decode_low_float = .{
+            .value = payload,
+            .format = .f8_e5m2,
+        } });
+        callee.setTerminator(block, .{ .ret = ir.function.Ret.one(output) });
+    }
+
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const f32_t = try caller.types.intern(f32_kind);
+    const block = try caller.appendBlock();
+    const input = try caller.appendBlockParam(block, f32_t);
+    const call = try caller.appendCall(block, f32_t, "convert", &.{input});
+    caller.setTerminator(block, .{ .ret = ir.function.Ret.one(call) });
+
+    var lookup_context = TestLookup{ .callee = &callee, .name = "convert" };
+    try std.testing.expect(try run(allocator, &caller, .{
+        .context = &lookup_context,
+        .func = TestLookup.get,
+    }));
+
+    var encoded: ?ir.function.LowFloatConvert = null;
+    var decoded: ?ir.function.LowFloatConvert = null;
+    for (0..caller.blockCount()) |block_index| {
+        for (caller.blockInsts(@enumFromInt(block_index))) |inst| switch (caller.opcode(inst)) {
+            .encode_low_float => |conversion| encoded = conversion,
+            .decode_low_float => |conversion| decoded = conversion,
+            .call => return error.TestUnexpectedResult,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(ir.function.LowFloatFormat.f8_e4m3, encoded.?.format);
+    try std.testing.expectEqual(ir.function.LowFloatFormat.f8_e5m2, decoded.?.format);
+    try std.testing.expectEqual(input, encoded.?.value);
+    const encoded_inst = caller.definingInst(decoded.?.value).?;
+    try std.testing.expect(caller.opcode(encoded_inst) == .encode_low_float);
 }
 
 test "inlines a multi-block, two-return callee (the call is replaced by cloned control flow)" {

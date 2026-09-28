@@ -1934,6 +1934,9 @@ fn usesInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
             if (s.then == v) c += 1;
             if (s.@"else" == v) c += 1;
         },
+        .decode_low_float, .encode_low_float => |cv| {
+            if (cv.value == v) c += 1;
+        },
         .load => |l| {
             if (l.ptr == v) c += 1;
         },
@@ -3907,6 +3910,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 action_cursor += 1;
             }
             switch (func.opcode(inst)) {
+                .decode_low_float, .encode_low_float => return error.Unsupported,
                 .arith => |a| {
                     // Fused multiply-add/sub: when this is a scalar float `mul` that is the
                     // single-use, immediately-preceding operand of the next add/sub, skip its
@@ -7838,6 +7842,22 @@ test "a barrier is rejected, not dropped like a prefetch" {
     func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+}
+
+test "both low float directions are rejected while their results are live" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |decode_direction| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const source = try func.appendBlockParam(block, if (decode_direction) u16_t else f32_t);
+        const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = .bf16 };
+        const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+        try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+    }
 }
 
 test "an atomic is rejected, not dropped like a prefetch" {
