@@ -18,6 +18,7 @@ pub const kernel = @import("vulcan-gpu/kernel.zig");
 pub const abi = @import("vulcan-gpu/abi.zig");
 pub const offload = @import("vulcan-gpu/offload.zig");
 pub const tensor = @import("vulcan-gpu/tensor.zig");
+pub const peer = @import("vulcan-gpu/peer.zig");
 
 /// A value the hardware provides rather than the parameter block. See `builtin.Builtin`.
 pub const Builtin = builtin.Builtin;
@@ -37,6 +38,8 @@ pub const layoutParams = abi.layoutParams;
 pub const lowerToLoopNest = offload.lowerToLoopNest;
 /// What one target's `matmul` lowering can take. See `tensor.Tensor`.
 pub const Tensor = tensor.Tensor;
+/// What a peer-to-peer link between two devices allows. See `peer.Caps`.
+pub const PeerCaps = peer.Caps;
 
 test {
     std.testing.refAllDecls(@This());
