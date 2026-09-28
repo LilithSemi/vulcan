@@ -246,6 +246,379 @@ pub fn expandNvFp4(allocator: std.mem.Allocator, func: *Function) std.mem.Alloca
     return true;
 }
 
+/// Replace scalar f32 division with target-independent u32 operations.
+pub fn expandF32Div(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator.Error!bool {
+    var has_division = false;
+    for (0..func.blockCount()) |block_index| {
+        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+            .arith => |arith| if (arith.op == .div) switch (func.types.type_kind(func.valueType(func.instResult(inst).?))) {
+                .float => |kind| if (kind == .f32) {
+                    has_division = true;
+                    break;
+                },
+                else => {},
+            },
+            else => {},
+        };
+        if (has_division) break;
+    }
+    if (!has_division) return false;
+
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    for (0..func.blockCount()) |block_index| {
+        const block: Block = @enumFromInt(block_index);
+        var contains_division = false;
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+            .arith => |arith| if (arith.op == .div and func.valueType(func.instResult(inst).?) == f32_t) {
+                contains_division = true;
+                break;
+            },
+            else => {},
+        };
+        if (!contains_division) continue;
+
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        var out: std.ArrayList(Inst) = .empty;
+        defer out.deinit(allocator);
+        const builder: NumericBuilder = .{
+            .func = func,
+            .out = &out,
+            .allocator = allocator,
+            .u8_t = u8_t,
+            .u16_t = u16_t,
+            .u32_t = u32_t,
+            .f32_t = f32_t,
+            .bool_t = bool_t,
+        };
+
+        for (original) |inst| switch (func.opcode(inst)) {
+            .arith => |arith| if (arith.op == .div and func.valueType(func.instResult(inst).?) == f32_t) {
+                const old_result = func.instResult(inst).?;
+                const expanded = try expandF32Division(builder, arith.lhs, arith.rhs);
+                func.replaceAllUses(old_result, expanded);
+                func.retargetAttrs(.{ .value = old_result }, .{ .value = expanded });
+                func.retargetAttrs(.{ .inst = inst }, .{ .inst = func.definingInst(expanded).? });
+            } else try out.append(allocator, inst),
+            else => try out.append(allocator, inst),
+        };
+        try func.setBlockInsts(block, out.items);
+    }
+    return true;
+}
+
+const NormalizedF32 = struct {
+    significand: Value,
+    exponent: Value,
+};
+
+fn normalizeF32(builder: NumericBuilder, magnitude: Value) std.mem.Allocator.Error!NormalizedF32 {
+    const fraction = try builder.masked(magnitude, 0x007f_ffff);
+    const raw_exponent = try builder.masked(try builder.shifted(.shr, magnitude, 23), 0xff);
+    const is_subnormal = try builder.equalConstant(raw_exponent, 0);
+    var significand = try builder.select(
+        is_subnormal,
+        fraction,
+        try builder.binary(.bit_or, fraction, try builder.constant(0x0080_0000)),
+    );
+    var exponent = try builder.select(
+        is_subnormal,
+        try builder.constant(257),
+        try builder.binary(.add, raw_exponent, try builder.constant(256)),
+    );
+    for ([_]u32{ 16, 8, 4, 2, 1 }) |shift| {
+        const needs_shift = try builder.compare(.lt, significand, try builder.constant(@as(u32, 0x0100_0000) >> @intCast(shift)));
+        significand = try builder.select(needs_shift, try builder.shifted(.shl, significand, shift), significand);
+        exponent = try builder.select(needs_shift, try builder.binary(.sub, exponent, try builder.constant(shift)), exponent);
+    }
+    return .{ .significand = significand, .exponent = exponent };
+}
+
+fn boolAsU32(builder: NumericBuilder, condition: Value) std.mem.Allocator.Error!Value {
+    return builder.select(condition, try builder.constant(1), try builder.constant(0));
+}
+
+fn flagSet(builder: NumericBuilder, flag: Value) std.mem.Allocator.Error!Value {
+    return builder.compare(.ne, flag, try builder.constant(0));
+}
+
+fn roundDivisionQuotient(builder: NumericBuilder, quotient: Value, remainder: Value, shift: Value) std.mem.Allocator.Error!Value {
+    const one = try builder.constant(1);
+    const retained = try builder.binary(.shr, quotient, shift);
+    const shifted_one = try builder.binary(.shl, one, shift);
+    const discarded = try builder.binary(.bit_and, quotient, try builder.binary(.sub, shifted_one, one));
+    const halfway = try builder.binary(.shl, one, try builder.binary(.sub, shift, one));
+    const above_half = try boolAsU32(builder, try builder.compare(.gt, discarded, halfway));
+    const at_half = try boolAsU32(builder, try builder.compare(.eq, discarded, halfway));
+    const has_remainder = try boolAsU32(builder, try builder.compare(.ne, remainder, try builder.constant(0)));
+    const odd = try boolAsU32(builder, try builder.compare(.ne, try builder.binary(.bit_and, retained, one), try builder.constant(0)));
+    const half_increment = try builder.select(try flagSet(builder, has_remainder), one, odd);
+    const tie_increment = try builder.select(try flagSet(builder, at_half), half_increment, try builder.constant(0));
+    const increment = try builder.select(try flagSet(builder, above_half), one, tie_increment);
+    return builder.binary(.add, retained, increment);
+}
+
+fn expandF32Division(builder: NumericBuilder, numerator: Value, denominator: Value) std.mem.Allocator.Error!Value {
+    const numerator_bits = try builder.reinterpret(builder.u32_t, numerator);
+    const denominator_bits = try builder.reinterpret(builder.u32_t, denominator);
+    const numerator_magnitude = try builder.masked(numerator_bits, 0x7fff_ffff);
+    const denominator_magnitude = try builder.masked(denominator_bits, 0x7fff_ffff);
+    const sign = try builder.masked(try builder.binary(.bit_xor, numerator_bits, denominator_bits), 0x8000_0000);
+    const normalized_numerator = try normalizeF32(builder, numerator_magnitude);
+    const normalized_denominator = try normalizeF32(builder, denominator_magnitude);
+
+    const ratio_below_one = try boolAsU32(builder, try builder.compare(.lt, normalized_numerator.significand, normalized_denominator.significand));
+    const dividend = try builder.select(
+        try flagSet(builder, ratio_below_one),
+        try builder.shifted(.shl, normalized_numerator.significand, 1),
+        normalized_numerator.significand,
+    );
+    const exponent_bias = try builder.constant(383);
+    var result_exponent = try builder.binary(
+        .add,
+        try builder.binary(.sub, normalized_numerator.exponent, normalized_denominator.exponent),
+        exponent_bias,
+    );
+    result_exponent = try builder.binary(.sub, result_exponent, ratio_below_one);
+
+    var quotient = try builder.constant(0);
+    var remainder = dividend;
+    for (0..27) |step| {
+        const bit = try builder.compare(.ge, remainder, normalized_denominator.significand);
+        const subtrahend = try builder.select(bit, normalized_denominator.significand, try builder.constant(0));
+        remainder = try builder.binary(.sub, remainder, subtrahend);
+        quotient = try builder.binary(.bit_or, try builder.shifted(.shl, quotient, 1), try boolAsU32(builder, bit));
+        if (step != 26) remainder = try builder.shifted(.shl, remainder, 1);
+    }
+
+    const is_tiny = try boolAsU32(builder, try builder.compare(.le, result_exponent, try builder.constant(256)));
+    const raw_tiny_shift = try builder.binary(.sub, try builder.constant(260), result_exponent);
+    const shift_too_large = try boolAsU32(builder, try builder.compare(.gt, raw_tiny_shift, try builder.constant(31)));
+    const tiny_shift = try builder.select(try flagSet(builder, shift_too_large), try builder.constant(31), raw_tiny_shift);
+    const rounding_shift = try builder.select(try flagSet(builder, is_tiny), tiny_shift, try builder.constant(3));
+    const rounded = try roundDivisionQuotient(builder, quotient, remainder, rounding_shift);
+
+    const rounded_carry = try boolAsU32(builder, try builder.compare(.ge, rounded, try builder.constant(0x0100_0000)));
+    const normal_significand = try builder.select(try flagSet(builder, rounded_carry), try builder.shifted(.shr, rounded, 1), rounded);
+    const normal_exponent = try builder.binary(
+        .add,
+        try builder.binary(.sub, result_exponent, try builder.constant(256)),
+        rounded_carry,
+    );
+    const normal_bits = try builder.binary(
+        .bit_or,
+        try builder.shifted(.shl, normal_exponent, 23),
+        try builder.masked(normal_significand, 0x007f_ffff),
+    );
+    const finite_bits = try builder.select(try flagSet(builder, is_tiny), rounded, normal_bits);
+    const overflow_before_round = try boolAsU32(builder, try builder.compare(.ge, result_exponent, try builder.constant(511)));
+    const overflow_after_round = try boolAsU32(builder, try builder.compare(.ge, normal_exponent, try builder.constant(255)));
+    const rounded_overflow = try builder.select(try flagSet(builder, is_tiny), try builder.constant(0), overflow_after_round);
+    const overflow = try builder.select(try flagSet(builder, overflow_before_round), try builder.constant(1), rounded_overflow);
+    var result_bits = try builder.select(
+        try builder.compare(.ne, overflow, try builder.constant(0)),
+        try builder.constant(0x7f80_0000),
+        finite_bits,
+    );
+
+    const numerator_zero = try boolAsU32(builder, try builder.equalConstant(numerator_magnitude, 0));
+    const denominator_zero = try boolAsU32(builder, try builder.equalConstant(denominator_magnitude, 0));
+    const numerator_infinity = try boolAsU32(builder, try builder.equalConstant(numerator_magnitude, 0x7f80_0000));
+    const denominator_infinity = try boolAsU32(builder, try builder.equalConstant(denominator_magnitude, 0x7f80_0000));
+    const numerator_nan = try boolAsU32(builder, try builder.compare(.gt, numerator_magnitude, try builder.constant(0x7f80_0000)));
+    const denominator_nan = try boolAsU32(builder, try builder.compare(.gt, denominator_magnitude, try builder.constant(0x7f80_0000)));
+    result_bits = try builder.select(try flagSet(builder, denominator_infinity), try builder.constant(0), result_bits);
+    result_bits = try builder.select(try flagSet(builder, numerator_infinity), try builder.constant(0x7f80_0000), result_bits);
+    result_bits = try builder.select(try flagSet(builder, denominator_zero), try builder.constant(0x7f80_0000), result_bits);
+    result_bits = try builder.select(try flagSet(builder, numerator_zero), try builder.constant(0), result_bits);
+    result_bits = try builder.binary(.bit_or, sign, result_bits);
+
+    const both_zero = try builder.select(try flagSet(builder, numerator_zero), denominator_zero, try builder.constant(0));
+    const both_infinite = try builder.select(try flagSet(builder, numerator_infinity), denominator_infinity, try builder.constant(0));
+    var invalid = try builder.select(try flagSet(builder, numerator_nan), try builder.constant(1), denominator_nan);
+    invalid = try builder.binary(.bit_or, invalid, both_zero);
+    invalid = try builder.binary(.bit_or, invalid, both_infinite);
+    result_bits = try builder.select(
+        try builder.compare(.ne, invalid, try builder.constant(0)),
+        try builder.constant(0x7fc0_0000),
+        result_bits,
+    );
+    return builder.reinterpret(builder.f32_t, result_bits);
+}
+
+fn appendF32DivisionFixture(func: *Function, block: Block) std.mem.Allocator.Error!Value {
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const numerator = try func.appendBlockParam(block, f32_t);
+    const denominator = try func.appendBlockParam(block, f32_t);
+    return func.appendInst(block, f32_t, .{ .arith = .{ .op = .div, .lhs = numerator, .rhs = denominator } });
+}
+
+test "expandF32Div replaces uses attributes and every scalar division in program order" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const entry = try func.appendBlock();
+    const first = try appendF32DivisionFixture(&func, entry);
+    const first_inst = func.definingInst(first).?;
+    try func.addAttr(.{ .inst = first_inst }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 45 } } });
+    try func.addAttr(.{ .value = first }, .{ .custom = .{ .namespace = "test", .key = "division", .value = .flag } });
+    const second = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = first, .rhs = func.blockParams(entry)[1] } });
+    const exit = try func.appendBlock();
+    try func.setJump(entry, exit, &.{second});
+    const forwarded = try func.appendBlockParam(exit, f32_t);
+    func.setTerminator(exit, .{ .ret = function.Ret.one(forwarded) });
+
+    try std.testing.expect(try expandF32Div(allocator, &func));
+    try std.testing.expect(!(try expandF32Div(allocator, &func)));
+    var diagnostics = try verify.verify(allocator, &func, .low);
+    defer diagnostics.deinit();
+    try std.testing.expect(diagnostics.ok());
+    for (0..func.blockCount()) |block_index| {
+        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+            .arith => |arithmetic| if (arithmetic.op == .div and
+                func.valueType(func.instResult(inst).?) == f32_t)
+            {
+                return error.TestUnexpectedResult;
+            },
+            else => {},
+        };
+    }
+    const replacement = func.blockArgs(func.terminator(entry).?.jump)[0];
+    try std.testing.expect(replacement != second);
+    var migrated_value_attrs: usize = 0;
+    var migrated_inst_attrs: usize = 0;
+    for (func.blockInsts(entry)) |inst| {
+        const live_result = func.instResult(inst).?;
+        var value_attrs = func.attributesOf(.{ .value = live_result });
+        if (value_attrs.next()) |attribute| {
+            try std.testing.expectEqualStrings("division", attribute.custom.key);
+            migrated_value_attrs += 1;
+        }
+        var inst_attrs = func.attributesOf(.{ .inst = inst });
+        if (inst_attrs.next()) |attribute| {
+            try std.testing.expectEqualStrings("line", attribute.custom.key);
+            migrated_inst_attrs += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), migrated_value_attrs);
+    try std.testing.expectEqual(@as(usize, 1), migrated_inst_attrs);
+    var old_value_attrs = func.attributesOf(.{ .value = first });
+    var old_inst_attrs = func.attributesOf(.{ .inst = first_inst });
+    try std.testing.expect(old_value_attrs.next() == null);
+    try std.testing.expect(old_inst_attrs.next() == null);
+}
+
+test "expandF32Div emits only bounded ordinary integer operations" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const block = try func.appendBlock();
+    const result = try appendF32DivisionFixture(&func, block);
+    func.setTerminator(block, .{ .ret = function.Ret.one(result) });
+    try std.testing.expect(try expandF32Div(allocator, &func));
+
+    var restoring_compares: usize = 0;
+    var dynamic_shifts: usize = 0;
+    var clamped_shift_uses: usize = 0;
+    var count_minus_one_uses: usize = 0;
+    var max_predicate_distance: usize = 0;
+    const insts = func.blockInsts(block);
+    for (insts, 0..) |inst, inst_index| switch (func.opcode(inst)) {
+        .arith => |arithmetic| {
+            const result_kind = func.types.type_kind(func.valueType(func.instResult(inst).?));
+            try std.testing.expect(std.meta.activeTag(result_kind) == .int);
+            try std.testing.expectEqual(@as(u16, 32), result_kind.int.bits);
+            if (arithmetic.op == .shl or arithmetic.op == .shr) switch (func.opcode(func.definingInst(arithmetic.rhs).?)) {
+                .iconst => |amount| try std.testing.expect(amount <= 31),
+                .select => |amount| {
+                    dynamic_shifts += 1;
+                    clamped_shift_uses += 1;
+                    switch (func.opcode(func.definingInst(amount.@"else").?)) {
+                        .iconst => |normal_count| try std.testing.expectEqual(@as(i64, 3), normal_count),
+                        else => return error.TestUnexpectedResult,
+                    }
+                    switch (func.opcode(func.definingInst(amount.then).?)) {
+                        .select => |clamp| {
+                            switch (func.opcode(func.definingInst(clamp.then).?)) {
+                                .iconst => |maximum| try std.testing.expectEqual(@as(i64, 31), maximum),
+                                else => return error.TestUnexpectedResult,
+                            }
+                            try std.testing.expect(func.opcode(func.definingInst(clamp.@"else").?) == .arith);
+                        },
+                        else => return error.TestUnexpectedResult,
+                    }
+                },
+                .arith => |count| {
+                    dynamic_shifts += 1;
+                    try std.testing.expectEqual(function.BinOp.sub, count.op);
+                    switch (func.opcode(func.definingInst(count.rhs).?)) {
+                        .iconst => |one| try std.testing.expectEqual(@as(i64, 1), one),
+                        else => return error.TestUnexpectedResult,
+                    }
+                    try std.testing.expect(func.opcode(func.definingInst(count.lhs).?) == .select);
+                    count_minus_one_uses += 1;
+                },
+                else => return error.TestUnexpectedResult,
+            };
+        },
+        .icmp => |comparison| {
+            if (comparison.op == .ge) restoring_compares += 1;
+            try std.testing.expect(std.meta.activeTag(func.types.type_kind(func.valueType(comparison.lhs))) == .int);
+            try std.testing.expect(std.meta.activeTag(func.types.type_kind(func.valueType(comparison.rhs))) == .int);
+        },
+        .select => |selection| {
+            try std.testing.expect(std.meta.activeTag(func.types.type_kind(func.valueType(selection.then))) == .int);
+            try std.testing.expect(std.meta.activeTag(func.types.type_kind(func.valueType(selection.@"else"))) == .int);
+            const predicate_inst = func.definingInst(selection.cond).?;
+            var predicate_index: ?usize = null;
+            for (insts[0..inst_index], 0..) |candidate, candidate_index| {
+                if (candidate == predicate_inst) predicate_index = candidate_index;
+            }
+            const distance = inst_index - (predicate_index orelse return error.TestUnexpectedResult);
+            max_predicate_distance = @max(max_predicate_distance, distance);
+        },
+        .unary => |unary| try std.testing.expectEqual(function.UnaryOp.reinterpret, unary.op),
+        .call, .call_indirect, .convert => return error.TestUnexpectedResult,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 30), restoring_compares);
+    try std.testing.expectEqual(@as(usize, 3), dynamic_shifts);
+    try std.testing.expectEqual(@as(usize, 2), clamped_shift_uses);
+    try std.testing.expectEqual(@as(usize, 1), count_minus_one_uses);
+    // The restoring predicate has the longest span: compare, guarded subtract, quotient
+    // shift, then conversion to a u32 flag. Freeze that eight-instruction ceiling so a
+    // refactor cannot hoist transient predicates across the unrolled division.
+    try std.testing.expectEqual(@as(usize, 8), max_predicate_distance);
+}
+
+test "expandF32Div leaves division-free logical IR byte-for-byte unchanged" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const value = try func.appendInst(block, u32_t, .{ .iconst = 45 });
+    try func.addAttr(.{ .value = value }, .{ .custom = .{ .namespace = "test", .key = "unchanged", .value = .flag } });
+    func.setTerminator(block, .{ .ret = function.Ret.one(value) });
+    const text_before = try std.fmt.allocPrint(allocator, "{f}", .{func});
+    defer allocator.free(text_before);
+    const bits_before = try bitcode.encode(allocator, &func);
+    defer allocator.free(bits_before);
+    try std.testing.expect(!(try expandF32Div(allocator, &func)));
+    const text_after = try std.fmt.allocPrint(allocator, "{f}", .{func});
+    defer allocator.free(text_after);
+    const bits_after = try bitcode.encode(allocator, &func);
+    defer allocator.free(bits_after);
+    try std.testing.expectEqualStrings(text_before, text_after);
+    try std.testing.expectEqualSlices(u8, bits_before, bits_after);
+}
+
 const NvFp4Expansion = struct {
     result: Value,
     semantic_inst: Inst,

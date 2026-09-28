@@ -608,7 +608,11 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
 pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: Stage, a: gpu.Abi, options: Options) Error!Kernel {
     var work = try func.clone(allocator);
     defer work.deinit();
-    if (stage == .compute) _ = try ir.expand.expandLowFloat(allocator, &work);
+    if (stage == .compute) {
+        _ = try ir.expand.expandNvFp4(allocator, &work);
+        _ = try ir.expand.expandF32Div(allocator, &work);
+        _ = try ir.expand.expandLowFloat(allocator, &work);
+    }
     return compileShaderOwned(allocator, &work, stage, a, options);
 }
 
@@ -622,6 +626,11 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
         for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
             .decode_low_float, .encode_low_float => return error.Unsupported,
             .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
+            .arith => |arithmetic| if (stage == .compute and arithmetic.op == .div and
+                std.meta.activeTag(func.types.type_kind(func.valueType(func.instResult(inst).?))) == .float)
+            {
+                return error.Unsupported;
+            },
             else => {},
         };
     }
@@ -6051,29 +6060,203 @@ test "NVIDIA conversion selector keeps its scalar whitelist narrow" {
     }
 }
 
-test "both nvfp4 directions are rejected before emission without mutating caller IR" {
+fn buildF32DivisionFixture(allocator: std.mem.Allocator, later_failure: bool) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const numerator = try func.appendBlockParam(block, f32_t);
+    const denominator = try func.appendBlockParam(block, f32_t);
+    const result = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .div, .lhs = numerator, .rhs = denominator } });
+    try func.addAttr(.{ .inst = func.definingInst(result).? }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 45 } } });
+    try func.addAttr(.{ .value = result }, .{ .custom = .{ .namespace = "test", .key = "division", .value = .flag } });
+    if (later_failure) try func.appendBarrier(block, .subgroup);
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    return func;
+}
+
+fn kernelHasOpcode(kernel: *const Kernel, opcode: u32) bool {
+    for (0..kernel.code.len / 4) |index| if (opAt(kernel.code, index) == opcode) return true;
+    return false;
+}
+
+test "all NVIDIA compute funnels expand exact f32 division without mutating callers" {
     const allocator = testing.allocator;
-    inline for (.{ true, false }) |dequantize| {
-        var func = Function.init(allocator);
+    var baseline_code: ?[]u32 = null;
+    defer if (baseline_code) |code| allocator.free(code);
+    inline for (std.enums.values(ComputeFunnel)) |funnel| {
+        var func = try buildF32DivisionFixture(allocator, false);
         defer func.deinit();
-        const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
-        const f32_t = try func.types.intern(.{ .float = .f32 });
-        const block = try func.appendBlock();
-        const payload = try func.appendBlockParam(block, u8_t);
-        const block_scale = try func.appendBlockParam(block, u8_t);
-        const value = try func.appendBlockParam(block, f32_t);
-        const global_scale = try func.appendBlockParam(block, f32_t);
-        const conversion: ir.function.NvFp4Convert = .{ .value = if (dequantize) payload else value, .block_scale = block_scale, .global_scale = global_scale, .block_application = .multiply, .global_application = .divide };
-        const result = try func.appendInst(block, if (dequantize) f32_t else u8_t, if (dequantize) .{ .dequantize_nvfp4 = conversion } else .{ .quantize_nvfp4 = conversion });
-        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+        const text_before = try std.fmt.allocPrint(allocator, "{f}", .{func});
+        defer allocator.free(text_before);
+        const bits_before = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(bits_before);
+        var kernel = try compileComputeFunnel(allocator, &func, funnel);
+        defer kernel.deinit(allocator);
+        try testing.expect(!kernelHasOpcode(&kernel, encode.MUFU_OPCODE));
+        if (baseline_code) |code| {
+            try testing.expectEqualSlices(u32, code, kernel.code);
+        } else {
+            baseline_code = try allocator.dupe(u32, kernel.code);
+        }
+        const text_after = try std.fmt.allocPrint(allocator, "{f}", .{func});
+        defer allocator.free(text_after);
+        const bits_after = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(bits_after);
+        try testing.expectEqualStrings(text_before, text_after);
+        try testing.expectEqualSlices(u8, bits_before, bits_after);
+    }
+}
+
+test "NVIDIA exact division preserves callers on later failure and rejects an unexpanded compute preflight" {
+    const allocator = testing.allocator;
+    var func = try buildF32DivisionFixture(allocator, true);
+    defer func.deinit();
+    const before = try ir.bitcode.encode(allocator, &func);
+    defer allocator.free(before);
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+    const after = try ir.bitcode.encode(allocator, &func);
+    defer allocator.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+
+    var raw = try buildF32DivisionFixture(allocator, false);
+    defer raw.deinit();
+    try testing.expectError(error.Unsupported, compileShaderOwned(allocator, &raw, .compute, nvidia_abi, .{}));
+}
+
+test "NVIDIA graphics retains reciprocal multiplication for ordinary f32 division" {
+    const allocator = testing.allocator;
+    inline for (.{ Stage.vertex, Stage.fragment }) |stage| {
+        var func = try buildF32DivisionFixture(allocator, false);
+        defer func.deinit();
+        var kernel = try compileShader(allocator, &func, stage, nvidia_abi);
+        defer kernel.deinit(allocator);
+        try testing.expect(kernelHasOpcode(&kernel, encode.MUFU_OPCODE));
+        try testing.expect(kernelHasOpcode(&kernel, FMUL_REG));
+    }
+}
+
+fn buildNvFp4Fixture(
+    allocator: std.mem.Allocator,
+    dequantize: bool,
+    block_application: ir.nvfp4.ScaleApplication,
+    global_application: ir.nvfp4.ScaleApplication,
+    later_failure: bool,
+) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const payload = try func.appendBlockParam(block, u8_t);
+    const block_scale = try func.appendBlockParam(block, u8_t);
+    const value = try func.appendBlockParam(block, f32_t);
+    const global_scale = try func.appendBlockParam(block, f32_t);
+    const conversion: ir.function.NvFp4Convert = .{
+        .value = if (dequantize) payload else value,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = block_application,
+        .global_application = global_application,
+    };
+    const result = try func.appendInst(block, if (dequantize) f32_t else u8_t, if (dequantize)
+        .{ .dequantize_nvfp4 = conversion }
+    else
+        .{ .quantize_nvfp4 = conversion });
+    try func.addAttr(.{ .inst = func.definingInst(result).? }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 45 } } });
+    try func.addAttr(.{ .value = result }, .{ .custom = .{ .namespace = "test", .key = "nvfp4", .value = .flag } });
+    if (later_failure) try func.appendBarrier(block, .subgroup);
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    return func;
+}
+
+test "all NVIDIA compute funnels expand every nvfp4 policy and direction" {
+    const allocator = testing.allocator;
+    inline for (.{ true, false }) |dequantize|
+        inline for (.{ ir.nvfp4.ScaleApplication.multiply, .divide }) |block_application|
+            inline for (.{ ir.nvfp4.ScaleApplication.multiply, .divide }) |global_application|
+                inline for (std.enums.values(ComputeFunnel)) |funnel| {
+                    var func = try buildNvFp4Fixture(allocator, dequantize, block_application, global_application, false);
+                    defer func.deinit();
+                    const before = try ir.bitcode.encode(allocator, &func);
+                    defer allocator.free(before);
+                    var kernel = try compileComputeFunnel(allocator, &func, funnel);
+                    defer kernel.deinit(allocator);
+                    try testing.expect(kernel.code.len != 0);
+                    try testing.expect(!kernelHasOpcode(&kernel, encode.MUFU_OPCODE));
+                    const after = try ir.bitcode.encode(allocator, &func);
+                    defer allocator.free(after);
+                    try testing.expectEqualSlices(u8, before, after);
+                };
+}
+
+test "NVIDIA graphics rejects every nvfp4 policy and later compute failures preserve callers" {
+    const allocator = testing.allocator;
+    inline for (.{ true, false }) |dequantize|
+        inline for (.{ ir.nvfp4.ScaleApplication.multiply, .divide }) |block_application|
+            inline for (.{ ir.nvfp4.ScaleApplication.multiply, .divide }) |global_application| {
+                var func = try buildNvFp4Fixture(allocator, dequantize, block_application, global_application, false);
+                defer func.deinit();
+                try testing.expectError(error.Unsupported, compileShader(allocator, &func, .vertex, nvidia_abi));
+                try testing.expectError(error.Unsupported, compileShaderOpts(allocator, &func, .fragment, nvidia_abi, .{}));
+            };
+    inline for (.{ true, false }) |dequantize| {
+        var func = try buildNvFp4Fixture(allocator, dequantize, .divide, .divide, true);
+        defer func.deinit();
         const before = try ir.bitcode.encode(allocator, &func);
         defer allocator.free(before);
         try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
-        try testing.expectError(error.Unsupported, compileShader(allocator, &func, .fragment, nvidia_abi));
         const after = try ir.bitcode.encode(allocator, &func);
         defer allocator.free(after);
         try testing.expectEqualSlices(u8, before, after);
     }
+}
+
+test "NVIDIA production allocation handles interleaved division and nvfp4 pressure" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const block = try func.appendBlock();
+    const output = try func.appendBlockParam(block, ptr_t);
+    const numerator = try func.appendBlockParam(block, f32_t);
+    const denominator = try func.appendBlockParam(block, f32_t);
+    const carrier = try func.appendBlockParam(block, u8_t);
+    const block_scale = try func.appendBlockParam(block, u8_t);
+    const global_scale = try func.appendBlockParam(block, f32_t);
+    const value = try func.appendBlockParam(block, f32_t);
+    const live_predicate = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = numerator, .rhs = denominator } });
+    const quotient = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .div, .lhs = numerator, .rhs = denominator } });
+    const dequantized = try func.appendInst(block, f32_t, .{ .dequantize_nvfp4 = .{
+        .value = carrier,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .divide,
+        .global_application = .divide,
+    } });
+    const quantized = try func.appendInst(block, u8_t, .{ .quantize_nvfp4 = .{
+        .value = value,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = .multiply,
+        .global_application = .multiply,
+    } });
+    const selected = try func.appendInst(block, f32_t, .{ .select = .{ .cond = live_predicate, .then = quotient, .@"else" = dequantized } });
+    const second_quotient = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .div, .lhs = selected, .rhs = value } });
+    try func.appendStore(block, selected, output);
+    try func.appendStore(block, quantized, try func.appendArithImm(block, ptr_t, .add, output, 4));
+    try func.appendStore(block, second_quotient, try func.appendArithImm(block, ptr_t, .add, output, 8));
+    func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+    try testing.expect(kernel.code.len != 0);
+    try testing.expect(kernel.reg_count > 0);
+    try testing.expect(kernel.reg_count <= 255);
+    try testing.expect(!kernelHasOpcode(&kernel, encode.MUFU_OPCODE));
 }
 
 test "compiles control flow: a max via if and a merge block" {

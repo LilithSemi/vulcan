@@ -28,6 +28,7 @@ const ir = @import("vulcan-ir");
 const gpu_abi = @import("vulcan-gpu");
 const target = @import("vulcan-target");
 const nvidia = @import("nvidia");
+const division_cases = target.f32_division_cases;
 
 const isel = target.nvidia.isel;
 const compute = nvidia.compute;
@@ -109,6 +110,11 @@ const Harness = struct {
     /// Allocate a zeroed buffer visible to both the CPU and the GPU.
     fn alloc(self: *Harness, size: u64) !compute.Buffer {
         return self.runner.alloc(.system, size);
+    }
+
+    fn ensureCodeCapacity(self: *Harness, bytes: usize) !void {
+        if (self.runner.code.bytes.len >= bytes) return;
+        self.runner.code = try self.runner.alloc(.system_wc, @intCast(bytes));
     }
 
     /// Allocate a zeroed buffer at the GPU virtual address `va`. The runner hands
@@ -263,6 +269,830 @@ fn expectGuard(buf: compute.Buffer, active_offset: usize, active_bytes: usize) !
     const bytes: [*]const volatile u8 = @ptrCast(buf.bytes.ptr);
     for (0..active_offset) |i| try testing.expectEqual(low_float_guard, bytes[i]);
     for (active_offset + active_bytes..buf.bytes.len) |i| try testing.expectEqual(low_float_guard, bytes[i]);
+}
+
+const MultiplicationPair = struct {
+    lhs: u32,
+    rhs: u32,
+};
+
+fn buildF32BinaryKernel(allocator: std.mem.Allocator, op: ir.function.BinOp) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const out = try func.appendBlockParam(b, ptr_t);
+    const lhs_base = try func.appendBlockParam(b, ptr_t);
+    const rhs_base = try func.appendBlockParam(b, ptr_t);
+    const gid = try func.appendBlockParam(b, u32_t);
+    try gpu_abi.attrs.setBuiltin(&func, gid, .global_id_x);
+
+    const byte = try binImm(&func, b, u32_t, .mul, gid, 4);
+    const lhs = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = try ptrAddVal(&func, b, ptr_t, lhs_base, byte) } });
+    const rhs = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = try ptrAddVal(&func, b, ptr_t, rhs_base, byte) } });
+    const result = try func.appendInst(b, f32_t, .{ .arith = .{ .op = op, .lhs = lhs, .rhs = rhs } });
+    const bits = try func.appendInst(b, u32_t, .{ .unary = .{ .op = .reinterpret, .value = result } });
+    try func.appendStore(b, bits, try ptrAddVal(&func, b, ptr_t, out, byte));
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+fn appendSignedMultiplicationPair(pairs: *std.ArrayList(MultiplicationPair), allocator: std.mem.Allocator, pair: MultiplicationPair) !void {
+    try pairs.append(allocator, pair);
+    try pairs.append(allocator, .{ .lhs = pair.lhs ^ 0x8000_0000, .rhs = pair.rhs });
+    try pairs.append(allocator, .{ .lhs = pair.lhs, .rhs = pair.rhs ^ 0x8000_0000 });
+    try pairs.append(allocator, .{ .lhs = pair.lhs ^ 0x8000_0000, .rhs = pair.rhs ^ 0x8000_0000 });
+}
+
+fn containsMultiplicationPair(pairs: []const MultiplicationPair, expected: MultiplicationPair) bool {
+    for (pairs) |pair| if (pair.lhs == expected.lhs and pair.rhs == expected.rhs) return true;
+    return false;
+}
+
+fn appendNvFp4MultiplicationPairs(pairs: *std.ArrayList(MultiplicationPair), allocator: std.mem.Allocator) ![8]MultiplicationPair {
+    const dequantize = [_]struct { payload: u8, block: u8, global: u32, block_op: ir.nvfp4.ScaleApplication, global_op: ir.nvfp4.ScaleApplication }{
+        .{ .payload = 0x03, .block = 0x03, .global = 0x3e00_0001, .block_op = .multiply, .global_op = .multiply },
+        .{ .payload = 0x01, .block = 0x03, .global = 0x3e00_0001, .block_op = .multiply, .global_op = .divide },
+        .{ .payload = 0x01, .block = 0x05, .global = 0x3e00_0001, .block_op = .divide, .global_op = .multiply },
+        .{ .payload = 0x01, .block = 0x03, .global = 0x3e00_0001, .block_op = .divide, .global_op = .divide },
+    };
+    const quantize = [_]struct { value: u32, block: u8, global: u32, block_op: ir.nvfp4.ScaleApplication, global_op: ir.nvfp4.ScaleApplication }{
+        .{ .value = 0x3e00_0522, .block = 0x23, .global = 0x3e54_d004, .block_op = .multiply, .global_op = .multiply },
+        .{ .value = 0x3e00_154f, .block = 0x0f, .global = 0x3ed1_dd10, .block_op = .multiply, .global_op = .divide },
+        .{ .value = 0x3e00_154f, .block = 0x47, .global = 0x3f20_1aa3, .block_op = .divide, .global_op = .multiply },
+        .{ .value = 0x3e00_399b, .block = 0x55, .global = 0x3eeb_e49b, .block_op = .divide, .global_op = .divide },
+    };
+
+    var required: [8]MultiplicationPair = undefined;
+    var count: usize = 0;
+    for (dequantize) |case| {
+        const decoded = ir.nvfp4.decodeE2M1(case.payload);
+        const block = try ir.low_float.decode(.f8_e4m3, case.block);
+        const global: f32 = @bitCast(case.global);
+        const local = switch (case.block_op) {
+            .multiply => value: {
+                required[count] = .{ .lhs = @bitCast(decoded), .rhs = @bitCast(block) };
+                count += 1;
+                break :value decoded * block;
+            },
+            .divide => decoded / block,
+        };
+        if (case.global_op == .multiply) {
+            required[count] = .{ .lhs = @bitCast(local), .rhs = @bitCast(global) };
+            count += 1;
+        }
+    }
+    for (quantize) |case| {
+        const value: f32 = @bitCast(case.value);
+        const block = try ir.low_float.decode(.f8_e4m3, case.block);
+        const global: f32 = @bitCast(case.global);
+        const global_unscaled = switch (case.global_op) {
+            .multiply => value / global,
+            .divide => product: {
+                required[count] = .{ .lhs = case.value, .rhs = case.global };
+                count += 1;
+                break :product value * global;
+            },
+        };
+        if (case.block_op == .divide) {
+            required[count] = .{ .lhs = @bitCast(global_unscaled), .rhs = @bitCast(block) };
+            count += 1;
+        }
+    }
+    try testing.expectEqual(required.len, count);
+    for (required) |pair| {
+        try testing.expect(std.math.isFinite(@as(f32, @bitCast(pair.lhs))));
+        try testing.expect(std.math.isFinite(@as(f32, @bitCast(pair.rhs))));
+        try pairs.append(allocator, pair);
+    }
+    return required;
+}
+
+test "live: NVIDIA f32 multiplication preserves exact NVFP4 scale semantics" {
+    const allocator = testing.allocator;
+    var pairs: std.ArrayList(MultiplicationPair) = .empty;
+    defer pairs.deinit(allocator);
+
+    const boundaries = [_]MultiplicationPair{
+        .{ .lhs = 0x0000_0000, .rhs = 0x3f80_0000 },
+        .{ .lhs = 0x3fc0_0000, .rhs = 0x0000_0000 },
+        .{ .lhs = 0x0000_0001, .rhs = 0x3f80_0000 },
+        .{ .lhs = 0x007f_ffff, .rhs = 0x3f80_0000 },
+        .{ .lhs = 0x0080_0000, .rhs = 0x3f80_0000 },
+        .{ .lhs = 0x0080_0001, .rhs = 0x3f80_0000 },
+        .{ .lhs = 0x0080_0000, .rhs = 0x3400_0000 },
+        .{ .lhs = 0x0080_0000, .rhs = 0x337f_ffff },
+        .{ .lhs = 0x0080_0000, .rhs = 0x3380_0000 },
+        .{ .lhs = 0x0080_0000, .rhs = 0x3380_0001 },
+        .{ .lhs = 0x007f_ffff, .rhs = 0x3f7f_ffff },
+        .{ .lhs = 0x007f_ffff, .rhs = 0x3f80_0000 },
+        .{ .lhs = 0x007f_ffff, .rhs = 0x3f80_0001 },
+        .{ .lhs = 0x7f7f_ffff, .rhs = 0x3f7f_ffff },
+        .{ .lhs = 0x7f7f_ffff, .rhs = 0x3f80_0000 },
+        .{ .lhs = 0x7f7f_ffff, .rhs = 0x3f80_0001 },
+        .{ .lhs = 0x7f00_0000, .rhs = 0x3fff_fffe },
+        .{ .lhs = 0x7f00_0000, .rhs = 0x3fff_ffff },
+        .{ .lhs = 0x7f00_0000, .rhs = 0x4000_0000 },
+        .{ .lhs = 0x7f00_0000, .rhs = 0x4000_0001 },
+        .{ .lhs = 0x7f80_0000, .rhs = 0x0000_0000 },
+        .{ .lhs = 0x7f80_0000, .rhs = 0x3f80_0000 },
+        .{ .lhs = 0x7f80_0001, .rhs = 0x3f80_0000 },
+        .{ .lhs = 0x7fc0_1234, .rhs = 0x3f80_0000 },
+    };
+    for (boundaries) |pair| try appendSignedMultiplicationPair(&pairs, allocator, pair);
+    const order_pairs = try appendNvFp4MultiplicationPairs(&pairs, allocator);
+
+    for (boundaries) |pair| {
+        try testing.expect(containsMultiplicationPair(pairs.items, pair));
+        try testing.expect(containsMultiplicationPair(pairs.items, .{ .lhs = pair.lhs ^ 0x8000_0000, .rhs = pair.rhs }));
+        try testing.expect(containsMultiplicationPair(pairs.items, .{ .lhs = pair.lhs, .rhs = pair.rhs ^ 0x8000_0000 }));
+        try testing.expect(containsMultiplicationPair(pairs.items, .{ .lhs = pair.lhs ^ 0x8000_0000, .rhs = pair.rhs ^ 0x8000_0000 }));
+    }
+    for (order_pairs) |pair| try testing.expect(containsMultiplicationPair(pairs.items, pair));
+    try testing.expectEqual(boundaries.len * 4 + order_pairs.len, pairs.items.len);
+
+    var func = try buildF32BinaryKernel(allocator, .mul);
+    defer func.deinit();
+    var h = try Harness.open();
+    defer h.deinit();
+    var launch = try h.compile(&func, runner_abi);
+    defer launch.deinit();
+
+    const lhs_offset: usize = 12;
+    const rhs_offset: usize = 20;
+    const output_offset: usize = 28;
+    const active_bytes = pairs.items.len * @sizeOf(u32);
+    var lhs = try guardedBuffer(&h, lhs_offset, active_bytes);
+    var rhs = try guardedBuffer(&h, rhs_offset, active_bytes);
+    var output = try guardedBuffer(&h, output_offset, active_bytes);
+    for (pairs.items, 0..) |pair, index| {
+        std.mem.writeInt(u32, lhs.bytes[lhs_offset + index * 4 ..][0..4], pair.lhs, .little);
+        std.mem.writeInt(u32, rhs.bytes[rhs_offset + index * 4 ..][0..4], pair.rhs, .little);
+    }
+
+    launch.setPtr(launch.kernel.launch.params[0].offset, output.va + output_offset);
+    launch.setPtr(launch.kernel.launch.params[1].offset, lhs.va + lhs_offset);
+    launch.setPtr(launch.kernel.launch.params[2].offset, rhs.va + rhs_offset);
+    try launch.run(.{ @intCast(pairs.items.len), 1, 1 });
+
+    for (pairs.items, 0..) |pair, index| {
+        const expected = @as(f32, @bitCast(pair.lhs)) * @as(f32, @bitCast(pair.rhs));
+        const actual_bits = output.read(u32, output_offset / 4 + index);
+        const actual: f32 = @bitCast(actual_bits);
+        if (std.math.isNan(expected)) {
+            try testing.expect(std.math.isNan(actual));
+        } else {
+            try testing.expectEqual(@as(u32, @bitCast(expected)), actual_bits);
+        }
+    }
+    try expectGuard(lhs, lhs_offset, active_bytes);
+    try expectGuard(rhs, rhs_offset, active_bytes);
+    try expectGuard(output, output_offset, active_bytes);
+}
+
+test "live: NVIDIA exact f32 division matches the shared adversarial corpus" {
+    const allocator = testing.allocator;
+    var corpus = try division_cases.build(allocator);
+    defer corpus.deinit();
+
+    var func = try buildF32BinaryKernel(allocator, .div);
+    defer func.deinit();
+    var h = try Harness.open();
+    defer h.deinit();
+    var launch = try h.compile(&func, runner_abi);
+    defer launch.deinit();
+    var unfused_launch = try h.compileOpts(&func, runner_abi, .{ .contract_fma = false });
+    defer unfused_launch.deinit();
+    try h.ensureCodeCapacity(launch.kernel.code.len * @sizeOf(u32));
+    try h.ensureCodeCapacity(unfused_launch.kernel.code.len * @sizeOf(u32));
+
+    const numerator_offset: usize = 12;
+    const denominator_offset: usize = 20;
+    const output_offset: usize = 28;
+    const active_bytes = corpus.pairs.len * @sizeOf(u32);
+    var numerators = try guardedBuffer(&h, numerator_offset, active_bytes);
+    var denominators = try guardedBuffer(&h, denominator_offset, active_bytes);
+    var output = try guardedBuffer(&h, output_offset, active_bytes);
+    var unfused_output = try guardedBuffer(&h, output_offset, active_bytes);
+    for (corpus.pairs, 0..) |pair, index| {
+        std.mem.writeInt(u32, numerators.bytes[numerator_offset + index * 4 ..][0..4], pair.numerator, .little);
+        std.mem.writeInt(u32, denominators.bytes[denominator_offset + index * 4 ..][0..4], pair.denominator, .little);
+    }
+
+    launch.setPtr(launch.kernel.launch.params[0].offset, output.va + output_offset);
+    launch.setPtr(launch.kernel.launch.params[1].offset, numerators.va + numerator_offset);
+    launch.setPtr(launch.kernel.launch.params[2].offset, denominators.va + denominator_offset);
+    try launch.run(.{ @intCast(corpus.pairs.len), 1, 1 });
+    unfused_launch.setPtr(unfused_launch.kernel.launch.params[0].offset, unfused_output.va + output_offset);
+    unfused_launch.setPtr(unfused_launch.kernel.launch.params[1].offset, numerators.va + numerator_offset);
+    unfused_launch.setPtr(unfused_launch.kernel.launch.params[2].offset, denominators.va + denominator_offset);
+    try unfused_launch.run(.{ @intCast(corpus.pairs.len), 1, 1 });
+
+    for (corpus.pairs, 0..) |pair, index| {
+        const expected = @as(f32, @bitCast(pair.numerator)) / @as(f32, @bitCast(pair.denominator));
+        const actual_bits = output.read(u32, output_offset / 4 + index);
+        const unfused_bits = unfused_output.read(u32, output_offset / 4 + index);
+        try testing.expectEqual(actual_bits, unfused_bits);
+        const actual: f32 = @bitCast(actual_bits);
+        if (std.math.isNan(expected)) {
+            try testing.expect(std.math.isNan(actual));
+        } else {
+            const Observation = struct { numerator: u32, denominator: u32, result: u32 };
+            try testing.expectEqual(
+                Observation{ .numerator = pair.numerator, .denominator = pair.denominator, .result = @bitCast(expected) },
+                Observation{ .numerator = pair.numerator, .denominator = pair.denominator, .result = actual_bits },
+            );
+        }
+    }
+    try expectGuard(numerators, numerator_offset, active_bytes);
+    try expectGuard(denominators, denominator_offset, active_bytes);
+    try expectGuard(output, output_offset, active_bytes);
+    try expectGuard(unfused_output, output_offset, active_bytes);
+}
+
+fn buildNvFp4BufferKernel(
+    allocator: std.mem.Allocator,
+    dequantize: bool,
+    block_application: ir.nvfp4.ScaleApplication,
+    global_application: ir.nvfp4.ScaleApplication,
+) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const out = try func.appendBlockParam(b, ptr_t);
+    const values = try func.appendBlockParam(b, ptr_t);
+    const blocks = try func.appendBlockParam(b, ptr_t);
+    const globals = try func.appendBlockParam(b, ptr_t);
+    const gid = try func.appendBlockParam(b, u32_t);
+    try gpu_abi.attrs.setBuiltin(&func, gid, .global_id_x);
+
+    const byte = try binImm(&func, b, u32_t, .mul, gid, 4);
+    const payload_byte = if (dequantize) gid else byte;
+    const value = try func.appendInst(b, if (dequantize) u8_t else f32_t, .{ .load = .{
+        .ptr = try ptrAddVal(&func, b, ptr_t, values, payload_byte),
+    } });
+    const block_scale = try func.appendInst(b, u8_t, .{ .load = .{
+        .ptr = try ptrAddVal(&func, b, ptr_t, blocks, gid),
+    } });
+    const global_scale = try func.appendInst(b, f32_t, .{ .load = .{
+        .ptr = try ptrAddVal(&func, b, ptr_t, globals, byte),
+    } });
+    const conversion: ir.function.NvFp4Convert = .{
+        .value = value,
+        .block_scale = block_scale,
+        .global_scale = global_scale,
+        .block_application = block_application,
+        .global_application = global_application,
+    };
+    const converted = try func.appendInst(b, if (dequantize) f32_t else u8_t, if (dequantize)
+        .{ .dequantize_nvfp4 = conversion }
+    else
+        .{ .quantize_nvfp4 = conversion });
+    const result = if (dequantize)
+        try func.appendInst(b, u32_t, .{ .unary = .{ .op = .reinterpret, .value = converted } })
+    else
+        converted;
+    const output_byte = if (dequantize) try binImm(&func, b, u32_t, .mul, gid, 4) else gid;
+    try func.appendStore(b, result, try ptrAddVal(&func, b, ptr_t, out, output_byte));
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+fn buildReorderedNvFp4BufferKernel(
+    allocator: std.mem.Allocator,
+    dequantize: bool,
+    block_application: ir.nvfp4.ScaleApplication,
+    global_application: ir.nvfp4.ScaleApplication,
+) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const out = try func.appendBlockParam(b, ptr_t);
+    const values = try func.appendBlockParam(b, ptr_t);
+    const blocks = try func.appendBlockParam(b, ptr_t);
+    const globals = try func.appendBlockParam(b, ptr_t);
+    const gid = try func.appendBlockParam(b, u32_t);
+    try gpu_abi.attrs.setBuiltin(&func, gid, .global_id_x);
+
+    const byte = try binImm(&func, b, u32_t, .mul, gid, 4);
+    const payload_byte = if (dequantize) gid else byte;
+    const value = try func.appendInst(b, if (dequantize) u8_t else f32_t, .{ .load = .{
+        .ptr = try ptrAddVal(&func, b, ptr_t, values, payload_byte),
+    } });
+    const block_payload = try func.appendInst(b, u8_t, .{ .load = .{
+        .ptr = try ptrAddVal(&func, b, ptr_t, blocks, gid),
+    } });
+    const global_scale = try func.appendInst(b, f32_t, .{ .load = .{
+        .ptr = try ptrAddVal(&func, b, ptr_t, globals, byte),
+    } });
+    const block_scale = try func.appendInst(b, f32_t, .{ .decode_low_float = .{ .format = .f8_e4m3, .value = block_payload } });
+    const unit_payload = try func.appendInst(b, u8_t, .{ .iconst = 0x38 });
+    const unit_scale = try func.appendInst(b, f32_t, .{ .fconst = 1.0 });
+    const result = if (dequantize) result: {
+        const global_first = try func.appendInst(b, f32_t, .{ .dequantize_nvfp4 = .{
+            .value = value,
+            .block_scale = unit_payload,
+            .global_scale = global_scale,
+            .block_application = .multiply,
+            .global_application = global_application,
+        } });
+        const reordered = try bin(&func, b, f32_t, if (block_application == .multiply) .mul else .div, global_first, block_scale);
+        break :result try func.appendInst(b, u32_t, .{ .unary = .{ .op = .reinterpret, .value = reordered } });
+    } else result: {
+        const block_first = try bin(&func, b, f32_t, if (block_application == .multiply) .div else .mul, value, block_scale);
+        const global_second = try bin(&func, b, f32_t, if (global_application == .multiply) .div else .mul, block_first, global_scale);
+        break :result try func.appendInst(b, u8_t, .{ .quantize_nvfp4 = .{
+            .value = global_second,
+            .block_scale = unit_payload,
+            .global_scale = unit_scale,
+            .block_application = .divide,
+            .global_application = .divide,
+        } });
+    };
+    const output_byte = if (dequantize) try binImm(&func, b, u32_t, .mul, gid, 4) else gid;
+    try func.appendStore(b, result, try ptrAddVal(&func, b, ptr_t, out, output_byte));
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+fn runNvFp4BufferControl(
+    allocator: std.mem.Allocator,
+    h: *Harness,
+    dequantize: bool,
+    reordered: bool,
+    value_bits: u32,
+    block_payload: u8,
+    global_bits: u32,
+    block_application: ir.nvfp4.ScaleApplication,
+    global_application: ir.nvfp4.ScaleApplication,
+) !u32 {
+    var func = if (reordered)
+        try buildReorderedNvFp4BufferKernel(allocator, dequantize, block_application, global_application)
+    else
+        try buildNvFp4BufferKernel(allocator, dequantize, block_application, global_application);
+    defer func.deinit();
+    var launch = try h.compile(&func, runner_abi);
+    defer launch.deinit();
+    try h.ensureCodeCapacity(launch.kernel.code.len * @sizeOf(u32));
+
+    const value_offset: usize = if (dequantize) 3 else 12;
+    const block_offset: usize = 5;
+    const global_offset: usize = 12;
+    const output_offset: usize = 20;
+    const value_bytes: usize = if (dequantize) 1 else 4;
+    const output_bytes: usize = if (dequantize) 4 else 1;
+    var value = try guardedBuffer(h, value_offset, value_bytes);
+    var block = try guardedBuffer(h, block_offset, 1);
+    var global = try guardedBuffer(h, global_offset, 4);
+    var output = try guardedBuffer(h, output_offset, output_bytes);
+    if (dequantize)
+        value.bytes[value_offset] = @truncate(value_bits)
+    else
+        std.mem.writeInt(u32, value.bytes[value_offset..][0..4], value_bits, .little);
+    block.bytes[block_offset] = block_payload;
+    std.mem.writeInt(u32, global.bytes[global_offset..][0..4], global_bits, .little);
+    launch.setPtr(launch.kernel.launch.params[0].offset, output.va + output_offset);
+    launch.setPtr(launch.kernel.launch.params[1].offset, value.va + value_offset);
+    launch.setPtr(launch.kernel.launch.params[2].offset, block.va + block_offset);
+    launch.setPtr(launch.kernel.launch.params[3].offset, global.va + global_offset);
+    try launch.run(.{ 1, 1, 1 });
+
+    const result: u32 = if (dequantize) output.read(u32, output_offset / 4) else output.read(u8, output_offset);
+    try expectGuard(value, value_offset, value_bytes);
+    try expectGuard(block, block_offset, 1);
+    try expectGuard(global, global_offset, 4);
+    try expectGuard(output, output_offset, output_bytes);
+    return result;
+}
+
+fn nvFp4QuantizeValues(allocator: std.mem.Allocator) ![]u32 {
+    var values: std.ArrayList(u32) = .empty;
+    errdefer values.deinit(allocator);
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(allocator);
+    for (0..16) |payload| try appendUnique(@bitCast(ir.nvfp4.decodeE2M1(@intCast(payload))), &seen, &values, allocator);
+    const midpoints = [_]u32{ 0x3e80_0000, 0x3f40_0000, 0x3fa0_0000, 0x3fe0_0000, 0x4020_0000, 0x4060_0000, 0x40a0_0000 };
+    for (midpoints) |midpoint| inline for (.{ @as(u32, 0), @as(u32, 0x8000_0000) }) |sign| {
+        try appendTriplet(midpoint | sign, &seen, &values, allocator);
+    };
+    const specials = [_]u32{
+        0x0000_0000, 0x8000_0000, 0x0000_0001, 0x8000_0001,
+        0x007f_ffff, 0x807f_ffff, 0x0080_0000, 0x8080_0000,
+        0x7f7f_ffff, 0xff7f_ffff, 0x7f80_0000, 0xff80_0000,
+        0x7f80_0001, 0xff80_0001, 0x7fc0_1234, 0xffc0_1234,
+    };
+    for (specials) |bits| try appendUnique(bits, &seen, &values, allocator);
+
+    for (0..16) |payload| try testing.expect(seen.contains(@bitCast(ir.nvfp4.decodeE2M1(@intCast(payload)))));
+    for (midpoints) |midpoint| inline for (.{ @as(u32, 0), @as(u32, 0x8000_0000) }) |sign| {
+        try expectCorpusTriplet(&seen, midpoint | sign);
+    };
+    for (specials) |bits| try testing.expect(seen.contains(bits));
+    return values.toOwnedSlice(allocator);
+}
+
+test "live: NVIDIA NVFP4 conversion matches exhaustive scales and quantization boundaries" {
+    const allocator = testing.allocator;
+    const policies = [_]ir.nvfp4.ScaleApplication{ .multiply, .divide };
+    const dequant_globals = [_]u32{ 0x0000_0000, 0x8000_0000, 0x3f00_0000, 0xbf80_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_1234 };
+    const quant_blocks = [_]u8{ 0x00, 0xb8, 0x7e, 0x7f };
+    const quant_globals = [_]u32{ 0x0000_0000, 0x8000_0000, 0xbf80_0000, 0x3f00_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_1234 };
+    const quant_values = try nvFp4QuantizeValues(allocator);
+    defer allocator.free(quant_values);
+    try testing.expectEqual(@as(usize, 7), dequant_globals.len);
+    try testing.expectEqual(@as(usize, 4), quant_blocks.len);
+    try testing.expectEqual(@as(usize, 7), quant_globals.len);
+
+    var h = try Harness.open();
+    defer h.deinit();
+    inline for (policies) |block_application| inline for (policies) |global_application| {
+        const dequant_count = 256 * 256 * dequant_globals.len;
+        const carrier_offset: usize = 3;
+        const block_offset: usize = 5;
+        const global_offset: usize = 12;
+        const dequant_output_offset: usize = 20;
+        var carriers = try guardedBuffer(&h, carrier_offset, dequant_count);
+        var blocks = try guardedBuffer(&h, block_offset, dequant_count);
+        var globals = try guardedBuffer(&h, global_offset, dequant_count * 4);
+        var dequant_output = try guardedBuffer(&h, dequant_output_offset, dequant_count * 4);
+        var at: usize = 0;
+        for (dequant_globals) |global| for (0..256) |block| for (0..256) |carrier| {
+            carriers.bytes[carrier_offset + at] = @intCast(carrier);
+            blocks.bytes[block_offset + at] = @intCast(block);
+            std.mem.writeInt(u32, globals.bytes[global_offset + at * 4 ..][0..4], global, .little);
+            at += 1;
+        };
+        try testing.expectEqual(dequant_count, at);
+
+        var dequant_func = try buildNvFp4BufferKernel(allocator, true, block_application, global_application);
+        defer dequant_func.deinit();
+        var dequant_launch = try h.compile(&dequant_func, runner_abi);
+        defer dequant_launch.deinit();
+        try h.ensureCodeCapacity(dequant_launch.kernel.code.len * @sizeOf(u32));
+        const batch_count: usize = 32 * 1024;
+        var batch_start: usize = 0;
+        while (batch_start < dequant_count) : (batch_start += batch_count) {
+            const count = @min(batch_count, dequant_count - batch_start);
+            dequant_launch.setPtr(dequant_launch.kernel.launch.params[0].offset, dequant_output.va + dequant_output_offset + batch_start * 4);
+            dequant_launch.setPtr(dequant_launch.kernel.launch.params[1].offset, carriers.va + carrier_offset + batch_start);
+            dequant_launch.setPtr(dequant_launch.kernel.launch.params[2].offset, blocks.va + block_offset + batch_start);
+            dequant_launch.setPtr(dequant_launch.kernel.launch.params[3].offset, globals.va + global_offset + batch_start * 4);
+            try dequant_launch.run(.{ @intCast(count), 1, 1 });
+        }
+
+        at = 0;
+        for (dequant_globals) |global| for (0..256) |block| for (0..256) |carrier| {
+            const expected = ir.nvfp4.dequantize(@intCast(carrier), @intCast(block), @bitCast(global), block_application, global_application);
+            const actual_bits = dequant_output.read(u32, dequant_output_offset / 4 + at);
+            const actual: f32 = @bitCast(actual_bits);
+            if (std.math.isNan(expected)) {
+                try testing.expect(std.math.isNan(actual));
+            } else {
+                try testing.expectEqual(@as(u32, @bitCast(expected)), actual_bits);
+            }
+            at += 1;
+        };
+        try expectGuard(carriers, carrier_offset, dequant_count);
+        try expectGuard(blocks, block_offset, dequant_count);
+        try expectGuard(globals, global_offset, dequant_count * 4);
+        try expectGuard(dequant_output, dequant_output_offset, dequant_count * 4);
+
+        const quant_count = quant_values.len * quant_blocks.len * quant_globals.len;
+        const value_offset: usize = 12;
+        const quant_block_offset: usize = 5;
+        const quant_global_offset: usize = 20;
+        const quant_output_offset: usize = 3;
+        var values = try guardedBuffer(&h, value_offset, quant_count * 4);
+        var quant_block_buffer = try guardedBuffer(&h, quant_block_offset, quant_count);
+        var quant_global_buffer = try guardedBuffer(&h, quant_global_offset, quant_count * 4);
+        var quant_output = try guardedBuffer(&h, quant_output_offset, quant_count);
+        at = 0;
+        for (quant_globals) |global| for (quant_blocks) |block| for (quant_values) |value| {
+            std.mem.writeInt(u32, values.bytes[value_offset + at * 4 ..][0..4], value, .little);
+            quant_block_buffer.bytes[quant_block_offset + at] = block;
+            std.mem.writeInt(u32, quant_global_buffer.bytes[quant_global_offset + at * 4 ..][0..4], global, .little);
+            at += 1;
+        };
+        try testing.expectEqual(quant_count, at);
+
+        var quant_func = try buildNvFp4BufferKernel(allocator, false, block_application, global_application);
+        defer quant_func.deinit();
+        var quant_launch = try h.compile(&quant_func, runner_abi);
+        defer quant_launch.deinit();
+        try h.ensureCodeCapacity(quant_launch.kernel.code.len * @sizeOf(u32));
+        quant_launch.setPtr(quant_launch.kernel.launch.params[0].offset, quant_output.va + quant_output_offset);
+        quant_launch.setPtr(quant_launch.kernel.launch.params[1].offset, values.va + value_offset);
+        quant_launch.setPtr(quant_launch.kernel.launch.params[2].offset, quant_block_buffer.va + quant_block_offset);
+        quant_launch.setPtr(quant_launch.kernel.launch.params[3].offset, quant_global_buffer.va + quant_global_offset);
+        try quant_launch.run(.{ @intCast(quant_count), 1, 1 });
+
+        at = 0;
+        for (quant_globals) |global| for (quant_blocks) |block| for (quant_values) |value| {
+            const expected = ir.nvfp4.quantize(@bitCast(value), block, @bitCast(global), block_application, global_application);
+            try testing.expectEqual(expected, quant_output.read(u8, quant_output_offset + at));
+            at += 1;
+        };
+        try expectGuard(values, value_offset, quant_count * 4);
+        try expectGuard(quant_block_buffer, quant_block_offset, quant_count);
+        try expectGuard(quant_global_buffer, quant_global_offset, quant_count * 4);
+        try expectGuard(quant_output, quant_output_offset, quant_count);
+    };
+}
+
+fn applyNvFp4Scale(value: f32, scale: f32, application: ir.nvfp4.ScaleApplication) f32 {
+    return if (application == .multiply) value * scale else value / scale;
+}
+
+fn undoNvFp4Scale(value: f32, scale: f32, application: ir.nvfp4.ScaleApplication) f32 {
+    return if (application == .multiply) value / scale else value * scale;
+}
+
+fn runF32BinaryControl(allocator: std.mem.Allocator, h: *Harness, lhs_bits: u32, rhs_bits: u32, op: ir.function.BinOp) !u32 {
+    var func = try buildF32BinaryKernel(allocator, op);
+    defer func.deinit();
+    var launch = try h.compile(&func, runner_abi);
+    defer launch.deinit();
+    try h.ensureCodeCapacity(launch.kernel.code.len * @sizeOf(u32));
+
+    const lhs_offset: usize = 12;
+    const rhs_offset: usize = 20;
+    const output_offset: usize = 28;
+    var lhs = try guardedBuffer(h, lhs_offset, 4);
+    var rhs = try guardedBuffer(h, rhs_offset, 4);
+    var output = try guardedBuffer(h, output_offset, 4);
+    std.mem.writeInt(u32, lhs.bytes[lhs_offset..][0..4], lhs_bits, .little);
+    std.mem.writeInt(u32, rhs.bytes[rhs_offset..][0..4], rhs_bits, .little);
+    launch.setPtr(launch.kernel.launch.params[0].offset, output.va + output_offset);
+    launch.setPtr(launch.kernel.launch.params[1].offset, lhs.va + lhs_offset);
+    launch.setPtr(launch.kernel.launch.params[2].offset, rhs.va + rhs_offset);
+    try launch.run(.{ 1, 1, 1 });
+    const result = output.read(u32, output_offset / 4);
+    try expectGuard(lhs, lhs_offset, 4);
+    try expectGuard(rhs, rhs_offset, 4);
+    try expectGuard(output, output_offset, 4);
+    return result;
+}
+
+fn runNvFp4UnitQuantizeControl(allocator: std.mem.Allocator, h: *Harness, value_bits: u32) !u8 {
+    var func = try buildNvFp4BufferKernel(allocator, false, .divide, .divide);
+    defer func.deinit();
+    var launch = try h.compile(&func, runner_abi);
+    defer launch.deinit();
+    try h.ensureCodeCapacity(launch.kernel.code.len * @sizeOf(u32));
+
+    const value_offset: usize = 12;
+    const block_offset: usize = 5;
+    const global_offset: usize = 20;
+    const output_offset: usize = 3;
+    var value = try guardedBuffer(h, value_offset, 4);
+    var block = try guardedBuffer(h, block_offset, 1);
+    var global = try guardedBuffer(h, global_offset, 4);
+    var output = try guardedBuffer(h, output_offset, 1);
+    std.mem.writeInt(u32, value.bytes[value_offset..][0..4], value_bits, .little);
+    block.bytes[block_offset] = 0x38;
+    std.mem.writeInt(u32, global.bytes[global_offset..][0..4], 0x3f80_0000, .little);
+    launch.setPtr(launch.kernel.launch.params[0].offset, output.va + output_offset);
+    launch.setPtr(launch.kernel.launch.params[1].offset, value.va + value_offset);
+    launch.setPtr(launch.kernel.launch.params[2].offset, block.va + block_offset);
+    launch.setPtr(launch.kernel.launch.params[3].offset, global.va + global_offset);
+    try launch.run(.{ 1, 1, 1 });
+    const result = output.read(u8, output_offset);
+    try expectGuard(value, value_offset, 4);
+    try expectGuard(block, block_offset, 1);
+    try expectGuard(global, global_offset, 4);
+    try expectGuard(output, output_offset, 1);
+    return result;
+}
+
+test "live: NVIDIA NVFP4 preserves canonical scale order against reordered controls" {
+    const allocator = testing.allocator;
+    const policies = [_]ir.nvfp4.ScaleApplication{ .multiply, .divide };
+    const dequantize_cases = [_]struct { payload: u8, block_scale: u8, global_bits: u32, block: ir.nvfp4.ScaleApplication, global: ir.nvfp4.ScaleApplication, expected: u32, reordered: u32 }{
+        .{ .payload = 0x03, .block_scale = 0x03, .global_bits = 0x3e00_0001, .block = .multiply, .global = .multiply, .expected = 0x3a90_0001, .reordered = 0x3a90_0002 },
+        .{ .payload = 0x01, .block_scale = 0x03, .global_bits = 0x3e00_0001, .block = .multiply, .global = .divide, .expected = 0x3cbf_ffff, .reordered = 0x3cbf_fffe },
+        .{ .payload = 0x01, .block_scale = 0x05, .global_bits = 0x3e00_0001, .block = .divide, .global = .multiply, .expected = 0x40cc_cccf, .reordered = 0x40cc_ccce },
+        .{ .payload = 0x01, .block_scale = 0x03, .global_bits = 0x3e00_0001, .block = .divide, .global = .divide, .expected = 0x442a_aaaa, .reordered = 0x442a_aaa9 },
+    };
+    const quantize_cases = [_]struct { value_bits: u32, block_scale: u8, global_bits: u32, block: ir.nvfp4.ScaleApplication, global: ir.nvfp4.ScaleApplication, expected: u8, reordered: u8 }{
+        .{ .value_bits = 0x3e00_0522, .block_scale = 0x23, .global_bits = 0x3e54_d004, .block = .multiply, .global = .multiply, .expected = 0x06, .reordered = 0x05 },
+        .{ .value_bits = 0x3e00_154f, .block_scale = 0x0f, .global_bits = 0x3ed1_dd10, .block = .multiply, .global = .divide, .expected = 0x04, .reordered = 0x03 },
+        .{ .value_bits = 0x3e00_154f, .block_scale = 0x47, .global_bits = 0x3f20_1aa3, .block = .divide, .global = .multiply, .expected = 0x01, .reordered = 0x02 },
+        .{ .value_bits = 0x3e00_399b, .block_scale = 0x55, .global_bits = 0x3eeb_e49b, .block = .divide, .global = .divide, .expected = 0x01, .reordered = 0x02 },
+    };
+
+    for (dequantize_cases) |case| {
+        const block_scale = try ir.low_float.decode(.f8_e4m3, case.block_scale);
+        const global_scale: f32 = @bitCast(case.global_bits);
+        const canonical = ir.nvfp4.dequantize(case.payload, case.block_scale, global_scale, case.block, case.global);
+        const reordered = applyNvFp4Scale(applyNvFp4Scale(ir.nvfp4.decodeE2M1(case.payload), global_scale, case.global), block_scale, case.block);
+        try testing.expectEqual(case.expected, @as(u32, @bitCast(canonical)));
+        try testing.expectEqual(case.reordered, @as(u32, @bitCast(reordered)));
+        try testing.expect(case.expected != case.reordered);
+    }
+    for (quantize_cases) |case| {
+        const value: f32 = @bitCast(case.value_bits);
+        const block_scale = try ir.low_float.decode(.f8_e4m3, case.block_scale);
+        const global_scale: f32 = @bitCast(case.global_bits);
+        const canonical = ir.nvfp4.quantize(value, case.block_scale, global_scale, case.block, case.global);
+        const reordered = ir.nvfp4.encodeE2M1(undoNvFp4Scale(undoNvFp4Scale(value, block_scale, case.block), global_scale, case.global));
+        try testing.expectEqual(case.expected, canonical);
+        try testing.expectEqual(case.reordered, reordered);
+        try testing.expect(case.expected != case.reordered);
+    }
+
+    var h = try Harness.open();
+    defer h.deinit();
+    inline for (policies, 0..) |block_application, block_index| inline for (policies, 0..) |global_application, global_index| {
+        const case_index = block_index * policies.len + global_index;
+        const dequantize_case = dequantize_cases[case_index];
+        const quantize_case = quantize_cases[case_index];
+        try testing.expectEqual(block_application, dequantize_case.block);
+        try testing.expectEqual(global_application, dequantize_case.global);
+        try testing.expectEqual(block_application, quantize_case.block);
+        try testing.expectEqual(global_application, quantize_case.global);
+
+        const canonical_dequantize = try runNvFp4BufferControl(allocator, &h, true, false, dequantize_case.payload, dequantize_case.block_scale, dequantize_case.global_bits, block_application, global_application);
+        try testing.expectEqual(dequantize_case.expected, canonical_dequantize);
+        const reordered_dequantize = try runNvFp4BufferControl(allocator, &h, true, true, dequantize_case.payload, dequantize_case.block_scale, dequantize_case.global_bits, block_application, global_application);
+        try testing.expectEqual(dequantize_case.reordered, reordered_dequantize);
+
+        const canonical_quantize = try runNvFp4BufferControl(allocator, &h, false, false, quantize_case.value_bits, quantize_case.block_scale, quantize_case.global_bits, block_application, global_application);
+        try testing.expectEqual(@as(u32, quantize_case.expected), canonical_quantize);
+        const decoded_block_bits: u32 = @bitCast(try ir.low_float.decode(.f8_e4m3, quantize_case.block_scale));
+
+        const value: f32 = @bitCast(quantize_case.value_bits);
+        const block_scale: f32 = @bitCast(decoded_block_bits);
+        const global_scale: f32 = @bitCast(quantize_case.global_bits);
+        const expected_block_first = undoNvFp4Scale(value, block_scale, block_application);
+        const expected_global_second = undoNvFp4Scale(expected_block_first, global_scale, global_application);
+        const block_first_bits = try runF32BinaryControl(allocator, &h, quantize_case.value_bits, decoded_block_bits, if (block_application == .multiply) .div else .mul);
+        try testing.expectEqual(@as(u32, @bitCast(expected_block_first)), block_first_bits);
+        const global_second_bits = try runF32BinaryControl(allocator, &h, block_first_bits, quantize_case.global_bits, if (global_application == .multiply) .div else .mul);
+        try testing.expectEqual(@as(u32, @bitCast(expected_global_second)), global_second_bits);
+        const reordered_quantize_output = try runNvFp4UnitQuantizeControl(allocator, &h, global_second_bits);
+
+        const expected_global_first = undoNvFp4Scale(value, global_scale, global_application);
+        const expected_local_second = undoNvFp4Scale(expected_global_first, block_scale, block_application);
+        const global_first_bits = try runF32BinaryControl(allocator, &h, quantize_case.value_bits, quantize_case.global_bits, if (global_application == .multiply) .div else .mul);
+        try testing.expectEqual(@as(u32, @bitCast(expected_global_first)), global_first_bits);
+        const local_second_bits = try runF32BinaryControl(allocator, &h, global_first_bits, decoded_block_bits, if (block_application == .multiply) .div else .mul);
+        try testing.expectEqual(@as(u32, @bitCast(expected_local_second)), local_second_bits);
+        const canonical_unit_output = try runNvFp4UnitQuantizeControl(allocator, &h, local_second_bits);
+        try testing.expectEqual(quantize_case.expected, canonical_unit_output);
+        try testing.expectEqual(quantize_case.reordered, reordered_quantize_output);
+    };
+}
+
+fn buildNvFp4PackedMemoryKernel(allocator: std.mem.Allocator, element_count: usize) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const b = try func.appendBlock();
+    const packed_input = try func.appendBlockParam(b, ptr_t);
+    const scales = try func.appendBlockParam(b, ptr_t);
+    const globals = try func.appendBlockParam(b, ptr_t);
+    const decoded_output = try func.appendBlockParam(b, ptr_t);
+    const float_input = try func.appendBlockParam(b, ptr_t);
+    const packed_output = try func.appendBlockParam(b, ptr_t);
+    const global_scale = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = globals } });
+    for (0..element_count) |index| {
+        const packed_at = if (index < 2) packed_input else try func.appendArithImm(b, ptr_t, .add, packed_input, @intCast(index / 2));
+        const scale_at = if (index < 16) scales else try func.appendArithImm(b, ptr_t, .add, scales, @intCast(index / 16));
+        const packed_byte = try func.appendInst(b, u8_t, .{ .load = .{ .ptr = packed_at } });
+        const packed_wide = try func.appendInst(b, u32_t, .{ .convert = .{ .value = packed_byte } });
+        const positioned = if (index & 1 == 0) packed_wide else try func.appendArithImm(b, u32_t, .shr, packed_wide, 4);
+        const nibble_wide = try func.appendArithImm(b, u32_t, .bit_and, positioned, 0x0f);
+        const nibble = try func.appendInst(b, u8_t, .{ .convert = .{ .value = nibble_wide } });
+        const block_scale = try func.appendInst(b, u8_t, .{ .load = .{ .ptr = scale_at } });
+        const decoded = try func.appendInst(b, f32_t, .{ .dequantize_nvfp4 = .{
+            .value = nibble,
+            .block_scale = block_scale,
+            .global_scale = global_scale,
+            .block_application = .multiply,
+            .global_application = .divide,
+        } });
+        const decoded_at = if (index == 0) decoded_output else try func.appendArithImm(b, ptr_t, .add, decoded_output, @intCast(index * 4));
+        try func.appendStore(b, decoded, decoded_at);
+
+        const float_at = if (index == 0) float_input else try func.appendArithImm(b, ptr_t, .add, float_input, @intCast(index * 4));
+        const source = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = float_at } });
+        const encoded = try func.appendInst(b, u8_t, .{ .quantize_nvfp4 = .{
+            .value = source,
+            .block_scale = block_scale,
+            .global_scale = global_scale,
+            .block_application = .divide,
+            .global_application = .multiply,
+        } });
+        const encoded_wide = try func.appendInst(b, u32_t, .{ .convert = .{ .value = encoded } });
+        const output_at = if (index < 2) packed_output else try func.appendArithImm(b, ptr_t, .add, packed_output, @intCast(index / 2));
+        const old_byte = try func.appendInst(b, u8_t, .{ .load = .{ .ptr = output_at } });
+        const old_wide = try func.appendInst(b, u32_t, .{ .convert = .{ .value = old_byte } });
+        const preserved = try func.appendArithImm(b, u32_t, .bit_and, old_wide, if (index & 1 == 0) 0xf0 else 0x0f);
+        const placed = if (index & 1 == 0) encoded_wide else try func.appendArithImm(b, u32_t, .shl, encoded_wide, 4);
+        const combined = try bin(&func, b, u32_t, .bit_or, preserved, placed);
+        const output_byte = try func.appendInst(b, u8_t, .{ .convert = .{ .value = combined } });
+        try func.appendStore(b, output_byte, output_at);
+    }
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+test "live: NVIDIA NVFP4 packed memory crosses a scale block and preserves its tail sibling" {
+    const allocator = testing.allocator;
+    const element_count = 19;
+    const packed_count = (element_count + 1) / 2;
+    const packed_values = [_]u8{ 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x21, 0x43 };
+    const scale_values = [_]u8{ 0x39, 0xb8 };
+    const global_scale_bits: u32 = 0x3f40_0000;
+    const source_bits = [_]u32{
+        0x0000_0000, 0x8000_0000, 0x3e80_0000, 0x3e80_0001, 0x3f40_0000,
+        0x3f40_0001, 0x3fa0_0000, 0x3fa0_0001, 0x3fe0_0000, 0x4020_0000,
+        0x4060_0000, 0x40a0_0000, 0x7f7f_ffff, 0xff7f_ffff, 0x7f80_0000,
+        0xff80_0000, 0x7f80_0001, 0xff80_0001, 0x7fc0_1234,
+    };
+    try testing.expect(element_count > 16);
+    try testing.expect(element_count & 1 == 1);
+    try testing.expectEqual(element_count, source_bits.len);
+    try testing.expectEqual(packed_count, packed_values.len);
+    try testing.expectEqual(@as(u8, 0), packed_values[0] & 0x0f);
+    try testing.expectEqual(@as(u8, 1), packed_values[0] >> 4);
+    try testing.expect(scale_values[0] != scale_values[1]);
+
+    var func = try buildNvFp4PackedMemoryKernel(allocator, element_count);
+    defer func.deinit();
+    var h = try Harness.open();
+    defer h.deinit();
+    var launch = try h.compile(&func, runner_abi);
+    defer launch.deinit();
+    try h.ensureCodeCapacity(launch.kernel.code.len * @sizeOf(u32));
+
+    const packed_input_offset: usize = 3;
+    const scale_offset: usize = 5;
+    const global_offset: usize = 12;
+    const decoded_offset: usize = 20;
+    const float_offset: usize = 28;
+    const packed_output_offset: usize = 7;
+    var packed_input = try guardedBuffer(&h, packed_input_offset, packed_count);
+    var scales = try guardedBuffer(&h, scale_offset, scale_values.len);
+    var globals = try guardedBuffer(&h, global_offset, 4);
+    var decoded_output = try guardedBuffer(&h, decoded_offset, element_count * 4);
+    var float_input = try guardedBuffer(&h, float_offset, element_count * 4);
+    var packed_output = try guardedBuffer(&h, packed_output_offset, packed_count);
+    @memcpy(packed_input.bytes[packed_input_offset..][0..packed_count], &packed_values);
+    @memcpy(scales.bytes[scale_offset..][0..scale_values.len], &scale_values);
+    std.mem.writeInt(u32, globals.bytes[global_offset..][0..4], global_scale_bits, .little);
+    for (source_bits, 0..) |bits, index| {
+        std.mem.writeInt(u32, float_input.bytes[float_offset + index * 4 ..][0..4], bits, .little);
+    }
+
+    launch.setPtr(launch.kernel.launch.params[0].offset, packed_input.va + packed_input_offset);
+    launch.setPtr(launch.kernel.launch.params[1].offset, scales.va + scale_offset);
+    launch.setPtr(launch.kernel.launch.params[2].offset, globals.va + global_offset);
+    launch.setPtr(launch.kernel.launch.params[3].offset, decoded_output.va + decoded_offset);
+    launch.setPtr(launch.kernel.launch.params[4].offset, float_input.va + float_offset);
+    launch.setPtr(launch.kernel.launch.params[5].offset, packed_output.va + packed_output_offset);
+    try launch.run(.{ 1, 1, 1 });
+
+    var expected_output = [_]u8{low_float_guard} ** packed_count;
+    const global_scale: f32 = @bitCast(global_scale_bits);
+    for (0..element_count) |index| {
+        const payload = if (index & 1 == 0) packed_values[index / 2] & 0x0f else packed_values[index / 2] >> 4;
+        const scale = scale_values[index / 16];
+        const expected_decoded = ir.nvfp4.dequantize(payload, scale, global_scale, .multiply, .divide);
+        const actual_bits = decoded_output.read(u32, decoded_offset / 4 + index);
+        if (std.math.isNan(expected_decoded)) {
+            try testing.expect(std.math.isNan(@as(f32, @bitCast(actual_bits))));
+        } else {
+            try testing.expectEqual(@as(u32, @bitCast(expected_decoded)), actual_bits);
+        }
+        const encoded = ir.nvfp4.quantize(@bitCast(source_bits[index]), scale, global_scale, .divide, .multiply);
+        if (index & 1 == 0) {
+            expected_output[index / 2] = (expected_output[index / 2] & 0xf0) | encoded;
+        } else {
+            expected_output[index / 2] = (expected_output[index / 2] & 0x0f) | (encoded << 4);
+        }
+    }
+    try testing.expectEqualSlices(u8, &expected_output, packed_output.bytes[packed_output_offset..][0..packed_count]);
+    try testing.expectEqual(@as(u8, low_float_guard & 0xf0), packed_output.bytes[packed_output_offset + packed_count - 1] & 0xf0);
+    try expectGuard(packed_input, packed_input_offset, packed_count);
+    try expectGuard(scales, scale_offset, scale_values.len);
+    try expectGuard(globals, global_offset, 4);
+    try expectGuard(decoded_output, decoded_offset, element_count * 4);
+    try expectGuard(float_input, float_offset, element_count * 4);
+    try expectGuard(packed_output, packed_output_offset, packed_count);
 }
 
 fn appendUnique(bits: u32, seen: *std.AutoHashMapUnmanaged(u32, void), values: *std.ArrayList(u32), allocator: std.mem.Allocator) !void {

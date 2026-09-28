@@ -12,6 +12,7 @@ const disasm = @import("../disasm.zig");
 const link = @import("../link.zig");
 const jit = @import("../jit.zig");
 const encode = @import("../encode.zig");
+const division_cases = @import("../../tests/f32_division_cases.zig");
 
 const Function = ir.function.Function;
 
@@ -94,6 +95,63 @@ test "native low float conversions match exhaustive and structured references" {
     }
     try std.testing.expect(distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e4m3)][0] != distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e5m2)][0]);
     try std.testing.expect(distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e4m3)][1] != distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e5m2)][1]);
+}
+
+fn f32DivisionWrapper(allocator: std.mem.Allocator) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const numerator_bits = try func.appendBlockParam(block, u32_t);
+    const denominator_bits = try func.appendBlockParam(block, u32_t);
+    const numerator = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = numerator_bits } });
+    const denominator = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = denominator_bits } });
+    const quotient = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .div, .lhs = numerator, .rhs = denominator } });
+    const result = try func.appendInst(block, u32_t, .{ .unary = .{ .op = .reinterpret, .value = quotient } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    return func;
+}
+
+const F32DivisionBitsFn = *const fn (u32, u32) callconv(.c) u32;
+
+fn expectF32Division(divide: F32DivisionBitsFn, numerator_bits: u32, denominator_bits: u32) !void {
+    const numerator: f32 = @bitCast(numerator_bits);
+    const denominator: f32 = @bitCast(denominator_bits);
+    const expected = numerator / denominator;
+    const actual_bits = divide(numerator_bits, denominator_bits);
+    const actual: f32 = @bitCast(actual_bits);
+    if (std.math.isNan(expected)) {
+        try std.testing.expect(std.math.isNan(actual));
+    } else {
+        const Observation = struct { numerator: u32, denominator: u32, result: u32 };
+        try std.testing.expectEqual(
+            Observation{ .numerator = numerator_bits, .denominator = denominator_bits, .result = @bitCast(expected) },
+            Observation{ .numerator = numerator_bits, .denominator = denominator_bits, .result = actual_bits },
+        );
+    }
+}
+
+test "native expanded f32 division matches hardware across boundaries and random bits" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = try f32DivisionWrapper(allocator);
+    defer func.deinit();
+    try std.testing.expect(try ir.expand.expandF32Div(allocator, &func));
+    try std.testing.expect(!(try ir.expand.expandF32Div(allocator, &func)));
+    var diagnostics = try ir.verify.verify(allocator, &func, .low);
+    defer diagnostics.deinit();
+    try std.testing.expect(diagnostics.ok());
+
+    const words = try isel.selectFunction(allocator, &func);
+    defer allocator.free(words);
+    var buffer = try jit.CodeBuffer.map(std.mem.sliceAsBytes(words));
+    defer buffer.deinit();
+    const divide: F32DivisionBitsFn = @ptrCast(buffer.memory.ptr);
+
+    var corpus = try division_cases.build(allocator);
+    defer corpus.deinit();
+    for (corpus.pairs) |pair| try expectF32Division(divide, pair.numerator, pair.denominator);
 }
 
 /// Compile `func` to A64 and assert its disassembled listing equals `expected`. This round-trips

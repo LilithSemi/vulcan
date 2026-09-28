@@ -5,6 +5,9 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const cases = @import("cases.zig");
+const division_cases = @import("../../tests/f32_division_cases.zig");
+const emit = @import("../emit.zig");
+const encode = @import("../encode.zig");
 const harness = @import("harness.zig");
 const isel = @import("../isel.zig");
 
@@ -267,6 +270,173 @@ test "qemu-user-riscv nvfp4 production expansion executes with integer and float
             else => return err,
         };
         try std.testing.expectEqual(@as(i64, nvfp4PressureReference(input)), got);
+    }
+}
+
+fn appendU32Immediate(allocator: std.mem.Allocator, words: *std.ArrayList(u32), register: encode.Reg, value: u32) !void {
+    const high: u20 = @truncate((value +% 0x800) >> 12);
+    const low: i12 = @bitCast(@as(u12, @truncate(value)));
+    try words.append(allocator, encode.lui(register, high));
+    try words.append(allocator, encode.addi(register, register, low));
+}
+
+fn instructionOffset(from: usize, to: usize) i13 {
+    return @intCast((@as(isize, @intCast(to)) - @as(isize, @intCast(from))) * 4);
+}
+
+fn runDivisionBatch(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    division_code: []const u32,
+    pairs: []const division_cases.Pair,
+    first_corpus_index: u32,
+) !u64 {
+    std.debug.assert(pairs.len > 0);
+    std.debug.assert(pairs.len <= 16 * 1024);
+
+    var wrapper: std.ArrayList(u32) = .empty;
+    defer wrapper.deinit(allocator);
+
+    const data_address_index = wrapper.items.len;
+    try wrapper.append(allocator, encode.auipc(.x8, 0));
+    try wrapper.append(allocator, encode.addi(.x8, .x8, 0));
+    try appendU32Immediate(allocator, &wrapper, .x9, @intCast(pairs.len));
+    try appendU32Immediate(allocator, &wrapper, .x21, first_corpus_index);
+    try wrapper.append(allocator, encode.addi(.x18, .x0, 0));
+    try wrapper.append(allocator, encode.addi(.x19, .x0, 0));
+    try appendU32Immediate(allocator, &wrapper, .x22, 0x7f80_0000);
+    try appendU32Immediate(allocator, &wrapper, .x24, 0x7fc0_0000);
+
+    const loop_index = wrapper.items.len;
+    try wrapper.append(allocator, encode.lwu(.x10, .x8, 0));
+    try wrapper.append(allocator, encode.lwu(.x11, .x8, 4));
+    try wrapper.append(allocator, encode.lwu(.x20, .x8, 8));
+    const call_index = wrapper.items.len;
+    try wrapper.append(allocator, encode.jal(.x1, 0));
+    try wrapper.append(allocator, encode.slli(.x5, .x10, 33));
+    try wrapper.append(allocator, encode.srli(.x5, .x5, 33));
+    const nan_branch_index = wrapper.items.len;
+    try wrapper.append(allocator, encode.bltu(.x22, .x5, 0));
+    const mismatch_branch_index = wrapper.items.len;
+    try wrapper.append(allocator, encode.bne(.x10, .x20, 0));
+
+    const continue_index = wrapper.items.len;
+    try wrapper.append(allocator, encode.addi(.x8, .x8, 12));
+    try wrapper.append(allocator, encode.addi(.x9, .x9, -1));
+    try wrapper.append(allocator, encode.addi(.x21, .x21, 1));
+    try wrapper.append(allocator, encode.bne(.x9, .x0, instructionOffset(wrapper.items.len, loop_index)));
+    try wrapper.append(allocator, encode.slli(.x19, .x19, 32));
+    try wrapper.append(allocator, encode.or_(.x10, .x19, .x18));
+    try wrapper.append(allocator, encode.addi(.x2, .x2, -16));
+    try wrapper.append(allocator, encode.sd(.x10, .x2, 0));
+    try wrapper.append(allocator, encode.addi(.x10, .x0, 1));
+    try wrapper.append(allocator, encode.addi(.x11, .x2, 0));
+    try wrapper.append(allocator, encode.addi(.x12, .x0, 8));
+    try wrapper.append(allocator, encode.addi(.x17, .x0, 64));
+    try wrapper.append(allocator, encode.ecall());
+    try wrapper.append(allocator, encode.addi(.x10, .x0, 0));
+    try wrapper.append(allocator, encode.addi(.x17, .x0, 93));
+    try wrapper.append(allocator, encode.ecall());
+
+    const mismatch_index = wrapper.items.len;
+    try wrapper.append(allocator, encode.addi(.x18, .x18, 1));
+    try wrapper.append(allocator, encode.bne(.x19, .x0, instructionOffset(wrapper.items.len, continue_index)));
+    try wrapper.append(allocator, encode.addi(.x19, .x21, 0));
+    try wrapper.append(allocator, encode.jal(.x0, instructionOffset(wrapper.items.len, continue_index)));
+
+    const nan_index = wrapper.items.len;
+    try wrapper.append(allocator, encode.addi(.x10, .x24, 0));
+    try wrapper.append(allocator, encode.jal(.x0, instructionOffset(wrapper.items.len, mismatch_branch_index)));
+
+    const function_index = wrapper.items.len;
+    wrapper.items[call_index] = encode.jal(.x1, instructionOffset(call_index, function_index));
+    wrapper.items[nan_branch_index] = encode.bltu(.x22, .x5, instructionOffset(nan_branch_index, nan_index));
+    wrapper.items[mismatch_branch_index] = encode.bne(.x10, .x20, instructionOffset(mismatch_branch_index, mismatch_index));
+
+    var words: std.ArrayList(u32) = .empty;
+    defer words.deinit(allocator);
+    try words.appendSlice(allocator, wrapper.items);
+    try words.appendSlice(allocator, division_code);
+    const data_index = words.items.len;
+    const data_offset: i64 = @as(i64, @intCast((data_index - data_address_index) * 4));
+    const data_high: u20 = @intCast((data_offset + 0x800) >> 12);
+    const data_low: i12 = @intCast(data_offset - (@as(i64, data_high) << 12));
+    words.items[data_address_index] = encode.auipc(.x8, data_high);
+    words.items[data_address_index + 1] = encode.addi(.x8, .x8, data_low);
+
+    var image: std.ArrayList(u8) = .empty;
+    defer image.deinit(allocator);
+    const code_bytes = try emit.emitBytes(allocator, words.items);
+    defer allocator.free(code_bytes);
+    try image.appendSlice(allocator, code_bytes);
+    for (pairs) |pair| {
+        const numerator: f32 = @bitCast(pair.numerator);
+        const denominator: f32 = @bitCast(pair.denominator);
+        const reference = numerator / denominator;
+        const expected: u32 = if (std.math.isNan(reference)) 0x7fc0_0000 else @bitCast(reference);
+        var record: [12]u8 = undefined;
+        std.mem.writeInt(u32, record[0..4], pair.numerator, .little);
+        std.mem.writeInt(u32, record[4..8], pair.denominator, .little);
+        std.mem.writeInt(u32, record[8..12], expected, .little);
+        try image.appendSlice(allocator, &record);
+    }
+
+    const user_base: u64 = 0x10000;
+    const elf = try (@import("vulcan-link")).writeElfExec(.riscv64, allocator, image.items, image.items.len, user_base, user_base);
+    defer allocator.free(elf);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(io, .{ .sub_path = "firmware.elf", .data = elf, .flags = .{ .permissions = .executable_file } });
+    const arguments = try harness.qemu_user.buildArgv(allocator, "firmware.elf");
+    defer allocator.free(arguments);
+    const result = std.process.run(allocator, io, .{ .argv = arguments, .cwd = .{ .dir = temporary.dir } }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.stdout.len < 8) return error.BackendFailed;
+    return std.mem.readInt(u64, result.stdout[result.stdout.len - 8 ..][0..8], .little);
+}
+
+test "qemu-user-riscv executes shared audited exact f32 division corpus in bounded batches" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const numerator_bits = try func.appendBlockParam(block, u32_t);
+    const denominator_bits = try func.appendBlockParam(block, u32_t);
+    const numerator = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = numerator_bits } });
+    const denominator = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = denominator_bits } });
+    const quotient = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .div, .lhs = numerator, .rhs = denominator } });
+    const result = try func.appendInst(block, u32_t, .{ .unary = .{ .op = .reinterpret, .value = quotient } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    try std.testing.expect(try ir.expand.expandF32Div(allocator, &func));
+    var division_code = try harness.compileFunc(allocator, &func);
+    defer division_code.deinit(allocator);
+    var corpus = try division_cases.build(allocator);
+    defer corpus.deinit();
+    const batch_size = 16 * 1024;
+    var batch_start: usize = 0;
+    while (batch_start < corpus.pairs.len) : (batch_start += batch_size) {
+        const batch_end = @min(batch_start + batch_size, corpus.pairs.len);
+        const evidence = runDivisionBatch(
+            std.testing.io,
+            allocator,
+            division_code.items,
+            corpus.pairs[batch_start..batch_end],
+            @intCast(batch_start + 1),
+        ) catch |err| switch (err) {
+            error.SkipZigTest => return error.SkipZigTest,
+            else => return err,
+        };
+        const MismatchEvidence = struct { count: u32, first_corpus_index: u32 };
+        try std.testing.expectEqual(
+            MismatchEvidence{ .count = 0, .first_corpus_index = 0 },
+            MismatchEvidence{ .count = @truncate(evidence), .first_corpus_index = @truncate(evidence >> 32) },
+        );
     }
 }
 

@@ -38,6 +38,7 @@ pub const object_emit = @import("vulcan-target/object_emit.zig");
 
 /// Shared, target-independent Wimmer-Franz register allocator (target abstraction + algorithm).
 pub const wimmer = @import("vulcan-target/wimmer.zig");
+pub const f32_division_cases = @import("vulcan-target/tests/f32_division_cases.zig");
 
 /// Shared, target-independent address-mode-folding analysis (recognizer + dead-add analysis).
 pub const addrfold = @import("vulcan-target/addrfold.zig");

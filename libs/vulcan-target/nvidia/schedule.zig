@@ -1183,23 +1183,28 @@ fn isControlFlow(opcode: u32) bool {
     };
 }
 
-/// The latency of a COUPLED producer, in cycles, for the stall model. Two classes cover
-/// every coupled op this backend emits: the FMA pipe and everything else.
+/// The latency of a COUPLED producer, in cycles, for the stall model.
 ///
 /// THE VALUES ARE CALIBRATED AGAINST PTXAS OUTPUT, NOT DERIVED FROM A MANUAL. The FMA
-/// anchor is ptxas's own dependent chains on sm_120: a back-to-back pair carries stall 4
-/// and a four-accumulator chain carries stall 1, and both give a latency of 5. The ALU
-/// anchor is the integer half of the same streams: an IMAD whose result a LEA reads one
-/// instruction later carries stall 5, and ptxas k2n's IMAD.WIDE whose store reads it two
-/// instructions later carries stall 4, and both give a latency of 6. A first version of
-/// this model took 4 for the ALU class, and every hardware test with an integer address
-/// chain came back reading a stale register, which the RTX 5070 confirmed directly.
+/// FADD and FFMA use ptxas's dependent chains on sm_120: a back-to-back pair carries
+/// stall 4 and a four-accumulator chain carries stall 1, and both give a latency of 5.
+/// FMUL is one cycle longer on the RTX 5070. A back-to-back pair with stall 4 returned
+/// a stale first product under occupancy, while stall 5 made the exhaustive NVFP4 chain
+/// exact. Keep that measured distinction: folding FMUL back into the FMA class silently
+/// corrupts two ordered scale multiplications. The ALU anchor is the integer half of the
+/// same ptxas streams: an IMAD whose result a LEA reads one instruction later carries
+/// stall 5, and ptxas k2n's IMAD.WIDE whose store reads it two instructions later carries
+/// stall 4, and both give a latency of 6. A first version of this model took 4 for the ALU
+/// class, and every hardware test with an integer address chain came back reading a stale
+/// register, which the RTX 5070 confirmed directly.
+const coupled_fmul_latency: u32 = 6;
 const coupled_fma_latency: u32 = 5;
 const coupled_alu_latency: u32 = 6;
 
 fn coupledLatency(opcode: u32) u32 {
     return switch (opcode & 0x1ff) {
-        0x020, 0x021, 0x023 => coupled_fma_latency, // FMUL, FADD, FFMA
+        0x020 => coupled_fmul_latency, // FMUL
+        0x021, 0x023 => coupled_fma_latency, // FADD, FFMA
         else => coupled_alu_latency,
     };
 }
@@ -3500,6 +3505,26 @@ test "a tight dependent pair stalls more than an independent pair" {
     var indep = [_]Inst{
         encode.ffmaImm(4, 8, nine_tenths, 9, .{}),
         encode.ffmaImm(5, 20, nine_tenths, 9, .{}), // reads nothing in flight
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&indep, &.{0});
+    try std.testing.expectEqual(@as(u32, 1), getField(indep[0], 105, 4));
+    try std.testing.expectEqual(@as(u32, 1), getField(indep[1], 105, 4));
+}
+
+test "a dependent FMUL pair uses the measured six cycle latency" {
+    var dep = [_]Inst{
+        encode.fmul(8, 4, 5, .{}),
+        encode.fmul(9, 8, 6, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&dep, &.{0});
+    try std.testing.expectEqual(@as(u32, 5), getField(dep[0], 105, 4));
+    try std.testing.expectEqual(@as(u32, 1), getField(dep[1], 105, 4));
+
+    var indep = [_]Inst{
+        encode.fmul(8, 4, 5, .{}),
+        encode.fmul(9, 10, 11, .{}),
         encode.exit(.{}),
     };
     scheduleBlocks(&indep, &.{0});
