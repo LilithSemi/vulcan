@@ -220,6 +220,327 @@ fn bin(func: *Function, b: Block, ty: ir.types.Type, op: ir.function.BinOp, lhs:
     return func.appendInst(b, ty, .{ .arith = .{ .op = op, .lhs = lhs, .rhs = rhs } });
 }
 
+const low_float_guard: u8 = 0xa5;
+
+fn buildLowFloatBufferKernel(allocator: std.mem.Allocator, format: ir.low_float.Format, decode: bool) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const payload_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = format.payloadBits() } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const out = try func.appendBlockParam(b, ptr_t);
+    const input = try func.appendBlockParam(b, ptr_t);
+    const gid = try func.appendBlockParam(b, u32_t);
+    try gpu_abi.attrs.setBuiltin(&func, gid, .global_id_x);
+
+    const payload_bytes: i64 = @intCast(format.payloadBits() / 8);
+    const input_stride: i64 = if (decode) payload_bytes else 4;
+    const output_stride: i64 = if (decode) 4 else payload_bytes;
+    const input_byte = try binImm(&func, b, u32_t, .mul, gid, input_stride);
+    const output_byte = try binImm(&func, b, u32_t, .mul, gid, output_stride);
+    const source = try func.appendInst(b, if (decode) payload_t else f32_t, .{ .load = .{
+        .ptr = try ptrAddVal(&func, b, ptr_t, input, input_byte),
+    } });
+    const conversion: ir.function.LowFloatConvert = .{ .format = format, .value = source };
+    const result = try func.appendInst(b, if (decode) f32_t else payload_t, if (decode)
+        .{ .decode_low_float = conversion }
+    else
+        .{ .encode_low_float = conversion });
+    try func.appendStore(b, result, try ptrAddVal(&func, b, ptr_t, out, output_byte));
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+fn guardedBuffer(h: *Harness, active_offset: usize, active_bytes: usize) !compute.Buffer {
+    const buf = try h.alloc(@intCast(active_offset + active_bytes + 29));
+    @memset(buf.bytes, low_float_guard);
+    return buf;
+}
+
+fn expectGuard(buf: compute.Buffer, active_offset: usize, active_bytes: usize) !void {
+    const bytes: [*]const volatile u8 = @ptrCast(buf.bytes.ptr);
+    for (0..active_offset) |i| try testing.expectEqual(low_float_guard, bytes[i]);
+    for (active_offset + active_bytes..buf.bytes.len) |i| try testing.expectEqual(low_float_guard, bytes[i]);
+}
+
+fn appendUnique(bits: u32, seen: *std.AutoHashMapUnmanaged(u32, void), values: *std.ArrayList(u32), allocator: std.mem.Allocator) !void {
+    const gop = try seen.getOrPut(allocator, bits);
+    if (!gop.found_existing) try values.append(allocator, bits);
+}
+
+fn appendTriplet(center: u32, seen: *std.AutoHashMapUnmanaged(u32, void), values: *std.ArrayList(u32), allocator: std.mem.Allocator) !void {
+    try appendUnique(center -% 1, seen, values, allocator);
+    try appendUnique(center, seen, values, allocator);
+    try appendUnique(center +% 1, seen, values, allocator);
+}
+
+fn expectCorpusTriplet(seen: *const std.AutoHashMapUnmanaged(u32, void), center: u32) !void {
+    try testing.expect(seen.contains(center -% 1));
+    try testing.expect(seen.contains(center));
+    try testing.expect(seen.contains(center +% 1));
+}
+
+fn positiveFiniteMax(format: ir.low_float.Format) u16 {
+    return switch (format) {
+        .bf16 => 0x7f7f,
+        .f8_e4m3 => 0x007e,
+        .f8_e5m2 => 0x007b,
+    };
+}
+
+fn positiveMaxSubnormal(format: ir.low_float.Format) u16 {
+    return switch (format) {
+        .bf16 => 0x007f,
+        .f8_e4m3 => 0x0007,
+        .f8_e5m2 => 0x0003,
+    };
+}
+
+fn midpointBits(format: ir.low_float.Format, lower: u16, upper: u16) !u32 {
+    const lo: u32 = @bitCast(try ir.low_float.decode(format, lower));
+    const hi: u32 = @bitCast(try ir.low_float.decode(format, upper));
+    try testing.expect(lo < hi);
+    try testing.expect((hi - lo) & 1 == 0);
+    return lo + (hi - lo) / 2;
+}
+
+fn lowFloatEncodeCorpus(allocator: std.mem.Allocator, format: ir.low_float.Format) ![]u32 {
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(allocator);
+    var values: std.ArrayList(u32) = .empty;
+    errdefer values.deinit(allocator);
+
+    // Every f32 exponent field, five mantissas, and both signs. This also includes signed
+    // zero, infinities, and several signaling and quiet NaNs.
+    const mantissas = [_]u32{ 0, 1, 0x003f_ffff, 0x007f_fffe, 0x007f_ffff };
+    for (0..256) |exponent| {
+        for (mantissas) |mantissa| {
+            inline for (.{ @as(u32, 0), @as(u32, 0x8000_0000) }) |sign| {
+                try appendUnique(sign | (@as(u32, @intCast(exponent)) << 23) | mantissa, &seen, &values, allocator);
+            }
+        }
+    }
+
+    // Every adjacent pair of nonnegative finite destination values, with the exact f32
+    // midpoint and its immediate bit neighbours, then the sign-reflected three values.
+    const finite_max = positiveFiniteMax(format);
+    var interval_count: usize = 0;
+    var lower: u16 = 0;
+    while (lower < finite_max) : (lower += 1) {
+        const midpoint = try midpointBits(format, lower, lower + 1);
+        try appendTriplet(midpoint, &seen, &values, allocator);
+        try appendTriplet(midpoint | 0x8000_0000, &seen, &values, allocator);
+        interval_count += 1;
+    }
+    try testing.expectEqual(@as(usize, finite_max), interval_count);
+
+    // The committed shared boundary corpus is part of the live corpus too.
+    for (ir.low_float.bf16_encode_boundary_cases) |case| if (format == .bf16) {
+        try appendUnique(case.source, &seen, &values, allocator);
+    };
+    for (ir.low_float.e4_encode_boundary_cases) |case| if (format == .f8_e4m3) {
+        try appendUnique(case.source, &seen, &values, allocator);
+        try appendUnique(case.source | 0x8000_0000, &seen, &values, allocator);
+    };
+    for (ir.low_float.e5_encode_boundary_cases) |case| if (format == .f8_e5m2) {
+        try appendUnique(case.source, &seen, &values, allocator);
+        try appendUnique(case.source | 0x8000_0000, &seen, &values, allocator);
+    };
+    for (ir.low_float.fp8_encode_special_cases) |case| if (format != .bf16) {
+        try appendUnique(case.source, &seen, &values, allocator);
+    };
+
+    // Name the storage-format boundaries independently of the committed tables: zero to
+    // subnormal, subnormal to normal, maximum finite, and overflow/saturation. Each gets
+    // both immediate f32 bit neighbours and both signs.
+    const first_mid = try midpointBits(format, 0, 1);
+    const last_subnormal = positiveMaxSubnormal(format);
+    const normal_mid = try midpointBits(format, last_subnormal, last_subnormal + 1);
+    const max_bits: u32 = @bitCast(try ir.low_float.decode(format, finite_max));
+    const overflow_mid: u32 = switch (format) {
+        .bf16 => 0x7f7f_8000,
+        .f8_e4m3 => 0x43e8_0000,
+        .f8_e5m2 => 0x4770_0000,
+    };
+    for ([_]u32{ first_mid, normal_mid, max_bits, overflow_mid }) |boundary| {
+        try appendTriplet(boundary, &seen, &values, allocator);
+        try appendTriplet(boundary | 0x8000_0000, &seen, &values, allocator);
+    }
+
+    // The guarded width proof requires an odd active element count. Preserve deduplication:
+    // add one otherwise-unused deterministic f32 bit pattern only when parity demands it.
+    var filler: u32 = 0x1234_5678;
+    while (values.items.len % 2 == 0) : (filler +%= 1) try appendUnique(filler, &seen, &values, allocator);
+    try testing.expect(values.items.len % 2 == 1);
+
+    // Audit the FINAL deduplicated corpus rather than trusting the loops that attempted to
+    // populate it. A shortened append helper or a skipped append therefore fails here, before
+    // any device allocation or launch can hide the missing coverage.
+    var exponent_seen = [_]bool{false} ** 256;
+    for (values.items) |bits| exponent_seen[@intCast((bits >> 23) & 0xff)] = true;
+    for (exponent_seen) |covered| try testing.expect(covered);
+
+    lower = 0;
+    while (lower < finite_max) : (lower += 1) {
+        const midpoint = try midpointBits(format, lower, lower + 1);
+        try expectCorpusTriplet(&seen, midpoint);
+        try expectCorpusTriplet(&seen, midpoint | 0x8000_0000);
+    }
+
+    for (ir.low_float.bf16_encode_boundary_cases) |case| if (format == .bf16) {
+        try testing.expect(seen.contains(case.source));
+    };
+    for (ir.low_float.e4_encode_boundary_cases) |case| if (format == .f8_e4m3) {
+        try testing.expect(seen.contains(case.source));
+        try testing.expect(seen.contains(case.source | 0x8000_0000));
+    };
+    for (ir.low_float.e5_encode_boundary_cases) |case| if (format == .f8_e5m2) {
+        try testing.expect(seen.contains(case.source));
+        try testing.expect(seen.contains(case.source | 0x8000_0000));
+    };
+    for (ir.low_float.fp8_encode_special_cases) |case| if (format != .bf16) {
+        try testing.expect(seen.contains(case.source));
+    };
+    for ([_]u32{ first_mid, normal_mid, max_bits, overflow_mid }) |boundary| {
+        try expectCorpusTriplet(&seen, boundary);
+        try expectCorpusTriplet(&seen, boundary | 0x8000_0000);
+    }
+
+    return values.toOwnedSlice(allocator);
+}
+
+test "live: NVIDIA low-float decode exhaustively matches the shared oracle with guarded narrow buffers" {
+    const allocator = testing.allocator;
+    var h = try Harness.open();
+    defer h.deinit();
+
+    for ([_]ir.low_float.Format{ .bf16, .f8_e4m3, .f8_e5m2 }) |format| {
+        var func = try buildLowFloatBufferKernel(allocator, format, true);
+        defer func.deinit();
+        var launch = try h.compile(&func, runner_abi);
+        defer launch.deinit();
+
+        const payload_bytes: usize = format.payloadBits() / 8;
+        const payload_count: usize = if (format == .bf16) 65536 else 256;
+        const count = payload_count + 1; // deliberately odd; the final payload repeats zero
+        const input_offset: usize = if (payload_bytes == 1) 3 else 6;
+        const output_offset: usize = 4;
+        var input = try guardedBuffer(&h, input_offset, count * payload_bytes);
+        var output = try guardedBuffer(&h, output_offset, count * @sizeOf(u32));
+
+        for (0..count) |i| {
+            const payload: u16 = @intCast(i % payload_count);
+            if (payload_bytes == 1) {
+                input.bytes[input_offset + i] = @truncate(payload);
+            } else {
+                std.mem.writeInt(u16, input.bytes[input_offset + i * 2 ..][0..2], payload, .little);
+            }
+        }
+
+        launch.setPtr(launch.kernel.launch.params[0].offset, output.va + output_offset);
+        launch.setPtr(launch.kernel.launch.params[1].offset, input.va + input_offset);
+        try launch.run(.{ @intCast(count), 1, 1 });
+
+        for (0..count) |i| {
+            const payload: u16 = @intCast(i % payload_count);
+            const expected: u32 = @bitCast(try ir.low_float.decode(format, payload));
+            try testing.expectEqual(expected, output.read(u32, output_offset / 4 + i));
+        }
+        try expectGuard(input, input_offset, count * payload_bytes);
+        try expectGuard(output, output_offset, count * @sizeOf(u32));
+    }
+}
+
+test "live: NVIDIA low-float encode matches the deterministic boundary corpus with guarded narrow buffers" {
+    const allocator = testing.allocator;
+    var h = try Harness.open();
+    defer h.deinit();
+
+    for ([_]ir.low_float.Format{ .bf16, .f8_e4m3, .f8_e5m2 }) |format| {
+        const corpus = try lowFloatEncodeCorpus(allocator, format);
+        defer allocator.free(corpus);
+        try testing.expect(corpus.len % 2 == 1);
+
+        var func = try buildLowFloatBufferKernel(allocator, format, false);
+        defer func.deinit();
+        var launch = try h.compile(&func, runner_abi);
+        defer launch.deinit();
+
+        const payload_bytes: usize = format.payloadBits() / 8;
+        const input_offset: usize = 4;
+        const output_offset: usize = if (payload_bytes == 1) 3 else 6;
+        var input = try guardedBuffer(&h, input_offset, corpus.len * @sizeOf(u32));
+        var output = try guardedBuffer(&h, output_offset, corpus.len * payload_bytes);
+        for (corpus, 0..) |bits, i| {
+            std.mem.writeInt(u32, input.bytes[input_offset + i * 4 ..][0..4], bits, .little);
+        }
+
+        launch.setPtr(launch.kernel.launch.params[0].offset, output.va + output_offset);
+        launch.setPtr(launch.kernel.launch.params[1].offset, input.va + input_offset);
+        try launch.run(.{ @intCast(corpus.len), 1, 1 });
+
+        for (corpus, 0..) |bits, i| {
+            const expected = ir.low_float.encode(format, @bitCast(bits));
+            const got: u16 = if (payload_bytes == 1)
+                output.read(u8, output_offset + i)
+            else
+                output.read(u16, output_offset / 2 + i);
+            try testing.expectEqual(expected, got);
+        }
+        try expectGuard(input, input_offset, corpus.len * @sizeOf(u32));
+        try expectGuard(output, output_offset, corpus.len * payload_bytes);
+    }
+}
+
+test "NVIDIA production allocator compiles overlapping low-float chains with retained results" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const out = try func.appendBlockParam(b, ptr_t);
+    const input = try func.appendBlockParam(b, ptr_t);
+
+    // Device memory supplies every narrow value. Two predicates are deliberately defined
+    // before all six conversions and consumed after them, keeping real predicate values live
+    // across the expansion's own compare/select chains in the production Wimmer allocator.
+    const bf_payload = try func.appendInst(b, u16_t, .{ .load = .{ .ptr = input } });
+    const e4_payload = try func.appendInst(b, u8_t, .{ .load = .{ .ptr = try ptrAdd(&func, b, ptr_t, input, 2) } });
+    const e5_payload = try func.appendInst(b, u8_t, .{ .load = .{ .ptr = try ptrAdd(&func, b, ptr_t, input, 3) } });
+    const x = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = try ptrAdd(&func, b, ptr_t, input, 4) } });
+    const y = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = try ptrAdd(&func, b, ptr_t, input, 8) } });
+    const float_pred = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = y } });
+    const int_pred = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = e4_payload, .rhs = e5_payload } });
+
+    const decoded_bf = try func.appendInst(b, f32_t, .{ .decode_low_float = .{ .format = .bf16, .value = bf_payload } });
+    const decoded_e4 = try func.appendInst(b, f32_t, .{ .decode_low_float = .{ .format = .f8_e4m3, .value = e4_payload } });
+    const decoded_e5 = try func.appendInst(b, f32_t, .{ .decode_low_float = .{ .format = .f8_e5m2, .value = e5_payload } });
+    const encoded_bf = try func.appendInst(b, u16_t, .{ .encode_low_float = .{ .format = .bf16, .value = x } });
+    const encoded_e4 = try func.appendInst(b, u8_t, .{ .encode_low_float = .{ .format = .f8_e4m3, .value = y } });
+    const encoded_e5 = try func.appendInst(b, u8_t, .{ .encode_low_float = .{ .format = .f8_e5m2, .value = x } });
+
+    const partial = try bin(&func, b, f32_t, .add, decoded_bf, decoded_e4);
+    const sum = try bin(&func, b, f32_t, .add, partial, decoded_e5);
+    const float_pick = try func.appendInst(b, u8_t, .{ .select = .{ .cond = float_pred, .then = encoded_e4, .@"else" = encoded_e5 } });
+    const final_pick = try func.appendInst(b, u8_t, .{ .select = .{ .cond = int_pred, .then = float_pick, .@"else" = encoded_e4 } });
+    try func.appendStore(b, encoded_bf, out);
+    try func.appendStore(b, final_pick, try ptrAdd(&func, b, ptr_t, out, 2));
+    try func.appendStore(b, encoded_e5, try ptrAdd(&func, b, ptr_t, out, 3));
+    try func.appendStore(b, sum, try ptrAdd(&func, b, ptr_t, out, 4));
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var kernel = try isel.compileKernel(allocator, &func, runner_abi);
+    defer kernel.deinit(allocator);
+    try testing.expect(kernel.code.len != 0);
+    try testing.expectEqual(@as(usize, 2), kernel.launch.params.len);
+}
+
 /// `(idx.z * extent.y + idx.y) * extent.x + idx.x` as IR, which is the launch contract's
 /// own linearization: x fastest and z slowest. See `gpu.kernel.linearIndex`.
 fn linear3(func: *Function, b: Block, ty: ir.types.Type, idx: [3]Value, extent: [3]u32) !Value {

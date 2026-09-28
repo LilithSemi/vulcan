@@ -606,6 +606,13 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
 
 /// `compileShader` with explicit code-generation options. See `Options`.
 pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: Stage, a: gpu.Abi, options: Options) Error!Kernel {
+    var work = try func.clone(allocator);
+    defer work.deinit();
+    if (stage == .compute) _ = try ir.expand.expandLowFloat(allocator, &work);
+    return compileShaderOwned(allocator, &work, stage, a, options);
+}
+
+fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stage, a: gpu.Abi, options: Options) Error!Kernel {
     // This backend does not lower f16 yet. Reject it cleanly instead of
     // silently treating it as f64. This check covers both this direct entry
     // and compileKernel, which calls this function.
@@ -4117,14 +4124,34 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             const result = func.instResult(inst).?;
             const rd = gprOf(loc.*, result);
             const rs = gprOf(loc.*, cv.value);
-            const dst_float = isFloat(func, result);
-            const src_float = isFloat(func, cv.value);
-            if (src_float and !dst_float) {
-                try code.append(allocator, encode.f2i(rd, rs, isSignedRaw(func, result), .{})); // f32 -> i32
-            } else if (!src_float and dst_float) {
-                try code.append(allocator, encode.i2f(rd, rs, isSignedRaw(func, cv.value), .{})); // i32 -> f32
-            } else {
-                return error.Unsupported; // int-to-int width change, or f32-to-f64, is not modeled yet
+            const dst_kind = func.types.type_kind(func.valueType(result));
+            const src_kind = func.types.type_kind(func.valueType(cv.value));
+            switch (src_kind) {
+                .float => |src_float| switch (dst_kind) {
+                    .int => |dst_int| {
+                        if (src_float != .f32 or dst_int.bits != 32) return error.Unsupported;
+                        try code.append(allocator, encode.f2i(rd, rs, dst_int.signedness == .signed, .{}));
+                    },
+                    else => return error.Unsupported,
+                },
+                .int => |src_int| switch (dst_kind) {
+                    .float => |dst_float| {
+                        if (dst_float != .f32 or src_int.bits != 32) return error.Unsupported;
+                        try code.append(allocator, encode.i2f(rd, rs, src_int.signedness == .signed, .{}));
+                    },
+                    .int => |dst_int| {
+                        if (src_int.signedness != .unsigned or dst_int.signedness != .unsigned) return error.Unsupported;
+                        const mask: u32 = if ((src_int.bits == 8 and dst_int.bits == 32) or (src_int.bits == 32 and dst_int.bits == 8))
+                            0xff
+                        else if ((src_int.bits == 16 and dst_int.bits == 32) or (src_int.bits == 32 and dst_int.bits == 16))
+                            0xffff
+                        else
+                            return error.Unsupported;
+                        try code.append(allocator, encode.lop3Imm(rd, rs, mask, encode.LUT_AND, .{}));
+                    },
+                    else => return error.Unsupported,
+                },
+                else => return error.Unsupported,
             }
         },
         .alloca => {
@@ -5820,19 +5847,207 @@ test "an f16 function is rejected cleanly, not miscompiled as f64" {
     try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
 }
 
-test "both low float directions are rejected before machine emission" {
+fn buildLowFloatFixture(allocator: std.mem.Allocator, format: ir.low_float.Format, decode_direction: bool, later_failure: bool) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const payload_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = format.payloadBits() } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const source = try func.appendBlockParam(block, if (decode_direction) payload_t else f32_t);
+    const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = format };
+    const result = try func.appendInst(block, if (decode_direction) f32_t else payload_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
+    try func.addAttr(.{ .inst = func.definingInst(result).? }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 44 } } });
+    try func.addAttr(.{ .value = result }, .{ .custom = .{ .namespace = "test", .key = "preserve", .value = .flag } });
+    if (later_failure) try func.appendBarrier(block, .subgroup);
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    return func;
+}
+
+const ComputeFunnel = enum { kernel, kernel_opts, shader, shader_opts };
+
+fn compileComputeFunnel(allocator: std.mem.Allocator, func: *Function, funnel: ComputeFunnel) Error!Kernel {
+    return switch (funnel) {
+        .kernel => compileKernel(allocator, func, nvidia_abi),
+        .kernel_opts => compileKernelOpts(allocator, func, nvidia_abi, .{}),
+        .shader => compileShader(allocator, func, .compute, nvidia_abi),
+        .shader_opts => compileShaderOpts(allocator, func, .compute, nvidia_abi, .{}),
+    };
+}
+
+test "all NVIDIA compute funnels expand every low float conversion without mutating callers" {
     const allocator = testing.allocator;
-    inline for (.{ true, false }) |decode_direction| {
-        var func = Function.init(allocator);
+    inline for (std.enums.values(ir.low_float.Format)) |format| inline for (.{ true, false }) |decode_direction| {
+        var baseline_code: ?[]u32 = null;
+        defer if (baseline_code) |code| allocator.free(code);
+        inline for (std.enums.values(ComputeFunnel)) |funnel| {
+            var func = try buildLowFloatFixture(allocator, format, decode_direction, false);
+            defer func.deinit();
+            const text_before = try std.fmt.allocPrint(allocator, "{f}", .{func});
+            defer allocator.free(text_before);
+            const bits_before = try ir.bitcode.encode(allocator, &func);
+            defer allocator.free(bits_before);
+            var kernel = try compileComputeFunnel(allocator, &func, funnel);
+            defer kernel.deinit(allocator);
+            try testing.expect(kernel.code.len != 0);
+            if (baseline_code) |code| {
+                try testing.expectEqualSlices(u32, code, kernel.code);
+            } else {
+                baseline_code = try allocator.dupe(u32, kernel.code);
+            }
+            const text_after = try std.fmt.allocPrint(allocator, "{f}", .{func});
+            defer allocator.free(text_after);
+            const bits_after = try ir.bitcode.encode(allocator, &func);
+            defer allocator.free(bits_after);
+            try testing.expectEqualStrings(text_before, text_after);
+            try testing.expectEqualSlices(u8, bits_before, bits_after);
+
+            var expanded = try func.clone(allocator);
+            defer expanded.deinit();
+            try testing.expect(try ir.expand.expandLowFloat(allocator, &expanded));
+            var diags = try ir.verify.verify(allocator, &expanded, .low);
+            defer diags.deinit();
+            try testing.expect(diags.ok());
+            for (0..expanded.blockCount()) |block_index| for (expanded.blockInsts(@enumFromInt(block_index))) |inst| switch (expanded.opcode(inst)) {
+                .decode_low_float, .encode_low_float => return error.TestUnexpectedResult,
+                else => {},
+            };
+        }
+    };
+}
+
+test "NVIDIA compute low float expansion reaches later failure without mutating callers" {
+    const allocator = testing.allocator;
+    inline for (std.enums.values(ir.low_float.Format)) |format| inline for (.{ true, false }) |decode_direction| {
+        var func = try buildLowFloatFixture(allocator, format, decode_direction, true);
         defer func.deinit();
-        const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
-        const f32_t = try func.types.intern(.{ .float = .f32 });
-        const block = try func.appendBlock();
-        const source = try func.appendBlockParam(block, if (decode_direction) u16_t else f32_t);
-        const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = .bf16 };
-        const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
-        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+        const text_before = try std.fmt.allocPrint(allocator, "{f}", .{func});
+        defer allocator.free(text_before);
+        const bits_before = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(bits_before);
         try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+        const text_after = try std.fmt.allocPrint(allocator, "{f}", .{func});
+        defer allocator.free(text_after);
+        const bits_after = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(bits_after);
+        try testing.expectEqualStrings(text_before, text_after);
+        try testing.expectEqualSlices(u8, bits_before, bits_after);
+    };
+}
+
+test "NVIDIA graphics keeps every low float conversion unsupported" {
+    const allocator = testing.allocator;
+    inline for (std.enums.values(ir.low_float.Format)) |format| inline for (.{ true, false }) |decode_direction| {
+        var func = try buildLowFloatFixture(allocator, format, decode_direction, false);
+        defer func.deinit();
+        try testing.expectError(error.Unsupported, compileShader(allocator, &func, .fragment, nvidia_abi));
+        try testing.expectError(error.Unsupported, compileShaderOpts(allocator, &func, .vertex, nvidia_abi, .{}));
+    };
+}
+
+fn buildConvertFixture(allocator: std.mem.Allocator, source_kind: ir.types.TypeKind, result_kind: ir.types.TypeKind, dirty_upper: bool) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const source_t = try func.types.intern(source_kind);
+    const result_t = try func.types.intern(result_kind);
+    const block = try func.appendBlock();
+    const source = try func.appendBlockParam(block, source_t);
+    const converted_source = if (dirty_upper) dirty: {
+        const bits = source_kind.int.bits;
+        break :dirty try func.appendArithImm(block, source_t, .add, source, @as(i64, 1) << @intCast(@min(bits, 31)));
+    } else source;
+    const result = try func.appendInst(block, result_t, .{ .convert = .{ .value = converted_source } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    return func;
+}
+
+test "NVIDIA unsigned low width conversions emit exact integer masks" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { source_bits: u16, result_bits: u16, mask: u32 }{
+        .{ .source_bits = 8, .result_bits = 32, .mask = 0xff },
+        .{ .source_bits = 16, .result_bits = 32, .mask = 0xffff },
+        .{ .source_bits = 32, .result_bits = 8, .mask = 0xff },
+        .{ .source_bits = 32, .result_bits = 16, .mask = 0xffff },
+    };
+    for (cases) |case| {
+        var func = try buildConvertFixture(
+            allocator,
+            .{ .int = .{ .signedness = .unsigned, .bits = case.source_bits } },
+            .{ .int = .{ .signedness = .unsigned, .bits = case.result_bits } },
+            true,
+        );
+        defer func.deinit();
+        var kernel = try compileKernel(allocator, &func, nvidia_abi);
+        defer kernel.deinit(allocator);
+        var saw_mask = false;
+        var index: usize = 0;
+        while (index * 4 < kernel.code.len) : (index += 1) {
+            const opcode = opAt(kernel.code, index);
+            try testing.expect(opcode != encode.I2F_OPCODE);
+            try testing.expect(opcode != encode.F2I_OPCODE);
+            if (opcode == 0x812 and immAt(kernel.code, index) == case.mask) saw_mask = true;
+        }
+        try testing.expect(saw_mask);
+    }
+}
+
+test "NVIDIA conversion selector keeps its scalar whitelist narrow" {
+    const allocator = testing.allocator;
+    const int_cases = [_]struct { source: ir.types.Int, result: ir.types.Int }{
+        .{ .source = .{ .signedness = .unsigned, .bits = 8 }, .result = .{ .signedness = .unsigned, .bits = 16 } },
+        .{ .source = .{ .signedness = .unsigned, .bits = 16 }, .result = .{ .signedness = .unsigned, .bits = 8 } },
+        .{ .source = .{ .signedness = .unsigned, .bits = 32 }, .result = .{ .signedness = .unsigned, .bits = 32 } },
+        .{ .source = .{ .signedness = .signed, .bits = 8 }, .result = .{ .signedness = .signed, .bits = 32 } },
+        .{ .source = .{ .signedness = .signed, .bits = 32 }, .result = .{ .signedness = .signed, .bits = 8 } },
+        .{ .source = .{ .signedness = .unsigned, .bits = 64 }, .result = .{ .signedness = .unsigned, .bits = 32 } },
+        .{ .source = .{ .signedness = .unsigned, .bits = 32 }, .result = .{ .signedness = .unsigned, .bits = 64 } },
+    };
+    for (int_cases) |case| {
+        var func = try buildConvertFixture(allocator, .{ .int = case.source }, .{ .int = case.result }, false);
+        defer func.deinit();
+        try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+    }
+
+    const mixed_cases = [_]struct { source: ir.types.TypeKind, result: ir.types.TypeKind }{
+        .{ .source = .{ .int = .{ .signedness = .unsigned, .bits = 16 } }, .result = .{ .float = .f32 } },
+        .{ .source = .{ .float = .f32 }, .result = .{ .int = .{ .signedness = .unsigned, .bits = 16 } } },
+        .{ .source = .{ .float = .f64 }, .result = .{ .int = .{ .signedness = .signed, .bits = 32 } } },
+        .{ .source = .{ .float = .f32 }, .result = .{ .float = .f64 } },
+    };
+    for (mixed_cases) |case| {
+        var func = try buildConvertFixture(allocator, case.source, case.result, false);
+        defer func.deinit();
+        try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+    }
+
+    inline for (.{ std.builtin.Signedness.signed, std.builtin.Signedness.unsigned }) |signedness| {
+        var to_float = try buildConvertFixture(allocator, .{ .int = .{ .signedness = signedness, .bits = 32 } }, .{ .float = .f32 }, false);
+        defer to_float.deinit();
+        var to_float_kernel = try compileKernel(allocator, &to_float, nvidia_abi);
+        defer to_float_kernel.deinit(allocator);
+        var from_float = try buildConvertFixture(allocator, .{ .float = .f32 }, .{ .int = .{ .signedness = signedness, .bits = 32 } }, false);
+        defer from_float.deinit();
+        var from_float_kernel = try compileKernel(allocator, &from_float, nvidia_abi);
+        defer from_float_kernel.deinit(allocator);
+        try testing.expect(to_float_kernel.code.len != 0);
+        try testing.expect(from_float_kernel.code.len != 0);
+    }
+
+    var vector_func = Function.init(allocator);
+    defer vector_func.deinit();
+    const u8_t = try vector_func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u32_t = try vector_func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const v8_t = try vector_func.types.intern(.{ .vector = .{ .len = 4, .elem = u8_t } });
+    const v32_t = try vector_func.types.intern(.{ .vector = .{ .len = 4, .elem = u32_t } });
+    const block = try vector_func.appendBlock();
+    const source = try vector_func.appendBlockParam(block, v8_t);
+    const result = try vector_func.appendInst(block, v32_t, .{ .convert = .{ .value = source } });
+    vector_func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    if (compileKernel(allocator, &vector_func, nvidia_abi)) |kernel_value| {
+        var kernel = kernel_value;
+        defer kernel.deinit(allocator);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try testing.expect(err == error.Unsupported or err == error.UnsupportedParamType);
     }
 }
 
@@ -5854,6 +6069,7 @@ test "both nvfp4 directions are rejected before emission without mutating caller
         const before = try ir.bitcode.encode(allocator, &func);
         defer allocator.free(before);
         try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+        try testing.expectError(error.Unsupported, compileShader(allocator, &func, .fragment, nvidia_abi));
         const after = try ir.bitcode.encode(allocator, &func);
         defer allocator.free(after);
         try testing.expectEqualSlices(u8, before, after);
