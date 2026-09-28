@@ -21,6 +21,8 @@
 const std = @import("std");
 const function = @import("function.zig");
 const types = @import("types.zig");
+const verify = @import("verify.zig");
+const bitcode = @import("bitcode.zig");
 
 const Function = function.Function;
 const Value = function.Value;
@@ -28,6 +30,485 @@ const Block = function.Block;
 const Inst = function.Inst;
 const BinOp = function.BinOp;
 const MatMul = function.MatMul;
+
+const LowFloatBuilder = struct {
+    func: *Function,
+    out: *std.ArrayList(Inst),
+    allocator: std.mem.Allocator,
+    u8_t: types.Type,
+    u16_t: types.Type,
+    u32_t: types.Type,
+    f32_t: types.Type,
+    bool_t: types.Type,
+
+    fn emit(self: LowFloatBuilder, ty: types.Type, opcode: function.Opcode) std.mem.Allocator.Error!Value {
+        const value = try self.func.createInst(ty, opcode);
+        try self.out.append(self.allocator, self.func.definingInst(value).?);
+        return value;
+    }
+
+    fn constant(self: LowFloatBuilder, value: u32) std.mem.Allocator.Error!Value {
+        return self.emit(self.u32_t, .{ .iconst = value });
+    }
+
+    fn binary(self: LowFloatBuilder, op: BinOp, lhs: Value, rhs: Value) std.mem.Allocator.Error!Value {
+        return self.emit(self.u32_t, .{ .arith = .{ .op = op, .lhs = lhs, .rhs = rhs } });
+    }
+
+    fn compare(self: LowFloatBuilder, op: function.CmpOp, lhs: Value, rhs: Value) std.mem.Allocator.Error!Value {
+        return self.emit(self.bool_t, .{ .icmp = .{ .op = op, .lhs = lhs, .rhs = rhs } });
+    }
+
+    fn select(self: LowFloatBuilder, cond: Value, then_value: Value, else_value: Value) std.mem.Allocator.Error!Value {
+        return self.emit(self.u32_t, .{ .select = .{ .cond = cond, .then = then_value, .@"else" = else_value } });
+    }
+
+    fn convert(self: LowFloatBuilder, ty: types.Type, value: Value) std.mem.Allocator.Error!Value {
+        return self.emit(ty, .{ .convert = .{ .value = value } });
+    }
+
+    fn reinterpret(self: LowFloatBuilder, ty: types.Type, value: Value) std.mem.Allocator.Error!Value {
+        return self.emit(ty, .{ .unary = .{ .op = .reinterpret, .value = value } });
+    }
+
+    fn masked(self: LowFloatBuilder, value: Value, mask: u32) std.mem.Allocator.Error!Value {
+        return self.binary(.bit_and, value, try self.constant(mask));
+    }
+
+    fn shifted(self: LowFloatBuilder, op: BinOp, value: Value, amount: u32) std.mem.Allocator.Error!Value {
+        return self.binary(op, value, try self.constant(amount));
+    }
+
+    fn equalConstant(self: LowFloatBuilder, value: Value, expected: u32) std.mem.Allocator.Error!Value {
+        return self.compare(.eq, value, try self.constant(expected));
+    }
+
+    fn roundRight(self: LowFloatBuilder, value: Value, shift: Value) std.mem.Allocator.Error!Value {
+        const one = try self.constant(1);
+        const retained = try self.binary(.shr, value, shift);
+        const shifted_one = try self.binary(.shl, one, shift);
+        const mask = try self.binary(.sub, shifted_one, one);
+        const discarded = try self.binary(.bit_and, value, mask);
+        const shift_minus_one = try self.binary(.sub, shift, one);
+        const halfway = try self.binary(.shl, one, shift_minus_one);
+        const greater = try self.compare(.gt, discarded, halfway);
+        const equal = try self.compare(.eq, discarded, halfway);
+        const odd_bits = try self.binary(.bit_and, retained, one);
+        const odd = try self.compare(.ne, odd_bits, try self.constant(0));
+        const odd_as_int = try self.select(odd, one, try self.constant(0));
+        const tie_and_odd = try self.select(equal, odd_as_int, try self.constant(0));
+        const increment = try self.select(greater, one, tie_and_odd);
+        return self.binary(.add, retained, increment);
+    }
+};
+
+/// Replace all low-float storage conversions with target-independent integer operations.
+pub fn expandLowFloat(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator.Error!bool {
+    var has_low_float = false;
+    for (0..func.blockCount()) |block_index| {
+        const block: Block = @enumFromInt(block_index);
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+            .decode_low_float, .encode_low_float => {
+                has_low_float = true;
+                break;
+            },
+            else => {},
+        };
+        if (has_low_float) break;
+    }
+    if (!has_low_float) return false;
+
+    var changed = false;
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const bool_t = try func.types.intern(.bool);
+
+    for (0..func.blockCount()) |block_index| {
+        const block: Block = @enumFromInt(block_index);
+        var contains_low_float = false;
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+            .decode_low_float, .encode_low_float => contains_low_float = true,
+            else => {},
+        };
+        if (!contains_low_float) continue;
+        changed = true;
+
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        var out: std.ArrayList(Inst) = .empty;
+        defer out.deinit(allocator);
+        const builder: LowFloatBuilder = .{
+            .func = func,
+            .out = &out,
+            .allocator = allocator,
+            .u8_t = u8_t,
+            .u16_t = u16_t,
+            .u32_t = u32_t,
+            .f32_t = f32_t,
+            .bool_t = bool_t,
+        };
+
+        for (original) |inst| switch (func.opcode(inst)) {
+            .decode_low_float => |conversion| {
+                const old_result = func.instResult(inst).?;
+                const expanded = try expandDecodeLowFloat(builder, conversion);
+                func.replaceAllUses(old_result, expanded);
+                func.retargetAttrs(.{ .value = old_result }, .{ .value = expanded });
+                func.retargetAttrs(.{ .inst = inst }, .{ .inst = func.definingInst(expanded).? });
+            },
+            .encode_low_float => |conversion| {
+                const old_result = func.instResult(inst).?;
+                const expanded = try expandEncodeLowFloat(builder, conversion, inst);
+                func.replaceAllUses(old_result, expanded);
+                func.retargetAttrs(.{ .value = old_result }, .{ .value = expanded });
+            },
+            else => try out.append(allocator, inst),
+        };
+        try func.setBlockInsts(block, out.items);
+    }
+    return changed;
+}
+
+fn expandDecodeLowFloat(builder: LowFloatBuilder, conversion: function.LowFloatConvert) std.mem.Allocator.Error!Value {
+    const payload = try builder.convert(builder.u32_t, conversion.value);
+    const bits = switch (conversion.format) {
+        .bf16 => try builder.shifted(.shl, payload, 16),
+        .f8_e4m3 => try decodeE4M3(builder, payload),
+        .f8_e5m2 => try decodeE5M2(builder, payload),
+    };
+    return builder.reinterpret(builder.f32_t, bits);
+}
+
+fn decodeE4M3(builder: LowFloatBuilder, payload: Value) std.mem.Allocator.Error!Value {
+    const sign = try builder.shifted(.shl, try builder.masked(payload, 0x80), 24);
+    const exponent = try builder.masked(try builder.shifted(.shr, payload, 3), 0x0f);
+    const fraction = try builder.masked(payload, 0x07);
+    const normal_exponent = try builder.shifted(.shl, try builder.binary(.add, exponent, try builder.constant(120)), 23);
+    const normal_fraction = try builder.shifted(.shl, fraction, 20);
+    const normal = try builder.binary(.bit_or, sign, try builder.binary(.bit_or, normal_exponent, normal_fraction));
+
+    var subnormal = try builder.constant(0);
+    const subnormal_bits = [_]u32{ 0x3b00_0000, 0x3b80_0000, 0x3bc0_0000, 0x3c00_0000, 0x3c20_0000, 0x3c40_0000, 0x3c60_0000 };
+    for (subnormal_bits, 1..) |bits, raw_fraction| {
+        subnormal = try builder.select(try builder.equalConstant(fraction, @intCast(raw_fraction)), try builder.constant(bits), subnormal);
+    }
+    subnormal = try builder.binary(.bit_or, sign, subnormal);
+    const finite = try builder.select(try builder.equalConstant(exponent, 0), subnormal, normal);
+    const nan = try builder.binary(.bit_or, sign, try builder.constant(0x7fc0_0000));
+    const exponent_is_max = try builder.equalConstant(exponent, 0x0f);
+    const fraction_is_nan = try builder.equalConstant(fraction, 0x07);
+    const fraction_is_nan_int = try builder.select(fraction_is_nan, try builder.constant(1), try builder.constant(0));
+    const is_nan_int = try builder.select(exponent_is_max, fraction_is_nan_int, try builder.constant(0));
+    const is_nan = try builder.compare(.ne, is_nan_int, try builder.constant(0));
+    return builder.select(is_nan, nan, finite);
+}
+
+fn decodeE5M2(builder: LowFloatBuilder, payload: Value) std.mem.Allocator.Error!Value {
+    const sign = try builder.shifted(.shl, try builder.masked(payload, 0x80), 24);
+    const exponent = try builder.masked(try builder.shifted(.shr, payload, 2), 0x1f);
+    const fraction = try builder.masked(payload, 0x03);
+    const normal_exponent = try builder.shifted(.shl, try builder.binary(.add, exponent, try builder.constant(112)), 23);
+    const normal_fraction = try builder.shifted(.shl, fraction, 21);
+    const normal = try builder.binary(.bit_or, sign, try builder.binary(.bit_or, normal_exponent, normal_fraction));
+
+    var subnormal = try builder.constant(0);
+    const subnormal_bits = [_]u32{ 0x3780_0000, 0x3800_0000, 0x3840_0000 };
+    for (subnormal_bits, 1..) |bits, raw_fraction| {
+        subnormal = try builder.select(try builder.equalConstant(fraction, @intCast(raw_fraction)), try builder.constant(bits), subnormal);
+    }
+    subnormal = try builder.binary(.bit_or, sign, subnormal);
+    const finite = try builder.select(try builder.equalConstant(exponent, 0), subnormal, normal);
+    const quiet_fraction = try builder.shifted(.shl, try builder.binary(.bit_or, fraction, try builder.constant(2)), 21);
+    const nan = try builder.binary(.bit_or, sign, try builder.binary(.bit_or, try builder.constant(0x7f80_0000), quiet_fraction));
+    const infinity = try builder.binary(.bit_or, sign, try builder.constant(0x7f80_0000));
+    const special = try builder.select(try builder.equalConstant(fraction, 0), infinity, nan);
+    return builder.select(try builder.equalConstant(exponent, 0x1f), special, finite);
+}
+
+fn expandEncodeLowFloat(builder: LowFloatBuilder, conversion: function.LowFloatConvert, old_inst: Inst) std.mem.Allocator.Error!Value {
+    const bits = try builder.reinterpret(builder.u32_t, conversion.value);
+    builder.func.retargetAttrs(.{ .inst = old_inst }, .{ .inst = builder.func.definingInst(bits).? });
+    const payload = switch (conversion.format) {
+        .bf16 => try encodeBf16(builder, bits),
+        .f8_e4m3 => try encodeFp8(builder, bits, true),
+        .f8_e5m2 => try encodeFp8(builder, bits, false),
+    };
+    return builder.convert(if (conversion.format == .bf16) builder.u16_t else builder.u8_t, payload);
+}
+
+fn encodeBf16(builder: LowFloatBuilder, bits: Value) std.mem.Allocator.Error!Value {
+    const exponent = try builder.masked(bits, 0x7f80_0000);
+    const fraction = try builder.masked(bits, 0x007f_ffff);
+    const retained = try builder.shifted(.shr, bits, 16);
+    const retained_lsb = try builder.masked(retained, 1);
+    const rounded = try builder.shifted(.shr, try builder.binary(.add, bits, try builder.binary(.add, try builder.constant(0x7fff), retained_lsb)), 16);
+    const nan = try builder.binary(.bit_or, retained, try builder.constant(0x40));
+    const special = try builder.select(try builder.compare(.ne, fraction, try builder.constant(0)), nan, retained);
+    return builder.select(try builder.equalConstant(exponent, 0x7f80_0000), special, rounded);
+}
+
+fn encodeFp8(builder: LowFloatBuilder, bits: Value, e4m3: bool) std.mem.Allocator.Error!Value {
+    const sign = try builder.masked(try builder.shifted(.shr, bits, 24), 0x80);
+    const source_exponent = try builder.masked(try builder.shifted(.shr, bits, 23), 0xff);
+    const source_fraction = try builder.masked(bits, 0x007f_ffff);
+    const significand = try builder.binary(.bit_or, source_fraction, try builder.constant(0x0080_0000));
+    const threshold: u32 = if (e4m3) 121 else 113;
+    const shift_bias: u32 = if (e4m3) 141 else 134;
+    const original_shift = try builder.binary(.sub, try builder.constant(shift_bias), source_exponent);
+    const shift_too_large = try builder.compare(.gt, original_shift, try builder.constant(24));
+    const bounded_shift = try builder.select(shift_too_large, try builder.constant(24), original_shift);
+    const uses_subnormal_path = try builder.compare(.lt, source_exponent, try builder.constant(threshold));
+    const safe_shift = try builder.select(uses_subnormal_path, bounded_shift, try builder.constant(24));
+    const subnormal_rounded = try builder.roundRight(significand, safe_shift);
+    const subnormal = try builder.select(shift_too_large, try builder.constant(0), subnormal_rounded);
+
+    const normal_shift = try builder.constant(if (e4m3) 20 else 21);
+    const normal_rounded = try builder.roundRight(significand, normal_shift);
+    const carry_value: u32 = if (e4m3) 16 else 8;
+    const retained_value: u32 = if (e4m3) 8 else 4;
+    const carry = try builder.equalConstant(normal_rounded, carry_value);
+    const rounded = try builder.select(carry, try builder.constant(retained_value), normal_rounded);
+    const exponent_base = try builder.binary(.sub, source_exponent, try builder.constant(if (e4m3) 120 else 112));
+    const carry_increment = try builder.select(carry, try builder.constant(1), try builder.constant(0));
+    const target_exponent = try builder.binary(.add, exponent_base, carry_increment);
+    const scaled_exponent = try builder.shifted(.shl, target_exponent, if (e4m3) 3 else 2);
+    const normal = try builder.binary(.add, scaled_exponent, try builder.binary(.sub, rounded, try builder.constant(retained_value)));
+    const finite_magnitude = try builder.select(try builder.compare(.lt, source_exponent, try builder.constant(threshold)), subnormal, normal);
+    const max_finite: u32 = if (e4m3) 0x7e else 0x7b;
+    const saturated = try builder.select(try builder.compare(.gt, finite_magnitude, try builder.constant(max_finite)), try builder.constant(max_finite), finite_magnitude);
+    const finite = try builder.binary(.bit_or, sign, saturated);
+
+    const nan = if (e4m3)
+        try builder.binary(.bit_or, sign, try builder.constant(0x7f))
+    else blk: {
+        const retained_nan = try builder.masked(try builder.shifted(.shr, source_fraction, 21), 0x03);
+        const payload = try builder.binary(.bit_or, try builder.constant(0x7e), retained_nan);
+        break :blk try builder.binary(.bit_or, sign, payload);
+    };
+    const infinity = try builder.binary(.bit_or, sign, try builder.constant(if (e4m3) 0x7e else 0x7c));
+    const special = try builder.select(try builder.compare(.ne, source_fraction, try builder.constant(0)), nan, infinity);
+    const non_special = try builder.select(try builder.equalConstant(source_exponent, 0), sign, finite);
+    return builder.select(try builder.equalConstant(source_exponent, 0xff), special, non_special);
+}
+
+fn appendLowFloatFixture(func: *Function, block: Block, format: function.LowFloatFormat) ![2]Value {
+    const payload_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = format.payloadBits() } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const payload = try func.appendBlockParam(block, payload_t);
+    const source_bits = try func.appendBlockParam(block, u32_t);
+    const source = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = source_bits } });
+    const decoded = try func.appendInst(block, f32_t, .{ .decode_low_float = .{ .format = format, .value = payload } });
+    const decoded_bits = try func.appendInst(block, u32_t, .{ .unary = .{ .op = .reinterpret, .value = decoded } });
+    const encoded = try func.appendInst(block, payload_t, .{ .encode_low_float = .{ .format = format, .value = source } });
+    const encoded_wide = try func.appendInst(block, u32_t, .{ .convert = .{ .value = encoded } });
+    return .{ decoded_bits, encoded_wide };
+}
+
+test "expandLowFloat rewrites all formats and directions into integer operations" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const block = try func.appendBlock();
+    var results: [6]Value = undefined;
+    var index: usize = 0;
+    for (std.enums.values(function.LowFloatFormat)) |format| {
+        const pair = try appendLowFloatFixture(&func, block, format);
+        results[index] = pair[0];
+        results[index + 1] = pair[1];
+        index += 2;
+    }
+    var combined = results[0];
+    for (results[1..]) |result| {
+        combined = try func.appendInst(block, func.valueType(result), .{ .arith = .{ .op = .bit_xor, .lhs = combined, .rhs = result } });
+    }
+    func.setTerminator(block, .{ .ret = function.Ret.one(combined) });
+
+    try std.testing.expect(try expandLowFloat(allocator, &func));
+    try std.testing.expect(!(try expandLowFloat(allocator, &func)));
+    var diags = try verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+
+    for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+        .decode_low_float, .encode_low_float, .call => return error.TestUnexpectedResult,
+        .arith => |op| {
+            try std.testing.expect(func.types.type_kind(func.valueType(func.instResult(inst).?)) == .int);
+            try std.testing.expect(func.types.type_kind(func.valueType(op.lhs)) == .int);
+            try std.testing.expect(func.types.type_kind(func.valueType(op.rhs)) == .int);
+        },
+        .icmp => |op| {
+            try std.testing.expect(func.types.type_kind(func.valueType(op.lhs)) == .int);
+            try std.testing.expect(func.types.type_kind(func.valueType(op.rhs)) == .int);
+        },
+        .select => |op| {
+            try std.testing.expect(func.types.type_kind(func.valueType(func.instResult(inst).?)) == .int);
+            try std.testing.expect(func.types.type_kind(func.valueType(op.then)) == .int);
+            try std.testing.expect(func.types.type_kind(func.valueType(op.@"else")) == .int);
+        },
+        .convert => |op| {
+            try std.testing.expect(func.types.type_kind(func.valueType(func.instResult(inst).?)) == .int);
+            try std.testing.expect(func.types.type_kind(func.valueType(op.value)) == .int);
+        },
+        .unary => |op| {
+            try std.testing.expectEqual(function.UnaryOp.reinterpret, op.op);
+            const result_kind = func.types.type_kind(func.valueType(func.instResult(inst).?));
+            const source_kind = func.types.type_kind(func.valueType(op.value));
+            try std.testing.expect((result_kind == .float and source_kind == .int) or
+                (result_kind == .int and source_kind == .float));
+        },
+        else => {},
+    };
+}
+
+test "expandLowFloat replaces uses across blocks in program order" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const entry = try func.appendBlock();
+    const next = try func.appendBlock();
+    const payload = try func.appendBlockParam(entry, u8_t);
+    const decoded = try func.appendInst(entry, f32_t, .{ .decode_low_float = .{ .format = .f8_e4m3, .value = payload } });
+    try func.setJump(entry, next, &.{decoded});
+    const forwarded = try func.appendBlockParam(next, f32_t);
+    const encoded = try func.appendInst(next, u8_t, .{ .encode_low_float = .{ .format = .f8_e5m2, .value = forwarded } });
+    func.setTerminator(next, .{ .ret = function.Ret.one(encoded) });
+
+    try std.testing.expect(try expandLowFloat(allocator, &func));
+    var diags = try verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+    for (0..func.blockCount()) |block_index| {
+        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+            .decode_low_float, .encode_low_float => return error.TestUnexpectedResult,
+            else => {},
+        };
+    }
+}
+
+test "expandLowFloat migrates live value and debug attributes" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+    const block = try func.appendBlock();
+    const payload = try func.appendBlockParam(block, u16_t);
+    const decoded = try func.appendInst(block, f32_t, .{ .decode_low_float = .{ .format = .bf16, .value = payload } });
+    const original_inst = func.definingInst(decoded).?;
+    try func.addAttr(.{ .value = decoded }, .{ .custom = .{ .namespace = "test", .key = "semantic", .value = .flag } });
+    try func.addAttr(.{ .inst = original_inst }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 41 } } });
+    func.setTerminator(block, .{ .ret = function.Ret.one(decoded) });
+
+    try std.testing.expect(try expandLowFloat(allocator, &func));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const boundary = func.definingInst(replacement).?;
+    var value_attrs = func.attributesOf(.{ .value = replacement });
+    var inst_attrs = func.attributesOf(.{ .inst = boundary });
+    var old_value_attrs = func.attributesOf(.{ .value = decoded });
+    var old_inst_attrs = func.attributesOf(.{ .inst = original_inst });
+    try std.testing.expect(value_attrs.next() != null);
+    try std.testing.expect(inst_attrs.next() != null);
+    try std.testing.expect(old_value_attrs.next() == null);
+    try std.testing.expect(old_inst_attrs.next() == null);
+    var diags = try verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "expandLowFloat moves encode attributes to the result and f32 boundary" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const block = try func.appendBlock();
+    const source = try func.appendBlockParam(block, f32_t);
+    const encoded = try func.appendInst(block, u8_t, .{ .encode_low_float = .{ .format = .f8_e5m2, .value = source } });
+    const original_inst = func.definingInst(encoded).?;
+    try func.addAttr(.{ .value = encoded }, .{ .custom = .{ .namespace = "test", .key = "semantic", .value = .flag } });
+    try func.addAttr(.{ .inst = original_inst }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 42 } } });
+    func.setTerminator(block, .{ .ret = function.Ret.one(encoded) });
+
+    try std.testing.expect(try expandLowFloat(allocator, &func));
+    const replacement = func.terminator(block).?.ret.values[0];
+    var boundary: ?Inst = null;
+    for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+        .unary => |op| if (op.op == .reinterpret and op.value == source) {
+            boundary = inst;
+        },
+        else => {},
+    };
+    try std.testing.expect(boundary != null);
+    var value_attrs = func.attributesOf(.{ .value = replacement });
+    var inst_attrs = func.attributesOf(.{ .inst = boundary.? });
+    var old_value_attrs = func.attributesOf(.{ .value = encoded });
+    var old_inst_attrs = func.attributesOf(.{ .inst = original_inst });
+    try std.testing.expect(value_attrs.next() != null);
+    try std.testing.expect(inst_attrs.next() != null);
+    try std.testing.expect(old_value_attrs.next() == null);
+    try std.testing.expect(old_inst_attrs.next() == null);
+    var diags = try verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "expandLowFloat clamps eager FP8 subnormal shifts outside their path" {
+    const allocator = std.testing.allocator;
+    for ([_]struct { format: function.LowFloatFormat, shift_bias: u32 }{
+        .{ .format = .f8_e4m3, .shift_bias = 141 },
+        .{ .format = .f8_e5m2, .shift_bias = 134 },
+    }) |case| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const bits = try func.appendInst(block, u32_t, .{ .iconst = @as(i64, case.shift_bias << 23) });
+        const source = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = bits } });
+        const encoded = try func.appendInst(block, u8_t, .{ .encode_low_float = .{ .format = case.format, .value = source } });
+        func.setTerminator(block, .{ .ret = function.Ret.one(encoded) });
+
+        try std.testing.expect(try expandLowFloat(allocator, &func));
+        var guarded_shift_count: usize = 0;
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+            .arith => |op| if (op.op == .shr or op.op == .shl) {
+                const amount_inst = func.definingInst(op.rhs) orelse continue;
+                const amount_select = switch (func.opcode(amount_inst)) {
+                    .select => |select| select,
+                    else => continue,
+                };
+                const fallback_inst = func.definingInst(amount_select.@"else").?;
+                try std.testing.expectEqual(@as(i64, 24), func.opcode(fallback_inst).iconst);
+                guarded_shift_count += 1;
+            },
+            else => {},
+        };
+        try std.testing.expectEqual(@as(usize, 2), guarded_shift_count);
+    }
+}
+
+test "expandLowFloat leaves a function without conversions byte-for-byte unchanged" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const value = try func.appendInst(block, u32_t, .{ .iconst = 41 });
+    func.setTerminator(block, .{ .ret = function.Ret.one(value) });
+    const before = try bitcode.encode(allocator, &func);
+    defer allocator.free(before);
+
+    try std.testing.expect(!(try expandLowFloat(allocator, &func)));
+    const after = try bitcode.encode(allocator, &func);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
 
 /// Rewrite every `arith` with op `.mulh` in `func` into an equivalent limb sequence. Returns
 /// whether anything was rewritten.

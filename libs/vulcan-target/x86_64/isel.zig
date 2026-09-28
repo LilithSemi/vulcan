@@ -556,6 +556,8 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
     var work = try func.clone(allocator);
     defer work.deinit();
 
+    _ = try ir.expand.expandLowFloat(allocator, &work);
+
     // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls before
     // anything numbers the IR, so the call clobbers and argument placement are visible to the
     // register allocator. f128 data movement stays native and is untouched.
@@ -4169,20 +4171,55 @@ test "a barrier is rejected, not dropped like a prefetch" {
     try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
 }
 
-test "both low float directions are rejected while their results are live" {
+test "all low float formats and directions compile without mutating caller IR" {
     const allocator = std.testing.allocator;
-    inline for (.{ true, false }) |decode_direction| {
-        var func = Function.init(allocator);
-        defer func.deinit();
-        const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
-        const f32_t = try func.types.intern(.{ .float = .f32 });
-        const block = try func.appendBlock();
-        const source = try func.appendBlockParam(block, if (decode_direction) u16_t else f32_t);
-        const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = .bf16 };
-        const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
-        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
-        try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+    inline for ([_]ir.low_float.Format{ .bf16, .f8_e4m3, .f8_e5m2 }) |format| {
+        inline for (.{ true, false }) |decode_direction| {
+            var func = Function.init(allocator);
+            defer func.deinit();
+            const payload_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = format.payloadBits() } });
+            const f32_t = try func.types.intern(.{ .float = .f32 });
+            const block = try func.appendBlock();
+            const source = try func.appendBlockParam(block, if (decode_direction) payload_t else f32_t);
+            const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = format };
+            const result = try func.appendInst(block, if (decode_direction) f32_t else payload_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
+            try func.addAttr(.{ .value = result }, .{ .custom = .{ .namespace = "test", .key = "preserve", .value = .flag } });
+            func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+            const before = try std.fmt.allocPrint(allocator, "{f}", .{func});
+            defer allocator.free(before);
+            const bits_before = try ir.bitcode.encode(allocator, &func);
+            defer allocator.free(bits_before);
+            const code = try selectFunction(allocator, &func);
+            allocator.free(code);
+            const after = try std.fmt.allocPrint(allocator, "{f}", .{func});
+            defer allocator.free(after);
+            const bits_after = try ir.bitcode.encode(allocator, &func);
+            defer allocator.free(bits_after);
+            try std.testing.expectEqualStrings(before, after);
+            try std.testing.expectEqualSlices(u8, bits_before, bits_after);
+        }
     }
+}
+
+test "a later compile error preserves low float IR bitcode and attributes" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const source = try func.appendBlockParam(block, u8_t);
+    const result = try func.appendInst(block, f32_t, .{ .decode_low_float = .{ .value = source, .format = .f8_e4m3 } });
+    try func.addAttr(.{ .value = result }, .{ .custom = .{ .namespace = "test", .key = "preserve", .value = .flag } });
+    try func.appendBarrier(block, .workgroup);
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    const before = try ir.bitcode.encode(allocator, &func);
+    defer allocator.free(before);
+
+    try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+    const after = try ir.bitcode.encode(allocator, &func);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
 }
 
 test "a matmul is refused, not a panic on the result unwrap" {

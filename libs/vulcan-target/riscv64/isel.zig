@@ -847,6 +847,127 @@ fn storeFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *c
     }
 }
 
+/// Emit an exact u32-to-f32 bit reinterpret for already-resolved allocator locations. Integer and
+/// float spill slots use their established eight-byte frame strides, while the actual float load or
+/// store is 32-bit. Keeping this helper location-driven makes every resident/spilled combination
+/// explicit and independently testable.
+fn emitU32ToF32Reinterpret(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    spill_base: u32,
+    float_spill_base: u32,
+    src: IntLoc,
+    dst: FloatLoc,
+    float_tmp: FReg,
+) std.mem.Allocator.Error!void {
+    const rs = switch (src) {
+        .reg => |r| r,
+        .slot => |slot| blk: {
+            try code.append(allocator, encode.ld(spill_scratch0, .x2, @intCast(spill_base + slot * 8)));
+            break :blk spill_scratch0;
+        },
+    };
+    const rd = switch (dst) {
+        .reg => |r| r,
+        .slot => float_tmp,
+    };
+    try code.append(allocator, encode.fmv_w_x(rd, rs));
+    switch (dst) {
+        .reg => {},
+        .slot => |slot| try code.append(allocator, encode.fsw(rd, .x2, @intCast(float_spill_base + slot * 8))),
+    }
+}
+
+/// Emit an exact f32-to-u32 bit reinterpret for already-resolved allocator locations. `fmv.x.w`
+/// sign-extends bit 31 to XLEN on RV64, so the shift pair explicitly clears the upper 32 bits before
+/// the value can participate in unsigned arithmetic, widening, spilling, or an integer return.
+fn emitF32ToU32Reinterpret(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    spill_base: u32,
+    float_spill_base: u32,
+    src: FloatLoc,
+    dst: IntLoc,
+    float_tmp: FReg,
+) std.mem.Allocator.Error!void {
+    const rs = switch (src) {
+        .reg => |r| r,
+        .slot => |slot| blk: {
+            try code.append(allocator, encode.flw(float_tmp, .x2, @intCast(float_spill_base + slot * 8)));
+            break :blk float_tmp;
+        },
+    };
+    const rd = switch (dst) {
+        .reg => |r| r,
+        .slot => spill_scratch0,
+    };
+    try code.append(allocator, encode.fmv_x_w(rd, rs));
+    try code.append(allocator, encode.slli(rd, rd, 32));
+    try code.append(allocator, encode.srli(rd, rd, 32));
+    switch (dst) {
+        .reg => {},
+        .slot => |slot| try code.append(allocator, encode.sd(rd, .x2, @intCast(spill_base + slot * 8))),
+    }
+}
+
+fn emitIntSelectArm(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    spill_base: u32,
+    src: IntLoc,
+    dst: IntLoc,
+) std.mem.Allocator.Error!void {
+    const rs = switch (src) {
+        .reg => |r| r,
+        .slot => |slot| blk: {
+            try code.append(allocator, encode.ld(spill_scratch1, .x2, @intCast(spill_base + slot * 8)));
+            break :blk spill_scratch1;
+        },
+    };
+    const rd = switch (dst) {
+        .reg => |r| r,
+        .slot => spill_scratch0,
+    };
+    if (rd != rs) try code.append(allocator, encode.addi(rd, rs, 0));
+    switch (dst) {
+        .reg => {},
+        .slot => |slot| try code.append(allocator, encode.sd(rd, .x2, @intCast(spill_base + slot * 8))),
+    }
+}
+
+/// Emit a scalar integer select without requiring any operand or result to remain resident. Only
+/// the chosen arm is reloaded, so the condition and two alternatives never need three spill
+/// scratches simultaneously. The local branch distances are patched immediately and stay within a
+/// handful of instructions.
+fn emitSpillSafeIntSelect(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    spill_base: u32,
+    cond_loc: IntLoc,
+    then_loc: IntLoc,
+    else_loc: IntLoc,
+    dst_loc: IntLoc,
+) std.mem.Allocator.Error!void {
+    const cond = switch (cond_loc) {
+        .reg => |r| r,
+        .slot => |slot| blk: {
+            try code.append(allocator, encode.ld(spill_scratch0, .x2, @intCast(spill_base + slot * 8)));
+            break :blk spill_scratch0;
+        },
+    };
+    const branch_at = code.items.len;
+    try code.append(allocator, encode.beq(cond, .x0, 0));
+    try emitIntSelectArm(allocator, code, spill_base, then_loc, dst_loc);
+    const jump_at = code.items.len;
+    try code.append(allocator, encode.jal(.x0, 0));
+    const else_at = code.items.len;
+    try emitIntSelectArm(allocator, code, spill_base, else_loc, dst_loc);
+    const end_at = code.items.len;
+
+    code.items[branch_at] = encode.beq(cond, .x0, @intCast((else_at - branch_at) * 4));
+    code.items[jump_at] = encode.jal(.x0, @intCast((end_at - jump_at) * 4));
+}
+
 /// The sp-relative byte offset of f128 value `v`'s LOW 64-bit half in its 16-byte class-4 slot (the
 /// HIGH half sits at `+8`). Every f128 value is spill-resident (its register pool is empty), so it
 /// always has a `quad_spill` entry. A missing one is a codegen bug, not a runtime condition.
@@ -2066,17 +2187,24 @@ fn riscv64ClassOf(ctx: *const anyopaque, func: *const Function, v: Value) u16 {
     return 0;
 }
 
-/// `RegDescription.useKind` for riscv64: every operand needs a register. riscv64 has no memory
-/// operands, and some sites (for example the fused compare-and-branch) cannot reload a spilled operand, so
-/// `must_have_register` is both conservative and correct. Unused params are the generic hook shape.
+/// `RegDescription.useKind` for riscv64. Most operands need a register because riscv64 has no memory
+/// operands and some sites, such as fused compare-and-branch, cannot reload a spilled operand. Scalar
+/// select and same-width reinterpret are the exceptions: their emitters explicitly handle slot operands.
 fn riscv64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) wimmer.UseKind {
     _ = ctx;
-    _ = inst;
     // An f128 operand (class 4) has no register to occupy: its class pool is empty, so it is always
     // read from its 16-byte slot. Forcing `must_have_register` would make the allocator try to place it
     // in a register the class does not have. It must be `should_have_register` (the shared allocator
     // then leaves it in its slot, which the f128 isel sites read directly).
     if (isQuad(func, func.valueType(operand))) return .should_have_register;
+    // These two scalar forms explicitly reload every operand through the reserved class scratches.
+    // Letting Wimmer leave an operand in its slot is what makes their spill-safe emission reachable
+    // under real low-float expansion pressure instead of only through direct helper tests.
+    switch (func.insts.items[@intFromEnum(inst)].op) {
+        .select => return .should_have_register,
+        .unary => |u| if (u.op == .reinterpret) return .should_have_register,
+        else => {},
+    }
     return .must_have_register;
 }
 
@@ -3288,7 +3416,112 @@ fn alignPadWords(words: usize, fetch_align: u16) usize {
 /// under a model with `features.riscv64.zicbop` set reaches the new path. `prefetch.r` is
 /// ORI-shaped (see encode.zig), so unlike the VPU path this one is execution-validated: it
 /// decodes as a harmless no-op on any qemu-riscv64 host, Zicbop or not.
+fn reloadedAt(alloc: *const Allocation, value: Value, pos: usize) bool {
+    for (alloc.actions.items) |action| {
+        if (action.at == pos and action.value == value and action.kind == .reload) return true;
+    }
+    return false;
+}
+
+fn intHasSlot(alloc: *const Allocation, value: Value) bool {
+    if (alloc.int_spill.contains(value)) return true;
+    if (alloc.segments.get(value)) |segments| for (segments) |segment| switch (segment.loc) {
+        .slot => return true,
+        .reg => {},
+    };
+    return false;
+}
+
+fn floatHasSlot(alloc: *const Allocation, value: Value) bool {
+    if (alloc.float_spill.contains(value)) return true;
+    if (alloc.float_segments.get(value)) |segments| for (segments) |segment| switch (segment.loc) {
+        .slot => return true,
+        .reg => {},
+    };
+    return false;
+}
+
+fn intSpilledAtUse(alloc: *const Allocation, value: Value, pos: usize) bool {
+    return switch (intLocationAt(alloc, value, pos)) {
+        .slot => true,
+        .reg => reloadedAt(alloc, value, pos),
+    };
+}
+
+fn floatSpilledAtUse(alloc: *const Allocation, value: Value, pos: usize) bool {
+    return switch (floatLocationAt(alloc, value, pos)) {
+        .slot => true,
+        .reg => reloadedAt(alloc, value, pos),
+    };
+}
+
+fn collectLowFloatSpillEvidence(func: *const Function, alloc: *const Allocation, evidence: *LowFloatSpillEvidence) void {
+    evidence.int_spill_count = alloc.spill_count;
+    evidence.float_spill_count = alloc.float_spill_count;
+    evidence.split_action_count = @intCast(alloc.actions.items.len);
+    var select_cond_spilled = false;
+    var select_then_spilled = false;
+    var select_else_spilled = false;
+    var select_result_spilled = false;
+    var pos: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        const insts = func.blockInsts(@enumFromInt(bi));
+        for (insts, 0..) |inst, index| {
+            const inst_pos = pos + 1 + index;
+            const result = func.instResult(inst);
+            switch (func.opcode(inst)) {
+                .select => |select| if (result) |value| {
+                    select_cond_spilled = select_cond_spilled or intSpilledAtUse(alloc, select.cond, inst_pos);
+                    select_then_spilled = select_then_spilled or intSpilledAtUse(alloc, select.then, inst_pos);
+                    select_else_spilled = select_else_spilled or intSpilledAtUse(alloc, select.@"else", inst_pos);
+                    select_result_spilled = select_result_spilled or intHasSlot(alloc, value);
+                },
+                .unary => |unary| if (unary.op == .reinterpret) if (result) |value| {
+                    const source_float = isFloat(func, func.valueType(unary.value));
+                    const result_float = isFloat(func, func.valueType(value));
+                    if (!source_float and result_float and
+                        intSpilledAtUse(alloc, unary.value, inst_pos) and floatHasSlot(alloc, value)) evidence.u32_to_f32_source_and_result = true;
+                    if (source_float and !result_float and
+                        floatSpilledAtUse(alloc, unary.value, inst_pos) and intHasSlot(alloc, value)) evidence.f32_to_u32_source_and_result = true;
+                },
+                else => {},
+            }
+        }
+        pos += insts.len + 2;
+    }
+    // A fresh SSA definition receives a register at its defining position; a "spilled result" is
+    // therefore evidenced by the subsequent slot segment/store action, while operands are proved
+    // spilled at the use itself (direct slot or a same-position reload action).
+    evidence.select_condition_spilled_at_use = select_cond_spilled;
+    evidence.select_then_spilled_at_use = select_then_spilled;
+    evidence.select_else_spilled_at_use = select_else_spilled;
+    evidence.select_result_has_slot = select_result_spilled;
+    evidence.select_operands_and_result = select_cond_spilled and select_then_spilled and select_else_spilled and select_result_spilled;
+}
+
+pub const LowFloatSpillEvidence = struct {
+    select_operands_and_result: bool = false,
+    select_condition_spilled_at_use: bool = false,
+    select_then_spilled_at_use: bool = false,
+    select_else_spilled_at_use: bool = false,
+    select_result_has_slot: bool = false,
+    u32_to_f32_source_and_result: bool = false,
+    f32_to_u32_source_and_result: bool = false,
+    int_spill_count: u32 = 0,
+    float_spill_count: u32 = 0,
+    split_action_count: u32 = 0,
+};
+
+pub fn compileFunctionWithLowFloatSpillEvidence(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, evidence: *LowFloatSpillEvidence) Error!Compiled {
+    evidence.* = .{};
+    return compileFunctionInternal(allocator, func, caps, evidence);
+}
+
 pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps) Error!Compiled {
+    return compileFunctionInternal(allocator, func, caps, null);
+}
+
+fn compileFunctionInternal(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, spill_evidence: ?*LowFloatSpillEvidence) Error!Compiled {
     // f16 lowering has two modes (see `ModelCaps.zfh`). Software emulation (no Zfh, the default):
     // an f16 is held as its f32 widening in a float register and every boundary rounds via the
     // inline convert routines (`emitHalfToFloat`/`emitFloatToHalf`). Those routines need dedicated
@@ -3321,6 +3554,8 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // `*const` signature unchanged.
     var work = try func.clone(allocator);
     defer work.deinit();
+
+    _ = try ir.expand.expandLowFloat(allocator, &work);
 
     // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls on the clone,
     // before any numbering or edge splitting, so the call clobbers and the f128 GPR-pair argument
@@ -3374,6 +3609,8 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
 
     var alloc = try translateAllocation(allocator, &work, caps.vpu, &walloc);
     defer alloc.deinit(allocator);
+
+    if (spill_evidence) |evidence| collectLowFloatSpillEvidence(&work, &alloc, evidence);
 
     // An edge move on an if-edge cannot be realized by the `.@"if"` emission (it only branches), so
     // reject rather than drop it. Register phis land on jump edges, which the `.jump` path replays.
@@ -4369,33 +4606,50 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (fuse_addr_hi_lo) std.debug.assert(code.items.len == hi + 2);
                 },
                 .select => |sel| {
-                    // `cond ? then : else`, lowered to a short forward branch. The
-                    // result register is distinct from the operands (drawn while
-                    // they are still live), so there is no aliasing hazard.
                     if (isFloat(func, func.valueType(sel.then))) return error.Unsupported; // float select: later
-                    const rd = switch (intLocationAt(alloc, func.instResult(inst).?, inst_pos)) {
-                        .reg => |r| r,
-                        .slot => return error.Unsupported,
-                    };
-                    // The three operands each need a live register through the branch sequence, more
-                    // than the two int spill scratches can reload. A spilled operand (for example a spilled
-                    // int block param) is rejected cleanly rather than panicking on the unwrap.
-                    // Resident in every currently-compiling case (byte-identical there).
-                    const cond = switch (intLocationAt(alloc, sel.cond, inst_pos)) {
-                        .reg => |r| r,
-                        .slot => return error.Unsupported,
-                    };
-                    const then_r = switch (intLocationAt(alloc, sel.then, inst_pos)) {
-                        .reg => |r| r,
-                        .slot => return error.Unsupported,
-                    };
-                    const else_r = switch (intLocationAt(alloc, sel.@"else", inst_pos)) {
-                        .reg => |r| r,
-                        .slot => return error.Unsupported,
-                    };
-                    try code.append(allocator, encode.addi(rd, then_r, 0)); // rd = then
-                    try code.append(allocator, encode.bne(cond, .x0, 8)); // if cond != 0, keep then
-                    try code.append(allocator, encode.addi(rd, else_r, 0)); // else rd = else
+                    try emitSpillSafeIntSelect(
+                        allocator,
+                        &code,
+                        spill_base,
+                        intLocationAt(alloc, sel.cond, inst_pos),
+                        intLocationAt(alloc, sel.then, inst_pos),
+                        intLocationAt(alloc, sel.@"else", inst_pos),
+                        intLocationAt(alloc, func.instResult(inst).?, inst_pos),
+                    );
+                },
+                .unary => |u| {
+                    if (u.op != .reinterpret) return error.Unsupported;
+                    const result = func.instResult(inst).?;
+                    const src_ty = func.valueType(u.value);
+                    const dst_ty = func.valueType(result);
+                    const src_float = isFloat(func, src_ty);
+                    const dst_float = isFloat(func, dst_ty);
+                    if (src_float == dst_float) return error.Unsupported;
+                    if (src_float) {
+                        if (!isUnsignedInt(func, dst_ty) or intBits(func, dst_ty) != 32 or
+                            isHalf(func, src_ty) or is64Float(func, src_ty) or isQuad(func, src_ty)) return error.Unsupported;
+                        try emitF32ToU32Reinterpret(
+                            allocator,
+                            &code,
+                            spill_base,
+                            float_spill_base,
+                            floatLocationAt(alloc, u.value, inst_pos),
+                            intLocationAt(alloc, result, inst_pos),
+                            fspill0,
+                        );
+                    } else {
+                        if (!isUnsignedInt(func, src_ty) or intBits(func, src_ty) != 32 or
+                            isHalf(func, dst_ty) or is64Float(func, dst_ty) or isQuad(func, dst_ty)) return error.Unsupported;
+                        try emitU32ToF32Reinterpret(
+                            allocator,
+                            &code,
+                            spill_base,
+                            float_spill_base,
+                            intLocationAt(alloc, u.value, inst_pos),
+                            floatLocationAt(alloc, result, inst_pos),
+                            fspill0,
+                        );
+                    }
                 },
                 .convert => |cv| {
                     const result = func.instResult(inst).?;
@@ -7701,15 +7955,89 @@ test "selectFunctionForModel fires the alignment hook from river-rc1.ma, matches
 // the class scratch (int `spill_scratch0`, float `float_scratch`/`float_spill_scratch0_vpu` in vpu
 // mode, RVV `vector_scratch`, VPU `float_scratch`).
 //
-// A natural Wimmer allocation never reaches this shape on riscv64, for the same structural reason
-// documented at aarch64's and x86_64's own `.slot_to_slot` tests: `riscv64UseKind` makes every operand
-// use `must_have_register`, so a placed value alternates register, slot, register, and two adjacent
-// slot segments never arise. The shared `wimmer.zig` `orderMoves`/`orderIntraActions` machinery also
+// A natural Wimmer allocation never reaches this shape on riscv64. Most operands use
+// `must_have_register`, while select/reinterpret operands which may remain in a slot need no adjacent
+// slot-to-slot transition. The shared `wimmer.zig` `orderMoves`/`orderIntraActions` machinery also
 // expands any slot-to-slot parallel-move shuffle through the class scratch before it ever becomes an
 // `Action` (see `SplitAction`'s doc comment), so `walloc.actions` never carries one either. These
 // tests exercise the exact mechanism (`emitSplitAction`'s `.slot_to_slot` arm) directly with a
 // hand-built `SplitAction`, one per register class, the same way the aarch64/x86_64 bridges do.
 // ===========================================================================
+
+test "u32/f32 reinterpret emission covers every resident and spilled location pair" {
+    const allocator = std.testing.allocator;
+    const spill_base: u32 = 16;
+    const float_spill_base: u32 = 80;
+
+    inline for (.{ false, true }) |src_spilled| {
+        inline for (.{ false, true }) |dst_spilled| {
+            var code: std.ArrayList(u32) = .empty;
+            defer code.deinit(allocator);
+            const src: IntLoc = if (src_spilled) .{ .slot = 2 } else .{ .reg = .x10 };
+            const dst: FloatLoc = if (dst_spilled) .{ .slot = 3 } else .{ .reg = .f11 };
+            try emitU32ToF32Reinterpret(allocator, &code, spill_base, float_spill_base, src, dst, float_spill_scratch0);
+
+            var expected: std.ArrayList(u32) = .empty;
+            defer expected.deinit(allocator);
+            const rs: Reg = if (src_spilled) spill_scratch0 else .x10;
+            const rd: FReg = if (dst_spilled) float_spill_scratch0 else .f11;
+            if (src_spilled) try expected.append(allocator, encode.ld(rs, .x2, spill_base + 2 * 8));
+            try expected.append(allocator, encode.fmv_w_x(rd, rs));
+            if (dst_spilled) try expected.append(allocator, encode.fsw(rd, .x2, float_spill_base + 3 * 8));
+            try std.testing.expectEqualSlices(u32, expected.items, code.items);
+        }
+    }
+
+    inline for (.{ false, true }) |src_spilled| {
+        inline for (.{ false, true }) |dst_spilled| {
+            var code: std.ArrayList(u32) = .empty;
+            defer code.deinit(allocator);
+            const src: FloatLoc = if (src_spilled) .{ .slot = 4 } else .{ .reg = .f12 };
+            const dst: IntLoc = if (dst_spilled) .{ .slot = 5 } else .{ .reg = .x11 };
+            try emitF32ToU32Reinterpret(allocator, &code, spill_base, float_spill_base, src, dst, float_spill_scratch0);
+
+            var expected: std.ArrayList(u32) = .empty;
+            defer expected.deinit(allocator);
+            const rs: FReg = if (src_spilled) float_spill_scratch0 else .f12;
+            const rd: Reg = if (dst_spilled) spill_scratch0 else .x11;
+            if (src_spilled) try expected.append(allocator, encode.flw(rs, .x2, float_spill_base + 4 * 8));
+            try expected.append(allocator, encode.fmv_x_w(rd, rs));
+            try expected.append(allocator, encode.slli(rd, rd, 32));
+            try expected.append(allocator, encode.srli(rd, rd, 32));
+            if (dst_spilled) try expected.append(allocator, encode.sd(rd, .x2, spill_base + 5 * 8));
+            try std.testing.expectEqualSlices(u32, expected.items, code.items);
+        }
+    }
+}
+
+test "integer select emission reloads spilled condition arms and result" {
+    const allocator = std.testing.allocator;
+    const spill_base: u32 = 24;
+    var code: std.ArrayList(u32) = .empty;
+    defer code.deinit(allocator);
+    try emitSpillSafeIntSelect(
+        allocator,
+        &code,
+        spill_base,
+        .{ .slot = 0 },
+        .{ .slot = 1 },
+        .{ .slot = 2 },
+        .{ .slot = 4 },
+    );
+
+    const expected = [_]u32{
+        encode.ld(spill_scratch0, .x2, spill_base + 0 * 8),
+        encode.beq(spill_scratch0, .x0, 20),
+        encode.ld(spill_scratch1, .x2, spill_base + 1 * 8),
+        encode.addi(spill_scratch0, spill_scratch1, 0),
+        encode.sd(spill_scratch0, .x2, spill_base + 4 * 8),
+        encode.jal(.x0, 16),
+        encode.ld(spill_scratch1, .x2, spill_base + 2 * 8),
+        encode.addi(spill_scratch0, spill_scratch1, 0),
+        encode.sd(spill_scratch0, .x2, spill_base + 4 * 8),
+    };
+    try std.testing.expectEqualSlices(u32, &expected, code.items);
+}
 
 test "emitSplitAction .slot_to_slot expands to reload+store through the int scratch" {
     const allocator = std.testing.allocator;
@@ -7844,19 +8172,33 @@ test "a barrier is rejected, not dropped like a prefetch" {
     try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
 }
 
-test "both low float directions are rejected while their results are live" {
+test "all low float formats and directions compile without mutating caller IR" {
     const allocator = std.testing.allocator;
-    inline for (.{ true, false }) |decode_direction| {
-        var func = Function.init(allocator);
-        defer func.deinit();
-        const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
-        const f32_t = try func.types.intern(.{ .float = .f32 });
-        const block = try func.appendBlock();
-        const source = try func.appendBlockParam(block, if (decode_direction) u16_t else f32_t);
-        const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = .bf16 };
-        const result = try func.appendInst(block, if (decode_direction) f32_t else u16_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
-        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
-        try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+    inline for ([_]ir.low_float.Format{ .bf16, .f8_e4m3, .f8_e5m2 }) |format| {
+        inline for (.{ true, false }) |decode_direction| {
+            var func = Function.init(allocator);
+            defer func.deinit();
+            const payload_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = format.payloadBits() } });
+            const f32_t = try func.types.intern(.{ .float = .f32 });
+            const block = try func.appendBlock();
+            const source = try func.appendBlockParam(block, if (decode_direction) payload_t else f32_t);
+            const conversion: ir.function.LowFloatConvert = .{ .value = source, .format = format };
+            const result = try func.appendInst(block, if (decode_direction) f32_t else payload_t, if (decode_direction) .{ .decode_low_float = conversion } else .{ .encode_low_float = conversion });
+            try func.addAttr(.{ .value = result }, .{ .custom = .{ .namespace = "test", .key = "preserve", .value = .flag } });
+            func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+            const before = try std.fmt.allocPrint(allocator, "{f}", .{func});
+            defer allocator.free(before);
+            const bits_before = try ir.bitcode.encode(allocator, &func);
+            defer allocator.free(bits_before);
+            const code = try selectFunction(allocator, &func);
+            allocator.free(code);
+            const after = try std.fmt.allocPrint(allocator, "{f}", .{func});
+            defer allocator.free(after);
+            const bits_after = try ir.bitcode.encode(allocator, &func);
+            defer allocator.free(bits_after);
+            try std.testing.expectEqualStrings(before, after);
+            try std.testing.expectEqualSlices(u8, bits_before, bits_after);
+        }
     }
 }
 

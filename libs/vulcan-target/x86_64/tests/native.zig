@@ -4,6 +4,7 @@
 //! x86-64 host this also exercises the JIT (coherent_jit) path.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cases = @import("cases.zig");
 const harness = @import("harness.zig");
 const ir = @import("vulcan-ir");
@@ -11,6 +12,244 @@ const isel = @import("../isel.zig");
 const disasm = @import("../disasm.zig");
 const link = @import("../link.zig");
 const mm = @import("vulcan-opt").microarch;
+const jit = @import("../../coherent_jit.zig");
+
+fn lowFloatWrapper(allocator: std.mem.Allocator, format: ir.low_float.Format, decode: bool) !ir.function.Function {
+    var func = ir.function.Function.init(allocator);
+    errdefer func.deinit();
+    const payload_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = format.payloadBits() } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const input = try func.appendBlockParam(block, if (decode) payload_t else u32_t);
+    const result = if (decode) blk: {
+        const value = try func.appendInst(block, f32_t, .{ .decode_low_float = .{ .format = format, .value = input } });
+        break :blk try func.appendInst(block, u32_t, .{ .unary = .{ .op = .reinterpret, .value = value } });
+    } else blk: {
+        const value = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = input } });
+        const payload = try func.appendInst(block, payload_t, .{ .encode_low_float = .{ .format = format, .value = value } });
+        break :blk try func.appendInst(block, u32_t, .{ .convert = .{ .value = payload } });
+    };
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    return func;
+}
+
+const LowFloatCode = struct {
+    buffer: jit.CodeBuffer,
+
+    fn init(allocator: std.mem.Allocator, func: *const ir.function.Function) !LowFloatCode {
+        if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+        const code = try isel.selectFunction(allocator, func);
+        defer allocator.free(code);
+        return .{ .buffer = try jit.CodeBuffer.map(code) };
+    }
+
+    fn deinit(self: *LowFloatCode) void {
+        self.buffer.deinit();
+    }
+
+    fn call(self: *const LowFloatCode, input: u32) u32 {
+        return self.buffer.entry(*const fn (u32) callconv(.c) u32, 0)(input);
+    }
+};
+
+test "x86_64 native low float decode is exhaustive and caller IR stays unchanged" {
+    const allocator = std.testing.allocator;
+    var distinguished_decode: [3][2]u32 = undefined;
+    for (std.enums.values(ir.low_float.Format)) |format| {
+        var func = try lowFloatWrapper(allocator, format, true);
+        defer func.deinit();
+        try func.addAttr(.func, .{ .custom = .{ .namespace = "test", .key = "preserve", .value = .{ .int = 41 } } });
+        const text_before = try std.fmt.allocPrint(allocator, "{f}", .{func});
+        defer allocator.free(text_before);
+        const bits_before = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(bits_before);
+        var code = try LowFloatCode.init(allocator, &func);
+        defer code.deinit();
+        const text_after = try std.fmt.allocPrint(allocator, "{f}", .{func});
+        defer allocator.free(text_after);
+        const bits_after = try ir.bitcode.encode(allocator, &func);
+        defer allocator.free(bits_after);
+        try std.testing.expectEqualStrings(text_before, text_after);
+        try std.testing.expectEqualSlices(u8, bits_before, bits_after);
+
+        const limit: usize = if (format == .bf16) 65536 else 256;
+        for (0..limit) |raw| {
+            const payload: u16 = @intCast(raw);
+            const expected: u32 = @bitCast(try ir.low_float.decode(format, payload));
+            try std.testing.expectEqual(expected, code.call(payload));
+        }
+        distinguished_decode[@intFromEnum(format)] = .{ code.call(0x7c), code.call(0x7e) };
+    }
+    try std.testing.expect(distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e4m3)][0] != distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e5m2)][0]);
+    try std.testing.expect(distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e4m3)][1] != distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e5m2)][1]);
+}
+
+test "x86_64 native low float encode matches structured and boundary corpora" {
+    const allocator = std.testing.allocator;
+    const mantissas = [_]u32{
+        0,           1,           0x003f_ffff, 0x0040_0000, 0x0040_0001, 0x007f_7fff,
+        0x007f_8000, 0x007f_8001, 0x007f_ffff, 0x0000_7fff, 0x0000_8000, 0x0000_8001,
+    };
+    const boundaries = [_]u32{
+        0x0000_0000, 0x8000_0000, 0x3f80_0000, 0x3f80_7fff, 0x3f80_8000,
+        0x3f80_8001, 0x3f81_8000, 0x3a7f_ffff, 0x3a80_0000, 0x3a80_0001,
+        0x3b3f_ffff, 0x3b40_0000, 0x3b40_0001, 0x36ff_ffff, 0x3700_0000,
+        0x3700_0001, 0x37bf_ffff, 0x37c0_0000, 0x37c0_0001, 0x7f7f_ffff,
+        0xff7f_ffff, 0x7f80_0000, 0xff80_0000, 0x7f80_0001, 0xffa0_0001,
+        0x7fc0_0000, 0xffc0_0000,
+    };
+
+    for (std.enums.values(ir.low_float.Format)) |format| {
+        var func = try lowFloatWrapper(allocator, format, false);
+        defer func.deinit();
+        var code = try LowFloatCode.init(allocator, &func);
+        defer code.deinit();
+        for (boundaries) |bits| {
+            try std.testing.expectEqual(@as(u32, ir.low_float.encode(format, @bitCast(bits))), code.call(bits));
+        }
+        switch (format) {
+            .bf16 => for (ir.low_float.bf16_encode_boundary_cases) |case| {
+                try std.testing.expectEqual(@as(u32, case.expected), code.call(case.source));
+            },
+            .f8_e4m3 => for (ir.low_float.e4_encode_boundary_cases) |case| {
+                try std.testing.expectEqual(@as(u32, case.expected), code.call(case.source));
+                try std.testing.expectEqual(@as(u32, case.expected | 0x80), code.call(case.source | 0x8000_0000));
+            },
+            .f8_e5m2 => for (ir.low_float.e5_encode_boundary_cases) |case| {
+                try std.testing.expectEqual(@as(u32, case.expected), code.call(case.source));
+                try std.testing.expectEqual(@as(u32, case.expected | 0x80), code.call(case.source | 0x8000_0000));
+            },
+        }
+        if (format != .bf16) for (ir.low_float.fp8_encode_special_cases) |case| {
+            const expected = if (format == .f8_e4m3) case.e4 else case.e5;
+            try std.testing.expectEqual(@as(u32, expected), code.call(case.source));
+        };
+        for (0..256) |exponent| {
+            for ([_]u32{ 0, 0x8000_0000 }) |sign| {
+                for (mantissas) |mantissa| {
+                    const bits = sign | (@as(u32, @intCast(exponent)) << 23) | mantissa;
+                    try std.testing.expectEqual(@as(u32, ir.low_float.encode(format, @bitCast(bits))), code.call(bits));
+                }
+            }
+        }
+    }
+}
+
+test "x86_64 native low float decode then encode follows reference NaN quieting" {
+    const allocator = std.testing.allocator;
+    for (std.enums.values(ir.low_float.Format)) |format| {
+        var decode_func = try lowFloatWrapper(allocator, format, true);
+        defer decode_func.deinit();
+        var encode_func = try lowFloatWrapper(allocator, format, false);
+        defer encode_func.deinit();
+        var decode_code = try LowFloatCode.init(allocator, &decode_func);
+        defer decode_code.deinit();
+        var encode_code = try LowFloatCode.init(allocator, &encode_func);
+        defer encode_code.deinit();
+        const limit: usize = if (format == .bf16) 65536 else 256;
+        for (0..limit) |raw| {
+            const payload: u16 = @intCast(raw);
+            const expected = ir.low_float.encode(format, try ir.low_float.decode(format, payload));
+            try std.testing.expectEqual(@as(u32, expected), encode_code.call(decode_code.call(payload)));
+        }
+    }
+}
+
+test "x86_64 native low float memory path supports payload and f32 buffers" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const element_count = 5;
+    const payload_values = [_]u16{ 0x00, 0x01, 0x3d, 0x7c, 0xff };
+    const source_bits = [_]u32{ 0x0000_0000, 0x8000_0000, 0x3f88_0001, 0x7f80_0001, 0xff7f_ffff };
+    for (std.enums.values(ir.low_float.Format)) |format| {
+        var func = ir.function.Function.init(allocator);
+        defer func.deinit();
+        const ptr_t = try func.types.ptrGlobal();
+        const payload_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = format.payloadBits() } });
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const block = try func.appendBlock();
+        const decode_ptr = try func.appendBlockParam(block, ptr_t);
+        const float_out_ptr = try func.appendBlockParam(block, ptr_t);
+        const float_in_ptr = try func.appendBlockParam(block, ptr_t);
+        const encode_ptr = try func.appendBlockParam(block, ptr_t);
+        const payload_bytes: usize = format.payloadBits() / 8;
+        for (0..element_count) |index| {
+            const payload_offset: i64 = @intCast(index * payload_bytes);
+            const float_offset: i64 = @intCast(index * @sizeOf(u32));
+            const payload_at = if (index == 0) decode_ptr else try func.appendArithImm(block, ptr_t, .add, decode_ptr, payload_offset);
+            const float_out_at = if (index == 0) float_out_ptr else try func.appendArithImm(block, ptr_t, .add, float_out_ptr, float_offset);
+            const float_in_at = if (index == 0) float_in_ptr else try func.appendArithImm(block, ptr_t, .add, float_in_ptr, float_offset);
+            const encode_at = if (index == 0) encode_ptr else try func.appendArithImm(block, ptr_t, .add, encode_ptr, payload_offset);
+            const payload = try func.appendInst(block, payload_t, .{ .load = .{ .ptr = payload_at } });
+            const decoded = try func.appendInst(block, f32_t, .{ .decode_low_float = .{ .format = format, .value = payload } });
+            try func.appendStore(block, decoded, float_out_at);
+            const source = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = float_in_at } });
+            const encoded = try func.appendInst(block, payload_t, .{ .encode_low_float = .{ .format = format, .value = source } });
+            try func.appendStore(block, encoded, encode_at);
+        }
+        func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+
+        const code = try isel.selectFunction(allocator, &func);
+        defer allocator.free(code);
+        var buffer = try jit.CodeBuffer.map(code);
+        defer buffer.deinit();
+        const run = buffer.entry(*const fn (*const u8, *u32, *const u32, *u8) callconv(.c) void, 0);
+        var input_storage = [_]u8{0xaa} ++ [_]u8{0} ** (element_count * 2);
+        var decoded_bits = [_]u32{0} ** element_count;
+        var output_storage = [_]u8{0} ** (element_count * 2);
+        for (payload_values, 0..) |payload_value, index| {
+            input_storage[1 + index * payload_bytes] = @truncate(payload_value);
+            if (format == .bf16) input_storage[2 + index * payload_bytes] = @truncate(payload_value >> 8);
+        }
+        run(&input_storage[1], &decoded_bits[0], &source_bits[0], &output_storage[0]);
+        for (payload_values, source_bits, 0..) |payload_value, source, index| {
+            try std.testing.expectEqual(@as(u32, @bitCast(try ir.low_float.decode(format, payload_value))), decoded_bits[index]);
+            const expected = ir.low_float.encode(format, @bitCast(source));
+            try std.testing.expectEqual(@as(u8, @truncate(expected)), output_storage[index * payload_bytes]);
+            if (format == .bf16) try std.testing.expectEqual(@as(u8, @truncate(expected >> 8)), output_storage[index * payload_bytes + 1]);
+        }
+    }
+}
+
+test "x86_64 native low float expansion survives integer spill pressure" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = ir.function.Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const input = try func.appendBlockParam(block, u32_t);
+    var values: [24]ir.function.Value = undefined;
+    for (&values, 0..) |*slot, index| {
+        const salt = try func.appendInst(block, u32_t, .{ .iconst = @as(i64, @intCast(index * 0x10203)) });
+        const bits = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = input, .rhs = salt } });
+        const source = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = bits } });
+        const format: ir.low_float.Format = @enumFromInt(index % 3);
+        const payload_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = format.payloadBits() } });
+        const encoded = try func.appendInst(block, payload_t, .{ .encode_low_float = .{ .format = format, .value = source } });
+        slot.* = try func.appendInst(block, u32_t, .{ .convert = .{ .value = encoded } });
+    }
+    var result = values[0];
+    for (values[1..]) |value| {
+        result = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = result, .rhs = value } });
+    }
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+
+    var code = try LowFloatCode.init(allocator, &func);
+    defer code.deinit();
+    const inputs = [_]u32{ 0, 0x3f80_8001, 0x7f80_0001, 0xff7f_ffff };
+    for (inputs) |input_bits| {
+        var expected: u32 = 0;
+        for (0..values.len) |index| {
+            const format: ir.low_float.Format = @enumFromInt(index % 3);
+            const bits = input_bits ^ @as(u32, @intCast(index * 0x10203));
+            expected ^= ir.low_float.encode(format, @bitCast(bits));
+        }
+        try std.testing.expectEqual(expected, code.call(input_bits));
+    }
+}
 
 test "module disasm: linked functions get labels and a resolved, named call" {
     const a = std.testing.allocator;

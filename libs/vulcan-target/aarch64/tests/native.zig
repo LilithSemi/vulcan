@@ -15,6 +15,87 @@ const encode = @import("../encode.zig");
 
 const Function = ir.function.Function;
 
+fn lowFloatWrapper(allocator: std.mem.Allocator, format: ir.low_float.Format, decode: bool) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const payload_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = format.payloadBits() } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const input = try func.appendBlockParam(block, if (decode) payload_t else u32_t);
+    const result = if (decode) blk: {
+        const value = try func.appendInst(block, f32_t, .{ .decode_low_float = .{ .format = format, .value = input } });
+        break :blk try func.appendInst(block, u32_t, .{ .unary = .{ .op = .reinterpret, .value = value } });
+    } else blk: {
+        const value = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = input } });
+        const payload = try func.appendInst(block, payload_t, .{ .encode_low_float = .{ .format = format, .value = value } });
+        break :blk try func.appendInst(block, u32_t, .{ .convert = .{ .value = payload } });
+    };
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    return func;
+}
+
+test "native low float conversions match exhaustive and structured references" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mantissas = [_]u32{ 0, 1, 0x003f_ffff, 0x0040_0000, 0x0040_0001, 0x007f_7fff, 0x007f_8000, 0x007f_8001, 0x007f_ffff, 0x0000_7fff, 0x0000_8000, 0x0000_8001 };
+    var distinguished_decode: [3][2]u32 = undefined;
+    for (std.enums.values(ir.low_float.Format)) |format| {
+        var decode_func = try lowFloatWrapper(allocator, format, true);
+        defer decode_func.deinit();
+        const decode_words = try isel.selectFunction(allocator, &decode_func);
+        defer allocator.free(decode_words);
+        var decode_buffer = try jit.CodeBuffer.map(std.mem.sliceAsBytes(decode_words));
+        defer decode_buffer.deinit();
+        const decode = @as(*const fn (u32) callconv(.c) u32, @ptrCast(decode_buffer.memory.ptr));
+
+        var encode_func = try lowFloatWrapper(allocator, format, false);
+        defer encode_func.deinit();
+        const encode_words = try isel.selectFunction(allocator, &encode_func);
+        defer allocator.free(encode_words);
+        var encode_buffer = try jit.CodeBuffer.map(std.mem.sliceAsBytes(encode_words));
+        defer encode_buffer.deinit();
+        const encode_fn = @as(*const fn (u32) callconv(.c) u32, @ptrCast(encode_buffer.memory.ptr));
+
+        const limit: usize = if (format == .bf16) 65536 else 256;
+        for (0..limit) |raw| {
+            const payload: u16 = @intCast(raw);
+            const expected_bits: u32 = @bitCast(try ir.low_float.decode(format, payload));
+            const actual_bits = decode(payload);
+            try std.testing.expectEqual(expected_bits, actual_bits);
+            try std.testing.expectEqual(@as(u32, ir.low_float.encode(format, @bitCast(expected_bits))), encode_fn(actual_bits));
+        }
+        distinguished_decode[@intFromEnum(format)] = .{ decode(0x7c), decode(0x7e) };
+        switch (format) {
+            .bf16 => for (ir.low_float.bf16_encode_boundary_cases) |case| {
+                try std.testing.expectEqual(@as(u32, case.expected), encode_fn(case.source));
+            },
+            .f8_e4m3 => for (ir.low_float.e4_encode_boundary_cases) |case| {
+                try std.testing.expectEqual(@as(u32, case.expected), encode_fn(case.source));
+                try std.testing.expectEqual(@as(u32, case.expected | 0x80), encode_fn(case.source | 0x8000_0000));
+            },
+            .f8_e5m2 => for (ir.low_float.e5_encode_boundary_cases) |case| {
+                try std.testing.expectEqual(@as(u32, case.expected), encode_fn(case.source));
+                try std.testing.expectEqual(@as(u32, case.expected | 0x80), encode_fn(case.source | 0x8000_0000));
+            },
+        }
+        if (format != .bf16) for (ir.low_float.fp8_encode_special_cases) |case| {
+            const expected = if (format == .f8_e4m3) case.e4 else case.e5;
+            try std.testing.expectEqual(@as(u32, expected), encode_fn(case.source));
+        };
+        for (0..256) |exponent| {
+            for ([_]u32{ 0, 0x8000_0000 }) |sign| {
+                for (mantissas) |mantissa| {
+                    const bits = sign | (@as(u32, @intCast(exponent)) << 23) | mantissa;
+                    try std.testing.expectEqual(@as(u32, ir.low_float.encode(format, @bitCast(bits))), encode_fn(bits));
+                }
+            }
+        }
+    }
+    try std.testing.expect(distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e4m3)][0] != distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e5m2)][0]);
+    try std.testing.expect(distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e4m3)][1] != distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e5m2)][1]);
+}
+
 /// Compile `func` to A64 and assert its disassembled listing equals `expected`. This round-trips
 /// codegen through the disassembler. So it checks the actual instructions and register allocation,
 /// not just the run result. It works on any host, because it never executes the code.

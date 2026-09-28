@@ -808,6 +808,14 @@ pub const Function = struct {
         return self.attributes.items;
     }
 
+    /// Move every attribute from one live IR entity to another. Attribute payload ownership does
+    /// not change. This is for replacement passes which remove the old entity instead of cloning it.
+    pub fn retargetAttrs(self: *Function, from: AttrTarget, to: AttrTarget) void {
+        for (self.attributes.items) |*entry| {
+            if (std.meta.eql(entry.target, from)) entry.target = to;
+        }
+    }
+
     /// True when the memory operation `inst` carries an `endian` attribute, in either of the
     /// two places the verifier accepts it: on the instruction, or on the instruction's result
     /// value. A load is tagged on its result, a store on the instruction, and this answers for

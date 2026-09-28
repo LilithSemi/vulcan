@@ -152,6 +152,77 @@ fn roundRight(value: u32, shift: u8) u32 {
         (discarded == halfway and retained & 1 != 0));
 }
 
+pub const bf16_encode_boundary_cases = [_]struct { source: u32, expected: u16 }{
+    .{ .source = 0x0000_0000, .expected = 0x0000 },
+    .{ .source = 0x8000_0000, .expected = 0x8000 },
+    .{ .source = 0x3f80_0000, .expected = 0x3f80 },
+    .{ .source = 0x3f80_7fff, .expected = 0x3f80 },
+    .{ .source = 0x3f80_8000, .expected = 0x3f80 },
+    .{ .source = 0x3f80_8001, .expected = 0x3f81 },
+    .{ .source = 0x3f81_7fff, .expected = 0x3f81 },
+    .{ .source = 0x3f81_8000, .expected = 0x3f82 },
+    .{ .source = 0x3f81_8001, .expected = 0x3f82 },
+    .{ .source = 0x7f7f_ffff, .expected = 0x7f80 },
+    .{ .source = 0xff7f_ffff, .expected = 0xff80 },
+    .{ .source = 0x7f80_0000, .expected = 0x7f80 },
+    .{ .source = 0xff80_0000, .expected = 0xff80 },
+    .{ .source = 0x7f81_2345, .expected = 0x7fc1 },
+    .{ .source = 0xffa5_4321, .expected = 0xffe5 },
+};
+
+pub const e4_encode_boundary_cases = [_]struct { source: u32, expected: u16 }{
+    .{ .source = 0x3f87_ffff, .expected = 0x38 },
+    .{ .source = 0x3f88_0000, .expected = 0x38 },
+    .{ .source = 0x3f88_0001, .expected = 0x39 },
+    .{ .source = 0x3f97_ffff, .expected = 0x39 },
+    .{ .source = 0x3f98_0000, .expected = 0x3a },
+    .{ .source = 0x3f98_0001, .expected = 0x3a },
+    .{ .source = 0x3a7f_ffff, .expected = 0x00 },
+    .{ .source = 0x3a80_0000, .expected = 0x00 },
+    .{ .source = 0x3a80_0001, .expected = 0x01 },
+    .{ .source = 0x3b3f_ffff, .expected = 0x01 },
+    .{ .source = 0x3b40_0000, .expected = 0x02 },
+    .{ .source = 0x3b40_0001, .expected = 0x02 },
+    .{ .source = 0x3c6f_ffff, .expected = 0x07 },
+    .{ .source = 0x3c70_0000, .expected = 0x08 },
+    .{ .source = 0x3c70_0001, .expected = 0x08 },
+};
+
+pub const e5_encode_boundary_cases = [_]struct { source: u32, expected: u16 }{
+    .{ .source = 0x3f8f_ffff, .expected = 0x3c },
+    .{ .source = 0x3f90_0000, .expected = 0x3c },
+    .{ .source = 0x3f90_0001, .expected = 0x3d },
+    .{ .source = 0x3faf_ffff, .expected = 0x3d },
+    .{ .source = 0x3fb0_0000, .expected = 0x3e },
+    .{ .source = 0x3fb0_0001, .expected = 0x3e },
+    .{ .source = 0x36ff_ffff, .expected = 0x00 },
+    .{ .source = 0x3700_0000, .expected = 0x00 },
+    .{ .source = 0x3700_0001, .expected = 0x01 },
+    .{ .source = 0x37bf_ffff, .expected = 0x01 },
+    .{ .source = 0x37c0_0000, .expected = 0x02 },
+    .{ .source = 0x37c0_0001, .expected = 0x02 },
+    .{ .source = 0x385f_ffff, .expected = 0x03 },
+    .{ .source = 0x3860_0000, .expected = 0x04 },
+    .{ .source = 0x3860_0001, .expected = 0x04 },
+};
+
+pub const fp8_encode_special_cases = [_]struct { source: u32, e4: u16, e5: u16 }{
+    .{ .source = 0x0000_0000, .e4 = 0x00, .e5 = 0x00 },
+    .{ .source = 0x8000_0000, .e4 = 0x80, .e5 = 0x80 },
+    .{ .source = 0x3f88_0000, .e4 = 0x38, .e5 = 0x3c },
+    .{ .source = 0x3f88_0001, .e4 = 0x39, .e5 = 0x3c },
+    .{ .source = 0x3a80_0000, .e4 = 0x00, .e5 = 0x14 },
+    .{ .source = 0x3a80_0001, .e4 = 0x01, .e5 = 0x14 },
+    .{ .source = 0x3700_0000, .e4 = 0x00, .e5 = 0x00 },
+    .{ .source = 0x3700_0001, .e4 = 0x00, .e5 = 0x01 },
+    .{ .source = 0x7f7f_ffff, .e4 = 0x7e, .e5 = 0x7b },
+    .{ .source = 0xff7f_ffff, .e4 = 0xfe, .e5 = 0xfb },
+    .{ .source = 0x7f80_0000, .e4 = 0x7e, .e5 = 0x7c },
+    .{ .source = 0xff80_0000, .e4 = 0xfe, .e5 = 0xfc },
+    .{ .source = 0x7f80_0001, .e4 = 0x7f, .e5 = 0x7e },
+    .{ .source = 0xffa0_0001, .e4 = 0xff, .e5 = 0xff },
+};
+
 test "BF16 payloads round trip with NaNs quieted" {
     for (0..@as(usize, std.math.maxInt(u16)) + 1) |raw| {
         const payload: u16 = @intCast(raw);
@@ -164,24 +235,7 @@ test "BF16 payloads round trip with NaNs quieted" {
 }
 
 test "BF16 encode uses ties to even and preserves special signs" {
-    const cases = [_]struct { source: u32, expected: u16 }{
-        .{ .source = 0x0000_0000, .expected = 0x0000 },
-        .{ .source = 0x8000_0000, .expected = 0x8000 },
-        .{ .source = 0x3f80_0000, .expected = 0x3f80 },
-        .{ .source = 0x3f80_7fff, .expected = 0x3f80 },
-        .{ .source = 0x3f80_8000, .expected = 0x3f80 },
-        .{ .source = 0x3f80_8001, .expected = 0x3f81 },
-        .{ .source = 0x3f81_7fff, .expected = 0x3f81 },
-        .{ .source = 0x3f81_8000, .expected = 0x3f82 },
-        .{ .source = 0x3f81_8001, .expected = 0x3f82 },
-        .{ .source = 0x7f7f_ffff, .expected = 0x7f80 },
-        .{ .source = 0xff7f_ffff, .expected = 0xff80 },
-        .{ .source = 0x7f80_0000, .expected = 0x7f80 },
-        .{ .source = 0xff80_0000, .expected = 0xff80 },
-        .{ .source = 0x7f81_2345, .expected = 0x7fc1 },
-        .{ .source = 0xffa5_4321, .expected = 0xffe5 },
-    };
-    for (cases) |case| try std.testing.expectEqual(case.expected, encode(.bf16, @bitCast(case.source)));
+    for (bf16_encode_boundary_cases) |case| try std.testing.expectEqual(case.expected, encode(.bf16, @bitCast(case.source)));
 }
 
 test "FP8 payloads round trip with format-specific NaNs" {
@@ -197,69 +251,19 @@ test "FP8 payloads round trip with format-specific NaNs" {
 }
 
 test "FP8 normal and subnormal boundaries round nearest ties to even" {
-    const e4_cases = [_]struct { source: u32, expected: u16 }{
-        .{ .source = 0x3f87_ffff, .expected = 0x38 },
-        .{ .source = 0x3f88_0000, .expected = 0x38 },
-        .{ .source = 0x3f88_0001, .expected = 0x39 },
-        .{ .source = 0x3f97_ffff, .expected = 0x39 },
-        .{ .source = 0x3f98_0000, .expected = 0x3a },
-        .{ .source = 0x3f98_0001, .expected = 0x3a },
-        .{ .source = 0x3a7f_ffff, .expected = 0x00 },
-        .{ .source = 0x3a80_0000, .expected = 0x00 },
-        .{ .source = 0x3a80_0001, .expected = 0x01 },
-        .{ .source = 0x3b3f_ffff, .expected = 0x01 },
-        .{ .source = 0x3b40_0000, .expected = 0x02 },
-        .{ .source = 0x3b40_0001, .expected = 0x02 },
-        .{ .source = 0x3c6f_ffff, .expected = 0x07 },
-        .{ .source = 0x3c70_0000, .expected = 0x08 },
-        .{ .source = 0x3c70_0001, .expected = 0x08 },
-    };
-    for (e4_cases) |case| {
+    for (e4_encode_boundary_cases) |case| {
         try std.testing.expectEqual(case.expected, encode(.f8_e4m3, @bitCast(case.source)));
         try std.testing.expectEqual(case.expected | 0x80, encode(.f8_e4m3, @bitCast(case.source | 0x8000_0000)));
     }
 
-    const e5_cases = [_]struct { source: u32, expected: u16 }{
-        .{ .source = 0x3f8f_ffff, .expected = 0x3c },
-        .{ .source = 0x3f90_0000, .expected = 0x3c },
-        .{ .source = 0x3f90_0001, .expected = 0x3d },
-        .{ .source = 0x3faf_ffff, .expected = 0x3d },
-        .{ .source = 0x3fb0_0000, .expected = 0x3e },
-        .{ .source = 0x3fb0_0001, .expected = 0x3e },
-        .{ .source = 0x36ff_ffff, .expected = 0x00 },
-        .{ .source = 0x3700_0000, .expected = 0x00 },
-        .{ .source = 0x3700_0001, .expected = 0x01 },
-        .{ .source = 0x37bf_ffff, .expected = 0x01 },
-        .{ .source = 0x37c0_0000, .expected = 0x02 },
-        .{ .source = 0x37c0_0001, .expected = 0x02 },
-        .{ .source = 0x385f_ffff, .expected = 0x03 },
-        .{ .source = 0x3860_0000, .expected = 0x04 },
-        .{ .source = 0x3860_0001, .expected = 0x04 },
-    };
-    for (e5_cases) |case| {
+    for (e5_encode_boundary_cases) |case| {
         try std.testing.expectEqual(case.expected, encode(.f8_e5m2, @bitCast(case.source)));
         try std.testing.expectEqual(case.expected | 0x80, encode(.f8_e5m2, @bitCast(case.source | 0x8000_0000)));
     }
 }
 
 test "FP8 encode covers rounding saturation infinity and NaN" {
-    const cases = [_]struct { source: u32, e4: u16, e5: u16 }{
-        .{ .source = 0x0000_0000, .e4 = 0x00, .e5 = 0x00 },
-        .{ .source = 0x8000_0000, .e4 = 0x80, .e5 = 0x80 },
-        .{ .source = 0x3f88_0000, .e4 = 0x38, .e5 = 0x3c },
-        .{ .source = 0x3f88_0001, .e4 = 0x39, .e5 = 0x3c },
-        .{ .source = 0x3a80_0000, .e4 = 0x00, .e5 = 0x14 },
-        .{ .source = 0x3a80_0001, .e4 = 0x01, .e5 = 0x14 },
-        .{ .source = 0x3700_0000, .e4 = 0x00, .e5 = 0x00 },
-        .{ .source = 0x3700_0001, .e4 = 0x00, .e5 = 0x01 },
-        .{ .source = 0x7f7f_ffff, .e4 = 0x7e, .e5 = 0x7b },
-        .{ .source = 0xff7f_ffff, .e4 = 0xfe, .e5 = 0xfb },
-        .{ .source = 0x7f80_0000, .e4 = 0x7e, .e5 = 0x7c },
-        .{ .source = 0xff80_0000, .e4 = 0xfe, .e5 = 0xfc },
-        .{ .source = 0x7f80_0001, .e4 = 0x7f, .e5 = 0x7e },
-        .{ .source = 0xffa0_0001, .e4 = 0xff, .e5 = 0xff },
-    };
-    for (cases) |case| {
+    for (fp8_encode_special_cases) |case| {
         const value: f32 = @bitCast(case.source);
         try std.testing.expectEqual(case.e4, encode(.f8_e4m3, value));
         try std.testing.expectEqual(case.e5, encode(.f8_e5m2, value));
