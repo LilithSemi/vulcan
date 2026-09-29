@@ -14,6 +14,13 @@
 //! (nothing else carried), an `i < n` / `i <= n` test with a loop-invariant bound, a constant
 //! positive step, and each accumulator used only by its own reduction. Anything else is skipped
 //! unchanged. Correctness is proven by the differential JIT oracle in splitunroll_differential.zig.
+//!
+//! K comes from the accumulate op's own latency (`splitFactor`), not from the body's instruction
+//! count. Splitting exists to hide a serial dependency chain, and a body ten times as long has the
+//! exact same chain: the extra instructions are independent work the split can interleave with,
+//! never a reason to carry fewer partials. When a loop carries several accumulators they share one
+//! K, sized off the slowest of their ops, because an under-sized accumulator would stay the loop's
+//! critical path and waste the split on the one thing it exists to fix.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -83,6 +90,22 @@ fn functionHasFastMath(func: *const Function) bool {
         else => {},
     };
     return false;
+}
+
+/// How many independent partial accumulators (K) to carry for an accumulate op whose result takes
+/// `latency` cycles. Splitting turns one N-link dependency chain into K chains of N/K links, each
+/// K iterations apart, so the chain is fully hidden once K reaches the op's own latency: another
+/// copy past that point only adds a live register, it shortens nothing further. This is a
+/// different question from plain unrolling's `unroll.cpuUnrollFactor`, which asks whether the
+/// body already has enough independent work to fill the issue width; a splitting accumulator has
+/// no independent work of its own; the body's OTHER instructions play no part in this number.
+///
+/// `MAX_FACTOR` (shared with `unroll.zig`) is the hard ceiling: every partial accumulator is a
+/// live value across the whole loop, so a long-latency op cannot ask for more registers than the
+/// target actually has.
+fn splitFactor(model: *const mm.Model, latency: u32) u32 {
+    if (model.issue_width <= 1) return 1; // no ILP to expose, same reason plain unrolling declines
+    return std.math.clamp(latency, 2, unroll.MAX_FACTOR);
 }
 
 fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Model, loop: *const loops.Loop, fast_math: bool) Error!?Plan {
@@ -229,7 +252,16 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         return null; // no accumulator to split
     }
 
-    const factor = unroll.unrollFactor(model, @intCast(func.blockInsts(bodyb).len));
+    // All reductions share one K, sized off the SLOWEST accumulate op. An accumulator whose op
+    // is still latency-bound after splitting stays the loop's critical path, so under-sizing K
+    // for it would waste the split on the very thing it exists to fix. Sizing a fast op's K off
+    // a slow neighbour only costs it a few spare live registers, never a wrong answer.
+    var op_latency: u32 = 0;
+    for (reductions.items) |red| {
+        const lat = model.latency(.{ .arith = .{ .op = red.op, .lhs = undefined, .rhs = undefined } });
+        if (lat > op_latency) op_latency = lat;
+    }
+    const factor = splitFactor(model, op_latency);
     if (factor < 2) {
         reductions.deinit(allocator);
         return null;
@@ -895,4 +927,180 @@ test "an atomic in the body is declined, not sent into remapOp's unreachable" {
         if (plan) |p2| allocator.free(p2.reductions);
         try std.testing.expectEqual(!use_atomic, plan != null);
     }
+}
+
+/// `for (i = 0; i < n; i += 1) { pad_count independent chained adds on i; acc = acc op i; }
+/// return` (no escaping use of `acc`, so `recognize` never has to build loop-closed SSA for it).
+/// The padding instructions exist only to push the body's instruction count well past a small
+/// number: they do not feed `acc`, so they say nothing about the split factor a correct rule
+/// should choose.
+fn buildPaddedAccumulator(allocator: std.mem.Allocator, pad_count: u32, op: BinOp) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, header, &.{ zero, zero });
+    const i = try func.appendBlockParam(header, i32_t);
+    const acc = try func.appendBlockParam(header, i32_t);
+    const cmp = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(header, cmp, .{ .target = body, .args = &.{ i, acc } }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    const bacc = try func.appendBlockParam(body, i32_t);
+    var pad = bi;
+    for (0..pad_count) |_| pad = try func.appendArithImm(body, i32_t, .add, pad, 1);
+    const nacc = try func.appendInst(body, i32_t, .{ .arith = .{ .op = op, .lhs = bacc, .rhs = bi } });
+    const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, header, &.{ ni, nacc });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+test "a body far past the old 6-instruction ceiling now splits, sized off the op's own latency" {
+    // 30 padding instructions plus the accumulate and induction update: 32 instructions, which
+    // the old body-size heuristic (unroll.unrollFactor, target 4*3=12 issue-slot-cycles) would
+    // have put well under a factor of 2 and declined outright.
+    const allocator = std.testing.allocator;
+    var func = try buildPaddedAccumulator(allocator, 30, .mul);
+    defer func.deinit();
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    const model = @import("registry.zig").modelFor(.@"ampere-altra");
+    const plan = try recognize(allocator, &func, model, &info.loops[0], false);
+    try std.testing.expect(plan != null);
+    defer allocator.free(plan.?.reductions);
+
+    // altra prices an i32 mul at latency 4 (altraArith), so K = clamp(4, 2, 8) = 4, independent
+    // of the 32-instruction body around it.
+    try std.testing.expectEqual(@as(u32, 4), plan.?.factor);
+    try std.testing.expectEqual(@as(usize, 1), plan.?.reductions.len);
+
+    try apply(allocator, &func, &plan.?);
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+
+    // Structure: the main header (appended 4th, right after entry/header/body/done) carries the
+    // induction variable plus K partials for the one accumulator.
+    const mainheader: Block = @enumFromInt(4);
+    try std.testing.expectEqual(@as(usize, 1 + 4), func.blockParams(mainheader).len);
+}
+
+test "a small body that already worked keeps the same factor" {
+    // pad_count=1, mul accumulator: a 3-instruction body. The old body-size heuristic gave K =
+    // (issue_width*3)/body_ops = 12/3 = 4. The new latency-based rule gives the same K here
+    // (altra also prices an i32 mul at latency 4), so a body the old rule already handled is not
+    // silently retuned by this change.
+    const allocator = std.testing.allocator;
+    var func = try buildPaddedAccumulator(allocator, 1, .mul);
+    defer func.deinit();
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    const model = @import("registry.zig").modelFor(.@"ampere-altra");
+    const plan = try recognize(allocator, &func, model, &info.loops[0], false);
+    try std.testing.expect(plan != null);
+    defer allocator.free(plan.?.reductions);
+    try std.testing.expectEqual(@as(u32, 4), plan.?.factor);
+}
+
+test "several accumulators share one K, sized off the slowest op's latency" {
+    // Two accumulators in one loop, an add (altra latency 1) and a mul (altra latency 4). Sizing
+    // K off the add alone (2) would leave the mul's chain still latency-bound; sizing it off the
+    // mul (4) costs the add a couple of spare live registers, never a wrong answer. The shared K
+    // must be the mul's.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, header, &.{ zero, zero, zero });
+    const i = try func.appendBlockParam(header, i32_t);
+    const s = try func.appendBlockParam(header, i32_t);
+    const p = try func.appendBlockParam(header, i32_t);
+    const cmp = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(header, cmp, .{ .target = body, .args = &.{ i, s, p } }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    const bs = try func.appendBlockParam(body, i32_t);
+    const bp = try func.appendBlockParam(body, i32_t);
+    const ns = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = bi } });
+    const np = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .mul, .lhs = bp, .rhs = bi } });
+    const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, header, &.{ ni, ns, np });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    const model = @import("registry.zig").modelFor(.@"ampere-altra");
+    const plan = try recognize(allocator, &func, model, &info.loops[0], false);
+    try std.testing.expect(plan != null);
+    defer allocator.free(plan.?.reductions);
+    try std.testing.expectEqual(@as(u32, 4), plan.?.factor);
+    try std.testing.expectEqual(@as(usize, 2), plan.?.reductions.len);
+}
+
+test "issue_width <= 1 still refuses to split, whatever the body's op latency" {
+    // et-soc is single-issue in-order: it has no ILP to expose, the same reason plain unrolling
+    // declines it. A 32-instruction body with a mul accumulator (which would split on altra)
+    // must still decline here.
+    const allocator = std.testing.allocator;
+    var func = try buildPaddedAccumulator(allocator, 30, .mul);
+    defer func.deinit();
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    const model = @import("registry.zig").modelFor(.@"et-soc");
+    try std.testing.expectEqual(@as(u8, 1), model.issue_width);
+    const plan = try recognize(allocator, &func, model, &info.loops[0], false);
+    try std.testing.expect(plan == null);
+}
+
+test "a float accumulator without vulcan.fast_math is still refused" {
+    // reorderable() gates float add/mul reassociation on the function's fast_math attribute,
+    // regardless of the new factor rule; this proves the gate survived the change untouched.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const bool_t = try func.types.intern(.bool);
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero_i = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const zero_f = try func.appendInst(entry, f32_t, .{ .fconst = 0 });
+    try func.setJump(entry, header, &.{ zero_i, zero_f });
+    const i = try func.appendBlockParam(header, i32_t);
+    const acc = try func.appendBlockParam(header, f32_t);
+    const cmp = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(header, cmp, .{ .target = body, .args = &.{ i, acc } }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    const bacc = try func.appendBlockParam(body, f32_t);
+    const bif = try func.appendInst(body, f32_t, .{ .convert = .{ .value = bi } });
+    const nacc = try func.appendInst(body, f32_t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = bif } });
+    const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, header, &.{ ni, nacc });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    const model = @import("registry.zig").modelFor(.@"ampere-altra");
+
+    const declined = try recognize(allocator, &func, model, &info.loops[0], false);
+    try std.testing.expect(declined == null);
+
+    const allowed = try recognize(allocator, &func, model, &info.loops[0], true);
+    try std.testing.expect(allowed != null);
+    if (allowed) |p| allocator.free(p.reductions);
 }

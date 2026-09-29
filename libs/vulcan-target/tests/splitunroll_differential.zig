@@ -105,6 +105,35 @@ fn buildTwoAccumulators(func: *Function) anyerror!void {
     func.setTerminator(done, .{ .ret = ir.function.Ret.one(total) });
 }
 
+/// `for (i = 0; i < n; i += 1) { 25 padding adds on i, unused; s += i; }  return s`. The padding
+/// pushes the body to 27 instructions, well past the old 6-instruction ceiling that
+/// `unroll.unrollFactor` needed to ever return a factor above 1: under the old body-size rule this
+/// loop would NOT have split at all. It proves the fix through the oracle, not just through
+/// `recognize`'s returned plan.
+fn buildPaddedSum(func: *Function) anyerror!void {
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, t);
+    const i = try func.appendBlockParam(loop, t);
+    const s = try func.appendBlockParam(loop, t);
+    const bi = try func.appendBlockParam(body, t);
+    const bs = try func.appendBlockParam(body, t);
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{ zero, zero });
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, s } }, .{ .target = done });
+    var pad = bi;
+    for (0..25) |_| pad = try func.appendArithImm(body, t, .add, pad, 1);
+    const ns = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = bi } });
+    const ni = try func.appendArithImm(body, t, .add, bi, 1);
+    try func.setJump(body, loop, &.{ ni, ns });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(s) });
+}
+
 fn expectSplitMatches(build: Builder) !void {
     const allocator = std.testing.allocator;
     // A spread hitting: 0, below K, exactly K, a K-multiple, and non-multiples around it.
@@ -152,4 +181,9 @@ test "splitunroll differential: sum-of-squares reduction, all trip counts" {
 test "splitunroll differential: two accumulators split together, all trip counts" {
     if (comptime !hasJit()) return error.SkipZigTest;
     try expectSplitMatches(buildTwoAccumulators);
+}
+
+test "splitunroll differential: a realistic padded body splits and matches the unsplit loop" {
+    if (comptime !hasJit()) return error.SkipZigTest;
+    try expectSplitMatches(buildPaddedSum);
 }

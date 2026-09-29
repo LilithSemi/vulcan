@@ -349,8 +349,10 @@ pub fn cloneBlocks(
     return clones;
 }
 
-/// The largest factor we ever unroll by (keeps code growth bounded).
-const MAX_FACTOR: u32 = 8;
+/// The largest factor we ever unroll by (keeps code growth bounded). Public because
+/// `splitunroll.zig` shares this same register-pressure ceiling for its own, differently derived
+/// factor.
+pub const MAX_FACTOR: u32 = 8;
 
 /// The share of peak occupancy a SIMT unroll refuses to fall below, written as a divisor of
 /// `Simt.warps_per_sm`: 2 means "never below half the resident warps the SM can hold".
