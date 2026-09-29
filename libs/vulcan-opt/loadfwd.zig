@@ -111,6 +111,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 .global_addr,
                 .prefetch,
                 .dot,
+                .reduce,
+                .splat,
                 .@"if",
                 => {},
             }

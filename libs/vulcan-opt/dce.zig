@@ -13,7 +13,7 @@ pub const pass_def = pass.Pass{ .name = "dce", .run = run };
 /// Whether an instruction has no side effects, so it may be dropped when unused.
 fn isPure(op: ir.function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .dot, .reduce, .splat => true,
         // A prefetch hint has no result but must be kept, like a store. A
         // matmul writes the `c` memory, likewise kept.
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
@@ -80,6 +80,8 @@ pub fn countUses(func: *const Function, uses: []u32) void {
                     uses[@intFromEnum(d.a)] += 1;
                     uses[@intFromEnum(d.b)] += 1;
                 },
+                .reduce => |red| uses[@intFromEnum(red.vector)] += 1,
+                .splat => |sp| uses[@intFromEnum(sp.scalar)] += 1,
                 .matmul => |mm| {
                     uses[@intFromEnum(mm.a)] += 1;
                     uses[@intFromEnum(mm.b)] += 1;
@@ -165,6 +167,27 @@ test "removes a chain of dead pure instructions" {
     try std.testing.expect(try run(allocator, &func, &analyses));
 
     // Both dead instructions are gone.
+    try std.testing.expectEqual(@as(usize, 0), func.blockInsts(b).len);
+}
+
+test "removes a dead reduce and a dead splat, both are pure" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32_t);
+    const vec = try func.appendSplat(b, v4i32, x); // dead: never read
+    _ = try func.appendReduce(b, .add, vec); // dead: never read
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
+
+    try std.testing.expectEqual(@as(usize, 2), func.blockInsts(b).len);
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
     try std.testing.expectEqual(@as(usize, 0), func.blockInsts(b).len);
 }
 

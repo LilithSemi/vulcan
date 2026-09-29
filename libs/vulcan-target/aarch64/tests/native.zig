@@ -3693,6 +3693,151 @@ test "multi-block inlining preserves semantics on aarch64 (callee has a loop)" {
     }
 }
 
+/// Builds a function that packs 4 scalar params into a `<4 x elem>` vector with `struct_new`,
+/// reduces it with `op`, and returns the scalar. `add` takes this backend's native `.reduce` isel
+/// arm (`addv`+`umov` for an integer vector, `faddp`+`faddp` for a float one); every other op has
+/// no matching instruction, so `expandVectorLanes` still rewrites it into `extract`s plus a tree
+/// of `arith` before isel runs.
+fn reduceFunc(allocator: std.mem.Allocator, elem_kind: ir.types.TypeKind, op: ir.function.BinOp) !Function {
+    var func = Function.init(allocator);
+    const elem_ty = try func.types.intern(elem_kind);
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = elem_ty } });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, elem_ty);
+    const b = try func.appendBlockParam(entry, elem_ty);
+    const c = try func.appendBlockParam(entry, elem_ty);
+    const d = try func.appendBlockParam(entry, elem_ty);
+    const vec = try func.appendStructNew(entry, vec_t, &.{ a, b, c, d });
+    const result = try func.appendReduce(entry, op, vec);
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(result) });
+    return func;
+}
+
+test "reduce add over an i32 vector matches the scalar sum, lowered to addv+umov" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = try reduceFunc(allocator, .{ .int = .{ .signedness = .signed, .bits = 32 } }, .add);
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    // Proves the native path ran, not the extract-and-tree expansion: one addv sums every
+    // lane, not four separate umov extracts feeding three scalar adds.
+    try std.testing.expect(std.mem.indexOf(u8, text, "addv s") != null);
+
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const f = @as(*const fn (i32, i32, i32, i32) callconv(.c) i32, @ptrCast(buf.memory.ptr));
+
+    try std.testing.expectEqual(@as(i32, 10), f(1, 2, 3, 4));
+    try std.testing.expectEqual(@as(i32, -4), f(-1, -2, -3, 2));
+    // Wraps like plain i32 addition: no different from the scalar oracle's own wraparound.
+    try std.testing.expectEqual(@as(i32, std.math.minInt(i32)), f(std.math.maxInt(i32), 1, 0, 0));
+}
+
+test "reduce bit_xor over an i32 vector matches the scalar xor, still via the expansion" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = try reduceFunc(allocator, .{ .int = .{ .signedness = .signed, .bits = 32 } }, .bit_xor);
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    // bit_xor has no horizontal instruction, so this must still go through
+    // `expandVectorLanes`, not the `addv` native path `.reduce` only covers for `add`.
+    try std.testing.expect(std.mem.indexOf(u8, text, "addv") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "eor") != null);
+
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const f = @as(*const fn (i32, i32, i32, i32) callconv(.c) i32, @ptrCast(buf.memory.ptr));
+
+    try std.testing.expectEqual(@as(i32, 0x1 ^ 0x2 ^ 0x4 ^ 0x8), f(0x1, 0x2, 0x4, 0x8));
+    try std.testing.expectEqual(@as(i32, 0), f(0x5a5a, 0x5a5a, 0x1234, 0x1234)); // pairs cancel
+}
+
+test "reduce add over an f32 vector matches the scalar sum, lowered to faddp+faddp" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = try reduceFunc(allocator, .{ .float = .f32 }, .add);
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    // Proves the two-instruction faddp sequence ran, not the extract-and-tree expansion.
+    try std.testing.expect(std.mem.indexOf(u8, text, "faddp v") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "faddp s") != null);
+
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const f = @as(*const fn (f32, f32, f32, f32) callconv(.c) f32, @ptrCast(buf.memory.ptr));
+
+    // Exact powers of two, so the pairwise tree order (0+1)+(2+3) matches plain left-to-right
+    // addition bit for bit: no rounding ambiguity to make this test flaky.
+    try std.testing.expectEqual(@as(f32, 1.0 + 2.0 + 4.0 + 8.0), f(1.0, 2.0, 4.0, 8.0));
+}
+
+test "splat broadcasts a scalar into every lane, read back by extract" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, i32_t);
+    const vec = try func.appendSplat(entry, v4i32, x);
+    const lane2 = try func.appendInst(entry, i32_t, .{ .extract = .{ .aggregate = vec, .index = 2 } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(lane2) });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    // One dup from the general register, native, not the struct_new expansion's 4 inserts.
+    try std.testing.expect(std.mem.indexOf(u8, text, "dup v") != null);
+
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const f = @as(*const fn (i32) callconv(.c) i32, @ptrCast(buf.memory.ptr));
+
+    try std.testing.expectEqual(@as(i32, 42), f(42));
+    try std.testing.expectEqual(@as(i32, -7), f(-7));
+}
+
+test "splat of an f32 scalar broadcasts into every lane, read back by extract" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const v4f32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
+    const entry = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, f32_t);
+    const vec = try func.appendSplat(entry, v4f32, x);
+    const lane3 = try func.appendInst(entry, f32_t, .{ .extract = .{ .aggregate = vec, .index = 3 } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(lane3) });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    // One dup from lane 0, native, not the struct_new expansion's 4 inserts.
+    try std.testing.expect(std.mem.indexOf(u8, text, "dup v") != null);
+
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const f = @as(*const fn (f32) callconv(.c) f32, @ptrCast(buf.memory.ptr));
+
+    try std.testing.expectEqual(@as(f32, 3.5), f(3.5));
+}
+
 /// Builds `out.<4 x i32> = dot(*zero_ptr, *a_ptr, *b_ptr)`. It loads the zero accumulator and
 /// the two `<16 x i8>` or `<16 x u8>` operands (signedness picked by `signed`), dots them, and
 /// stores the `<4 x i32>` result. This mirrors the existing pointer-argument NEON tests above

@@ -449,6 +449,8 @@ fn blockUsesValueFromBlock(func: *const Function, block: Block, def_bi: u32, def
                 if (c.ret_dest) |d| if (usesB(def_block, d, def_bi)) return true; // SM14 M4d-c
             },
             .dot => |d| if (usesB(def_block, d.acc, def_bi) or usesB(def_block, d.a, def_bi) or usesB(def_block, d.b, def_bi)) return true,
+            .reduce => |red| if (usesB(def_block, red.vector, def_bi)) return true,
+            .splat => |sp| if (usesB(def_block, sp.scalar, def_bi)) return true,
             .matmul => |mm| if (usesB(def_block, mm.a, def_bi) or usesB(def_block, mm.b, def_bi) or usesB(def_block, mm.c, def_bi)) return true,
             .@"if" => |cf| {
                 if (usesB(def_block, cf.cond, def_bi)) return true;
@@ -507,6 +509,8 @@ fn hasSideEffect(func: *const Function, block: Block) bool {
             .alloca,
             .global_addr,
             .dot,
+            .reduce,
+            .splat,
             .@"if",
             => {},
         }

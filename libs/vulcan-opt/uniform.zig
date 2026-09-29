@@ -103,7 +103,7 @@ pub fn twoWayIf(func: *const Function, bi: usize) ?ir.function.If {
             .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select => {},
             .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca => {},
             .call, .call_indirect, .global_addr, .load, .store, .prefetch => {},
-            .va_start, .va_arg, .va_end, .dot, .matmul, .barrier, .atomic_rmw => {},
+            .va_start, .va_arg, .va_end, .dot, .reduce, .splat, .matmul, .barrier, .atomic_rmw => {},
         }
     }
     return null;
@@ -134,6 +134,8 @@ fn operandsDiverge(func: *const Function, divergent: []const bool, op: ir.functi
         .unary => |u| d(divergent, u.value),
         .extract => |e| d(divergent, e.aggregate),
         .dot => |x| d(divergent, x.acc) or d(divergent, x.a) or d(divergent, x.b),
+        .reduce => |x| d(divergent, x.vector),
+        .splat => |x| d(divergent, x.scalar),
         .struct_new => |s| blk: {
             for (func.valueList(s.fields)) |f| {
                 if (d(divergent, f)) break :blk true;
@@ -240,7 +242,7 @@ pub fn analyze(allocator: std.mem.Allocator, func: *const Function) Error!Unifor
                     .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select => {},
                     .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca => {},
                     .call, .call_indirect, .global_addr, .load, .store, .prefetch => {},
-                    .va_start, .va_arg, .va_end, .dot, .matmul, .barrier, .atomic_rmw => {},
+                    .va_start, .va_arg, .va_end, .dot, .reduce, .splat, .matmul, .barrier, .atomic_rmw => {},
                 }
             }
             if (func.terminator(block)) |term| switch (term) {

@@ -229,6 +229,11 @@ fn mapOpcode(caller: *Function, callee: *const Function, vmap: std.AutoHashMapUn
         // fail the `scalar` gate today, so this is unreachable in practice, but the
         // remap is here so a future vector-aware inline path needs no new wiring.)
         .dot => |d| .{ .dot = .{ .acc = m(vmap, d.acc), .a = m(vmap, d.a), .b = m(vmap, d.b) } },
+        // reduce/splat are pure, like dot: remap their operands. (`splat`'s vector result
+        // type and `reduce`'s vector operand both fail the `scalar` gate today, so these are
+        // unreachable in practice, kept for the same reason dot's remap is above.)
+        .reduce => |red| .{ .reduce = .{ .vector = m(vmap, red.vector), .op = red.op } },
+        .splat => |sp| .{ .splat = .{ .scalar = m(vmap, sp.scalar) } },
         // Inlining an atomic is a straight code move: the caller runs it exactly as often
         // as the callee did, so the count of read-modify-writes is unchanged. Only the
         // three operands need remapping; the operation, ordering and scope copy unchanged.
@@ -305,6 +310,8 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
                 d.a = r(from, to, d.a);
                 d.b = r(from, to, d.b);
             },
+            .reduce => |*red| red.vector = r(from, to, red.vector),
+            .splat => |*sp| sp.scalar = r(from, to, sp.scalar),
             .matmul => |*mm| {
                 mm.a = r(from, to, mm.a);
                 mm.b = r(from, to, mm.b);
@@ -357,6 +364,7 @@ fn inlinableMulti(callee: *const Function) bool {
         for (callee.blockInsts(block)) |inst| switch (callee.opcode(inst)) {
             .call, .call_indirect => return false, // keep it leaf, no nested inlining here
             .struct_new, .extract => return false, // aggregate type remap is not handled
+            .reduce, .splat => return false, // vector operand/result type remap is not handled
             .@"if" => {}, // control flow, cloned in a later pass
             .store => |st| _ = st, // yields no value, cloned in a later pass
             .prefetch => |pf| _ = pf, // yields no value, cloned in a later pass
@@ -668,6 +676,44 @@ test "inlines a leaf helper and replaces the call result" {
     // The call is gone, replaced by the cloned mul/add, and `r` adds 1 to the
     // inlined sum.
     for (caller.blockInsts(b)) |inst| try std.testing.expect(caller.opcode(inst) != .call);
+}
+
+test "a callee containing a splat and a reduce is left un-inlined" {
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // callee: sumsplat(a) = reduce add (splat a)
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i32k);
+        const v4 = try callee.types.intern(.{ .vector = .{ .len = 4, .elem = t } });
+        const b = try callee.appendBlock();
+        const a = try callee.appendBlockParam(b, t);
+        const vec = try callee.appendSplat(b, v4, a);
+        const sum = try callee.appendReduce(b, .add, vec);
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+    }
+
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const t = try caller.types.intern(i32k);
+    const b = try caller.appendBlock();
+    const x = try caller.appendBlockParam(b, t);
+    const call = try caller.appendCall(b, t, "sumsplat", &.{x});
+    caller.setTerminator(b, .{ .ret = ir.function.Ret.one(call) });
+
+    var lk = TestLookup{ .callee = &callee, .name = "sumsplat" };
+    const lookup = Lookup{ .context = &lk, .func = TestLookup.get };
+    try std.testing.expect(!try run(allocator, &caller, lookup));
+
+    // The call is still there: neither the single-block nor the multi-block path inlines a
+    // callee whose vector-typed intermediate value this pass does not remap.
+    var saw_call = false;
+    for (caller.blockInsts(b)) |inst| {
+        if (caller.opcode(inst) == .call) saw_call = true;
+    }
+    try std.testing.expect(saw_call);
 }
 
 test "inlining preserves low float directions formats and remapped operands" {

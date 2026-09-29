@@ -764,6 +764,33 @@ pub fn insLaneFromGpr(rd: Reg, lane: u2, rn: Reg) u32 {
     return 0x4E001C00 | (imm5 << 16) | (n(rn) << 5) | n(rd);
 }
 
+/// `addv sd, vn.4s` (Advanced SIMD across lanes, integer ADDV, 32-bit): sum all 4 lanes of an
+/// integer vector into a scalar. The sum lands in an S register, not a general register, so a
+/// caller after an i32 result still needs `umovLane` to cross into the GPR file. Golden word
+/// obtained by assembling `addv s0, v1.4s` with `as` and disassembling with `objdump` on this
+/// aarch64 host: 0x4EB1B820, with `n(rn) << 5` (0x20) subtracted for the zero-register base.
+pub fn addv(rd: Reg, rn: Reg) u32 {
+    return 0x4EB1B800 | (n(rn) << 5) | n(rd);
+}
+
+/// `faddp vd.4s, vn.4s, vm.4s`: pairwise-add lanes across the two operands. With `vn` and `vm`
+/// the same register, `Vd = [n0+n1, n2+n3, n0+n1, n2+n3]`, the first half of a 4-lane horizontal
+/// float sum (there is no 4S-wide `faddv`). `faddpScalar` finishes the reduction. Golden word from
+/// assembling `faddp v0.4s, v1.4s, v2.4s` with `as` and disassembling with `objdump`: 0x6E22D420,
+/// with `n(rm) << 16` and `n(rn) << 5` subtracted for the zero-register base.
+pub fn faddpVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6E20D400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// `faddp sd, vn.2s`: pairwise-add the low two lanes of `vn` into a scalar. Paired with
+/// `faddpVec(t, v, v)`, `faddpScalar(d, t)` computes `(n0+n1)+(n2+n3)`, the full 4-lane sum in the
+/// same pairwise order `expandVectorLanes`'s tree uses. Golden word from assembling
+/// `faddp s0, v1.2s` with `as` and disassembling with `objdump`: 0x7E30D820, with `n(rn) << 5`
+/// subtracted for the zero-register base.
+pub fn faddpScalar(rd: Reg, rn: Reg) u32 {
+    return 0x7E30D800 | (n(rn) << 5) | n(rd);
+}
+
 /// `mov vd.16b, vn.16b` (an alias for `orr vd.16b, vn.16b, vn.16b`): copy a whole 128-bit
 /// vector register. Use this for vector register moves. `fmovReg` only copies 64 bits.
 pub fn movVec(rd: Reg, rn: Reg) u32 {
@@ -1003,6 +1030,17 @@ test "NEON vector op encodings" {
     try std.testing.expectEqual(@as(u32, 0x0E1C3C61), umovLane(.x1, .x3, 3)); // umov w1, v3.s[3]
     try std.testing.expectEqual(@as(u32, 0x4E041C00), insLaneFromGpr(.x0, 0, .x0)); // ins v0.s[0], w0
     try std.testing.expectEqual(@as(u32, 0x4E1C1C61), insLaneFromGpr(.x1, 3, .x3)); // ins v1.s[3], w3
+}
+
+test "addv/faddp horizontal-reduce encodings" {
+    // Golden words obtained by assembling with `as` and disassembling with `objdump` on this
+    // aarch64 host (see the doc comments in encode.zig for the derivation).
+    try std.testing.expectEqual(@as(u32, 0x4EB1B820), addv(.x0, .x1)); // addv s0, v1.4s
+    try std.testing.expectEqual(@as(u32, 0x4EB1B862), addv(.x2, .x3)); // addv s2, v3.4s
+    try std.testing.expectEqual(@as(u32, 0x6E22D420), faddpVec(.x0, .x1, .x2)); // faddp v0.4s,v1.4s,v2.4s
+    try std.testing.expectEqual(@as(u32, 0x6E25D4A4), faddpVec(.x4, .x5, .x5)); // faddp v4.4s,v5.4s,v5.4s
+    try std.testing.expectEqual(@as(u32, 0x7E30D820), faddpScalar(.x0, .x1)); // faddp s0, v1.2s
+    try std.testing.expectEqual(@as(u32, 0x7E30D883), faddpScalar(.x3, .x4)); // faddp s3, v4.2s
 }
 
 test "FMLA/FMLS vector encodings (NEON accumulate-into-Vd)" {

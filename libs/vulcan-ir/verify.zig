@@ -124,6 +124,12 @@ fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocat
                 .dot => |d| if (dotOperandsMismatch(func, inst, d)) {
                     if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
                 },
+                .reduce => |red| if (reduceOperandsMismatch(func, inst, red)) {
+                    if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
+                },
+                .splat => |sp| if (splatOperandsMismatch(func, inst, sp)) {
+                    if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
+                },
                 .decode_low_float => |cv| if (lowFloatOperandsMismatch(func, inst, cv, true)) {
                     try diags.add(.{ .operand_type_mismatch = func.instResult(inst) orelse cv.value });
                 },
@@ -290,6 +296,39 @@ fn dotOperandsMismatch(func: *const Function, inst: function.Inst, d: function.D
     const b_ty = func.valueType(d.b);
     if (a_ty != b_ty) return true;
     return !isDotDataType(func, a_ty);
+}
+
+/// The associative ops a `reduce` may fold lanes with. A horizontal combine has no defined lane
+/// order, so a non-associative op (`sub`, `div`, `rem`, a shift, `mulh`) would answer differently
+/// depending on the fold order a backend picks; see `Reduce`'s doc comment.
+fn reduceOpAllowed(op: function.BinOp) bool {
+    return switch (op) {
+        .add, .mul, .bit_and, .bit_or, .bit_xor => true,
+        .sub, .div, .rem, .shl, .shr, .mulh => false,
+    };
+}
+
+/// `reduce`'s operand must be a vector, its result must equal that vector's element type, and
+/// its op must be one of the associative ones `reduceOpAllowed` names.
+fn reduceOperandsMismatch(func: *const Function, inst: function.Inst, red: function.Reduce) bool {
+    if (!reduceOpAllowed(red.op)) return true;
+    const elem = switch (func.types.type_kind(func.valueType(red.vector))) {
+        .vector => |v| v.elem,
+        else => return true,
+    };
+    const result = func.instResult(inst) orelse return true;
+    return func.valueType(result) != elem;
+}
+
+/// `splat`'s result must be a vector, and its scalar operand's type must equal that vector's
+/// element type.
+fn splatOperandsMismatch(func: *const Function, inst: function.Inst, sp: function.Splat) bool {
+    const result = func.instResult(inst) orelse return true;
+    const elem = switch (func.types.type_kind(func.valueType(result))) {
+        .vector => |v| v.elem,
+        else => return true,
+    };
+    return func.valueType(sp.scalar) != elem;
 }
 
 /// `<4 x i32>`, the required accumulator/result type of `dot`.
@@ -542,6 +581,8 @@ fn checkDominance(func: *const Function, diags: *Diagnostics) std.mem.Allocator.
                     try checkUse(&dominance, def_block, diags, d.a, bi);
                     try checkUse(&dominance, def_block, diags, d.b, bi);
                 },
+                .reduce => |red| try checkUse(&dominance, def_block, diags, red.vector, bi),
+                .splat => |sp| try checkUse(&dominance, def_block, diags, sp.scalar, bi),
                 .matmul => |mm| {
                     try checkUse(&dominance, def_block, diags, mm.a, bi);
                     try checkUse(&dominance, def_block, diags, mm.b, bi);
@@ -807,6 +848,160 @@ test "dot with a non-<4 x i32> accumulator is reported" {
     const a = try func.appendBlockParam(entry, v16i8);
     const b = try func.appendBlockParam(entry, v16i8);
     const result = try func.appendInst(entry, v4i32, .{ .dot = .{ .acc = acc, .a = a, .b = b } });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = result }, d.items()[0]);
+}
+
+test "reduce over an i32 vector with add verifies clean" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const vec = try func.appendBlockParam(entry, v4i32);
+    const result = try func.appendReduce(entry, .add, vec);
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(d.ok());
+}
+
+test "reduce over an f32 vector with add verifies clean without any fast-math attribute" {
+    // Writing `reduce` by hand is already the caller's consent to reassociate the lanes, unlike
+    // the loop vectorizer's own reduction, so no fast-math attribute is required here.
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const v4f32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
+    const entry = try func.appendBlock();
+    const vec = try func.appendBlockParam(entry, v4f32);
+    const result = try func.appendReduce(entry, .add, vec);
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(d.ok());
+}
+
+test "reduce with sub is reported, a horizontal combine has no defined lane order" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const vec = try func.appendBlockParam(entry, v4i32);
+    const result = try func.appendReduce(entry, .sub, vec);
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = result }, d.items()[0]);
+}
+
+test "reduce with mulh is reported, the same as sub" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const vec = try func.appendBlockParam(entry, v4i32);
+    const result = try func.appendReduce(entry, .mulh, vec);
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = result }, d.items()[0]);
+}
+
+test "reduce over a non-vector operand is reported" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const scalar = try func.appendBlockParam(entry, i32_t); // wrong: not a vector
+    const result = try func.appendInst(entry, i32_t, .{ .reduce = .{ .vector = scalar, .op = .add } });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = result }, d.items()[0]);
+}
+
+test "reduce with a result type not matching the vector's element type is reported" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const vec = try func.appendBlockParam(entry, v4i32);
+    // wrong: result should be i32_t (the element type), not i64_t
+    const result = try func.appendInst(entry, i64_t, .{ .reduce = .{ .vector = vec, .op = .add } });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = result }, d.items()[0]);
+}
+
+test "splat broadcasting a scalar into a matching vector verifies clean" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const scalar = try func.appendBlockParam(entry, i32_t);
+    const result = try func.appendSplat(entry, v4i32, scalar);
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(d.ok());
+}
+
+test "splat with a non-vector result is reported" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const scalar = try func.appendBlockParam(entry, i32_t);
+    // wrong: result type should be a vector, not the scalar type itself
+    const result = try func.appendInst(entry, i32_t, .{ .splat = .{ .scalar = scalar } });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = result }, d.items()[0]);
+}
+
+test "splat with a scalar type not matching the vector's element type is reported" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const scalar = try func.appendBlockParam(entry, i64_t); // wrong: element type is i32_t
+    const result = try func.appendInst(entry, v4i32, .{ .splat = .{ .scalar = scalar } });
     func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
 
     var d = try verify(std.testing.allocator, &func, .low);

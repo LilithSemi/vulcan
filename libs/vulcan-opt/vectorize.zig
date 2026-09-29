@@ -464,6 +464,8 @@ fn hasWriteBetween(func: *const Function, block: Block, lo: usize, hi: usize) bo
             .alloca,
             .global_addr,
             .dot,
+            .reduce,
+            .splat,
             => {},
         }
     }
@@ -603,6 +605,8 @@ fn resultsAreCoalesceableStores(func: *const Function, block: Block, results: []
             .alloca,
             .global_addr,
             .dot,
+            .reduce,
+            .splat,
             => {},
         }
     }
@@ -688,6 +692,12 @@ fn valueUseCount(func: *const Function, v: Value) usize {
                     if (x.acc == v) n += 1;
                     if (x.a == v) n += 1;
                     if (x.b == v) n += 1;
+                },
+                .reduce => |x| if (x.vector == v) {
+                    n += 1;
+                },
+                .splat => |x| if (x.scalar == v) {
+                    n += 1;
                 },
                 .matmul => |x| {
                     if (x.a == v) n += 1;
@@ -874,6 +884,8 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
                 .alloca,
                 .global_addr,
                 .dot,
+                .reduce,
+                .splat,
                 => {},
             }
         }
@@ -970,7 +982,7 @@ fn cleanup(allocator: std.mem.Allocator, func: *Function, coalesced_loads: *cons
 /// loads/stores/prefetch/calls/`if` are impure and kept (coalesced loads are handled separately).
 fn isPure(op: ir.function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .dot, .reduce, .splat => true,
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
@@ -1036,6 +1048,8 @@ fn countUses(func: *const Function, uses: []u32) void {
                     uses[@intFromEnum(x.a)] += 1;
                     uses[@intFromEnum(x.b)] += 1;
                 },
+                .reduce => |x| uses[@intFromEnum(x.vector)] += 1,
+                .splat => |x| uses[@intFromEnum(x.scalar)] += 1,
                 .matmul => |x| {
                     uses[@intFromEnum(x.a)] += 1;
                     uses[@intFromEnum(x.b)] += 1;

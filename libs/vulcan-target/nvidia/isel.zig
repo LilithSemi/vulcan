@@ -614,6 +614,10 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
         _ = try ir.expand.expandNvFp4(allocator, &work);
         _ = try ir.expand.expandF32Div(allocator, &work);
         _ = try ir.expand.expandLowFloat(allocator, &work);
+        // A warp lane is already the vector lane on an SM (see vectorize.zig/loopvec.zig),
+        // so this backend has no native `reduce`/`splat` lowering; run the shared expansion
+        // before isel, the same as every backend but aarch64.
+        _ = try ir.expand.expandVectorLanes(allocator, &work);
     }
     return compileShaderOwned(allocator, &work, stage, a, options);
 }
@@ -4852,6 +4856,8 @@ fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, po
             markUse(last_use, d.a, pos);
             markUse(last_use, d.b, pos);
         },
+        .reduce => |red| markUse(last_use, red.vector, pos),
+        .splat => |sp| markUse(last_use, sp.scalar, pos),
         .matmul => |mmv| {
             markUse(last_use, mmv.a, pos);
             markUse(last_use, mmv.b, pos);
@@ -4928,6 +4934,8 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) vo
             setUsed(row, d.a);
             setUsed(row, d.b);
         },
+        .reduce => |red| setUsed(row, red.vector),
+        .splat => |sp| setUsed(row, sp.scalar),
         .matmul => |mmv| {
             setUsed(row, mmv.a);
             setUsed(row, mmv.b);

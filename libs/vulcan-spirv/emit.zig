@@ -950,6 +950,8 @@ const Emitter = struct {
             .load,
             .va_arg,
             .dot,
+            .reduce,
+            .splat,
             => error.UnsupportedConstruct,
         };
     }

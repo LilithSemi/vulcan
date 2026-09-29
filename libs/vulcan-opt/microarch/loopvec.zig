@@ -447,6 +447,8 @@ fn usesValue(func: *const Function, inst: Inst, v: Value) bool {
         .atomic_rmw => |a| a.ptr == v or a.value == v or (a.compare != null and a.compare.? == v),
         .prefetch => |p| p.ptr == v,
         .dot => |d| d.acc == v or d.a == v or d.b == v,
+        .reduce => |red| red.vector == v,
+        .splat => |sp| sp.scalar == v,
         .matmul => |m| m.a == v or m.b == v or m.c == v,
         .va_start => |s| s.list == v,
         .va_arg => |a| a.list == v,
@@ -595,6 +597,8 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         .alloca,
         .global_addr,
         .dot,
+        .reduce,
+        .splat,
         => {},
     };
 

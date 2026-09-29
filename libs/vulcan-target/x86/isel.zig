@@ -369,6 +369,8 @@ fn unhandledStatement(op_code: ir.function.Opcode) Error {
         .load,
         .va_arg,
         .dot,
+        .reduce,
+        .splat,
         => error.Unsupported,
     };
 }
@@ -1565,6 +1567,11 @@ fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const ad
             f(ctx, d.a, false);
             f(ctx, d.b, false);
         },
+        // Never reached: `expandVectorLanes` runs before isel on every backend without a
+        // native lowering, x86 included, and rewrites `reduce`/`splat` away first. Real
+        // arms all the same, matching `dot`'s walk above.
+        .reduce => |red| f(ctx, red.vector, false),
+        .splat => |sp| f(ctx, sp.scalar, false),
         .matmul => |mmv| {
             f(ctx, mmv.a, false);
             f(ctx, mmv.b, false);

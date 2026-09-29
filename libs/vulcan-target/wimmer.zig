@@ -415,6 +415,8 @@ fn visitOperands(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn
             f(ctx, d.a, false);
             f(ctx, d.b, false);
         },
+        .reduce => |red| f(ctx, red.vector, false),
+        .splat => |sp| f(ctx, sp.scalar, false),
         .matmul => |mm| {
             f(ctx, mm.a, false);
             f(ctx, mm.b, false);

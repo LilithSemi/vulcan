@@ -161,6 +161,8 @@ fn rebuildOpcode(
             .a = remapValue(value_map, d.a),
             .b = remapValue(value_map, d.b),
         } },
+        .reduce => |red| .{ .reduce = .{ .vector = remapValue(value_map, red.vector), .op = red.op } },
+        .splat => |sp| .{ .splat = .{ .scalar = remapValue(value_map, sp.scalar) } },
         // Only a/b/c are Values. Everything else (m/n/k, dtype, accumulate, embedded,
         // quant, input_signs) is compile-time metadata, so start from the source op and
         // overwrite only the Values. A named-field rebuild silently defaulted `embedded`
@@ -726,7 +728,7 @@ fn eligible(
                 if (idx != h_insts.len - 1) return null; // the `if` must end the block
                 if_inst = inst;
             },
-            .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .extract, .struct_new, .dot => {},
+            .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .extract, .struct_new, .dot, .reduce, .splat => {},
             // load/store/call/call_indirect/alloca/global_addr are impure or memory ops.
             else => return null,
         }
@@ -1415,6 +1417,8 @@ fn instUsesValue(func: *const Function, inst: Inst, value: Value) bool {
         .va_arg => |x| x.list == value,
         .va_end => |x| x.list == value,
         .dot => |x| x.acc == value or x.a == value or x.b == value,
+        .reduce => |x| x.vector == value,
+        .splat => |x| x.scalar == value,
         .matmul => |x| x.a == value or x.b == value or x.c == value,
         .struct_new => |x| blk: {
             for (func.valueList(x.fields)) |field| if (field == value) break :blk true;
@@ -1603,6 +1607,8 @@ fn collectOperands(
                 try set.put(a, x.a, {});
                 try set.put(a, x.b, {});
             },
+            .reduce => |x| try set.put(a, x.vector, {}),
+            .splat => |x| try set.put(a, x.scalar, {}),
             .matmul => |x| {
                 try set.put(a, x.a, {});
                 try set.put(a, x.b, {});
@@ -1682,6 +1688,8 @@ fn replaceInBlock(func: *Function, block: Block, from: Value, to: Value) void {
                 x.a = rep(from, to, x.a);
                 x.b = rep(from, to, x.b);
             },
+            .reduce => |*x| x.vector = rep(from, to, x.vector),
+            .splat => |*x| x.scalar = rep(from, to, x.scalar),
             .matmul => |*x| {
                 x.a = rep(from, to, x.a);
                 x.b = rep(from, to, x.b);

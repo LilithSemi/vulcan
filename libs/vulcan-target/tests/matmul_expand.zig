@@ -677,6 +677,8 @@ fn isScaling(opcode: ir.function.Opcode) bool {
         .va_arg,
         .va_end,
         .dot,
+        .reduce,
+        .splat,
         .matmul,
         .barrier,
         .atomic_rmw,

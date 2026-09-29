@@ -2087,6 +2087,12 @@ fn usesInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
             if (d.a == v) c += 1;
             if (d.b == v) c += 1;
         },
+        .reduce => |red| {
+            if (red.vector == v) c += 1;
+        },
+        .splat => |sp| {
+            if (sp.scalar == v) c += 1;
+        },
         .matmul => |mmv| {
             if (mmv.a == v) c += 1;
             if (mmv.b == v) c += 1;
@@ -3562,6 +3568,10 @@ fn compileFunctionInternal(allocator: std.mem.Allocator, func: *const Function, 
 
     _ = try ir.expand.expandNvFp4(allocator, &work);
     _ = try ir.expand.expandLowFloat(allocator, &work);
+    // riscv64 lowers `dot` and `extract`/`struct_new` natively (the V/VPU vector paths above),
+    // but not `reduce`/`splat` themselves: only aarch64 gets a native lowering for those, so
+    // every other backend runs this shared expansion before isel.
+    _ = try ir.expand.expandVectorLanes(allocator, &work);
 
     // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls on the clone,
     // before any numbering or edge splitting, so the call clobbers and the f128 GPR-pair argument

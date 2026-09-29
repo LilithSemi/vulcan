@@ -34,6 +34,8 @@ fn altraLatency(op: ir.function.Opcode) u32 {
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 3,
         // A dot is a multiply-class op (4-way multiply-accumulate), grouped with `mul`.
         .dot => 4,
+        .reduce => 4, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         // A matmul (et-soc tensor tile) is a big multicycle op, priced well above a
         // scalar mul/dot: not native to this arch, a placeholder pending real timing.
         .matmul => 64,
@@ -87,6 +89,8 @@ fn altraThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         // NEON dotprod is a pipelined multiply-accumulate: one issues per cycle.
         .dot => 1,
+        .reduce => 1, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         // A matmul is not native here; a placeholder, non-pipelined (== latency).
         .matmul => 64,
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
@@ -120,6 +124,8 @@ fn cascadelakeLatency(op: ir.function.Opcode) u32 {
         .load => 5, // L1 ~4.7 corrected
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 4,
         .dot => 3, // mul-class
+        .reduce => 3, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         .matmul => 64, // non-native placeholder
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
@@ -157,6 +163,8 @@ fn cascadelakeThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .load => 1,
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         .dot => 1,
+        .reduce => 1, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         .matmul => 64,
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
@@ -190,6 +198,8 @@ fn etsocLatency(op: ir.function.Opcode) u32 {
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 7,
         // A dot is a multiply-class op (4-way multiply-accumulate), grouped with `mul`.
         .dot => 8,
+        .reduce => 8, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         // The et-soc fixed-tile matmul: the real tensor CSR-write sequence (load, wait,
         // fma, wait, store) is many times an arith latency; 64 is a placeholder pending
         // a cycle-accurate model of the CSR protocol (isel lowering is a later task).
@@ -241,6 +251,8 @@ fn etsocThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         // The dot macro is an async multicycle MulDiv-class op: throughput == latency (never used by SLP).
         .dot => 8,
+        .reduce => 8, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         // Matmul is the async CSR-write tensor sequence: non-pipelined, throughput == latency.
         .matmul => 64,
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
@@ -278,6 +290,8 @@ fn riverInorderLatency(op: ir.function.Opcode) u32 {
         // A dot is a multiply-class op (4-way multiply-accumulate), grouped with `mul`.
         // River carries no dotprod feature today; this is a placeholder in case one is added.
         .dot => 3,
+        .reduce => 3, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         // River carries no tensor unit; a placeholder in case one is added.
         .matmul => 64,
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
@@ -317,6 +331,8 @@ fn riverMacroLatency(op: ir.function.Opcode) u32 {
         // A dot is a multiply-class op (4-way multiply-accumulate), grouped with `mul`.
         // River carries no dotprod feature today; this is a placeholder in case one is added.
         .dot => 3,
+        .reduce => 3, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         // River carries no tensor unit; a placeholder in case one is added.
         .matmul => 64,
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
@@ -357,6 +373,8 @@ fn riverInorderThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .load => 1, // pipelined load-to-use (latency 2)
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         .dot => 3, // mul-class placeholder, non-pipelined here
+        .reduce => 3, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
@@ -397,6 +415,8 @@ fn riverPipelinedThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .load => 1,
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         .dot => 1, // pipelined mul-accumulate on the wider profile
+        .reduce => 1, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
@@ -467,6 +487,8 @@ fn sm120Latency(op: ir.function.Opcode) u32 {
         // Priced like a multiply because a dot is a multiply-accumulate, but the NVIDIA backend
         // lowers no `dot`, so this can never price a real one.
         .dot => 5,
+        .reduce => 5, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         // The NVIDIA backend lowers no `matmul`: `gpu.tensor.nvidia` declares no dtype at all, so
         // `Model.tensor` refuses the op before it is ever built. Placeholder, as on every other
         // model with no tensor unit.
@@ -506,6 +528,8 @@ fn sm120Throughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // A barrier is not pipelined: a second one cannot start before the first releases.
         .barrier => 32,
         .dot => 1,
+        .reduce => 1, // a cross-lane combine, multiply class like dot above
+        .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
         .matmul => 64, // no lowering. Non-pipelined placeholder, as in `sm120Latency`
         .iconst, .fconst, .fconst128, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         .va_start, .va_arg, .va_end => 1,
@@ -536,6 +560,7 @@ fn unitOfShared(op: ir.function.Opcode) UnitClass {
         .struct_new, .extract => .none,
         // dot runs on the SIMD/vector unit, like the vector-shaped fpsimd ops above.
         .dot => .fpsimd,
+        .reduce, .splat => .fpsimd, // lane ops run on the same unit as dot
         // matmul runs on the tensor/VPU unit, modeled as fpsimd like dot.
         .matmul => .fpsimd,
         // SM12 T3: no backend expands these yet. `va_arg` reads through `list` (a memory

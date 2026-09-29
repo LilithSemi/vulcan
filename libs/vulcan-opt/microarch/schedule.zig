@@ -28,7 +28,7 @@ const UnitClass = mm.UnitClass;
 /// Model.
 fn movable(op: ir.function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .dot, .reduce, .splat => true,
         // matmul writes the `c` memory: a barrier, like store/prefetch, not reordered.
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // SM12 T3: `va_start`/`va_arg`/`va_end` all read/mutate the `va_list` object at
@@ -104,6 +104,8 @@ fn collectOperands(
             try buf.append(allocator, d.a);
             try buf.append(allocator, d.b);
         },
+        .reduce => |red| try buf.append(allocator, red.vector),
+        .splat => |sp| try buf.append(allocator, sp.scalar),
         .matmul => |mmv| {
             try buf.append(allocator, mmv.a);
             try buf.append(allocator, mmv.b);
@@ -622,7 +624,7 @@ fn windowTestLatency(op: ir.function.Opcode) u32 {
             .mul, .mulh => 5,
             .div, .rem, .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
         },
-        .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end, .barrier, .atomic_rmw => 1,
+        .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .reduce, .splat, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end, .barrier, .atomic_rmw => 1,
     };
 }
 fn windowTestUnit(op: ir.function.Opcode) UnitClass {

@@ -246,6 +246,131 @@ pub fn expandNvFp4(allocator: std.mem.Allocator, func: *Function) std.mem.Alloca
     return true;
 }
 
+/// Replace `reduce` and `splat` with operations every backend already lowers. `reduce` becomes
+/// one `extract` per lane plus a balanced tree of `arith` with the reduce's own op, exactly the
+/// shape `vulcan-opt.microarch.loopvec`'s own reduction already builds. `splat` becomes a
+/// `struct_new` whose fields are all the same value, which the aarch64 backend already
+/// recognizes (its `struct_new` isel arm) and lowers to one `dup`.
+///
+/// A backend with no native lowering of its own runs this unconditionally. aarch64 lowers
+/// add-reduce and every splat directly (one `addv`/`faddp` pair, one `dup`), so it calls
+/// `expandVectorLanesExcept` instead, keeping only the reduce ops (`mul`, `bit_and`, `bit_or`,
+/// `bit_xor`) that still have no matching instruction. Runs once per function.
+pub fn expandVectorLanes(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator.Error!bool {
+    return expandVectorLanesExcept(allocator, func, keepNothing);
+}
+
+fn keepNothing(func: *const Function, inst: Inst) bool {
+    _ = func;
+    _ = inst;
+    return false;
+}
+
+/// Same rewrite as `expandVectorLanes`, but leaves a `reduce`/`splat` instruction untouched when
+/// `keep` reports the caller's own isel already lowers it. `keep` sees the instruction before any
+/// rewriting, so it can inspect the reduce op or the vector's element type to decide.
+pub fn expandVectorLanesExcept(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    keep: *const fn (*const Function, Inst) bool,
+) std.mem.Allocator.Error!bool {
+    var changed = false;
+    for (0..func.blockCount()) |block_index| {
+        const block: Block = @enumFromInt(block_index);
+        var has = false;
+        for (func.blockInsts(block)) |inst| {
+            if (isVectorLaneOp(func, inst) and !keep(func, inst)) {
+                has = true;
+                break;
+            }
+        }
+        if (!has) continue;
+        changed = true;
+
+        var out: std.ArrayList(Inst) = .empty;
+        defer out.deinit(allocator);
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        for (original) |inst| {
+            if (isVectorLaneOp(func, inst) and keep(func, inst)) {
+                try out.append(allocator, inst);
+                continue;
+            }
+            switch (func.opcode(inst)) {
+                .reduce => |red| {
+                    const result = func.instResult(inst).?;
+                    const elem_ty = func.valueType(result);
+                    const len = vectorLenOf(func, red.vector);
+
+                    var lanes: std.ArrayList(Value) = .empty;
+                    defer lanes.deinit(allocator);
+                    for (0..len) |lane| {
+                        const v = try func.createInst(elem_ty, .{ .extract = .{ .aggregate = red.vector, .index = @intCast(lane) } });
+                        try out.append(allocator, func.definingInst(v).?);
+                        try lanes.append(allocator, v);
+                    }
+                    const tree = try buildLaneTree(func, &out, allocator, red.op, elem_ty, lanes.items);
+                    func.replaceAllUses(result, tree);
+                },
+                .splat => |sp| {
+                    const result = func.instResult(inst).?;
+                    const vec_ty = func.valueType(result);
+                    const len = vectorLenOf(func, result);
+
+                    const fields = try allocator.alloc(Value, len);
+                    defer allocator.free(fields);
+                    for (fields) |*f| f.* = sp.scalar;
+                    const list = try func.internValues(fields);
+                    const v = try func.createInst(vec_ty, .{ .struct_new = .{ .fields = list } });
+                    try out.append(allocator, func.definingInst(v).?);
+                    func.replaceAllUses(result, v);
+                },
+                else => try out.append(allocator, inst),
+            }
+        }
+        try func.setBlockInsts(block, out.items);
+    }
+    return changed;
+}
+
+fn isVectorLaneOp(func: *const Function, inst: Inst) bool {
+    return switch (func.opcode(inst)) {
+        .reduce, .splat => true,
+        else => false,
+    };
+}
+
+/// `v`'s vector length. `v` must be a vector value; `verify` guarantees it for well-formed IR,
+/// and this expansion only ever reads it from a `reduce`'s vector operand or a `splat`'s result,
+/// both of which `verify` already requires to be a vector.
+fn vectorLenOf(func: *const Function, v: Value) u32 {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .vector => |vec| vec.len,
+        else => unreachable,
+    };
+}
+
+/// Fold `items` pairwise into a balanced tree of `arith op`, the same shape
+/// `loopvec.zig`'s `buildTree` produces for a vectorized reduction.
+fn buildLaneTree(func: *Function, out: *std.ArrayList(Inst), allocator: std.mem.Allocator, op: BinOp, ty: types.Type, items: []const Value) std.mem.Allocator.Error!Value {
+    var cur: std.ArrayList(Value) = .empty;
+    defer cur.deinit(allocator);
+    try cur.appendSlice(allocator, items);
+    while (cur.items.len > 1) {
+        var next: std.ArrayList(Value) = .empty;
+        var i: usize = 0;
+        while (i + 1 < cur.items.len) : (i += 2) {
+            const v = try func.createInst(ty, .{ .arith = .{ .op = op, .lhs = cur.items[i], .rhs = cur.items[i + 1] } });
+            try out.append(allocator, func.definingInst(v).?);
+            try next.append(allocator, v);
+        }
+        if (cur.items.len % 2 == 1) try next.append(allocator, cur.items[cur.items.len - 1]);
+        cur.deinit(allocator);
+        cur = next;
+    }
+    return cur.items[0];
+}
+
 /// Replace scalar f32 division with target-independent u32 operations.
 pub fn expandF32Div(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator.Error!bool {
     var has_division = false;

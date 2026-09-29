@@ -210,6 +210,8 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
                 d.a = sub(subst, d.a);
                 d.b = sub(subst, d.b);
             },
+            .reduce => |*red| red.vector = sub(subst, red.vector),
+            .splat => |*sp| sp.scalar = sub(subst, sp.scalar),
             .matmul => |*mm| {
                 mm.a = sub(subst, mm.a);
                 mm.b = sub(subst, mm.b);

@@ -1228,6 +1228,9 @@ fn emitInst(
         .prefetch => {}, // This is a hint. Wasm has no prefetch, so isel drops it.
         // dot is aarch64 dotprod-only in practice. Wasm has no lowering for it.
         .dot => return error.Unsupported,
+        // reduce/splat have no shared expansion wired for this backend yet. Wasm has no
+        // lowering for a real IR vector type at all.
+        .reduce, .splat => return error.Unsupported,
         // matmul is et-soc only, a later task. Wasm has no lowering for it.
         .matmul => return error.Unsupported,
         // These IR ops exist for frontend and IR construction only. Wasm has no lowering

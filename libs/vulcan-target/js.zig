@@ -285,6 +285,9 @@ const Emitter = struct {
             .prefetch => {}, // a hint, JS has no prefetch, dropped
             // dot is aarch64+dotprod-only in practice. The JS backend has no lowering for it.
             .dot => return error.Unsupported,
+            // reduce/splat have no shared expansion wired for this backend yet. The JS
+            // backend has no lowering for a real IR vector type at all.
+            .reduce, .splat => return error.Unsupported,
             // matmul is et-soc-only (a later task). The JS backend has no lowering for it.
             .matmul => return error.Unsupported,
             // An atomic read-modify-write. This backend emits single-threaded JS over plain

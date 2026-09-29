@@ -99,6 +99,8 @@ const op_decode_low_float: u8 = 26;
 const op_encode_low_float: u8 = 27;
 const op_dequantize_nvfp4: u8 = 28;
 const op_quantize_nvfp4: u8 = 29;
+const op_reduce: u8 = 30;
+const op_splat: u8 = 31;
 
 // An `atomic_rmw` record flag bit: the compare operand follows the two ordinary operand
 // slots. Written from the field and read back into it, so a record round-trips whatever the
@@ -551,6 +553,15 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
             try w.u32v(sv(serial, d.a));
             try w.u32v(sv(serial, d.b));
         },
+        .reduce => |red| {
+            try w.u8v(op_reduce);
+            try w.u8v(@intFromEnum(red.op));
+            try w.u32v(sv(serial, red.vector));
+        },
+        .splat => |sp| {
+            try w.u8v(op_splat);
+            try w.u32v(sv(serial, sp.scalar));
+        },
         .matmul => |mm| {
             try w.u8v(op_matmul);
             try w.u32v(sv(serial, mm.a));
@@ -958,6 +969,8 @@ const Fixup = struct {
                         d.a = next(&i, self.slots, serial);
                         d.b = next(&i, self.slots, serial);
                     },
+                    .reduce => |*red| red.vector = next(&i, self.slots, serial),
+                    .splat => |*sp| sp.scalar = next(&i, self.slots, serial),
                     .matmul => |*mm| {
                         mm.a = next(&i, self.slots, serial);
                         mm.b = next(&i, self.slots, serial);
@@ -1244,6 +1257,17 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
             try slots.append(allocator, try r.take(u32));
             try slots.append(allocator, try r.take(u32));
             break :blk try appendRes(func, block, serial, rty, .{ .dot = .{ .acc = dummy, .a = dummy, .b = dummy } });
+        },
+        op_reduce => blk: {
+            // The stream is untrusted: an unknown op byte is malformed bitcode, never an
+            // invalid enum, the same rule `op_barrier` and `op_atomic_rmw` follow above.
+            const red_op = std.enums.fromInt(function.BinOp, try r.take(u8)) orelse return error.MalformedBitcode;
+            try slots.append(allocator, try r.take(u32));
+            break :blk try appendRes(func, block, serial, rty, .{ .reduce = .{ .vector = dummy, .op = red_op } });
+        },
+        op_splat => blk: {
+            try slots.append(allocator, try r.take(u32));
+            break :blk try appendRes(func, block, serial, rty, .{ .splat = .{ .scalar = dummy } });
         },
         op_matmul => blk: {
             try slots.append(allocator, try r.take(u32));
@@ -1811,6 +1835,67 @@ test "round-trips a dot through bitcode" {
     try std.testing.expectEqual(acc, op.dot.acc);
     try std.testing.expectEqual(a_val, op.dot.a);
     try std.testing.expectEqual(b_val, op.dot.b);
+
+    const a = try std.fmt.allocPrint(allocator, "{f}", .{func});
+    defer allocator.free(a);
+    const b = try std.fmt.allocPrint(allocator, "{f}", .{decoded});
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings(a, b);
+}
+
+test "round-trips a reduce through bitcode" {
+    const allocator = std.testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const vec = try func.appendBlockParam(entry, v4i32);
+    const result = try func.appendReduce(entry, .bit_xor, vec);
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+
+    var decoded = try decode(allocator, bytes);
+    defer decoded.deinit();
+
+    const insts = decoded.blockInsts(entry);
+    const op = decoded.opcode(insts[insts.len - 1]);
+    try std.testing.expect(op == .reduce);
+    try std.testing.expectEqual(vec, op.reduce.vector);
+    try std.testing.expectEqual(function.BinOp.bit_xor, op.reduce.op);
+
+    const a = try std.fmt.allocPrint(allocator, "{f}", .{func});
+    defer allocator.free(a);
+    const b = try std.fmt.allocPrint(allocator, "{f}", .{decoded});
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings(a, b);
+}
+
+test "round-trips a splat through bitcode" {
+    const allocator = std.testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const scalar = try func.appendBlockParam(entry, i32_t);
+    const result = try func.appendSplat(entry, v4i32, scalar);
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+
+    var decoded = try decode(allocator, bytes);
+    defer decoded.deinit();
+
+    const insts = decoded.blockInsts(entry);
+    const op = decoded.opcode(insts[insts.len - 1]);
+    try std.testing.expect(op == .splat);
+    try std.testing.expectEqual(scalar, op.splat.scalar);
 
     const a = try std.fmt.allocPrint(allocator, "{f}", .{func});
     defer allocator.free(a);

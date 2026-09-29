@@ -144,6 +144,19 @@ fn laneKind(func: *const Function, vector_value: Value) ?LaneKind {
     };
 }
 
+/// Whether this backend's isel lowers `inst` (a `reduce` or `splat`) directly, so
+/// `expandVectorLanesExcept` must leave it alone. Add-reduce and every splat are native for the
+/// element kinds `laneKind` supports; the other reduce ops, and any unsupported element kind,
+/// still need the expansion (its `extract`/`struct_new` output goes through this same `laneKind`
+/// gate further down, so an unsupported element kind is rejected there instead, not here).
+fn hasNativeVectorLaneOp(func: *const Function, inst: ir.function.Inst) bool {
+    return switch (func.opcode(inst)) {
+        .reduce => |red| red.op == .add and laneKind(func, red.vector) != null,
+        .splat => laneKind(func, func.instResult(inst).?) != null,
+        else => false,
+    };
+}
+
 fn isDouble(func: *const Function, v: Value) bool {
     return switch (func.types.type_kind(func.valueType(v))) {
         .float => |f| f == .f64,
@@ -634,6 +647,10 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
 
     _ = try ir.expand.expandNvFp4(allocator, &work);
     _ = try ir.expand.expandLowFloat(allocator, &work);
+    // Add-reduce and splat are lowered natively below (the `.reduce`/`.splat` isel arms), so keep
+    // those out of the expansion and only rewrite the reduce ops with no matching instruction
+    // (`mul`, `bit_and`, `bit_or`, `bit_xor`) or an unsupported element type.
+    _ = try ir.expand.expandVectorLanesExcept(allocator, &work, hasNativeVectorLaneOp);
 
     // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls before any
     // numbering is built, so the call clobbers and the f128 argument placement are visible to the
@@ -1659,6 +1676,56 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                                 .i32 => try code.append(allocator, encode.insLaneFromGpr(rd, lane, fr)),
                             }
                         }
+                    }
+                    try storeResult(allocator, &code, ctx, result, rd);
+                },
+                .reduce => |red| {
+                    // A horizontal reduce over a SIMD vector. Only `add` has a native path here:
+                    // integer add is one `addv` (all 4 lanes into a scalar S register), float add
+                    // is `faddp` twice (there is no 4S-wide `faddv`). `mul`/`bit_and`/`bit_or`/
+                    // `bit_xor` have no matching instruction on this core, so `expandVectorLanes`
+                    // still rewrites those into extracts and a tree of scalar ops before isel runs,
+                    // and this arm never sees them.
+                    switch (red.op) {
+                        .add => {},
+                        else => return error.Unsupported,
+                    }
+                    if (!isVector(func, red.vector)) return error.Unsupported;
+                    const elem = laneKind(func, red.vector) orelse return error.Unsupported;
+                    const result = func.instResult(inst).?;
+                    const src = try ctx.loadOp(allocator, &code, red.vector, fp_spill_op[0]);
+                    const rd = ctx.resultReg(result);
+                    switch (elem) {
+                        .i32 => {
+                            // `addv` leaves the sum in an S register (lane 0 of a V register), but
+                            // an i32 result lives in the general-register file, so `umov` moves it
+                            // across, the same crossing `extract` uses for an integer lane.
+                            try code.append(allocator, encode.addv(fp_spill_op[1], src));
+                            try code.append(allocator, encode.umovLane(rd, fp_spill_op[1], 0));
+                        },
+                        .f32 => {
+                            // `faddp v, v, v` (self-operand) folds lanes [0,1,2,3] into
+                            // [0+1, 2+3, 0+1, 2+3]; a second `faddp s, v.2s` adds the low two of
+                            // those, giving (0+1)+(2+3), the same pairwise order the expansion's
+                            // tree builds.
+                            try code.append(allocator, encode.faddpVec(fp_spill_op[1], src, src));
+                            try code.append(allocator, encode.faddpScalar(rd, fp_spill_op[1]));
+                        },
+                    }
+                    try storeResult(allocator, &code, ctx, result, rd);
+                },
+                .splat => |spv| {
+                    // Broadcast a scalar into every lane: one instruction, the same `dup` the
+                    // `struct_new` arm above already uses for an all-same-field vector.
+                    const result = func.instResult(inst).?;
+                    if (!isVector(func, result)) return error.Unsupported;
+                    const elem = laneKind(func, result) orelse return error.Unsupported;
+                    const rd = ctx.resultReg(result);
+                    const scratch: Reg = if (elem == .f32) fp_spill_op[0] else spill_op[0];
+                    const fr = try ctx.loadOp(allocator, &code, spv.scalar, scratch);
+                    switch (elem) {
+                        .f32 => try code.append(allocator, encode.dupVecLane(rd, fr, 0)),
+                        .i32 => try code.append(allocator, encode.dupFromGpr(rd, fr)),
                     }
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
@@ -3514,6 +3581,11 @@ fn forEachOperand(
             f(ctx, d.a, false);
             f(ctx, d.b, false);
         },
+        // A native add-reduce or splat reaches the allocator as `.reduce`/`.splat` (see the isel
+        // arms below), so this walk is load-bearing for them, matching `dot`'s walk above. The
+        // other reduce ops are still expanded away before isel runs and never reach here.
+        .reduce => |red| f(ctx, red.vector, false),
+        .splat => |spv| f(ctx, spv.scalar, false),
         .matmul => |mmv| {
             f(ctx, mmv.a, false);
             f(ctx, mmv.b, false);
@@ -3975,6 +4047,12 @@ fn usesOfInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
             if (d.a == v) c += 1;
             if (d.b == v) c += 1;
         },
+        .reduce => |red| {
+            if (red.vector == v) c += 1;
+        },
+        .splat => |spv| {
+            if (spv.scalar == v) c += 1;
+        },
         .matmul => |mmv| {
             if (mmv.a == v) c += 1;
             if (mmv.b == v) c += 1;
@@ -4070,6 +4148,8 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, fold: *const ad
             setUsed(row, d.a);
             setUsed(row, d.b);
         },
+        .reduce => |red| setUsed(row, red.vector),
+        .splat => |spv| setUsed(row, spv.scalar),
         .matmul => |mmv| {
             setUsed(row, mmv.a);
             setUsed(row, mmv.b);

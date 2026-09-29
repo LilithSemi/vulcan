@@ -155,6 +155,8 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         .alloca,
         .global_addr,
         .dot,
+        .reduce,
+        .splat,
         => {},
     };
 
@@ -530,6 +532,8 @@ fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Va
         .store => |s| .{ .store = .{ .value = rv(vmap, s.value), .ptr = rv(vmap, s.ptr), .@"volatile" = s.@"volatile" } },
         .prefetch => |p| .{ .prefetch = .{ .ptr = rv(vmap, p.ptr) } },
         .dot => |d| .{ .dot = .{ .acc = rv(vmap, d.acc), .a = rv(vmap, d.a), .b = rv(vmap, d.b) } },
+        .reduce => |red| .{ .reduce = .{ .vector = rv(vmap, red.vector), .op = red.op } },
+        .splat => |sp| .{ .splat = .{ .scalar = rv(vmap, sp.scalar) } },
         .struct_new => |sn| blk: {
             var fields: std.ArrayList(Value) = .empty;
             defer fields.deinit(allocator);
@@ -621,6 +625,8 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
                 bump(counts, x.a);
                 bump(counts, x.b);
             },
+            .reduce => |x| bump(counts, x.vector),
+            .splat => |x| bump(counts, x.scalar),
             .matmul => |x| {
                 bump(counts, x.a);
                 bump(counts, x.b);

@@ -391,6 +391,8 @@ fn emitArm(func: *Function, out: *std.ArrayListUnmanaged(Inst), visited: []bool,
             .alloca,
             .global_addr,
             .dot,
+            .reduce,
+            .splat,
             => try out.append(func.allocator, inst),
         }
     }
@@ -538,6 +540,10 @@ fn widenFlattened(func: *Function) Error!void {
             // dot is an aarch64+dotprod-only INT8 op; a shader function never contains one. Reject
             // conservatively rather than assume a lane-widening it has never been proven correct for.
             .dot => return error.NotWidenable,
+            // reduce/splat are whole-vector ops a lowered fragment shader never contains (this
+            // pass is what widens a value to 4 lanes; the source never had a vector to begin
+            // with). Reject conservatively, the same reasoning as `dot` above.
+            .reduce, .splat => return error.NotWidenable,
             // matmul is an et-soc tensor-tile op; a shader function never contains one either.
             .matmul => return error.NotWidenable,
             // SM12 T3: `va_start`/`va_arg`/`va_end` are a C-frontend-only construct; a shader

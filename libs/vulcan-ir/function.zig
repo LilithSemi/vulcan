@@ -95,10 +95,14 @@ pub const Compare = struct { op: CmpOp, lhs: Value, rhs: Value };
 /// The value form of `if` (`c := if {} else {}`).
 pub const Select = struct { cond: Value, then: Value, @"else": Value };
 
-/// Construct an aggregate value from field values. High profile only.
+/// Construct a vector or an aggregate value from field values. Backend support differs by
+/// operand: the aarch64 lowering builds a vector and refuses an aggregate, so building a
+/// vector with it is a supported codegen path and not a high-profile-only operation.
 pub const StructNew = struct { fields: ValueList };
 
-/// Extract field `index` from an aggregate value. High profile only.
+/// Extract lane or field `index` from a vector or an aggregate value. Backend support
+/// differs by operand: the aarch64 lowering reads a vector lane and refuses an aggregate,
+/// so a lane read is a supported codegen path and not a high-profile-only operation.
 pub const Extract = struct { aggregate: Value, index: u32 };
 
 /// Convert a value to the instruction's result type (int<->float). The
@@ -237,6 +241,22 @@ pub const VaEnd = struct { list: Value };
 /// memory effect), like `arith`. `acc` and the result are `<4 x i32>`; `a` and
 /// `b` are the same `<16 x i8>` (signed) or `<16 x u8>` (unsigned) type.
 pub const Dot = struct { acc: Value, a: Value, b: Value };
+
+/// Combine every lane of `vector` into one scalar with an associative `op`. Pure, like `dot`.
+/// The result type is the vector's element type. `op` must be `add`, `mul`, `bit_and`, `bit_or`,
+/// or `bit_xor`: a horizontal combine has no defined lane order, so a non-associative op (`sub`,
+/// `div`, `rem`, a shift, `mulh`) would answer differently depending on the order a backend picks
+/// to fold the lanes, and `verify` refuses those.
+///
+/// A float `reduce` needs no fast-math attribute. Writing this op by hand is already the
+/// caller's consent to reassociate the lanes; this differs from the loop vectorizer's own
+/// reduction, which builds a `reduce` from a scalar loop the source never asked to reorder, and
+/// so must ask for that consent with a fast-math attribute before it may build one.
+pub const Reduce = struct { vector: Value, op: BinOp };
+
+/// Broadcast a runtime scalar into every lane of a vector. Pure, like `struct_new`. The result
+/// type is the vector type; `scalar`'s type must equal its element type.
+pub const Splat = struct { scalar: Value };
 
 /// A fixed-tile matrix multiply: `c := a * b` (or `c += a * b` when `accumulate`),
 /// an `m x k` by `k x n` tile written to `c`. `a`, `b`, and `c` are `ptr` values;
@@ -606,6 +626,10 @@ pub const Opcode = union(enum) {
     va_end: VaEnd,
     /// An INT8 4-way dot-product accumulate. Pure, like `arith`.
     dot: Dot,
+    /// Combine every lane of a vector into one scalar with an associative op. Pure. See `Reduce`.
+    reduce: Reduce,
+    /// Broadcast a scalar into every lane of a vector. Pure. See `Splat`.
+    splat: Splat,
     /// A fixed-tile matrix multiply. Produces no result. EFFECTFUL (writes memory
     /// at `c`). Its preconditions are per target, see `MatMul`.
     matmul: MatMul,
@@ -1135,6 +1159,24 @@ pub const Function = struct {
         return self.appendInst(block, self.valueType(acc), .{ .dot = .{ .acc = acc, .a = a, .b = b } });
     }
 
+    /// Append a `reduce`: combine every lane of `vector` into one scalar with `op`. The result
+    /// type is `vector`'s element type. `vector` must already be a vector value; a caller that
+    /// gets this wrong is a programmer error, and `verify` is the backstop for IR built by hand
+    /// or read from bitcode. See `Reduce` for which `op`s are allowed.
+    pub fn appendReduce(self: *Function, block: Block, op: BinOp, vector: Value) std.mem.Allocator.Error!Value {
+        const elem = switch (self.types.type_kind(self.valueType(vector))) {
+            .vector => |v| v.elem,
+            else => unreachable, // vector must be a vector value, see the doc comment above
+        };
+        return self.appendInst(block, elem, .{ .reduce = .{ .vector = vector, .op = op } });
+    }
+
+    /// Append a `splat`: broadcast `scalar` into every lane of a `vec_ty` vector, returning the
+    /// vector value. `scalar`'s type must equal `vec_ty`'s element type; `verify` enforces it.
+    pub fn appendSplat(self: *Function, block: Block, vec_ty: Type, scalar: Value) std.mem.Allocator.Error!Value {
+        return self.appendInst(block, vec_ty, .{ .splat = .{ .scalar = scalar } });
+    }
+
     /// Append an et-soc fixed-tile matrix multiply to a block: `c := a * b`
     /// (or `c += a * b` when `accumulate`), an `m x k` by `k x n` tile. No
     /// result. EFFECTFUL (writes memory at `c`).
@@ -1427,6 +1469,8 @@ pub const Function = struct {
                     d.a = r(from, to, d.a);
                     d.b = r(from, to, d.b);
                 },
+                .reduce => |*red| red.vector = r(from, to, red.vector),
+                .splat => |*sp| sp.scalar = r(from, to, sp.scalar),
                 .matmul => |*mm| {
                     mm.a = r(from, to, mm.a);
                     mm.b = r(from, to, mm.b);
@@ -1713,6 +1757,8 @@ pub const Function = struct {
             .va_arg => |va| .{ .va_arg = .{ .list = remapValue(map, va.list), .ty = va.ty } },
             .va_end => |ve| .{ .va_end = .{ .list = remapValue(map, ve.list) } },
             .dot => |d| .{ .dot = .{ .acc = remapValue(map, d.acc), .a = remapValue(map, d.a), .b = remapValue(map, d.b) } },
+            .reduce => |red| .{ .reduce = .{ .vector = remapValue(map, red.vector), .op = red.op } },
+            .splat => |sp| .{ .splat = .{ .scalar = remapValue(map, sp.scalar) } },
             .matmul => |mm| blk: {
                 // Only a/b/c are Values. The m/n/k/dtype/accumulate/embedded/quant/input_signs are
                 // compile-time metadata, copied unchanged.
@@ -2232,6 +2278,18 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
             self.valueName(d.acc),
             self.valueName(d.a),
             self.valueName(d.b),
+        }),
+        .reduce => |red| try w.print("let v{d} = reduce {s}, v{d}", .{
+            self.valueName(data.result.?),
+            @tagName(red.op),
+            self.valueName(red.vector),
+        }),
+        // The vector type prints explicitly, like `convert`'s result type: the operand's
+        // scalar type alone does not say how many lanes to broadcast into.
+        .splat => |sp| try w.print("let v{d} = splat {f}, v{d}", .{
+            self.valueName(data.result.?),
+            self.types.fmt(self.valueType(data.result.?)),
+            self.valueName(sp.scalar),
         }),
         .matmul => |mm| {
             try w.print("matmul c=v{d}, a=v{d}, b=v{d} [{d} x {d} x {d}] {s}", .{

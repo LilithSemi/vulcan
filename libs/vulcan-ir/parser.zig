@@ -642,6 +642,36 @@ const FunctionParser = struct {
             try self.recordValue(result);
             return result;
         }
+        if (std.mem.eql(u8, op, "reduce")) {
+            self.skipWs();
+            // The text is untrusted, so an unknown op word is a parse error, never an
+            // invalid enum, and `vector`'s shape is checked here rather than through
+            // `appendReduce` (whose precondition is a programmer contract, not something a
+            // malformed source file may violate).
+            const bin_op = std.meta.stringToEnum(BinOp, self.readWord()) orelse return error.InvalidSyntax;
+            self.skipWs();
+            try self.eat(',');
+            self.skipWs();
+            const vector = try self.parseValueRef();
+            const elem = switch (self.func.types.type_kind(self.func.valueType(vector))) {
+                .vector => |v| v.elem,
+                else => return error.InvalidSyntax,
+            };
+            const result = try self.func.appendInst(block, elem, .{ .reduce = .{ .vector = vector, .op = bin_op } });
+            try self.recordValue(result);
+            return result;
+        }
+        if (std.mem.eql(u8, op, "splat")) {
+            self.skipWs();
+            const ty = try self.parseType();
+            self.skipWs();
+            try self.eat(',');
+            self.skipWs();
+            const scalar = try self.parseValueRef();
+            const result = try self.func.appendSplat(block, ty, scalar);
+            try self.recordValue(result);
+            return result;
+        }
         if (std.mem.eql(u8, op, "va_arg")) {
             self.skipWs();
             const ty = try self.parseType();
@@ -1482,6 +1512,50 @@ test "round-trips field extraction" {
     defer func.deinit();
 
     try std.testing.expectFmt(text, "{f}", .{func});
+}
+
+test "round-trips a reduce" {
+    const text =
+        \\fn {
+        \\  block0(v0: <4 x i32>):
+        \\    let v1 = reduce add, v0
+        \\    ret v1
+        \\}
+    ;
+
+    var func = try parse(std.testing.allocator, text);
+    defer func.deinit();
+
+    try std.testing.expectFmt(text, "{f}", .{func});
+}
+
+test "round-trips a splat" {
+    const text =
+        \\fn {
+        \\  block0(v0: i32):
+        \\    let v1 = splat <4 x i32>, v0
+        \\    ret v1
+        \\}
+    ;
+
+    var func = try parse(std.testing.allocator, text);
+    defer func.deinit();
+
+    try std.testing.expectFmt(text, "{f}", .{func});
+}
+
+test "reduce over a non-vector value is a parse error, not a crash" {
+    // The text is untrusted, so a shape mismatch here must fail the parse cleanly rather
+    // than hit `appendReduce`'s unreachable, which assumes a programmer-built vector.
+    const text =
+        \\fn {
+        \\  block0(v0: i32):
+        \\    let v1 = reduce add, v0
+        \\    ret v1
+        \\}
+    ;
+
+    try std.testing.expectError(error.InvalidSyntax, parse(std.testing.allocator, text));
 }
 
 test "round-trips loads and stores" {

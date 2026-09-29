@@ -201,6 +201,8 @@ fn countUses(func: *const Function, uses: []u32) void {
                     uses[@intFromEnum(d.a)] += 1;
                     uses[@intFromEnum(d.b)] += 1;
                 },
+                .reduce => |red| uses[@intFromEnum(red.vector)] += 1,
+                .splat => |sp| uses[@intFromEnum(sp.scalar)] += 1,
                 .matmul => |mm| {
                     uses[@intFromEnum(mm.a)] += 1;
                     uses[@intFromEnum(mm.b)] += 1;

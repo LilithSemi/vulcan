@@ -928,6 +928,7 @@ fn vecDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
         .{ .match = 0x6E601C00, .mnem = "bsl", .b16 = true },
         .{ .match = 0x4E20CC00, .mnem = "fmla", .b16 = false },
         .{ .match = 0x4EA0CC00, .mnem = "fmls", .b16 = false },
+        .{ .match = 0x6E20D400, .mnem = "faddp", .b16 = false },
     };
     for (v3) |e| {
         if (w == e.match | (@as(u32, rm(w)) << 16) | (@as(u32, rn(w)) << 5) | rd(w)) {
@@ -940,6 +941,16 @@ fn vecDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
     if (w & 0xFFFFFC00 == 0x6EA0F800) return vec2(a, buf, w, "fneg", "4s");
     if (w & 0xFFFFFC00 == 0x6EA1F800) return vec2(a, buf, w, "fsqrt", "4s");
     if (w & 0xFFFFFC00 == 0x6E205800) return vec2(a, buf, w, "mvn", "16b");
+    // Horizontal reduce: addv sums the 4S lanes to a scalar S register; faddpScalar finishes a
+    // pairwise float reduction from a 2S pair. Both cross from the Vn.4S/2S view into Sd.
+    if (w & 0xFFFFFC00 == 0x4EB1B800) {
+        try buf.print(a, "addv s{d}, v{d}.4s", .{ rd(w), rn(w) });
+        return true;
+    }
+    if (w & 0xFFFFFC00 == 0x7E30D800) {
+        try buf.print(a, "faddp s{d}, v{d}.2s", .{ rd(w), rn(w) });
+        return true;
+    }
     // mov vd.16b, vn.16b is orr with rm == rn.
     if (w & 0xFFE0FC00 == 0x4EA01C00 and rm(w) == rn(w)) {
         try buf.print(a, "mov v{d}.16b, v{d}.16b", .{ rd(w), rn(w) });
@@ -1253,6 +1264,9 @@ test "round-trips scalar and vector floating point" {
     try expectOne(encode.insLane(.x0, 1, .x1), "ins v0.s[1], v1.s[0]");
     try expectOne(encode.umovLane(.x0, .x1, 2), "umov w0, v1.s[2]");
     try expectOne(encode.insLaneFromGpr(.x0, 1, .x1), "ins v0.s[1], w1");
+    try expectOne(encode.addv(.x0, .x1), "addv s0, v1.4s");
+    try expectOne(encode.faddpVec(.x0, .x1, .x2), "faddp v0.4s, v1.4s, v2.4s");
+    try expectOne(encode.faddpScalar(.x0, .x1), "faddp s0, v1.2s");
     try expectOne(encode.movVec(.x0, .x1), "mov v0.16b, v1.16b");
     try expectOne(encode.fmadd(.x0, .x1, .x2, .x3, false), "fmadd s0, s1, s2, s3");
     try expectOne(encode.fmadd(.x0, .x1, .x2, .x3, true), "fmadd d0, d1, d2, d3");

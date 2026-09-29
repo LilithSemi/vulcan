@@ -319,7 +319,7 @@ fn foldArith(op: function.BinOp, lhs: i64, rhs: i64) ?i64 {
 /// Whether an instruction has no side effects, so it may be dropped when unused.
 fn isPure(op: function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .alloca, .global_addr, .dot, .reduce, .splat => true,
         // Loads are kept conservatively. Stores, `if`, and calls have effects.
         // A prefetch hint behaves like store here (effectful, not droppable).
         // A matmul writes the `c` memory, likewise effectful.
@@ -426,6 +426,8 @@ fn applySubst(func: *Function, subst: *const Subst) void {
                 d.a = sub(subst, d.a);
                 d.b = sub(subst, d.b);
             },
+            .reduce => |*red| red.vector = sub(subst, red.vector),
+            .splat => |*sp| sp.scalar = sub(subst, sp.scalar),
             .matmul => |*mm| {
                 mm.a = sub(subst, mm.a);
                 mm.b = sub(subst, mm.b);
@@ -544,6 +546,8 @@ fn countUses(func: *const Function, uses: []u32) void {
                     uses[@intFromEnum(d.a)] += 1;
                     uses[@intFromEnum(d.b)] += 1;
                 },
+                .reduce => |red| uses[@intFromEnum(red.vector)] += 1,
+                .splat => |sp| uses[@intFromEnum(sp.scalar)] += 1,
                 .matmul => |mm| {
                     uses[@intFromEnum(mm.a)] += 1;
                     uses[@intFromEnum(mm.b)] += 1;

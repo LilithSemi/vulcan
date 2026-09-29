@@ -29,7 +29,7 @@ fn nonTrapping(op: BinOp) bool {
 /// Whether an instruction may be hoisted out of a loop if it is invariant.
 fn hoistable(opcode: ir.function.Opcode) bool {
     return switch (opcode) {
-        .iconst, .fconst, .fconst128, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .extract, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .extract, .global_addr, .dot, .reduce, .splat => true,
         .arith => |a| nonTrapping(a.op),
         .arith_imm => |a| nonTrapping(a.op),
         .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => false,
@@ -66,6 +66,8 @@ fn operandsInvariant(func: *const Function, inst: Inst, invariant: []const bool)
         .unary => |u| inv(invariant, u.value),
         .extract => |e| inv(invariant, e.aggregate),
         .dot => |d| inv(invariant, d.acc) and inv(invariant, d.a) and inv(invariant, d.b),
+        .reduce => |red| inv(invariant, red.vector),
+        .splat => |sp| inv(invariant, sp.scalar),
         // An atomic's three operands are really checked here, so `hoistable` above is the
         // ONE thing that refuses one. A blanket false would turn that entry into
         // documentation, and a later change to `hoistable` would then hoist an atomic with
@@ -266,6 +268,77 @@ test "does not hoist a loop-variant value" {
     const bi = try func.appendBlockParam(body, i32_t);
     // `bi * bi` depends on the loop induction value, so it is not invariant.
     _ = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .mul, .lhs = bi, .rhs = bi } });
+    const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{next});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+}
+
+test "hoists a loop-invariant splat and a loop-invariant reduce over it to the preheader" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, i32_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const i = try func.appendBlockParam(loop, i32_t);
+
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{zero});
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    // Both `x`'s splat and the reduce over it are loop-invariant: `x` comes from entry.
+    const vec = try func.appendSplat(body, v4i32, x);
+    _ = try func.appendReduce(body, .add, vec);
+    const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{next});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
+
+    const entry_before = func.blockInsts(entry).len;
+    const body_before = func.blockInsts(body).len;
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+
+    // Both the splat and the reduce left the body and landed in the preheader (entry).
+    try std.testing.expectEqual(entry_before + 2, func.blockInsts(entry).len);
+    try std.testing.expectEqual(body_before - 2, func.blockInsts(body).len);
+}
+
+test "does not hoist a splat of the loop induction variable" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const i = try func.appendBlockParam(loop, i32_t);
+
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{zero});
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    // `bi` depends on the loop induction value, so its splat is not invariant.
+    _ = try func.appendSplat(body, v4i32, bi);
     const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{next});
     func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });

@@ -596,6 +596,9 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
 
     _ = try ir.expand.expandNvFp4(allocator, &work);
     _ = try ir.expand.expandLowFloat(allocator, &work);
+    // x86_64 has no native `reduce`/`splat` lowering (only aarch64 does), so every
+    // function runs through the shared expansion before isel ever sees either opcode.
+    _ = try ir.expand.expandVectorLanes(allocator, &work);
 
     // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls before
     // anything numbers the IR, so the call clobbers and argument placement are visible to the
@@ -1495,6 +1498,8 @@ fn unhandledStatement(op_code: ir.function.Opcode) Error {
         .load,
         .va_arg,
         .dot,
+        .reduce,
+        .splat,
         => error.Unsupported,
     };
 }
@@ -3582,6 +3587,12 @@ fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const ad
             f(ctx, d.a, false);
             f(ctx, d.b, false);
         },
+        // Never reached: `expandVectorLanes` (wired in `compileWithCaps` above) rewrites
+        // every `reduce`/`splat` into `extract`/`arith`/`struct_new` before isel runs.
+        // Real arms all the same, matching `dot`'s walk, so a caller that skips the
+        // expansion still gets sound liveness instead of an unhandled use.
+        .reduce => |red| f(ctx, red.vector, false),
+        .splat => |sp| f(ctx, sp.scalar, false),
         .matmul => |mmv| {
             f(ctx, mmv.a, false);
             f(ctx, mmv.b, false);

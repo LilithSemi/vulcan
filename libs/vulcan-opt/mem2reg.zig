@@ -565,6 +565,8 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
                 esc(promotable, d.a);
                 esc(promotable, d.b);
             },
+            .reduce => |red| esc(promotable, red.vector),
+            .splat => |sp| esc(promotable, sp.scalar),
             .matmul => |mm| {
                 esc(promotable, mm.a);
                 esc(promotable, mm.b);

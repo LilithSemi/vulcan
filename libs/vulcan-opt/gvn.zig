@@ -19,7 +19,7 @@ const Block = ir.function.Block;
 
 pub const pass_def = pass.Pass{ .name = "gvn", .run = run };
 
-const ExprKind = enum(u8) { iconst, fconst, fconst128, arith, arith_imm, icmp, select, convert, unary, extract, global_addr, dot };
+const ExprKind = enum(u8) { iconst, fconst, fconst128, arith, arith_imm, icmp, select, convert, unary, extract, global_addr, dot, reduce, splat };
 
 /// A canonical key for a pure expression: its kind, a sub-opcode (BinOp/CmpOp,
 /// result type, or field index), and up to three operand value-numbers/literals.
@@ -136,6 +136,13 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         // dot is pure, like arith, and keyed on all three operands (not commutative:
         // acc is the accumulator, distinct from a/b).
         .dot => |x| .{ .kind = .dot, .a = vn(canon, x.acc), .b = vn(canon, x.a), .c = vn(canon, x.b) },
+        // reduce is pure, like dot, and keyed on the op (a horizontal combine with a
+        // different op over the same vector is a different value) plus the vector operand.
+        .reduce => |x| .{ .kind = .reduce, .sub = @intFromEnum(x.op), .a = vn(canon, x.vector) },
+        // The result type must be part of splat's key, the same discipline `iconst`,
+        // `convert` and `global_addr` already follow above: the same scalar broadcast into a
+        // `<4 x i32>` and a `<8 x i32>` are not interchangeable values.
+        .splat => |x| .{ .kind = .splat, .sub = @intFromEnum(func.valueType(result)), .a = vn(canon, x.scalar) },
         // alloca (distinct addresses), struct_new (variadic), and the impure
         // load/store/prefetch/matmul/call/if are not numbered.
         .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => null,
@@ -209,6 +216,8 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
                 d.a = sub(canon, d.a);
                 d.b = sub(canon, d.b);
             },
+            .reduce => |*red| red.vector = sub(canon, red.vector),
+            .splat => |*sp| sp.scalar = sub(canon, sp.scalar),
             .matmul => |*mm| {
                 mm.a = sub(canon, mm.a);
                 mm.b = sub(canon, mm.b);
@@ -295,6 +304,72 @@ test "cse does not reuse across a non-dominating block" {
     // b1 does not dominate b2, so e2 cannot reuse e1: nothing changes.
     try std.testing.expect(!try run(allocator, &func, &analyses));
     try std.testing.expectEqual(e2, func.terminator(b2).?.ret.values[0]);
+}
+
+test "cse reuses a redundant splat and a redundant reduce over it" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32_t);
+    const s1 = try func.appendSplat(b, v4i32, x);
+    const s2 = try func.appendSplat(b, v4i32, x);
+    const r1 = try func.appendReduce(b, .add, s1);
+    const r2 = try func.appendReduce(b, .add, s2);
+    const sum = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = r1, .rhs = r2 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+
+    // s2/r2 were recognized as congruent to s1/r1: sum now adds r1 to itself.
+    const sum_def = func.definingInst(sum).?;
+    try std.testing.expectEqual(r1, func.opcode(sum_def).arith.lhs);
+    try std.testing.expectEqual(r1, func.opcode(sum_def).arith.rhs);
+}
+
+test "gvn does not merge a reduce add and a reduce bit_xor over the same vector" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const b = try func.appendBlock();
+    const vec = try func.appendBlockParam(b, v4i32);
+    const r1 = try func.appendReduce(b, .add, vec);
+    const r2 = try func.appendReduce(b, .bit_xor, vec);
+    const sum = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = r1, .rhs = r2 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+    try std.testing.expectEqual(r2, func.opcode(func.definingInst(sum).?).arith.rhs);
+}
+
+test "gvn does not merge a splat into a v4i32 and a splat of the same scalar into a v8i32" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const v8i32 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = i32_t } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32_t);
+    _ = try func.appendSplat(b, v4i32, x);
+    const s2 = try func.appendSplat(b, v8i32, x);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(s2) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+    try std.testing.expectEqual(s2, func.terminator(b).?.ret.values[0]);
 }
 
 test "gvn deliberately leaves low float conversions distinct" {
