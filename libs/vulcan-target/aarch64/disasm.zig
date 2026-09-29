@@ -965,6 +965,17 @@ fn vecDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
         try buf.print(a, "ins v{d}.s[{d}], v{d}.s[0]", .{ rd(w), lane, rn(w) });
         return true;
     }
+    if (w & 0xFFE0FC00 == 0x0E003C00) { // umov Wd, Vn.s[i]
+        try buf.appendSlice(a, "umov ");
+        try gp(buf, a, false, rd(w));
+        try buf.print(a, ", v{d}.s[{d}]", .{ rn(w), lane });
+        return true;
+    }
+    if (w & 0xFFE0FC00 == 0x4E001C00) { // ins Vd.s[i], Wn
+        try buf.print(a, "ins v{d}.s[{d}], ", .{ rd(w), lane });
+        try gp(buf, a, false, rn(w));
+        return true;
+    }
     return false;
 }
 
@@ -1240,6 +1251,8 @@ test "round-trips scalar and vector floating point" {
     try expectOne(encode.dupFromGpr(.x0, .x1), "dup v0.4s, w1");
     try expectOne(encode.dupLane(.x0, .x1, 2), "dup s0, v1.s[2]");
     try expectOne(encode.insLane(.x0, 1, .x1), "ins v0.s[1], v1.s[0]");
+    try expectOne(encode.umovLane(.x0, .x1, 2), "umov w0, v1.s[2]");
+    try expectOne(encode.insLaneFromGpr(.x0, 1, .x1), "ins v0.s[1], w1");
     try expectOne(encode.movVec(.x0, .x1), "mov v0.16b, v1.16b");
     try expectOne(encode.fmadd(.x0, .x1, .x2, .x3, false), "fmadd s0, s1, s2, s3");
     try expectOne(encode.fmadd(.x0, .x1, .x2, .x3, true), "fmadd d0, d1, d2, d3");

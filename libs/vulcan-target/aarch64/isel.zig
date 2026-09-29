@@ -127,6 +127,23 @@ fn isVector(func: *const Function, v: Value) bool {
     return func.types.type_kind(func.valueType(v)) == .vector;
 }
 
+/// A SIMD lane's element kind: which register file a scalar extracted from, or packed
+/// into, a vector lives in. Only 32-bit elements are supported, matching the `.4s`-only
+/// lane encoders below; anything else (f64, f16, i64, i8, ...) is `null`.
+const LaneKind = enum { f32, i32 };
+
+fn laneKind(func: *const Function, vector_value: Value) ?LaneKind {
+    const vec = switch (func.types.type_kind(func.valueType(vector_value))) {
+        .vector => |vt| vt,
+        else => return null,
+    };
+    return switch (func.types.type_kind(vec.elem)) {
+        .float => |f| if (f == .f32) .f32 else null,
+        .int => |i| if (i.bits == 32) .i32 else null,
+        else => null,
+    };
+}
+
 fn isDouble(func: *const Function, v: Value) bool {
     return switch (func.types.type_kind(func.valueType(v))) {
         .float => |f| f == .f64,
@@ -1591,37 +1608,56 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try code.append(allocator, encode.prfm(base));
                 },
                 .extract => |e| {
-                    // Extract a SIMD lane to a scalar (the vectorizer's unpack): one NEON
-                    // `dup`, pure, so dead extracts fall to DCE.
+                    // Extract a SIMD lane to a scalar (the vectorizer's unpack): one instruction,
+                    // pure, so dead extracts fall to DCE. The source vector is always a V register,
+                    // but the element kind decides which register file the RESULT lands in: a
+                    // float lane stays in the V file (`dup`), an integer lane crosses into the
+                    // general-register file (`umov`), and `resultReg` already placed `rd` there
+                    // because it reads the result's own (non-vector) type.
                     if (!isVector(func, e.aggregate)) return error.Unsupported;
+                    const elem = laneKind(func, e.aggregate) orelse return error.Unsupported;
                     const result = func.instResult(inst).?;
                     const src = try ctx.loadOp(allocator, &code, e.aggregate, fp_spill_op[0]);
                     const rd = ctx.resultReg(result);
-                    try code.append(allocator, encode.dupLane(rd, src, @intCast(e.index)));
+                    switch (elem) {
+                        .f32 => try code.append(allocator, encode.dupLane(rd, src, @intCast(e.index))),
+                        .i32 => try code.append(allocator, encode.umovLane(rd, src, @intCast(e.index))),
+                    }
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .struct_new => |sn| {
-                    // Build a SIMD vector from scalar lanes (the vectorizer's pack): one NEON
-                    // `ins` per lane, lane 0 last so a field the allocator placed in the result
-                    // register keeps its value (in lane 0) until its own `ins` reads it.
+                    // Build a SIMD vector from scalar lanes (the vectorizer's pack): one instruction
+                    // per lane, lane 0 last so a field the allocator placed in the result register
+                    // keeps its value (in lane 0) until its own insert reads it. The element kind
+                    // decides which register file each FIELD is read from: a float field is a V
+                    // register lane (`dup`/`ins ..., vn.s[0]`), an integer field is a general
+                    // register (`dup`/`ins ..., wn`).
                     const result = func.instResult(inst).?;
                     if (!isVector(func, result)) return error.Unsupported;
+                    const elem = laneKind(func, result) orelse return error.Unsupported;
                     const fields = func.valueList(sn.fields);
-                    if (fields.len != 4) return error.Unsupported; // <4 x f32> only for now
+                    if (fields.len != 4) return error.Unsupported; // <4 x T> only for now
                     const rd = ctx.resultReg(result);
-                    // A splat (every lane the same scalar) is one `dup` from that scalar's lane 0,
-                    // not four inserts. This is what makes the vectorizer's invariant operand (e.g.
-                    // the SAXPY multiplier) cheap enough to fuse on a wide core.
+                    const scratch: Reg = if (elem == .f32) fp_spill_op[0] else spill_op[0];
+                    // A splat (every lane the same scalar) is one `dup` from that scalar, not four
+                    // inserts. This is what makes the vectorizer's invariant operand (e.g. the
+                    // SAXPY multiplier) cheap enough to fuse on a wide core.
                     const splat = for (fields[1..]) |f| {
                         if (f != fields[0]) break false;
                     } else true;
                     if (splat) {
-                        const fr = try ctx.loadOp(allocator, &code, fields[0], fp_spill_op[0]);
-                        try code.append(allocator, encode.dupVecLane(rd, fr, 0));
+                        const fr = try ctx.loadOp(allocator, &code, fields[0], scratch);
+                        switch (elem) {
+                            .f32 => try code.append(allocator, encode.dupVecLane(rd, fr, 0)),
+                            .i32 => try code.append(allocator, encode.dupFromGpr(rd, fr)),
+                        }
                     } else {
                         for ([_]u2{ 1, 2, 3, 0 }) |lane| {
-                            const fr = try ctx.loadOp(allocator, &code, fields[lane], fp_spill_op[0]);
-                            try code.append(allocator, encode.insLane(rd, lane, fr));
+                            const fr = try ctx.loadOp(allocator, &code, fields[lane], scratch);
+                            switch (elem) {
+                                .f32 => try code.append(allocator, encode.insLane(rd, lane, fr)),
+                                .i32 => try code.append(allocator, encode.insLaneFromGpr(rd, lane, fr)),
+                            }
                         }
                     }
                     try storeResult(allocator, &code, ctx, result, rd);

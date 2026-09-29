@@ -121,9 +121,42 @@ fn buildSumReduction(func: *Function) !void {
     func.setTerminator(done, .{ .ret = ir.function.Ret.one(rs) });
 }
 
+/// `s = 0; for (i = 0; i < n; i += 1) s += a[i]; return s;` over i32. Integer add is reorderable
+/// without fast_math, so this exercises the same vector-accumulator path through the GPR lane
+/// encoders instead of the NEON ones the f32 reduction test uses.
+fn buildSumReductionI32(func: *Function) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero_i = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const zero_s = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{ zero_i, zero_s });
+    const i = try func.appendBlockParam(loop, i32_t);
+    const s = try func.appendBlockParam(loop, i32_t);
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, s } }, .{ .target = done, .args = &.{s} });
+    const bi = try func.appendBlockParam(body, i32_t);
+    const bs = try func.appendBlockParam(body, i32_t);
+    const off = try func.appendArithImm(body, i32_t, .mul, bi, 4);
+    const addr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = off } });
+    const v = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = addr } });
+    const ns = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = v } });
+    const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{ ni, ns });
+    const rs = try func.appendBlockParam(done, i32_t);
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(rs) });
+}
+
 const Builder = *const fn (*Function) anyerror!void;
 const SaxpyFn = *const fn (x: [*]f32, y: [*]f32, a: f32, n: i32) callconv(.c) void;
 const SumFn = *const fn (a: [*]f32, n: i32) callconv(.c) f32;
+const SumFnI32 = *const fn (a: [*]i32, n: i32) callconv(.c) i32;
 
 /// Transform: apply loopvec only, or the full microarch pipeline (so SLP widens the body too).
 const Mode = enum { loopvec_only, full };
@@ -245,6 +278,40 @@ test "loopvec differential: f32 sum reduction (vector accumulator), all trip cou
         // reductions agree bit-for-bit despite the reassociation.
         var arr: [128]f32 = undefined;
         for (0..128) |k| arr[k] = @floatFromInt((k % 7) + 1);
+        try std.testing.expectEqual(f_o(&arr, n), f_t(&arr, n));
+    }
+}
+
+test "loopvec differential: i32 sum reduction (vector accumulator), all trip counts" {
+    if (comptime !hasJit()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const trip_counts = [_]i32{ 0, 1, 3, 4, 5, 7, 8, 12, 13, 17, 100 };
+
+    var orig = Function.init(allocator);
+    defer orig.deinit();
+    try buildSumReductionI32(&orig);
+    var tuned = Function.init(allocator);
+    defer tuned.deinit();
+    try buildSumReductionI32(&tuned);
+    try std.testing.expect(try opt.microarch.loopvec.run(allocator, &tuned, ampere()));
+    try std.testing.expect(hasVectorValue(&tuned)); // a genuine vector accumulator was emitted
+
+    var diags = try ir.verify.verify(allocator, &tuned, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+
+    var buf_o = try target.native.jitFunction(allocator, &orig);
+    defer buf_o.deinit();
+    var buf_t = try target.native.jitFunction(allocator, &tuned);
+    defer buf_t.deinit();
+    const f_o = buf_o.entry(SumFnI32, 0);
+    const f_t = buf_t.entry(SumFnI32, 0);
+
+    for (trip_counts) |n| {
+        // Integer add is associative and exact, so serial and vector-partial reductions
+        // must agree bit-for-bit at every trip count, not just in the common case.
+        var arr: [128]i32 = undefined;
+        for (0..128) |k| arr[k] = @intCast((k % 7) + 1);
         try std.testing.expectEqual(f_o(&arr, n), f_t(&arr, n));
     }
 }

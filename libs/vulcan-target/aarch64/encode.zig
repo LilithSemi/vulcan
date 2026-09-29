@@ -747,6 +747,23 @@ pub fn insLane(rd: Reg, lane: u2, rn: Reg) u32 {
     return 0x6E000400 | (imm5 << 16) | (n(rn) << 5) | n(rd); // imm4 = 0 -> source lane 0
 }
 
+/// `umov wd, vn.s[index]`: move 32-bit lane `index` of a vector into a general register.
+/// The GPR counterpart of `dupLane`, for extracting an integer lane instead of a float one.
+/// One instruction covers both signed and unsigned 32-bit elements: the element already
+/// fills the whole destination width, so there is no sign bit left to extend and the
+/// signed `smov` form is never needed at this width.
+pub fn umovLane(rd: Reg, rn: Reg, index: u2) u32 {
+    const imm5: u32 = (@as(u32, index) << 3) | 0b100; // S element: index in bits[4:3]
+    return 0x0E003C00 | (imm5 << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// `ins vd.s[lane], wn`: insert a general register into lane `lane` of a vector. The GPR
+/// counterpart of `insLane`, for building an integer vector lane by lane.
+pub fn insLaneFromGpr(rd: Reg, lane: u2, rn: Reg) u32 {
+    const imm5: u32 = (@as(u32, lane) << 3) | 0b100; // destination S element
+    return 0x4E001C00 | (imm5 << 16) | (n(rn) << 5) | n(rd);
+}
+
 /// `mov vd.16b, vn.16b` (an alias for `orr vd.16b, vn.16b, vn.16b`): copy a whole 128-bit
 /// vector register. Use this for vector register moves. `fmovReg` only copies 64 bits.
 pub fn movVec(rd: Reg, rn: Reg) u32 {
@@ -982,6 +999,10 @@ test "NEON vector op encodings" {
     // f128 constant. rd bits[4:0], rn bits[9:5]; the base 0x4E181C00 has every register field 0.
     try std.testing.expectEqual(@as(u32, 0x4E181C20), insD1FromGpr(.x0, .x1)); // ins v0.d[1], x1
     try std.testing.expectEqual(@as(u32, 0x4E181D34), insD1FromGpr(.x20, .x9)); // ins v20.d[1], x9
+    try std.testing.expectEqual(@as(u32, 0x0E043C00), umovLane(.x0, .x0, 0)); // umov w0, v0.s[0]
+    try std.testing.expectEqual(@as(u32, 0x0E1C3C61), umovLane(.x1, .x3, 3)); // umov w1, v3.s[3]
+    try std.testing.expectEqual(@as(u32, 0x4E041C00), insLaneFromGpr(.x0, 0, .x0)); // ins v0.s[0], w0
+    try std.testing.expectEqual(@as(u32, 0x4E1C1C61), insLaneFromGpr(.x1, 3, .x3)); // ins v1.s[3], w3
 }
 
 test "FMLA/FMLS vector encodings (NEON accumulate-into-Vd)" {
