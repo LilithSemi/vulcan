@@ -1650,6 +1650,40 @@ test "a load's consumer waits on the load's scoreboard" {
     try std.testing.expectEqual(s2r_bar, ldg_bar);
 }
 
+test "bytewise global pack and extract keep every generated dependency" {
+    // A B32 load starts with one byte in the destination, then loads each later byte into
+    // reserved scratch before SHF and LOP3 pack it. The SHF must wait for the scratch load,
+    // and the first LOP3 must independently wait for the destination load. Mutating either
+    // register read out of the scheduler makes one of these masks lose its producer.
+    var pack_sequence = [_]Inst{
+        encode.ldgAt(4, 8, 0, .u8, .{}),
+        encode.ldgAt(0, 8, 1, .u8, .{}),
+        encode.shfImm(0, 0, 8, false, false, .{}),
+        encode.lop3(4, 4, 0, encode.LUT_OR, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&pack_sequence, &.{0});
+
+    const destination_barrier = getField(pack_sequence[0], 110, 3);
+    const scratch_barrier = getField(pack_sequence[1], 110, 3);
+    try std.testing.expect(destination_barrier < num_scoreboards);
+    try std.testing.expect(scratch_barrier < num_scoreboards);
+    try std.testing.expect((getField(pack_sequence[2], 116, 6) & (@as(u32, 1) << @intCast(scratch_barrier))) != 0);
+    try std.testing.expect((getField(pack_sequence[3], 116, 6) & (@as(u32, 1) << @intCast(destination_barrier))) != 0);
+    try std.testing.expectEqual(coupled_alu_latency - 1, getField(pack_sequence[2], 105, 4));
+
+    // A byte store extracts each nonzero lane with a fixed-latency SHF immediately before
+    // STG. The producer carries the delay; if STG stops naming its data field as a source,
+    // the scheduler leaves the SHF at its one-cycle floor instead.
+    var extracted = [_]Inst{
+        encode.shfImm(0, 4, 8, true, false, .{}),
+        encode.stgAt(8, 0, 1, .u8, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&extracted, &.{0});
+    try std.testing.expectEqual(coupled_alu_latency - 1, getField(extracted[0], 105, 4));
+}
+
 test "a large LDG batch shares one write barrier and one wait retires the group" {
     var insts: [10]Inst = undefined;
     for (0..7) |i| insts[i] = encode.ldgU32(@intCast(8 + i), @intCast(32 + i * 2), .{});

@@ -67,9 +67,11 @@ const bank0: u5 = 0;
 /// allocator excludes this register from its pool (see assignLocs).
 const graphics_prologue_pad: u32 = 6;
 const graphics_pad_reg: u8 = 40;
+const graphics_memory_scratch_reg: u8 = 41;
 
-/// Reserved registers: R0 and R1 are scratch, and R2:R3 hold the 64-bit output
-/// pointer. Values get GPRs starting at R4.
+/// Compute reserves R0:R1 as scratch and R2:R3 as the 64-bit output pointer. Graphics
+/// reserves R40:R41 for scratch because its architectural outputs occupy low registers.
+/// Values get GPRs starting at R4.
 const r_scratch: u8 = 0;
 const r_scratch2: u8 = 1; // second prologue scratch register, for invocation-ID computation
 const r_outptr: u8 = 2; // pair R2:R3
@@ -693,6 +695,10 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
         try assignLocsWimmer(allocator, func, stage, &loc, &max_reg, &fma);
     } else {
         try assignLocs(allocator, func, &loc, &max_reg, &fma);
+        // Graphics keeps R0..R3 for the ROP and can reserve further low registers for MRT
+        // and depth. R40:R41 are outside that architectural output block and outside the
+        // allocator pool, so every later graphics reservation starts above both scratches.
+        max_reg = @max(max_reg, graphics_memory_scratch_reg);
     }
 
     // Give each hoisted constant a register above everything `assignLocs` handed
@@ -1041,7 +1047,7 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
         var terminated = false;
 
         for (func.blockInsts(block)) |inst| {
-            try lowerInst(allocator, func, &loc, &code, &tex, &deriv, &math, &shared, &disp, &fma, &pred_fold, &uniform_params, inst);
+            try lowerInst(allocator, func, stage, &loc, &code, &tex, &deriv, &math, &shared, &disp, &fma, &pred_fold, &uniform_params, inst);
             if (func.opcode(inst) == .@"if") {
                 // Set up the convergence barrier just before the divergent
                 // branch. BCLEAR initializes the barrier register, and BSSY
@@ -1341,11 +1347,12 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
     for (0..nval) |i| ivals[i] = .{ .value = @enumFromInt(i), .start = def_pos[i], .end = last_use[i] };
     std.mem.sort(Interval, ivals, {}, lessByStart);
 
-    // Free pools: GPRs R4..R254 (R0 and R1 are scratch, R2:R3 is the output
-    // pointer), and predicates P0..P5.
+    // Free pools: GPRs R4..R254 (R0:R3 stay outside the graphics value pool), and
+    // predicates P0..P5. The two high graphics scratch registers are removed below.
     var gpr_free = [_]bool{false} ** 256;
     for (value_reg_base..encode.RZ) |r| gpr_free[r] = true;
     gpr_free[graphics_pad_reg] = false; // reserved as the graphics prologue pad scratch
+    gpr_free[graphics_memory_scratch_reg] = false; // paired graphics memory scratch
     // gl_FragDepth: reserve the ROP depth-output register so no live value
     // takes it. The frag_depth store moves the depth into it, and it must
     // stay untouched until EXIT. The register sits past all N color targets
@@ -1946,18 +1953,26 @@ fn foldAddressDisplacements(allocator: std.mem.Allocator, func: *Function, out: 
     const nblocks = func.blockCount();
     for (0..nblocks) |bi| {
         for (func.blockInsts(@enumFromInt(bi))) |inst| {
-            const ptr = switch (func.opcode(inst)) {
+            const access = func.opcode(inst);
+            const ptr = switch (access) {
                 .load => |l| l.ptr,
                 .store => |s| s.ptr,
                 else => continue,
+            };
+            const width = switch (access) {
+                .load => memTypeOf(func, func.instResult(inst).?) catch continue,
+                .store => |s| memTypeOf(func, s.value) catch continue,
+                else => unreachable,
             };
             var base = ptr;
             var total: i64 = 0;
             // Collapse a whole chain, so `(p + 4) + 8` folds as one displacement of 12.
             // The walk stops at the first step that would leave the field's range.
             while (addrChainStep(func, base)) |step| {
-                if (!encode.fitsAddrOffset(total + step.imm)) break;
-                total += step.imm;
+                const next = std.math.add(i64, total, step.imm) catch break;
+                const last = std.math.add(i64, next, @as(i64, width.byteSize()) - 1) catch break;
+                if (!encode.fitsAddrOffset(next) or !encode.fitsAddrOffset(last)) break;
+                total = next;
                 base = step.base;
             }
             if (base == ptr) continue;
@@ -2303,7 +2318,7 @@ fn reserveHoistRegs(func: *const Function, stage: Stage, fold: *FmaFold, max_reg
 
 /// Whether register `r` is one `assignLocs` reserves outside its pool. See `reserveHoistRegs`.
 fn hoistRegTaken(func: *const Function, stage: Stage, r: u8) bool {
-    if (stage != .compute and r == graphics_pad_reg) return true;
+    if (stage != .compute and (r == graphics_pad_reg or r == graphics_memory_scratch_reg)) return true;
     if (stage == .fragment) {
         if (writesFragDepth(func) and r == fragDepthReg(func)) return true;
         const nt: u32 = colorTargetCount(func);
@@ -2788,6 +2803,91 @@ fn memTypeOf(func: *const Function, v: Value) Error!encode.MemType {
         },
         .ptr => return if (isWidePtr(func, v)) .b64 else .b32,
         .vector, .@"struct", .array, .slice => return error.Unsupported,
+    }
+}
+
+/// Add one byte lane to an already validated memory displacement. Address folding proves
+/// the complete access range fits the instruction field, and an unfolded access starts at
+/// zero. Rechecking here keeps a future caller from turning a lane offset into wrapping SASS.
+fn globalByteOffset(displacement: i32, lane: u8) i32 {
+    return std.math.add(i32, displacement, lane) catch unreachable;
+}
+
+const MemoryScratch = struct {
+    byte: u8,
+    pack: u8,
+};
+
+/// Compute owns R0:R1 as general scratch. A graphics shader cannot use those registers after
+/// it has published a fragment color or depth because the ROP reads the low architectural
+/// output block at EXIT. Its bytewise memory lowering therefore uses the reserved high pair.
+fn memoryScratch(stage: Stage) MemoryScratch {
+    return if (stage == .compute)
+        .{ .byte = r_scratch, .pack = r_scratch2 }
+    else
+        .{ .byte = graphics_pad_reg, .pack = graphics_memory_scratch_reg };
+}
+
+/// Load one 32-bit register from four exact-footprint byte accesses. The packed scratch holds
+/// the word until every access has collected its address, so an allocator choice which reuses
+/// the address's low register for the result cannot clobber the address between byte loads.
+/// Later bytes use the other reserved scratch; neither register belongs to an SSA value.
+fn emitGlobalLoadWord(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), scratch: MemoryScratch, destination: u8, address: u8, displacement: i32, byte_count: u8) Error!void {
+    std.debug.assert(byte_count >= 1 and byte_count <= 4);
+    try code.append(allocator, encode.ldgAt(scratch.pack, address, displacement, .u8, .{}));
+    for (1..byte_count) |lane_usize| {
+        const lane: u8 = @intCast(lane_usize);
+        try code.append(allocator, encode.ldgAt(scratch.byte, address, globalByteOffset(displacement, lane), .u8, .{}));
+        try code.append(allocator, encode.shfImm(scratch.byte, scratch.byte, @as(u32, lane) * 8, false, false, .{}));
+        try code.append(allocator, encode.lop3(scratch.pack, scratch.pack, scratch.byte, encode.LUT_OR, .{}));
+    }
+    try code.append(allocator, encode.movReg(destination, scratch.pack, .{}));
+}
+
+/// Load an ordinary global scalar without relying on an alignment promise the IR does not
+/// carry. Pointer payloads own a register pair, so each half is reconstructed independently.
+fn emitGlobalLoadBytes(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), scratch: MemoryScratch, destination: u8, address: u8, displacement: i32, width: encode.MemType) Error!void {
+    switch (width) {
+        .u8, .i8 => try code.append(allocator, encode.ldgAt(destination, address, displacement, width, .{})),
+        .u16, .i16 => {
+            try emitGlobalLoadWord(allocator, code, scratch, destination, address, displacement, 2);
+            if (width == .i16) {
+                try code.append(allocator, encode.shfImm(destination, destination, 16, false, false, .{}));
+                try code.append(allocator, encode.shfImm(destination, destination, 16, true, true, .{}));
+            }
+        },
+        .b32 => try emitGlobalLoadWord(allocator, code, scratch, destination, address, displacement, 4),
+        .b64 => {
+            try emitGlobalLoadWord(allocator, code, scratch, destination, address, displacement, 4);
+            try emitGlobalLoadWord(allocator, code, scratch, destination + 1, address, globalByteOffset(displacement, 4), 4);
+        },
+        .b128 => return error.Unsupported,
+    }
+}
+
+/// Store one register through exact-footprint byte stores. Byte zero can use the source
+/// directly; every later byte is extracted through reserved R0 immediately before its store.
+fn emitGlobalStoreWord(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), scratch: MemoryScratch, source: u8, address: u8, displacement: i32, byte_count: u8) Error!void {
+    std.debug.assert(byte_count >= 1 and byte_count <= 4);
+    try code.append(allocator, encode.stgAt(address, source, displacement, .u8, .{}));
+    for (1..byte_count) |lane_usize| {
+        const lane: u8 = @intCast(lane_usize);
+        try code.append(allocator, encode.shfImm(scratch.byte, source, @as(u32, lane) * 8, true, false, .{}));
+        try code.append(allocator, encode.stgAt(address, scratch.byte, globalByteOffset(displacement, lane), .u8, .{}));
+    }
+}
+
+/// Store an ordinary global scalar without touching bytes outside its IR footprint.
+fn emitGlobalStoreBytes(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), scratch: MemoryScratch, source: u8, address: u8, displacement: i32, width: encode.MemType) Error!void {
+    switch (width) {
+        .u8, .i8 => try code.append(allocator, encode.stgAt(address, source, displacement, width, .{})),
+        .u16, .i16 => try emitGlobalStoreWord(allocator, code, scratch, source, address, displacement, 2),
+        .b32 => try emitGlobalStoreWord(allocator, code, scratch, source, address, displacement, 4),
+        .b64 => {
+            try emitGlobalStoreWord(allocator, code, scratch, source, address, displacement, 4);
+            try emitGlobalStoreWord(allocator, code, scratch, source + 1, address, globalByteOffset(displacement, 4), 4);
+        },
+        .b128 => return error.Unsupported,
     }
 }
 
@@ -3808,7 +3908,7 @@ fn emitCubeAtlasUv(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), loc
     try code.append(allocator, encode.ffma(call.coord + 1, s + 3, s + 1, s + 1, .{})); // v
 }
 
-fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), tex: *const TexLowering, deriv: *const DerivLowering, math: *const MathLowering, shared: *const gpu.abi.SharedFrame, disp: *const DispFold, fma: *const FmaFold, pred_fold: *const PredicateFold, uniform: *const UniformParams, inst: ir.function.Inst) Error!void {
+fn lowerInst(allocator: std.mem.Allocator, func: *const Function, stage: Stage, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), tex: *const TexLowering, deriv: *const DerivLowering, math: *const MathLowering, shared: *const gpu.abi.SharedFrame, disp: *const DispFold, fma: *const FmaFold, pred_fold: *const PredicateFold, uniform: *const UniformParams, inst: ir.function.Inst) Error!void {
     switch (func.opcode(inst)) {
         .iconst => |c| {
             // A graphics output-attribute store pointer is a tag-carrier
@@ -4000,7 +4100,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             // into the result register. This is variable latency: the
             // scoreboard scheduler assigns its write barrier and the wait on
             // each consumer.
-            try code.append(allocator, encode.ldgAt(rd, gprOf(loc.*, l.ptr), disp.offsetOf(inst), width, .{}));
+            try emitGlobalLoadBytes(allocator, code, memoryScratch(stage), rd, gprOf(loc.*, l.ptr), disp.offsetOf(inst), width);
         },
         .store => |st| {
             // A store whose pointer is tagged with a graphics output
@@ -4039,7 +4139,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 try code.append(allocator, encode.stsAt(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), disp.offsetOf(inst), width, .{}));
             } else {
                 const width = try memTypeOf(func, st.value);
-                try code.append(allocator, encode.stgAt(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), disp.offsetOf(inst), width, .{}));
+                try emitGlobalStoreBytes(allocator, code, memoryScratch(stage), gprOf(loc.*, st.value), gprOf(loc.*, st.ptr), disp.offsetOf(inst), width);
             }
         },
         .prefetch => {}, // a hint; this GPU target has no CPU-style prefetch, so it is dropped
@@ -7009,7 +7109,7 @@ test "shared address arithmetic is one 32-bit IADD3, where a global address is a
     // inside one instruction, so no plain IADD3 forms the address at all.
     try testing.expectEqual(@as(usize, 0), count(global_k.code, 0x210)); // no 32-bit address add
     try testing.expectEqual(@as(usize, 1), count(global_k.code, encode.IMAD_WIDE_IMM_OPCODE));
-    try testing.expectEqual(@as(usize, 1), count(global_k.code, 0x981)); // LDG
+    try testing.expectEqual(@as(usize, 4), count(global_k.code, 0x981)); // four exact bytes
     try testing.expectEqual(@as(usize, 0), count(global_k.code, 0x984)); // no LDS
     try testing.expectEqual(@as(usize, 3), count(global_k.code, 0xb82)); // outptr, base, i
 }
@@ -7047,6 +7147,19 @@ fn memTypeAt(code: []const u32, i: usize) u32 {
     return (code[i * 4 + 2] >> (73 - 64)) & 0x7;
 }
 
+/// The signed 24-bit byte displacement at bits 40..63.
+fn addressOffsetAt(code: []const u32, i: usize) i32 {
+    const raw = code[i * 4 + 1] >> 8;
+    const shifted: i32 = @bitCast(raw << 8);
+    return shifted >> 8;
+}
+
+/// One scheduling-control field from the fourth dword of instruction `i`.
+fn controlAt(code: []const u32, i: usize, comptime lo: u7, comptime width: u4) u32 {
+    std.debug.assert(lo >= 96 and lo + width <= 128);
+    return (code[i * 4 + 3] >> @intCast(lo - 96)) & ((@as(u32, 1) << width) - 1);
+}
+
 test "a byte access uses the 8-bit memory type, not a 32-bit one" {
     // Regression: the load and store arms ignored the IR value type and always emitted the
     // B32 encoders. A byte store then wrote FOUR bytes, destroying the three bytes beside its
@@ -7076,33 +7189,270 @@ test "a byte access uses the 8-bit memory type, not a 32-bit one" {
     try testing.expectEqual(regAt(kernel.code, ld, 16), regAt(kernel.code, st, 32));
 }
 
-test "an unsigned 16-bit access uses U16 and a 32-bit one is unchanged" {
+test "ordinary global multi-byte accesses use exact-footprint unsigned byte operations" {
+    const allocator = testing.allocator;
+    const cases = [_]struct {
+        kind: ir.types.TypeKind,
+        bytes: u8,
+        words: u8,
+        signed_half: bool = false,
+    }{
+        .{ .kind = .{ .int = .{ .signedness = .unsigned, .bits = 16 } }, .bytes = 2, .words = 1 },
+        .{ .kind = .{ .int = .{ .signedness = .signed, .bits = 16 } }, .bytes = 2, .words = 1, .signed_half = true },
+        .{ .kind = .{ .int = .{ .signedness = .unsigned, .bits = 32 } }, .bytes = 4, .words = 1 },
+        .{ .kind = .{ .int = .{ .signedness = .signed, .bits = 32 } }, .bytes = 4, .words = 1 },
+        .{ .kind = .{ .float = .f32 }, .bytes = 4, .words = 1 },
+        .{ .kind = .{ .ptr = .shared }, .bytes = 4, .words = 1 },
+        .{ .kind = .{ .ptr = .global }, .bytes = 8, .words = 2 },
+        .{ .kind = .{ .ptr = .constant }, .bytes = 8, .words = 2 },
+        .{ .kind = .{ .ptr = .private }, .bytes = 8, .words = 2 },
+    };
+    for (cases) |case| for ([_]i64{ 0, 1 }) |displacement| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const value_t = try func.types.intern(case.kind);
+        const ptr_t = try func.types.ptrGlobal();
+        const b = try func.appendBlock();
+        const out = try func.appendBlockParam(b, ptr_t);
+        const input = try func.appendBlockParam(b, ptr_t);
+        const load_at = if (displacement == 0) input else try func.appendArithImm(b, ptr_t, .add, input, displacement);
+        const store_at = if (displacement == 0) out else try func.appendArithImm(b, ptr_t, .add, out, displacement);
+        const value = try func.appendInst(b, value_t, .{ .load = .{ .ptr = load_at } });
+        try func.appendStore(b, value, store_at);
+        func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+        var kernel = try compileKernel(allocator, &func, nvidia_abi);
+        defer kernel.deinit(allocator);
+
+        var load_lane: u8 = 0;
+        var store_lane: u8 = 0;
+        var lop_count: usize = 0;
+        var shift_count: usize = 0;
+        var load_word_count: u8 = 0;
+        var first_load_dst: ?u8 = null;
+        var high_load_dst: ?u8 = null;
+        var first_store_src: ?u8 = null;
+        var high_store_src: ?u8 = null;
+        for (0..kernel.code.len / 4) |i| switch (opAt(kernel.code, i)) {
+            0x981 => {
+                try testing.expect(load_lane < case.bytes);
+                try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, i));
+                try testing.expectEqual(@as(i32, @intCast(displacement + load_lane)), addressOffsetAt(kernel.code, i));
+                const dst = regAt(kernel.code, i, 16);
+                if (load_lane % 4 == 0) {
+                    try testing.expectEqual(r_scratch2, dst);
+                } else {
+                    try testing.expectEqual(r_scratch, dst);
+                    const shift = i + 1;
+                    try testing.expectEqual(@as(u32, 0x819), opAt(kernel.code, shift));
+                    try testing.expectEqual(r_scratch, regAt(kernel.code, shift, 16));
+                    const barrier = controlAt(kernel.code, i, 110, 3);
+                    try testing.expect(barrier < 6);
+                    try testing.expect(controlAt(kernel.code, shift, 116, 6) & (@as(u32, 1) << @intCast(barrier)) != 0);
+                }
+                load_lane += 1;
+            },
+            0x202 => if (regAt(kernel.code, i, 32) == r_scratch2) {
+                const dst = regAt(kernel.code, i, 16);
+                if (load_word_count == 0) first_load_dst = dst;
+                if (load_word_count == 1) high_load_dst = dst;
+                load_word_count += 1;
+            },
+            0x986 => {
+                try testing.expect(store_lane < case.bytes);
+                try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, i));
+                try testing.expectEqual(@as(i32, @intCast(displacement + store_lane)), addressOffsetAt(kernel.code, i));
+                const src = regAt(kernel.code, i, 32);
+                if (store_lane == 0) first_store_src = src;
+                if (store_lane == 4) high_store_src = src;
+                if (store_lane % 4 != 0) {
+                    try testing.expectEqual(r_scratch, src);
+                    try testing.expect(i != 0);
+                    try testing.expectEqual(@as(u32, 0x819), opAt(kernel.code, i - 1));
+                    try testing.expectEqual(r_scratch, regAt(kernel.code, i - 1, 16));
+                    // The store reads the extraction result immediately, so the fixed-latency
+                    // scheduler must keep the SHF live for the measured ALU latency.
+                    try testing.expectEqual(@as(u32, 5), controlAt(kernel.code, i - 1, 105, 4));
+                }
+                store_lane += 1;
+            },
+            0x212 => lop_count += 1,
+            0x819 => shift_count += 1,
+            else => {},
+        };
+        try testing.expectEqual(case.bytes, load_lane);
+        try testing.expectEqual(case.bytes, store_lane);
+        try testing.expectEqual(case.words, load_word_count);
+        try testing.expectEqual(@as(usize, case.bytes - case.words), lop_count);
+        try testing.expectEqual(@as(usize, 2 * (case.bytes - case.words)) + @as(usize, @intFromBool(case.signed_half)) * 2, shift_count);
+        if (case.bytes == 8) {
+            try testing.expectEqual(first_load_dst.? + 1, high_load_dst.?);
+            try testing.expectEqual(first_store_src.? + 1, high_store_src.?);
+        }
+    };
+}
+
+test "a signed global B16 load extends only after its unsigned-byte pack" {
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
-    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const i16_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 16 } });
     const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const p = try func.appendBlockParam(b, ptr_t);
-    const half = try func.appendInst(b, u16_t, .{ .load = .{ .ptr = p } });
-    try func.appendStore(b, half, p);
-    const word = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = p } });
-    try func.appendStore(b, word, p);
-    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    const v = try func.appendInst(b, i16_t, .{ .load = .{ .ptr = try func.appendArithImm(b, ptr_t, .add, p, 1) } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     var kernel = try compileKernel(allocator, &func, nvidia_abi);
     defer kernel.deinit(allocator);
+    const pack = findOp(kernel.code, 0x212).?;
+    const copy = pack + 1;
+    const left = copy + 1;
+    const right = copy + 2;
+    try testing.expectEqual(@as(u32, 0x202), opAt(kernel.code, copy));
+    try testing.expectEqual(@as(u32, 0x819), opAt(kernel.code, left));
+    try testing.expectEqual(@as(u32, 0x819), opAt(kernel.code, right));
+    try testing.expectEqual(@as(u32, 16), kernel.code[left * 4 + 1]);
+    try testing.expectEqual(@as(u32, 16), kernel.code[right * 4 + 1]);
+    try testing.expectEqual(@as(u32, 0), (kernel.code[left * 4 + 2] >> (76 - 64)) & 1);
+    try testing.expectEqual(@as(u32, 3), (kernel.code[left * 4 + 2] >> (73 - 64)) & 0x3);
+    try testing.expectEqual(@as(u32, 1), (kernel.code[right * 4 + 2] >> (76 - 64)) & 1);
+    try testing.expectEqual(@as(u32, 2), (kernel.code[right * 4 + 2] >> (73 - 64)) & 0x3);
+    try testing.expectEqual(regAt(kernel.code, copy, 16), regAt(kernel.code, left, 16));
+    try testing.expectEqual(regAt(kernel.code, left, 16), regAt(kernel.code, right, 16));
+}
 
-    // Two LDG/STG pairs in source order: the 16-bit one first, then the 32-bit one.
-    const first_ld = findOp(kernel.code, 0x981).?;
-    const first_st = findOp(kernel.code, 0x986).?;
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u16)), memTypeAt(kernel.code, first_ld));
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u16)), memTypeAt(kernel.code, first_st));
-    const second_ld = findOp(kernel.code[(first_ld + 1) * 4 ..], 0x981).? + first_ld + 1;
-    const second_st = findOp(kernel.code[(first_st + 1) * 4 ..], 0x986).? + first_st + 1;
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b32)), memTypeAt(kernel.code, second_ld));
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b32)), memTypeAt(kernel.code, second_st));
+const FragmentOutputKind = enum { color, depth };
+
+fn fragmentMemoryAfterOutput(allocator: std.mem.Allocator, output_kind: FragmentOutputKind) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const output = try func.appendBlockParam(b, f32_t);
+    try func.addAttr(.{ .value = output }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "attr",
+        .value = .{ .int = encode.ATTR_GENERIC0 },
+    } });
+    const memory = try func.appendBlockParam(b, ptr_t);
+
+    // Publish the architectural output first. Every bytewise memory instruction below it
+    // must leave the ROP registers intact until EXIT.
+    const slot = try func.appendInst(b, i32_t, .{ .iconst = 0 });
+    try func.addAttr(.{ .value = slot }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = if (output_kind == .color) "color_out" else "frag_depth",
+        .value = .{ .int = 0 },
+    } });
+    try func.appendStore(b, output, slot);
+
+    const word = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = try func.appendArithImm(b, ptr_t, .add, memory, 1) } });
+    try func.appendStore(b, word, try func.appendArithImm(b, ptr_t, .add, memory, 5));
+    const pointer = try func.appendInst(b, ptr_t, .{ .load = .{ .ptr = try func.appendArithImm(b, ptr_t, .add, memory, 9) } });
+    try func.appendStore(b, pointer, try func.appendArithImm(b, ptr_t, .add, memory, 17));
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+test "fragment bytewise global memory uses high scratch after color and depth outputs" {
+    const allocator = testing.allocator;
+    for ([_]FragmentOutputKind{ .color, .depth }) |output_kind| {
+        var func = try fragmentMemoryAfterOutput(allocator, output_kind);
+        defer func.deinit();
+        const output_reg: u8 = if (output_kind == .color) 0 else fragDepthReg(&func);
+
+        var kernel = try compileShader(allocator, &func, .fragment, nvidia_abi);
+        defer kernel.deinit(allocator);
+        try testing.expect(kernel.reg_count >= graphics_memory_scratch_reg + 1 + hw_reserved_regs);
+
+        var output_at: ?usize = null;
+        for (0..kernel.code.len / 4) |i| {
+            if (opAt(kernel.code, i) == 0x202 and regAt(kernel.code, i, 16) == output_reg) {
+                output_at = i;
+                break;
+            }
+        }
+        try testing.expect(output_at != null);
+
+        var byte_loads: usize = 0;
+        var byte_stores: usize = 0;
+        var packs: usize = 0;
+        var shifts: usize = 0;
+        for (output_at.? + 1..kernel.code.len / 4) |i| {
+            const op = opAt(kernel.code, i);
+            const dst = regAt(kernel.code, i, 16);
+            switch (op) {
+                0x981 => {
+                    byte_loads += 1;
+                    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, i));
+                    try testing.expect(dst == graphics_pad_reg or dst == graphics_memory_scratch_reg);
+                },
+                0x986 => {
+                    byte_stores += 1;
+                    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, i));
+                },
+                0x212 => {
+                    packs += 1;
+                    try testing.expectEqual(graphics_memory_scratch_reg, dst);
+                },
+                0x819 => {
+                    shifts += 1;
+                    try testing.expectEqual(graphics_pad_reg, dst);
+                },
+                else => {},
+            }
+            if (op == 0x202 and regAt(kernel.code, i, 32) == graphics_memory_scratch_reg) {
+                try testing.expect(dst != graphics_pad_reg and dst != graphics_memory_scratch_reg);
+            }
+            // The fixture has no later operation which legitimately writes an architectural
+            // output. A low destination on any emitted writer is therefore a clobber.
+            if (op == 0x981 or op == 0x212 or op == 0x819 or op == 0x202) {
+                try testing.expect(dst >= value_reg_base);
+                if (output_kind == .depth) try testing.expect(dst != output_reg);
+            }
+        }
+        try testing.expectEqual(@as(usize, 12), byte_loads);
+        try testing.expectEqual(@as(usize, 12), byte_stores);
+        try testing.expectEqual(@as(usize, 9), packs);
+        try testing.expectEqual(@as(usize, 18), shifts);
+    }
+}
+
+test "vertex bytewise global memory uses the reserved high scratch pair" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const memory = try func.appendBlockParam(b, ptr_t);
+    const word = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = try func.appendArithImm(b, ptr_t, .add, memory, 1) } });
+    try func.appendStore(b, word, try func.appendArithImm(b, ptr_t, .add, memory, 5));
+    const pointer = try func.appendInst(b, ptr_t, .{ .load = .{ .ptr = try func.appendArithImm(b, ptr_t, .add, memory, 9) } });
+    try func.appendStore(b, pointer, try func.appendArithImm(b, ptr_t, .add, memory, 17));
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var kernel = try compileShader(allocator, &func, .vertex, nvidia_abi);
+    defer kernel.deinit(allocator);
+    var loads: usize = 0;
+    for (0..kernel.code.len / 4) |i| switch (opAt(kernel.code, i)) {
+        0x981 => {
+            loads += 1;
+            const dst = regAt(kernel.code, i, 16);
+            try testing.expect(dst == graphics_pad_reg or dst == graphics_memory_scratch_reg);
+        },
+        0x819 => try testing.expectEqual(graphics_pad_reg, regAt(kernel.code, i, 16)),
+        0x212 => try testing.expectEqual(graphics_memory_scratch_reg, regAt(kernel.code, i, 16)),
+        0x202 => if (regAt(kernel.code, i, 32) == graphics_memory_scratch_reg) {
+            const dst = regAt(kernel.code, i, 16);
+            try testing.expect(dst != graphics_pad_reg and dst != graphics_memory_scratch_reg);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 12), loads);
 }
 
 test "a shared byte access uses the 8-bit memory type on LDS and STS too" {
@@ -7127,32 +7477,6 @@ test "a shared byte access uses the 8-bit memory type on LDS and STS too" {
     // A shared access still reads ONE address register, and the STS data is at bit 32.
     try testing.expectEqual(regAt(kernel.code, ld, 24), regAt(kernel.code, st, 24));
     try testing.expectEqual(regAt(kernel.code, ld, 16), regAt(kernel.code, st, 32));
-}
-
-test "a pointer load and store move BOTH halves of the address pair (B64)" {
-    // A pointer value owns an aligned GPR pair, so the 64-bit width fills exactly the pair
-    // the allocator reserved. Before the width came from the value type, this loaded only the
-    // low dword and left the high dword holding whatever the register had, so the next access
-    // through that pointer went to a garbage address.
-    const allocator = testing.allocator;
-    var func = Function.init(allocator);
-    defer func.deinit();
-    const ptr_t = try func.types.ptrGlobal();
-    const b = try func.appendBlock();
-    const pp = try func.appendBlockParam(b, ptr_t);
-    const inner = try func.appendInst(b, ptr_t, .{ .load = .{ .ptr = pp } });
-    try func.appendStore(b, inner, pp);
-    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
-
-    var kernel = try compileKernel(allocator, &func, nvidia_abi);
-    defer kernel.deinit(allocator);
-
-    const ld = findOp(kernel.code, 0x981).?;
-    const st = findOp(kernel.code, 0x986).?;
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b64)), memTypeAt(kernel.code, ld));
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b64)), memTypeAt(kernel.code, st));
-    // The loaded pointer lands in an EVEN register, so (dst, dst+1) is an aligned pair.
-    try testing.expectEqual(@as(u8, 0), regAt(kernel.code, ld, 16) % 2);
 }
 
 test "a 64-bit scalar access is REFUSED, not silently truncated" {
@@ -7822,6 +8146,86 @@ fn gprOfCompiled(func: *Function, v: Value, options: Options) u8 {
     var max_reg: u8 = r_outptr + 1;
     assignLocsWimmer(allocator, func, .compute, &locs, &max_reg, &fma) catch unreachable;
     return gprOf(locs, v);
+}
+
+fn memoryPointer(func: *const Function, inst: ir.function.Inst) Value {
+    return switch (func.opcode(inst)) {
+        .load => |load| load.ptr,
+        .store => |store| store.ptr,
+        else => unreachable,
+    };
+}
+
+test "address folding accepts only complete B16 B32 and B64 byte ranges" {
+    const allocator = testing.allocator;
+    const field_min: i64 = -(1 << 23);
+    const field_max: i64 = (1 << 23) - 1;
+    const widths = [_]struct { kind: ir.types.TypeKind, bytes: u8 }{
+        .{ .kind = .{ .int = .{ .signedness = .unsigned, .bits = 16 } }, .bytes = 2 },
+        .{ .kind = .{ .int = .{ .signedness = .unsigned, .bits = 32 } }, .bytes = 4 },
+        .{ .kind = .{ .ptr = .global }, .bytes = 8 },
+    };
+    for (widths) |width| for ([_]bool{ false, true }) |store_direction| {
+        const max_base = field_max - (width.bytes - 1);
+        const boundaries = [_]struct { displacement: i64, folds: bool }{
+            .{ .displacement = field_min, .folds = true },
+            .{ .displacement = field_min - 1, .folds = false },
+            .{ .displacement = max_base, .folds = true },
+            // Byte zero fits, but the inclusive final byte does not.
+            .{ .displacement = max_base + 1, .folds = false },
+            .{ .displacement = field_max, .folds = false },
+        };
+        for (boundaries) |boundary| {
+            var func = Function.init(allocator);
+            defer func.deinit();
+            const value_t = try func.types.intern(width.kind);
+            const ptr_t = try func.types.ptrGlobal();
+            const b = try func.appendBlock();
+            const base = try func.appendBlockParam(b, ptr_t);
+            const address = try func.appendArithImm(b, ptr_t, .add, base, boundary.displacement);
+            const access: ir.function.Inst = if (store_direction) access: {
+                const value = try func.appendBlockParam(b, value_t);
+                const index = func.instCount();
+                try func.appendStore(b, value, address);
+                break :access @enumFromInt(index);
+            } else func.definingInst(try func.appendInst(b, value_t, .{ .load = .{ .ptr = address } })).?;
+            func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+            var fold = DispFold{};
+            defer fold.deinit(allocator);
+            try foldAddressDisplacements(allocator, &func, &fold);
+            if (boundary.folds) {
+                try testing.expectEqual(base, memoryPointer(&func, access));
+                try testing.expectEqual(@as(i32, @intCast(boundary.displacement)), fold.offsetOf(access));
+            } else {
+                try testing.expectEqual(address, memoryPointer(&func, access));
+                try testing.expectEqual(@as(i32, 0), fold.offsetOf(access));
+            }
+        }
+    };
+}
+
+test "address folding uses checked arithmetic before a partial chain rewrite" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const base = try func.appendBlockParam(b, ptr_t);
+    const huge = try func.appendArithImm(b, ptr_t, .add, base, std.math.maxInt(i64));
+    const outer = try func.appendArithImm(b, ptr_t, .add, huge, 1);
+    const loaded = try func.appendInst(b, u32_t, .{ .load = .{ .ptr = outer } });
+    const access = func.definingInst(loaded).?;
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var fold = DispFold{};
+    defer fold.deinit(allocator);
+    try foldAddressDisplacements(allocator, &func, &fold);
+    // The outer one-byte step is legal. Adding it to maxInt is not, so the walk stops at
+    // `huge` instead of wrapping the chain onto the original base.
+    try testing.expectEqual(huge, memoryPointer(&func, access));
+    try testing.expectEqual(@as(i32, 1), fold.offsetOf(access));
 }
 
 test "constant pointer increments collapse into the last address" {

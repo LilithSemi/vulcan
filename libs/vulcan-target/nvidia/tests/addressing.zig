@@ -142,10 +142,37 @@ const Launch = struct {
     }
 };
 
-/// How many instructions the kernel holds, not counting the trailing NOP padding the
-/// emitter adds. A test that names a count states what the change bought.
-fn instructionCount(kernel: *const isel.Kernel) usize {
-    return kernel.code.len / 4;
+/// Count one opcode in the four-dword SASS stream.
+fn opcodeCount(kernel: *const isel.Kernel, opcode: u32) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < kernel.code.len) : (i += 4) {
+        if (kernel.code[i] & 0xfff == opcode) count += 1;
+    }
+    return count;
+}
+
+/// Decode the signed 24-bit byte displacement at bits 40..63.
+fn memoryDisplacement(code: []const u32, instruction: usize) i32 {
+    const raw = code[instruction * 4 + 1] >> 8;
+    const signed: i32 = @bitCast(raw << 8);
+    return signed >> 8;
+}
+
+/// Require exactly one byte memory operation at each expected displacement. This pins both
+/// address folding and exact-footprint B32 legalization without depending on unrelated ALU
+/// or scheduling instructions in the kernel.
+fn expectByteAccesses(kernel: *const isel.Kernel, opcode: u32, expected: []const i32) !void {
+    var found: usize = 0;
+    var i: usize = 0;
+    while (i < kernel.code.len) : (i += 4) {
+        if (kernel.code[i] & 0xfff != opcode) continue;
+        try testing.expect(found < expected.len);
+        try testing.expectEqual(expected[found], memoryDisplacement(kernel.code, i / 4));
+        try testing.expectEqual(@as(u32, 0), (kernel.code[i + 2] >> (73 - 64)) & 0x7); // U8
+        found += 1;
+    }
+    try testing.expectEqual(expected.len, found);
 }
 
 fn ptrAddImm(func: *Function, b: Block, ptr_t: ir.types.Type, base: Value, imm: i64) !Value {
@@ -184,9 +211,11 @@ test "live: a constant array index folds into the load and the store, and reads 
     var launch = try h.compile(&func);
     defer launch.deinit();
 
-    // Two LDC.64s (one per pointer), the load, the add, the store, EXIT. No address
-    // arithmetic at all.
-    try testing.expectEqual(@as(usize, 6), instructionCount(&launch.kernel));
+    // Every B32 access is now four exact-footprint U8 operations. Their displacements prove
+    // both pointer additions folded into the access itself, without pinning the pack/unpack
+    // instruction count.
+    try expectByteAccesses(&launch.kernel, 0x981, &.{ 8, 9, 10, 11 }); // LDG.U8
+    try expectByteAccesses(&launch.kernel, 0x986, &.{ 16, 17, 18, 19 }); // STG.U8
 
     const dstbuf = try h.alloc(0x1000);
     const inbuf = try h.alloc(0x1000);
@@ -254,9 +283,11 @@ test "live: a chain of constant offsets folds into ONE displacement" {
     var launch = try h.compile(&func);
     defer launch.deinit();
 
-    // Two LDC.64s, the load, the store, EXIT. Both address adds disappear, and the inner
-    // one only because the dead scan repeats.
-    try testing.expectEqual(@as(usize, 5), instructionCount(&launch.kernel));
+    // Both address adds disappear into the four byte loads. The inner one only disappears
+    // because the dead scan repeats, and the exact displacement run catches a walk that
+    // stops at either link of the chain.
+    try expectByteAccesses(&launch.kernel, 0x981, &.{ 12, 13, 14, 15 });
+    try expectByteAccesses(&launch.kernel, 0x986, &.{ 0, 1, 2, 3 });
 
     const dstbuf = try h.alloc(0x1000);
     const inbuf = try h.alloc(0x1000);
@@ -526,9 +557,11 @@ test "live: a computed array index reaches the right slot through IMAD.WIDE" {
     var launch = try h.compile(&func);
     defer launch.deinit();
 
-    // Two LDC.64s, two S2Rs, the fused index, the byte shift, two IMAD.WIDEs, the load,
-    // the multiply, the store, EXIT.
-    try testing.expectEqual(@as(usize, 12), instructionCount(&launch.kernel));
+    // One wide address operation forms each dynamic pointer. Byte legalization grows the
+    // memory sequence, but must not expand either address back into a carry chain.
+    try testing.expectEqual(@as(usize, 2), opcodeCount(&launch.kernel, 0x825)); // IMAD.WIDE.U32 immediate
+    try expectByteAccesses(&launch.kernel, 0x981, &.{ 0, 1, 2, 3 });
+    try expectByteAccesses(&launch.kernel, 0x986, &.{ 0, 1, 2, 3 });
 
     const dstbuf = try h.alloc(0x1000);
     const inbuf = try h.alloc(0x1000);
@@ -567,8 +600,16 @@ test "live: an LDC.64 loads BOTH halves of a pointer parameter" {
     var launch = try h.compile(&func);
     defer launch.deinit();
 
-    // Three LDC.64s, two loads, the add, the store, EXIT. Six LDCs before.
-    try testing.expectEqual(@as(usize, 8), instructionCount(&launch.kernel));
+    // One B64 LDC fills each pointer pair. The bytewise payload accesses may grow without
+    // changing this parameter ABI invariant.
+    try testing.expectEqual(@as(usize, 3), opcodeCount(&launch.kernel, 0xb82));
+    var i: usize = 0;
+    while (i < launch.kernel.code.len) : (i += 4) {
+        if (launch.kernel.code[i] & 0xfff != 0xb82) continue;
+        try testing.expectEqual(@as(u32, 5), (launch.kernel.code[i + 2] >> (73 - 64)) & 0x7); // B64
+    }
+    try expectByteAccesses(&launch.kernel, 0x981, &.{ 0, 1, 2, 3, 0, 1, 2, 3 });
+    try expectByteAccesses(&launch.kernel, 0x986, &.{ 0, 1, 2, 3 });
 
     const abuf = try h.alloc(0x1000);
     const bbuf = try h.alloc(0x1000);

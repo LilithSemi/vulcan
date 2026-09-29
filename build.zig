@@ -700,6 +700,22 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(nvidia_addressing).step);
 
+    // Scalar-expanded matmul over deliberately odd global pointers. The expansion is test-owned:
+    // NVIDIA production codegen receives the ordinary scalar IR, then real hardware proves its
+    // bytewise memory lowering preserves the exact footprint and fp32 bits.
+    const nvidia_unaligned_matmul = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/nvidia/tests/unaligned_matmul.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-gpu", .module = vulcan_gpu },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "nvidia", .module = nvidia_dep.module("nvidia") },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(nvidia_unaligned_matmul).step);
+
     // GLSL frontend tests: parsing/lowering (IR only), plus execution (GLSL -> IR ->
     // host JIT -> run) for scalar functions.
     const glsl_tests = b.addTest(.{ .root_module = vulcan_glsl });

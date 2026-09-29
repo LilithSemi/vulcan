@@ -139,7 +139,9 @@ const Harness = struct {
     /// `compile` with explicit code-generation options, for a test that needs the same IR
     /// built two ways. See `isel.Options`.
     fn compileOpts(self: *Harness, func: *Function, abi: gpu_abi.Abi, options: isel.Options) !Launch {
-        const kernel = try isel.compileKernelOpts(testing.allocator, func, abi, options);
+        var kernel = try isel.compileKernelOpts(testing.allocator, func, abi, options);
+        errdefer kernel.deinit(testing.allocator);
+        try self.ensureCodeCapacity(kernel.code.len * @sizeOf(u32));
         return .{ .harness = self, .kernel = kernel, .base = abi.param_base };
     }
 };
@@ -1679,6 +1681,176 @@ test "live: a pointer load and store move BOTH halves of the address pair" {
     try launch.run(.{ 1, 1, 1 });
 
     try testing.expectEqual(pattern, dst.read(u64, 0));
+}
+
+const UnalignedAddress = enum { folded, dynamic, parameter };
+
+const UnalignedPayload = enum {
+    u16,
+    i16,
+    u32,
+    f32,
+    shared_ptr,
+    global_ptr,
+    constant_ptr,
+    private_ptr,
+
+    fn byteSize(self: UnalignedPayload) usize {
+        return switch (self) {
+            .u16, .i16 => 2,
+            .u32, .f32, .shared_ptr => 4,
+            .global_ptr, .constant_ptr, .private_ptr => 8,
+        };
+    }
+
+    fn isWidePointer(self: UnalignedPayload) bool {
+        return switch (self) {
+            .global_ptr, .constant_ptr, .private_ptr => true,
+            else => false,
+        };
+    }
+};
+
+fn unalignedPayloadType(func: *Function, payload: UnalignedPayload) !ir.types.Type {
+    return switch (payload) {
+        .u16 => func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } }),
+        .i16 => func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 16 } }),
+        .u32 => func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } }),
+        .f32 => func.types.intern(.{ .float = .f32 }),
+        .shared_ptr => func.types.intern(.{ .ptr = .shared }),
+        .global_ptr => func.types.intern(.{ .ptr = .global }),
+        .constant_ptr => func.types.intern(.{ .ptr = .constant }),
+        .private_ptr => func.types.intern(.{ .ptr = .private }),
+    };
+}
+
+fn unalignedAddress(func: *Function, block: Block, ptr_t: ir.types.Type, base: Value, offset: Value, mode: UnalignedAddress, folded: i64) !Value {
+    return switch (mode) {
+        .folded => ptrAdd(func, block, ptr_t, base, folded),
+        .dynamic => ptrAddVal(func, block, ptr_t, base, offset),
+        .parameter => base,
+    };
+}
+
+/// Build independent one-sided load and store paths. The loaded value travels only to an
+/// aligned result, while the odd store comes only from a parameter, so opposite byte-order
+/// mistakes cannot cancel each other.
+fn buildUnalignedMemoryKernel(allocator: std.mem.Allocator, payload: UnalignedPayload, mode: UnalignedAddress, folded: i64) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const value_t = try unalignedPayloadType(&func, payload);
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const b = try func.appendBlock();
+    const load_output = try func.appendBlockParam(b, ptr_t);
+    const load_input = try func.appendBlockParam(b, ptr_t);
+    const store_output = try func.appendBlockParam(b, ptr_t);
+    const store_source = try func.appendBlockParam(b, value_t);
+    const offset = try func.appendBlockParam(b, u32_t);
+    const load_at = try unalignedAddress(&func, b, ptr_t, load_input, offset, mode, folded);
+    const store_at = try unalignedAddress(&func, b, ptr_t, store_output, offset, mode, folded);
+    const loaded = try func.appendInst(b, value_t, .{ .load = .{ .ptr = load_at } });
+    if (payload.isWidePointer()) {
+        const carried = try func.appendArithImm(b, value_t, .add, loaded, 0x30);
+        try func.appendStore(b, carried, load_output);
+    } else {
+        try func.appendStore(b, loaded, load_output);
+    }
+    if (payload == .i16) {
+        const zero = try func.appendInst(b, value_t, .{ .iconst = 0 });
+        const negative = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = loaded, .rhs = zero } });
+        const yes = try func.appendInst(b, i32_t, .{ .iconst = 0x1357_2468 });
+        const no = try func.appendInst(b, i32_t, .{ .iconst = 0x2468_1357 });
+        const observed = try func.appendInst(b, i32_t, .{ .select = .{ .cond = negative, .then = yes, .@"else" = no } });
+        try func.appendStore(b, observed, try ptrAdd(&func, b, ptr_t, load_output, 4));
+    }
+    try func.appendStore(b, store_source, store_at);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+const guard_before: u8 = 0xa5;
+const guard_after: u8 = 0x5a;
+
+fn unalignedBuffer(h: *Harness, offset: usize, active_bytes: usize) !compute.Buffer {
+    const buf = try h.alloc(@intCast(offset + active_bytes + 17));
+    @memset(buf.bytes[0..offset], guard_before);
+    @memset(buf.bytes[offset .. offset + active_bytes], 0xcc);
+    @memset(buf.bytes[offset + active_bytes ..], guard_after);
+    return buf;
+}
+
+fn expectUnalignedGuards(buf: compute.Buffer, offset: usize, active_bytes: usize) !void {
+    for (buf.bytes[0..offset]) |byte| try testing.expectEqual(guard_before, byte);
+    for (buf.bytes[offset + active_bytes ..]) |byte| try testing.expectEqual(guard_after, byte);
+}
+
+fn writePayload(bytes: []u8, payload: UnalignedPayload, bits: u64) void {
+    switch (payload.byteSize()) {
+        2 => std.mem.writeInt(u16, bytes[0..2], @truncate(bits), .little),
+        4 => std.mem.writeInt(u32, bytes[0..4], @truncate(bits), .little),
+        8 => std.mem.writeInt(u64, bytes[0..8], bits, .little),
+        else => unreachable,
+    }
+}
+
+fn expectPayload(bytes: []const u8, payload: UnalignedPayload, bits: u64) !void {
+    switch (payload.byteSize()) {
+        2 => try testing.expectEqual(@as(u16, @truncate(bits)), std.mem.readInt(u16, bytes[0..2], .little)),
+        4 => try testing.expectEqual(@as(u32, @truncate(bits)), std.mem.readInt(u32, bytes[0..4], .little)),
+        8 => try testing.expectEqual(bits, std.mem.readInt(u64, bytes[0..8], .little)),
+        else => unreachable,
+    }
+}
+
+test "live: unaligned global scalar loads and stores have exact independent footprints" {
+    const allocator = testing.allocator;
+    const offsets = [_]usize{ 1, 3, 5, 7 };
+    const cases = [_]struct { payload: UnalignedPayload, loaded: u64, stored: u64 }{
+        .{ .payload = .u16, .loaded = 0xabcd, .stored = 0x1357 },
+        .{ .payload = .i16, .loaded = 0x80f1, .stored = 0x9abc },
+        .{ .payload = .u32, .loaded = 0x89ab_cdef, .stored = 0x1357_9bdf },
+        .{ .payload = .f32, .loaded = 0x7fc1_2345, .stored = 0x8000_0001 },
+        .{ .payload = .shared_ptr, .loaded = 0xfedc_ba98, .stored = 0x7654_3210 },
+        .{ .payload = .global_ptr, .loaded = 0x1234_5678_ffff_fff0, .stored = 0xfedc_ba98_7654_3210 },
+        .{ .payload = .constant_ptr, .loaded = 0x2234_5678_ffff_fff0, .stored = 0xedcb_a987_6543_2101 },
+        .{ .payload = .private_ptr, .loaded = 0x3234_5678_ffff_fff0, .stored = 0xdcba_9876_5432_1023 },
+    };
+
+    var h = try Harness.open();
+    defer h.deinit();
+    for (cases) |case| for ([_]UnalignedAddress{ .folded, .dynamic, .parameter }) |mode| for (offsets) |offset| {
+        var func = try buildUnalignedMemoryKernel(allocator, case.payload, mode, @intCast(offset));
+        defer func.deinit();
+        var launch = try h.compile(&func, runner_abi);
+        defer launch.deinit();
+        const width = case.payload.byteSize();
+        var input = try unalignedBuffer(&h, offset, width);
+        var stored = try unalignedBuffer(&h, offset, width);
+        const result = try h.alloc(16);
+        @memset(result.bytes, 0);
+        writePayload(input.bytes[offset .. offset + width], case.payload, case.loaded);
+
+        launch.setPtr(launch.kernel.launch.params[0].offset, result.va);
+        launch.setPtr(launch.kernel.launch.params[1].offset, input.va + if (mode == .parameter) offset else 0);
+        launch.setPtr(launch.kernel.launch.params[2].offset, stored.va + if (mode == .parameter) offset else 0);
+        if (case.payload.isWidePointer()) {
+            launch.setPtr(launch.kernel.launch.params[3].offset, case.stored);
+        } else {
+            launch.setU32(launch.kernel.launch.params[3].offset, @truncate(case.stored));
+        }
+        launch.setU32(launch.kernel.launch.params[4].offset, @intCast(offset));
+        try launch.run(.{ 1, 1, 1 });
+
+        const expected_load = if (case.payload.isWidePointer()) case.loaded + 0x30 else case.loaded;
+        try expectPayload(result.bytes[0..width], case.payload, expected_load);
+        if (case.payload == .i16) try testing.expectEqual(@as(u32, 0x1357_2468), result.read(u32, 1));
+        try expectPayload(stored.bytes[offset .. offset + width], case.payload, case.stored);
+        try expectUnalignedGuards(input, offset, width);
+        try expectUnalignedGuards(stored, offset, width);
+    };
 }
 
 test "live: a dependent LDG-to-LDG-to-LDC chain gives the right answer in every thread" {
