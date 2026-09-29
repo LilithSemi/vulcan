@@ -527,7 +527,8 @@ pub fn nvFp4SpillCountsForTest(allocator: std.mem.Allocator, func: *const Functi
     var walloc = try wimmer.allocate(allocator, &work, &desc);
     defer walloc.deinit(allocator);
 
-    var counts = .{ .integer = @as(usize, 0), .float = @as(usize, 0) };
+    var integer: usize = 0;
+    var float: usize = 0;
     var it = walloc.segments.iterator();
     while (it.next()) |entry| {
         var has_slot = false;
@@ -539,14 +540,14 @@ pub fn nvFp4SpillCountsForTest(allocator: std.mem.Allocator, func: *const Functi
         }
         if (!has_slot) continue;
         switch (work.types.type_kind(work.valueType(entry.key_ptr.*))) {
-            .int => counts.integer += 1,
+            .int => integer += 1,
             .float => |kind| if (kind == .f32) {
-                counts.float += 1;
+                float += 1;
             },
             else => {},
         }
     }
-    return counts;
+    return .{ .integer = integer, .float = float };
 }
 
 /// Compile `func` to machine code plus its call relocations. The caller owns the
