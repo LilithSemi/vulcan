@@ -9,9 +9,11 @@
 //! libs/vulcan-target/tests/dotprod_differential.zig.
 //!
 //! Addressing is verify-clean: the scalar loop carries its two element pointers as loop values and
-//! advances them by one byte each iteration (arith_imm on a ptr, which verify permits, unlike a
-//! runtime `arith add(ptr, i32)`). The vector loop carries the same two pointers and advances them by
-//! 16 bytes per iteration, so at the remainder entry they already point at element `16*floor(n/16)`.
+//! advances them by one byte each iteration with arith_imm on a ptr. A runtime `arith add(ptr, i32)`
+//! is equally permitted, see `pointerArith` in verify.zig, which accepts ptr plus int for add and
+//! sub and only refuses a result that changes address space. The vector loop carries the same two
+//! pointers and advances them by 16 bytes per iteration, so at the remainder entry they already
+//! point at element `16*floor(n/16)`.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
