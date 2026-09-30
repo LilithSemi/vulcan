@@ -511,6 +511,10 @@ fn customLatency(op: ir.function.Opcode) u32 {
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 2,
         // A dot is a multiply-class op (4-way multiply-accumulate), grouped with `mul`.
         .dot => 3,
+        // A reduce combines every lane, a cross-lane op in the same class as dot. A
+        // splat is one broadcast, as cheap as the struct_new it replaces.
+        .reduce => 3,
+        .splat => 1,
         // This fictional part carries no tensor unit; a placeholder in case one is added.
         .matmul => 64,
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
@@ -543,6 +547,10 @@ fn customThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .load => 1,
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         .dot => 3,
+        // A reduce combines every lane, a cross-lane op in the same class as dot. A
+        // splat is one broadcast, as cheap as the struct_new it replaces.
+        .reduce => 3,
+        .splat => 1,
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet, priced like any other cheap bookkeeping op.
@@ -568,6 +576,9 @@ fn customUnit(op: ir.function.Opcode) opt.microarch.UnitClass {
         .struct_new, .extract => .none,
         // dot runs on the SIMD/vector unit, like the vector-shaped fpsimd ops above.
         .dot => .fpsimd,
+        // Lane ops run on the same unit as dot: a horizontal add and a broadcast are
+        // both SIMD instructions.
+        .reduce, .splat => .fpsimd,
         // matmul runs on the tensor/VPU unit, modeled as fpsimd like dot.
         .matmul => .fpsimd,
         // SM12 T3: `va_arg` reads through `list` (a memory access, like `load`); `va_start`/
