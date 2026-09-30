@@ -1356,6 +1356,10 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, stage: Stage,
     // So a varying register is never handed out again. The live range runs to the end of the
     // shader because nothing here bounds when delivery completes: the scoreboard is the only
     // signal the hardware gives and this is the case that proves it insufficient.
+    //
+    // The hazard only appears when a varying is dead. A live one is never reused as a
+    // destination, so a shader that reads all its inputs never exposes this, which is why it
+    // survived until a shader declaring four varyings and reading one met the race.
     if (stage == .fragment) {
         for (func.blockParams(@enumFromInt(0))) |p| {
             if (attrTag(func, p, "attr") != null) last_use[@intFromEnum(p)] = pos;
