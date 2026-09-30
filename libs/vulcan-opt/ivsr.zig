@@ -37,6 +37,16 @@
 //! type from the value it replaces, and the invariant base pointer keeps its own type, so
 //! `verify.pointerArithChangesSpace` sees the same space on both sides.
 //!
+//! COALESCING. An unrolled loop can present several pointers that walk one address chain: same
+//! base, same scale, offsets apart by a compile-time constant, but with no syntactic derivation
+//! between them (`splitunroll` builds each unrolled copy's address independently from its own copy
+//! of the index). Reducing every one of them separately would carry one induction variable per
+//! copy for what is really one chain. `coalescable` recognizes the family by its base, scale and
+//! basic induction variable; the first member reached earns the real induction variable and every
+//! later member becomes a `Rider`, rewritten in `applyPlan` to read that member's parameter plus its
+//! own constant offset, in the same `arith_imm` shape `addToPointer` already builds elsewhere in
+//! this pass, so `addrfold` folds it into a load or store the same way.
+//!
 //! This pass adds no block and moves no block, so the dominance-respecting block order the machine
 //! backends need is exactly the order it was given (see `blocklayout`). Each new value is either a
 //! header block parameter, which dominates the whole loop, or an instruction in the preheader or
@@ -94,6 +104,57 @@ const Reduction = struct {
     /// The header parameter that replaces `old`. Filled in when the rewrite runs.
     param: Value = undefined,
 };
+
+/// Identifies a family of pointer candidates that could share one induction variable: the same
+/// loop-invariant base, walked by the same compile-time scale, at the same basic induction
+/// variable. Two members of a family differ only in a compile-time-constant offset, which is what
+/// `coalescable` checks before handing back a key. See `Rider`.
+const FamilyKey = struct {
+    base: Value,
+    biv: u32,
+    scale_ty: Type,
+    scale: i64,
+};
+
+/// The member of a family already given a Reduction, so a later member can ride on it instead of
+/// earning its own.
+const Keeper = struct {
+    /// This family's index into `plan`, valid once `applyPlan` fills in its `param`.
+    plan_index: usize,
+    /// The keeper's own compile-time offset. A rider's distance from it is `own` minus `this`.
+    offset: i64,
+    /// The keeper's result type, checked against a candidate's own before coalescing: a mismatch
+    /// would mean the two disagree on address space, and folding across that would break
+    /// `verify.pointerArithChangesSpace`.
+    ty: Type,
+};
+
+/// A pointer candidate coalesced onto another member's induction variable instead of earning its
+/// own. `inst` is rewritten once the keeper's header parameter exists (`applyPlan`): the loop stops
+/// recomputing this address from its own scaled index and instead reads the keeper's walker plus a
+/// constant, in the `arith_imm` shape `addrfold` folds into a load or store's own displacement.
+const Rider = struct {
+    inst: Inst,
+    plan_index: usize,
+    diff: i64,
+};
+
+/// Whether a candidate's affine form is eligible to join or start a coalescing family: a pointer
+/// walk (`base` present) whose scale AND offset are both compile-time constants. `splitunroll`
+/// clones an address chain K times, one per unrolled copy, and every clone computes its own address
+/// independently from its own index (`idx_m = biv + step*m`), so there is no syntactic predecessor
+/// relation between them for `chainPredecessor` to find (see that function's doc). What ties them
+/// together instead is semantic: identical scale, and a constant-differing offset, because `step`,
+/// `m` and the element size are all compile-time known. A candidate whose offset depends on some
+/// other runtime-invariant value (not just a literal) is refused here rather than guessed at: this
+/// pass folds a difference, it does not try to prove two symbolic expressions equal.
+fn coalescable(ctx: *const LoopCtx, pool: *const Pool, rep: Affine) ?struct { key: FamilyKey, offset: i64 } {
+    const base = rep.base orelse return null;
+    if (intInfo(ctx.func, rep.scale_ty) == null) return null;
+    const scale = pool.constOf(rep.scale) orelse return null;
+    const offset = pool.constOf(rep.offset) orelse return null;
+    return .{ .key = .{ .base = base, .biv = rep.biv, .scale_ty = rep.scale_ty, .scale = scale }, .offset = offset };
+}
 
 /// The expression pool of one loop's analysis.
 const Pool = struct {
@@ -295,11 +356,13 @@ fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_
     defer pool.deinit(allocator);
     var plan: std.ArrayList(Reduction) = .empty;
     defer plan.deinit(allocator);
+    var riders: std.ArrayList(Rider) = .empty;
+    defer riders.deinit(allocator);
 
-    try analyzeLoop(allocator, &ctx, &pool, &plan);
+    try analyzeLoop(allocator, &ctx, &pool, &plan, &riders);
     if (plan.items.len == 0) return false;
 
-    try applyPlan(allocator, func, &ctx, &pool, plan.items);
+    try applyPlan(allocator, func, &ctx, &pool, plan.items, riders.items);
     return true;
 }
 
@@ -387,8 +450,9 @@ fn fillSubstitutions(ctx: *LoopCtx, header_params: []const Value, latch_args: []
     }
 }
 
-/// Find the reducible values of one loop and append a `Reduction` for each.
-fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *std.ArrayList(Reduction)) pass.Error!void {
+/// Find the reducible values of one loop and append a `Reduction` for each, coalescing a pointer
+/// candidate onto an existing family instead when `coalescable` finds one (see `Rider`).
+fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *std.ArrayList(Reduction), riders: *std.ArrayList(Rider)) pass.Error!void {
     const func = ctx.func;
     try fillAliases(allocator, ctx);
 
@@ -440,10 +504,22 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
     // Whether each value already has a plan entry, checked below so a chain step built directly
     // from an already-reduced pointer does not earn a second variable of its own: once the base
     // walks, `base + 4` is already one cheap add away, and giving it a variable too would only add
-    // a live value for no win. See `chainPredecessor`.
+    // a live value for no win. See `chainPredecessor`. A coalesced rider marks itself here too: its
+    // own value is likewise already just one cheap add off a walking pointer once `applyPlan` runs.
     const reduced = try allocator.alloc(bool, func.valueCount());
     defer allocator.free(reduced);
     @memset(reduced, false);
+
+    // Families seen so far, keyed by base/scale/scale_ty/biv, naming whichever member reached this
+    // loop first. That member keeps the induction variable; every later member of the same family
+    // rides on it instead. For the shape this exists to fix (`splitunroll`'s K clones), the first
+    // member reached is also the smallest-offset one: clone 0 computes `idx_0 = biv` itself, offset
+    // zero, and later clones add a positive multiple of the unroll step ahead of it in the block's
+    // instruction order. A hand-built loop that presented a smaller offset later would still
+    // coalesce correctly, just not with the smallest offset as the walking value; that is a quality
+    // choice, not a correctness one, so this pass does not pay for a global rescan to guarantee it.
+    var families: std.AutoHashMapUnmanaged(FamilyKey, Keeper) = .empty;
+    defer families.deinit(allocator);
 
     for (0..func.blockCount()) |bi| {
         if (!ctx.loop.contains(bi)) continue;
@@ -451,6 +527,20 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
             const result = func.instResult(inst) orelse continue;
             const rep = ctx.affine[@intFromEnum(result)] orelse continue;
             if (!worthReducing(ctx, pool, result, rep)) continue;
+
+            const family = coalescable(ctx, pool, rep);
+            if (family) |f| {
+                if (families.get(f.key)) |keeper| {
+                    if (func.valueType(result) == keeper.ty) {
+                        const width = intInfo(func, rep.scale_ty).?; // coalescable already checked this
+                        const diff = wrapTo(f.offset -% keeper.offset, width);
+                        try riders.append(allocator, .{ .inst = inst, .plan_index = keeper.plan_index, .diff = diff });
+                        reduced[@intFromEnum(result)] = true;
+                        continue;
+                    }
+                }
+            }
+
             if (chainPredecessor(ctx, inst)) |pred| {
                 if (reduced[@intFromEnum(pred)]) continue;
             }
@@ -475,6 +565,15 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
                 .step = delta,
                 .base = rep.base,
             });
+
+            // Only when the key is not already taken: a mismatched-type candidate that fell through
+            // to its own Reduction above must not displace a valid, type-matching keeper a sibling
+            // already found for this family.
+            if (family) |f| {
+                if (!families.contains(f.key)) {
+                    try families.put(allocator, f.key, .{ .plan_index = plan.items.len - 1, .offset = f.offset, .ty = ty });
+                }
+            }
         }
     }
 }
@@ -1083,8 +1182,9 @@ fn pointerUsesAreAddresses(ctx: *const LoopCtx, v: Value) bool {
 }
 
 /// Emit the plan: the initial values and the steps into the preheader, one new header parameter per
-/// reduction, and one advance per reduction into the latch.
-fn applyPlan(allocator: std.mem.Allocator, func: *Function, ctx: *LoopCtx, pool: *Pool, plan: []Reduction) pass.Error!void {
+/// reduction, one advance per reduction into the latch, and every coalesced rider rewritten to read
+/// its keeper's parameter plus a constant.
+fn applyPlan(allocator: std.mem.Allocator, func: *Function, ctx: *LoopCtx, pool: *Pool, plan: []Reduction, riders: []const Rider) pass.Error!void {
     // Preheader first: the initial value and the step of every reduction are loop-invariant, and
     // the preheader dominates the header, so this is where they can be read from.
     var inits = try allocator.alloc(Value, plan.len);
@@ -1105,6 +1205,16 @@ fn applyPlan(allocator: std.mem.Allocator, func: *Function, ctx: *LoopCtx, pool:
     // dominates every block of the loop, so the parameter is in scope wherever the old value was.
     for (plan) |*r| r.param = try func.appendBlockParam(ctx.header, r.ty);
     for (plan) |*r| func.replaceAllUses(r.old, r.param);
+
+    // Every rider becomes `keeper.param + diff`, an `arith_imm.add` in place of whatever it used to
+    // compute. Its result value is untouched, so every existing use keeps reading it; only what
+    // defines it changes. This is the same shape `addToPointer` builds and `addrfold` folds, and it
+    // is why the diff had to be a compile-time constant: an `arith_imm` immediate cannot hold
+    // anything else.
+    for (riders) |rider| {
+        const keeper_param = plan[rider.plan_index].param;
+        func.opcodeMut(rider.inst).* = .{ .arith_imm = .{ .op = .add, .lhs = keeper_param, .imm = rider.diff } };
+    }
 
     // The advance, at the end of the latch, and the two edges into the header.
     var next_values = try allocator.alloc(Value, plan.len);
@@ -1781,6 +1891,102 @@ test "leaves an integer offset of the counter alone, and still walks a pointer b
         else => {},
     };
     try testing.expect(keeps_offset);
+
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
+test "coalesces two same-scale pointers that differ by a constant offset into one induction variable" {
+    // The two addresses are built INDEPENDENTLY from `p` and `k`, not one from the other, so there
+    // is no syntactic predecessor for `chainPredecessor` to find. `coalescable` ties them together
+    // by base, scale and basic induction variable instead: `addr0` earns the induction variable
+    // (it is reached first, at the smaller offset), and `addr1` becomes a rider that reads
+    // `addr0`'s walker plus 4 rather than recomputing its own scaled index.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const c = try buildCounted(&func, n, i32_t, entry);
+
+    // addr0 = p + k*4
+    const off0 = try func.appendArithImm(c.body, i32_t, .mul, c.bk, 4);
+    const addr0 = try func.appendInst(c.body, ptr_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = off0 } });
+    const load0 = try func.appendInst(c.body, i32_t, .{ .load = .{ .ptr = addr0 } });
+    // addr1 = p + (k+1)*4, computed from its own copy of the index rather than from addr0.
+    const k1 = try func.appendArithImm(c.body, i32_t, .add, c.bk, 1);
+    const off1 = try func.appendArithImm(c.body, i32_t, .mul, k1, 4);
+    const addr1 = try func.appendInst(c.body, ptr_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = off1 } });
+    const load1 = try func.appendInst(c.body, i32_t, .{ .load = .{ .ptr = addr1 } });
+    const sum = try func.appendInst(c.body, i32_t, .{ .arith = .{ .op = .add, .lhs = load0, .rhs = load1 } });
+    try closeCounted(&func, c, sum);
+
+    try testing.expect(try runPass(allocator, &func));
+
+    // Only ONE new pointer walker, not two: k, acc, and one walking pointer.
+    try testing.expectEqual(@as(usize, 3), func.blockParams(c.head).len);
+    const walker = func.blockParams(c.head)[2];
+    try testing.expectEqual(ptr_t, func.valueType(walker));
+
+    // addr0's load reads the walker directly; addr1 becomes `walker + 4`, an `arith_imm` add, so
+    // `addrfold` can still fold it into its own load's displacement.
+    var walker_load = false;
+    var offset_add = false;
+    for (func.blockInsts(c.body)) |inst| switch (func.opcode(inst)) {
+        .load => |l| if (l.ptr == walker) {
+            walker_load = true;
+        },
+        .arith_imm => |a| if (a.op == .add and a.lhs == walker and a.imm == 4) {
+            offset_add = true;
+        },
+        else => {},
+    };
+    try testing.expect(walker_load);
+    try testing.expect(offset_add);
+
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
+test "splitunroll's cloned address chains coalesce to one carried pointer instead of one per clone" {
+    // The real interaction this pass exists for. `splitunroll` clones a reduction loop's body K
+    // times, and each clone computes its own address independently from its own copy of the
+    // induction variable (`idx_m = bmi + step*m`). Before this pass could coalesce that shape, one
+    // address chain earned K induction variables; after, it earns one.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const c = try buildCounted(&func, n, i32_t, entry);
+    const off = try func.appendArithImm(c.body, i32_t, .mul, c.bk, 4);
+    const addr = try func.appendInst(c.body, ptr_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = off } });
+    const loaded = try func.appendInst(c.body, i32_t, .{ .load = .{ .ptr = addr } });
+    try closeCounted(&func, c, loaded);
+
+    const root = @import("../vulcan-opt.zig");
+    const model = root.microarch.modelFor(.@"ampere-altra");
+    try testing.expect(try root.microarch.splitunroll.run(allocator, &func, model));
+
+    // K = 2 for an i32 `add` accumulator on this model (splitunroll clamps latency 1 up to 2). The
+    // main header is the block appended right after entry/head/body/done.
+    const mainheader: Block = @enumFromInt(4);
+    const k: usize = 2;
+    try testing.expectEqual(@as(usize, 1 + k), func.blockParams(mainheader).len);
+
+    try testing.expect(try runPass(allocator, &func));
+
+    // Without coalescing, each of the K clones would earn its own pointer: 1 + k + k. With it, the
+    // whole family shares one: 1 + k + 1.
+    try testing.expectEqual(@as(usize, 1 + k + 1), func.blockParams(mainheader).len);
 
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();

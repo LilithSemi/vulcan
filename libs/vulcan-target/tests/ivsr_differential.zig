@@ -116,6 +116,61 @@ fn buildEscapingChainStep(func: *Function) anyerror!Kernel {
     return .{ .head = head, .body = body };
 }
 
+/// `for (i = 0; i < bound; i += 1) acc += base[i] + base[i+1]`, addressed as two INDEPENDENT
+/// chains rather than one derived from the other: `addr0 = base + i*4`, `idx1 = i + 1`,
+/// `addr1 = base + idx1*4`. This is the shape `splitunroll`'s cloned bodies produce (see
+/// `ivsr.zig`'s coalescing rule): same base, same scale, offsets a constant apart, with no
+/// syntactic predecessor relation between the two chains for `chainPredecessor` to find. Before
+/// coalescing, both addresses reduced independently and the loop carried two walking pointers for
+/// one address stream; after, `addr1` folds to `addr0`'s walker plus a constant.
+fn buildIndependentSiblings(func: *Function) anyerror!Kernel {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+
+    const base = try func.appendBlockParam(entry, ptr_t);
+    const bound = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, head, &.{ zero, zero });
+
+    const i = try func.appendBlockParam(head, i32_t);
+    const acc = try func.appendBlockParam(head, i32_t);
+    const lt = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = bound } });
+    try func.appendIf(head, lt, .{ .target = body, .args = &.{ i, acc } }, .{ .target = done, .args = &.{acc} });
+
+    const bi = try func.appendBlockParam(body, i32_t);
+    const bacc = try func.appendBlockParam(body, i32_t);
+    const off0 = try func.appendArithImm(body, i32_t, .mul, bi, 4);
+    const addr0 = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = off0 } });
+    const x0 = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = addr0 } });
+    const idx1 = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    const off1 = try func.appendArithImm(body, i32_t, .mul, idx1, 4);
+    const addr1 = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = off1 } });
+    const x1 = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = addr1 } });
+    const sum = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = x0, .rhs = x1 } });
+    const nacc = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = sum } });
+    const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, head, &.{ ni, nacc });
+
+    const fin = try func.appendBlockParam(done, i32_t);
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(fin) });
+    return .{ .head = head, .body = body };
+}
+
+fn referenceSiblings(base: []const i32, n: i32) i32 {
+    var acc: i32 = 0;
+    var i: i32 = 0;
+    while (i < n) : (i += 1) {
+        const row: usize = @intCast(i);
+        acc +%= base[row] +% base[row + 1];
+    }
+    return acc;
+}
+
 /// How many `mul` instructions (either form) remain in `block`.
 fn countMul(func: *const Function, block: Block) usize {
     var n: usize = 0;
@@ -239,5 +294,51 @@ test "ivsr differential: a chain step that escapes leaves the whole address chai
         const got_b = f_b(&arr, &sink_b, n);
         const got_t = f_t(&arr, &sink_t, n);
         try std.testing.expectEqual(got_b, got_t);
+    }
+}
+
+test "ivsr differential: two independent same-scale address chains coalesce to one walking pointer and match the scalar baseline" {
+    const allocator = std.testing.allocator;
+
+    var baseline = Function.init(allocator);
+    defer baseline.deinit();
+    _ = try buildIndependentSiblings(&baseline);
+
+    var tuned = Function.init(allocator);
+    defer tuned.deinit();
+    const k = try buildIndependentSiblings(&tuned);
+
+    const before_carried = tuned.blockParams(k.head).len; // i, acc: 2
+    try std.testing.expectEqual(@as(usize, 2), before_carried);
+
+    _ = try opt.optimizeLate(allocator, &tuned);
+
+    var diags = try ir.verify.verify(allocator, &tuned, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+
+    // One new walking pointer for the whole family, not one per chain.
+    const after_carried = tuned.blockParams(k.head).len;
+    try std.testing.expectEqual(@as(usize, 3), after_carried);
+    try std.testing.expectEqual(@as(usize, 0), countMul(&tuned, k.body));
+
+    if (comptime !hasJit()) return error.SkipZigTest;
+
+    var buf_b = try target.native.jitFunction(allocator, &baseline);
+    defer buf_b.deinit();
+    var buf_t = try target.native.jitFunction(allocator, &tuned);
+    defer buf_t.deinit();
+    const f_b = buf_b.entry(KernelFn, 0);
+    const f_t = buf_t.entry(KernelFn, 0);
+
+    var arr: [32]i32 = undefined;
+    for (&arr, 0..) |*e, idx| e.* = @intCast(idx);
+
+    const trips = [_]i32{ 0, 1, 2, 3, 5, 8 };
+    for (trips) |n| {
+        const got_b = f_b(&arr, n);
+        const got_t = f_t(&arr, n);
+        try std.testing.expectEqual(got_b, got_t);
+        try std.testing.expectEqual(referenceSiblings(&arr, n), got_t);
     }
 }
