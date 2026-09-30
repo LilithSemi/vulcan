@@ -698,7 +698,7 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
     if (stage == .compute) {
         try assignLocsWimmer(allocator, func, stage, &loc, &max_reg, &fma);
     } else {
-        try assignLocs(allocator, func, &loc, &max_reg, &fma);
+        try assignLocs(allocator, func, stage, &loc, &max_reg, &fma);
         // Graphics keeps R0..R3 for the ROP and can reserve further low registers for MRT
         // and depth. R40:R41 are outside that architectural output block and outside the
         // allocator pool, so every later graphics reservation starts above both scratches.
@@ -1208,7 +1208,7 @@ fn lessByStart(_: void, a: Interval, b: Interval) bool {
 /// Booleans take predicates P0..P5 (P6 is the 64-bit-add carry scratch).
 /// There is no spilling: a class running out returns `error.Unsupported`,
 /// which a real kernel should never hit, since it has 250 or more GPRs.
-fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), max_reg: *u8, fma: *const FmaFold) Error!void {
+fn assignLocs(allocator: std.mem.Allocator, func: *const Function, stage: Stage, loc: *std.AutoHashMapUnmanaged(Value, Loc), max_reg: *u8, fma: *const FmaFold) Error!void {
     const nval = func.valueCount();
     if (nval == 0) return;
     const nblocks = func.blockCount();
@@ -1342,6 +1342,23 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
                     if (last_use[idx] < last_grad_pos) last_use[idx] = last_grad_pos;
                 }
             }
+        }
+    }
+    // An IPA's register write is not complete when its scoreboard clears. A later op that
+    // overwrites a varying register can lose its own result to the late attribute write, even
+    // though the write-after-write barrier sits in that op's wait mask. On an RTX 5070 a
+    // fragment shader whose FMUL destination reused a dead varying's register dropped that
+    // product in about 30 of 100 runs, and moving the destination off the varying registers
+    // made it exact at the same stalls. Raising the FMUL latency appeared to fix it and did
+    // not: stall 6 passed while both 5 and 7 failed, because a longer stall only widened the
+    // window for the late write to land on top.
+    //
+    // So a varying register is never handed out again. The live range runs to the end of the
+    // shader because nothing here bounds when delivery completes: the scoreboard is the only
+    // signal the hardware gives and this is the case that proves it insufficient.
+    if (stage == .fragment) {
+        for (func.blockParams(@enumFromInt(0))) |p| {
+            if (attrTag(func, p, "attr") != null) last_use[@intFromEnum(p)] = pos;
         }
     }
     try extendLiveRanges(allocator, func, last_use, block_end);
@@ -8757,7 +8774,7 @@ fn locsUnder(allocator: std.mem.Allocator, func: *Function, use_wimmer: bool, lo
     if (use_wimmer) {
         try assignLocsWimmer(allocator, func, .compute, locs, &max_reg, &fma);
     } else {
-        try assignLocs(allocator, func, locs, &max_reg, &fma);
+        try assignLocs(allocator, func, .compute, locs, &max_reg, &fma);
     }
 }
 
