@@ -182,6 +182,24 @@ fn isQuad(func: *const Function, v: Value) bool {
 fn isXmm(func: *const Function, v: Value) bool {
     return isFloat(func, v) or isVector(func, v);
 }
+/// A SIMD lane's element kind: which register file a scalar extracted from, or packed
+/// into, a vector lives in. The vector itself always lives in the xmm file (`isXmm`
+/// covers any vector), but a lane read out of it, or a field packed into it, is a float
+/// (xmm) or an integer (general register) depending on the element type. Only 32-bit
+/// elements are supported, matching the `<4 x T>` lane encoders below; anything else
+/// (f64, f16, i64, i8, ...) is `null`.
+const LaneKind = enum { f32, i32 };
+fn laneKind(func: *const Function, vector_value: Value) ?LaneKind {
+    const vec = switch (func.types.type_kind(func.valueType(vector_value))) {
+        .vector => |vt| vt,
+        else => return null,
+    };
+    return switch (func.types.type_kind(vec.elem)) {
+        .float => |f| if (f == .f32) .f32 else null,
+        .int => |i| if (i.bits == 32) .i32 else null,
+        else => null,
+    };
+}
 /// The bit width of an integer value. Returns 64 for a non-integer, as the safe
 /// 64-bit default.
 fn intBits(func: *const Function, v: Value) u16 {
@@ -2286,56 +2304,100 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         // handed here is always the real scalar result.
         .call => |c| try lowerDirectCall(allocator, ctx, c, result),
         .struct_new => |sn| {
-            // Build a SIMD vector from scalar lanes, the vectorizer's pack:
-            // one insertps per lane, lane 0 last, so a field the allocator
-            // placed in the result register keeps its value (in lane 0)
-            // until its own insert reads it.
+            // Build a SIMD vector from scalar lanes, the vectorizer's pack: one insert
+            // per lane, lane 0 last, so a field the allocator placed in the result
+            // register keeps its value (in lane 0) until its own insert reads it. The
+            // vector result always lives in xmm (`isVector` implies `isXmm`), but the
+            // element kind decides which register file each FIELD is read from: a
+            // float field is an xmm lane (`insertps`), an integer field is a general
+            // register (`pinsrd`).
             if (!isVector(func, result)) return error.Unsupported;
+            const elem = laneKind(func, result) orelse return error.Unsupported;
             const fields = func.valueList(sn.fields);
             const rd = try ctx.dstXmm(result, xmm_scratch); // vectors do not spill (rd is a register)
-            if (isWide(func, result)) {
-                // AVX `<8 x f32>`: build the two 128-bit halves with
-                // insertps, low in op0, high in op1, then join them into the
-                // 256-bit result with vinsertf128.
-                if (fields.len != 8) return error.Unsupported;
-                for (0..4) |lane| {
-                    const fr = try ctx.useXmm(allocator, fields[lane], xmm_scratch);
-                    try ctx.put(allocator, encode.insertps(xmm_op0, fr, @as(u8, @intCast(lane)) << 4));
-                }
-                for (0..4) |lane| {
-                    const fr = try ctx.useXmm(allocator, fields[4 + lane], xmm_scratch);
-                    try ctx.put(allocator, encode.insertps(xmm_op1, fr, @as(u8, @intCast(lane)) << 4));
-                }
-                try ctx.put(allocator, encode.vinsertf128(rd, xmm_op0, xmm_op1, 1)); // rd = [hi:lo]
-                try ctx.storeXmm(allocator, result, rd);
-                return;
+            switch (elem) {
+                .f32 => {
+                    if (isWide(func, result)) {
+                        // AVX `<8 x f32>`: build the two 128-bit halves with
+                        // insertps, low in op0, high in op1, then join them into the
+                        // 256-bit result with vinsertf128.
+                        if (fields.len != 8) return error.Unsupported;
+                        for (0..4) |lane| {
+                            const fr = try ctx.useXmm(allocator, fields[lane], xmm_scratch);
+                            try ctx.put(allocator, encode.insertps(xmm_op0, fr, @as(u8, @intCast(lane)) << 4));
+                        }
+                        for (0..4) |lane| {
+                            const fr = try ctx.useXmm(allocator, fields[4 + lane], xmm_scratch);
+                            try ctx.put(allocator, encode.insertps(xmm_op1, fr, @as(u8, @intCast(lane)) << 4));
+                        }
+                        try ctx.put(allocator, encode.vinsertf128(rd, xmm_op0, xmm_op1, 1)); // rd = [hi:lo]
+                        try ctx.storeXmm(allocator, result, rd);
+                        return;
+                    }
+                    if (fields.len != 4) return error.Unsupported; // <4 x f32>
+                    for ([_]u8{ 1, 2, 3, 0 }) |lane| {
+                        const fr = try ctx.useXmm(allocator, fields[lane], xmm_op0); // a spilled field reloads to op0
+                        try ctx.put(allocator, encode.insertps(rd, fr, lane << 4)); // src lane 0 -> dst lane
+                    }
+                    try ctx.storeXmm(allocator, result, rd);
+                },
+                .i32 => {
+                    // No AVX 8-lane integer vector exists yet, so the wide path is
+                    // out of scope until something builds one.
+                    if (isWide(func, result)) return error.Unsupported;
+                    if (fields.len != 4) return error.Unsupported; // <4 x i32>
+                    for ([_]u2{ 1, 2, 3, 0 }) |lane| {
+                        // A gpr reload, never xmm: an integer field lives in the
+                        // general-register file, so reloading it through the xmm
+                        // scratch bucket would read the wrong file entirely.
+                        const fr = try ctx.use(allocator, fields[lane], scratch2);
+                        try ctx.put(allocator, encode.pinsrd(rd, fr, lane));
+                    }
+                    try ctx.storeXmm(allocator, result, rd);
+                },
             }
-            if (fields.len != 4) return error.Unsupported; // <4 x f32>
-            for ([_]u8{ 1, 2, 3, 0 }) |lane| {
-                const fr = try ctx.useXmm(allocator, fields[lane], xmm_op0); // a spilled field reloads to op0
-                try ctx.put(allocator, encode.insertps(rd, fr, lane << 4)); // src lane 0 -> dst lane
-            }
-            try ctx.storeXmm(allocator, result, rd);
         },
         .extract => |e| {
-            // Extract a lane of a SIMD vector to a scalar, the vectorizer's
-            // unpack: a single pshufd moves that lane to lane 0. This is
-            // pure, so dead extracts fall to DCE.
+            // Extract a lane of a SIMD vector to a scalar, the vectorizer's unpack.
+            // The source vector always lives in xmm, but the element kind decides
+            // which register file the RESULT lands in: a float lane stays in xmm
+            // (`pshufd` moves it to lane 0), an integer lane crosses into the
+            // general-register file (the same `pshufd` followed by `movd`). Both
+            // are pure, so a dead extract falls to DCE.
             if (!isVector(func, e.aggregate)) return error.Unsupported;
+            const elem = laneKind(func, e.aggregate) orelse return error.Unsupported;
             const src = try ctx.useXmm(allocator, e.aggregate, xmm_op0);
-            const rd = try ctx.dstXmm(result, xmm_scratch);
-            if (isWide(func, e.aggregate) and e.index >= 4) {
-                // The lane is in the high 128 bits of the ymm. Bring that
-                // half down to an xmm first, then shuffle the lane, relative
-                // to the half, into lane 0.
-                try ctx.put(allocator, encode.vextractf128(xmm_op1, src, 1));
-                try ctx.put(allocator, encode.pshufd(rd, xmm_op1, @intCast(e.index - 4)));
-            } else {
-                // Lane 0 through 3 lives in the low 128 bits, which a
-                // 128-bit pshufd reads directly.
-                try ctx.put(allocator, encode.pshufd(rd, src, @intCast(e.index)));
+            switch (elem) {
+                .f32 => {
+                    const rd = try ctx.dstXmm(result, xmm_scratch);
+                    if (isWide(func, e.aggregate) and e.index >= 4) {
+                        // The lane is in the high 128 bits of the ymm. Bring that
+                        // half down to an xmm first, then shuffle the lane, relative
+                        // to the half, into lane 0.
+                        try ctx.put(allocator, encode.vextractf128(xmm_op1, src, 1));
+                        try ctx.put(allocator, encode.pshufd(rd, xmm_op1, @intCast(e.index - 4)));
+                    } else {
+                        // Lane 0 through 3 lives in the low 128 bits, which a
+                        // 128-bit pshufd reads directly.
+                        try ctx.put(allocator, encode.pshufd(rd, src, @intCast(e.index)));
+                    }
+                    try ctx.storeXmm(allocator, result, rd);
+                },
+                .i32 => {
+                    // No AVX 8-lane integer vector exists yet, so the wide path is
+                    // out of scope until something builds one.
+                    if (isWide(func, e.aggregate)) return error.Unsupported;
+                    // pshufd brings the lane to lane 0 of an xmm scratch register,
+                    // then movd reads that lane 0 into the general-register result.
+                    // A gpr destination, never xmm: `dst` (not `dstXmm`) is right
+                    // because the result is a scalar i32, which the allocator
+                    // classifies gpr.
+                    try ctx.put(allocator, encode.pshufd(xmm_scratch, src, @intCast(e.index)));
+                    const rd = ctx.dst(result, scratch1);
+                    try ctx.put(allocator, encode.movdFromXmm(rd, xmm_scratch));
+                    try ctx.store(allocator, result, rd);
+                },
             }
-            try ctx.storeXmm(allocator, result, rd);
         },
         .alloca => {
             // The alloca's result is the address of its stack slot. lea it

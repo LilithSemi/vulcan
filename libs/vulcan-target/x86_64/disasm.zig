@@ -556,8 +556,15 @@ fn twoByte(a: std.mem.Allocator, b: *std.ArrayList(u8), d: *D, op: u8) !void {
 }
 
 fn threeByteA(a: std.mem.Allocator, b: *std.ArrayList(u8), d: *D, op: u8) !void {
-    // 66 0F 3A 21 insertps; F3/F2 0F 3A 11 roundss/roundsd (as this backend emits them).
+    // 66 0F 3A 21 insertps; 66 0F 3A 22 pinsrd; F3/F2 0F 3A 11 roundss/roundsd (as this
+    // backend emits them).
     const o = modrm(d);
+    if (op == 0x22) { // pinsrd xmm, gpr32, imm8: crosses register files, like movd
+        try b.appendSlice(a, "pinsrd ");
+        try xmm(a, b, o.reg);
+        try b.print(a, ", {s}, ", .{rvq(d, o.rm)});
+        return b.print(a, "{d}", .{d.byte()});
+    }
     const mnem: []const u8 = if (op == 0x21) "insertps" else if (d.mand == 0xF2) "roundsd" else "roundss";
     try b.print(a, "{s} ", .{mnem});
     try xmm(a, b, o.reg);
@@ -788,6 +795,7 @@ test "round-trips SSE and AVX" {
     try expectOne(encode.ucomiss(.xmm0, .xmm1), "ucomiss xmm0, xmm1");
     try expectOne(encode.pshufd(.xmm0, .xmm1, 2), "pshufd xmm0, xmm1, 2");
     try expectOne(encode.insertps(.xmm0, .xmm1, 0x10), "insertps xmm0, xmm1, 16");
+    try expectOne(encode.pinsrd(.xmm0, .rax, 1), "pinsrd xmm0, eax, 1");
     try expectOne(encode.movssStore(8, .xmm1), "movss dword ptr [rsp + 8], xmm1");
     try expectOne(encode.vaddps(.xmm0, .xmm1, .xmm2), "vaddps ymm0, ymm1, ymm2");
     try expectOne(encode.vmovupsRR(.xmm0, .xmm1), "vmovups ymm0, ymm1");

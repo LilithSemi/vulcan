@@ -447,6 +447,22 @@ pub fn insertps(dst: Xmm, src: Xmm, imm: u8) Inst {
     }
     return Inst.of(&.{ 0x66, 0x0F, 0x3A, 0x21, mod, imm });
 }
+/// `pinsrd dst, src, imm8` (66 0F 3A 22 /r ib): insert 32 bits from a general register into
+/// lane `imm8[1:0]` of `dst`, leaving the other lanes unchanged. The GPR counterpart of
+/// `insertps`, needed to pack an integer vector lane by lane, since `insertps` only moves a
+/// lane between two xmm registers. SSE4.1; source: Intel SDM Vol. 2B, PINSRD/PINSRQ, opcode
+/// 66 0F 3A 22 /r ib (REX.W=0 picks the 32-bit form). Verified against an independent decoder
+/// (capstone), not written from memory.
+pub fn pinsrd(dst: Xmm, src: Reg, lane: u2) Inst {
+    const r = xn(dst);
+    const b = n(src);
+    const mod: u8 = 0xC0 | ((r & 7) << 3) | (b & 7);
+    if (r >= 8 or b >= 8) {
+        const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+        return Inst.of(&.{ 0x66, rex, 0x0F, 0x3A, 0x22, mod, lane });
+    }
+    return Inst.of(&.{ 0x66, 0x0F, 0x3A, 0x22, mod, lane });
+}
 /// `pshufd dst, src, imm8` (66 0F 70 /r ib): shuffle 32-bit lanes. With imm = lane, this puts
 /// src's lane `lane` into dst's lane 0. This extracts a lane to a scalar position.
 pub fn pshufd(dst: Xmm, src: Xmm, imm: u8) Inst {
@@ -1281,6 +1297,12 @@ test "known SSE encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x10, 0xC1 }, movupsRR(.xmm0, .xmm1).slice()); // movups xmm0, xmm1
     try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x3A, 0x21, 0xC1, 0x10 }, insertps(.xmm0, .xmm1, 0x10).slice()); // insertps xmm0, xmm1, 1
     try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x70, 0xC1, 0x02 }, pshufd(.xmm0, .xmm1, 0x02).slice()); // pshufd xmm0, xmm1, 2
+    // pinsrd xmm0, eax, 0 -> 66 0F 3A 22 C0 00 (capstone-verified)
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x3A, 0x22, 0xC0, 0x00 }, pinsrd(.xmm0, .rax, 0).slice());
+    // pinsrd xmm1, ecx, 3 -> 66 0F 3A 22 C9 03 (capstone-verified)
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x3A, 0x22, 0xC9, 0x03 }, pinsrd(.xmm1, .rcx, 3).slice());
+    // pinsrd xmm9, r15d, 1 -> REX.RB for xmm9 (reg>=8) and r15 (rm>=8): 66 45 0F 3A 22 CF 01
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x45, 0x0F, 0x3A, 0x22, 0xCF, 0x01 }, pinsrd(.xmm9, .r15, 1).slice());
     try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x2E, 0xC1 }, ucomiss(.xmm0, .xmm1).slice()); // ucomiss xmm0, xmm1
     try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x2A, 0xC0 }, cvtsi2ss(.xmm0, .rax).slice()); // cvtsi2ss xmm0, eax
     try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x2C, 0xC0 }, cvttss2si(.rax, .xmm0).slice()); // cvttss2si eax, xmm0
