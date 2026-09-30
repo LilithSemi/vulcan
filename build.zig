@@ -546,6 +546,23 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(splitunroll_diff).step);
 
+    // Induction-variable strength reduction differential oracle: build a loop that addresses a base
+    // pointer plus two further constant offsets twice, run one copy through the late pipeline (where
+    // `ivsr` lives), JIT both on the host, and require identical sums over a real array across
+    // several trip counts (0, 1, and a spread above). Also checks that the base collapses to one
+    // walking pointer rather than three, and that an address that escapes the loop stays refused.
+    const ivsr_diff = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/tests/ivsr_differential.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(ivsr_diff).step);
+
     // Loop-vectorizer differential oracle: build a map loop twice, run loopvec (and the full pipeline
     // so SLP widens it) on one, JIT both, run over real arrays, require bit-identical output for every
     // trip count (0 / below V / exactly V / multiples / non-multiples).

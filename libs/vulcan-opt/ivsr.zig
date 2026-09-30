@@ -27,9 +27,11 @@
 //! the pointer (`verify.pointerArith` allows it), and the IR states no extension rule for that
 //! operand. A pointer induction variable advances in pointer width, so it agrees with the original
 //! address only while the integer offset stays inside its own type. This pass does not try to prove
-//! that. Instead it reduces a pointer ONLY when every use of it is an address the loop
-//! dereferences, so an offset that did wrap would have made the original program read or write an
-//! address outside the object it indexes. See `pointerUsesAreAddresses`.
+//! that. Instead it reduces a pointer only when every use of it is an address the loop dereferences,
+//! or a further address computation that is itself dereference-only all the way down its own chain,
+//! so an offset that did wrap would have made the original program read or write an address outside
+//! the object it indexes. See `pointerUsesAreAddresses` and the `chain_safe` fixed point in
+//! `countUses`.
 //!
 //! The address space rides along with the type: every emitted pointer instruction takes its result
 //! type from the value it replaces, and the invariant base pointer keeps its own type, so
@@ -226,6 +228,10 @@ const LoopCtx = struct {
     address_uses: []u32,
     /// Total uses of each value, over the whole function.
     total_uses: []u32,
+    /// Whether every use of a pointer value, other than a dereference, is itself another address
+    /// computation that is also in this state. A fixed point over the whole loop, filled in by
+    /// `countUses`. See `pointerUsesAreAddresses`.
+    chain_safe: []bool,
     /// The preheader argument of each header parameter the loop carries around unchanged. Such a
     /// parameter holds one value for the whole loop, so it is loop-invariant, but it is not
     /// READABLE outside the loop. The preheader argument holds the same value and is, so every
@@ -262,6 +268,8 @@ fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_
     defer allocator.free(address_uses);
     const total_uses = try allocator.alloc(u32, value_count);
     defer allocator.free(total_uses);
+    const chain_safe = try allocator.alloc(bool, value_count);
+    defer allocator.free(chain_safe);
     const substitute = try allocator.alloc(?Value, value_count);
     defer allocator.free(substitute);
     @memset(substitute, null);
@@ -278,6 +286,7 @@ fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_
         .demanding_uses = demanding_uses,
         .address_uses = address_uses,
         .total_uses = total_uses,
+        .chain_safe = chain_safe,
         .substitute = substitute,
     };
     fillDefBlocks(func, def_block);
@@ -428,12 +437,24 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
 
     try countUses(allocator, ctx);
 
+    // Whether each value already has a plan entry, checked below so a chain step built directly
+    // from an already-reduced pointer does not earn a second variable of its own: once the base
+    // walks, `base + 4` is already one cheap add away, and giving it a variable too would only add
+    // a live value for no win. See `chainPredecessor`.
+    const reduced = try allocator.alloc(bool, func.valueCount());
+    defer allocator.free(reduced);
+    @memset(reduced, false);
+
     for (0..func.blockCount()) |bi| {
         if (!ctx.loop.contains(bi)) continue;
         for (func.blockInsts(@enumFromInt(bi))) |inst| {
             const result = func.instResult(inst) orelse continue;
             const rep = ctx.affine[@intFromEnum(result)] orelse continue;
             if (!worthReducing(ctx, pool, result, rep)) continue;
+            if (chainPredecessor(ctx, inst)) |pred| {
+                if (reduced[@intFromEnum(pred)]) continue;
+            }
+            reduced[@intFromEnum(result)] = true;
 
             const ty = func.valueType(result);
             const biv = func.blockParams(ctx.header)[rep.biv];
@@ -769,14 +790,68 @@ fn affineArithImm(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, op: 
     }
 }
 
+/// The pointer `inst` dereferences as an address, or null when it reads or writes no address at
+/// all. Only `load`, `store` and `prefetch` dereference. `atomic_rmw` also reads and writes its
+/// pointer, and is deliberately absent: counting it here would let a pointer an atomic touches
+/// become an induction variable, and this pass has no test that runs one. Exhaustive with no
+/// `else` prong, like `appendOperands`: a new dereferencing opcode left out only makes
+/// `pointerUsesAreAddresses` refuse, which is the safe direction, but the decision belongs in this
+/// list rather than in a silent default.
+fn dereferencedPointer(func: *const Function, inst: Inst) ?Value {
+    return switch (func.opcode(inst)) {
+        .load => |l| l.ptr,
+        .store => |s| s.ptr,
+        .prefetch => |p| p.ptr,
+        .iconst,
+        .fconst,
+        .fconst128,
+        .arith,
+        .arith_imm,
+        .icmp,
+        .select,
+        .struct_new,
+        .extract,
+        .convert,
+        .decode_low_float,
+        .encode_low_float,
+        .dequantize_nvfp4,
+        .quantize_nvfp4,
+        .unary,
+        .alloca,
+        .call,
+        .call_indirect,
+        .global_addr,
+        .va_start,
+        .va_arg,
+        .va_end,
+        .dot,
+        .reduce,
+        .splat,
+        .matmul,
+        .barrier,
+        .atomic_rmw,
+        .@"if",
+        => null,
+    };
+}
+
 /// Count, for every value, the uses this pass cannot make disappear by reducing the consumer, the
-/// uses that are a dereferenced address, and the uses in total.
+/// uses that are a dereferenced address, and the uses in total. Also settles `chain_safe`: whether
+/// a pointer's only uses, beyond a dereference, are further address computations that are
+/// themselves dereference-only all the way down.
 fn countUses(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
     const func = ctx.func;
     @memset(ctx.demanding_uses, 0);
     @memset(ctx.address_uses, 0);
     @memset(ctx.total_uses, 0);
+    @memset(ctx.chain_safe, true);
 
+    // A chain edge records that `from`'s safety depends on `to`'s: `from` is a pointer stepped by
+    // an invariant amount to build `to`, another affine pointer. Settled below as a fixed point,
+    // since `to` may turn out unsafe only once its own uses are all in.
+    const ChainEdge = struct { from: Value, to: Value };
+    var edges: std.ArrayList(ChainEdge) = .empty;
+    defer edges.deinit(allocator);
     var operands: std.ArrayList(Value) = .empty;
     defer operands.deinit(allocator);
 
@@ -784,59 +859,33 @@ fn countUses(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
         const block: Block = @enumFromInt(bi);
         const in_loop = ctx.loop.contains(bi);
         for (func.blockInsts(block)) |inst| {
+            const result = func.instResult(inst);
             // A use inside a reducible consumer disappears with that consumer. Any other use has
             // to keep reading a real value, which is what makes this value worth its own variable.
-            const consumer_is_affine = in_loop and blk: {
-                const r = func.instResult(inst) orelse break :blk false;
-                break :blk ctx.affine[@intFromEnum(r)] != null;
-            };
+            const consumer_is_affine = in_loop and result != null and ctx.affine[@intFromEnum(result.?)] != null;
             operands.clearRetainingCapacity();
             try appendOperands(allocator, func, inst, &operands);
             for (operands.items) |v| {
                 ctx.total_uses[@intFromEnum(v)] += 1;
                 if (!consumer_is_affine) ctx.demanding_uses[@intFromEnum(v)] += 1;
             }
-            // The three ops that DEREFERENCE an address. `atomic_rmw` also reads and writes its
-            // pointer, and is deliberately absent: counting it here would let a pointer an atomic
-            // touches become an induction variable, and this pass has no test that runs one.
-            // Exhaustive with no `else` prong, like `appendOperands`: a new dereferencing opcode
-            // left out only makes `pointerUsesAreAddresses` refuse, which is the safe direction,
-            // but the decision belongs in this list rather than in a silent default.
-            if (in_loop) switch (func.opcode(inst)) {
-                .load => |l| ctx.address_uses[@intFromEnum(l.ptr)] += 1,
-                .store => |s| ctx.address_uses[@intFromEnum(s.ptr)] += 1,
-                .prefetch => |p| ctx.address_uses[@intFromEnum(p.ptr)] += 1,
-                .iconst,
-                .fconst,
-                .fconst128,
-                .arith,
-                .arith_imm,
-                .icmp,
-                .select,
-                .struct_new,
-                .extract,
-                .convert,
-                .decode_low_float,
-                .encode_low_float,
-                .dequantize_nvfp4,
-                .quantize_nvfp4,
-                .unary,
-                .alloca,
-                .call,
-                .call_indirect,
-                .global_addr,
-                .va_start,
-                .va_arg,
-                .va_end,
-                .dot,
-                .reduce,
-                .splat,
-                .matmul,
-                .barrier,
-                .atomic_rmw,
-                .@"if",
-                => {},
-            };
+
+            const deref = if (in_loop) dereferencedPointer(func, inst) else null;
+            if (deref) |p| ctx.address_uses[@intFromEnum(p)] += 1;
+
+            if (!in_loop) continue;
+            for (operands.items) |v| {
+                if (func.types.type_kind(func.valueType(v)) != .ptr) continue;
+                if (deref) |p| if (p == v) continue; // the dereference itself: always safe
+                // `consumer_is_affine` for a pointer operand means this instruction built another
+                // affine pointer by stepping `v` with an invariant amount (the only way `affineOf`
+                // ever gives a `ptr`-typed result), so this is a chain step rather than an escape.
+                if (consumer_is_affine) {
+                    try edges.append(allocator, .{ .from = v, .to = result.? });
+                } else {
+                    ctx.chain_safe[@intFromEnum(v)] = false;
+                }
+            }
         }
         if (func.terminator(block)) |term| {
             const args: []const Value = switch (term) {
@@ -846,6 +895,21 @@ fn countUses(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
             for (args) |v| {
                 ctx.total_uses[@intFromEnum(v)] += 1;
                 ctx.demanding_uses[@intFromEnum(v)] += 1;
+                if (func.types.type_kind(func.valueType(v)) == .ptr) ctx.chain_safe[@intFromEnum(v)] = false;
+            }
+        }
+    }
+
+    // Propagate an escape back through the chain: `from` is only as safe as `to` turns out to be,
+    // however far downstream the escape actually sits. Monotone (only ever clears a bit), so this
+    // settles in at most one pass per chain link.
+    var again = true;
+    while (again) {
+        again = false;
+        for (edges.items) |e| {
+            if (ctx.chain_safe[@intFromEnum(e.from)] and !ctx.chain_safe[@intFromEnum(e.to)]) {
+                ctx.chain_safe[@intFromEnum(e.from)] = false;
+                again = true;
             }
         }
     }
@@ -930,6 +994,59 @@ fn worthReducing(ctx: *const LoopCtx, pool: *const Pool, v: Value, rep: Affine) 
     return true;
 }
 
+/// The nearer pointer `inst` steps by an invariant amount to build its own affine result, or null
+/// when `inst` instead builds the chain's own root straight from the loop-invariant base.
+///
+/// `v28`'s own `Affine` and `v38 = v28 + 2`'s both name the same root base pointer, since affine
+/// forms collapse the whole chain down to one base and one combined offset. That collapse is right
+/// for computing the offset, but it erases which value is the immediate predecessor, which is
+/// exactly what the plan-building loop needs to know: once `v28` gets a variable, `v38` should ride
+/// on it for free rather than earn a second one. This walks the instruction instead, using the same
+/// "existing pointer stepped" test `affineArith`/`affineArithImm` used to build the affine form.
+fn chainPredecessor(ctx: *const LoopCtx, inst: Inst) ?Value {
+    const stepsFrom = struct {
+        fn f(c: *const LoopCtx, v: Value) bool {
+            const a = c.affine[@intFromEnum(v)] orelse return false;
+            return a.base != null;
+        }
+    }.f;
+    return switch (ctx.func.opcode(inst)) {
+        .arith_imm => |a| if (stepsFrom(ctx, a.lhs)) a.lhs else null,
+        .arith => |a| if (stepsFrom(ctx, a.lhs)) a.lhs else if (stepsFrom(ctx, a.rhs)) a.rhs else null,
+        .iconst,
+        .fconst,
+        .fconst128,
+        .icmp,
+        .select,
+        .struct_new,
+        .extract,
+        .convert,
+        .decode_low_float,
+        .encode_low_float,
+        .dequantize_nvfp4,
+        .quantize_nvfp4,
+        .unary,
+        .alloca,
+        .call,
+        .call_indirect,
+        .global_addr,
+        .load,
+        .store,
+        .prefetch,
+        .va_start,
+        .va_arg,
+        .va_end,
+        .dot,
+        .reduce,
+        .splat,
+        .matmul,
+        .barrier,
+        .atomic_rmw,
+        .@"if",
+        => null,
+    };
+}
+
 /// Whether the back edge passes `v` to the header as a block argument.
 fn isCarriedBack(ctx: *const LoopCtx, v: Value) bool {
     const args = ctx.func.blockArgs(ctx.func.terminator(ctx.latch).?.jump);
@@ -940,20 +1057,29 @@ fn isCarriedBack(ctx: *const LoopCtx, v: Value) bool {
 }
 
 /// Whether every use of pointer `v` is an address the loop dereferences, or another in-loop address
-/// computation that is itself affine.
+/// computation that is itself dereference-only all the way down its own chain.
 ///
 /// This is the one precondition a pointer induction variable needs. The new variable advances in
-/// POINTER width, while the address it replaces was built by adding an integer offset that may be
+/// pointer width, while the address it replaces was built by adding an integer offset that may be
 /// narrower (see the file comment). The two agree while that offset stays inside its own type. This
-/// does not prove that; it requires instead that the loop only ever DEREFERENCES the address, so an
+/// does not prove that; it requires instead that the loop only ever dereferences the address, so an
 /// offset that wrapped would already have made the original program touch memory outside the object
 /// it indexes. A pointer that escapes the loop, is compared, or is stored somewhere is refused,
 /// because for those the wrapped value is an observable result rather than a bad access.
+///
+/// A further address computation built from `v`, such as `v + 2`, extends the same argument: its
+/// own value stays invisible too as long as its uses are only dereferences (or further steps that
+/// are, recursively). `chain_safe` is exactly that fixed point, so checking it here is sufficient
+/// without also asking whether the consumer ends up getting its own induction variable. Whether a
+/// consumer is reduced is a separate, later decision (`worthReducing` also weighs cost: is there
+/// still a reader, is it already carried by the back edge). None of that changes what value the
+/// consumer computes: `applyPlan` replaces every use of `v`, including inside the consumer, with a
+/// value equal to `v` at every trip, so the consumer reads the same numbers whether or not it later
+/// earns a variable of its own. Only an escaping use anywhere in the chain can make a wrapped offset
+/// observable, and `chain_safe` already refuses the whole chain back to its root when one exists.
 fn pointerUsesAreAddresses(ctx: *const LoopCtx, v: Value) bool {
     const i = @intFromEnum(v);
-    // EVERY use, not just the demanding ones: a use inside another address computation would
-    // carry a wrapped offset onward, and that computation may itself be refused.
-    return ctx.address_uses[i] > 0 and ctx.total_uses[i] == ctx.address_uses[i];
+    return ctx.address_uses[i] > 0 and ctx.chain_safe[i];
 }
 
 /// Emit the plan: the initial values and the steps into the preheader, one new header parameter per
