@@ -1782,6 +1782,17 @@ fn markReuse(insts: []Inst, block_starts: []const usize, entry_start: usize) voi
         const opcode = getField(inst.*, 0, 12);
         // Only a coupled ALU op gets bits. See the marking policy above.
         if (!isAluOp(opcode) or isVariableLatency(opcode)) continue;
+        // FADD TAKES NO REUSE BIT ON ITS SECOND SOURCE, and nvdisasm is the authority: a word
+        // with the slot-1 bit set is rejected as "undefined value for table TABLES_opex_4",
+        // while the same word with the slot-0 bit is accepted. ptxas agrees from the other
+        // side, carrying reuse=0 on every FADD in the measured streams.
+        //
+        // This is what `abs(x)` hit. It lowers to FSETP, FADD and SEL, the SEL re-reads the
+        // same register the FADD read in the same slot, and the chain scan marked it. A
+        // compare-and-select alone has no FADD and a bare negate has no second reader, so only
+        // the combination produced the illegal word. Shipping an encoding the vendor tool
+        // refuses to decode is not something to reason about, it is something to not do.
+        if ((opcode & 0x1ff) == 0x021) continue;
         // ISETP uses bits 109 and 122..125 as part of its operation extension,
         // not as the generic ALU reuse encoding. nvdisasm rejects a compare
         // with those bits set even when its scheduled stall is small.
@@ -4643,4 +4654,40 @@ test "no instruction arms a barrier it waits on" {
     setField(&drained[0], 116, 6, (1 << num_scoreboards) - 1);
     setField(&drained[0], 110, 3, 0);
     try std.testing.expectEqual(@as(usize, 0), countSelfWaits(&drained));
+}
+
+/// FADDs carrying a reuse bit, which is an encoding sm_120 does not define.
+///
+/// `nvdisasm --binary SM120` rejects such a word outright: "Opclass 'fadd__RRR_RR', undefined
+/// value 0x51 for table 'TABLES_opex_4'". The same word with the slot-0 bit instead of slot-1 is
+/// accepted, so the operand is real and the collector slot is not where `aluSrcSlot` puts it.
+/// ptxas agrees from the other side and carries reuse=0 on every FADD in the measured streams.
+pub fn countIllegalReuse(insts: []const Inst) usize {
+    var n: usize = 0;
+    for (insts) |inst| {
+        if ((getField(inst, 0, 12) & 0x1ff) != 0x021) continue;
+        if (getField(inst, 122, 4) != 0) n += 1;
+    }
+    return n;
+}
+
+test "an abs-shaped chain emits no reuse bit on its FADD" {
+    // abs(x) lowers to FSETP, FADD and SEL, and the SEL re-reads the register the FADD read in
+    // the same slot, so the chain scan wanted to mark it. The resulting word is one nvdisasm
+    // refuses to decode. Neither half alone produces it: a compare-and-select has no FADD and a
+    // bare negate has no second reader.
+    var insts = [_]Inst{
+        encode.fsetp(0, 4, 7, .lt, .{}),
+        encode.fadd(8, 7, 4, .{}),
+        encode.sel(7, 8, 4, 0, .{}),
+        encode.fadd(9, 7, 4, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(usize, 0), countIllegalReuse(&insts));
+    // The chain is real: something else in it still carries a mark, so the zero above is the
+    // FADD exclusion and not an absence of reuse opportunities.
+    var marked: usize = 0;
+    for (insts) |i| marked += @intFromBool(getField(i, 122, 4) != 0);
+    try std.testing.expect(marked > 0);
 }

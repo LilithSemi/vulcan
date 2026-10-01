@@ -9460,6 +9460,8 @@ test "no emitted instruction reads a source field its opcode leaves at zero" {
             try testing.expectEqual(@as(?schedule.StallShortfall, null), schedule.findStallShortfall(@ptrCast(k.code)));
             // And nothing arms a barrier it waits on. See `countSelfWaits`.
             try testing.expectEqual(@as(usize, 0), schedule.countSelfWaits(@ptrCast(k.code)));
+            // And no FADD carries a reuse bit, which sm_120 does not define. See `countIllegalReuse`.
+            try testing.expectEqual(@as(usize, 0), schedule.countIllegalReuse(@ptrCast(k.code)));
         }
     }
 }
