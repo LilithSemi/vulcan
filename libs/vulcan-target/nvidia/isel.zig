@@ -1145,7 +1145,14 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
     // also keeps the patch's re-encoded branches from wiping a wait mask or a
     // stall the scheduler chose for them: the re-encode builds a fresh Control,
     // and with the patch first the scheduler runs last and its choices stand.
-    schedule.scheduleBlocks(code.items, block_start);
+    // A fragment shader publishes its colours in R0..R[4N-1] and, when it writes one, its depth
+    // just above them. The ROP latches that block when the warp exits, so the stall pass has to
+    // know those registers have a consumer at EXIT that no register field names.
+    const exit_regs: u16 = if (stage == .fragment)
+        @as(u16, if (writesFragDepth(func)) fragDepthReg(func) + 1 else 4 * @as(u16, colorTargetCount(func)))
+    else
+        0;
+    schedule.scheduleBlocksExit(code.items, block_start, exit_regs);
 
     // The instruction fetch unit reads AHEAD of the program counter, so the bytes after the last
     // instruction get fetched whether or not they are code. ptxas ends every shader with a
@@ -9442,6 +9449,9 @@ test "no emitted instruction reads a source field its opcode leaves at zero" {
             defer k.deinit(allocator);
             try testing.expect(k.code.len > 0);
             try testing.expectEqual(@as(usize, 0), schedule.countPhantomR0(@ptrCast(k.code)));
+            // And no coupled result is left with a stall shorter than a reader needs, judged
+            // against a scan that trusts no opcode table. See `findStallShortfall`.
+            try testing.expectEqual(@as(?schedule.StallShortfall, null), schedule.findStallShortfall(@ptrCast(k.code)));
         }
     }
 }
@@ -9519,4 +9529,48 @@ fn bodyLen(code: []const u32) usize {
         if (code[i] & 0xfff == 0x94d) return i / 4 + 1;
     }
     return code.len / 4;
+}
+
+test "a fragment colour publish keeps its latency before the exit" {
+    // The ROP latches R0..R[4N-1] when the warp exits, so the MOV that publishes a colour has a
+    // consumer, EXIT, that no register field names. With stalls computed rather than pinned at
+    // 15, that MOV dropped to the stall floor of 1 and the ROP could latch a colour it had not
+    // landed yet. A compute kernel reads nothing at its exit and must NOT pay for this.
+    const allocator = testing.allocator;
+    const Case = struct {
+        fn build(alloc: std.mem.Allocator, stage: Stage) !Kernel {
+            var func = Function.init(alloc);
+            defer func.deinit();
+            const f32_t = try func.types.intern(.{ .float = .f32 });
+            const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+            const b = try func.appendBlock();
+            const in = try func.appendBlockParam(b, f32_t);
+            try func.addAttr(.{ .value = in }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = encode.ATTR_GENERIC0 } } });
+            const two = try func.appendInst(b, f32_t, .{ .fconst = 2.0 });
+            const sum = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = in, .rhs = two } });
+            const out = try func.appendInst(b, i32_t, .{ .iconst = 0 });
+            const key = if (stage == .fragment) "color_out" else "out_attr";
+            const val: i64 = if (stage == .fragment) 0 else encode.ATTR_POSITION;
+            try func.addAttr(.{ .value = out }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = key, .value = .{ .int = val } } });
+            try func.appendStore(b, sum, out);
+            func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+            return compileShader(alloc, &func, stage, nvidia_abi);
+        }
+    };
+
+    var frag = try Case.build(allocator, .fragment);
+    defer frag.deinit(allocator);
+    // The last MOV into the colour block carries its full latency, not the floor.
+    const body = bodyLen(frag.code);
+    const publish = body - 2; // the MOV just before EXIT
+    try testing.expectEqual(@as(u32, 0x202), frag.code[publish * 4] & 0xfff);
+    try testing.expect((frag.code[publish * 4] >> 16) & 0xff < 4); // into the ROP block
+    try testing.expect((frag.code[publish * 4 + 3] >> 9) & 0xf > 1);
+
+    // A vertex shader publishes through AST, which names its source register, so the ordinary
+    // scan already covers it and nothing here is paid twice.
+    var vert = try Case.build(allocator, .vertex);
+    defer vert.deinit(allocator);
+    try testing.expectEqual(@as(?schedule.StallShortfall, null), schedule.findStallShortfall(@ptrCast(vert.code)));
+    try testing.expectEqual(@as(?schedule.StallShortfall, null), schedule.findStallShortfall(@ptrCast(frag.code)));
 }

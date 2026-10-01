@@ -687,7 +687,15 @@ pub fn schedule(insts: []Inst) void {
     scheduleBlocks(insts, &.{});
 }
 
+/// Schedule a stream whose EXIT reads nothing, which is every stage but the fragment one.
 pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
+    scheduleBlocksExit(insts, block_starts, 0);
+}
+
+/// Schedule a stream, naming how many low registers EXIT reads. A fragment shader publishes its
+/// colours and depth in that block and the ROP latches them at the exit, which is a dependency
+/// no register field expresses. See `assignStalls`.
+pub fn scheduleBlocksExit(insts: []Inst, block_starts: []const usize, exit_regs: u16) void {
     // The ENTRY block start (the smallest one - the isel emits a straight-line PROLOGUE, e.g. the
     // IPA varying-fetches + the LDC uniform-block-base loads, then records block 0 starting AFTER
     // it) has a SINGLE linear predecessor (the prologue), not multiple branch predecessors. Draining
@@ -963,7 +971,7 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
     // makes sound), and the reuse scan must see the block starts exactly as the
     // scoreboard walk did. Both live inside `scheduleBlocks` because the isel calls it
     // exactly once on the finished code, so every caller gets them without new wiring.
-    assignStalls(insts);
+    assignStalls(insts, exit_regs);
     markReuse(insts, block_starts, entry_start);
 }
 
@@ -1667,7 +1675,9 @@ fn predRead(inst: Inst, pred: u8) bool {
 /// Control flow keeps the stall the isel set, and bit 109 (the yield bit NAK's encoder
 /// writes only below sm_120) stays untouched: ptxas sets it on most sm_120 instructions
 /// and no measurement here says what it does.
-fn assignStalls(insts: []Inst) void {
+/// How many low registers EXIT reads, which is the fragment stage's architectural output block
+/// and zero everywhere else. See `assignStalls`.
+fn assignStalls(insts: []Inst, exit_regs: u16) void {
     for (insts, 0..) |*inst, idx| {
         const opcode = getField(inst.*, 0, 12);
 
@@ -1688,6 +1698,26 @@ fn assignStalls(insts: []Inst) void {
             var bneed: u32 = 0;
             scanConsumers(insts, idx + 1, 1, latency, want, &need, &bneed);
             need = @max(need, bneed);
+        }
+        // EXIT READS THE FRAGMENT OUTPUTS, and no register field says so. A fragment shader
+        // publishes its colours in R0..R3, more for MRT, and its depth in a reserved register
+        // above them, and the ROP latches all of it when the warp exits. So the last write to
+        // one of those registers has a real consumer, EXIT, that the encoding cannot express
+        // and the scan above therefore cannot find.
+        //
+        // Before stalls were computed every instruction carried 15, which gave that write
+        // sixteen cycles before the exit by accident. Computed stalls dropped it to the floor
+        // of 1, leaving the ROP to latch a colour its MOV may not have landed yet. A compute
+        // kernel reads nothing at EXIT, and ptxas puts stall 1 on the instruction before one,
+        // so `exit_regs` is zero there and this costs nothing.
+        if (has_gpr_dst and getField(inst.*, 16, 8) < exit_regs) {
+            var d: u32 = 1;
+            while (d <= coupledLatency(opcode) and idx + d < insts.len) : (d += 1) {
+                if (getField(insts[idx + d], 0, 12) == 0x94d) {
+                    need = @max(need, coupledLatency(opcode) -| d);
+                    break;
+                }
+            }
         }
         if (need > 15) need = 15;
         // THE FLOOR IS 1, NOT 0, AND THE REASON IS NOT A HINT. A stall of 0 on an ALU op
@@ -4400,4 +4430,113 @@ test "a compare feeding a later compare's accumulate predicate gets the full sta
     };
     scheduleBlocks(&apart, &.{0});
     try std.testing.expect(getField(apart[0], 105, 4) < coupled_alu_latency - 1);
+}
+
+/// An instruction whose stall does not cover a reader the production consumer scan did not see.
+pub const StallShortfall = struct {
+    /// The producer carrying the short stall.
+    at: usize,
+    /// The reader `consumes` does not recognise.
+    consumer: usize,
+    /// What the producer carries.
+    stall: u32,
+    /// What that reader needs at its distance.
+    required: u32,
+};
+
+/// Whether `later` touches the register run or the predicate `want` produces, judged WITHOUT
+/// the opcode tables `consumes` relies on: every source field counts as a read and every
+/// predicate field as a predicate read. It over-reports by design. A field an opcode does not
+/// use shows up here as a reader, which is noise, but a reader the tables get WRONG cannot hide.
+fn touchesConservatively(later: Inst, want: Consumer) bool {
+    if (want.reg_live) {
+        inline for (.{ 16, 24, 32, 64 }) |pos| {
+            const reg = getField(later, pos, 8);
+            if (reg != RZ and readsWrittenReg(reg, want.reg, @max(want.span, 1))) return true;
+        }
+    }
+    if (want.pred) |p| {
+        inline for (.{ 12, 68, 77, 81, 84, 87 }) |pos| {
+            if (getField(later, pos, 3) == p) return true;
+        }
+    }
+    return false;
+}
+
+/// The first instruction whose emitted stall is shorter than a reader needs, where that reader
+/// is one `consumes` does not recognise. Null when the two agree everywhere that matters.
+///
+/// This is the diff between what `scanConsumers` believes the dependencies are and what a scan
+/// that trusts no opcode table finds over the same stream. A coupled result has no scoreboard,
+/// so its stall is the only thing that makes it ready, and a consumer missing from the scan
+/// leaves the producer short for that reader alone with every latency constant correct.
+///
+/// It reports only where the two DISAGREE and the disagreement makes the stall too short, so a
+/// field an opcode leaves unused is noise here and not a finding.
+pub fn findStallShortfall(insts: []const Inst) ?StallShortfall {
+    for (insts, 0..) |inst, idx| {
+        const opcode = getField(inst, 0, 12);
+        if (isControlFlow(opcode)) continue;
+        const own_pred = predWritten(inst, opcode);
+        const has_gpr_dst = writesDst(opcode) and !isVariableLatency(opcode) and
+            getField(inst, 16, 8) != RZ;
+        if (!has_gpr_dst and own_pred == null) continue;
+
+        const latency = coupledLatency(opcode);
+        const want = Consumer{
+            .pred = own_pred,
+            .reg = getField(inst, 16, 8),
+            .span = if (has_gpr_dst) dstSpan(opcode, inst) else 0,
+            .reg_live = has_gpr_dst,
+        };
+        const stall = getField(inst, 105, 4);
+
+        var dist: u32 = 1;
+        while (dist <= latency and idx + dist < insts.len) : (dist += 1) {
+            const later = insts[idx + dist];
+            const later_op = getField(later, 0, 12);
+            const required = latency -| dist;
+            if (required <= stall) break; // the stall already covers everything this far out
+            if (consumes(later, later_op, want) != .none) break; // the scan saw it
+            // EXIT leaves every field at zero, so the conservative read below would call it a
+            // reader of R0 on every shader. Whether it really reads the output block is the
+            // stage question `assignStalls` handles with `exit_regs`, not a table error.
+            if (later_op == 0x94d or later_op == 0x95b) break;
+            if (touchesConservatively(later, want)) return .{
+                .at = idx,
+                .consumer = idx + dist,
+                .stall = stall,
+                .required = required,
+            };
+        }
+    }
+    return null;
+}
+
+test "the stall-shortfall diff fires on a consumer the opcode tables deny" {
+    // An ordinary chain the scan understands: nothing to report.
+    var ok = [_]Inst{
+        encode.iadd3(10, 4, 4, .{}),
+        encode.iadd3(11, 10, 10, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&ok, &.{0});
+    try std.testing.expectEqual(@as(?StallShortfall, null), findStallShortfall(&ok));
+
+    // Now a reader the tables DENY. `readsSrc` says FADD does not use bits 64..71, so a
+    // register parked there is invisible to `consumes` and the producer keeps the stall floor.
+    // This is the shape of every zero-field bug found tonight, and the diff is what sees it
+    // without having to know which opcode the table is wrong about.
+    var consumer = encode.fadd(11, 4, 5, .{});
+    setField(&consumer, 64, 8, 10);
+    var hidden = [_]Inst{
+        encode.iadd3(10, 4, 4, .{}),
+        consumer,
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&hidden, &.{0});
+    const s = findStallShortfall(&hidden) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), s.at);
+    try std.testing.expectEqual(@as(usize, 1), s.consumer);
+    try std.testing.expect(s.required > s.stall);
 }
