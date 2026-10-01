@@ -4284,3 +4284,76 @@ test "no fixed-latency constant here is shorter than the reference's" {
     // The capture really is a serial chain, so the comparison is not vacuous.
     try std.testing.expect(checked >= 7);
 }
+
+/// A register read before anything in the stream writes it.
+pub const UndefinedRead = struct {
+    at: usize,
+    reg: u8,
+};
+
+/// The first read of a register nothing earlier in the stream writes, or null.
+///
+/// A register the shader never writes holds whatever the previous warp left in it, so reading one
+/// gives a different answer every run. That is the only way a deterministic shader on
+/// deterministic input can produce a different frame each time, and it is invisible to
+/// `findHazard`, which asks whether a producer has LANDED and assumes one exists.
+///
+/// `written` seeds the registers that are live before the first instruction: the architectural
+/// inputs a stage is handed. Everything else must be written by the stream before it is read.
+pub fn findUndefinedRead(insts: []const Inst, written: *const [256]bool) ?UndefinedRead {
+    var seen = written.*;
+    for (insts, 0..) |inst, idx| {
+        const opcode = getField(inst, 0, 12);
+        const form = getField(inst, 9, 3);
+        inline for (.{ 24, 32, 64 }) |pos| {
+            if (readsSrc(opcode, form, pos)) {
+                const reg = getField(inst, pos, 8);
+                if (reg != RZ) {
+                    const span = srcSpan(opcode, inst, pos);
+                    var r: u32 = 0;
+                    while (r < span and reg + r < RZ) : (r += 1) {
+                        if (!seen[reg + r]) return .{ .at = idx, .reg = @intCast(reg + r) };
+                    }
+                }
+            }
+        }
+        if (writesDst(opcode)) {
+            const dst = getField(inst, 16, 8);
+            if (dst != RZ) {
+                const span = dstSpan(opcode, inst);
+                var k: u32 = 0;
+                while (k < span and dst + k < RZ) : (k += 1) seen[dst + k] = true;
+            }
+        }
+    }
+    return null;
+}
+
+test "the undefined-read check accepts a written register and names an unwritten one" {
+    // A register the shader never writes holds whatever the previous warp left there, so reading
+    // one gives a different frame every run. That is the only way a deterministic shader on
+    // deterministic input can be nondeterministic, and `findHazard` cannot see it: that one asks
+    // whether a producer has LANDED and takes for granted that there is one.
+    const empty = [_]bool{false} ** 256;
+    var ok = [_]Inst{
+        encode.ldgU32(8, 8, .{}), // writes R8, reads the address pair R8:R9
+        encode.iadd3(10, 8, 8, .{}),
+        encode.exit(.{}),
+    };
+    // R8:R9 is read as an address before anything writes it, so seed them as architectural.
+    var seeded = empty;
+    seeded[8] = true;
+    seeded[9] = true;
+    scheduleBlocks(&ok, &.{0});
+    try std.testing.expectEqual(@as(?UndefinedRead, null), findUndefinedRead(&ok, &seeded));
+
+    // Read a register nothing writes and nothing seeds.
+    var bad = [_]Inst{
+        encode.iadd3(10, 77, 77, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&bad, &.{0});
+    const u = findUndefinedRead(&bad, &empty) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), u.at);
+    try std.testing.expectEqual(@as(u8, 77), u.reg);
+}

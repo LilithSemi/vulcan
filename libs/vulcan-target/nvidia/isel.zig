@@ -702,9 +702,13 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
         // Graphics keeps R0..R3 for the ROP and can reserve further low registers for MRT
         // and depth. R40:R41 are outside that architectural output block and outside the
         // allocator pool, so every later graphics reservation starts above both scratches.
-        // Only a shader that reconstructs an access byte by byte writes the second scratch,
-        // and a shader that does not keeps its own register count.
-        if (needsMemoryScratch(func, &disp)) max_reg = @max(max_reg, graphics_memory_scratch_reg);
+        //
+        // BOTH ARE ALWAYS DECLARED. The prologue pads with MOVs into R40 on every graphics
+        // shader, so that one is always written, and a register the shader writes without
+        // declaring is outside what the warp owns. Making this conditional on the bytewise
+        // lowering bought nothing anyway: the hardware hands out registers in multiples of
+        // eight, so R40 and R41 land in the same granule.
+        max_reg = @max(max_reg, graphics_memory_scratch_reg);
     }
 
     // Give each hoisted constant a register above everything `assignLocs` handed
@@ -1065,7 +1069,7 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
                     try code.append(allocator, encode.bssy(bar, 0, .{ .stall = 1 }));
                     try fixups.append(allocator, .{ .at = at, .target = @intFromEnum(conv.merge_of_if[bi]), .is_bssy = true });
                 }
-                try emitIf(allocator, func, &loc, &code, &fixups, bi + 1, func.opcode(inst).@"if");
+                try emitIf(allocator, func, stage, &loc, &code, &fixups, bi + 1, func.opcode(inst).@"if");
                 terminated = true;
             }
         }
@@ -1090,7 +1094,7 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
                 }
                 try code.append(allocator, encode.exit(.{ .stall = 1 }));
             },
-            .jump => |j| try emitJump(allocator, func, &loc, &code, &fixups, bi + 1, j),
+            .jump => |j| try emitJump(allocator, func, stage, &loc, &code, &fixups, bi + 1, j),
         };
     }
 
@@ -1995,44 +1999,6 @@ fn globalAccessIsAligned(func: *const Function, ptr: Value, displacement: i32, w
     return @abs(displacement) % need == 0;
 }
 
-/// Whether any access in `func` needs the bytewise global lowering, which is the only writer of
-/// the second graphics scratch register. A shader whose every access sits on its own boundary
-/// never touches that register and does not have to declare it, which keeps the register count
-/// down and the occupancy up.
-///
-/// Anything this cannot read gives the answer that reserves, because an unreserved scratch that
-/// a later reservation also owns loses one of the two writes.
-fn needsMemoryScratch(func: *const Function, disp: *const DispFold) bool {
-    for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
-            const ptr, const value = switch (func.opcode(inst)) {
-                .load => |l| .{ l.ptr, func.instResult(inst) orelse return true },
-                .store => |s| .{ s.ptr, s.value },
-                else => continue,
-            };
-            // Shared memory has its own instruction and never touches the scratch. Everything
-            // else counts, including a private pointer: the lowering sends a private load it
-            // does not recognise down the same global path, and the texture and gradient
-            // reloads that would be skipped here are not known until after registers are
-            // assigned. Over-reserving costs one register; under-reserving lets the bytewise
-            // lowering write a register the shader never declared.
-            switch (ptrSpace(func, ptr) orelse return true) {
-                .global, .constant, .private => {},
-                .shared => continue,
-            }
-            // A store through a graphics output tag becomes an AST or a move, which the
-            // lowering picks BEFORE it looks at memory. A load does not take those branches.
-            if (func.opcode(inst) == .store) {
-                if (attrTag(func, ptr, "out_attr") != null) continue;
-                if (attrTag(func, ptr, "frag_depth") != null) continue;
-                if (attrTag(func, ptr, "color_out") != null) continue;
-            }
-            const width = memTypeOf(func, value) catch return true;
-            if (!globalAccessIsAligned(func, ptr, disp.offsetOf(inst), width)) return true;
-        }
-    }
-    return false;
-}
 
 /// Collapse a chain of constant pointer increments into its last increment.
 ///
@@ -4797,7 +4763,7 @@ fn isSignedRaw(func: *const Function, v: Value) bool {
     };
 }
 
-fn emitIf(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), next: usize, cf: ir.function.If) Error!void {
+fn emitIf(allocator: std.mem.Allocator, func: *const Function, stage: Stage, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), next: usize, cf: ir.function.If) Error!void {
     const pred = predOf(loc.*, cf.cond);
     // Each path's phi edge moves must execute only on that path. The old
     // layout emitted the `then` moves unconditionally, before the guarded
@@ -4816,7 +4782,7 @@ fn emitIf(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHas
     const skip_else = code.items.len;
     try code.append(allocator, encode.bra(0, .{ .pred = pred })); // taken if cond -> L_then
     // else path
-    try emitMoves(allocator, func, loc, code, cf.@"else");
+    try emitMoves(allocator, func, stage, loc, code, cf.@"else");
     const else_bra = code.items.len;
     try code.append(allocator, encode.bra(0, .{}));
     try fixups.append(allocator, .{ .at = else_bra, .target = @intFromEnum(cf.@"else".target) });
@@ -4825,7 +4791,7 @@ fn emitIf(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHas
     // of two: the old layout landed it on a bare trampoline BRA that only
     // existed to reach moves that were not there.
     const then_moves_start = code.items.len;
-    try emitMoves(allocator, func, loc, code, cf.then);
+    try emitMoves(allocator, func, stage, loc, code, cf.then);
     if (code.items.len == then_moves_start) {
         try fixups.append(allocator, .{ .at = skip_else, .target = @intFromEnum(cf.then.target) });
         return;
@@ -4843,8 +4809,8 @@ fn emitIf(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHas
     }
 }
 
-fn emitJump(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), next: usize, jump: ir.function.Jump) Error!void {
-    try emitMoves(allocator, func, loc, code, jump);
+fn emitJump(allocator: std.mem.Allocator, func: *const Function, stage: Stage, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), next: usize, jump: ir.function.Jump) Error!void {
+    try emitMoves(allocator, func, stage, loc, code, jump);
     // The same fallthrough rule as the then-branch of an `if`: a jump to the next
     // emitted block needs no BRA.
     if (@intFromEnum(jump.target) == next) return;
@@ -4871,7 +4837,7 @@ const EdgeMove = struct { dst: u8, src: u8 };
 /// A BOOLEAN LIVES IN A PREDICATE, not a GPR. There is no spare predicate to break a cycle
 /// with: the allocator hands out P0..P5 and P6 is the carry scratch. An edge that passes
 /// one is refused, which is what `gprOf` would otherwise reach an `unreachable` on.
-fn emitMoves(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), jump: ir.function.Jump) Error!void {
+fn emitMoves(allocator: std.mem.Allocator, func: *const Function, stage: Stage, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), jump: ir.function.Jump) Error!void {
     const args = func.blockArgs(jump);
     const params = func.blockParams(jump.target);
     if (args.len != params.len) return error.Unsupported;
@@ -4888,7 +4854,7 @@ fn emitMoves(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             if (dst + i != src + i) try moves.append(allocator, .{ .dst = dst + i, .src = src + i });
         }
     }
-    try emitParallelCopy(allocator, code, &moves);
+    try emitParallelCopy(allocator, code, &moves, memoryScratch(stage).byte);
 }
 
 /// Whether a move OTHER than the one at `skip` still reads `reg`.
@@ -4926,7 +4892,7 @@ fn readByAnotherMove(moves: []const EdgeMove, skip: usize, reg: u8) bool {
 ///
 /// `r_scratch` is the parking register. The prologue owns it and `assignLocs` gives it to no
 /// value, so parking there destroys nothing.
-fn emitParallelCopy(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), moves: *std.ArrayList(EdgeMove)) Error!void {
+fn emitParallelCopy(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), moves: *std.ArrayList(EdgeMove), scratch: u8) Error!void {
     // Each turn either emits a move or breaks a cycle, and a broken cycle lets at least one
     // move go on the next turn, so the whole set drains.
     while (moves.items.len > 0) {
@@ -4941,10 +4907,16 @@ fn emitParallelCopy(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), mo
             try code.append(allocator, encode.movReg(m.dst, m.src, .{}));
             continue;
         }
+        // Park one value so a move can go. The scratch BELONGS TO THE STAGE: compute owns
+        // R0:R1, but a graphics shader publishes its colours and depth out of the low registers
+        // and the ROP reads them at EXIT, so parking into R0 there overwrites an architectural
+        // output with a loop-carried value. Which edges even have a cycle depends entirely on
+        // the registers the allocator handed out, so this fires on one allocation and not on
+        // the next. See `memoryScratch`.
         const parked = moves.items[0].src;
-        try code.append(allocator, encode.movReg(r_scratch, parked, .{}));
+        try code.append(allocator, encode.movReg(scratch, parked, .{}));
         for (moves.items) |*m| {
-            if (m.src == parked) m.src = r_scratch;
+            if (m.src == parked) m.src = scratch;
         }
     }
 }
@@ -7663,11 +7635,12 @@ test "vertex bytewise global memory uses the reserved high scratch pair" {
 }
 
 
-test "an aligned vertex shader does not reserve the bytewise scratch register" {
-    // The second graphics scratch exists only for the bytewise lowering. Reserving it pins the
-    // declared register count at 48, three blocks above the 16 a small shader needs, and every
-    // warp on the GPU pays that. A shader whose every access sits on its own boundary never
-    // writes the register, so it keeps its own count.
+test "every graphics shader declares the scratch registers its prologue writes" {
+    // The prologue pads with MOVs into R40 on every graphics shader, and the bytewise memory
+    // lowering and the parallel-copy cycle break both park into the reserved pair. A shader that
+    // writes a register it did not declare writes outside what the warp owns, so the declared
+    // count covers them whatever the shader does. Registers come in granules of eight, so this
+    // pins 48 rather than the 16 a tiny shader would otherwise ask for.
     const allocator = testing.allocator;
     const Case = struct {
         fn compile(alloc: std.mem.Allocator, offset: i64) !Kernel {
@@ -7687,9 +7660,9 @@ test "an aligned vertex shader does not reserve the bytewise scratch register" {
 
     var aligned = try Case.compile(allocator, 4);
     defer aligned.deinit(allocator);
-    try testing.expectEqual(@as(u32, 16), aligned.reg_count);
+    try testing.expectEqual(@as(u32, 48), aligned.reg_count);
 
-    // The same shader one byte off the boundary keeps the bytewise lowering and the scratch.
+    // And the same shader one byte off the boundary, which does use the bytewise lowering.
     var odd = try Case.compile(allocator, 1);
     defer odd.deinit(allocator);
     try testing.expectEqual(@as(u32, 48), odd.reg_count);
@@ -8811,7 +8784,7 @@ fn simulateParallelCopy(allocator: std.mem.Allocator, moves: []const EdgeMove, i
     try list.appendSlice(allocator, moves);
     var code: std.ArrayList(Inst) = .empty;
     defer code.deinit(allocator);
-    try emitParallelCopy(allocator, &code, &list);
+    try emitParallelCopy(allocator, &code, &list, r_scratch);
 
     var regs = initial;
     for (code.items) |inst| {
@@ -8874,7 +8847,7 @@ test "a CHAIN of edge moves needs no scratch register" {
     });
     var code: std.ArrayList(Inst) = .empty;
     defer code.deinit(allocator);
-    try emitParallelCopy(allocator, &code, &list);
+    try emitParallelCopy(allocator, &code, &list, r_scratch);
 
     try testing.expectEqual(@as(usize, 2), code.items.len);
     for (code.items) |inst| {
@@ -9456,6 +9429,36 @@ test "no emitted instruction reads a source field its opcode leaves at zero" {
             defer k.deinit(allocator);
             try testing.expect(k.code.len > 0);
             try testing.expectEqual(@as(usize, 0), schedule.countPhantomR0(@ptrCast(k.code)));
+        }
+    }
+}
+
+test "a parallel copy cycle parks in the scratch its stage owns, not the ROP block" {
+    // A graphics shader publishes its colours and depth out of R0..R3 and the ROP reads them at
+    // EXIT, so parking a loop-carried value in R0 there replaces an architectural output. Which
+    // edges even have a cycle depends entirely on the registers the allocator handed out, so a
+    // copy that parks in the wrong place corrupts one allocation and not the next.
+    const allocator = testing.allocator;
+    for ([_]Stage{ .compute, .vertex, .fragment }) |stage| {
+        var code: std.ArrayList(Inst) = .empty;
+        defer code.deinit(allocator);
+        var moves: std.ArrayList(EdgeMove) = .empty;
+        defer moves.deinit(allocator);
+        // A two-cycle: R5 and R6 swap, so no move can go first and one value must be parked.
+        try moves.append(allocator, .{ .dst = 5, .src = 6 });
+        try moves.append(allocator, .{ .dst = 6, .src = 5 });
+        const scratch = memoryScratch(stage).byte;
+        try emitParallelCopy(allocator, &code, &moves, scratch);
+
+        // Three moves: park, then the two swaps.
+        try testing.expectEqual(@as(usize, 3), code.items.len);
+        try testing.expectEqual(@as(u32, scratch), (code.items[0][0] >> 16) & 0xff);
+        if (stage != .compute) {
+            try testing.expect(scratch == graphics_pad_reg);
+            // Nothing in a graphics copy may write the ROP output block.
+            for (code.items) |inst| try testing.expect((inst[0] >> 16) & 0xff >= 4);
+        } else {
+            try testing.expectEqual(@as(u8, r_scratch), scratch);
         }
     }
 }
