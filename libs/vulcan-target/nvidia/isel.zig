@@ -4102,17 +4102,23 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, stage: Stage, 
             } else if (if (a.op == .mul) uniform.regOf(a.lhs) else null) |ur| {
                 try code.append(allocator, encode.imadUreg(gprOf(loc.*, result), gprOf(loc.*, a.rhs), ur, encode.RZ, .{}));
             } else if (a.op == .div and isFloat(func, a.lhs)) {
-                // Float divide a/b = a * (1/b): the GPU has no FDIV, so
-                // reciprocate b on the multifunction unit (MUFU.RCP), then
-                // multiply. `normalize` uses this path for its 1.0/sqrt(dot)
-                // reciprocal. The RCP result lands in a scratch register.
-                // MUFU has fixed latency, so the default stall covers the
-                // FMUL dependency.
+                // Float divide a/b = a * (1/b): the GPU has no FDIV, so reciprocate b on the
+                // multifunction unit (MUFU.RCP), then multiply. `normalize` uses this path for
+                // its 1.0/sqrt(dot) reciprocal.
+                //
+                // THE SCRATCH BELONGS TO THE STAGE. This used R0 for every stage, and a
+                // graphics shader publishes its colours and depth out of the low registers
+                // while the SMs deliver sysvals into them asynchronously. See `memoryScratch`.
+                //
+                // MUFU is DECOUPLED on sm_120, so the FMUL below depends on a scoreboard and
+                // not on a stall: `isVariableLatency` names it for exactly this reason, and the
+                // comment that used to sit here claimed the opposite.
                 const rd = gprOf(loc.*, result);
                 const ra = gprOf(loc.*, a.lhs);
                 const rb = gprOf(loc.*, a.rhs);
-                try code.append(allocator, encode.mufu(r_scratch, rb, .rcp, .{}));
-                try code.append(allocator, encode.fmul(rd, ra, r_scratch, .{}));
+                const scratch = memoryScratch(stage).byte;
+                try code.append(allocator, encode.mufu(scratch, rb, .rcp, .{}));
+                try code.append(allocator, encode.fmul(rd, ra, scratch, .{}));
             } else {
                 const rd = gprOf(loc.*, result);
                 const ra = gprOf(loc.*, a.lhs);
@@ -9573,4 +9579,44 @@ test "a fragment colour publish keeps its latency before the exit" {
     defer vert.deinit(allocator);
     try testing.expectEqual(@as(?schedule.StallShortfall, null), schedule.findStallShortfall(@ptrCast(vert.code)));
     try testing.expectEqual(@as(?schedule.StallShortfall, null), schedule.findStallShortfall(@ptrCast(frag.code)));
+}
+
+test "a graphics divide reciprocates into the scratch its stage owns" {
+    // A float divide has no FDIV: it reciprocates on the multifunction unit into a scratch
+    // register and multiplies. That scratch was R0 for every stage, and a graphics shader
+    // publishes its colours and depth out of the low registers while the SMs deliver sysvals
+    // into them asynchronously. `normalize` is the common source of these divides, so a
+    // lighting chain wrote R0 once per normalize.
+    const allocator = testing.allocator;
+    for ([_]Stage{ .vertex, .fragment, .compute }) |stage| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const b = try func.appendBlock();
+        const in = try func.appendBlockParam(b, f32_t);
+        if (stage != .compute) try func.addAttr(.{ .value = in }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = encode.ATTR_GENERIC0 } } });
+        const two = try func.appendInst(b, f32_t, .{ .fconst = 2.0 });
+        const len = try func.appendInst(b, f32_t, .{ .unary = .{ .op = .sqrt, .value = in } });
+        const q = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .div, .lhs = two, .rhs = len } });
+        const out = try func.appendInst(b, i32_t, .{ .iconst = 0 });
+        const key = if (stage == .fragment) "color_out" else "out_attr";
+        const val: i64 = if (stage == .fragment) 0 else encode.ATTR_POSITION;
+        if (stage != .compute) try func.addAttr(.{ .value = out }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = key, .value = .{ .int = val } } });
+        try func.appendStore(b, q, out);
+        func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+        var k = compileShader(allocator, &func, stage, nvidia_abi) catch continue;
+        defer k.deinit(allocator);
+
+        // Every MUFU in a graphics shader stays clear of the architectural output block.
+        var i: usize = 0;
+        var mufus: usize = 0;
+        while (i < k.code.len) : (i += 4) {
+            if (k.code[i] & 0xfff != encode.MUFU_OPCODE) continue;
+            mufus += 1;
+            const dst: u8 = @intCast((k.code[i] >> 16) & 0xff);
+            if (stage != .compute) try testing.expect(dst >= 4);
+        }
+        try testing.expect(mufus >= 1); // at least the reciprocal
+    }
 }
