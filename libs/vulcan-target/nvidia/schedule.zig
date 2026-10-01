@@ -893,8 +893,22 @@ pub fn scheduleBlocksExit(insts: []Inst, block_starts: []const usize, exit_regs:
                     !barrierHeld(&scoreboard_of, &read_scoreboard_of, @intCast(ldg_group))) {
                     ldg_group = num_scoreboards;
                 }
-                const reuse_ldg = opcode == 0x981 and ldg_group < num_scoreboards;
-                const sb: u3 = if (reuse_ldg) @intCast(ldg_group) else @intCast(@ctz(free_mask));
+                // NEVER ARM A BARRIER THIS INSTRUCTION ALSO WAITS ON. A decoupled op whose
+                // sources come from another decoupled op waits on that barrier at issue, and if
+                // it then claims the same barrier for its own write, the drain it is waiting for
+                // and the increment it is about to make are the same counter. Whether the
+                // hardware orders those is not something this code can know.
+                //
+                // ptxas never does it: zero instances across six measured sm_120 kernels,
+                // including a MUFU-heavy one and a twenty-four-load one. A `normalize` lowers to
+                // MUFU.SQRT then MUFU.RCP reading its result, which is exactly the shape that
+                // produced it here.
+                const own_wait: u8 = @intCast(getField(inst.*, 116, 6));
+                const clear_of_wait = free_mask & ~own_wait;
+                const pool = if (clear_of_wait != 0) clear_of_wait else free_mask;
+                const reuse_ldg = opcode == 0x981 and ldg_group < num_scoreboards and
+                    (own_wait & (@as(u8, 1) << @intCast(ldg_group))) == 0;
+                const sb: u3 = if (reuse_ldg) @intCast(ldg_group) else @intCast(@ctz(pool));
                 free_mask &= ~(@as(u8, 1) << sb);
                 if (opcode == 0x981 and (reuse_ldg or hasLargeLdgBatch(insts, idx, block_starts))) ldg_group = sb;
                 own_write_barrier = sb;
@@ -4572,4 +4586,40 @@ test "an unused register slot holds RZ, not a zero that reads as R0" {
     try std.testing.expect(!writesDst(0x918));
     try std.testing.expect(!readsSrc(0x94d, 0, 24));
     try std.testing.expect(!writesDst(0x94d));
+}
+
+/// Instructions that arm a write or read barrier they also wait on.
+///
+/// The wait drains a counter and the arm increments the same one. Whether the hardware orders
+/// those within an instruction is not something this code can know, and ptxas never relies on
+/// it: zero instances across six measured sm_120 kernels, including a MUFU-heavy one and a
+/// twenty-four-load one. A `normalize` lowers to MUFU.SQRT then MUFU.RCP reading its result,
+/// which is the shape that produced it here.
+pub fn countSelfWaits(insts: []const Inst) usize {
+    var n: usize = 0;
+    for (insts) |inst| {
+        const wait = getField(inst, 116, 6);
+        inline for (.{ 110, 113 }) |pos| {
+            const bar = getField(inst, pos, 3);
+            if (bar < num_scoreboards and (wait & (@as(u32, 1) << @intCast(bar))) != 0) n += 1;
+        }
+    }
+    return n;
+}
+
+test "no instruction arms a barrier it waits on" {
+    // MUFU.SQRT then MUFU.RCP reading its result: the reciprocal must wait on the square root's
+    // barrier, so it has to take a different one for its own write.
+    var insts = [_]Inst{
+        encode.mufu(7, 8, .sqrt, .{}),
+        encode.mufu(9, 7, .rcp, .{}),
+        encode.fmul(10, 4, 9, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(usize, 0), countSelfWaits(&insts));
+    // And the chain really is synchronised, so the zero above is not from nobody waiting.
+    try std.testing.expect(getField(insts[1], 116, 6) != 0);
+    try std.testing.expect(getField(insts[1], 110, 3) < num_scoreboards);
+    try std.testing.expect(getField(insts[1], 110, 3) != getField(insts[0], 110, 3));
 }

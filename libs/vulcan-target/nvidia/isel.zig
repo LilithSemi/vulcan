@@ -9458,6 +9458,8 @@ test "no emitted instruction reads a source field its opcode leaves at zero" {
             // And no coupled result is left with a stall shorter than a reader needs, judged
             // against a scan that trusts no opcode table. See `findStallShortfall`.
             try testing.expectEqual(@as(?schedule.StallShortfall, null), schedule.findStallShortfall(@ptrCast(k.code)));
+            // And nothing arms a barrier it waits on. See `countSelfWaits`.
+            try testing.expectEqual(@as(usize, 0), schedule.countSelfWaits(@ptrCast(k.code)));
         }
     }
 }
