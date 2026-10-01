@@ -116,6 +116,8 @@ pub fn movImm(dst: u8, imm: u32, c: Control) Inst {
     setBits(&w, 0, 9, 0x002);
     setBits(&w, 9, 3, 4); // form: 32-bit immediate
     setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, RZ); // no operands in either slot, see `movReg`
+    setBits(&w, 64, 8, RZ);
     setBits(&w, 32, 32, imm);
     setBits(&w, 72, 4, 0xf); // all quad lanes
     return w;
@@ -127,6 +129,11 @@ pub fn movReg(dst: u8, src: u8, c: Control) Inst {
     setBits(&w, 0, 9, 0x002);
     setBits(&w, 9, 3, 1); // form: register source
     setBits(&w, 16, 8, dst);
+    // MOV takes no operand at bits 24..31 or 64..71. Left at zero those fields read back as R0,
+    // which any analysis over the finished stream has to treat as reads of R0. RZ is what an
+    // unused register slot means, and what `alu` already writes into the ones its callers skip.
+    setBits(&w, 24, 8, RZ);
+    setBits(&w, 64, 8, RZ);
     setBits(&w, 32, 8, src);
     setBits(&w, 72, 4, 0xf);
     return w;

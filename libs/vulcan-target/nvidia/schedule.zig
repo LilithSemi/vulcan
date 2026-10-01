@@ -4444,15 +4444,27 @@ pub const StallShortfall = struct {
     required: u32,
 };
 
-/// Whether `later` touches the register run or the predicate `want` produces, judged WITHOUT
-/// the opcode tables `consumes` relies on: every source field counts as a read and every
-/// predicate field as a predicate read. It over-reports by design. A field an opcode does not
-/// use shows up here as a reader, which is noise, but a reader the tables get WRONG cannot hide.
+/// Whether `later` touches the register run or the predicate `want` produces, judged without the
+/// PER-OPCODE tables `consumes` relies on. Every field that the instruction FORM says holds a
+/// register counts as a read, whatever the opcode claims.
+///
+/// The form is kept because it is structural: bits 32..63 are a 32-bit immediate in form 4, and
+/// reading its low byte as a register number finds R0 in every constant whose low byte is zero.
+/// The per-opcode source table is what is dropped, because that is where all five of the
+/// zero-field bugs found so far have lived.
 fn touchesConservatively(later: Inst, want: Consumer) bool {
     if (want.reg_live) {
+        const form = getField(later, 9, 3);
         inline for (.{ 16, 24, 32, 64 }) |pos| {
-            const reg = getField(later, pos, 8);
-            if (reg != RZ and readsWrittenReg(reg, want.reg, @max(want.span, 1))) return true;
+            const holds_register = switch (pos) {
+                16, 24 => true,
+                32 => form == 1, // otherwise an immediate or a constant-bank offset
+                else => form != 4,
+            };
+            if (holds_register) {
+                const reg = getField(later, pos, 8);
+                if (reg != RZ and readsWrittenReg(reg, want.reg, @max(want.span, 1))) return true;
+            }
         }
     }
     if (want.pred) |p| {
@@ -4539,4 +4551,25 @@ test "the stall-shortfall diff fires on a consumer the opcode tables deny" {
     try std.testing.expectEqual(@as(usize, 0), s.at);
     try std.testing.expectEqual(@as(usize, 1), s.consumer);
     try std.testing.expect(s.required > s.stall);
+}
+
+test "an unused register slot holds RZ, not a zero that reads as R0" {
+    // Every field an opcode does not use must say RZ. Left at zero it reads back as R0, and any
+    // analysis over the finished stream then sees a read or a write of R0 that is not there:
+    // the scheduler waits on R0 scoreboard and clears its tag, or a stall is computed for a
+    // dependency that does not exist. Five opcodes had this tonight, so it gets a test.
+    const movs = [_]Inst{
+        encode.movReg(7, 5, .{}),
+        encode.movImm(7, 0x40000000, .{}),
+    };
+    for (movs) |m| {
+        try std.testing.expectEqual(@as(u32, RZ), getField(m, 24, 8));
+        try std.testing.expectEqual(@as(u32, RZ), getField(m, 64, 8));
+    }
+    // NOP and EXIT leave everything zero, which is why `readsSrc` and `writesDst` name them
+    // rather than relying on RZ.
+    try std.testing.expect(!readsSrc(0x918, 0, 24));
+    try std.testing.expect(!writesDst(0x918));
+    try std.testing.expect(!readsSrc(0x94d, 0, 24));
+    try std.testing.expect(!writesDst(0x94d));
 }
