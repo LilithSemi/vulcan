@@ -169,6 +169,12 @@ fn writesDst(opcode: u32) bool {
         // map from being polluted by a phantom "R0/R1" write.
         0x355, 0x945, 0x941 => false,
         0x918 => false, // NOP writes nothing; bits 16..23 are zero, not a destination
+        // ISETP and FSETP write a PREDICATE, never a GPR. Their bits 16..23 are left at zero,
+        // which reads back as R0: the compare then claims R0 as its destination, waits on R0
+        // scoreboard, CLEARS its tag so the real consumer of R0 emits no wait, and takes a
+        // stall computed for R0 consumers. `predWritten` already reports the predicate these
+        // write, so excluding the GPR destination here loses nothing.
+        0x00c, 0x00b, 0x20c, 0x20b, 0x80c, 0x80b => false,
         // RED (0x98e), the global atomic reduction. It applies the operation to memory and
         // gives back nothing, so it is a store, not a load. The encoder writes RZ into bits
         // 16..24, following NAK's set_dst(&Dst::None), and the RZ guard below would already
@@ -1586,6 +1592,16 @@ fn predRead(inst: Inst, pred: u8) bool {
         if (p != encode.PT and p == pred) return true;
     }
     if (base == 0x010 and getField(inst, 74, 1) == 1) { // IADD3.X reads its carry-in
+        const p: u8 = @intCast(getField(inst, 87, 3));
+        if (p != encode.PT and p == pred) return true;
+    }
+    // ISETP and FSETP take an ACCUMULATE predicate at bits 87..89, which is how a folded
+    // `a && b` reaches the hardware as one instruction. The isel emits exactly that shape, see
+    // `scanPredicateAnds`, so a compare feeding a later compare is a real dependency and
+    // missing it leaves the producer at the stall floor of 1 where it needs the full latency.
+    // Real ptxas sm_120 puts stall 5 on every link of an ISETP.AND chain whose consumer is the
+    // next instruction, which is a latency of 6, the ordinary ALU value.
+    if (base == 0x00c or base == 0x00b) {
         const p: u8 = @intCast(getField(inst, 87, 3));
         if (p != encode.PT and p == pred) return true;
     }
@@ -4360,4 +4376,28 @@ test "the undefined-read check accepts a written register and names an unwritten
     const u = findUndefinedRead(&bad, &empty) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), u.at);
     try std.testing.expectEqual(@as(u8, 77), u.reg);
+}
+
+test "a compare feeding a later compare's accumulate predicate gets the full stall" {
+    // `a && b` folds into one ISETP whose accumulate operand at bits 87..89 is the previous
+    // compare's predicate. That is a real dependency on the slow predicate path, and with it
+    // unseen the producer sat at the stall floor of 1 while the consumer needed six cycles.
+    // ptxas sm_120 puts stall 5 on every link of such a chain at distance 1.
+    var insts = [_]Inst{
+        encode.isetp(0, 4, 5, .gt, true, .{}),
+        encode.isetpAnd(1, 4, 5, .lt, true, 0, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(coupled_alu_latency - 1, getField(insts[0], 105, 4));
+
+    // A chain whose second compare does NOT read the first predicate needs no stall for it,
+    // so the number above is the dependency and not the shape of the test.
+    var apart = [_]Inst{
+        encode.isetp(0, 4, 5, .gt, true, .{}),
+        encode.isetp(1, 4, 5, .lt, true, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&apart, &.{0});
+    try std.testing.expect(getField(apart[0], 105, 4) < coupled_alu_latency - 1);
 }
