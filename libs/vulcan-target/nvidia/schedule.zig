@@ -168,6 +168,7 @@ fn writesDst(opcode: u32) bool {
         // register (or RZ), NOT a GPR dst - excluding them keeps the GPR scoreboard
         // map from being polluted by a phantom "R0/R1" write.
         0x355, 0x945, 0x941 => false,
+        0x918 => false, // NOP writes nothing; bits 16..23 are zero, not a destination
         // RED (0x98e), the global atomic reduction. It applies the operation to memory and
         // gives back nothing, so it is a store, not a load. The encoder writes RZ into bits
         // 16..24, following NAK's set_dst(&Dst::None), and the RZ guard below would already
@@ -227,6 +228,9 @@ fn readsSrc(opcode: u32, form: u32, pos: usize) bool {
         // Convergence barriers (BCLEAR/BSSY/BSYNC) and BAR read no GPR at all: their
         // bit-24/16 fields hold a Bar register, and BAR has no operand.
         0x355, 0x945, 0x941, 0xb1d => false,
+        // NOP. Every field is zero, so the generic rule below would read bits 24 and 64 as R0,
+        // making the trailing padding wait on R0 scoreboard and clear its tag.
+        0x918 => false,
         // IPA (0x326), the fragment-input interpolation, in both the perspective and the
         // CONSTANT form. Bits 64..71 hold the ATTRIBUTE ADDRESS divided by 4, not a
         // register: ATTR_GENERIC0 (0x80) reads back as "R32" and ATTR_POSITION (0x70) as
@@ -1327,7 +1331,7 @@ fn isAluOp(opcode: u32) bool {
     return switch (opcode) {
         0x355, 0x945, 0x941, 0xb1d => false, // BCLEAR, BSSY, BSYNC, BAR
         0x326, 0x919 => false, // IPA, S2R
-        0x947, 0x94d, 0x95b => false, // BRA, EXIT, KIL
+        0x947, 0x94d, 0x95b, 0x918 => false, // BRA, EXIT, KIL, NOP
         0x81c => false, // PLOP3
         0x202, 0x802 => false, // MOV, register and immediate form
         0xb82, 0x321, 0x322 => false, // LDC, ALD, AST

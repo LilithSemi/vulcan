@@ -1147,6 +1147,19 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
     // and with the patch first the scheduler runs last and its choices stand.
     schedule.scheduleBlocks(code.items, block_start);
 
+    // The instruction fetch unit reads AHEAD of the program counter, so the bytes after the last
+    // instruction get fetched whether or not they are code. ptxas ends every shader with a
+    // branch to itself and pads with NOPs out to a 128-byte multiple, so what the fetcher reads
+    // ahead is always a NOP, and a warp that somehow runs past EXIT loops instead of executing
+    // whatever memory happens to follow the buffer. We emitted nothing at all, which left the
+    // tail of the last fetch line holding other people's data.
+    //
+    // This goes after scheduling on purpose. The padding has no dependencies, needs no barrier,
+    // no wait and no stall, and the scheduler must not treat the trap branch as control flow
+    // that ends a basic block.
+    try code.append(allocator, encode.bra(-4, .{ .stall = 0 }));
+    while (code.items.len % 8 != 0) try code.append(allocator, encode.nop(.{ .stall = 0 }));
+
     // Flatten to dwords.
     const out = try allocator.alloc(u32, code.items.len * 4);
     errdefer allocator.free(out);
@@ -5343,7 +5356,7 @@ test "compiles a kernel: load params, multiply-add, store, exit" {
     // THE ADD IS GONE, and that is the contraction: `x * y + x` is one IMAD, whose addend
     // field held RZ while the sum needed a separate IADD3. This test read 7 instructions
     // with an IADD3 after the IMAD before `FmaFold` existed.
-    try testing.expectEqual(@as(usize, 6 * 4), kernel.code.len);
+    try testing.expectEqual(@as(usize, 6), bodyLen(kernel.code));
     try testing.expectEqual(@as(u32, 0xb82), kernel.code[0] & 0xfff); // first LDC
     // The first LDC reads the whole output pointer at the ABI's parameter base.
     try testing.expectEqual(
@@ -7144,7 +7157,7 @@ test "a shared pointer parameter is 32 bits: ONE LDC, and its accesses are LDS a
     // LDC.64 outptr, LDC tile, LDC n, LDS, IADD3, STS, STG, EXIT.
     // The tile pointer contributes ONE LDC. A 64-bit pointer would read a PAIR, which is
     // what the outptr LDC.64 does in one instruction.
-    try testing.expectEqual(@as(usize, 8 * 4), kernel.code.len);
+    try testing.expectEqual(@as(usize, 8), bodyLen(kernel.code));
     try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 0)); // outptr, one LDC.64
     try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 1)); // tile, the ONLY one
     try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 2)); // n
@@ -7220,7 +7233,7 @@ test "shared address arithmetic is one 32-bit IADD3, where a global address is a
     }.of;
 
     // Shared: LDC.64 outptr, LDC tile, LDC i, IADD3, LDS, STG, EXIT.
-    try testing.expectEqual(@as(usize, 7 * 4), shared_k.code.len);
+    try testing.expectEqual(@as(usize, 7), bodyLen(shared_k.code));
     try testing.expectEqual(@as(usize, 1), count(shared_k.code, 0x210)); // ONE IADD3
     try testing.expectEqual(@as(usize, 1), count(shared_k.code, 0x984)); // LDS
     try testing.expectEqual(@as(usize, 0), count(shared_k.code, 0x981)); // no LDG
@@ -8621,7 +8634,7 @@ test "a shared alloca lowers to a MOV of its frame offset, and two of them do no
     defer kernel.deinit(allocator);
 
     // LDC n, MOV tile, MOV small, STS, STS, EXIT. No LDC for either slot.
-    try testing.expectEqual(@as(usize, 6 * 4), kernel.code.len);
+    try testing.expectEqual(@as(usize, 6), bodyLen(kernel.code));
     try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 0)); // LDC n
     try testing.expectEqual(@as(u32, 0x802), opAt(kernel.code, 1)); // MOV immediate
     try testing.expectEqual(@as(u32, 0x802), opAt(kernel.code, 2));
@@ -8663,7 +8676,7 @@ test "a shared alloca's element address is ONE 32-bit IADD3, with no carry chain
     defer kernel.deinit(allocator);
 
     // LDC i, MOV tile, IADD3, LDS, STS, EXIT. A global pointer would need two IADD3s here.
-    try testing.expectEqual(@as(usize, 6 * 4), kernel.code.len);
+    try testing.expectEqual(@as(usize, 6), bodyLen(kernel.code));
     try testing.expectEqual(@as(u32, 0x802), opAt(kernel.code, 1)); // MOV frame offset
     try testing.expectEqual(@as(u32, 0x210), opAt(kernel.code, 2)); // the ONE IADD3
     try testing.expectEqual(@as(u32, 0x984), opAt(kernel.code, 3)); // LDS
@@ -9461,4 +9474,49 @@ test "a parallel copy cycle parks in the scratch its stage owns, not the ROP blo
             try testing.expectEqual(@as(u8, r_scratch), scratch);
         }
     }
+}
+
+test "every shader ends with a trap branch and NOP padding" {
+    // The instruction fetch unit reads ahead of the program counter, so the bytes after the
+    // last instruction are fetched whether or not they are code. ptxas ends every shader with a
+    // branch to itself and pads with NOPs to a 128-byte multiple, and this holds us to that:
+    // what the fetcher reads ahead is a NOP, and a warp that runs past EXIT loops instead of
+    // executing whatever memory follows the buffer.
+    const allocator = testing.allocator;
+    for ([_]Stage{ .vertex, .fragment, .compute }) |stage| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const b = try func.appendBlock();
+        const in = try func.appendBlockParam(b, f32_t);
+        try func.addAttr(.{ .value = in }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = encode.ATTR_GENERIC0 } } });
+        const two = try func.appendInst(b, f32_t, .{ .fconst = 2.0 });
+        const sum = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = in, .rhs = two } });
+        const out = try func.appendInst(b, i32_t, .{ .iconst = 0 });
+        const key = if (stage == .fragment) "color_out" else "out_attr";
+        const val: i64 = if (stage == .fragment) 0 else encode.ATTR_POSITION;
+        try func.addAttr(.{ .value = out }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = key, .value = .{ .int = val } } });
+        try func.appendStore(b, sum, out);
+        func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+        var k = compileShader(allocator, &func, stage, nvidia_abi) catch continue;
+        defer k.deinit(allocator);
+        const n = k.code.len / 4;
+        const body = bodyLen(k.code);
+        try testing.expect(body < n); // something follows EXIT
+        try testing.expectEqual(@as(u32, 0x947), k.code[body * 4] & 0xfff); // the trap branch
+        var j = body + 1;
+        while (j < n) : (j += 1) try testing.expectEqual(@as(u32, 0x918), k.code[j * 4] & 0xfff);
+        try testing.expectEqual(@as(usize, 0), n % 8); // padded to a 128-byte multiple
+    }
+}
+
+/// Instructions up to and including EXIT, so a count means the shader's body and not the trap
+/// branch and NOP padding that follow it. See the fetch-ahead note in `compileShaderOwned`.
+fn bodyLen(code: []const u32) usize {
+    var i: usize = 0;
+    while (i < code.len) : (i += 4) {
+        if (code[i] & 0xfff == 0x94d) return i / 4 + 1;
+    }
+    return code.len / 4;
 }

@@ -2973,3 +2973,11 @@ test "LEA encodes (a << shift) + b in one instruction" {
     // The widest shift the 5-bit field holds.
     try std.testing.expectEqual(@as(u32, 31), (lea(9, 7, 6, 31, .{})[2] >> (75 - 64)) & 0x1f);
 }
+
+/// NOP. Its only use is the padding after a shader's last instruction: see the fetch-ahead
+/// note in `compileShaderOwned`.
+pub fn nop(c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 12, 0x918);
+    return w;
+}
