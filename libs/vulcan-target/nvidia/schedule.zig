@@ -4588,17 +4588,26 @@ test "an unused register slot holds RZ, not a zero that reads as R0" {
     try std.testing.expect(!writesDst(0x94d));
 }
 
-/// Instructions that arm a write or read barrier they also wait on.
+/// Instructions that arm a write or read barrier they also PARTIALLY wait on.
 ///
 /// The wait drains a counter and the arm increments the same one. Whether the hardware orders
 /// those within an instruction is not something this code can know, and ptxas never relies on
 /// it: zero instances across six measured sm_120 kernels, including a MUFU-heavy one and a
 /// twenty-four-load one. A `normalize` lowers to MUFU.SQRT then MUFU.RCP reading its result,
 /// which is the shape that produced it here.
+///
+/// A FULL DRAIN IS EXEMPT, and that exemption is the reason this says "partially". An
+/// instruction waiting on every barrier has every barrier clear by the time it issues, so there
+/// is nothing for its own arm to contend with. `drainAll` emits exactly that, and the barrier
+/// chooser cannot avoid it either: with every barrier in the wait mask the exclusion set is
+/// everything and there is nothing left to pick. Counting those would make this assertion fire
+/// on a shape that is sound, which is worse than not asserting it.
 pub fn countSelfWaits(insts: []const Inst) usize {
+    const all = (1 << num_scoreboards) - 1;
     var n: usize = 0;
     for (insts) |inst| {
         const wait = getField(inst, 116, 6);
+        if (wait == all) continue;
         inline for (.{ 110, 113 }) |pos| {
             const bar = getField(inst, pos, 3);
             if (bar < num_scoreboards and (wait & (@as(u32, 1) << @intCast(bar))) != 0) n += 1;
@@ -4622,4 +4631,11 @@ test "no instruction arms a barrier it waits on" {
     try std.testing.expect(getField(insts[1], 116, 6) != 0);
     try std.testing.expect(getField(insts[1], 110, 3) < num_scoreboards);
     try std.testing.expect(getField(insts[1], 110, 3) != getField(insts[0], 110, 3));
+
+    // A full drain is exempt and must stay exempt: it waits on every barrier, so every barrier
+    // is clear when it issues and arming one it drained contends with nothing.
+    var drained = [_]Inst{ encode.ldgU32(8, 32, .{}), encode.exit(.{}) };
+    setField(&drained[0], 116, 6, (1 << num_scoreboards) - 1);
+    setField(&drained[0], 110, 3, 0);
+    try std.testing.expectEqual(@as(usize, 0), countSelfWaits(&drained));
 }
