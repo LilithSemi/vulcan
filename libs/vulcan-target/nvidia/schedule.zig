@@ -262,6 +262,18 @@ fn readsSrc(opcode: u32, form: u32, pos: usize) bool {
         // BOTH forms, so the ALU rule read two phantom R0 sources on the most frequently
         // emitted instruction in the backend.
         0x202, 0x802 => pos == 32 and form == 1,
+        // FADD and FMUL take TWO sources. The generic rule below reads bits 64..71 as a third
+        // for every ALU op, and a two-source op leaves that field at whatever its encoder puts
+        // there. Our own `alu` writes RZ, which every caller skips, so this was harmless here;
+        // real ptxas writes ZERO, which reads back as R0. Then the op waits on R0's scoreboard
+        // and clears its tag, so whatever really consumes R0 emits no wait and reads it stale,
+        // and `markReuse` marks a slot for an operand the instruction never reads. This is the
+        // same shape already fixed for IPA above.
+        // The opcode field at bits 0..11 carries the FORM in bits 9..11, so each form of an
+        // instruction is a distinct value here: FADD is 0x221 in the register form and 0x821 in
+        // the immediate one, FMUL 0x220 and 0x820. A form this does not name falls to the
+        // generic rule below, which over-reads rather than under-reads.
+        0x220, 0x221, 0x820, 0x821 => pos == 24 or (pos == 32 and form == 1),
         // LDC (0xb82), the constant-bank load. Bits 24..31 hold the DYNAMIC offset
         // register, which the encoder always sets to RZ, and it is a real register field.
         // The 16-bit static offset lives at bits 38..53 and the bank at 54..58, so bits
@@ -641,6 +653,20 @@ fn setField(inst: *Inst, comptime lo: usize, comptime width: usize, val: u32) vo
 
 const num_scoreboards = 6;
 
+/// How deep a load group is known to work.
+///
+/// The write barrier is a counter: each load on it raises the count and a wait releases when the
+/// count drains, so a wait covers a load only while that load is still counted. A group deeper
+/// than the count would release its wait early. `findHazard` takes that depth as a parameter so
+/// the question can be asked again on other hardware.
+///
+/// THE REFERENCE DOES THE SAME THING. CUDA 12.9 ptxas on sm_120, given 24 independent global
+/// loads, assigns barriers 2, 2, 3, 4 and then puts TWENTY loads on barrier 5. One consumer
+/// waits on barrier 5 and every later consumer carries no wait at all. So a deep group and a
+/// single retiring wait are the reference policy, not something this backend invented, and the
+/// counter covers at least twenty.
+pub const measured_ldg_group = 20;
+
 /// Assign scoreboards and wait masks across `insts` so every variable-latency
 /// result is awaited before it is consumed. Rewrites the scheduling control fields
 /// in place. `block_starts`, if given, are the instruction indices at which a basic
@@ -841,11 +867,17 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
         if (isVariableLatency(opcode) and writesDst(opcode)) {
             const dst = getField(inst.*, 16, 8);
             if (dst != RZ) {
-                const reuse_ldg = opcode == 0x981 and ldg_group < num_scoreboards and
-                    barrierHeld(&scoreboard_of, &read_scoreboard_of, @intCast(ldg_group));
                 if (free_mask == 0) drainAll(inst, &scoreboard_of, &read_scoreboard_of, &free_mask);
+                // A drain lands every result, so whatever group was open is gone. Reading the
+                // group before the drain kept it open over a barrier the drain had freed, and
+                // the load then took a scoreboard the free pool still offered to somebody else.
+                if (ldg_group < num_scoreboards and
+                    !barrierHeld(&scoreboard_of, &read_scoreboard_of, @intCast(ldg_group))) {
+                    ldg_group = num_scoreboards;
+                }
+                const reuse_ldg = opcode == 0x981 and ldg_group < num_scoreboards;
                 const sb: u3 = if (reuse_ldg) @intCast(ldg_group) else @intCast(@ctz(free_mask));
-                if (!reuse_ldg) free_mask &= ~(@as(u8, 1) << sb);
+                free_mask &= ~(@as(u8, 1) << sb);
                 if (opcode == 0x981 and (reuse_ldg or hasLargeLdgBatch(insts, idx, block_starts))) ldg_group = sb;
                 own_write_barrier = sb;
                 setField(inst, 110, 3, sb); // write barrier
@@ -1116,6 +1148,168 @@ fn drainAll(inst: *Inst, scoreboard_of: *[256]u8, read_scoreboard_of: *[256]u8, 
     @memset(scoreboard_of, 0);
     @memset(read_scoreboard_of, 0);
     free_mask.* = (1 << num_scoreboards) - 1;
+}
+
+/// A read or a write the scheduled stream does not protect.
+pub const Hazard = struct {
+    pub const Kind = enum {
+        /// A register read while a variable-latency producer is still in flight, with no wait
+        /// covering that producer's barrier.
+        stale_read,
+        /// A register read before a fixed-latency producer's stall count has paid its latency.
+        /// No barrier is involved: the stall field is the only protection this class has.
+        early_read,
+        /// A register overwritten while a variable-latency producer is still in flight. The
+        /// late write lands on top and the overwriting value is lost.
+        late_write,
+        /// A source register overwritten while a decoupled op is still collecting it. The op
+        /// then reads the new value: a load addresses the wrong place, a store sends the wrong
+        /// data. This is what the READ barriers exist for.
+        early_clobber,
+    };
+    kind: Kind,
+    /// The instruction that reads or overwrites the register.
+    at: usize,
+    /// The instruction whose result is not ready.
+    producer: usize,
+    reg: u8,
+};
+
+/// The first unprotected access in a scheduled stream, or null when every one is covered.
+///
+/// This shares the instruction decoder with `scheduleBlocks` and none of its bookkeeping. The
+/// scheduler decides which barrier a producer takes, which loads join a group, when a wait
+/// retires one and what stall a fixed-latency result needs; this walks the finished stream and
+/// asks only what the hardware asks, so a wrong group, a wrong retire or a short stall shows up
+/// here instead of on a card.
+///
+/// `retire_depth` is how many writes on one barrier a wait releases. The hardware barrier is a
+/// counter and its width is not something this code can read, so pass the depth to test: a group
+/// deeper than the counter releases its wait early, and this reports the reads that follow.
+///
+/// The walk is linear, which is the scheduler's own model: it drains every barrier at a block
+/// boundary so a producer on one path cannot reach a consumer on another.
+pub fn findHazard(insts: []const Inst, retire_depth: u32) ?Hazard {
+    var barrier_of = [_]u8{0} ** 256; // a variable-latency producer's barrier + 1, per register
+    var producer_of = [_]usize{0} ** 256;
+    var age_of = [_]u32{0} ** 256; // issue order within the barrier, for a bounded retire
+    var issued = [_]u32{0} ** num_scoreboards;
+    var retired = [_]u32{0} ** num_scoreboards;
+    // The fixed-latency side. A coupled result has no barrier: it is ready once enough cycles
+    // have passed, and the stall counts are the only thing that makes them pass.
+    var ready_at = [_]u64{0} ** 256;
+    var coupled_by = [_]usize{0} ** 256;
+    // The read side. A decoupled op collects its sources when its pipe reaches it, not when it
+    // issues, so a write to one of them before then reaches the op instead of the old value.
+    var collecting = [_]u8{0} ** 256; // the collecting op's read barrier + 1, per source register
+    var collector_of = [_]usize{0} ** 256;
+    var cycle: u64 = 0;
+
+    for (insts, 0..) |inst, idx| {
+        const opcode = getField(inst, 0, 12);
+        const form = getField(inst, 9, 3);
+
+        // A wait releases the writes its barriers still count. A counter that stops climbing
+        // releases early: everything past its top stays in flight while the wait succeeds.
+        const wait = getField(inst, 116, 6);
+        var w: u3 = 0;
+        while (w < num_scoreboards) : (w += 1) {
+            if ((wait & (@as(u32, 1) << w)) == 0) continue;
+            retired[w] += @min(issued[w] - retired[w], retire_depth);
+            for (&barrier_of, 0..) |*b, r| {
+                if (b.* == @as(u8, w) + 1 and age_of[r] < retired[w]) b.* = 0;
+            }
+            // A read barrier signals once the op has collected every source it reads, so one
+            // wait releases the whole run of them.
+            for (&collecting) |*c| {
+                if (c.* == @as(u8, w) + 1) c.* = 0;
+            }
+        }
+
+        // Every source must be ready by now, from either side.
+        inline for (.{ 24, 32, 64 }) |pos| {
+            if (readsSrc(opcode, form, pos)) {
+                const reg = getField(inst, pos, 8);
+                if (reg != RZ) {
+                    const span = srcSpan(opcode, inst, pos);
+                    var r: u32 = 0;
+                    while (r < span and reg + r < RZ) : (r += 1) {
+                        const sreg = reg + r;
+                        if (barrier_of[sreg] != 0) return .{
+                            .kind = .stale_read,
+                            .at = idx,
+                            .producer = producer_of[sreg],
+                            .reg = @intCast(sreg),
+                        };
+                        if (ready_at[sreg] > cycle) return .{
+                            .kind = .early_read,
+                            .at = idx,
+                            .producer = coupled_by[sreg],
+                            .reg = @intCast(sreg),
+                        };
+                    }
+                }
+            }
+        }
+
+        // Then this instruction's own write.
+        if (writesDst(opcode)) {
+            const dst = getField(inst, 16, 8);
+            if (dst != RZ) {
+                const variable = isVariableLatency(opcode);
+                const bar = getField(inst, 110, 3);
+                const span = if (variable) dstSpan(opcode, inst) else 1;
+                var k: u32 = 0;
+                while (k < span and dst + k < RZ) : (k += 1) {
+                    const wreg = dst + k;
+                    // Overwriting a result that has not landed loses this write to the late one.
+                    if (barrier_of[wreg] != 0) return .{
+                        .kind = .late_write,
+                        .at = idx,
+                        .producer = producer_of[wreg],
+                        .reg = @intCast(wreg),
+                    };
+                    if (collecting[wreg] != 0) return .{
+                        .kind = .early_clobber,
+                        .at = idx,
+                        .producer = collector_of[wreg],
+                        .reg = @intCast(wreg),
+                    };
+                    if (variable and bar < num_scoreboards) {
+                        barrier_of[wreg] = @as(u8, @intCast(bar)) + 1;
+                        producer_of[wreg] = idx;
+                        age_of[wreg] = issued[bar];
+                        ready_at[wreg] = 0;
+                    } else {
+                        ready_at[wreg] = cycle + coupledLatency(opcode);
+                        coupled_by[wreg] = idx;
+                    }
+                }
+                if (variable and bar < num_scoreboards) issued[bar] += 1;
+            }
+        }
+
+        // An op that collects its sources late claims a read barrier over them, so a later
+        // write to any of them has to wait on it first.
+        const read_bar = getField(inst, 113, 3);
+        if (read_bar < num_scoreboards) {
+            inline for (.{ 24, 32, 64 }) |pos| {
+                if (readsSrc(opcode, form, pos)) {
+                    const reg = getField(inst, pos, 8);
+                    if (reg != RZ) {
+                        const span = srcSpan(opcode, inst, pos);
+                        var r: u32 = 0;
+                        while (r < span and reg + r < RZ) : (r += 1) {
+                            collecting[reg + r] = @as(u8, @intCast(read_bar)) + 1;
+                            collector_of[reg + r] = idx;
+                        }
+                    }
+                }
+            }
+        }
+        cycle += getField(inst, 105, 4) + 1;
+    }
+    return null;
 }
 
 /// Whether `opcode` is one of the memory, control-flow, attribute, texture or tensor
@@ -1538,14 +1732,22 @@ fn markReuse(insts: []Inst, block_starts: []const usize, entry_start: usize) voi
         if (getField(inst.*, 105, 4) > 6) continue;
         const form = getField(inst.*, 9, 3);
 
+        // The register run THIS instruction writes. A slot holding one of those registers must
+        // not keep its collected value, because the value the next reader wants is the one this
+        // instruction is about to produce, not the one it read. Accumulator coalescing makes
+        // exactly this shape: an FFMA whose destination is also its addend, dst == srcC.
+        const own_dst: u32 = getField(inst.*, 16, 8);
+        const own_span: u32 = if (writesDst(opcode) and own_dst != RZ) dstSpan(opcode, inst.*) else 0;
+
         var mask: u4 = 0;
         inline for (.{ 24, 32, 64 }) |pos| {
             if (aluSrcSlot(pos, form)) |slot| {
                 if (readsSrc(opcode, form, pos)) {
                     const reg = getField(inst.*, pos, 8);
+                    const overwritten = own_span != 0 and reg >= own_dst and reg < own_dst + own_span;
                     // RZ is a fixed zero, not a register, and a multi-register operand
                     // is not one slot.
-                    if (reg != RZ and srcSpan(opcode, inst.*, pos) == 1) {
+                    if (!overwritten and reg != RZ and srcSpan(opcode, inst.*, pos) == 1) {
                         if (reuseScanFinds(insts, idx, block_starts, entry_start, slot, reg))
                             mask |= @as(u4, 1) << slot;
                     }
@@ -1596,13 +1798,14 @@ fn reuseScanFinds(
                 if (other_slot == slot) {
                     if (isAluOp(later_op) and
                         readsSrc(later_op, later_form, pos) and
-                        getField(later, pos, 8) != RZ and
-                        srcSpan(later_op, later, pos) == 1)
+                        getField(later, pos, 8) != RZ)
                     {
-                        // A different register in the slot replaces the cached value, so
-                        // the chain ends here. The same register is the hit this scan
-                        // looks for.
-                        return getField(later, pos, 8) == reg;
+                        // Anything this op puts in the slot replaces the cached value, so the
+                        // chain ends here either way. It is a hit only if the slot holds the
+                        // SAME single register. A PAIR occupies the slot just as firmly, and
+                        // walking past one marked a chain whose cached value an IMAD.WIDE had
+                        // already overwritten, which serves the next reader a stale operand.
+                        return srcSpan(later_op, later, pos) == 1 and getField(later, pos, 8) == reg;
                     }
                 }
             }
@@ -1684,7 +1887,9 @@ test "bytewise global pack and extract keep every generated dependency" {
     try std.testing.expectEqual(coupled_alu_latency - 1, getField(extracted[0], 105, 4));
 }
 
-test "a large LDG batch shares one write barrier and one wait retires the group" {
+test "an LDG batch shares one write barrier and one wait retires the group" {
+    // Consecutive loads share a barrier so a batch bigger than the six scoreboards still fits,
+    // and one wait on that barrier releases every load counted on it.
     var insts: [10]Inst = undefined;
     for (0..7) |i| insts[i] = encode.ldgU32(@intCast(8 + i), @intCast(32 + i * 2), .{});
     insts[7] = encode.iadd3(20, 8, 8, .{});
@@ -1697,6 +1902,10 @@ test "a large LDG batch shares one write barrier and one wait retires the group"
     for (insts[1..7]) |load| try std.testing.expectEqual(group, getField(load, 110, 3));
     try std.testing.expectEqual(@as(u32, 1) << @intCast(group), getField(insts[7], 116, 6));
     try std.testing.expectEqual(@as(u32, 0), getField(insts[8], 116, 6));
+
+    // The sharing is only safe while the barrier still counts every load on it, so the same
+    // stream is checked against a barrier that counts as deep as the hardware was measured to.
+    try std.testing.expectEqual(@as(?Hazard, null), findHazard(&insts, measured_ldg_group));
 }
 
 test "an independent instruction adds no wait" {
@@ -3337,12 +3546,15 @@ test "a form 2 FFMA chain marks every multiplier reader but the last" {
     };
     scheduleBlocks(&insts, &.{0});
 
-    // The first FFMA marks both slots: the next one reads its RESULT in srcA and the
-    // shared multiplier in srcB. The second and third mark only srcB, because the
-    // srcA chain broke: each reads a different accumulator than the one before it, and
-    // a different register in a slot replaces the cached value. The last reader marks
-    // nothing.
-    try std.testing.expectEqual(@as(u32, 0x3), getField(insts[0], 122, 4));
+    // Every FFMA here writes the register it reads in srcA, so NO srcA slot is marked: the
+    // collector would keep the operand this instruction read, and the next reader wants the
+    // result it produced. Real ptxas sm_120 agrees, and that is the evidence rather than a
+    // reading of the policy. An accumulator chain `fma %f4, %f3, %f2, %f3` compiles to four
+    // FFMAs that all overlap dst with a source and carry NO reuse bit at all, while an
+    // independent shape with a shared multiplier gives `FFMA R9, R0.reuse, R5, R4`, dst clear
+    // of every source. So the marks here are the srcB multiplier only, and the last reader
+    // caches a value nothing later takes, so it carries nothing.
+    try std.testing.expectEqual(@as(u32, 0x2), getField(insts[0], 122, 4));
     try std.testing.expectEqual(@as(u32, 1), getField(insts[0], 109, 1)); // rides with reuse
     try std.testing.expectEqual(@as(u32, 0x2), getField(insts[1], 122, 4));
     try std.testing.expectEqual(@as(u32, 0x2), getField(insts[2], 122, 4));
@@ -3364,7 +3576,9 @@ test "a shared form 4 FFMA addend at bits 64 gets the srcC reuse bit" {
     };
     scheduleBlocks(&insts, &.{0});
 
-    try std.testing.expectEqual(@as(u32, 0x5), getField(insts[0], 122, 4)); // srcA and srcC
+    // srcC only. srcA holds the register this FFMA also writes, and ptxas never marks a slot
+    // whose register the instruction overwrites.
+    try std.testing.expectEqual(@as(u32, 0x4), getField(insts[0], 122, 4));
     try std.testing.expectEqual(@as(u32, 1), getField(insts[0], 109, 1)); // rides with reuse
     try std.testing.expectEqual(@as(u32, 0x4), getField(insts[1], 122, 4)); // srcC: srcA broke
     try std.testing.expectEqual(@as(u32, 0), getField(insts[2], 122, 4)); // the last reader
@@ -3443,9 +3657,9 @@ test "a block boundary ends the reuse scan, and the entry block start does not" 
     // Block 0 starts at index 1, and index 1 is the entry start, so the scan crosses it.
     scheduleBlocks(&insts, &.{1});
 
-    // The first FFMA marks both slots (its result feeds the second in srcA, and the
-    // multiplier chain crosses the entry start); the second marks only srcB.
-    try std.testing.expectEqual(@as(u32, 0x3), getField(insts[0], 122, 4));
+    // The first FFMA marks srcB only: the multiplier chain crosses the entry start, and its
+    // srcA register is the one it overwrites. The second marks srcB too.
+    try std.testing.expectEqual(@as(u32, 0x2), getField(insts[0], 122, 4));
     try std.testing.expectEqual(@as(u32, 0x2), getField(insts[1], 122, 4));
 
     // A SECOND block start at index 2 is a real branch target: the chain breaks there.
@@ -3458,8 +3672,9 @@ test "a block boundary ends the reuse scan, and the entry block start does not" 
     scheduleBlocks(&split, &.{ 1, 2 });
 
     // The reader before the real branch target still marks: its scan crosses the ENTRY
-    // start at 1 and finds the next reader there.
-    try std.testing.expectEqual(@as(u32, 0x3), getField(split[0], 122, 4));
+    // start at 1 and finds the next reader there. srcB only, because its srcA register is
+    // the one it overwrites.
+    try std.testing.expectEqual(@as(u32, 0x2), getField(split[0], 122, 4));
     // The reader at the entry start scans toward index 2, a real branch target, so the
     // scan stops and it carries no bit.
     try std.testing.expectEqual(@as(u32, 0), getField(split[1], 122, 4));
@@ -3483,10 +3698,9 @@ test "a lone reader and a memory op carry no reuse bits" {
     scheduleBlocks(&insts, &.{0});
 
     try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 122, 4)); // the LDG
-    // The chain spans the load: the first reader marks both slots (the load touches
-    // neither the srcB slot nor R9), and the middle reader marks only srcB because its
-    // srcA register differs from the next reader's.
-    try std.testing.expectEqual(@as(u32, 0x3), getField(insts[0], 122, 4));
+    // The chain spans the load, which touches neither the srcB slot nor R9. Both readers mark
+    // srcB only: each writes the register it reads in srcA.
+    try std.testing.expectEqual(@as(u32, 0x2), getField(insts[0], 122, 4));
     try std.testing.expectEqual(@as(u32, 0x2), getField(insts[2], 122, 4));
     try std.testing.expectEqual(@as(u32, 0), getField(insts[3], 122, 4)); // the last
 }
@@ -3711,5 +3925,362 @@ test "ISETP never carries generic ALU reuse bits" {
     scheduleBlocks(&far, &.{0});
     try std.testing.expect(getField(far[0], 105, 4) <= 6);
     try std.testing.expectEqual(@as(u32, 0), getField(far[0], 122, 4));
-    try std.testing.expectEqual(@as(u32, 0), getField(far[0], 109, 1));
+}
+
+test "the hazard check fires on each class it claims to cover" {
+    // A check is only worth running if it can fail. Each class gets a stream the scheduler
+    // protects, then the protection is removed and the check must name the instruction.
+    {
+        // Read-after-write on a decoupled producer.
+        var insts = [_]Inst{
+            encode.ldgU32(8, 32, .{}),
+            encode.iadd3(30, 8, 8, .{}),
+            encode.exit(.{}),
+        };
+        scheduleBlocks(&insts, &.{0});
+        try std.testing.expectEqual(@as(?Hazard, null), findHazard(&insts, 64));
+        setField(&insts[1], 116, 6, 0);
+        const h = findHazard(&insts, 64) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(Hazard.Kind.stale_read, h.kind);
+        try std.testing.expectEqual(@as(u8, 8), h.reg);
+    }
+    {
+        // Write-after-write: a synchronous write lands under a load that is still in flight.
+        var insts = [_]Inst{
+            encode.ldgU32(8, 32, .{}),
+            encode.movImm(8, 7, .{}),
+            encode.iadd3(30, 8, 8, .{}),
+            encode.exit(.{}),
+        };
+        scheduleBlocks(&insts, &.{0});
+        try std.testing.expectEqual(@as(?Hazard, null), findHazard(&insts, 64));
+        setField(&insts[1], 116, 6, 0);
+        const h = findHazard(&insts, 64) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(Hazard.Kind.late_write, h.kind);
+        try std.testing.expectEqual(@as(u8, 8), h.reg);
+    }
+    {
+        // Write-after-read: the load's address is overwritten before the load collects it.
+        var insts = [_]Inst{
+            encode.ldgU32(8, 32, .{}),
+            encode.movImm(32, 7, .{}),
+            encode.exit(.{}),
+        };
+        scheduleBlocks(&insts, &.{0});
+        try std.testing.expectEqual(@as(?Hazard, null), findHazard(&insts, 64));
+        setField(&insts[1], 116, 6, 0);
+        const h = findHazard(&insts, 64) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(Hazard.Kind.early_clobber, h.kind);
+        try std.testing.expectEqual(@as(u8, 32), h.reg);
+    }
+    {
+        // A fixed-latency result read before its stall has paid the latency. No barrier is
+        // involved at all, so a scoreboard model cannot see this one.
+        var insts = [_]Inst{
+            encode.iadd3(8, 4, 4, .{}),
+            encode.iadd3(30, 8, 8, .{}),
+            encode.exit(.{}),
+        };
+        scheduleBlocks(&insts, &.{0});
+        try std.testing.expectEqual(@as(?Hazard, null), findHazard(&insts, 64));
+        setField(&insts[0], 105, 4, 0); // drop the producer's stall
+        const h = findHazard(&insts, 64) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(Hazard.Kind.early_read, h.kind);
+        try std.testing.expectEqual(@as(u8, 8), h.reg);
+    }
+}
+
+test "a paired operand in a reuse slot ends the chain" {
+    // The operand collector caches one value per source slot, and the reuse bit tells it to
+    // keep the one it collects. A register PAIR occupies the slot just as firmly as a single
+    // register, so a chain marked across one serves its next reader an operand the pair has
+    // already replaced. Slot 2 is srcC at bits 64..71, which is where IMAD.WIDE puts its
+    // 64-bit addend, and an address-forming shader is full of them.
+    var insts = [_]Inst{
+        encode.ffma(10, 4, 5, 20, .{}),
+        encode.imadWide(30, 6, 7, 40, false, .{}),
+        encode.ffma(11, 4, 5, 20, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[0], 122, 4));
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[0], 109, 1));
+
+    // With something that does NOT touch the slot in between, the same two readers DO form a
+    // chain. So the stop above is the pair, not the shape of the test.
+    var untouched = [_]Inst{
+        encode.ffma(10, 4, 5, 20, .{}),
+        encode.movImm(12, 7, .{}),
+        encode.ffma(11, 4, 5, 20, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&untouched, &.{0});
+    try std.testing.expect(getField(untouched[0], 122, 4) & 0b0100 != 0);
+    try std.testing.expectEqual(@as(u32, 1), getField(untouched[0], 109, 1));
+}
+
+/// A register number the hardware cannot accept where the stream puts it.
+pub const EncodingFault = struct {
+    pub const Kind = enum {
+        /// A multi-register operand whose first register is not aligned to its own width. The
+        /// address unit and the register file read such an operand from the aligned register
+        /// below it, so it moves the wrong registers.
+        unaligned_tuple,
+        /// A register past the count the shader declares. The warp owns only the registers it
+        /// declared, so a write above that lands outside them.
+        undeclared_register,
+    };
+    kind: Kind,
+    at: usize,
+    reg: u8,
+    span: u32,
+};
+
+/// The first register number in a scheduled stream that the hardware cannot accept, or null.
+///
+/// A 64-bit operand occupies an even-aligned pair and a 128-bit one a quad-aligned run, and the
+/// allocator is responsible for that. This checks the finished stream instead of trusting it,
+/// because the claim lives in a comment and the consequence is silent: an operand read from the
+/// register below the one it names moves plausible garbage, and the instruction count does not
+/// change. `reg_count` is what the shader declares, from `Kernel.reg_count`.
+pub fn findEncodingFault(insts: []const Inst, reg_count: u32) ?EncodingFault {
+    for (insts, 0..) |inst, idx| {
+        const opcode = getField(inst, 0, 12);
+        const form = getField(inst, 9, 3);
+        if (writesDst(opcode)) {
+            const dst = getField(inst, 16, 8);
+            if (dst != RZ) {
+                const span = dstSpan(opcode, inst);
+                if (span > 1 and dst % span != 0) {
+                    return .{ .kind = .unaligned_tuple, .at = idx, .reg = @intCast(dst), .span = span };
+                }
+                if (dst + span > reg_count) {
+                    return .{ .kind = .undeclared_register, .at = idx, .reg = @intCast(dst), .span = span };
+                }
+            }
+        }
+        inline for (.{ 24, 32, 64 }) |pos| {
+            if (readsSrc(opcode, form, pos)) {
+                const reg = getField(inst, pos, 8);
+                if (reg != RZ) {
+                    const span = srcSpan(opcode, inst, pos);
+                    if (span > 1 and reg % span != 0) {
+                        return .{ .kind = .unaligned_tuple, .at = idx, .reg = @intCast(reg), .span = span };
+                    }
+                    if (reg + span > reg_count) {
+                        return .{ .kind = .undeclared_register, .at = idx, .reg = @intCast(reg), .span = span };
+                    }
+                }
+            }
+        }
+    }
+    return null;
+}
+
+test "an instruction that overwrites a slot register gets no reuse bit for it" {
+    // An accumulator coalesced onto its own FFMA destination: dst == srcC == R20. The collector
+    // would keep the value this FFMA READ, and the next reader of R20 wants the one it
+    // PRODUCED, so marking the slot serves a stale operand one step behind the chain.
+    //
+    // Real ptxas sm_120 never marks such a slot. An accumulator chain compiles to FFMA R0, R0,
+    // R5, R0 four times over with no .reuse anywhere, while an independent shape whose
+    // destination is clear of every source gives FFMA R9, R0.reuse, R5, R4.
+    var insts = [_]Inst{
+        encode.ffma(20, 4, 5, 20, .{}),
+        encode.ffma(21, 6, 7, 20, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[0], 122, 4));
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[0], 109, 1));
+
+    // Move the destination off every source and the same chain DOES mark, so the refusal is
+    // the overlap and not the shape of the test.
+    var clear = [_]Inst{
+        encode.ffma(30, 4, 5, 20, .{}),
+        encode.ffma(31, 6, 7, 20, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&clear, &.{0});
+    try std.testing.expect(getField(clear[0], 122, 4) & 0b0100 != 0);
+}
+
+test "the encoding check accepts aligned register tuples and names an unaligned one" {
+    // A 64-bit operand occupies an even-aligned pair. The allocator is responsible for that and
+    // says so in a comment, so this checks the finished stream instead of trusting it. The
+    // consequence of getting it wrong is silent: the hardware reads the aligned register below
+    // the one named, which moves plausible garbage at an unchanged instruction count.
+    var insts = [_]Inst{
+        encode.ldc(8, 0, 0, .{}), // LDC into R8, a single register
+        encode.ldgU32(10, 8, .{}), // reads the address pair R8:R9
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(?EncodingFault, null), findEncodingFault(&insts, 16));
+
+    // Move the load's address onto an odd register and the check must name it.
+    setField(&insts[1], 24, 8, 9);
+    const fault = findEncodingFault(&insts, 16) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(EncodingFault.Kind.unaligned_tuple, fault.kind);
+    try std.testing.expectEqual(@as(u8, 9), fault.reg);
+    try std.testing.expectEqual(@as(u32, 2), fault.span);
+
+    // And a register past the declared count is the other way this goes wrong.
+    setField(&insts[1], 24, 8, 8);
+    const past = findEncodingFault(&insts, 8) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(EncodingFault.Kind.undeclared_register, past.kind);
+}
+
+test "our reuse marking matches ptxas on a stream ptxas itself allocated" {
+    // The reuse bits are the only field in this encoding keyed on register NUMBERS, so our
+    // policy cannot be checked against a shape we allocated ourselves: a disagreement would be
+    // indistinguishable from a different allocation. This runs our policy over ptxas sm_120
+    // output instead, so the registers are ptxas own and any difference is purely policy.
+    //
+    // The kernel is eight loads through a thread-indexed pointer feeding two rounds of FFMA
+    // with a shared multiplier, then adds and a multiply. Captured from CUDA 12.9 ptxas, which
+    // reaches sm_120. BIT 109 IS NOT COMPARED: ptxas sets it on unmarked memory and control
+    // ops too, 21 of these 40 instructions, so it is not the reuse companion a comment here
+    // once claimed. It tracks issue behaviour, and this test is about the slot bits.
+    const words = [_][4]u32{
+    .{ 0xff017b82, 0x0000df00, 0x00000800, 0x000fe200 },
+    .{ 0x00057919, 0x00000000, 0x00002100, 0x000e2e00 },
+    .{ 0xff027b82, 0x0000e000, 0x00000a00, 0x000e2200 },
+    .{ 0xff0477ac, 0x00006b00, 0x08000a00, 0x000e6200 },
+    .{ 0x05027825, 0x00000004, 0x078e0202, 0x001fca00 },
+    .{ 0x02007981, 0x00000004, 0x0c1e1900, 0x002ea800 },
+    .{ 0x02057981, 0x00000404, 0x0c1e1900, 0x000ea800 },
+    .{ 0x02067981, 0x00001004, 0x0c1e1900, 0x000ea800 },
+    .{ 0x02047981, 0x00000804, 0x0c1e1900, 0x000ee800 },
+    .{ 0x02077981, 0x00000c04, 0x0c1e1900, 0x000f2800 },
+    .{ 0x020b7981, 0x00001804, 0x0c1e1900, 0x000f6800 },
+    .{ 0x02097981, 0x00001404, 0x0c1e1900, 0x000f6800 },
+    .{ 0x020d7981, 0x00001c04, 0x0c1e1900, 0x000f6200 },
+    .{ 0x00087223, 0x00000006, 0x00000005, 0x084fe200 },
+    .{ 0x05057223, 0x00000006, 0x00000004, 0x088fe200 },
+    .{ 0x070f7223, 0x00000006, 0x00000000, 0x090fe200 },
+    .{ 0x04047223, 0x00000006, 0x00000007, 0x000fc400 },
+    .{ 0x06007223, 0x0000000b, 0x00000005, 0x060fe200 },
+    .{ 0x060f7223, 0x00000008, 0x0000000f, 0x040fe200 },
+    .{ 0x06097223, 0x00000009, 0x00000008, 0x040fe200 },
+    .{ 0x06047223, 0x0000000d, 0x00000004, 0x000fc600 },
+    .{ 0x09007221, 0x00000000, 0x00000000, 0x000fe200 },
+    .{ 0x040f7221, 0x0000000f, 0x00000000, 0x000fc800 },
+    .{ 0x000f7220, 0x0000000f, 0x00400000, 0x000fca00 },
+    .{ 0x02007986, 0x0000200f, 0x0c101904, 0x000fe200 },
+    .{ 0x0000794d, 0x00000000, 0x03800000, 0x000fea00 },
+    .{ 0x00fc7947, 0xfffffffc, 0x0383ffff, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    };
+    var ours: [words.len]Inst = undefined;
+    var theirs: [words.len]u32 = undefined;
+    for (words, 0..) |w, i| {
+        ours[i] = w;
+        theirs[i] = (getField(w, 122, 4) << 1) | getField(w, 109, 1);
+        setField(&ours[i], 122, 4, 0);
+        setField(&ours[i], 109, 1, 0);
+    }
+    markReuse(&ours, &.{0}, 0);
+    for (ours, 0..) |inst, i| {
+        try std.testing.expectEqual(theirs[i] >> 1, getField(inst, 122, 4));
+    }
+    // And the capture really does contain marks, so the comparison is not vacuous.
+    var marked: usize = 0;
+    for (theirs) |t| marked += @intFromBool(t >> 1 != 0);
+    try std.testing.expect(marked >= 6);
+}
+
+/// Instructions whose source field at `pos` is read by the model but holds R0 rather than RZ.
+/// A field an opcode does not use is left at a fixed value by its encoder; if that value is zero
+/// the model reads it as R0, waits on R0's scoreboard and clears its tag, so whatever really
+/// consumes R0 emits no wait. See the IPA case in `readsSrc` for the same bug already fixed once.
+pub fn countPhantomR0(insts: []const Inst) usize {
+    var n: usize = 0;
+    for (insts) |inst| {
+        const opcode = getField(inst, 0, 12);
+        const form = getField(inst, 9, 3);
+        inline for (.{ 24, 32, 64 }) |pos| {
+            if (readsSrc(opcode, form, pos) and getField(inst, pos, 8) == 0) n += 1;
+        }
+    }
+    return n;
+}
+
+test "no fixed-latency constant here is shorter than the reference's" {
+    // A coupled result has no scoreboard: the stall count on its producer is the ONLY thing
+    // that makes it ready, so a constant that is too small is a stale read with nothing to
+    // catch it, and `findHazard` cannot catch it either because it reads the same constant.
+    //
+    // The reference pins them. This is CUDA 12.9 ptxas sm_120 output for a fully serial chain,
+    // where every consumer is the instruction immediately after its producer, so the producer's
+    // stall is exactly latency minus one. FFMA, FADD and FMUL all carry stall 4 there, giving a
+    // latency of 5 for each. Being LONGER than the reference only costs issue slots, so the
+    // assertion is one-sided.
+    const chain = [_][4]u32{
+        .{ 0xff017b82, 0x0000df00, 0x00000800, 0x000fe200 },
+        .{ 0xff0477ac, 0x00006b00, 0x08000a00, 0x000e2e00 },
+        .{ 0xff027b82, 0x0000e000, 0x00000a00, 0x000e2400 },
+        .{ 0x02007981, 0x00000004, 0x0c1e1900, 0x001ea800 },
+        .{ 0x02057981, 0x00000404, 0x0c1e1900, 0x000ea800 },
+        .{ 0x02047981, 0x00000804, 0x0c1e1900, 0x000ea400 },
+        .{ 0x00007223, 0x00000005, 0x00000004, 0x004fc800 },
+        .{ 0x05077223, 0x00000000, 0x00000004, 0x000fc800 },
+        .{ 0x05077223, 0x00000007, 0x00000004, 0x000fc800 },
+        .{ 0x05077223, 0x00000007, 0x00000004, 0x000fc800 },
+        .{ 0x05077223, 0x00000007, 0x00000004, 0x000fc800 },
+        .{ 0x07077221, 0x00000007, 0x00000000, 0x000fc800 },
+        .{ 0x07077221, 0x00000007, 0x00000000, 0x000fc800 },
+        .{ 0x07077221, 0x00000007, 0x00000000, 0x000fc800 },
+        .{ 0x07077220, 0x00000007, 0x00400000, 0x000fc800 },
+        .{ 0x07077220, 0x00000007, 0x00400000, 0x000fca00 },
+        .{ 0x02007986, 0x00001007, 0x0c101904, 0x000fe200 },
+        .{ 0x0000794d, 0x00000000, 0x03800000, 0x000fea00 },
+        .{ 0x00fc7947, 0xfffffffc, 0x0383ffff, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+        .{ 0x00007918, 0x00000000, 0x00000000, 0x000fc000 },
+    };
+    // Walk the capture and, for every instruction whose result the NEXT one reads, read the
+    // latency the reference assigned and require ours to be at least that.
+    var checked: usize = 0;
+    for (chain[0 .. chain.len - 1], 0..) |inst, i| {
+        const opcode = getField(inst, 0, 12);
+        if (isVariableLatency(opcode) or !writesDst(opcode)) continue;
+        const dst = getField(inst, 16, 8);
+        if (dst == RZ) continue;
+        const next = chain[i + 1];
+        const next_op = getField(next, 0, 12);
+        const next_form = getField(next, 9, 3);
+        var reads_it = false;
+        inline for (.{ 24, 32, 64 }) |pos| {
+            if (readsSrc(next_op, next_form, pos) and getField(next, pos, 8) == dst) reads_it = true;
+        }
+        if (!reads_it) continue;
+        checked += 1;
+        try std.testing.expect(coupledLatency(opcode) >= getField(inst, 105, 4) + 1);
+    }
+    // The capture really is a serial chain, so the comparison is not vacuous.
+    try std.testing.expect(checked >= 7);
 }
