@@ -183,8 +183,12 @@ test "SPIR-V compute shader -> SASS kernel (buffer load/store + thread id)" {
     }
     try std.testing.expect(saw_localsize_imm); // local_size_x folded into IMAD
     try std.testing.expectEqual(@as(usize, 1), countOpcode(kernel.code, 0xb82)); // one LDC.64 (buffer ptr)
-    try std.testing.expect(hasOpcode(kernel.code, 0x981)); // LDG (load data[i])
-    try std.testing.expect(hasOpcode(kernel.code, 0x986)); // STG (store data[i])
+    // ONE LDG and ONE STG. The buffer base carries the alignment the API guarantees, the
+    // element address scales the index by four, so the access sits on its own boundary and the
+    // hardware moves the whole word at once. An address nothing proves aligned reads and writes
+    // one byte at a time instead, which is four accesses plus the shifts that rebuild the word.
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(kernel.code, 0x981)); // LDG (load data[i])
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(kernel.code, 0x986)); // STG (store data[i])
     try std.testing.expect(hasOpcode(kernel.code, 0x94d)); // EXIT
 
     // The 64-bit element address is ONE IMAD.WIDE.U32, which scales the byte offset,

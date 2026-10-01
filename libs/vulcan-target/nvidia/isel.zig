@@ -702,7 +702,9 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
         // Graphics keeps R0..R3 for the ROP and can reserve further low registers for MRT
         // and depth. R40:R41 are outside that architectural output block and outside the
         // allocator pool, so every later graphics reservation starts above both scratches.
-        max_reg = @max(max_reg, graphics_memory_scratch_reg);
+        // Only a shader that reconstructs an access byte by byte writes the second scratch,
+        // and a shader that does not keeps its own register count.
+        if (needsMemoryScratch(func, &disp)) max_reg = @max(max_reg, graphics_memory_scratch_reg);
     }
 
     // Give each hoisted constant a register above everything `assignLocs` handed
@@ -1360,6 +1362,15 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, stage: Stage,
     // The hazard only appears when a varying is dead. A live one is never reused as a
     // destination, so a shader that reads all its inputs never exposes this, which is why it
     // survived until a shader declaring four varyings and reading one met the race.
+    //
+    // A VERTEX SHADER IS DELIBERATELY NOT COVERED, though it has the same exposure: with this
+    // rule gated to fragment, a four-input vertex shader that reads one writes onto its
+    // ALD-delivered registers eight times, where the same fragment shader never does. Applying
+    // the rule there closes that and makes the render four times worse, by 16.8 sigma on a
+    // prism horse scene, at an identical instruction count, register count and load count. So
+    // it changes only WHICH registers are assigned, and the backend has a register-assignment
+    // sensitive defect that this steers into. Removing an unproven hazard is not worth waking
+    // a measured one. Cover the vertex stage only with evidence that its exposure fires.
     if (stage == .fragment) {
         for (func.blockParams(@enumFromInt(0))) |p| {
             if (attrTag(func, p, "attr") != null) last_use[@intFromEnum(p)] = pos;
@@ -1906,7 +1917,7 @@ fn addrChainStep(func: *const Function, v: Value) ?struct { base: Value, imm: i6
         .global, .constant, .shared => {},
         .private => return null,
     }
-    if (hasAnyAttribute(func, v)) return null;
+    if (hasTagAttribute(func, v)) return null;
     const inst = func.definingInst(v) orelse return null;
     const a = switch (func.opcode(inst)) {
         .arith_imm => |x| x,
@@ -1916,10 +1927,111 @@ fn addrChainStep(func: *const Function, v: Value) ?struct { base: Value, imm: i6
     return .{ .base = a.lhs, .imm = a.imm };
 }
 
-/// Whether any attribute is attached to `v`. See `addrChainStep` for why the fold cares.
-fn hasAnyAttribute(func: *const Function, v: Value) bool {
+/// Whether `v` carries an attribute that gives it an identity, which is every attribute other
+/// than `align`. See `addrChainStep` for why the fold cares. An alignment is a fact about the
+/// address the value holds, so moving an access onto or off such a value keeps it true.
+fn hasTagAttribute(func: *const Function, v: Value) bool {
     var it = func.attributesOf(.{ .value = v });
-    return it.next() != null;
+    while (it.next()) |a| switch (a) {
+        .@"align" => {},
+        else => return true,
+    };
+    return false;
+}
+
+/// The largest power of two `knownFactor` reports, which is large enough for every access
+/// width the hardware has.
+const max_factor: u32 = 1 << 30;
+
+/// The largest power of two that divides `n`. Zero divides by anything, so it takes the cap.
+fn factorOf(n: i64) u32 {
+    if (n == 0) return max_factor;
+    return @as(u32, 1) << @intCast(@min(@ctz(@abs(n)), 30));
+}
+
+/// The largest power of two that is known to divide the address or the integer in `v`, or 1
+/// when nothing proves one. A front end states the alignment of a buffer the API hands it with
+/// an `align` attribute, and address arithmetic keeps whatever the base and the offset share.
+///
+/// Only powers of two are trusted. Integer arithmetic here wraps at the operand width, and a
+/// wrap keeps divisibility only for a divisor of that width. So `i * 4` stays a multiple of 4
+/// but `i * 12` is not reliably a multiple of 12.
+fn knownFactor(func: *const Function, v: Value, depth: u8) u32 {
+    if (depth == 0) return 1;
+    var it = func.attributesOf(.{ .value = v });
+    while (it.next()) |a| switch (a) {
+        .@"align" => |n| return factorOf(n),
+        else => {},
+    };
+    const inst = func.definingInst(v) orelse return 1;
+    return switch (func.opcode(inst)) {
+        .iconst => |c| factorOf(c),
+        .arith_imm => |a| switch (a.op) {
+            .add, .sub => @min(knownFactor(func, a.lhs, depth - 1), factorOf(a.imm)),
+            .mul => factorOf(a.imm),
+            // A shift past the cap keeps at least the cap. A negative shift is not a shift at
+            // all, so it proves nothing.
+            .shl => if (a.imm < 0) 1 else if (a.imm < 30) @as(u32, 1) << @intCast(a.imm) else max_factor,
+            else => 1,
+        },
+        .arith => |a| switch (a.op) {
+            // Either side can hold the pointer, and the other holds the scaled index. Both
+            // read the same way, so the smaller factor is what the sum keeps.
+            .add, .sub => @min(knownFactor(func, a.lhs, depth - 1), knownFactor(func, a.rhs, depth - 1)),
+            .mul => @min(knownFactor(func, a.lhs, depth - 1) *| knownFactor(func, a.rhs, depth - 1), max_factor),
+            else => 1,
+        },
+        else => 1,
+    };
+}
+
+/// Whether an access of `width` at `displacement` from `ptr` is proven to sit on a multiple of
+/// its own size. One wide global access is then legal, and the bytewise lowering below is only
+/// needed when the address could be anywhere.
+fn globalAccessIsAligned(func: *const Function, ptr: Value, displacement: i32, width: encode.MemType) bool {
+    const need: u32 = width.byteSize();
+    if (need <= 1) return true;
+    if (knownFactor(func, ptr, 16) < need) return false;
+    return @abs(displacement) % need == 0;
+}
+
+/// Whether any access in `func` needs the bytewise global lowering, which is the only writer of
+/// the second graphics scratch register. A shader whose every access sits on its own boundary
+/// never touches that register and does not have to declare it, which keeps the register count
+/// down and the occupancy up.
+///
+/// Anything this cannot read gives the answer that reserves, because an unreserved scratch that
+/// a later reservation also owns loses one of the two writes.
+fn needsMemoryScratch(func: *const Function, disp: *const DispFold) bool {
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            const ptr, const value = switch (func.opcode(inst)) {
+                .load => |l| .{ l.ptr, func.instResult(inst) orelse return true },
+                .store => |s| .{ s.ptr, s.value },
+                else => continue,
+            };
+            // Shared memory has its own instruction and never touches the scratch. Everything
+            // else counts, including a private pointer: the lowering sends a private load it
+            // does not recognise down the same global path, and the texture and gradient
+            // reloads that would be skipped here are not known until after registers are
+            // assigned. Over-reserving costs one register; under-reserving lets the bytewise
+            // lowering write a register the shader never declared.
+            switch (ptrSpace(func, ptr) orelse return true) {
+                .global, .constant, .private => {},
+                .shared => continue,
+            }
+            // A store through a graphics output tag becomes an AST or a move, which the
+            // lowering picks BEFORE it looks at memory. A load does not take those branches.
+            if (func.opcode(inst) == .store) {
+                if (attrTag(func, ptr, "out_attr") != null) continue;
+                if (attrTag(func, ptr, "frag_depth") != null) continue;
+                if (attrTag(func, ptr, "color_out") != null) continue;
+            }
+            const width = memTypeOf(func, value) catch return true;
+            if (!globalAccessIsAligned(func, ptr, disp.offsetOf(inst), width)) return true;
+        }
+    }
+    return false;
 }
 
 /// Collapse a chain of constant pointer increments into its last increment.
@@ -1934,7 +2046,7 @@ fn collapsePointerAddChains(func: *Function) void {
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@enumFromInt(bi))) |inst| {
             const result = func.instResult(inst) orelse continue;
-            if (ptrSpace(func, result) == null or hasAnyAttribute(func, result)) continue;
+            if (ptrSpace(func, result) == null or hasTagAttribute(func, result)) continue;
             const op = func.opcodeMut(inst);
             var add = switch (op.*) {
                 .arith_imm => |a| a,
@@ -1943,7 +2055,7 @@ fn collapsePointerAddChains(func: *Function) void {
             if (add.op != .add) continue;
 
             var base = add.lhs;
-            while (!hasAnyAttribute(func, base)) {
+            while (!hasTagAttribute(func, base)) {
                 const defining = func.definingInst(base) orelse break;
                 const previous = switch (func.opcode(defining)) {
                     .arith_imm => |a| a,
@@ -2003,7 +2115,7 @@ fn foldAddressDisplacements(allocator: std.mem.Allocator, func: *Function, out: 
             if (base == ptr) continue;
             // The base is what the access will read, so it must keep its own identity for
             // the same reason `addrChainStep` refuses a tagged pointer.
-            if (hasAnyAttribute(func, base)) continue;
+            if (hasTagAttribute(func, base)) continue;
             const op = func.opcodeMut(inst);
             switch (op.*) {
                 .load => |l| {
@@ -4124,8 +4236,15 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, stage: Stage, 
             // Otherwise this is an ordinary LDG from the 64-bit pointer pair
             // into the result register. This is variable latency: the
             // scoreboard scheduler assigns its write barrier and the wait on
-            // each consumer.
-            try emitGlobalLoadBytes(allocator, code, memoryScratch(stage), rd, gprOf(loc.*, l.ptr), disp.offsetOf(inst), width);
+            // each consumer. An address the IR does not prove aligned reads
+            // one byte at a time, because a wide access off its own multiple
+            // reads the wrong bytes.
+            const offset = disp.offsetOf(inst);
+            if (globalAccessIsAligned(func, l.ptr, offset, width)) {
+                try code.append(allocator, encode.ldgAt(rd, gprOf(loc.*, l.ptr), offset, width, .{}));
+            } else {
+                try emitGlobalLoadBytes(allocator, code, memoryScratch(stage), rd, gprOf(loc.*, l.ptr), offset, width);
+            }
         },
         .store => |st| {
             // A store whose pointer is tagged with a graphics output
@@ -4164,7 +4283,12 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, stage: Stage, 
                 try code.append(allocator, encode.stsAt(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), disp.offsetOf(inst), width, .{}));
             } else {
                 const width = try memTypeOf(func, st.value);
-                try emitGlobalStoreBytes(allocator, code, memoryScratch(stage), gprOf(loc.*, st.value), gprOf(loc.*, st.ptr), disp.offsetOf(inst), width);
+                const offset = disp.offsetOf(inst);
+                if (globalAccessIsAligned(func, st.ptr, offset, width)) {
+                    try code.append(allocator, encode.stgAt(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), offset, width, .{}));
+                } else {
+                    try emitGlobalStoreBytes(allocator, code, memoryScratch(stage), gprOf(loc.*, st.value), gprOf(loc.*, st.ptr), offset, width);
+                }
             }
         },
         .prefetch => {}, // a hint; this GPU target has no CPU-style prefetch, so it is dropped
@@ -7143,6 +7267,60 @@ test "shared address arithmetic is one 32-bit IADD3, where a global address is a
     try testing.expectEqual(@as(usize, 3), count(global_k.code, 0xb82)); // outptr, base, i
 }
 
+
+test "a proven alignment turns a global access back into one wide LDG and STG" {
+    // A global access whose address could be anywhere moves one byte at a time, because a wide
+    // access off its own multiple reads and writes the wrong bytes. That costs eleven
+    // instructions for every 32-bit load. A front end that knows how the API aligns the buffer
+    // says so with an `align` attribute, and the access goes back to one instruction.
+    const allocator = testing.allocator;
+
+    const Case = struct {
+        fn compile(alloc: std.mem.Allocator, promise: ?u32) !Kernel {
+            var func = Function.init(alloc);
+            defer func.deinit();
+            const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+            const ptr_t = try func.types.ptrGlobal();
+            const b = try func.appendBlock();
+            const base = try func.appendBlockParam(b, ptr_t);
+            if (promise) |n| try func.addAttr(.{ .value = base }, .{ .@"align" = n });
+            const slot = try func.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = 8 } });
+            const v = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = slot } });
+            try func.appendStore(b, v, slot);
+            func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+            return compileKernel(alloc, &func, nvidia_abi);
+        }
+    };
+
+    const count = struct {
+        fn of(code: []const u32, opcode: u32) usize {
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i < code.len) : (i += 4) {
+                if (code[i] & 0xfff == opcode) n += 1;
+            }
+            return n;
+        }
+    }.of;
+
+    var unknown = try Case.compile(allocator, null);
+    defer unknown.deinit(allocator);
+    try testing.expectEqual(@as(usize, 4), count(unknown.code, 0x981)); // four LDG.U8
+    try testing.expectEqual(@as(usize, 4), count(unknown.code, 0x986)); // four STG.U8
+
+    // Four bytes is the whole promise a 32-bit access needs, and the displacement of 8 keeps it.
+    var aligned = try Case.compile(allocator, 4);
+    defer aligned.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), count(aligned.code, 0x981));
+    try testing.expectEqual(@as(usize, 1), count(aligned.code, 0x986));
+    try testing.expect(aligned.code.len < unknown.code.len);
+
+    // A promise smaller than the access proves nothing, so the bytes come back. This is the
+    // guard that keeps an odd buffer correct while a std-layout one stays fast.
+    var half = try Case.compile(allocator, 2);
+    defer half.deinit(allocator);
+    try testing.expectEqual(@as(usize, 4), count(half.code, 0x981));
+}
 test "a graphics stage rejects a shared pointer parameter instead of interpolating it" {
     // A graphics stage has no workgroup and therefore no workgroup shared memory. Before the
     // address-space split, `isPtr` sent this parameter down the UBO path and read a 64-bit
@@ -7484,6 +7662,38 @@ test "vertex bytewise global memory uses the reserved high scratch pair" {
     try testing.expectEqual(@as(usize, 12), loads);
 }
 
+
+test "an aligned vertex shader does not reserve the bytewise scratch register" {
+    // The second graphics scratch exists only for the bytewise lowering. Reserving it pins the
+    // declared register count at 48, three blocks above the 16 a small shader needs, and every
+    // warp on the GPU pays that. A shader whose every access sits on its own boundary never
+    // writes the register, so it keeps its own count.
+    const allocator = testing.allocator;
+    const Case = struct {
+        fn compile(alloc: std.mem.Allocator, offset: i64) !Kernel {
+            var func = Function.init(alloc);
+            defer func.deinit();
+            const f32_t = try func.types.intern(.{ .float = .f32 });
+            const ptr_t = try func.types.ptrGlobal();
+            const b = try func.appendBlock();
+            const memory = try func.appendBlockParam(b, ptr_t);
+            try func.addAttr(.{ .value = memory }, .{ .@"align" = 4 });
+            const word = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = try func.appendArithImm(b, ptr_t, .add, memory, offset) } });
+            try func.appendStore(b, word, try func.appendArithImm(b, ptr_t, .add, memory, offset + 8));
+            func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+            return compileShader(alloc, &func, .vertex, nvidia_abi);
+        }
+    };
+
+    var aligned = try Case.compile(allocator, 4);
+    defer aligned.deinit(allocator);
+    try testing.expectEqual(@as(u32, 16), aligned.reg_count);
+
+    // The same shader one byte off the boundary keeps the bytewise lowering and the scratch.
+    var odd = try Case.compile(allocator, 1);
+    defer odd.deinit(allocator);
+    try testing.expectEqual(@as(u32, 48), odd.reg_count);
+}
 test "a shared byte access uses the 8-bit memory type on LDS and STS too" {
     const allocator = testing.allocator;
     var func = Function.init(allocator);
@@ -9071,4 +9281,181 @@ test "an accumulator chain holds one register across the back edge" {
     // COUNTER's back-edge move, whose IADD3 result nothing coalesces. The unrolled loop
     // dodges even that by ping-ponging the counter between two IADD3 results.
     try testing.expectEqual(@as(usize, 1), countOp(kernel.code, MOV_REG));
+}
+
+test "a long load batch stays covered whether it is loaded wide or byte by byte" {
+    // Forty uniform loads is the shape that broke: consecutive global loads share a write
+    // barrier, and before the group had a cap they all sat on one. The check is not the
+    // scheduler's own bookkeeping, so a group deeper than the barrier counts shows up here.
+    //
+    // Both lowerings of the SAME function are checked. The bytewise one is what shipped while
+    // the alignment attribute went unread, and it is the control: a hazard the wide path has
+    // and the byte path does not belongs to the wide path, and one they share was always there.
+    const allocator = testing.allocator;
+    const Case = struct {
+        fn compile(alloc: std.mem.Allocator, promise: bool) !Kernel {
+            var func = Function.init(alloc);
+            defer func.deinit();
+            const f32_t = try func.types.intern(.{ .float = .f32 });
+            const ptr_t = try func.types.ptrGlobal();
+            const b = try func.appendBlock();
+            const base = try func.appendBlockParam(b, ptr_t);
+            if (promise) try func.addAttr(.{ .value = base }, .{ .@"align" = 4 });
+            var loaded: [40]Value = undefined;
+            for (0..40) |i| {
+                const slot = try func.appendArithImm(b, ptr_t, .add, base, @intCast(i * 4));
+                loaded[i] = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = slot } });
+            }
+            // A sum of products, which is what a matrix multiply is and what contracts into
+            // FFMA. A plain product chain would never exercise the contraction at all.
+            var sum = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = loaded[0], .rhs = loaded[1] } });
+            var i: usize = 2;
+            while (i + 1 < 40) : (i += 2) {
+                const product = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = loaded[i], .rhs = loaded[i + 1] } });
+                sum = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = product } });
+            }
+            try func.appendStore(b, sum, base);
+            func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+            return compileShader(alloc, &func, .vertex, nvidia_abi);
+        }
+    };
+
+    for ([_]bool{ true, false }) |promise| {
+        var kernel = try Case.compile(allocator, promise);
+        defer kernel.deinit(allocator);
+        // Clean against a barrier that counts every load this shader puts on one, and against
+        // one that counts without bound.
+        for ([_]u32{ 40, 64 }) |depth| {
+            try testing.expectEqual(@as(?schedule.Hazard, null), schedule.findHazard(@ptrCast(kernel.code), depth));
+        }
+    }
+
+    // The ARITHMETIC is identical between the two. Contraction runs on the IR, before any
+    // lowering, and reads no attribute, so the same multiply-adds fuse either way. Only the
+    // loads, the register numbers and the schedule differ, and none of those changes a float
+    // value. So a difference in a rendered frame between the two paths is not the arithmetic.
+    var wide_ops: std.ArrayList(u32) = .empty;
+    defer wide_ops.deinit(allocator);
+    var byte_ops: std.ArrayList(u32) = .empty;
+    defer byte_ops.deinit(allocator);
+    for ([_]bool{ true, false }) |promise| {
+        var k = try Case.compile(allocator, promise);
+        defer k.deinit(allocator);
+        var i: usize = 0;
+        while (i < k.code.len) : (i += 4) switch (k.code[i] & 0x1ff) {
+            0x020, 0x021, 0x023 => try (if (promise) &wide_ops else &byte_ops).append(allocator, k.code[i] & 0x1ff),
+            else => {},
+        };
+    }
+    try testing.expectEqualSlices(u32, byte_ops.items, wide_ops.items);
+
+    // The wide path puts every load on one barrier, so it depends on the barrier counting that
+    // deep. A shallower counter does NOT cover it, which is what pins the dependency: if the
+    // grouping is ever capped or the hardware is ever measured shallower, this is where it shows.
+    var wide = try Case.compile(allocator, true);
+    defer wide.deinit(allocator);
+    try testing.expect(schedule.findHazard(@ptrCast(wide.code), 8) != null);
+}
+
+test "a fragment shader never writes onto a delivered attribute register, a vertex one does" {
+    // An attribute delivery completes some unknown time after its scoreboard clears, so a
+    // fragment shader never hands a delivered register out again. A four-input shader that
+    // reads one input is the shape that exposes this, because only a DEAD attribute register
+    // is ever free for something else to take.
+    //
+    // A vertex shader IS exposed, and this pins that rather than hiding it. ALD delivers its
+    // inputs as asynchronously as IPA does, so the same argument applies, but closing it made
+    // a prism horse scene four times worse by 16.8 sigma at an identical instruction and
+    // register count. See the live-range rule in `assignLocs` for why that trade goes this way.
+    // If this count ever reaches zero on its own, the exposure is gone and that comment is stale.
+    const allocator = testing.allocator;
+    for ([_]Stage{ .vertex, .fragment }) |stage| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const b = try func.appendBlock();
+        // Four declared inputs, only the first one read: the shape that met the race.
+        var ins: [4]Value = undefined;
+        for (0..4) |i| {
+            ins[i] = try func.appendBlockParam(b, f32_t);
+            try func.addAttr(.{ .value = ins[i] }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = encode.ATTR_GENERIC0 + @as(i64, @intCast(i)) * 4 } } });
+        }
+        var acc = ins[0];
+        for (0..8) |_| acc = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = acc, .rhs = ins[0] } });
+        const out_ptr = try func.appendInst(b, i32_t, .{ .iconst = 0 });
+        try func.addAttr(.{ .value = out_ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "out_attr", .value = .{ .int = encode.ATTR_POSITION } } });
+        try func.appendStore(b, acc, out_ptr);
+        func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+        var k = try compileShader(allocator, &func, stage, nvidia_abi);
+        defer k.deinit(allocator);
+        // Every register an asynchronous attribute delivery writes: ALD in vertex, IPA in fragment.
+        var delivered = [_]bool{false} ** 256;
+        var i: usize = 0;
+        while (i < k.code.len) : (i += 4) {
+            const op = k.code[i] & 0xfff;
+            if (op == 0x321 or op == 0x326) delivered[(k.code[i] >> 16) & 0xff] = true;
+        }
+        var reused: usize = 0;
+        i = 0;
+        while (i < k.code.len) : (i += 4) {
+            const op = k.code[i] & 0xfff;
+            if (op == 0x321 or op == 0x326) continue;
+            const dst = (k.code[i] >> 16) & 0xff;
+            if (dst < 255 and delivered[dst]) reused += 1;
+        }
+        var count: usize = 0;
+        for (delivered) |d| count += @intFromBool(d);
+        try testing.expectEqual(@as(usize, 4), count); // all four inputs really were delivered
+        switch (stage) {
+            .fragment => try testing.expectEqual(@as(usize, 0), reused),
+            else => try testing.expect(reused > 0),
+        }
+    }
+}
+
+test "no emitted instruction reads a source field its opcode leaves at zero" {
+    // A field an opcode does not use is left at a fixed value by its encoder. If that value is
+    // zero the scheduler reads it as R0, waits on R0 scoreboard and CLEARS its tag, so whatever
+    // really consumes R0 emits no wait and reads it stale. Our encoders write RZ, which every
+    // caller skips, and this holds them to that. See `readsSrc`, where the same shape was fixed
+    // once for IPA and again for FADD and FMUL after real ptxas was seen writing zero there.
+    const allocator = testing.allocator;
+    const Case = struct {
+        fn build(alloc: std.mem.Allocator, stage: Stage, loads: usize) !Kernel {
+            var func = Function.init(alloc);
+            defer func.deinit();
+            const f32_t = try func.types.intern(.{ .float = .f32 });
+            const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+            const ptr_t = try func.types.ptrGlobal();
+            const b = try func.appendBlock();
+            const in = try func.appendBlockParam(b, f32_t);
+            try func.addAttr(.{ .value = in }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = encode.ATTR_GENERIC0 } } });
+            const base = try func.appendBlockParam(b, ptr_t);
+            try func.addAttr(.{ .value = base }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "binding", .value = .{ .int = 0 } } });
+            try func.addAttr(.{ .value = base }, .{ .@"align" = 4 });
+            var acc = in;
+            for (0..loads) |i| {
+                const v = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = try func.appendArithImm(b, ptr_t, .add, base, @intCast(i * 4)) } });
+                const s = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
+                acc = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = s, .rhs = v } });
+            }
+            const out = try func.appendInst(b, i32_t, .{ .iconst = 0 });
+            const key = if (stage == .fragment) "color_out" else "out_attr";
+            const val: i64 = if (stage == .fragment) 0 else encode.ATTR_POSITION;
+            try func.addAttr(.{ .value = out }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = key, .value = .{ .int = val } } });
+            try func.appendStore(b, acc, out);
+            func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+            return compileShader(alloc, &func, stage, nvidia_abi);
+        }
+    };
+    for ([_]Stage{ .vertex, .fragment, .compute }) |stage| {
+        for ([_]usize{ 2, 8, 20 }) |loads| {
+            var k = Case.build(allocator, stage, loads) catch continue;
+            defer k.deinit(allocator);
+            try testing.expect(k.code.len > 0);
+            try testing.expectEqual(@as(usize, 0), schedule.countPhantomR0(@ptrCast(k.code)));
+        }
+    }
 }

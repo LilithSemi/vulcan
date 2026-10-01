@@ -939,6 +939,12 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         // FS that reads a UBO/push-constant would be fed the texture descriptor.
         if (module.var_kind[buf_id] == .sampler) {
             try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_desc", .value = .{ .int = 1 } } });
+        } else {
+            // A UBO, an SSBO and a push-constant block all hold standard-layout members, whose
+            // offsets are multiples of four, in a buffer the API binds on at least a four-byte
+            // boundary. Without the promise a backend that cannot assume alignment reads every
+            // scalar one byte at a time and reassembles it.
+            try func.addAttr(.{ .value = p }, .{ .@"align" = 4 });
         }
         // Tag the descriptor's Vulkan binding number so a GPU backend can place it at the
         // matching slot in the SHARED constant bank. The constant bank is shared across
@@ -2937,7 +2943,9 @@ test "lowers a compute shader: buffer store through a thread-indexed pointer" {
     const text = try std.fmt.bufPrint(&buf, "{f}", .{func});
     // The invocation-id parameter carries its `vulcan.gpu.builtin` tag, which the printer
     // now writes: the tag decides whether the parameter takes space in the parameter block.
-    try testing.expect(std.mem.indexOf(u8, text, "block0(v0: i32 #[vulcan.gpu.builtin = 12], v1: ptr):") != null);
+    // The buffer parameter carries the alignment the API guarantees for a bound buffer, which
+    // lets a backend use one wide access for each standard-layout member.
+    try testing.expect(std.mem.indexOf(u8, text, "block0(v0: i32 #[vulcan.gpu.builtin = 12], v1: ptr #[align(4)]):") != null);
     try testing.expect(std.mem.indexOf(u8, text, "load i32") != null);
     try testing.expect(std.mem.indexOf(u8, text, "store ") != null);
     try testing.expect(std.mem.indexOf(u8, text, "ret void") != null);
