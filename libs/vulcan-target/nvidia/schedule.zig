@@ -4481,10 +4481,15 @@ fn touchesConservatively(later: Inst, want: Consumer) bool {
             }
         }
     }
+    // THE PREDICATE SIDE IS NARROWER THAN THE REGISTER SIDE, and deliberately. Only the guard
+    // at bits 12..14 is checked, because `base` writes that field on every instruction and it
+    // is therefore never a stray zero. Every other predicate slot is opcode-specific: an FADD
+    // leaves bits 81..83 at zero, which reads as P0, and nvdisasm confirms it prints no
+    // predicate there at all. Treating those as reads reported a shortfall on every compare
+    // that allocated P0. Predicate operands beyond the guard are covered by `consumes` with its
+    // table, so this diff does not claim to find a missed predicate consumer.
     if (want.pred) |p| {
-        inline for (.{ 12, 68, 77, 81, 84, 87 }) |pos| {
-            if (getField(later, pos, 3) == p) return true;
-        }
+        if (getField(later, 12, 3) == p) return true;
     }
     return false;
 }
