@@ -2019,7 +2019,6 @@ fn globalAccessIsAligned(func: *const Function, ptr: Value, displacement: i32, w
     return @abs(displacement) % need == 0;
 }
 
-
 /// Collapse a chain of constant pointer increments into its last increment.
 ///
 /// Unrolling turns a carried address into `p + 4`, `(p + 4) + 4`, and so on. After the
@@ -7265,7 +7264,6 @@ test "shared address arithmetic is one 32-bit IADD3, where a global address is a
     try testing.expectEqual(@as(usize, 3), count(global_k.code, 0xb82)); // outptr, base, i
 }
 
-
 test "a proven alignment turns a global access back into one wide LDG and STG" {
     // A global access whose address could be anywhere moves one byte at a time, because a wide
     // access off its own multiple reads and writes the wrong bytes. That costs eleven
@@ -7659,7 +7657,6 @@ test "vertex bytewise global memory uses the reserved high scratch pair" {
     };
     try testing.expectEqual(@as(usize, 12), loads);
 }
-
 
 test "every graphics shader declares the scratch registers its prologue writes" {
     // The prologue pads with MOVs into R40 on every graphics shader, and the bytewise memory
