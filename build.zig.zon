@@ -9,8 +9,8 @@
             .hash = "uefi-0.1.0-1okz4b5QAAD-ImP4Q86o97td2DpQNfFhltlBjgnLdL8X",
         },
         .nvidia = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/nvidia.zig#2eb511adb224c55d2357d5862e91460272c4a777",
-            .hash = "nvidia-0.1.0-nX_095kyCwAr_8MApFKBDjtHz1UWJyWuasgd2aPNGbum",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/nvidia.zig#c278df01ad3dcf3568a2ed530719eb7b8ac178de",
+            .hash = "nvidia-0.1.0-nX_095kyCwArp7mMdvRev_44U2oXxZXf7y8Q66L6PdhZ",
         },
     },
     .paths = .{
