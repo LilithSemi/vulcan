@@ -171,7 +171,7 @@ const FunctionParser = struct {
     /// up front, so the count is final here).
     fn checkedBlock(self: *FunctionParser, bnum: u32) Error!Block {
         if (@as(usize, bnum) >= self.func.blockCount()) return error.InvalidSyntax;
-        return @enumFromInt(bnum);
+        return @fromBackingInt(@intCast(bnum));
     }
 
     fn parseFunction(self: *FunctionParser) Error!void {
@@ -1836,7 +1836,7 @@ test "a barrier verifies clean and keeps its scope through a clone" {
 
     var copy = try func.clone(std.testing.allocator);
     defer copy.deinit();
-    const insts = copy.blockInsts(@enumFromInt(0));
+    const insts = copy.blockInsts(@fromBackingInt(@intCast(0)));
     try std.testing.expectEqual(@as(usize, 1), insts.len);
     try std.testing.expectEqual(
         function.BarrierScope.workgroup,
@@ -1878,7 +1878,7 @@ test "an atomic round-trips FIELD BY FIELD through the text form" {
     var func = try parse(std.testing.allocator, text);
     defer func.deinit();
 
-    const entry: Block = @enumFromInt(0);
+    const entry: Block = @fromBackingInt(@intCast(0));
     const params = func.blockParams(entry);
     const insts = func.blockInsts(entry);
 
@@ -1943,8 +1943,8 @@ test "an atomic verifies clean and keeps every field through a clone" {
 
     var copy = try func.clone(std.testing.allocator);
     defer copy.deinit();
-    const insts = copy.blockInsts(@enumFromInt(0));
-    const params = copy.blockParams(@enumFromInt(0));
+    const insts = copy.blockInsts(@fromBackingInt(@intCast(0)));
+    const params = copy.blockParams(@fromBackingInt(@intCast(0)));
     const cas = copy.opcode(insts[0]).atomic_rmw;
     try std.testing.expectEqual(function.AtomicOp.compare_exchange, cas.op);
     try std.testing.expectEqual(function.AtomicScope.system, cas.scope);
@@ -2018,7 +2018,7 @@ test "low float conversions print parse and verify in every format and direction
     defer diags.deinit();
     try std.testing.expect(diags.ok());
 
-    const insts = func.blockInsts(@enumFromInt(0));
+    const insts = func.blockInsts(@fromBackingInt(@intCast(0)));
     inline for (.{
         function.LowFloatFormat.bf16,
         function.LowFloatFormat.f8_e4m3,
@@ -2053,7 +2053,7 @@ test "NVFP4 conversions print parse and verify every policy pair" {
     defer diags.deinit();
     try std.testing.expect(diags.ok());
 
-    const insts = func.blockInsts(@enumFromInt(0));
+    const insts = func.blockInsts(@fromBackingInt(@intCast(0)));
     var inst_attrs = func.attributesOf(.{ .inst = insts[0] });
     try std.testing.expectEqualStrings("inst", inst_attrs.next().?.custom.key);
     var result_attrs = func.attributesOf(.{ .value = func.instResult(insts[0]).? });

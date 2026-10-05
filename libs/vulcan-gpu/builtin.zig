@@ -54,7 +54,7 @@ pub const Builtin = enum(u16) {
     /// Whether this builtin belongs to the compute group. A graphics builtin on a compute
     /// kernel is a frontend error, and a backend uses this to reject it.
     pub fn isCompute(self: Builtin) bool {
-        return @intFromEnum(self) <= @intFromEnum(Builtin.subgroup_size);
+        return @backingInt(self) <= @backingInt(Builtin.subgroup_size);
     }
 
     /// Whether every thread of ONE WORKGROUP reads the same value from this builtin.
@@ -145,6 +145,6 @@ test "every graphics builtin is divergent" {
 test "the compute group boundary sits where isCompute expects it" {
     // Pins the numbering the isCompute comparison depends on. Renumbering the enum without
     // moving the boundary would silently reclassify a builtin.
-    try std.testing.expectEqual(@as(u16, 17), @intFromEnum(Builtin.subgroup_size));
-    try std.testing.expectEqual(@as(u16, 32), @intFromEnum(Builtin.vertex_index));
+    try std.testing.expectEqual(@as(u16, 17), @backingInt(Builtin.subgroup_size));
+    try std.testing.expectEqual(@as(u16, 32), @backingInt(Builtin.vertex_index));
 }

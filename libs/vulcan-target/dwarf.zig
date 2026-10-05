@@ -180,7 +180,7 @@ pub fn emitInfo(allocator: std.mem.Allocator, unit: Unit) std.mem.Allocator.Erro
         try type_offsets.put(allocator, ty.name, @intCast(out.items.len));
         try appendUleb(allocator, &out, ABBREV_BASE_TYPE);
         try appendStr(allocator, &out, ty.name);
-        try out.append(allocator, @intFromEnum(ty.encoding));
+        try out.append(allocator, @backingInt(ty.encoding));
         try out.append(allocator, ty.byte_size);
     }
 
@@ -589,7 +589,7 @@ fn wrapSectionsElf(allocator: std.mem.Allocator, sections: []const Section) ![]u
     errdefer out.deinit(allocator);
 
     try out.appendSlice(allocator, &.{ 0x7f, 'E', 'L', 'F', 2, 1, 1, 0 }); // magic, 64-bit, LE, v1
-    try out.appendSlice(allocator, &(.{0} ** 8)); // e_ident padding
+    try out.appendSlice(allocator, &@as([8]u8, @splat(0))); // e_ident padding
     try appendU16(allocator, &out, 1); // e_type = ET_REL
     try appendU16(allocator, &out, 0xB7); // e_machine = AArch64 (arbitrary valid)
     try appendU32(allocator, &out, 1); // e_version

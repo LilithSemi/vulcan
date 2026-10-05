@@ -7,8 +7,8 @@ pub const ScaleApplication = enum(u8) {
 };
 
 comptime {
-    if (@intFromEnum(ScaleApplication.multiply) != 0) @compileError("multiply tag changed");
-    if (@intFromEnum(ScaleApplication.divide) != 1) @compileError("divide tag changed");
+    if (@backingInt(ScaleApplication.multiply) != 0) @compileError("multiply tag changed");
+    if (@backingInt(ScaleApplication.divide) != 1) @compileError("divide tag changed");
 }
 
 pub fn decodeE2M1(payload: u8) f32 {

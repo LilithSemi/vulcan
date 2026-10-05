@@ -145,7 +145,7 @@ pub fn detect() ?Host {
 
 fn hwcap() usize {
     if (builtin.os.tag != .linux) return 0;
-    return std.os.linux.getauxval(std.elf.AT_HWCAP);
+    return std.os.linux.getauxval(std.elf.AT.HWCAP);
 }
 
 test "detect reports a sane baseline for the host arch" {

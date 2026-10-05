@@ -19,10 +19,10 @@ fn tableOffset(base: u64, index: u64, stride: u64) Error!u64 {
 }
 
 /// ELF `e_machine` values for the architectures Vulcan disassembles.
-pub const EM_386: u16 = @intFromEnum(elf.EM.@"386");
-pub const EM_X86_64: u16 = @intFromEnum(elf.EM.X86_64);
-pub const EM_AARCH64: u16 = @intFromEnum(elf.EM.AARCH64);
-pub const EM_RISCV: u16 = @intFromEnum(elf.EM.RISCV);
+pub const EM_386: u16 = @backingInt(elf.EM.@"386");
+pub const EM_X86_64: u16 = @backingInt(elf.EM.X86_64);
+pub const EM_AARCH64: u16 = @backingInt(elf.EM.AARCH64);
+pub const EM_RISCV: u16 = @backingInt(elf.EM.RISCV);
 
 /// `e_flags` bit indicating a RISC-V image uses the compressed (C) extension.
 pub const EF_RISCV_RVC: u32 = 0x1;
@@ -117,7 +117,7 @@ fn findTextGeneric(comptime L: type, comptime is_64: bool, image: []const u8) Er
         const sh = try shdr(L, image, eh, i);
         if (!std.mem.eql(u8, nameAt(names, sh.sh_name), ".text")) continue;
         return .{
-            .machine = @intFromEnum(eh.e_machine),
+            .machine = @backingInt(eh.e_machine),
             .is_64 = is_64,
             .addr = sh.sh_addr,
             .flags = eh.e_flags,
@@ -334,7 +334,7 @@ fn buildElf64(allocator: std.mem.Allocator, machine: u16, text_addr: u64, code: 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, &.{ 0x7f, 'E', 'L', 'F', 2, 1, 1, 0 });
-    try out.appendSlice(allocator, &(.{0} ** 8));
+    try out.appendSlice(allocator, &@as([8]u8, @splat(0)));
     try appendInt(allocator, &out, u16, 1); // e_type = ET_REL
     try appendInt(allocator, &out, u16, machine);
     try appendInt(allocator, &out, u32, 1);

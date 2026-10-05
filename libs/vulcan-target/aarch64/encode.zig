@@ -40,7 +40,7 @@ pub const Reg = enum(u5) {
 };
 
 fn n(reg: Reg) u32 {
-    return @intFromEnum(reg);
+    return @backingInt(reg);
 }
 
 /// `ret` (return to the address in x30, the link register).
@@ -262,7 +262,7 @@ pub fn addsImm64(rd: Reg, rn: Reg, imm: u12) u32 {
 /// `cset wd, cond` (32-bit): wd = 1 if `cond` holds, else 0. Encoded as
 /// `csinc wd, wzr, wzr, invert(cond)`.
 pub fn cset(rd: Reg, cond: Cond) u32 {
-    const inv: u32 = @as(u4, @intFromEnum(cond)) ^ 1; // invert toggles the low bit
+    const inv: u32 = @as(u4, @backingInt(cond)) ^ 1; // invert toggles the low bit
     return 0x1A800400 | (31 << 16) | (inv << 12) | (31 << 5) | n(rd);
 }
 
@@ -287,7 +287,7 @@ pub fn cbz(rt: Reg, off: i21) u32 {
 /// words), [4]=0, [3:0]=cond.
 pub fn bcc(cond: Cond, off: i21) u32 {
     const imm19: u32 = @as(u32, @bitCast(@as(i32, off) >> 2)) & 0x7FFFF;
-    return 0x54000000 | (imm19 << 5) | @as(u32, @intFromEnum(cond));
+    return 0x54000000 | (imm19 << 5) | @as(u32, @backingInt(cond));
 }
 
 /// `b label` (unconditional branch). `off` is the signed byte displacement.
@@ -566,7 +566,7 @@ pub fn asrv64(rd: Reg, rn: Reg, rm: Reg) u32 {
 
 /// `csel wd, wn, wm, cond` (32-bit): wd = cond ? wn : wm.
 pub fn csel(rd: Reg, rn: Reg, rm: Reg, cond: Cond) u32 {
-    return 0x1A800000 | (n(rm) << 16) | (@as(u32, @intFromEnum(cond)) << 12) | (n(rn) << 5) | n(rd);
+    return 0x1A800000 | (n(rm) << 16) | (@as(u32, @backingInt(cond)) << 12) | (n(rn) << 5) | n(rd);
 }
 
 // FP register operands are also indices 0..31, naming v0..v31 (s/d/h views). The scalar
@@ -825,7 +825,7 @@ pub fn fcmp(rn: Reg, rm: Reg, kind: FKind) u32 {
 
 /// `fcsel dd, dn, dm, cond` (and single/half forms): dd = cond ? dn : dm.
 pub fn fcsel(rd: Reg, rn: Reg, rm: Reg, cond: Cond, kind: FKind) u32 {
-    return 0x1E200C00 | ftype(kind) | (n(rm) << 16) | (@as(u32, @intFromEnum(cond)) << 12) | (n(rn) << 5) | n(rd);
+    return 0x1E200C00 | ftype(kind) | (n(rm) << 16) | (@as(u32, @backingInt(cond)) << 12) | (n(rn) << 5) | n(rd);
 }
 
 /// `fmov dd, dn` (a 64-bit FP register move, copies the low 64 bits, which covers

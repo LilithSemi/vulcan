@@ -212,7 +212,7 @@ fn intBits(func: *const Function, v: Value) u16 {
 /// needs 16-byte call-site alignment.
 fn hasCall(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
             .call, .call_indirect => return true,
             else => {},
         };
@@ -787,7 +787,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
     // System V passes general args in rdi, rsi, and so on, and fp args in xmm0,
     // xmm1, and so on, as separate sequences. So each class has its own
     // incoming-register index.
-    const eparams = func.blockParams(@enumFromInt(0));
+    const eparams = func.blockParams(@fromBackingInt(@intCast(0)));
     var arg_moves: std.ArrayList(Move) = .empty;
     defer arg_moves.deinit(allocator);
     var gpr_i: usize = 0;
@@ -881,7 +881,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
     var pos_base: u32 = 0;
     var action_cursor: usize = 0;
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         block_start[bi] = ctx.code.items.len;
         // A neutralized, unreachable block: `neutralizeUnreachable` emptied its
         // params, instructions, and terminator, so downstream passes see only the
@@ -925,7 +925,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
             // An instruction with a result must be emitted at exactly that
             // result's def position. This pins the emission numbering to
             // translateAllocationX86's numbering, and the assert must never fire.
-            if (func.instResult(inst)) |r| std.debug.assert(ctx.pos == ctx.def_pos[@intFromEnum(r)]);
+            if (func.instResult(inst)) |r| std.debug.assert(ctx.pos == ctx.def_pos[@backingInt(r)]);
             // Drain split-boundary stores landing at this position before the
             // code emits the instruction. A tail-split store writes the
             // victim's register to its slot before the taker (the instruction
@@ -951,7 +951,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 // one emitted, or null at the last block. Whichever successor
                 // edge targets `next_block` can fall through, so `emitIf` elides
                 // that branch.
-                const next_block: ?Block = if (bi + 1 < nblocks) @enumFromInt(bi + 1) else null;
+                const next_block: ?Block = if (bi + 1 < nblocks) @fromBackingInt(@intCast(bi + 1)) else null;
                 try emitIf(allocator, ctx, func.opcode(inst).@"if", block, next_block);
                 terminated = true;
             } else {
@@ -1064,7 +1064,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 // `next_block` is the next block emitted (`bi+1`), or null at
                 // the last block. A jump to it falls through, so `emitJump`
                 // elides the `jmp`.
-                const next_block: ?Block = if (bi + 1 < nblocks) @enumFromInt(bi + 1) else null;
+                const next_block: ?Block = if (bi + 1 < nblocks) @fromBackingInt(@intCast(bi + 1)) else null;
                 try emitJump(allocator, ctx, j, block, next_block);
             },
         };
@@ -1194,7 +1194,7 @@ fn emitVariadicSave(allocator: std.mem.Allocator, ctx: *Ctx) Error!void {
 /// exactly the prologue's param-homing split.
 const NamedRegCounts = struct { gp: u32, fp: u32 };
 fn namedRegCounts(func: *const Function) NamedRegCounts {
-    const eparams = func.blockParams(@enumFromInt(0));
+    const eparams = func.blockParams(@fromBackingInt(@intCast(0)));
     const n_fixed = @min(func.num_fixed_params, @as(u32, @intCast(eparams.len)));
     var gp: u32 = 0;
     var fp: u32 = 0;
@@ -2552,7 +2552,7 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
         // displacement is unchanged.
         const jcc_at = try emitBranch(allocator, ctx, encode.jcc(cc, 0));
         try emitMoves(allocator, ctx, cf.@"else", pred); // ELSE-moves on the else path
-        try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.@"else".target));
+        try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(cf.@"else".target));
         const then_start = ctx.code.items.len;
         const rel: i32 = @intCast(@as(i64, @intCast(then_start)) - @as(i64, @intCast(jcc_at + 4)));
         std.mem.writeInt(u32, ctx.code.items[jcc_at..][0..4], @bitCast(rel), .little);
@@ -2569,7 +2569,7 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
         // targets else_start.
         const jcc_at = try emitBranch(allocator, ctx, encode.jcc(encode.invertCond(cc), 0));
         try emitMoves(allocator, ctx, cf.then, pred); // THEN-moves on the then (not-taken) path
-        try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.then.target));
+        try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(cf.then.target));
         const else_start = ctx.code.items.len;
         const rel: i32 = @intCast(@as(i64, @intCast(else_start)) - @as(i64, @intCast(jcc_at + 4)));
         std.mem.writeInt(u32, ctx.code.items[jcc_at..][0..4], @bitCast(rel), .little);
@@ -2581,12 +2581,12 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
     // as before.
     const jcc_at = try emitBranch(allocator, ctx, encode.jcc(cc, 0));
     try emitMoves(allocator, ctx, cf.@"else", pred);
-    try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.@"else".target));
+    try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(cf.@"else".target));
     const then_start = ctx.code.items.len;
     const rel: i32 = @intCast(@as(i64, @intCast(then_start)) - @as(i64, @intCast(jcc_at + 4)));
     std.mem.writeInt(u32, ctx.code.items[jcc_at..][0..4], @bitCast(rel), .little);
     try emitMoves(allocator, ctx, cf.then, pred);
-    try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.then.target));
+    try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(cf.then.target));
 }
 
 fn emitJump(allocator: std.mem.Allocator, ctx: *Ctx, jump: ir.function.Jump, pred: Block, next_block: ?Block) Error!void {
@@ -2595,7 +2595,7 @@ fn emitJump(allocator: std.mem.Allocator, ctx: *Ctx, jump: ir.function.Jump, pre
     // `jmp` and its fixup.
     try emitMoves(allocator, ctx, jump, pred);
     if (next_block != null and jump.target == next_block.?) return;
-    try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(jump.target));
+    try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(jump.target));
 }
 
 fn emitBranch(allocator: std.mem.Allocator, ctx: *Ctx, inst: encode.Inst) Error!usize {
@@ -2705,33 +2705,33 @@ fn emitOneEdgeMoveX86(allocator: std.mem.Allocator, ctx: *Ctx, m: EdgeMove) Erro
     switch (m.class) {
         0 => switch (m.src) {
             .reg => |si| {
-                const sr: Reg = @enumFromInt(@as(u4, @intCast(si)));
+                const sr: Reg = @fromBackingInt(@intCast(@as(u4, @intCast(si))));
                 switch (m.dst) {
                     .reg => |di| {
-                        const dr: Reg = @enumFromInt(@as(u4, @intCast(di)));
+                        const dr: Reg = @fromBackingInt(@intCast(@as(u4, @intCast(di))));
                         if (sr != dr) try ctx.put(allocator, encode.movReg(dr, sr));
                     },
                     .slot => |ds| try ctx.put(allocator, encode.movToStack(slotDisp(ds), sr)),
                 }
             },
             .slot => |ss| switch (m.dst) {
-                .reg => |di| try ctx.put(allocator, encode.movFromStack(@enumFromInt(@as(u4, @intCast(di))), slotDisp(ss))),
+                .reg => |di| try ctx.put(allocator, encode.movFromStack(@fromBackingInt(@intCast(@as(u4, @intCast(di)))), slotDisp(ss))),
                 .slot => unreachable, // slot->slot was expanded through the class scratch
             },
         },
         1 => switch (m.src) {
             .reg => |si| {
-                const sx: Xmm = @enumFromInt(@as(u4, @intCast(si)));
+                const sx: Xmm = @fromBackingInt(@intCast(@as(u4, @intCast(si))));
                 switch (m.dst) {
                     .reg => |di| {
-                        const dx: Xmm = @enumFromInt(@as(u4, @intCast(di)));
+                        const dx: Xmm = @fromBackingInt(@intCast(@as(u4, @intCast(di))));
                         if (sx != dx) try ctx.put(allocator, if (m.wide) encode.vmovupsRR(dx, sx) else encode.movupsRR(dx, sx));
                     },
                     .slot => |ds| try ctx.put(allocator, if (m.wide) encode.vmovupsStore(ctx.xmmDisp(ds), sx) else encode.movupsStore(ctx.xmmDisp(ds), sx)),
                 }
             },
             .slot => |ss| switch (m.dst) {
-                .reg => |di| try ctx.put(allocator, if (m.wide) encode.vmovupsLoad(@enumFromInt(@as(u4, @intCast(di))), ctx.xmmDisp(ss)) else encode.movupsLoad(@enumFromInt(@as(u4, @intCast(di))), ctx.xmmDisp(ss))),
+                .reg => |di| try ctx.put(allocator, if (m.wide) encode.vmovupsLoad(@fromBackingInt(@intCast(@as(u4, @intCast(di)))), ctx.xmmDisp(ss)) else encode.movupsLoad(@fromBackingInt(@intCast(@as(u4, @intCast(di)))), ctx.xmmDisp(ss))),
                 .slot => unreachable,
             },
         },
@@ -2977,7 +2977,7 @@ fn x86_64CopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Val
 
 /// Append a `u16` index for every register in `regs` to `list` (via `@intFromEnum`).
 fn appendRegIndices(allocator: std.mem.Allocator, list: *std.ArrayList(u16), comptime R: type, regs: []const R) Error!void {
-    for (regs) |r| try list.append(allocator, @intFromEnum(r));
+    for (regs) |r| try list.append(allocator, @backingInt(r));
 }
 
 /// The kind of fixed-register clobber a single instruction contributes at
@@ -3058,12 +3058,12 @@ pub fn x86_64RegDescription(allocator: std.mem.Allocator, func: *const Function)
     if (func.blockCount() != 0) {
         var gpr_idx: usize = 0;
         var xmm_idx: usize = 0;
-        for (func.blockParams(@enumFromInt(0))) |p| {
+        for (func.blockParams(@fromBackingInt(@intCast(0)))) |p| {
             if (isXmm(func, p)) {
-                if (xmm_idx < xmm_arg_regs.len) try ef.append(allocator, .{ .value = p, .class = 1, .reg = @intFromEnum(xmm_arg_regs[xmm_idx]) });
+                if (xmm_idx < xmm_arg_regs.len) try ef.append(allocator, .{ .value = p, .class = 1, .reg = @backingInt(xmm_arg_regs[xmm_idx]) });
                 xmm_idx += 1;
             } else {
-                if (gpr_idx < arg_regs.len) try ef.append(allocator, .{ .value = p, .class = 0, .reg = @intFromEnum(arg_regs[gpr_idx]) });
+                if (gpr_idx < arg_regs.len) try ef.append(allocator, .{ .value = p, .class = 0, .reg = @backingInt(arg_regs[gpr_idx]) });
                 gpr_idx += 1;
             }
         }
@@ -3090,7 +3090,7 @@ pub fn x86_64RegDescription(allocator: std.mem.Allocator, func: *const Function)
         var pos: u32 = 0;
         for (0..func.blockCount()) |bi| {
             pos += 1; // block-parameter row
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 const clob = try buildClobber(allocator, clobberKindOf(func, inst));
                 if (clob) |cr| {
                     errdefer freeClassRegs(allocator, cr);
@@ -3116,8 +3116,8 @@ pub fn x86_64RegDescription(allocator: std.mem.Allocator, func: *const Function)
     // scratch r11 (index 11). Class 1 uses xmm15 (index 15). ---
     const scratch = try allocator.alloc(u16, 2);
     errdefer allocator.free(scratch);
-    scratch[0] = @intFromEnum(move_scratch);
-    scratch[1] = @intFromEnum(xmm_scratch);
+    scratch[0] = @backingInt(move_scratch);
+    scratch[1] = @backingInt(xmm_scratch);
 
     return .{
         .classes = classes,
@@ -3150,7 +3150,7 @@ fn buildClobber(allocator: std.mem.Allocator, kind: ClobberKind) Error!?[]wimmer
         .call => {
             const gpr_clob = try allocator.alloc(u16, caller_saved_gpr.len);
             errdefer allocator.free(gpr_clob);
-            for (caller_saved_gpr, 0..) |r, i| gpr_clob[i] = @intFromEnum(r);
+            for (caller_saved_gpr, 0..) |r, i| gpr_clob[i] = @backingInt(r);
             const xmm_clob = try allocator.alloc(u16, xmm_allocatable_count);
             errdefer allocator.free(xmm_clob);
             for (0..xmm_allocatable_count) |i| xmm_clob[i] = @intCast(i);
@@ -3162,8 +3162,8 @@ fn buildClobber(allocator: std.mem.Allocator, kind: ClobberKind) Error!?[]wimmer
         .div => {
             const gpr_clob = try allocator.alloc(u16, 2);
             errdefer allocator.free(gpr_clob);
-            gpr_clob[0] = @intFromEnum(Reg.rax);
-            gpr_clob[1] = @intFromEnum(Reg.rdx);
+            gpr_clob[0] = @backingInt(Reg.rax);
+            gpr_clob[1] = @backingInt(Reg.rdx);
             const clob = try allocator.alloc(wimmer.ClassRegs, 1);
             clob[0] = .{ .class = 0, .regs = gpr_clob };
             return clob;
@@ -3171,7 +3171,7 @@ fn buildClobber(allocator: std.mem.Allocator, kind: ClobberKind) Error!?[]wimmer
         .shift => {
             const gpr_clob = try allocator.alloc(u16, 1);
             errdefer allocator.free(gpr_clob);
-            gpr_clob[0] = @intFromEnum(Reg.rcx);
+            gpr_clob[0] = @backingInt(Reg.rcx);
             const clob = try allocator.alloc(wimmer.ClassRegs, 1);
             clob[0] = .{ .class = 0, .regs = gpr_clob };
             return clob;
@@ -3196,7 +3196,7 @@ fn buildClobber(allocator: std.mem.Allocator, kind: ClobberKind) Error!?[]wimmer
 /// index maps to the enum, and a per-class slot maps to a gpr spill slot.
 fn wimmerGprLoc(loc: wimmer.Location) Loc {
     return switch (loc) {
-        .reg => |ri| .{ .reg = @enumFromInt(@as(u4, @intCast(ri))) },
+        .reg => |ri| .{ .reg = @fromBackingInt(@intCast(@as(u4, @intCast(ri)))) },
         .slot => |s| .{ .spill = s },
     };
 }
@@ -3206,7 +3206,7 @@ fn wimmerGprLoc(loc: wimmer.Location) Loc {
 /// slot.
 fn wimmerXmmLoc(loc: wimmer.Location) Loc {
     return switch (loc) {
-        .reg => |ri| .{ .xmm = @enumFromInt(@as(u4, @intCast(ri))) },
+        .reg => |ri| .{ .xmm = @fromBackingInt(@intCast(@as(u4, @intCast(ri)))) },
         .slot => |s| .{ .xmm_spill = s },
     };
 }
@@ -3264,7 +3264,7 @@ fn edgeLocX86(loc: wimmer.Location) EdgeLoc {
 }
 
 fn regLessThanX86(_: void, a: Reg, b: Reg) bool {
-    return @intFromEnum(a) < @intFromEnum(b);
+    return @backingInt(a) < @backingInt(b);
 }
 
 /// Translate a finished shared `wimmer.Allocation` into a filled `ctx`
@@ -3303,11 +3303,11 @@ fn translateAllocationX86(
     {
         var pos: u32 = 0;
         for (0..func.blockCount()) |bi| {
-            const block: Block = @enumFromInt(bi);
-            for (func.blockParams(block)) |p| def_pos[@intFromEnum(p)] = pos;
+            const block: Block = @fromBackingInt(@intCast(bi));
+            for (func.blockParams(block)) |p| def_pos[@backingInt(p)] = pos;
             pos += 1;
             for (func.blockInsts(block)) |inst| {
-                if (func.instResult(inst)) |r| def_pos[@intFromEnum(r)] = pos;
+                if (func.instResult(inst)) |r| def_pos[@backingInt(r)] = pos;
                 pos += 1;
             }
             pos += 1; // terminator slot
@@ -3374,7 +3374,7 @@ fn translateAllocationX86(
     // class-1 used-saved register would be a model bug.
     for (walloc.used_callee_saved) |us| {
         if (us.class != 0) return error.Unsupported;
-        try saved.append(allocator, @enumFromInt(@as(u4, @intCast(us.reg))));
+        try saved.append(allocator, @fromBackingInt(@intCast(@as(u4, @intCast(us.reg)))));
     }
     std.mem.sort(Reg, saved.items, {}, regLessThanX86);
 
@@ -3444,7 +3444,7 @@ fn applyFoldRewriteX86(func: *Function, fold: *const addrfold.Analysis) void {
     // miscompile. Removal order does not matter, since no dead add's
     // result feeds another instruction.
     for (0..func.blockCount()) |bi| {
-        const list = func.blockInstsMut(@enumFromInt(bi));
+        const list = func.blockInstsMut(@fromBackingInt(@intCast(bi)));
         var i: usize = 0;
         while (i < list.items.len) {
             const inst = list.items[i];
@@ -3706,7 +3706,7 @@ fn countOperand(ctx: CountCtx, operand: Value, is_edge_arg: bool) void {
 fn countUses(func: *const Function, v: Value) usize {
     var count: usize = 0;
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| forEachOperand(func, inst, &empty_fold, CountCtx{ .target = v, .count = &count }, countOperand);
         if (func.terminator(block)) |term| forEachTermOperand(func, term, CountCtx{ .target = v, .count = &count }, countOperand);
     }
@@ -3834,7 +3834,7 @@ fn fusesArithIntoBranch(func: *const Function, insts: []const ir.function.Inst, 
 fn computeAllocaSlots(allocator: std.mem.Allocator, func: *const Function, map: *std.AutoHashMapUnmanaged(Value, u32)) Error!u32 {
     var cur: u32 = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             switch (func.opcode(inst)) {
                 .alloca => |al| {
                     cur = alignUp(cur, typeAlign(func, al.elem));

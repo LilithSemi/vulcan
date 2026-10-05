@@ -86,10 +86,10 @@ fn computeDefBlocks(allocator: std.mem.Allocator, func: *const Function) Error![
     const def_block = try allocator.alloc(u32, func.valueCount());
     errdefer allocator.free(def_block);
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
-        for (func.blockParams(block)) |p| def_block[@intFromEnum(p)] = @intCast(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockParams(block)) |p| def_block[@backingInt(p)] = @intCast(bi);
         for (func.blockInsts(block)) |inst| {
-            if (func.instResult(inst)) |r| def_block[@intFromEnum(r)] = @intCast(bi);
+            if (func.instResult(inst)) |r| def_block[@backingInt(r)] = @intCast(bi);
         }
     }
     return def_block;
@@ -115,7 +115,7 @@ fn inLoop(body: []const bool, idx: u32) bool {
 /// accumulators, wrong param count, non-zero initial index, ...) returns null.
 fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.Loop, def_block: []const u32) Error!?Plan {
     if (loop.preheader == null) return null;
-    const header: Block = @enumFromInt(loop.header);
+    const header: Block = @fromBackingInt(@intCast(loop.header));
     const body_bits = loop.body;
     const h_idx: u32 = loop.header;
 
@@ -124,10 +124,10 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
     for (0..func.blockCount()) |bi| {
         if (!inLoop(body_bits, @intCast(bi)) or bi == h_idx) continue;
         if (body_opt != null) return null;
-        body_opt = @enumFromInt(bi);
+        body_opt = @fromBackingInt(@intCast(bi));
     }
     const body = body_opt orelse return null;
-    const b_idx: u32 = @intFromEnum(body);
+    const b_idx: u32 = @backingInt(body);
 
     // Pure test header: exactly [icmp, if], the `if` testing the icmp, no explicit branching
     // terminator. Matches the loop-header idiom unroll.zig also requires.
@@ -153,13 +153,13 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
     }
     const iv_i = ivi orelse return null;
     const n = cmp.rhs;
-    if (inLoop(body_bits, def_block[@intFromEnum(n)])) return null; // n must be loop-invariant
+    if (inLoop(body_bits, def_block[@backingInt(n)])) return null; // n must be loop-invariant
     if (!isI32(func, hparams[iv_i])) return null;
 
     // The header's `if` has exactly one in-loop edge (to the body) and one exit edge; the in-loop edge
     // passes the header params straight through, so body param k corresponds to header param k.
-    const then_in = inLoop(body_bits, @intFromEnum(iff.then.target));
-    const else_in = inLoop(body_bits, @intFromEnum(iff.@"else".target));
+    const then_in = inLoop(body_bits, @backingInt(iff.then.target));
+    const else_in = inLoop(body_bits, @backingInt(iff.@"else".target));
     const in_edge = if (then_in and !else_in) iff.then else if (else_in and !then_in) iff.@"else" else return null;
     if (in_edge.target != body) return null;
     const in_args = func.blockArgs(in_edge);
@@ -188,7 +188,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
     var prod: Value = undefined;
     for (0..4) |k| {
         const upd = back_args[k];
-        if (def_block[@intFromEnum(upd)] != b_idx) continue;
+        if (def_block[@backingInt(upd)] != b_idx) continue;
         const di = func.definingInst(upd) orelse continue;
         const op = func.opcode(di);
         if (op != .arith) continue;
@@ -211,7 +211,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
     const nacc_inst = func.definingInst(back_args[acc_i]).?;
 
     // prod = ca * cb (both defined in the body).
-    if (def_block[@intFromEnum(prod)] != b_idx) return null;
+    if (def_block[@backingInt(prod)] != b_idx) return null;
     const prod_inst = func.definingInst(prod) orelse return null;
     const mulop = switch (func.opcode(prod_inst)) {
         .arith => |a| a,
@@ -227,7 +227,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
 
     // la = load(bp_x), lb = load(bp_y): 8-bit loads from two distinct body pointer params, same
     // signedness. bp_x and bp_y identify the pointer param indices.
-    if (def_block[@intFromEnum(la)] != b_idx or def_block[@intFromEnum(lb)] != b_idx) return null;
+    if (def_block[@backingInt(la)] != b_idx or def_block[@backingInt(lb)] != b_idx) return null;
     const la_inst = func.definingInst(la) orelse return null;
     const lb_inst = func.definingInst(lb) orelse return null;
     // A `volatile` load is an observable access (see `Load.@"volatile"`). The `dot` rewrite reads 16
@@ -272,7 +272,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
     if (func.blockInsts(body).len != nine.len) return null;
 
     // The preheader supplies the initial index (must be 0), accumulator, and the two pointer bases.
-    const preheader: Block = @enumFromInt(loop.preheader.?);
+    const preheader: Block = @fromBackingInt(@intCast(loop.preheader.?));
     const p_args = switch (func.terminator(preheader) orelse return null) {
         .jump => |j| blk: {
             if (j.target != header) return null;
@@ -300,7 +300,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
 
 /// If `v` is a `convert` to i32 defined in block `b_idx`, return its source value; else null.
 fn convertSource(func: *const Function, def_block: []const u32, b_idx: u32, v: Value) Error!?Value {
-    if (def_block[@intFromEnum(v)] != b_idx) return null;
+    if (def_block[@backingInt(v)] != b_idx) return null;
     const di = func.definingInst(v) orelse return null;
     return switch (func.opcode(di)) {
         .convert => |c| if (isI32(func, v)) c.value else null,
@@ -310,7 +310,7 @@ fn convertSource(func: *const Function, def_block: []const u32, b_idx: u32, v: V
 
 /// If `upd` is `arith_imm add(base, 1)` defined in block `b_idx`, return its instruction; else null.
 fn stepByOne(func: *const Function, def_block: []const u32, b_idx: u32, upd: Value, base: Value) Error!?Inst {
-    if (def_block[@intFromEnum(upd)] != b_idx) return null;
+    if (def_block[@backingInt(upd)] != b_idx) return null;
     const di = func.definingInst(upd) orelse return null;
     return switch (func.opcode(di)) {
         .arith_imm => |a| if (a.op == .add and a.lhs == base and a.imm == 1) di else null,
@@ -522,7 +522,7 @@ fn buildDotLoop(func: *Function, spec: LoopSpec) Error!void {
 fn countDots(func: *const Function) usize {
     var count: usize = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .dot) count += 1;
         }
     }
@@ -942,7 +942,7 @@ test "volatile: a dot loop over a volatile element load is left scalar" {
         try std.testing.expectEqual(@as(usize, 0), countDots(&func));
 
         // Both element loads are still in the body, and the marked one still carries its flag.
-        const body_insts = func.blockInsts(@enumFromInt(2));
+        const body_insts = func.blockInsts(@fromBackingInt(@intCast(2)));
         try std.testing.expect(func.opcode(body_insts[0]).load.@"volatile" == (vol == .a));
         try std.testing.expect(func.opcode(body_insts[1]).load.@"volatile" == (vol == .b));
     }
@@ -970,7 +970,7 @@ test "endian: a dot loop over a byte-order-tagged element load is left scalar" {
         try std.testing.expectEqual(@as(usize, 0), countDots(&func));
 
         // Both element loads are still in the body, and the tagged one still carries its tag.
-        const body_insts = func.blockInsts(@enumFromInt(2));
+        const body_insts = func.blockInsts(@fromBackingInt(@intCast(2)));
         try std.testing.expectEqual(tag == .a, func.isByteOrderTagged(body_insts[0]));
         try std.testing.expectEqual(tag == .b, func.isByteOrderTagged(body_insts[1]));
     }
@@ -1000,8 +1000,8 @@ test "a dot loop whose body also holds an atomic is not recognized" {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     var body: ?ir.function.Block = null;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
-            if (func.opcode(inst) == .load) body = @enumFromInt(bi);
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (func.opcode(inst) == .load) body = @fromBackingInt(@intCast(bi));
         }
     }
     const b = body.?;
@@ -1013,7 +1013,7 @@ test "a dot loop whose body also holds an atomic is not recognized" {
     try std.testing.expectEqual(@as(usize, 0), countDots(&func));
     var atomics: usize = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .atomic_rmw) atomics += 1;
         }
     }

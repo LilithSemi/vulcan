@@ -125,7 +125,7 @@ const Emitter = struct {
     }
 
     fn name(self: *Emitter, v: Value) u32 {
-        return self.names[@intFromEnum(v)];
+        return self.names[@backingInt(v)];
     }
 
     fn kind(self: *Emitter, ty: Type) ir.types.TypeKind {
@@ -136,11 +136,11 @@ const Emitter = struct {
         try self.assignNames();
         const func = self.func;
         for (0..func.instCount()) |ii| {
-            if (func.opcode(@enumFromInt(ii)) == .alloca) self.uses_alloca = true;
+            if (func.opcode(@fromBackingInt(@intCast(ii))) == .alloca) self.uses_alloca = true;
         }
 
         // Signature: entry-block parameters are the JS parameters.
-        const entry_params = func.blockParams(@as(Block, @enumFromInt(0)));
+        const entry_params = func.blockParams(@as(Block, @fromBackingInt(@intCast(0))));
         try self.print("function {s}(", .{sym});
         for (entry_params, 0..) |p, i| {
             if (i != 0) try self.w(", ");
@@ -153,13 +153,13 @@ const Emitter = struct {
 
         if (self.isStraightLine()) {
             // One block with no branching: emit it directly, no state machine.
-            const entry: Block = @enumFromInt(0);
+            const entry: Block = @fromBackingInt(@intCast(0));
             for (func.blockInsts(entry)) |inst| try self.emitInst(inst, "  ");
             try self.emitTerminator(entry, "  ");
         } else {
             try self.w("  let __blk = 0;\n  while (true) {\n    switch (__blk) {\n");
             for (0..func.blockCount()) |bi| {
-                const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
+                const block: Block = @fromBackingInt(@intCast(@as(u32, @intCast(bi))));
                 try self.print("      case {d}: {{\n", .{bi});
                 var branched = false;
                 for (func.blockInsts(block)) |inst| {
@@ -179,7 +179,7 @@ const Emitter = struct {
     fn isStraightLine(self: *Emitter) bool {
         const func = self.func;
         if (func.blockCount() != 1) return false;
-        const entry: Block = @enumFromInt(0);
+        const entry: Block = @fromBackingInt(@intCast(0));
         for (func.blockInsts(entry)) |inst| {
             if (func.opcode(inst) == .@"if") return false;
         }
@@ -194,14 +194,14 @@ const Emitter = struct {
         self.names = try self.allocator.alloc(u32, func.valueCount());
         var n: u32 = 0;
         for (0..func.blockCount()) |bi| {
-            const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
+            const block: Block = @fromBackingInt(@intCast(@as(u32, @intCast(bi))));
             for (func.blockParams(block)) |p| {
-                self.names[@intFromEnum(p)] = n;
+                self.names[@backingInt(p)] = n;
                 n += 1;
             }
             for (func.blockInsts(block)) |inst| {
                 if (func.instResult(inst)) |res| {
-                    self.names[@intFromEnum(res)] = n;
+                    self.names[@backingInt(res)] = n;
                     n += 1;
                 }
             }
@@ -214,7 +214,7 @@ const Emitter = struct {
         const func = self.func;
         var first = true;
         for (0..func.blockCount()) |bi| {
-            const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
+            const block: Block = @fromBackingInt(@intCast(@as(u32, @intCast(bi))));
             if (bi != 0) for (func.blockParams(block)) |p| try self.declare(p, &first);
             for (func.blockInsts(block)) |inst| {
                 if (func.instResult(inst)) |res| try self.declare(res, &first);
@@ -514,7 +514,7 @@ const Emitter = struct {
     fn emitEdge(self: *Emitter, target: Block, args: []const Value, indent: []const u8) Error!void {
         const params = self.func.blockParams(target);
         if (params.len == 0) {
-            try self.print("{s}  __blk = {d}; break;\n", .{ indent, @intFromEnum(target) });
+            try self.print("{s}  __blk = {d}; break;\n", .{ indent, @backingInt(target) });
             return;
         }
         try self.print("{s}  {{\n", .{indent});
@@ -524,7 +524,7 @@ const Emitter = struct {
         for (params) |p| {
             try self.print("{s}    v{d} = t{d};\n", .{ indent, self.name(p), self.name(p) });
         }
-        try self.print("{s}    __blk = {d}; break;\n", .{ indent, @intFromEnum(target) });
+        try self.print("{s}    __blk = {d}; break;\n", .{ indent, @backingInt(target) });
         try self.print("{s}  }}\n", .{indent});
     }
 

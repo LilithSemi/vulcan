@@ -148,7 +148,7 @@ pub const Kernel = struct {
 /// Whether any block returns a value.
 fn returnsValue(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
-        const term = func.terminator(@enumFromInt(bi)) orelse continue;
+        const term = func.terminator(@fromBackingInt(@intCast(bi))) orelse continue;
         switch (term) {
             .ret => |r| if (r.count != 0) return true,
             .jump => {},
@@ -515,7 +515,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, a: gpu
     var float_idx: usize = 0;
     var placed: usize = 0;
     var read_id = false;
-    for (func.blockParams(@enumFromInt(0))) |p| {
+    for (func.blockParams(@fromBackingInt(@intCast(0)))) |p| {
         if (gpu.attrs.builtinOf(func, p)) |b| {
             // A builtin is an integer the hardware supplies, so it takes an integer argument
             // register. A frontend that typed one as a float has tagged the wrong parameter.
@@ -979,7 +979,7 @@ test "a kernel whose entry a branch reaches refuses, and the same shape without 
         defer func.deinit();
         try buildOneBuiltinKernel(&func, .thread_id_x);
         const back = try func.appendBlock();
-        try func.setJump(back, @enumFromInt(0), &.{});
+        try func.setJump(back, @fromBackingInt(@intCast(0)), &.{});
         try testing.expectError(error.Unsupported, compileKernel(testing.allocator, &func, etsoc_abi));
     }
     {
@@ -987,7 +987,7 @@ test "a kernel whose entry a branch reaches refuses, and the same shape without 
         defer func.deinit();
         try buildOneBuiltinKernel(&func, .thread_id_x);
         const tail = try func.appendBlock();
-        try func.setJump(@enumFromInt(0), tail, &.{});
+        try func.setJump(@fromBackingInt(@intCast(0)), tail, &.{});
         func.setTerminator(tail, .{ .ret = ir.function.Ret.none() });
         var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
         kernel.deinit(testing.allocator);

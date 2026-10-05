@@ -119,7 +119,7 @@ pub const TypeTable = struct {
         const owned = try self.ownKind(kind);
         errdefer self.freeKind(owned);
 
-        const handle: Type = @enumFromInt(@as(u32, @intCast(self.kinds.items.len)));
+        const handle: Type = @fromBackingInt(@intCast(@as(u32, @intCast(self.kinds.items.len))));
         try self.kinds.append(self.allocator, owned);
         errdefer _ = self.kinds.pop();
 
@@ -136,7 +136,7 @@ pub const TypeTable = struct {
 
     /// Borrow the structural kind backing a handle.
     pub fn type_kind(self: *const TypeTable, handle: Type) TypeKind {
-        return self.kinds.items[@intFromEnum(handle)];
+        return self.kinds.items[@backingInt(handle)];
     }
 
     /// The number of interned types (handles are `0..count`).

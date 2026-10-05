@@ -59,14 +59,17 @@
 
           treefmt.programs = {
             nixfmt.enable = true;
-            zig.enable = true;
+            zig = {
+              enable = true;
+              package = pkgs.zig_0_17;
+            };
           };
 
           overlayAttrs = {
             flakever = flakeverConfig;
             erbium-hal = pkgs.callPackage ./pkgs/erbium-hal { };
             etsoc-sysemu = pkgs.callPackage ./pkgs/etsoc-sysemu { };
-            vulcan = pkgs.callPackage ./pkgs/vulcan { };
+            vulcan = pkgs.callPackage ./pkgs/vulcan { zig = pkgs.zig_0_17; };
           };
 
           packages = {

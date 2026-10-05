@@ -43,9 +43,9 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     defer allocator.free(consts);
     @memset(consts, null);
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .iconst) {
-                if (func.instResult(inst)) |r| consts[@intFromEnum(r)] = func.opcode(inst).iconst;
+                if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
             }
         }
     }
@@ -65,10 +65,10 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     defer allocator.free(is_addr);
     @memset(is_addr, false);
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             switch (func.opcode(inst)) {
-                .load => |l| is_addr[@intFromEnum(l.ptr)] = true,
-                .store => |st| is_addr[@intFromEnum(st.ptr)] = true,
+                .load => |l| is_addr[@backingInt(l.ptr)] = true,
+                .store => |st| is_addr[@backingInt(st.ptr)] = true,
                 else => {},
             }
         }
@@ -76,23 +76,23 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 
     var changed = false;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const a = switch (func.opcode(inst)) {
                 .arith => |a| a,
                 else => continue,
             };
             const info = immOp(a.op) orelse continue;
             const result = func.instResult(inst) orelse continue;
-            if (!is_addr[@intFromEnum(result)]) continue; // not an address base: leave it as `arith`
-            const lc = consts[@intFromEnum(a.lhs)];
-            const rc = consts[@intFromEnum(a.rhs)];
+            if (!is_addr[@backingInt(result)]) continue; // not an address base: leave it as `arith`
+            const lc = consts[@backingInt(a.lhs)];
+            const rc = consts[@backingInt(a.rhs)];
             if (lc != null and rc != null) continue; // both constant: leave it for constant folding
             if (rc) |c| {
-                if (uses[@intFromEnum(a.rhs)] != 1) continue;
+                if (uses[@backingInt(a.rhs)] != 1) continue;
                 func.opcodeMut(inst).* = .{ .arith_imm = .{ .op = a.op, .lhs = a.lhs, .imm = c } };
                 changed = true;
             } else if (info.commutative) if (lc) |c| {
-                if (uses[@intFromEnum(a.lhs)] != 1) continue;
+                if (uses[@backingInt(a.lhs)] != 1) continue;
                 func.opcodeMut(inst).* = .{ .arith_imm = .{ .op = a.op, .lhs = a.rhs, .imm = c } };
                 changed = true;
             };

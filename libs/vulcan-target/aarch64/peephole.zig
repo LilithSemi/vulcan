@@ -112,9 +112,9 @@ pub fn tryFuse(a: MemInsn, b: MemInsn) ?u32 {
     const imm7: u32 = a.off / size;
     if (imm7 > 63) return null;
 
-    const rt1: Reg = @enumFromInt(a.rt);
-    const rt2: Reg = @enumFromInt(b.rt);
-    const rn: Reg = @enumFromInt(a.rn);
+    const rt1: Reg = @fromBackingInt(@intCast(a.rt));
+    const rt2: Reg = @fromBackingInt(@intCast(b.rt));
+    const rn: Reg = @fromBackingInt(@intCast(a.rn));
     const imm: i16 = @intCast(a.off);
     return switch (a.kind) {
         .ldr_x => encode.ldpOffX(rt1, rt2, rn, imm),

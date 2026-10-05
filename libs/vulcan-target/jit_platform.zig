@@ -241,7 +241,7 @@ test "Buffer maps code W^X via the posix provider" {
 }
 
 test "MappedImage lays out and zeroes sections on page boundaries" {
-    const code = [_]u8{0} ** 8;
+    const code: [8]u8 = @splat(0);
     const ro = [_]u8{ 1, 2, 3, 4 };
     const da = [_]u8{ 5, 6, 7, 8, 9, 10, 11, 12 };
     var img = try MappedImage(noSync).map(default_provider, &code, &ro, &da, 16);
@@ -262,7 +262,7 @@ test "MappedImage lays out and zeroes sections on page boundaries" {
 // recorded structurally via `is_rodata_protected`, and proven with a real fault test
 // once a full JITed program exists.
 test "finalize applies W^X permissions without corrupting section contents" {
-    const code = [_]u8{0xC3} ** 8; // filler bytes, not executed here
+    const code: [8]u8 = @splat(0xC3); // filler bytes, not executed here
     const ro = [_]u8{ 1, 2, 3, 4 };
     var img = try MappedImage(noSync).map(default_provider, &code, &ro, &.{}, 0);
     defer img.deinit();

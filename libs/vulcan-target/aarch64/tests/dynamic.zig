@@ -180,7 +180,7 @@ fn buildPointerDataObj(allocator: std.mem.Allocator) ![]u8 {
     for (words, 0..) |w, i| std.mem.writeInt(u32, text[i * 4 ..][0..4], w, .little);
 
     // `.data`: g (i32 42) at 0, padding to 8, then p (u64, placeholder 0) at 8.
-    var data: [16]u8 = [_]u8{0} ** 16;
+    var data: [16]u8 = @splat(0);
     std.mem.writeInt(u32, data[0..4], 42, .little); // g = 42
 
     const symbols = [_]object.Symbol{
@@ -722,7 +722,7 @@ test "object.writeModule emits a .rela.data R_AARCH64_ABS64 for a pointer-initia
     var module = link.Module{};
     defer module.deinit(allocator);
     const g_bytes = [_]u8{ 42, 0, 0, 0 };
-    const p_bytes = [_]u8{0} ** 8;
+    const p_bytes: [8]u8 = @splat(0);
     try module.addWritable(allocator, "g", &g_bytes);
     try module.addWritableRelocs(allocator, "p", &p_bytes, &.{.{ .off = 0, .symbol = "g" }});
 

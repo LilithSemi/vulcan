@@ -158,7 +158,7 @@ fn eliminateDead(allocator: std.mem.Allocator, module: *Module, roots: []const [
     while (work.pop()) |name| {
         const func = module.get(name).?;
         for (0..func.blockCount()) |bi| {
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 if (func.opcode(inst) == .call) {
                     const callee = func.symbolName(func.opcode(inst).call.symbol);
                     if (module.get(callee) != null and !reachable.contains(callee)) {
@@ -231,7 +231,7 @@ test "cross-module inlining then dead-function elimination" {
     try std.testing.expectEqual(@as(usize, 1), module.count());
     try std.testing.expect(module.get("entry") != null);
     try std.testing.expect(module.get("helper") == null);
-    for (module.get("entry").?.blockInsts(@enumFromInt(0))) |inst| {
+    for (module.get("entry").?.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         try std.testing.expect(module.get("entry").?.opcode(inst) != .call);
     }
 }
@@ -268,7 +268,7 @@ test "an LTO module round trip keeps volatile, the variadic marker and the GPU b
     defer back.deinit();
 
     const f = back.get("mmio") orelse return error.TestUnexpectedResult;
-    const entry: ir.function.Block = @enumFromInt(0);
+    const entry: ir.function.Block = @fromBackingInt(@intCast(0));
     const insts = f.blockInsts(entry);
     try std.testing.expect(f.opcode(insts[0]).load.@"volatile");
     try std.testing.expect(f.opcode(insts[1]).store.@"volatile");

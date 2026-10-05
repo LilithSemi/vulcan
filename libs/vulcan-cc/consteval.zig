@@ -433,7 +433,7 @@ fn writeBitfieldLeaf(arena: std.mem.Allocator, bytes: []u8, unit_ty: ctype.CType
     const clear_mask: u64 = (~shifted_mask) & type_mask;
     // Read the current unit little-endian (zero-padded to 8 bytes), clear the field's bits, OR
     // the new value's low `w` bits shifted up to `bit_off`, and write the unit back.
-    var buf: [8]u8 = [_]u8{0} ** 8;
+    var buf: [8]u8 = @splat(0);
     @memcpy(buf[0..unit_size], bytes[off .. off + unit_size]);
     const cur = std.mem.readInt(u64, &buf, .little);
     const new_unit = (cur & clear_mask) | (((v & field_mask) << @intCast(bit_off)) & type_mask);

@@ -1173,7 +1173,7 @@ test "wasm target: nested if/else (sign) round-trips" {
     const c1 = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = z0 } });
     const p1 = try f.appendInst(entry, t, .{ .iconst = 1 });
     try f.appendIf(entry, c1, .{ .target = merge, .args = &.{p1} }, .{ .target = neg, .args = &.{} });
-    try f.addAttr(.{ .block = entry }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(merge) } } });
+    try f.addAttr(.{ .block = entry }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @backingInt(merge) } } });
 
     const z1 = try f.appendInst(neg, t, .{ .iconst = 0 });
     const c2 = try f.appendInst(neg, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = z1 } });
@@ -1220,8 +1220,8 @@ test "wasm target: loop (sum 1..n) round-trips" {
     const cond = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .le, .lhs = i, .rhs = n } });
     try f.appendIf(header, cond, .{ .target = body, .args = &.{} }, .{ .target = exit, .args = &.{sum} });
     // Mark the structured loop: merge (exit) and continue (the back-edge block).
-    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(exit) } } });
-    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "continue", .value = .{ .int = @intFromEnum(body) } } });
+    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @backingInt(exit) } } });
+    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "continue", .value = .{ .int = @backingInt(body) } } });
 
     const sum2 = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = i } });
     const inext = try f.appendArithImm(body, t, .add, i, 1);
@@ -1268,13 +1268,13 @@ test "wasm target: if nested inside a loop round-trips" {
 
     const cond = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .le, .lhs = i, .rhs = n } });
     try f.appendIf(header, cond, .{ .target = body, .args = &.{} }, .{ .target = exit, .args = &.{acc} });
-    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(exit) } } });
-    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "continue", .value = .{ .int = @intFromEnum(bmerge) } } });
+    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @backingInt(exit) } } });
+    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "continue", .value = .{ .int = @backingInt(bmerge) } } });
 
     const hundred = try f.appendInst(body, t, .{ .iconst = 100 });
     const c2 = try f.appendInst(body, bool_t, .{ .icmp = .{ .op = .lt, .lhs = acc, .rhs = hundred } });
     try f.appendIf(body, c2, .{ .target = add, .args = &.{} }, .{ .target = bmerge, .args = &.{acc} });
-    try f.addAttr(.{ .block = body }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(bmerge) } } });
+    try f.addAttr(.{ .block = body }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @backingInt(bmerge) } } });
 
     const acc2 = try f.appendInst(add, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = i } });
     try f.setJump(add, bmerge, &.{acc2});
@@ -2139,7 +2139,7 @@ test "wasm target: stack frame + control flow + cross-block alloca" {
     const zero = try f.appendInst(entry, t, .{ .iconst = 0 });
     const isneg = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = zero } });
     try f.appendIf(entry, isneg, .{ .target = neg, .args = &.{} }, .{ .target = pos, .args = &.{} });
-    try f.addAttr(.{ .block = entry }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(merge) } } });
+    try f.addAttr(.{ .block = entry }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @backingInt(merge) } } });
 
     const nx = try f.appendInst(neg, t, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = x } });
     try f.appendStore(neg, nx, slot);

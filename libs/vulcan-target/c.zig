@@ -124,14 +124,14 @@ const Emitter = struct {
 
     /// The C variable name of a value, e.g. `v3`.
     fn name(self: *Emitter, v: Value) u32 {
-        return self.names[@intFromEnum(v)];
+        return self.names[@backingInt(v)];
     }
 
     /// Emit the C signature `<ret> sym(<params>)` (no trailing brace or semicolon).
     /// Requires `assignNames` to have run.
     fn signature(self: *Emitter, sym: []const u8) Error!void {
         const func = self.func;
-        const entry_params = func.blockParams(@as(Block, @enumFromInt(0)));
+        const entry_params = func.blockParams(@as(Block, @fromBackingInt(@intCast(0))));
         // The return type is the type of the first `ret` value, void otherwise.
         try self.emitType(self.returnType());
         try self.print(" {s}(", .{sym});
@@ -164,7 +164,7 @@ const Emitter = struct {
         try self.emitDeclarations();
 
         for (0..func.blockCount()) |bi| {
-            const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
+            const block: Block = @fromBackingInt(@intCast(@as(u32, @intCast(bi))));
             // Add a label only for a block some edge jumps to. An empty statement follows
             // it, so the label stays legal even for an empty block.
             if (self.is_target[bi]) try self.print("block{d}:;\n", .{bi});
@@ -185,14 +185,14 @@ const Emitter = struct {
         self.names = try self.allocator.alloc(u32, func.valueCount());
         var n: u32 = 0;
         for (0..func.blockCount()) |bi| {
-            const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
+            const block: Block = @fromBackingInt(@intCast(@as(u32, @intCast(bi))));
             for (func.blockParams(block)) |p| {
-                self.names[@intFromEnum(p)] = n;
+                self.names[@backingInt(p)] = n;
                 n += 1;
             }
             for (func.blockInsts(block)) |inst| {
                 if (func.instResult(inst)) |res| {
-                    self.names[@intFromEnum(res)] = n;
+                    self.names[@backingInt(res)] = n;
                     n += 1;
                 }
             }
@@ -205,16 +205,16 @@ const Emitter = struct {
         self.is_target = try self.allocator.alloc(bool, func.blockCount());
         @memset(self.is_target, false);
         for (0..func.blockCount()) |bi| {
-            const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
+            const block: Block = @fromBackingInt(@intCast(@as(u32, @intCast(bi))));
             for (func.blockInsts(block)) |inst| {
                 if (func.opcode(inst) == .@"if") {
                     const cf = func.opcode(inst).@"if";
-                    self.is_target[@intFromEnum(cf.then.target)] = true;
-                    self.is_target[@intFromEnum(cf.@"else".target)] = true;
+                    self.is_target[@backingInt(cf.then.target)] = true;
+                    self.is_target[@backingInt(cf.@"else".target)] = true;
                 }
             }
             if (func.terminator(block)) |term| switch (term) {
-                .jump => |j| self.is_target[@intFromEnum(j.target)] = true,
+                .jump => |j| self.is_target[@backingInt(j.target)] = true,
                 .ret => {},
             };
         }
@@ -226,10 +226,10 @@ const Emitter = struct {
     fn collectAggs(self: *Emitter) Error!void {
         const func = self.func;
         for (0..func.valueCount()) |vi| {
-            try self.registerAgg(func.valueType(@enumFromInt(vi)));
+            try self.registerAgg(func.valueType(@fromBackingInt(@intCast(vi))));
         }
         for (0..func.instCount()) |ii| {
-            const inst: Inst = @enumFromInt(@as(u32, @intCast(ii)));
+            const inst: Inst = @fromBackingInt(@intCast(@as(u32, @intCast(ii))));
             if (func.opcode(inst) == .alloca) try self.registerAgg(func.opcode(inst).alloca.elem);
         }
     }
@@ -259,7 +259,7 @@ const Emitter = struct {
         var seen: std.ArrayList([]const u8) = .empty;
         defer seen.deinit(self.allocator);
         for (0..func.instCount()) |ii| {
-            const inst: Inst = @enumFromInt(@as(u32, @intCast(ii)));
+            const inst: Inst = @fromBackingInt(@intCast(@as(u32, @intCast(ii))));
             if (func.opcode(inst) != .global_addr) continue;
             const nm = func.symbolName(func.opcode(inst).global_addr.symbol);
             var dup = false;
@@ -319,7 +319,7 @@ const Emitter = struct {
     /// The function's return type: the type of any `ret` value, else void (a null type).
     fn returnType(self: *Emitter) ?Type {
         for (0..self.func.blockCount()) |bi| {
-            const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
+            const block: Block = @fromBackingInt(@intCast(@as(u32, @intCast(bi))));
             if (self.func.terminator(block)) |term| switch (term) {
                 .ret => |r| if (r.count > 0) return self.func.valueType(r.values[0]),
                 .jump => {},
@@ -332,7 +332,7 @@ const Emitter = struct {
     fn emitDeclarations(self: *Emitter) Error!void {
         const func = self.func;
         for (0..func.blockCount()) |bi| {
-            const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
+            const block: Block = @fromBackingInt(@intCast(@as(u32, @intCast(bi))));
             if (bi != 0) {
                 for (func.blockParams(block)) |p| try self.emitDecl(p);
             }
@@ -571,7 +571,7 @@ const Emitter = struct {
     fn emitEdge(self: *Emitter, target: Block, args: []const Value, indent: []const u8, scoped: bool) Error!void {
         const params = self.func.blockParams(target);
         if (params.len == 0) {
-            try self.print("{s}goto block{d};\n", .{ indent, @intFromEnum(target) });
+            try self.print("{s}goto block{d};\n", .{ indent, @backingInt(target) });
             return;
         }
         // Temporaries need their own scope so they never collide with another
@@ -588,7 +588,7 @@ const Emitter = struct {
         for (params) |p| {
             try self.print("{s}v{d} = t{d};\n", .{ inner, self.name(p), self.name(p) });
         }
-        try self.print("{s}goto block{d};\n", .{ inner, @intFromEnum(target) });
+        try self.print("{s}goto block{d};\n", .{ inner, @backingInt(target) });
         if (!scoped) try self.print("{s}}}\n", .{indent});
     }
 

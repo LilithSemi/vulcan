@@ -93,11 +93,11 @@ fn forwardIdentity(allocator: std.mem.Allocator, func: *Function) pass.Error!boo
     // forward_to[b] = the successor to which block b is a pure identity forwarder, else null.
     const forward_to = try allocator.alloc(?Block, n);
     defer allocator.free(forward_to);
-    for (0..n) |bi| forward_to[bi] = identityForwardTarget(func, @enumFromInt(bi));
+    for (0..n) |bi| forward_to[bi] = identityForwardTarget(func, @fromBackingInt(@intCast(bi)));
 
     var changed = false;
     for (0..n) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         // Redirect this block's out-edges that land on a forwarder to the forwarder's target.
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
@@ -143,15 +143,15 @@ fn threadOne(allocator: std.mem.Allocator, func: *Function, budget: *Budget) pas
     defer allocator.free(def_block);
     @memset(def_block, @intCast(n));
     for (0..n) |bi| {
-        const block: Block = @enumFromInt(bi);
-        for (func.blockParams(block)) |p| def_block[@intFromEnum(p)] = @intCast(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockParams(block)) |p| def_block[@backingInt(p)] = @intCast(bi);
         for (func.blockInsts(block)) |inst| {
-            if (func.instResult(inst)) |r| def_block[@intFromEnum(r)] = @intCast(bi);
+            if (func.instResult(inst)) |r| def_block[@backingInt(r)] = @intCast(bi);
         }
     }
 
     for (0..n) |bi_b| {
-        const b: Block = @enumFromInt(bi_b);
+        const b: Block = @fromBackingInt(@intCast(bi_b));
         const if_b = endsInIf(func, b) orelse continue;
         const cond = func.opcode(if_b).@"if".cond;
         const then_edge = func.opcode(if_b).@"if".then;
@@ -160,7 +160,7 @@ fn threadOne(allocator: std.mem.Allocator, func: *Function, budget: *Budget) pas
         for (cfg.predecessors(bi_b)) |pi| {
             if (pi == bi_b) continue; // P == B guard (a self-edge)
             if (!doms.isReachable(pi)) continue; // an unreachable P has a degenerate dominance relation
-            const p: Block = @enumFromInt(pi);
+            const p: Block = @fromBackingInt(@intCast(pi));
 
             // Enumerate P's out-edges that land on B. A block ends in an `@"if"` OR a jump/ret
             // terminator, never both, so at most the two `@"if"` sides or the single jump apply.
@@ -209,8 +209,8 @@ fn tryThreadEdge(
     edge: EdgeRef,
     p_if: ?Inst,
 ) pass.Error!bool {
-    const bi_b: u32 = @intFromEnum(b);
-    const pi: u32 = @intFromEnum(p);
+    const bi_b: u32 = @backingInt(b);
+    const pi: u32 = @backingInt(p);
 
     // The known truth of `cond` on this edge: correlated-branch outcome, else constant-param.
     var known = corr;
@@ -356,7 +356,7 @@ fn tryTailDup(
 /// not `b`. A value defined in `b` is excluded even if `b` happens to dominate `p` (a loop back
 /// edge), since on the threaded path `p` no longer flows through `b` to recompute it.
 fn availableAt(doms: *const dom.Dominators, def_block: []const u32, n: usize, w: Value, bi_b: u32, pi: u32) bool {
-    const db = def_block[@intFromEnum(w)];
+    const db = def_block[@backingInt(w)];
     if (db >= n) return false; // unknown definition
     if (db == bi_b) return false; // defined in B, lost when the P path skips B
     return doms.dominates(db, pi);
@@ -378,8 +378,8 @@ fn threadBreaksDominanceUse(
     b: Block,
     s: Block,
 ) pass.Error!bool {
-    const bi_b: u32 = @intFromEnum(b);
-    const si: u32 = @intFromEnum(s);
+    const bi_b: u32 = @backingInt(b);
+    const si: u32 = @backingInt(s);
     if (!doms.dominates(bi_b, si)) return false; // B does not dominate S: no dominance-use to break
 
     // Walk the region reachable from S without ever re-entering B. Those are exactly the blocks that
@@ -394,7 +394,7 @@ fn threadBreaksDominanceUse(
     visited[si] = true;
     try stack.append(allocator, si);
     while (stack.pop()) |x| {
-        if (blockUsesValueFromBlock(func, @enumFromInt(x), bi_b, def_block)) return true;
+        if (blockUsesValueFromBlock(func, @fromBackingInt(@intCast(x)), bi_b, def_block)) return true;
         for (cfg.successors(x)) |sx| {
             if (sx == bi_b) continue; // re-entering B keeps B's domination downstream, so cut it here
             if (!visited[sx]) {
@@ -412,7 +412,7 @@ fn threadBreaksDominanceUse(
 fn blockUsesValueFromBlock(func: *const Function, block: Block, def_bi: u32, def_block: []const u32) bool {
     const usesB = struct {
         fn f(db: []const u32, v: Value, target: u32) bool {
-            return db[@intFromEnum(v)] == target;
+            return db[@backingInt(v)] == target;
         }
     }.f;
     for (func.blockInsts(block)) |inst| {
@@ -535,10 +535,10 @@ fn endsInIf(func: *const Function, block: Block) ?Inst {
 /// The final destination for an edge into `target`: follows a chain of identity forwarders (bounded
 /// by the block count to avoid looping on a forwarder cycle), or null if `target` is not a forwarder.
 fn retarget(forward_to: []const ?Block, target: Block) ?Block {
-    var dest = forward_to[@intFromEnum(target)] orelse return null;
+    var dest = forward_to[@backingInt(target)] orelse return null;
     var steps: usize = 0;
     while (steps < forward_to.len) : (steps += 1) {
-        const next = forward_to[@intFromEnum(dest)] orelse return dest;
+        const next = forward_to[@backingInt(dest)] orelse return dest;
         if (next == dest) return dest; // self-forwarder guard (should not arise)
         dest = next;
     }
@@ -549,7 +549,7 @@ fn retarget(forward_to: []const ?Block, target: Block) ?Block {
 /// different block whose arguments are exactly this block's parameters in order), return that
 /// successor. Otherwise null.
 fn identityForwardTarget(func: *const Function, block: Block) ?Block {
-    if (@intFromEnum(block) == 0) return null; // never redirect away from the entry
+    if (@backingInt(block) == 0) return null; // never redirect away from the entry
     if (func.blockInsts(block).len != 0) return null; // must do nothing but forward
     const term = func.terminator(block) orelse return null;
     const jmp = switch (term) {
@@ -591,24 +591,24 @@ fn evalFunc(func: *const Function, inputs: []const i64) !i64 {
     const vals = try allocator.alloc(i64, func.valueCount());
     defer allocator.free(vals);
 
-    var cur: Block = @enumFromInt(0);
-    for (func.blockParams(cur), 0..) |param, i| vals[@intFromEnum(param)] = inputs[i];
+    var cur: Block = @fromBackingInt(@intCast(0));
+    for (func.blockParams(cur), 0..) |param, i| vals[@backingInt(param)] = inputs[i];
 
     var steps: usize = 0;
     const cap: usize = 100_000;
     while (steps < cap) : (steps += 1) {
         for (func.blockInsts(cur)) |inst| {
             const result = func.instResult(inst) orelse continue; // side-effect statements: skipped
-            vals[@intFromEnum(result)] = evalInst(func, vals, inst);
+            vals[@backingInt(result)] = evalInst(func, vals, inst);
         }
 
         // Where control leaves the block: an `@"if"` branch, then the terminator.
         var next_edge: ?Jump = null;
         if (endsInIf(func, cur)) |if_inst| {
             const cf = func.opcode(if_inst).@"if";
-            next_edge = if (vals[@intFromEnum(cf.cond)] != 0) cf.then else cf.@"else";
+            next_edge = if (vals[@backingInt(cf.cond)] != 0) cf.then else cf.@"else";
         } else if (func.terminator(cur)) |term| switch (term) {
-            .ret => |r| return if (r.count > 0) vals[@intFromEnum(r.values[0])] else 0,
+            .ret => |r| return if (r.count > 0) vals[@backingInt(r.values[0])] else 0,
             .jump => |j| next_edge = j,
         } else return 0; // implicit ret void
 
@@ -617,8 +617,8 @@ fn evalFunc(func: *const Function, inputs: []const i64) !i64 {
         const target_params = func.blockParams(edge.target);
         // Read every arg before writing any param, so param<-arg self-references stay correct.
         var buf: [16]i64 = undefined;
-        for (args, 0..) |a, i| buf[i] = vals[@intFromEnum(a)];
-        for (target_params, 0..) |param, i| vals[@intFromEnum(param)] = buf[i];
+        for (args, 0..) |a, i| buf[i] = vals[@backingInt(a)];
+        for (target_params, 0..) |param, i| vals[@backingInt(param)] = buf[i];
         cur = edge.target;
     }
     return error.NonTerminating;
@@ -627,10 +627,10 @@ fn evalFunc(func: *const Function, inputs: []const i64) !i64 {
 fn evalInst(func: *const Function, vals: []const i64, inst: Inst) i64 {
     return switch (func.opcode(inst)) {
         .iconst => |c| c,
-        .arith => |a| applyBin(a.op, vals[@intFromEnum(a.lhs)], vals[@intFromEnum(a.rhs)]),
-        .arith_imm => |a| applyBin(a.op, vals[@intFromEnum(a.lhs)], a.imm),
-        .icmp => |c| applyCmp(c.op, vals[@intFromEnum(c.lhs)], vals[@intFromEnum(c.rhs)]),
-        .select => |s| if (vals[@intFromEnum(s.cond)] != 0) vals[@intFromEnum(s.then)] else vals[@intFromEnum(s.@"else")],
+        .arith => |a| applyBin(a.op, vals[@backingInt(a.lhs)], vals[@backingInt(a.rhs)]),
+        .arith_imm => |a| applyBin(a.op, vals[@backingInt(a.lhs)], a.imm),
+        .icmp => |c| applyCmp(c.op, vals[@backingInt(c.lhs)], vals[@backingInt(c.rhs)]),
+        .select => |s| if (vals[@backingInt(s.cond)] != 0) vals[@backingInt(s.then)] else vals[@backingInt(s.@"else")],
         .alloca => 0, // an opaque stack-slot pointer, never loaded through in these tests (store is skipped)
         else => unreachable, // the threading tests only build the subset above
     };

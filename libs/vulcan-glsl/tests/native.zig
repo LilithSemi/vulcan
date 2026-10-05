@@ -157,8 +157,8 @@ test "glsl->vectorize->NEON: a vec4 add fuses and runs to the right sum" {
     try std.testing.expect(try opt.vectorize.run(allocator, f));
     var has_vec = false;
     for (0..f.instCount()) |i| {
-        if (f.opcodeMut(@enumFromInt(i)).* == .arith) {
-            const res = f.instResult(@enumFromInt(i)).?;
+        if (f.opcodeMut(@fromBackingInt(@intCast(i))).* == .arith) {
+            const res = f.instResult(@fromBackingInt(@intCast(i))).?;
             if (f.types.type_kind(f.valueType(res)) == .vector) has_vec = true;
         }
     }

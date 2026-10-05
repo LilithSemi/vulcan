@@ -79,7 +79,7 @@ fn inlinable(callee: *const Function) bool {
     // (has a result) needs this explicit guard.
     if (callee.is_variadic) return false;
     if (callee.blockCount() != 1) return false;
-    const entry: Block = @enumFromInt(0);
+    const entry: Block = @fromBackingInt(@intCast(0));
     const term = callee.terminator(entry) orelse return false;
     if (term != .ret) return false;
     // A multi-value return (SM14 M4d-a: a register-pair or HFA struct return) is not rewired
@@ -99,7 +99,7 @@ fn inlinable(callee: *const Function) bool {
 /// Find and inline a single call, returning whether one was inlined.
 fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter) Error!bool {
     for (0..caller.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (caller.blockInsts(block), 0..) |inst, idx| {
             if (caller.opcode(inst) != .call) continue;
             if (filter) |f| if (!f.allow(bi)) continue;
@@ -120,8 +120,8 @@ fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, fi
 }
 
 fn inlineCall(allocator: std.mem.Allocator, caller: *Function, bi: u32, call_idx: usize, call_inst: Inst, callee: *const Function) Error!void {
-    const entry: Block = @enumFromInt(0);
-    const block: Block = @enumFromInt(bi);
+    const entry: Block = @fromBackingInt(@intCast(0));
+    const block: Block = @fromBackingInt(@intCast(bi));
 
     // Copy the call's arguments and result before mutating the caller (the value
     // pool may reallocate during cloning).
@@ -264,7 +264,7 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
         }
     }.repl;
     for (0..func.instCount()) |i| {
-        const op = func.opcodeMut(@enumFromInt(i));
+        const op = func.opcodeMut(@fromBackingInt(@intCast(i)));
         switch (op.*) {
             .atomic_rmw => |*a| {
                 a.ptr = r(from, to, a.ptr);
@@ -335,7 +335,7 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
         }
     }
     for (0..func.blockCount()) |bi| {
-        const term = func.terminatorPtr(@enumFromInt(bi));
+        const term = func.terminatorPtr(@fromBackingInt(@intCast(bi)));
         if (term.*) |*t| switch (t.*) {
             .ret => |*ret| for (ret.values[0..ret.count]) |*vv| {
                 vv.* = r(from, to, vv.*);
@@ -354,7 +354,7 @@ fn inlinableMulti(callee: *const Function) bool {
     // SM12 T3: see `inlinable`'s matching guard - never inline a variadic-defining callee.
     if (callee.is_variadic) return false;
     for (0..callee.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (callee.blockParams(block)) |p| if (!scalar(callee, callee.valueType(p))) return false;
         // A multi-value return in any block is not rewired by this pass (SM14 M4d-a). Refuse
         // it, matching the backends' fail-closed stance. Never fires before M4d-c.
@@ -384,18 +384,18 @@ fn inlinableMulti(callee: *const Function) bool {
 
 /// The successor block indices of `b` (from its `if` exit instruction or its jump terminator).
 fn successorsOf(callee: *const Function, b: u32, buf: *[2]u32) []const u32 {
-    const block: Block = @enumFromInt(b);
+    const block: Block = @fromBackingInt(@intCast(b));
     for (callee.blockInsts(block)) |inst| {
         if (callee.opcode(inst) == .@"if") {
             const cf = callee.opcode(inst).@"if";
-            buf[0] = @intFromEnum(cf.then.target);
-            buf[1] = @intFromEnum(cf.@"else".target);
+            buf[0] = @backingInt(cf.then.target);
+            buf[1] = @backingInt(cf.@"else".target);
             return buf[0..2];
         }
     }
     if (callee.terminator(block)) |t| switch (t) {
         .jump => |j| {
-            buf[0] = @intFromEnum(j.target);
+            buf[0] = @backingInt(j.target);
             return buf[0..1];
         },
         .ret => {},
@@ -451,7 +451,7 @@ fn remapArgs(allocator: std.mem.Allocator, callee: *const Function, vmap: std.Au
 }
 
 fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, call_idx: usize, call_inst: Inst, callee: *const Function) Error!void {
-    const b_block: Block = @enumFromInt(bi);
+    const b_block: Block = @fromBackingInt(@intCast(bi));
     const call = caller.opcode(call_inst).call;
     const args = try allocator.dupe(Value, caller.valueList(call.args));
     defer allocator.free(args);
@@ -490,7 +490,7 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
     for (rpo) |cb| try bmap.put(allocator, cb, try caller.appendBlock());
     for (rpo) |cb| { // params of every cloned block (the entry's take the call args by jump)
         const nb = bmap.get(cb).?;
-        for (callee.blockParams(@enumFromInt(cb))) |p| {
+        for (callee.blockParams(@fromBackingInt(@intCast(cb)))) |p| {
             const np = try caller.appendBlockParam(nb, try mapType(caller, callee, &tmap, callee.valueType(p)));
             try vmap.put(allocator, p, np);
             // This path gives every callee parameter, the entry's included, a FRESH caller
@@ -501,7 +501,7 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
     }
     for (rpo) |cb| { // instructions, in RPO so operands are already mapped. `if` is handled below
         const nb = bmap.get(cb).?;
-        for (callee.blockInsts(@enumFromInt(cb))) |cinst| switch (callee.opcode(cinst)) {
+        for (callee.blockInsts(@fromBackingInt(@intCast(cb)))) |cinst| switch (callee.opcode(cinst)) {
             // The `if` is rebuilt by the control-flow pass below, which records its own pair.
             .@"if" => {},
             // `appendStoreVol`, not `appendStore`: `appendStore` hardcodes `volatile = false`, which
@@ -582,7 +582,7 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
     }
     for (rpo) |cb| { // control flow: `if` exits and jump/ret terminators
         const nb = bmap.get(cb).?;
-        const cblock: Block = @enumFromInt(cb);
+        const cblock: Block = @fromBackingInt(@intCast(cb));
         var if_cf: ?ir.function.If = null;
         var if_src: ?Inst = null;
         for (callee.blockInsts(cblock)) |cinst| {
@@ -597,7 +597,7 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
             defer allocator.free(ta);
             const ea = try remapArgs(allocator, callee, vmap, cf.@"else".args);
             defer allocator.free(ea);
-            try caller.appendIf(nb, mapV(vmap, cf.cond), .{ .target = bmap.get(@intFromEnum(cf.then.target)).?, .args = ta }, .{ .target = bmap.get(@intFromEnum(cf.@"else".target)).?, .args = ea });
+            try caller.appendIf(nb, mapV(vmap, cf.cond), .{ .target = bmap.get(@backingInt(cf.then.target)).?, .args = ta }, .{ .target = bmap.get(@backingInt(cf.@"else".target)).?, .args = ea });
             try inst_pairs.append(allocator, .{ .old = if_src.?, .new = lastInst(caller, nb) });
             continue;
         }
@@ -610,7 +610,7 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
             .jump => |j| {
                 const ja = try remapArgs(allocator, callee, vmap, j.args);
                 defer allocator.free(ja);
-                try caller.setJump(nb, bmap.get(@intFromEnum(j.target)).?, ja);
+                try caller.setJump(nb, bmap.get(@backingInt(j.target)).?, ja);
             },
         };
     }
@@ -756,7 +756,7 @@ test "inlining preserves low float directions formats and remapped operands" {
     var encoded: ?ir.function.LowFloatConvert = null;
     var decoded: ?ir.function.LowFloatConvert = null;
     for (0..caller.blockCount()) |block_index| {
-        for (caller.blockInsts(@enumFromInt(block_index))) |inst| switch (caller.opcode(inst)) {
+        for (caller.blockInsts(@fromBackingInt(@intCast(block_index)))) |inst| switch (caller.opcode(inst)) {
             .encode_low_float => |conversion| encoded = conversion,
             .decode_low_float => |conversion| decoded = conversion,
             .call => return error.TestUnexpectedResult,
@@ -812,7 +812,7 @@ test "inlining remaps all nvfp4 operands and preserves policies" {
     var saw_decode = false;
     var saw_encode = false;
     var remapped_decode: ?Value = null;
-    for (0..caller.blockCount()) |bi| for (caller.blockInsts(@enumFromInt(bi))) |inst| switch (caller.opcode(inst)) {
+    for (0..caller.blockCount()) |bi| for (caller.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (caller.opcode(inst)) {
         .dequantize_nvfp4 => |cv| {
             saw_decode = cv.value == p and cv.block_scale == bs and cv.global_scale == gs and cv.block_application == .multiply and cv.global_application == .divide;
             remapped_decode = caller.instResult(inst).?;
@@ -864,7 +864,7 @@ test "inlines a multi-block, two-return callee (the call is replaced by cloned c
     try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
     // The call instruction is gone: it was replaced by the cloned callee body.
     for (0..caller.blockCount()) |bi| {
-        for (caller.blockInsts(@enumFromInt(bi))) |inst| {
+        for (caller.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             try std.testing.expect(caller.opcode(inst) != .call);
         }
     }
@@ -991,7 +991,7 @@ test "inlined volatile store and volatile load both keep volatile=true (multi-bl
     var stores: usize = 0;
     var loads: usize = 0;
     for (0..caller.blockCount()) |bi| {
-        for (caller.blockInsts(@enumFromInt(bi))) |inst| switch (caller.opcode(inst)) {
+        for (caller.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (caller.opcode(inst)) {
             .store => |st| {
                 stores += 1;
                 try std.testing.expect(st.@"volatile");
@@ -1041,7 +1041,7 @@ test "inlining a plain load and store leaves volatile=false (the flag is carried
     // The other direction: a non-volatile access must NOT become volatile, which would block
     // every legal optimization on ordinary memory.
     for (0..caller.blockCount()) |bi| {
-        for (caller.blockInsts(@enumFromInt(bi))) |inst| switch (caller.opcode(inst)) {
+        for (caller.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (caller.opcode(inst)) {
             .store => |st| try std.testing.expect(!st.@"volatile"),
             .load => |ld| try std.testing.expect(!ld.@"volatile"),
             else => {},
@@ -1332,7 +1332,7 @@ test "inlining a RESULT-LESS atomic keeps it result-less, on the multi-block pat
 
     var found: usize = 0;
     for (0..caller.blockCount()) |bi| {
-        for (caller.blockInsts(@enumFromInt(bi))) |inst| {
+        for (caller.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (caller.opcode(inst) != .atomic_rmw) continue;
             found += 1;
             // Still result-less: it did not gain a destination on the way in.

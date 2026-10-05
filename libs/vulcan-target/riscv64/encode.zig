@@ -40,7 +40,7 @@ pub const Reg = enum(u5) {
 };
 
 fn num(reg: Reg) u32 {
-    return @intFromEnum(reg);
+    return @backingInt(reg);
 }
 
 /// A RISC-V floating-point register, f0 through f31.
@@ -80,7 +80,7 @@ pub const FReg = enum(u5) {
 };
 
 fn fnum(reg: FReg) u32 {
-    return @intFromEnum(reg);
+    return @backingInt(reg);
 }
 
 /// A RISC-V Vector (RVV) register v0..v31.
@@ -120,7 +120,7 @@ pub const VReg = enum(u5) {
 };
 
 fn vnum(reg: VReg) u32 {
-    return @intFromEnum(reg);
+    return @backingInt(reg);
 }
 
 // RVV (V extension). The vector unit is pinned to a 4-lane f32 group: vsetivli
@@ -471,7 +471,7 @@ pub fn fdiv_h(rd: FReg, rs1: FReg, rs2: FReg) u32 {
 
 /// `fsqrt.h rd, rs1` (half-precision square root, dynamic rounding). rs2 selector = 0.
 pub fn fsqrt_h(rd: FReg, rs1: FReg) u32 {
-    return fpRType(0b0101110, 0b111, rd, rs1, @enumFromInt(0));
+    return fpRType(0b0101110, 0b111, rd, rs1, @fromBackingInt(@intCast(0)));
 }
 
 /// `feq.h rd, rs1, rs2` (set if equal, integer result). Half sibling of `feq.s`.
@@ -1330,7 +1330,7 @@ pub fn packTensorFma(
         (@as(u64, @intFromBool(tena_unsigned)) << 21) | // hardware bit21 = A's sign flag (ua)
         (@as(u64, scp_b) << 12) |
         (@as(u64, scp_a) << 4) |
-        (@as(u64, @intFromEnum(type_)) << 1) |
+        (@as(u64, @backingInt(type_)) << 1) |
         @as(u64, @intFromBool(first_pass));
 }
 
@@ -1433,7 +1433,7 @@ pub const QuantTransform = enum(u4) {
 pub fn packTensorQuant(start_reg: u5, col_field: u2, row_field: u4, scp_loc: u6, transforms: [10]QuantTransform) u64 {
     var transforms_field: u64 = 0;
     for (transforms, 0..) |transform, i| {
-        transforms_field |= @as(u64, @intFromEnum(transform)) << @intCast(i * 4);
+        transforms_field |= @as(u64, @backingInt(transform)) << @intCast(i * 4);
     }
     return (@as(u64, start_reg) << 57) |
         (@as(u64, col_field) << 55) |
@@ -1903,9 +1903,9 @@ test "packTensorFma field placement" {
 }
 
 test "assert TensorType enum values" {
-    try std.testing.expectEqual(@as(u3, 0), @intFromEnum(TensorType.fp32));
-    try std.testing.expectEqual(@as(u3, 3), @intFromEnum(TensorType.int8));
-    try std.testing.expectEqual(@as(u3, 1), @intFromEnum(TensorType.fp16));
+    try std.testing.expectEqual(@as(u3, 0), @backingInt(TensorType.fp32));
+    try std.testing.expectEqual(@as(u3, 3), @backingInt(TensorType.int8));
+    try std.testing.expectEqual(@as(u3, 1), @backingInt(TensorType.fp16));
 }
 
 test "packTensorLoad field placement" {
@@ -1968,10 +1968,10 @@ test "tensor CSR and wait-event constants" {
 }
 
 test "assert QuantTransform enum values" {
-    try std.testing.expectEqual(@as(u4, 1), @intFromEnum(QuantTransform.i32_to_f32));
-    try std.testing.expectEqual(@as(u4, 6), @intFromEnum(QuantTransform.fp32_mul_row));
-    try std.testing.expectEqual(@as(u4, 8), @intFromEnum(QuantTransform.satint8));
-    try std.testing.expectEqual(@as(u4, 10), @intFromEnum(QuantTransform.pack_128b));
+    try std.testing.expectEqual(@as(u4, 1), @backingInt(QuantTransform.i32_to_f32));
+    try std.testing.expectEqual(@as(u4, 6), @backingInt(QuantTransform.fp32_mul_row));
+    try std.testing.expectEqual(@as(u4, 8), @backingInt(QuantTransform.satint8));
+    try std.testing.expectEqual(@as(u4, 10), @backingInt(QuantTransform.pack_128b));
 }
 
 test "packTensorQuant matches a real decoded proof-kernel descriptor" {
@@ -1995,7 +1995,7 @@ test "packTensorQuant matches a real decoded proof-kernel descriptor" {
 }
 
 test "packTensorQuant field placement" {
-    const all_last = [_]QuantTransform{.last} ** 10;
+    const all_last: [10]QuantTransform = @splat(.last);
     const start = packTensorQuant(5, 0, 0, 0, all_last);
     try std.testing.expectEqual(@as(u64, 5), start >> 57); // start_reg at bit 57
 

@@ -172,7 +172,7 @@ pub fn resolve(name: []const u8) ?usize {
 test "args_get/args_sizes_get reach argv through the per-instance context, not a global" {
     // Exercises the import-context threading at the host-function level: the ctx pointer
     // the engine forwards is recovered and its injected memory/args are used directly.
-    var mem = [_]u8{0} ** 128;
+    var mem: [128]u8 = @splat(0);
     var ctx = Ctx{
         .mem = &mem,
         .args = &.{ "prog", "arg1" },

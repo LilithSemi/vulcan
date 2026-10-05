@@ -467,8 +467,8 @@ fn freeOwned(allocator: std.mem.Allocator, iv: wimmer.Interval) void {
 
 test "verify: a narrow value on the SECOND register of a live pair is flagged" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
-    const v1: Value = @enumFromInt(1);
+    const v0: Value = @fromBackingInt(@intCast(0));
+    const v1: Value = @fromBackingInt(@intCast(1));
     // A deliberately corrupted assignment: `v0` owns the pair 4:5, and `v1` sits on 5 while `v0` is
     // still live. The two BASE registers differ, so a base-only exclusivity check sees nothing. The
     // span check sees the real conflict.
@@ -487,8 +487,8 @@ test "verify: a narrow value on the SECOND register of a live pair is flagged" {
 
 test "verify: a narrow value just PAST a live pair is not flagged" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
-    const v1: Value = @enumFromInt(1);
+    const v0: Value = @fromBackingInt(@intCast(0));
+    const v1: Value = @fromBackingInt(@intCast(1));
     // The other direction of the same guard: `v1` on register 6 is outside the pair 4:5, so the two
     // do not conflict. A span check that always conflicted would reject this valid allocation.
     var ivs = [_]wimmer.Interval{
@@ -504,8 +504,8 @@ test "verify: a narrow value just PAST a live pair is not flagged" {
 
 test "verify: two pairs that OVERLAP by one register are flagged" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
-    const v1: Value = @enumFromInt(1);
+    const v0: Value = @fromBackingInt(@intCast(0));
+    const v1: Value = @fromBackingInt(@intCast(1));
     // 4:5 and 5:6 share register 5. Neither base equals the other, so only the span test finds it.
     // The second pair is also misaligned, so the span-legality check fires as well.
     var ivs = [_]wimmer.Interval{
@@ -524,7 +524,7 @@ test "verify: two pairs that OVERLAP by one register are flagged" {
 
 test "verify: a pair on an odd base is flagged as a misaligned span" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
+    const v0: Value = @fromBackingInt(@intCast(0));
     // The single-interval corruption: nothing else is live, but the base breaks the alignment the
     // width demands, so the hardware would read the wrong register.
     var ivs = [_]wimmer.Interval{
@@ -540,8 +540,8 @@ test "verify: a pair on an odd base is flagged as a misaligned span" {
 
 test "verify: two pairs on the same aligned base with disjoint ranges are not flagged" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
-    const v1: Value = @enumFromInt(1);
+    const v0: Value = @fromBackingInt(@intCast(0));
+    const v1: Value = @fromBackingInt(@intCast(1));
     // Reuse of one pair after the first value dies is the normal, valid case.
     var ivs = [_]wimmer.Interval{
         try ownedWide(allocator, v0, &.{.{ .from = 0, .to = 4 }}, 2, 2, .{ .reg = 4 }),

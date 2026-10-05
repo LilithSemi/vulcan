@@ -161,7 +161,7 @@ pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
     // The text relocations, section-relative offsets already. Each `symbol` is the index
     // into `obj.symbols`. The emitter remaps it after its symbol sort.
     const text_relocs = try a.alloc(object_emit.OutReloc, obj.relocs.len);
-    for (obj.relocs, 0..) |r, i| text_relocs[i] = .{ .offset = r.offset, .symbol = r.symbol, .r_type = @intFromEnum(r.type), .addend = r.addend };
+    for (obj.relocs, 0..) |r, i| text_relocs[i] = .{ .offset = r.offset, .symbol = r.symbol, .r_type = @backingInt(r.type), .addend = r.addend };
 
     // The data pointer-init relocations, grouped by the section they modify. Each one is
     // an `R_AARCH64_ABS64` against the target symbol.
@@ -301,7 +301,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
         try symbols.append(a, .{ .name = entry.name, .section = @intCast(sec_index), .value = 0, .size = code.len, .binding = binding, .sym_type = .func, .defined = true });
         // Rebase each relocation section-relative. Its offset was a word index into this
         // function's own code, so multiply by 4.
-        for (compiled.relocs) |r| try text_relocs.append(a, .{ .sec = sec_index, .offset = @as(u64, r.offset) * 4, .name = r.symbol, .r_type = @intFromEnum(relocTypeOf(r.kind)) });
+        for (compiled.relocs) |r| try text_relocs.append(a, .{ .sec = sec_index, .offset = @as(u64, r.offset) * 4, .name = r.symbol, .r_type = @backingInt(relocTypeOf(r.kind)) });
     }
 
     // One section per data global.
@@ -391,7 +391,7 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
         try reloc_lists.append(a, .empty);
         const binding: object_emit.Binding = if (entry.func.is_local or std.mem.startsWith(u8, entry.name, ".")) .local else .global;
         try symbols.append(a, .{ .name = entry.name, .section = @intCast(sec_index), .value = 0, .size = code.len, .binding = binding, .sym_type = .func, .defined = true });
-        for (compiled.relocs) |r| try text_relocs.append(a, .{ .sec = sec_index, .offset = @as(u64, r.offset) * 4, .name = r.symbol, .r_type = @intFromEnum(relocTypeOf(r.kind)) });
+        for (compiled.relocs) |r| try text_relocs.append(a, .{ .sec = sec_index, .offset = @as(u64, r.offset) * 4, .name = r.symbol, .r_type = @backingInt(relocTypeOf(r.kind)) });
         // The DWARF PC range and line rows use the running text offset.
         try func_low.append(a, text_off);
         try func_high.append(a, text_off + code.len);
@@ -442,7 +442,7 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
 /// names, so the `.debug_info` base-type dedup keeps them apart.
 fn returnBaseType(func: *const Function) ?dwarf.BaseType {
     const ret_val = for (0..func.blocks.items.len) |bi| {
-        const term = func.terminator(@enumFromInt(bi)) orelse continue;
+        const term = func.terminator(@fromBackingInt(@intCast(bi))) orelse continue;
         switch (term) {
             .ret => |r| switch (r.count) {
                 0 => return null,

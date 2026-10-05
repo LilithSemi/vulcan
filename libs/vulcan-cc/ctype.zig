@@ -38,7 +38,7 @@ pub const IntType = struct {
 
     /// Integer promotion: types of rank < int promote to (signed) int; else unchanged.
     pub fn promote(self: IntType) IntType {
-        return if (@intFromEnum(self.rank) < @intFromEnum(Rank.int)) .{ .rank = .int, .signed = true } else self;
+        return if (@backingInt(self.rank) < @backingInt(Rank.int)) .{ .rank = .int, .signed = true } else self;
     }
 
     /// The usual arithmetic conversions over two already-promoted operand types (C89 6.2.1.5).
@@ -48,13 +48,13 @@ pub const IntType = struct {
         if (a.rank == b.rank and a.signed == b.signed) return a;
         // Same signedness: the higher rank wins.
         if (a.signed == b.signed) {
-            return if (@intFromEnum(a.rank) >= @intFromEnum(b.rank)) a else b;
+            return if (@backingInt(a.rank) >= @backingInt(b.rank)) a else b;
         }
         // Mixed signedness. Find the unsigned operand and the signed operand.
         const u = if (!a.signed) a else b;
         const s = if (a.signed) a else b;
         // If the unsigned operand's rank is at least the signed operand's rank, use the unsigned type.
-        if (@intFromEnum(u.rank) >= @intFromEnum(s.rank)) return u;
+        if (@backingInt(u.rank) >= @backingInt(s.rank)) return u;
         // The signed operand has strictly higher rank. If it is strictly wider, it can
         // represent every value of the unsigned type, so keep it signed. Otherwise use
         // the unsigned version of the signed operand's higher rank.

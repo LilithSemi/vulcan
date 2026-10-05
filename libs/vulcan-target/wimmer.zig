@@ -522,7 +522,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
         err: ?Error = null,
 
         fn visit(self: *@This(), v: Value, is_edge_arg: bool) void {
-            const vi = @intFromEnum(v);
+            const vi = @backingInt(v);
             self.used_row[vi] = true;
             const kind: UseKind = if (is_edge_arg)
                 // An edge argument feeds a successor block parameter through the parallel move the
@@ -569,10 +569,10 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
     // --- Pass A: number positions, record defs, gather uses + use-ranges, build the CFG. ---
     var pos: u32 = 0;
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         block_from[bi] = pos;
         for (func.blockParams(block)) |p| {
-            const pi = @intFromEnum(p);
+            const pi = @backingInt(p);
             def_pos[pi] = pos;
             is_def[pi] = true;
             defined[bi * nval + pi] = true;
@@ -607,11 +607,11 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             if (g.err) |e| return e;
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
-                try succ[bi].append(allocator, @intFromEnum(cf.then.target));
-                try succ[bi].append(allocator, @intFromEnum(cf.@"else".target));
+                try succ[bi].append(allocator, @backingInt(cf.then.target));
+                try succ[bi].append(allocator, @backingInt(cf.@"else".target));
             }
             if (func.instResult(inst)) |r| {
-                const ri = @intFromEnum(r);
+                const ri = @backingInt(r);
                 def_pos[ri] = pos;
                 is_def[ri] = true;
                 defined[bi * nval + ri] = true;
@@ -637,7 +637,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             };
             visitTermOperands(func, term, &g, Gather.visit);
             if (g.err) |e| return e;
-            if (term == .jump) try succ[bi].append(allocator, @intFromEnum(term.jump.target));
+            if (term == .jump) try succ[bi].append(allocator, @backingInt(term.jump.target));
         }
         block_to[bi] = term_pos + 1;
         pos += 1;
@@ -649,14 +649,14 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
     for (late_reads.items) |late| {
         const bi: usize = late.block;
         var until = block_to[bi] - 1;
-        const result_uses = use_lists[@intFromEnum(late.result)].items;
+        const result_uses = use_lists[@backingInt(late.result)].items;
         for (result_uses) |use| {
             if (use.pos > late.producer_pos and use.pos < block_to[bi]) {
                 until = use.pos;
                 break;
             }
         }
-        try range_lists[@intFromEnum(late.operand)].append(allocator, .{
+        try range_lists[@backingInt(late.operand)].append(allocator, .{
             .from = block_from[bi],
             .to = until + 1,
         });
@@ -754,7 +754,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
         errdefer allocator.free(rs);
         const us = try use_lists[v].toOwnedSlice(allocator);
         errdefer allocator.free(us);
-        const value: Value = @enumFromInt(v);
+        const value: Value = @fromBackingInt(@intCast(v));
         const class = desc.classOf(desc.ctx, func, value);
         // Record the copy source when the backend opts into coalescing and reports this value as a
         // pure same-class copy. The same-class guard is defensive: a cross-class copy shares no
@@ -1346,7 +1346,7 @@ fn buildParamArgs(allocator: std.mem.Allocator, func: *const Function) Error!Par
     var map: ParamArgs = .empty;
     errdefer freeParamArgs(allocator, &map);
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
@@ -1510,8 +1510,8 @@ fn slotGroupsInterfere(all: []const *Interval, parent: []u32, class_off: []const
 /// two slots are distinct and their groups do not interfere.
 fn coalesceEdgeParams(all: []const *Interval, parent: []u32, class_off: []const u32, func: *const Function, desc: *const RegDescription, block_from: []const u32, block_to: []const u32, pred: Block, edge: Jump) void {
     const succ = edge.target;
-    const pt = block_to[@intFromEnum(pred)] - 1;
-    const ss = block_from[@intFromEnum(succ)];
+    const pt = block_to[@backingInt(pred)] - 1;
+    const ss = block_from[@backingInt(succ)];
     const params = func.blockParams(succ);
     const args = func.blockArgs(edge);
     if (params.len != args.len) return;
@@ -1545,8 +1545,8 @@ fn coalesceEdgeParams(all: []const *Interval, parent: []u32, class_off: []const 
 /// post-rewrite slot numbers now in each interval's `location`.
 fn edgeSlotBothSrcAndDst(all: []const *Interval, intervals: []const Interval, children: []const *Interval, func: *const Function, desc: *const RegDescription, class_off: []const u32, mark: []u8, block_from: []const u32, block_to: []const u32, pred: Block, edge: Jump) bool {
     const succ = edge.target;
-    const pt = block_to[@intFromEnum(pred)] - 1;
-    const ss = block_from[@intFromEnum(succ)];
+    const pt = block_to[@backingInt(pred)] - 1;
+    const ss = block_from[@backingInt(succ)];
 
     const Marker = struct {
         fn go(m: []u8, coff: []const u32, cls: u16, from: Location, to: Location) bool {
@@ -1661,7 +1661,7 @@ fn coalesceSpillSlots(allocator: std.mem.Allocator, func: *const Function, inter
 
     // PASS 1: union each spilled parameter with a non-interfering spilled incoming argument.
     for (0..func.blockCount()) |bi| {
-        const pred: Block = @enumFromInt(bi);
+        const pred: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(pred)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
@@ -1720,7 +1720,7 @@ fn coalesceSpillSlots(allocator: std.mem.Allocator, func: *const Function, inter
         defer allocator.free(mark);
         var unsafe = false;
         walk: for (0..func.blockCount()) |bi| {
-            const pred: Block = @enumFromInt(bi);
+            const pred: Block = @fromBackingInt(@intCast(bi));
             for (func.blockInsts(pred)) |inst| {
                 if (func.opcode(inst) == .@"if") {
                     const cf = func.opcode(inst).@"if";
@@ -1979,7 +1979,7 @@ fn computeBlockBounds(allocator: std.mem.Allocator, func: *const Function) Error
     errdefer allocator.free(to);
     var pos: u32 = 0;
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         from[bi] = pos;
         pos += 1; // the block-parameter row
         pos += @intCast(func.blockInsts(block).len);
@@ -2834,7 +2834,7 @@ fn resolveDataFlow(
 
     const nblocks = func.blockCount();
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         // An `if` instruction contributes its two edges, then and else. Each carries its own args.
         for (func.blockInsts(block)) |inst| {
             if (func.opcode(inst) == .@"if") {
@@ -2875,8 +2875,8 @@ fn addEdgeMoves(
     // The predecessor's branch executes at its last position. The successor is entered at its
     // parameter row. A location looked up at `pt` is the value's placement as control leaves
     // `pred`, and at `ss` its placement as control enters `succ`.
-    const pt = block_to[@intFromEnum(pred)] - 1;
-    const ss = block_from[@intFromEnum(succ)];
+    const pt = block_to[@backingInt(pred)] - 1;
+    const ss = block_from[@backingInt(succ)];
 
     var raw: std.ArrayList(Move) = .empty;
     defer raw.deinit(allocator);
@@ -3171,29 +3171,29 @@ fn assertNoCriticalEdges(allocator: std.mem.Allocator, func: *const Function) Er
     defer allocator.free(pred_count);
     @memset(pred_count, 0);
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
-                pred_count[@intFromEnum(cf.then.target)] += 1;
-                pred_count[@intFromEnum(cf.@"else".target)] += 1;
+                pred_count[@backingInt(cf.then.target)] += 1;
+                pred_count[@backingInt(cf.@"else".target)] += 1;
             }
         }
         if (func.terminator(block)) |term| switch (term) {
-            .jump => |j| pred_count[@intFromEnum(j.target)] += 1,
+            .jump => |j| pred_count[@backingInt(j.target)] += 1,
             .ret => {},
         };
     }
 
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
                 // The `if` block already has two successors, so either target with more than one
                 // predecessor makes that edge critical.
-                std.debug.assert(pred_count[@intFromEnum(cf.then.target)] <= 1);
-                std.debug.assert(pred_count[@intFromEnum(cf.@"else".target)] <= 1);
+                std.debug.assert(pred_count[@backingInt(cf.then.target)] <= 1);
+                std.debug.assert(pred_count[@backingInt(cf.@"else".target)] <= 1);
             }
         }
     }
@@ -3480,7 +3480,7 @@ test "fixedClobberConflict: a one-position interval at a call keeps its register
     // the clobber does not conflict with it and every caller-saved register stays open to it.
     var head_ranges = [_]Range{.{ .from = c, .to = c + 1 }};
     const head: Interval = .{
-        .value = @enumFromInt(0),
+        .value = @fromBackingInt(@intCast(0)),
         .class = 0,
         .fixed_reg = null,
         .ranges = &head_ranges,
@@ -3492,7 +3492,7 @@ test "fixedClobberConflict: a one-position interval at a call keeps its register
     // is the case the head was split OUT of, and it must keep conflicting.
     var across_ranges = [_]Range{.{ .from = c, .to = c + 2 }};
     const across: Interval = .{
-        .value = @enumFromInt(1),
+        .value = @fromBackingInt(@intCast(1)),
         .class = 0,
         .fixed_reg = null,
         .ranges = &across_ranges,
@@ -3503,7 +3503,7 @@ test "fixedClobberConflict: a one-position interval at a call keeps its register
     // A value the call DEFINES starts after the clobber row, so it covers `c + 1` but not `c`.
     var tail_ranges = [_]Range{.{ .from = c + 1, .to = c + 3 }};
     const tail: Interval = .{
-        .value = @enumFromInt(2),
+        .value = @fromBackingInt(@intCast(2)),
         .class = 0,
         .fixed_reg = null,
         .ranges = &tail_ranges,
@@ -3515,7 +3515,7 @@ test "fixedClobberConflict: a one-position interval at a call keeps its register
     // with a longer lead-in. It keeps its register too.
     var dying_ranges = [_]Range{.{ .from = c - 2, .to = c + 1 }};
     const dying: Interval = .{
-        .value = @enumFromInt(3),
+        .value = @fromBackingInt(@intCast(3)),
         .class = 0,
         .fixed_reg = null,
         .ranges = &dying_ranges,
@@ -3527,7 +3527,7 @@ test "fixedClobberConflict: a one-position interval at a call keeps its register
     // though it is live on both sides of it.
     var holed_ranges = [_]Range{ .{ .from = c - 2, .to = c }, .{ .from = c + 1, .to = c + 3 } };
     const holed: Interval = .{
-        .value = @enumFromInt(4),
+        .value = @fromBackingInt(@intCast(4)),
         .class = 0,
         .fixed_reg = null,
         .ranges = &holed_ranges,
@@ -3555,7 +3555,7 @@ test "slotIntervalsInterfere: an early store holds the slot in front of the inte
     // head reads there.
     var rest_ranges = [_]Range{.{ .from = p + 1, .to = p + 6 }};
     var rest: Interval = .{
-        .value = @enumFromInt(0),
+        .value = @fromBackingInt(@intCast(0)),
         .class = 0,
         .fixed_reg = null,
         .ranges = &rest_ranges,
@@ -3568,7 +3568,7 @@ test "slotIntervalsInterfere: an early store holds the slot in front of the inte
     // still live where the early store writes. The two range sets never meet.
     var dies_ranges = [_]Range{.{ .from = p - 3, .to = p + 1 }};
     var dies: Interval = .{
-        .value = @enumFromInt(1),
+        .value = @fromBackingInt(@intCast(1)),
         .class = 0,
         .fixed_reg = null,
         .ranges = &dies_ranges,
@@ -3585,7 +3585,7 @@ test "slotIntervalsInterfere: an early store holds the slot in front of the inte
     // helpers share: a range `[x, p)` does not meet the prefix `[p, start())`.
     var earlier_ranges = [_]Range{.{ .from = p - 3, .to = p }};
     var earlier: Interval = .{
-        .value = @enumFromInt(2),
+        .value = @fromBackingInt(@intCast(2)),
         .class = 0,
         .fixed_reg = null,
         .ranges = &earlier_ranges,
@@ -3600,7 +3600,7 @@ test "slotIntervalsInterfere: an early store holds the slot in front of the inte
     // pair. A reload-at-use split whose remainder starts after a hole makes exactly this shape.
     var late_ranges = [_]Range{.{ .from = p + 6, .to = p + 8 }};
     var late: Interval = .{
-        .value = @enumFromInt(3),
+        .value = @fromBackingInt(@intCast(3)),
         .class = 0,
         .fixed_reg = null,
         .ranges = &late_ranges,
@@ -3617,7 +3617,7 @@ test "slotIntervalsInterfere: an early store holds the slot in front of the inte
     // `rest` on every test.
     var clear_ranges = [_]Range{.{ .from = p - 4, .to = p }};
     var clear: Interval = .{
-        .value = @enumFromInt(4),
+        .value = @fromBackingInt(@intCast(4)),
         .class = 0,
         .fixed_reg = null,
         .ranges = &clear_ranges,

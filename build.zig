@@ -207,7 +207,7 @@ pub fn build(b: *std.Build) void {
             b.installArtifact(wasm_cli);
             wasm_cli_artifact = wasm_cli;
             const run_cli = b.addRunArtifact(wasm_cli);
-            if (b.args) |a| run_cli.addArgs(a);
+            run_cli.addPassthruArgs();
             const run_step = b.step("run-wasm", "Run the host Wasm CLI: -- <file.wasm> [export] [i32 args]");
             run_step.dependOn(&run_cli.step);
         }
@@ -215,7 +215,7 @@ pub fn build(b: *std.Build) void {
         // The GLSL -> SPIR-V shader compiler CLI runner (glsl_cli is declared above).
         if (target.result.os.tag != .uefi) {
             const run_glsl = b.addRunArtifact(glsl_cli);
-            if (b.args) |a| run_glsl.addArgs(a);
+            run_glsl.addPassthruArgs();
             const run_glsl_step = b.step("run-glsl", "Run the GLSL->SPIR-V compiler: -- <input.glsl> [stage] [-o out.spv]");
             run_glsl_step.dependOn(&run_glsl.step);
 
@@ -232,7 +232,7 @@ pub fn build(b: *std.Build) void {
             }) });
             b.installArtifact(disasm_cli);
             const run_disasm = b.addRunArtifact(disasm_cli);
-            if (b.args) |a| run_disasm.addArgs(a);
+            run_disasm.addPassthruArgs();
             const run_disasm_step = b.step("run-disasm", "Disassemble an ELF or SPIR-V binary to text assembly: -- <file>");
             run_disasm_step.dependOn(&run_disasm.step);
 
@@ -252,7 +252,7 @@ pub fn build(b: *std.Build) void {
             }) });
             b.installArtifact(uarch_bench_cli);
             const run_uarch_bench = b.addRunArtifact(uarch_bench_cli);
-            if (b.args) |a| run_uarch_bench.addArgs(a);
+            run_uarch_bench.addPassthruArgs();
             const run_uarch_bench_step = b.step("run-uarch-bench", "Benchmark the microarch optimizer: -- [--model <tag> | --list | --custom]");
             run_uarch_bench_step.dependOn(&run_uarch_bench.step);
         }

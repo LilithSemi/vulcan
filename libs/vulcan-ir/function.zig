@@ -1001,26 +1001,26 @@ pub const Function = struct {
     pub fn appendBlock(self: *Function) std.mem.Allocator.Error!Block {
         const index: u32 = @intCast(self.blocks.items.len);
         try self.blocks.append(self.allocator, .{ .params = .empty, .insts = .empty });
-        return @enumFromInt(index);
+        return @fromBackingInt(@intCast(index));
     }
 
     /// Append an instruction to a block, returning the result value it defines.
     pub fn appendInst(self: *Function, block: Block, ty: Type, op: Opcode) std.mem.Allocator.Error!Value {
-        const inst: Inst = @enumFromInt(@as(u32, @intCast(self.insts.items.len)));
-        const value: Value = @enumFromInt(@as(u32, @intCast(self.values.items.len)));
+        const inst: Inst = @fromBackingInt(@intCast(@as(u32, @intCast(self.insts.items.len))));
+        const value: Value = @fromBackingInt(@intCast(@as(u32, @intCast(self.values.items.len))));
 
         try self.values.append(self.allocator, .{ .ty = ty, .def = .{ .inst_result = inst } });
         try self.insts.append(self.allocator, .{ .op = op, .result = value });
-        try self.blocks.items[@intFromEnum(block)].insts.append(self.allocator, inst);
+        try self.blocks.items[@backingInt(block)].insts.append(self.allocator, inst);
         return value;
     }
 
     /// Append a typed parameter to a block, returning the value it introduces.
     pub fn appendBlockParam(self: *Function, block: Block, ty: Type) std.mem.Allocator.Error!Value {
-        const data = &self.blocks.items[@intFromEnum(block)];
+        const data = &self.blocks.items[@backingInt(block)];
         const param_index: u32 = @intCast(data.params.items.len);
 
-        const value: Value = @enumFromInt(@as(u32, @intCast(self.values.items.len)));
+        const value: Value = @fromBackingInt(@intCast(@as(u32, @intCast(self.values.items.len))));
         try self.values.append(self.allocator, .{
             .ty = ty,
             .def = .{ .block_param = .{ .block = block, .index = param_index } },
@@ -1031,7 +1031,7 @@ pub const Function = struct {
 
     /// The type of a value.
     pub fn valueType(self: *const Function, value: Value) Type {
-        return self.values.items[@intFromEnum(value)].ty;
+        return self.values.items[@backingInt(value)].ty;
     }
 
     /// Retype a value in place (its defining instruction / param is unchanged). Used by
@@ -1039,7 +1039,7 @@ pub const Function = struct {
     /// the SSA graph. The caller is responsible for keeping the def consistent (e.g.
     /// splatting a scalar constant that becomes a vector).
     pub fn setValueType(self: *Function, value: Value, ty: Type) void {
-        self.values.items[@intFromEnum(value)].ty = ty;
+        self.values.items[@backingInt(value)].ty = ty;
     }
 
     /// The textual name number of a value: its position in a deterministic walk
@@ -1053,7 +1053,7 @@ pub const Function = struct {
                 n += 1;
             }
             for (block.insts.items) |inst| {
-                if (self.insts.items[@intFromEnum(inst)].result) |result| {
+                if (self.insts.items[@backingInt(inst)].result) |result| {
                     if (result == value) return n;
                     n += 1;
                 }
@@ -1064,7 +1064,7 @@ pub const Function = struct {
 
     /// Set the block's terminator.
     pub fn setTerminator(self: *Function, block: Block, term: Terminator) void {
-        self.blocks.items[@intFromEnum(block)].term = term;
+        self.blocks.items[@backingInt(block)].term = term;
     }
 
     /// Terminate a block with an unconditional jump, passing `args` to the
@@ -1078,9 +1078,9 @@ pub const Function = struct {
     /// instruction handle. Primitive behind the typed statement builders, also
     /// used to reconstruct instructions during deserialization.
     pub fn appendStmtRaw(self: *Function, block: Block, op: Opcode) std.mem.Allocator.Error!Inst {
-        const inst: Inst = @enumFromInt(@as(u32, @intCast(self.insts.items.len)));
+        const inst: Inst = @fromBackingInt(@intCast(@as(u32, @intCast(self.insts.items.len))));
         try self.insts.append(self.allocator, .{ .op = op, .result = null });
-        try self.blocks.items[@intFromEnum(block)].insts.append(self.allocator, inst);
+        try self.blocks.items[@backingInt(block)].insts.append(self.allocator, inst);
         return inst;
     }
 
@@ -1377,7 +1377,7 @@ pub const Function = struct {
 
     /// The instructions of a block, in order.
     pub fn blockInsts(self: *const Function, block: Block) []const Inst {
-        return self.blocks.items[@intFromEnum(block)].insts.items;
+        return self.blocks.items[@backingInt(block)].insts.items;
     }
 
     /// The number of blocks in the function.
@@ -1387,12 +1387,12 @@ pub const Function = struct {
 
     /// The parameters of a block, in order.
     pub fn blockParams(self: *const Function, block: Block) []const Value {
-        return self.blocks.items[@intFromEnum(block)].params.items;
+        return self.blocks.items[@backingInt(block)].params.items;
     }
 
     /// The value an instruction defines, if any.
     pub fn instResult(self: *const Function, inst: Inst) ?Value {
-        return self.insts.items[@intFromEnum(inst)].result;
+        return self.insts.items[@backingInt(inst)].result;
     }
 
     /// The number of instructions in the function.
@@ -1404,12 +1404,12 @@ pub const Function = struct {
 
     /// A mutable pointer to an instruction's opcode (to rewrite operands).
     pub fn opcodeMut(self: *Function, inst: Inst) *Opcode {
-        return &self.insts.items[@intFromEnum(inst)].op;
+        return &self.insts.items[@backingInt(inst)].op;
     }
 
     /// A mutable pointer to a block's terminator slot.
     pub fn terminatorPtr(self: *Function, block: Block) *?Terminator {
-        return &self.blocks.items[@intFromEnum(block)].term;
+        return &self.blocks.items[@backingInt(block)].term;
     }
 
     /// A mutable view of a value-list run (to rewrite variadic operands).
@@ -1427,7 +1427,7 @@ pub const Function = struct {
             }
         }.repl;
         for (0..self.instCount()) |i| {
-            const op = self.opcodeMut(@enumFromInt(i));
+            const op = self.opcodeMut(@fromBackingInt(@intCast(i)));
             switch (op.*) {
                 // A barrier carries a scope and no Value operand, so it has nothing to
                 // replace. It joins the constants here for that reason only.
@@ -1503,7 +1503,7 @@ pub const Function = struct {
             }
         }
         for (0..self.blockCount()) |bi| {
-            const term = self.terminatorPtr(@enumFromInt(bi));
+            const term = self.terminatorPtr(@fromBackingInt(@intCast(bi)));
             if (term.*) |*t| switch (t.*) {
                 .ret => |*ret| for (ret.values[0..ret.count]) |*vv| {
                     vv.* = r(from, to, vv.*);
@@ -1517,13 +1517,13 @@ pub const Function = struct {
 
     /// A mutable pointer to a block's instruction list (to drop instructions).
     pub fn blockInstsMut(self: *Function, block: Block) *std.ArrayList(Inst) {
-        return &self.blocks.items[@intFromEnum(block)].insts;
+        return &self.blocks.items[@backingInt(block)].insts;
     }
 
     /// Create a fresh block-parameter value of type `ty`, without adding it to
     /// any block's parameter list. The caller installs it via `setBlockParams`.
     pub fn newParam(self: *Function, block: Block, ty: Type) std.mem.Allocator.Error!Value {
-        const value: Value = @enumFromInt(@as(u32, @intCast(self.values.items.len)));
+        const value: Value = @fromBackingInt(@intCast(@as(u32, @intCast(self.values.items.len))));
         try self.values.append(self.allocator, .{
             .ty = ty,
             .def = .{ .block_param = .{ .block = block, .index = 0 } },
@@ -1533,7 +1533,7 @@ pub const Function = struct {
 
     /// Replace a block's parameter list with `params`.
     pub fn setBlockParams(self: *Function, block: Block, params: []const Value) std.mem.Allocator.Error!void {
-        const data = &self.blocks.items[@intFromEnum(block)];
+        const data = &self.blocks.items[@backingInt(block)];
         data.params.clearRetainingCapacity();
         try data.params.appendSlice(self.allocator, params);
     }
@@ -1541,8 +1541,8 @@ pub const Function = struct {
     /// Create an instruction and its result value without adding it to any
     /// block. The caller places it via `setBlockInsts`.
     pub fn createInst(self: *Function, ty: Type, op: Opcode) std.mem.Allocator.Error!Value {
-        const inst: Inst = @enumFromInt(@as(u32, @intCast(self.insts.items.len)));
-        const value: Value = @enumFromInt(@as(u32, @intCast(self.values.items.len)));
+        const inst: Inst = @fromBackingInt(@intCast(@as(u32, @intCast(self.insts.items.len))));
+        const value: Value = @fromBackingInt(@intCast(@as(u32, @intCast(self.values.items.len))));
         try self.values.append(self.allocator, .{ .ty = ty, .def = .{ .inst_result = inst } });
         try self.insts.append(self.allocator, .{ .op = op, .result = value });
         return value;
@@ -1550,7 +1550,7 @@ pub const Function = struct {
 
     /// Replace a block's instruction list with `insts`.
     pub fn setBlockInsts(self: *Function, block: Block, insts: []const Inst) std.mem.Allocator.Error!void {
-        const data = &self.blocks.items[@intFromEnum(block)];
+        const data = &self.blocks.items[@backingInt(block)];
         data.insts.clearRetainingCapacity();
         try data.insts.appendSlice(self.allocator, insts);
     }
@@ -1573,14 +1573,14 @@ pub const Function = struct {
     pub fn reorderBlocks(self: *Function, allocator: std.mem.Allocator, order: []const Block) std.mem.Allocator.Error!void {
         const n = self.blockCount();
         std.debug.assert(order.len == n);
-        std.debug.assert(order[0] == @as(Block, @enumFromInt(0))); // entry stays first
+        std.debug.assert(order[0] == @as(Block, @fromBackingInt(@intCast(0)))); // entry stays first
 
         // order must be a permutation of 0..n: every old id appears exactly once.
         const seen = try allocator.alloc(bool, n);
         defer allocator.free(seen);
         @memset(seen, false);
         for (order) |old| {
-            const old_index = @intFromEnum(old);
+            const old_index = @backingInt(old);
             std.debug.assert(old_index < n);
             std.debug.assert(!seen[old_index]); // no id repeated
             seen[old_index] = true;
@@ -1589,39 +1589,39 @@ pub const Function = struct {
         // new_id[old block index] = new block index.
         const new_id = try allocator.alloc(u32, n);
         defer allocator.free(new_id);
-        for (order, 0..) |old, new_index| new_id[@intFromEnum(old)] = @intCast(new_index);
+        for (order, 0..) |old, new_index| new_id[@backingInt(old)] = @intCast(new_index);
 
         // Permute the BlockData structs themselves: tmp[i] takes ownership of the storage that
         // used to live at the old index, then the memcpy-back writes those (moved, not copied)
         // structs into their new slots. No inner ArrayList is touched, so nothing is freed twice.
         const tmp = try allocator.alloc(BlockData, n);
         defer allocator.free(tmp);
-        for (order, 0..) |old, new_index| tmp[new_index] = self.blocks.items[@intFromEnum(old)];
+        for (order, 0..) |old, new_index| tmp[new_index] = self.blocks.items[@backingInt(old)];
         @memcpy(self.blocks.items, tmp);
 
         // Remap every block reference (terminator jump targets, `if` then/else targets) through
         // new_id. Values are function-global, so nothing else needs remapping.
         var bi: usize = 0;
         while (bi < n) : (bi += 1) {
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             const tp = self.terminatorPtr(block);
             if (tp.*) |*t| switch (t.*) {
                 .ret => {},
                 .jump => |*j| {
-                    const mapped = new_id[@intFromEnum(j.target)];
+                    const mapped = new_id[@backingInt(j.target)];
                     std.debug.assert(mapped < n);
-                    j.target = @enumFromInt(mapped);
+                    j.target = @fromBackingInt(@intCast(mapped));
                 },
             };
             for (self.blockInsts(block)) |inst| {
                 const op = self.opcodeMut(inst);
                 if (op.* == .@"if") {
-                    const then_mapped = new_id[@intFromEnum(op.@"if".then.target)];
-                    const else_mapped = new_id[@intFromEnum(op.@"if".@"else".target)];
+                    const then_mapped = new_id[@backingInt(op.@"if".then.target)];
+                    const else_mapped = new_id[@backingInt(op.@"if".@"else".target)];
                     std.debug.assert(then_mapped < n);
                     std.debug.assert(else_mapped < n);
-                    op.@"if".then.target = @enumFromInt(then_mapped);
-                    op.@"if".@"else".target = @enumFromInt(else_mapped);
+                    op.@"if".then.target = @fromBackingInt(@intCast(then_mapped));
+                    op.@"if".@"else".target = @fromBackingInt(@intCast(else_mapped));
                 }
             }
         }
@@ -1851,17 +1851,17 @@ pub const Function = struct {
 
     /// The block's terminator, or null if it has not been set yet.
     pub fn terminator(self: *const Function, block: Block) ?Terminator {
-        return self.blocks.items[@intFromEnum(block)].term;
+        return self.blocks.items[@backingInt(block)].term;
     }
 
     /// The opcode of an instruction.
     pub fn opcode(self: *const Function, inst: Inst) Opcode {
-        return self.insts.items[@intFromEnum(inst)].op;
+        return self.insts.items[@backingInt(inst)].op;
     }
 
     /// The instruction that defines a value, or null if it is a block parameter.
     pub fn definingInst(self: *const Function, value: Value) ?Inst {
-        return switch (self.values.items[@intFromEnum(value)].def) {
+        return switch (self.values.items[@backingInt(value)].def) {
             .inst_result => |inst| inst,
             .block_param => null,
         };
@@ -1888,7 +1888,7 @@ pub const Function = struct {
             // A block attribute prints above the label. The structured control-flow
             // lowerings key merge and continue blocks this way, so the text form must
             // carry it.
-            var block_attrs = self.attributesOf(.{ .block = @enumFromInt(bi) });
+            var block_attrs = self.attributesOf(.{ .block = @fromBackingInt(@intCast(bi)) });
             while (block_attrs.next()) |attr| {
                 try w.writeAll("  #[");
                 try printAttr(w, attr);
@@ -1949,7 +1949,7 @@ pub const Function = struct {
     /// jump terminator).
     fn branchesOut(self: *const Function, block: BlockData) bool {
         for (block.insts.items) |inst| {
-            switch (self.insts.items[@intFromEnum(inst)].op) {
+            switch (self.insts.items[@backingInt(inst)].op) {
                 .@"if" => return true,
                 else => {},
             }
@@ -2009,7 +2009,7 @@ fn typeContainsF128(table: *const TypeTable, ty: Type) bool {
 pub fn functionUsesF16(func: *const Function) bool {
     var i: usize = 0;
     while (i < func.valueCount()) : (i += 1) {
-        const value: Value = @enumFromInt(@as(u32, @intCast(i)));
+        const value: Value = @fromBackingInt(@intCast(@as(u32, @intCast(i))));
         if (typeContainsF16(&func.types, func.valueType(value))) return true;
     }
     return false;
@@ -2020,7 +2020,7 @@ pub fn functionUsesF16(func: *const Function) bool {
 pub fn functionUsesF128(func: *const Function) bool {
     var i: usize = 0;
     while (i < func.valueCount()) : (i += 1) {
-        const value: Value = @enumFromInt(@as(u32, @intCast(i)));
+        const value: Value = @fromBackingInt(@intCast(@as(u32, @intCast(i))));
         if (typeContainsF128(&func.types, func.valueType(value))) return true;
     }
     return false;
@@ -2037,7 +2037,7 @@ pub fn functionUsesF128(func: *const Function) bool {
 pub fn functionUsesCompositeF16(func: *const Function) bool {
     var i: usize = 0;
     while (i < func.valueCount()) : (i += 1) {
-        const value: Value = @enumFromInt(@as(u32, @intCast(i)));
+        const value: Value = @fromBackingInt(@intCast(@as(u32, @intCast(i))));
         const ty = func.valueType(value);
         switch (func.types.type_kind(ty)) {
             // A bare scalar float (f16/f32/f64) is handled directly; only f16 wrapped in a composite
@@ -2106,7 +2106,7 @@ fn printCallExtras(
 /// Render an instruction statement. Constants bind with `const` and carry a type
 /// annotation. Other results bind with `let`.
 fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer.Error!void {
-    const data = self.insts.items[@intFromEnum(inst)];
+    const data = self.insts.items[@backingInt(inst)];
     switch (data.op) {
         .iconst => |value| try w.print("const v{d}: {f} = {d}", .{
             self.valueName(data.result.?),
@@ -2348,7 +2348,7 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
 
 /// Render a jump's target and the arguments it passes, e.g. `block1(v3, v4)`.
 fn printEdge(self: *const Function, w: *std.Io.Writer, jump: Jump) std.Io.Writer.Error!void {
-    try w.print("block{d}(", .{@intFromEnum(jump.target)});
+    try w.print("block{d}(", .{@backingInt(jump.target)});
     for (self.blockArgs(jump), 0..) |arg, i| {
         if (i != 0) try w.writeAll(", ");
         try w.print("v{d}", .{self.valueName(arg)});
@@ -2944,12 +2944,12 @@ test "reorderBlocks permutes a 3-block chain and remaps jump targets" {
     try func.reorderBlocks(std.testing.allocator, &.{ entry, tail, mid });
 
     // New index 1 now holds the old tail block (empty, ret void terminator).
-    const new_tail: Block = @enumFromInt(1);
+    const new_tail: Block = @fromBackingInt(@intCast(1));
     try std.testing.expectEqual(@as(usize, 0), func.blockInsts(new_tail).len);
     try std.testing.expectEqual(@as(u8, 0), func.terminator(new_tail).?.ret.count);
 
     // New index 2 now holds the old mid block, carrying the marker const and its jump.
-    const new_mid: Block = @enumFromInt(2);
+    const new_mid: Block = @fromBackingInt(@intCast(2));
     const new_mid_insts = func.blockInsts(new_mid);
     try std.testing.expectEqual(@as(usize, 1), new_mid_insts.len);
     try std.testing.expectEqual(@as(i64, 99), func.opcode(new_mid_insts[0]).iconst);
@@ -2985,9 +2985,9 @@ test "reorderBlocks remaps if then/else edges" {
     // Swap then_b and else_b's positions (and move merge before else_b).
     try func.reorderBlocks(std.testing.allocator, &.{ entry, else_b, then_b, merge });
 
-    const new_then: Block = @enumFromInt(2); // old then_b
-    const new_else: Block = @enumFromInt(1); // old else_b
-    const new_merge: Block = @enumFromInt(3); // old merge, unchanged position
+    const new_then: Block = @fromBackingInt(@intCast(2)); // old then_b
+    const new_else: Block = @fromBackingInt(@intCast(1)); // old else_b
+    const new_merge: Block = @fromBackingInt(@intCast(3)); // old merge, unchanged position
 
     const if_inst = func.blockInsts(entry)[func.blockInsts(entry).len - 1];
     const cf = func.opcode(if_inst).@"if";
@@ -3420,7 +3420,7 @@ test "cloneBlock does not carry a block attribute or a function attribute onto t
     try func.addAttr(.{ .block = src }, .{ .custom = .{
         .namespace = "cf",
         .key = "merge",
-        .value = .{ .int = @intFromEnum(merge) },
+        .value = .{ .int = @backingInt(merge) },
     } });
     try func.addAttr(.{ .block = src }, .cold);
     try func.addAttr(.func, .@"inline");
@@ -3447,7 +3447,7 @@ test "clone deep-copies a function and leaves the original untouched" {
     _ = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = x } });
     const called = try func.appendCall(entry, i32_t, "callee", &.{x});
     func.setTerminator(entry, .{ .ret = Ret.one(called) });
-    try func.addAttr(.{ .inst = @enumFromInt(0) }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 12 } } });
+    try func.addAttr(.{ .inst = @fromBackingInt(@intCast(0)) }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 12 } } });
     func.is_variadic = true;
     func.num_fixed_params = 1;
     func.sret = true;
@@ -3465,7 +3465,7 @@ test "clone deep-copies a function and leaves the original untouched" {
     try std.testing.expect(copy.is_local);
 
     // The attribute list carries over, with its string payloads re-owned by the copy.
-    var it = copy.attributesOf(.{ .inst = @enumFromInt(0) });
+    var it = copy.attributesOf(.{ .inst = @fromBackingInt(@intCast(0)) });
     const attr = it.next() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("debug", attr.custom.namespace);
     try std.testing.expectEqualStrings("line", attr.custom.key);

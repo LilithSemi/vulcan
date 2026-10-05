@@ -52,14 +52,14 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     // in. Both start as the identity.
     const canon = try allocator.alloc(Value, func.valueCount());
     defer allocator.free(canon);
-    for (canon, 0..) |*c, i| c.* = @enumFromInt(i);
+    for (canon, 0..) |*c, i| c.* = @fromBackingInt(@intCast(i));
     const def_block = try allocator.alloc(u32, func.valueCount());
     defer allocator.free(def_block);
     for (0..n) |bi| {
-        const block: Block = @enumFromInt(bi);
-        for (func.blockParams(block)) |p| def_block[@intFromEnum(p)] = @intCast(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockParams(block)) |p| def_block[@backingInt(p)] = @intCast(bi);
         for (func.blockInsts(block)) |inst| {
-            if (func.instResult(inst)) |r| def_block[@intFromEnum(r)] = @intCast(bi);
+            if (func.instResult(inst)) |r| def_block[@backingInt(r)] = @intCast(bi);
         }
     }
 
@@ -68,13 +68,13 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 
     var changed = false;
     for (rpo) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             const result = func.instResult(inst) orelse continue;
             const key = keyOf(func, canon, inst, result) orelse continue; // not numberable
             if (table.get(key)) |leader| {
-                if (doms.dominates(def_block[@intFromEnum(leader)], bi)) {
-                    canon[@intFromEnum(result)] = leader; // redundant: reuse the leader
+                if (doms.dominates(def_block[@backingInt(leader)], bi)) {
+                    canon[@backingInt(result)] = leader; // redundant: reuse the leader
                     changed = true;
                     continue;
                 }
@@ -95,7 +95,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value) ?Key {
     const vn = struct {
         fn of(c: []const Value, v: Value) u64 {
-            return @intFromEnum(c[@intFromEnum(v)]);
+            return @backingInt(c[@backingInt(v)]);
         }
     }.of;
     return switch (func.opcode(inst)) {
@@ -107,26 +107,26 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         // (e.g. plain `int`), so the omission was latent; SM4 Task 5 (typed integer-literal
         // suffixes) is the first place a same-valued constant can carry a different type.
         .iconst => null, // SPIKE: do not common constants (rematerializable; commoning creates long-lived spills)
-        .fconst => |v| .{ .kind = .fconst, .a = @bitCast(v), .sub = @intFromEnum(func.valueType(result)) },
+        .fconst => |v| .{ .kind = .fconst, .a = @bitCast(v), .sub = @backingInt(func.valueType(result)) },
         // The 128-bit pattern needs two of the key's three slots; `c` stays zero.
-        .fconst128 => |v| .{ .kind = .fconst128, .a = @truncate(v), .b = @truncate(v >> 64), .sub = @intFromEnum(func.valueType(result)) },
+        .fconst128 => |v| .{ .kind = .fconst128, .a = @truncate(v), .b = @truncate(v >> 64), .sub = @backingInt(func.valueType(result)) },
         .arith => |x| blk: {
             var a = vn(canon, x.lhs);
             var b = vn(canon, x.rhs);
             if (isCommutative(x.op) and a > b) std.mem.swap(u64, &a, &b);
-            break :blk .{ .kind = .arith, .sub = @intFromEnum(x.op), .a = a, .b = b };
+            break :blk .{ .kind = .arith, .sub = @backingInt(x.op), .a = a, .b = b };
         },
-        .arith_imm => |x| .{ .kind = .arith_imm, .sub = @intFromEnum(x.op), .a = vn(canon, x.lhs), .b = @bitCast(x.imm) },
+        .arith_imm => |x| .{ .kind = .arith_imm, .sub = @backingInt(x.op), .a = vn(canon, x.lhs), .b = @bitCast(x.imm) },
         .icmp => |x| blk: {
             var a = vn(canon, x.lhs);
             var b = vn(canon, x.rhs);
             if ((x.op == .eq or x.op == .ne) and a > b) std.mem.swap(u64, &a, &b);
-            break :blk .{ .kind = .icmp, .sub = @intFromEnum(x.op), .a = a, .b = b };
+            break :blk .{ .kind = .icmp, .sub = @backingInt(x.op), .a = a, .b = b };
         },
         .select => |x| .{ .kind = .select, .a = vn(canon, x.cond), .b = vn(canon, x.then), .c = vn(canon, x.@"else") },
-        .convert => |x| .{ .kind = .convert, .sub = @intFromEnum(func.valueType(result)), .a = vn(canon, x.value) },
+        .convert => |x| .{ .kind = .convert, .sub = @backingInt(func.valueType(result)), .a = vn(canon, x.value) },
         .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4 => null,
-        .unary => |x| .{ .kind = .unary, .sub = @intFromEnum(func.valueType(result)), .a = vn(canon, x.value), .b = @intFromEnum(x.op) },
+        .unary => |x| .{ .kind = .unary, .sub = @backingInt(func.valueType(result)), .a = vn(canon, x.value), .b = @backingInt(x.op) },
         .extract => |x| .{ .kind = .extract, .sub = x.index, .a = vn(canon, x.aggregate) },
         // `via_got` must be part of the key, not just `symbol`: a direct global_addr and a
         // GOT-indirect global_addr of the same symbol are different addressing modes, not
@@ -138,11 +138,11 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         .dot => |x| .{ .kind = .dot, .a = vn(canon, x.acc), .b = vn(canon, x.a), .c = vn(canon, x.b) },
         // reduce is pure, like dot, and keyed on the op (a horizontal combine with a
         // different op over the same vector is a different value) plus the vector operand.
-        .reduce => |x| .{ .kind = .reduce, .sub = @intFromEnum(x.op), .a = vn(canon, x.vector) },
+        .reduce => |x| .{ .kind = .reduce, .sub = @backingInt(x.op), .a = vn(canon, x.vector) },
         // The result type must be part of splat's key, the same discipline `iconst`,
         // `convert` and `global_addr` already follow above: the same scalar broadcast into a
         // `<4 x i32>` and a `<8 x i32>` are not interchangeable values.
-        .splat => |x| .{ .kind = .splat, .sub = @intFromEnum(func.valueType(result)), .a = vn(canon, x.scalar) },
+        .splat => |x| .{ .kind = .splat, .sub = @backingInt(func.valueType(result)), .a = vn(canon, x.scalar) },
         // alloca (distinct addresses), struct_new (variadic), and the impure
         // load/store/prefetch/matmul/call/if are not numbered.
         .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => null,
@@ -160,14 +160,14 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
 }
 
 fn sub(canon: []const Value, v: Value) Value {
-    return canon[@intFromEnum(v)];
+    return canon[@backingInt(v)];
 }
 
 /// Rewrite every value operand (in instructions, `if` edges, and terminators) to
 /// its canonical leader, so redundant definitions fall out of use.
 fn rewriteOperands(func: *Function, canon: []const Value) void {
     for (0..func.instCount()) |i| {
-        const op = func.opcodeMut(@enumFromInt(i));
+        const op = func.opcodeMut(@fromBackingInt(@intCast(i)));
         switch (op.*) {
             // An atomic's three operands are canonicalized like any other. This rewrites
             // WHICH value each operand names; it never removes the atomic itself, which
@@ -243,7 +243,7 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
         }
     }
     for (0..func.blockCount()) |bi| {
-        const term = func.terminatorPtr(@enumFromInt(bi));
+        const term = func.terminatorPtr(@fromBackingInt(@intCast(bi)));
         if (term.*) |*t| switch (t.*) {
             .ret => |*r| for (r.values[0..r.count]) |*vv| {
                 vv.* = sub(canon, vv.*);

@@ -173,7 +173,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
         return;
     }
     for (0..func.blockCount()) |bi| {
-        try scheduleBlock(allocator, func, @enumFromInt(bi), model);
+        try scheduleBlock(allocator, func, @fromBackingInt(@intCast(bi)), model);
     }
 }
 
@@ -215,7 +215,7 @@ fn simtSchedule(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator
     var buf: std.ArrayList(Value) = .empty;
     defer buf.deinit(allocator);
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         const insts = func.blockInsts(block);
         const n = insts.len;
         if (n < 2) continue;
@@ -224,7 +224,7 @@ fn simtSchedule(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator
         defer allocator.free(local_of);
         @memset(local_of, none);
         for (insts, 0..) |inst, i| {
-            if (func.instResult(inst)) |r| local_of[@intFromEnum(r)] = i;
+            if (func.instResult(inst)) |r| local_of[@backingInt(r)] = i;
         }
 
         // A block with an `if` has it LAST by construction, and the emission keeps it
@@ -269,7 +269,7 @@ fn simtSchedule(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator
                 try work.append(allocator, cf.cond);
             }
             while (work.pop()) |v| {
-                const li = local_of[@intFromEnum(v)];
+                const li = local_of[@backingInt(v)];
                 if (li == none) continue;
                 if (chain[li]) continue;
                 if (!movable(func.opcode(insts[li]))) continue;
@@ -292,7 +292,7 @@ fn simtSchedule(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator
                     preload[li] = true;
                     try collectOperands(allocator, func, insts[li], &buf);
                     for (buf.items) |operand| {
-                        const oi = local_of[@intFromEnum(operand)];
+                        const oi = local_of[@backingInt(operand)];
                         if (oi == none) continue;
                         if (!movable(func.opcode(insts[oi]))) continue;
                         if (!preload[oi]) try work.append(allocator, oi);
@@ -319,17 +319,17 @@ fn simtSchedule(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator
         for (order.items, 0..) |inst, new_i| {
             try collectOperands(allocator, func, inst, &buf);
             for (buf.items) |operand| {
-                const oi = local_of[@intFromEnum(operand)];
+                const oi = local_of[@backingInt(operand)];
                 if (oi == none) continue;
                 const def = func.instResult(insts[oi]).?;
-                const p = pos_of[@intFromEnum(def)];
+                const p = pos_of[@backingInt(def)];
                 if (p == none or p >= new_i) {
                     ok = false;
                     break;
                 }
             }
             if (!ok) break;
-            if (func.instResult(inst)) |r| pos_of[@intFromEnum(r)] = new_i;
+            if (func.instResult(inst)) |r| pos_of[@backingInt(r)] = new_i;
         }
         if (ok and has_if and func.opcode(order.items[n - 1]) != .@"if") ok = false;
         if (!ok) continue;
@@ -353,7 +353,7 @@ fn scheduleBlock(allocator: std.mem.Allocator, func: *Function, block: Block, mo
     defer allocator.free(local_of);
     @memset(local_of, none);
     for (insts, 0..) |inst, i| {
-        if (func.instResult(inst)) |r| local_of[@intFromEnum(r)] = i;
+        if (func.instResult(inst)) |r| local_of[@backingInt(r)] = i;
     }
 
     const latency = try allocator.alloc(u32, n);
@@ -386,7 +386,7 @@ fn scheduleBlock(allocator: std.mem.Allocator, func: *Function, block: Block, mo
     var cycle: u32 = 0;
     while (order.items.len < n) {
         var issued_this_cycle: u32 = 0;
-        var used = [_]u32{0} ** @typeInfo(UnitClass).@"enum".fields.len;
+        var used: [@typeInfo(UnitClass).@"enum".field_names.len]u32 = @splat(0);
         var soonest: ?u32 = null;
 
         while (issued_this_cycle < width) {
@@ -427,7 +427,7 @@ fn scheduleBlock(allocator: std.mem.Allocator, func: *Function, block: Block, mo
                 var deps_ready = true;
                 var ready_cycle: u32 = 0;
                 for (operands.items) |v| {
-                    const li = local_of[@intFromEnum(v)];
+                    const li = local_of[@backingInt(v)];
                     if (li == none) continue;
                     if (!scheduled[li]) {
                         deps_ready = false;
@@ -439,7 +439,7 @@ fn scheduleBlock(allocator: std.mem.Allocator, func: *Function, block: Block, mo
 
                 if (ready_cycle <= cycle) {
                     const cap = classPorts(model, class[i]);
-                    if (cap != std.math.maxInt(u32) and used[@intFromEnum(class[i])] >= cap) continue;
+                    if (cap != std.math.maxInt(u32) and used[@backingInt(class[i])] >= cap) continue;
                     if (best == null) {
                         best = i;
                         best_lat = latency[i];
@@ -461,7 +461,7 @@ fn scheduleBlock(allocator: std.mem.Allocator, func: *Function, block: Block, mo
                 scheduled[i] = true;
                 avail_at[i] = cycle + latency[i];
                 try order.append(allocator, insts[i]);
-                used[@intFromEnum(class[i])] += 1;
+                used[@backingInt(class[i])] += 1;
                 issued_this_cycle += 1;
             } else break;
         }

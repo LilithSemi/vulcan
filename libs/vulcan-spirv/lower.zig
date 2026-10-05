@@ -1822,7 +1822,7 @@ const MATH_COS: i64 = 6;
 fn callMathFn(func: *Function, module: *Module, block: Block, math_op: i64, a: Value, b: ?Value) Error!Value {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const math_fn = if (module.math_fn) |m| m else blk: {
-        const p = try func.appendBlockParam(@enumFromInt(0), module.ptr_t);
+        const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
         try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "math_fn", .value = .flag } });
         module.math_fn = p;
         break :blk p;
@@ -2213,24 +2213,24 @@ fn lowerImageSample(func: *Function, module: *Module, block: Block, inst: binary
     // byte-identical. The CPU binds the same host sampler for cube + 3D (it dispatches on the desc).
     const sampler_fn = if (is_2darray) blk: {
         if (module.sampler_2darray_fn) |s| break :blk s;
-        const p = try func.appendBlockParam(@enumFromInt(0), module.ptr_t);
+        const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
         try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_2darray_fn", .value = .flag } });
         module.sampler_2darray_fn = p;
         break :blk p;
     } else if (is_3d) blk: {
         if (module.sampler_3d_fn) |s| break :blk s;
-        const p = try func.appendBlockParam(@enumFromInt(0), module.ptr_t);
+        const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
         try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_3d_fn", .value = .flag } });
         module.sampler_3d_fn = p;
         break :blk p;
     } else if (is_cube) blk: {
         if (module.sampler_cube_fn) |s| break :blk s;
-        const p = try func.appendBlockParam(@enumFromInt(0), module.ptr_t);
+        const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
         try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_cube_fn", .value = .flag } });
         module.sampler_cube_fn = p;
         break :blk p;
     } else if (module.sampler_fn) |s| s else blk: {
-        const p = try func.appendBlockParam(@enumFromInt(0), module.ptr_t);
+        const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
         try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_fn", .value = .flag } });
         module.sampler_fn = p;
         break :blk p;
@@ -2300,7 +2300,7 @@ fn lowerImageSampleShadow(func: *Function, module: *Module, block: Block, inst: 
         const layer: Value = if (cv.len >= 3) cv.comps[2] else try func.appendInst(block, f32_t, .{ .fconst = 0 });
         const lod: Value = try func.appendInst(block, f32_t, .{ .fconst = 0 });
         const array_shadow_fn = if (module.sampler_2darray_shadow_fn) |s| s else blk: {
-            const p = try func.appendBlockParam(@enumFromInt(0), module.ptr_t);
+            const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
             try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_2darray_shadow_fn", .value = .flag } });
             module.sampler_2darray_shadow_fn = p;
             break :blk p;
@@ -2320,7 +2320,7 @@ fn lowerImageSampleShadow(func: *Function, module: *Module, block: Block, inst: 
         // A cube sample uses an explicit 0.0 LOD (like the vec3 non-shadow cube path).
         const lod: Value = try func.appendInst(block, f32_t, .{ .fconst = 0 });
         const cube_shadow_fn = if (module.sampler_cube_shadow_fn) |s| s else blk: {
-            const p = try func.appendBlockParam(@enumFromInt(0), module.ptr_t);
+            const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
             try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_cube_shadow_fn", .value = .flag } });
             module.sampler_cube_shadow_fn = p;
             break :blk p;
@@ -2338,7 +2338,7 @@ fn lowerImageSampleShadow(func: *Function, module: *Module, block: Block, inst: 
     const lod: Value = try func.appendInst(block, f32_t, .{ .fconst = implicit_lod_sentinel });
 
     const shadow_fn = if (module.sampler_shadow_fn) |s| s else blk: {
-        const p = try func.appendBlockParam(@enumFromInt(0), module.ptr_t);
+        const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
         try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_shadow_fn", .value = .flag } });
         module.sampler_shadow_fn = p;
         break :blk p;
@@ -2386,7 +2386,7 @@ fn lowerImageFetch(func: *Function, module: *Module, block: Block, inst: binary.
         const key = if (arrayed) "sampler_fetch_array_fn" else "sampler_fetch_3d_fn";
         const existing = if (arrayed) module.sampler_fetch_array_fn else module.sampler_fetch_3d_fn;
         const fetch3_fn = if (existing) |s| s else blk: {
-            const p = try func.appendBlockParam(@enumFromInt(0), module.ptr_t);
+            const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
             try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = key, .value = .flag } });
             if (arrayed) {
                 module.sampler_fetch_array_fn = p;
@@ -2413,7 +2413,7 @@ fn lowerImageFetch(func: *Function, module: *Module, block: Block, inst: binary.
     }
 
     const fetch_fn = if (module.sampler_fetch_fn) |s| s else blk: {
-        const p = try func.appendBlockParam(@enumFromInt(0), module.ptr_t);
+        const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
         try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_fetch_fn", .value = .flag } });
         module.sampler_fetch_fn = p;
         break :blk p;
@@ -2455,7 +2455,7 @@ fn lowerImageGather(func: *Function, module: *Module, block: Block, inst: binary
     const comp: Value = try func.appendInst(block, f32_t, .{ .fconst = @floatFromInt(comp_int) });
 
     const gather_fn = if (module.sampler_gather_fn) |s| s else blk: {
-        const p = try func.appendBlockParam(@enumFromInt(0), module.ptr_t);
+        const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
         try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_gather_fn", .value = .flag } });
         module.sampler_gather_fn = p;
         break :blk p;
@@ -2981,7 +2981,7 @@ test "lowers a vertex shader: input attribute -> position passthrough" {
     defer func.deinit();
 
     // 4 entry params (the vec4 input, scalarized), the first tagged attr=0x80.
-    const params = func.blockParams(@enumFromInt(0));
+    const params = func.blockParams(@fromBackingInt(@intCast(0)));
     try testing.expectEqual(@as(usize, 4), params.len);
     try testing.expect(hasAttr(&func, params[0], "attr", 0x80));
     try testing.expect(hasAttr(&func, params[3], "attr", 0x8c)); // 0x80 + 3*4
@@ -2991,7 +2991,7 @@ test "lowers a vertex shader: input attribute -> position passthrough" {
     var n_out_attr: usize = 0;
     var i: u32 = 0;
     while (i < func.valueCount()) : (i += 1) {
-        if (hasAttr(&func, @enumFromInt(i), "out_attr", 0x70)) n_out_attr += 1;
+        if (hasAttr(&func, @fromBackingInt(@intCast(i)), "out_attr", 0x70)) n_out_attr += 1;
     }
     try testing.expectEqual(@as(usize, 1), n_out_attr); // exactly one at 0x70 (X)
 }
@@ -3028,7 +3028,7 @@ test "lowers a fragment shader: constant color -> color output" {
     var seen = [_]bool{ false, false, false, false };
     var i: u32 = 0;
     while (i < func.valueCount()) : (i += 1) {
-        inline for (0..4) |k| if (hasAttr(&func, @enumFromInt(i), "color_out", k)) {
+        inline for (0..4) |k| if (hasAttr(&func, @fromBackingInt(@intCast(i)), "color_out", k)) {
             seen[k] = true;
         };
     }
@@ -3080,7 +3080,7 @@ test "lowers a push-constant block read: PushConstant storage -> a pointer entry
     // any inputs - there are none here, so the sole entry param is the PC pointer). The
     // FS reads its four color components from that buffer pointer (4 loads) and stores
     // each to the color output (color_out 0..3).
-    const params = func.blockParams(@enumFromInt(0));
+    const params = func.blockParams(@fromBackingInt(@intCast(0)));
     try testing.expectEqual(@as(usize, 1), params.len); // just the PC pointer param
     var buf: [4096]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "{f}", .{func});
@@ -3088,7 +3088,7 @@ test "lowers a push-constant block read: PushConstant storage -> a pointer entry
     var seen = [_]bool{ false, false, false, false };
     var i: u32 = 0;
     while (i < func.valueCount()) : (i += 1) {
-        inline for (0..4) |k| if (hasAttr(&func, @enumFromInt(i), "color_out", k)) {
+        inline for (0..4) |k| if (hasAttr(&func, @fromBackingInt(@intCast(i)), "color_out", k)) {
             seen[k] = true;
         };
     }
@@ -3153,7 +3153,7 @@ test "lowers a UBO mat4 * vec4 (the classic MVP) natively into scalar FMA" {
     var n_pos: usize = 0;
     var i: u32 = 0;
     while (i < func.valueCount()) : (i += 1) {
-        if (hasAttr(&func, @enumFromInt(i), "out_attr", ATTR_POSITION)) n_pos += 1;
+        if (hasAttr(&func, @fromBackingInt(@intCast(i)), "out_attr", ATTR_POSITION)) n_pos += 1;
     }
     try testing.expectEqual(@as(usize, 1), n_pos); // exactly one store at ATTR_POSITION (X)
     // 16 element loads (4x4) for the matrix.
@@ -3207,7 +3207,7 @@ test "lowers per-component vertex input access (glslang scalar-at-a-time reads)"
 
     // 4 scalarized input params, the first tagged attr=0x80. The per-component loads
     // resolve to these params (no error.Unsupported from the access chains).
-    const params = func.blockParams(@enumFromInt(0));
+    const params = func.blockParams(@fromBackingInt(@intCast(0)));
     try testing.expectEqual(@as(usize, 4), params.len);
     try testing.expect(hasAttr(&func, params[0], "attr", 0x80));
     try testing.expect(hasAttr(&func, params[3], "attr", 0x8c));
@@ -3216,7 +3216,7 @@ test "lowers per-component vertex input access (glslang scalar-at-a-time reads)"
     var n_pos: usize = 0;
     var i: u32 = 0;
     while (i < func.valueCount()) : (i += 1) {
-        if (hasAttr(&func, @enumFromInt(i), "out_attr", ATTR_POSITION)) n_pos += 1;
+        if (hasAttr(&func, @fromBackingInt(@intCast(i)), "out_attr", ATTR_POSITION)) n_pos += 1;
     }
     try testing.expectEqual(@as(usize, 1), n_pos);
 }
@@ -3264,7 +3264,7 @@ test "lowers gl_PerVertex / gl_Position output (glslang interface block)" {
     var n_pos: usize = 0;
     var i: u32 = 0;
     while (i < func.valueCount()) : (i += 1) {
-        if (hasAttr(&func, @enumFromInt(i), "out_attr", ATTR_POSITION)) n_pos += 1;
+        if (hasAttr(&func, @fromBackingInt(@intCast(i)), "out_attr", ATTR_POSITION)) n_pos += 1;
     }
     try testing.expectEqual(@as(usize, 1), n_pos);
 }
@@ -3310,7 +3310,7 @@ test "lowers a texturing fragment shader: OpImageSampleImplicitLod -> a host sam
     try testing.expect(hasFuncStage(&func, "fragment"));
     // Entry params: uv (2 scalars, fpr) + the sampler descriptor pointer + the
     // appended sampler_fn pointer. The sampler_fn param carries the sampler_fn tag.
-    const params = func.blockParams(@enumFromInt(0));
+    const params = func.blockParams(@fromBackingInt(@intCast(0)));
     var saw_sampler_fn = false;
     for (params) |p| {
         var it = func.attributesOf(.{ .value = p });
@@ -3331,7 +3331,7 @@ test "lowers a texturing fragment shader: OpImageSampleImplicitLod -> a host sam
     var seen = [_]bool{ false, false, false, false };
     var i: u32 = 0;
     while (i < func.valueCount()) : (i += 1) {
-        inline for (0..4) |k| if (hasAttr(&func, @enumFromInt(i), "color_out", k)) {
+        inline for (0..4) |k| if (hasAttr(&func, @fromBackingInt(@intCast(i)), "color_out", k)) {
             seen[k] = true;
         };
     }
@@ -3371,7 +3371,7 @@ fn hasFuncStage(func: *const Function, stage: []const u8) bool {
 fn hasValueBuiltin(func: *const Function, which: gpu.Builtin) bool {
     var i: u32 = 0;
     while (i < func.valueCount()) : (i += 1) {
-        if (gpu.attrs.builtinOf(func, @enumFromInt(i)) == which) return true;
+        if (gpu.attrs.builtinOf(func, @fromBackingInt(@intCast(i))) == which) return true;
     }
     return false;
 }
@@ -3439,7 +3439,7 @@ test "lowers gl_VertexIndex pulling a vec4 from a UBO array (vkcube vertex-pulli
     var n_pos: usize = 0;
     var i: u32 = 0;
     while (i < func.valueCount()) : (i += 1) {
-        if (hasAttr(&func, @enumFromInt(i), "out_attr", ATTR_POSITION)) n_pos += 1;
+        if (hasAttr(&func, @fromBackingInt(@intCast(i)), "out_attr", ATTR_POSITION)) n_pos += 1;
     }
     try testing.expectEqual(@as(usize, 1), n_pos);
 }
@@ -3570,7 +3570,7 @@ fn hasGradSlot(func: *const Function, slot: u32, is_y: bool) bool {
 fn hasGradBuf(func: *const Function) bool {
     var i: u32 = 0;
     while (i < func.valueCount()) : (i += 1) {
-        var it = func.attributesOf(.{ .value = @as(Value, @enumFromInt(i)) });
+        var it = func.attributesOf(.{ .value = @as(Value, @fromBackingInt(@intCast(i))) });
         while (it.next()) |attr| switch (attr) {
             .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.gpu") and std.mem.eql(u8, c.key, "grad_buf")) return true,
             else => {},

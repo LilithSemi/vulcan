@@ -33,12 +33,12 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     // from every block. Seeding from the pool would re-discover such a dead alloca and re-promote
     // it forever, so the pass would never report "no change" and the fixpoint would not converge.
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             switch (func.opcode(inst)) {
                 .alloca => |al| {
                     const r = func.instResult(inst).?;
-                    if (promotable[@intFromEnum(r)]) {
-                        slot_of_value[@intFromEnum(r)] = @intCast(slot_elem.items.len);
+                    if (promotable[@backingInt(r)]) {
+                        slot_of_value[@backingInt(r)] = @intCast(slot_elem.items.len);
                         try slot_elem.append(allocator, al.elem);
                     }
                 },
@@ -108,7 +108,7 @@ const Builder = struct {
     /// values, and a later load or store THROUGH that pointer reads it here, so this bounds
     /// check is load-bearing, not defensive.
     fn slotOf(self: *const Builder, v: Value) ?u32 {
-        const i = @intFromEnum(v);
+        const i = @backingInt(v);
         if (i >= self.slot_of_value.len) return null;
         return self.slot_of_value[i];
     }
@@ -119,7 +119,7 @@ const Builder = struct {
         self.local_end = try self.allocator.alloc(Value, n);
         // Cells without a store are never read (gated on `writes`), but `repointCaches` scans the
         // whole array, so initialize to a valid Value to avoid reading uninitialized memory.
-        @memset(self.local_end, @enumFromInt(0));
+        @memset(self.local_end, @fromBackingInt(@intCast(0)));
         self.writes = try self.allocator.alloc(bool, n);
         @memset(self.writes, false);
         self.entry_memo = try self.allocator.alloc(?Value, n);
@@ -130,7 +130,7 @@ const Builder = struct {
         @memset(self.undef_zero, null);
 
         for (0..self.cfg.blockCount()) |bi| {
-            for (self.func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (self.func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 switch (self.func.opcode(inst)) {
                     .store => |st| if (self.slotOf(st.ptr)) |s| {
                         self.local_end[self.idx(s, bi)] = st.value;
@@ -170,9 +170,9 @@ const Builder = struct {
             self.entry_memo[self.idx(slot, block)] = z;
             return z;
         }
-        const phi = try self.func.appendBlockParam(@enumFromInt(block), self.slot_elem[slot]);
+        const phi = try self.func.appendBlockParam(@fromBackingInt(@intCast(block)), self.slot_elem[slot]);
         self.entry_memo[self.idx(slot, block)] = phi;
-        try self.addEdgeArgs(slot, @enumFromInt(block));
+        try self.addEdgeArgs(slot, @fromBackingInt(@intCast(block)));
         const resolved = try self.removeTrivialPhi(slot, block, phi);
         self.entry_memo[self.idx(slot, block)] = resolved;
         return resolved;
@@ -193,7 +193,7 @@ const Builder = struct {
     /// carry thousands of identity parameters into the backend (each one is otherwise an edge move
     /// across every loop iteration).
     fn removeTrivialPhi(self: *Builder, slot: usize, block: usize, phi: Value) pass.Error!Value {
-        const blk: Block = @enumFromInt(block);
+        const blk: Block = @fromBackingInt(@intCast(block));
         const params = self.func.blockParams(blk);
         const pidx = for (params, 0..) |p, i| {
             if (p == phi) break i;
@@ -228,10 +228,10 @@ const Builder = struct {
             }
         }.f;
         var prev_si: i64 = -1;
-        for (self.cfg.predecessors(@intFromEnum(blk))) |si| {
+        for (self.cfg.predecessors(@backingInt(blk))) |si| {
             if (@as(i64, si) == prev_si) continue;
             prev_si = si;
-            const source: Block = @enumFromInt(si);
+            const source: Block = @fromBackingInt(@intCast(si));
             for (self.func.blockInsts(source)) |inst| {
                 switch (self.func.opcode(inst)) {
                     .@"if" => |cf| {
@@ -264,7 +264,7 @@ const Builder = struct {
         while (changed) {
             changed = false;
             for (0..self.cfg.blockCount()) |bi| {
-                const blk: Block = @enumFromInt(bi);
+                const blk: Block = @fromBackingInt(@intCast(bi));
                 var pi: usize = 0;
                 while (pi < self.func.blockParams(blk).len) {
                     const param = self.func.blockParams(blk)[pi];
@@ -317,10 +317,10 @@ const Builder = struct {
         try self.func.setBlockParams(block, np.items);
 
         var prev_si: i64 = -1;
-        for (self.cfg.predecessors(@intFromEnum(block))) |si| {
+        for (self.cfg.predecessors(@backingInt(block))) |si| {
             if (@as(i64, si) == prev_si) continue;
             prev_si = si;
-            const source: Block = @enumFromInt(si);
+            const source: Block = @fromBackingInt(@intCast(si));
             for (self.func.blockInsts(source)) |inst| {
                 switch (self.func.opcode(inst)) {
                     .@"if" => |cf| {
@@ -361,10 +361,10 @@ const Builder = struct {
     /// gains exactly one argument per new parameter.
     fn addEdgeArgs(self: *Builder, slot: usize, block: Block) pass.Error!void {
         var prev_si: i64 = -1;
-        for (self.cfg.predecessors(@intFromEnum(block))) |si| {
+        for (self.cfg.predecessors(@backingInt(block))) |si| {
             if (@as(i64, si) == prev_si) continue;
             prev_si = si;
-            const source: Block = @enumFromInt(si);
+            const source: Block = @fromBackingInt(@intCast(si));
             for (self.func.blockInsts(source)) |inst| {
                 switch (self.func.opcode(inst)) {
                     .@"if" => |cf| {
@@ -411,7 +411,7 @@ const Builder = struct {
             .float => .{ .fconst = 0 },
             else => .{ .iconst = 0 },
         };
-        const v = try self.func.appendInst(@enumFromInt(0), ty, op);
+        const v = try self.func.appendInst(@fromBackingInt(@intCast(0)), ty, op);
         self.undef_zero[slot] = v;
         return v;
     }
@@ -425,7 +425,7 @@ const Builder = struct {
             @memset(current, null); // slot values reset at each block entry, computed lazily
             var kept: std.ArrayList(Inst) = .empty;
             defer kept.deinit(self.allocator);
-            for (self.func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (self.func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 switch (self.func.opcode(inst)) {
                     .alloca => {
                         const r = self.func.instResult(inst).?;
@@ -452,7 +452,7 @@ const Builder = struct {
                     else => try kept.append(self.allocator, inst),
                 }
             }
-            try self.func.setBlockInsts(@enumFromInt(bi), kept.items);
+            try self.func.setBlockInsts(@fromBackingInt(@intCast(bi)), kept.items);
         }
     }
 };
@@ -470,12 +470,12 @@ fn findPromotable(allocator: std.mem.Allocator, func: *const Function) pass.Erro
     // promoted alloca left over from an earlier fixpoint iteration still sits in the pool but is
     // gone from every block, and re-seeding it would make the pass re-promote a dead slot forever.
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             switch (func.opcode(inst)) {
                 .alloca => |al| {
                     const result = func.instResult(inst).?;
                     if (isScalar(func, al.elem) and isPromotableSpace(func, result)) {
-                        promotable[@intFromEnum(result)] = true;
+                        promotable[@backingInt(result)] = true;
                     }
                 },
                 else => {},
@@ -493,11 +493,11 @@ fn findPromotable(allocator: std.mem.Allocator, func: *const Function) pass.Erro
 fn markEscapes(func: *const Function, promotable: []bool) void {
     const esc = struct {
         fn hit(p: []bool, v: Value) void {
-            if (@intFromEnum(v) < p.len) p[@intFromEnum(v)] = false;
+            if (@backingInt(v) < p.len) p[@backingInt(v)] = false;
         }
     }.hit;
     for (0..func.instCount()) |i| {
-        const inst: Inst = @enumFromInt(i);
+        const inst: Inst = @fromBackingInt(@intCast(i));
         switch (func.opcode(inst)) {
             // ld.ptr is the sanctioned use - UNLESS the load is `volatile` (SM9 Plan 2 Task 4):
             // a volatile access must observably hit memory, so its alloca cannot be promoted
@@ -590,7 +590,7 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
         }
     }
     for (0..func.blockCount()) |bi| {
-        if (func.terminator(@enumFromInt(bi))) |term| switch (term) {
+        if (func.terminator(@fromBackingInt(@intCast(bi)))) |term| switch (term) {
             .ret => |r| for (r.slice()) |vv| esc(promotable, vv),
             .jump => |j| for (func.blockArgs(j)) |arg| esc(promotable, arg),
         };
@@ -891,23 +891,23 @@ fn assertNoDanglingEdgeArgs(allocator: std.mem.Allocator, func: *const Function)
     defer allocator.free(live);
     @memset(live, false);
     for (0..func.blockCount()) |bi| {
-        const blk: Block = @enumFromInt(bi);
-        for (func.blockParams(blk)) |p| live[@intFromEnum(p)] = true;
+        const blk: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockParams(blk)) |p| live[@backingInt(p)] = true;
         for (func.blockInsts(blk)) |inst| {
-            if (func.instResult(inst)) |r| live[@intFromEnum(r)] = true;
+            if (func.instResult(inst)) |r| live[@backingInt(r)] = true;
         }
     }
     for (0..func.blockCount()) |bi| {
-        const blk: Block = @enumFromInt(bi);
+        const blk: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(blk)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
-                for (func.blockArgs(cf.then)) |a| if (!live[@intFromEnum(a)]) return error.DanglingEdgeArg;
-                for (func.blockArgs(cf.@"else")) |a| if (!live[@intFromEnum(a)]) return error.DanglingEdgeArg;
+                for (func.blockArgs(cf.then)) |a| if (!live[@backingInt(a)]) return error.DanglingEdgeArg;
+                for (func.blockArgs(cf.@"else")) |a| if (!live[@backingInt(a)]) return error.DanglingEdgeArg;
             }
         }
         if (func.terminator(blk)) |term| switch (term) {
-            .jump => |j| for (func.blockArgs(j)) |a| if (!live[@intFromEnum(a)]) return error.DanglingEdgeArg,
+            .jump => |j| for (func.blockArgs(j)) |a| if (!live[@backingInt(a)]) return error.DanglingEdgeArg,
             .ret => {},
         };
     }

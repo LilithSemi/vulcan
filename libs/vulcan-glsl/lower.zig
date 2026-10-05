@@ -948,7 +948,7 @@ fn lowerStmt(l: *L, ret_ty: Type, stmt: parser.Stmt) Error!bool {
     if (stmt.line != 0) {
         var i = before;
         while (i < l.func.instCount()) : (i += 1) {
-            const inst: ir.function.Inst = @enumFromInt(@as(u32, @intCast(i)));
+            const inst: ir.function.Inst = @fromBackingInt(@intCast(@as(u32, @intCast(i))));
             if (!hasLineAttr(l.func, inst)) {
                 try l.func.addAttr(.{ .inst = inst }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = stmt.line } } });
             }
@@ -1151,8 +1151,8 @@ fn lowerFor(l: *L, ret_ty: Type, init: []const parser.Stmt, cond_e: ?*parser.Exp
     try l.func.appendIf(header, cond.scalar.value, .{ .target = body_b, .args = &.{} }, .{ .target = exit_b, .args = exit_edge });
     // Record the merge (exit) and the dedicated continue block for OpLoopMerge and
     // structured block ordering.
-    try l.func.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(exit_b) } } });
-    try l.func.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "continue", .value = .{ .int = @intFromEnum(continue_b) } } });
+    try l.func.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @backingInt(exit_b) } } });
+    try l.func.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "continue", .value = .{ .int = @backingInt(continue_b) } } });
 
     try l.loops.append(l.allocator, .{ .exit = exit_b, .cont = continue_b, .len = len });
 
@@ -1357,7 +1357,7 @@ fn lowerIf(l: *L, ret_ty: Type, cond_e: *parser.Expr, then_body: []const parser.
     try l.func.appendIf(head, cond.scalar.value, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
     // Record the structured merge so the SPIR-V emitter can emit OpSelectionMerge and
     // order blocks correctly even when branches contain nested control flow.
-    try l.func.addAttr(.{ .block = head }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(cont) } } });
+    try l.func.addAttr(.{ .block = head }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @backingInt(cont) } } });
 
     // then branch (a nested if/loop leaves l.block at the branch's actual end block)
     l.block = then_b;
@@ -3341,7 +3341,7 @@ test "lowering tags instructions with their source line for debug info" {
     var saw_line2 = false;
     var saw_line3 = false;
     for (0..func.instCount()) |i| {
-        var it = func.attributesOf(.{ .inst = @enumFromInt(@as(u32, @intCast(i))) });
+        var it = func.attributesOf(.{ .inst = @fromBackingInt(@intCast(@as(u32, @intCast(i)))) });
         while (it.next()) |attr| switch (attr) {
             .custom => |c| if (std.mem.eql(u8, c.namespace, "debug") and std.mem.eql(u8, c.key, "line")) {
                 if (c.value == .int and c.value.int == 2) saw_line2 = true;

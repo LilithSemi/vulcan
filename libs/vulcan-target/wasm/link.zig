@@ -110,7 +110,7 @@ fn computeSignature(func: *const Function) Error!Signature {
     var params = std.ArrayList(encode.ValType).empty;
     errdefer params.deinit(func.allocator);
 
-    const entry_block: Block = @enumFromInt(0);
+    const entry_block: Block = @fromBackingInt(@intCast(0));
     for (func.blockParams(entry_block)) |param| {
         const ty = func.valueType(param);
         if (encode.irTypeToWasm(types, ty)) |vt| {
@@ -127,7 +127,7 @@ fn computeSignature(func: *const Function) Error!Signature {
     // Find a return terminator in any block.
     var ret_value: ?Value = null;
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         if (func.terminator(block)) |t| {
             switch (t) {
                 .ret => |r| {
@@ -188,7 +188,7 @@ pub fn compileModule(allocator: std.mem.Allocator, module: *const Module) Error!
 
     for (module.entries.items) |entry| {
         for (0..entry.func.blockCount()) |bi| {
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             for (entry.func.blockInsts(block)) |inst| {
                 switch (entry.func.opcode(inst)) {
                     .call_indirect => |ci| {
@@ -210,7 +210,7 @@ pub fn compileModule(allocator: std.mem.Allocator, module: *const Module) Error!
     var needs_stack = false;
     for (module.entries.items) |entry| {
         for (0..entry.func.blockCount()) |bi| {
-            for (entry.func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (entry.func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 if (entry.func.opcode(inst) == .alloca) needs_stack = true;
             }
         }

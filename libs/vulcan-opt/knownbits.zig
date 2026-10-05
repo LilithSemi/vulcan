@@ -66,10 +66,10 @@ fn analyze(allocator: std.mem.Allocator, func: *const Function) pass.Error![]Bit
     defer allocator.free(rpo);
 
     for (rpo) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const result = func.instResult(inst) orelse continue;
             const w = intWidth(func, result) orelse continue;
-            bits[@intFromEnum(result)] = transfer(func, bits, inst, w, isUnsigned(func, result));
+            bits[@backingInt(result)] = transfer(func, bits, inst, w, isUnsigned(func, result));
         }
     }
     return bits;
@@ -82,9 +82,9 @@ fn transfer(func: *const Function, bits: []const Bits, inst: Inst, w: u16, unsig
     const mask = widthMask(w);
     const r: Bits = switch (func.opcode(inst)) {
         .iconst => |c| .{ .ones = @as(u64, @bitCast(c)) & mask, .zeros = ~@as(u64, @bitCast(c)) & mask },
-        .arith => |a| binary(a.op, bits[@intFromEnum(a.lhs)], bits[@intFromEnum(a.rhs)], null, unsigned, mask, w),
-        .arith_imm => |a| binary(a.op, bits[@intFromEnum(a.lhs)], constBits(a.imm), a.imm, unsigned, mask, w),
-        .select => |s| meet(bits[@intFromEnum(s.then)], bits[@intFromEnum(s.@"else")]),
+        .arith => |a| binary(a.op, bits[@backingInt(a.lhs)], bits[@backingInt(a.rhs)], null, unsigned, mask, w),
+        .arith_imm => |a| binary(a.op, bits[@backingInt(a.lhs)], constBits(a.imm), a.imm, unsigned, mask, w),
+        .select => |s| meet(bits[@backingInt(s.then)], bits[@backingInt(s.@"else")]),
         .convert => |cv| convertKnown(func, bits, cv.value, w),
         else => .{},
     };
@@ -204,7 +204,7 @@ fn extendBits(src: Bits, src_w: u16, dst_w: u16, signed: bool) Bits {
 /// exactly the source's known low bits). A non-int source (an int<->float convert) is fully unknown.
 fn convertKnown(func: *const Function, bits: []const Bits, src: Value, dst_w: u16) Bits {
     const src_w = intWidth(func, src) orelse return .{}; // float source: unknown
-    const src_bits = bits[@intFromEnum(src)];
+    const src_bits = bits[@backingInt(src)];
     if (dst_w > src_w) return extendBits(src_bits, src_w, dst_w, !isUnsigned(func, src)); // sext if signed
     const dmask = widthMask(dst_w);
     return .{ .zeros = src_bits.zeros & dmask, .ones = src_bits.ones & dmask }; // narrow/same: low bits
@@ -366,7 +366,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     // `replaceAllUses` and report a spurious change every iteration, so the pipeline fixpoint would
     // never converge.
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const result = func.instResult(inst) orelse continue;
             // Redundant mask: `x & c` is `x` when every bit that `c` clears is already known 0 in x.
             switch (func.opcode(inst)) {
@@ -380,8 +380,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 // Rewriting the icmp in place (its result stays a bool) keeps every use valid and hands
                 // branchfold a constant condition.
                 .icmp => |cmp| if (cmp.op == .eq or cmp.op == .ne) {
-                    const ba = bits[@intFromEnum(cmp.lhs)];
-                    const bb = bits[@intFromEnum(cmp.rhs)];
+                    const ba = bits[@backingInt(cmp.lhs)];
+                    const bb = bits[@backingInt(cmp.rhs)];
                     const conflict = (ba.ones & bb.zeros) | (ba.zeros & bb.ones);
                     if (conflict != 0) {
                         func.opcodeMut(inst).* = .{ .iconst = if (cmp.op == .ne) 1 else 0 };
@@ -425,7 +425,7 @@ fn redundantExtend(func: *const Function, bits: []const Bits, inst: Inst) ?Value
     if (isUnsigned(func, s) != isUnsigned(func, result)) return null; // same type as the result
 
     const high = widthMask(dst_w) & ~widthMask(mid_w); // the bits above the narrow width
-    const sz = bits[@intFromEnum(s)].zeros;
+    const sz = bits[@backingInt(s)].zeros;
     if (isUnsigned(func, mid)) {
         if (sz & high == high) return s; // zero-extend recovers s iff those bits are known 0
     } else {
@@ -440,7 +440,7 @@ fn redundantMask(func: *const Function, bits: []const Bits, x: Value, c: i64) bo
     const w = intWidth(func, x) orelse return false;
     const mask = widthMask(w);
     const cleared = ~@as(u64, @bitCast(c)) & mask; // bits the AND would clear
-    return cleared & ~bits[@intFromEnum(x)].zeros == 0; // all already known 0 in x
+    return cleared & ~bits[@backingInt(x)].zeros == 0; // all already known 0 in x
 }
 
 const testing = std.testing;
@@ -1073,7 +1073,7 @@ test "knownbits: a zext result has known-0 high bits (analyze)" {
     defer allocator.free(bits);
     // Zero-extension zero-fills the high bits regardless of the source's own known bits.
     const high_24: u64 = widthMask(32) & ~widthMask(8);
-    try testing.expectEqual(high_24, bits[@intFromEnum(z)].zeros & high_24);
+    try testing.expectEqual(high_24, bits[@backingInt(z)].zeros & high_24);
 }
 
 fn realMulhU(va: u64, vb: u64, w: u16) u64 {

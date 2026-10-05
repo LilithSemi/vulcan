@@ -85,7 +85,7 @@ fn runLanesGated(allocator: std.mem.Allocator, func: *Function, lanes: u8, allow
     var coalesced = false;
     var bi: usize = 0;
     while (bi < func.blockCount()) : (bi += 1) {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         while (try vectorizeOne(allocator, func, block, &vmap, lanes, allow_i32, model, &coalesced_loads, &coalesced)) changed = true;
         // Store coalescing is a per-block scan run after this block's arith groups are fused, so the
         // stored values are the fused groups' result lanes (or hand-built extracts). It rewrites each
@@ -624,7 +624,7 @@ const ArithConsumer = struct { inst: Inst, pos: usize, c_is_lhs: bool };
 fn valueUseCount(func: *const Function, v: Value) usize {
     var n: usize = 0;
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .atomic_rmw => |x| {
@@ -957,11 +957,11 @@ fn cleanup(allocator: std.mem.Allocator, func: *Function, coalesced_loads: *cons
         countUses(func, uses);
         var removed = false;
         for (0..func.blockCount()) |bi| {
-            const insts = func.blockInstsMut(@enumFromInt(bi));
+            const insts = func.blockInstsMut(@fromBackingInt(@intCast(bi)));
             var w: usize = 0;
             for (insts.items) |inst| {
                 const result = func.instResult(inst);
-                const unused = if (result) |r| uses[@intFromEnum(r)] == 0 else false;
+                const unused = if (result) |r| uses[@backingInt(r)] == 0 else false;
                 const is_coalesced_load = func.opcode(inst) == .load and result != null and
                     coalesced_loads.contains(result.?);
                 const dead = unused and (isPure(func.opcode(inst)) or is_coalesced_load);
@@ -1001,83 +1001,83 @@ fn isPure(op: ir.function.Opcode) bool {
 fn countUses(func: *const Function, uses: []u32) void {
     @memset(uses, 0);
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .atomic_rmw => |x| {
-                    uses[@intFromEnum(x.ptr)] += 1;
-                    uses[@intFromEnum(x.value)] += 1;
-                    if (x.compare) |c| uses[@intFromEnum(c)] += 1;
+                    uses[@backingInt(x.ptr)] += 1;
+                    uses[@backingInt(x.value)] += 1;
+                    if (x.compare) |c| uses[@backingInt(c)] += 1;
                 },
                 // A barrier uses no Value, so it adds no use count.
                 .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |x| {
-                    uses[@intFromEnum(x.lhs)] += 1;
-                    uses[@intFromEnum(x.rhs)] += 1;
+                    uses[@backingInt(x.lhs)] += 1;
+                    uses[@backingInt(x.rhs)] += 1;
                 },
-                .arith_imm => |x| uses[@intFromEnum(x.lhs)] += 1,
+                .arith_imm => |x| uses[@backingInt(x.lhs)] += 1,
                 .icmp => |x| {
-                    uses[@intFromEnum(x.lhs)] += 1;
-                    uses[@intFromEnum(x.rhs)] += 1;
+                    uses[@backingInt(x.lhs)] += 1;
+                    uses[@backingInt(x.rhs)] += 1;
                 },
                 .select => |x| {
-                    uses[@intFromEnum(x.cond)] += 1;
-                    uses[@intFromEnum(x.then)] += 1;
-                    uses[@intFromEnum(x.@"else")] += 1;
+                    uses[@backingInt(x.cond)] += 1;
+                    uses[@backingInt(x.then)] += 1;
+                    uses[@backingInt(x.@"else")] += 1;
                 },
-                .extract => |x| uses[@intFromEnum(x.aggregate)] += 1,
-                .convert => |x| uses[@intFromEnum(x.value)] += 1,
-                .decode_low_float, .encode_low_float => |x| uses[@intFromEnum(x.value)] += 1,
+                .extract => |x| uses[@backingInt(x.aggregate)] += 1,
+                .convert => |x| uses[@backingInt(x.value)] += 1,
+                .decode_low_float, .encode_low_float => |x| uses[@backingInt(x.value)] += 1,
                 .dequantize_nvfp4, .quantize_nvfp4 => |x| {
-                    uses[@intFromEnum(x.value)] += 1;
-                    uses[@intFromEnum(x.block_scale)] += 1;
-                    uses[@intFromEnum(x.global_scale)] += 1;
+                    uses[@backingInt(x.value)] += 1;
+                    uses[@backingInt(x.block_scale)] += 1;
+                    uses[@backingInt(x.global_scale)] += 1;
                 },
-                .unary => |x| uses[@intFromEnum(x.value)] += 1,
-                .load => |x| uses[@intFromEnum(x.ptr)] += 1,
+                .unary => |x| uses[@backingInt(x.value)] += 1,
+                .load => |x| uses[@backingInt(x.ptr)] += 1,
                 .store => |x| {
-                    uses[@intFromEnum(x.value)] += 1;
-                    uses[@intFromEnum(x.ptr)] += 1;
+                    uses[@backingInt(x.value)] += 1;
+                    uses[@backingInt(x.ptr)] += 1;
                 },
-                .prefetch => |x| uses[@intFromEnum(x.ptr)] += 1,
-                .va_start => |x| uses[@intFromEnum(x.list)] += 1,
-                .va_arg => |x| uses[@intFromEnum(x.list)] += 1,
-                .va_end => |x| uses[@intFromEnum(x.list)] += 1,
+                .prefetch => |x| uses[@backingInt(x.ptr)] += 1,
+                .va_start => |x| uses[@backingInt(x.list)] += 1,
+                .va_arg => |x| uses[@backingInt(x.list)] += 1,
+                .va_end => |x| uses[@backingInt(x.list)] += 1,
                 .dot => |x| {
-                    uses[@intFromEnum(x.acc)] += 1;
-                    uses[@intFromEnum(x.a)] += 1;
-                    uses[@intFromEnum(x.b)] += 1;
+                    uses[@backingInt(x.acc)] += 1;
+                    uses[@backingInt(x.a)] += 1;
+                    uses[@backingInt(x.b)] += 1;
                 },
-                .reduce => |x| uses[@intFromEnum(x.vector)] += 1,
-                .splat => |x| uses[@intFromEnum(x.scalar)] += 1,
+                .reduce => |x| uses[@backingInt(x.vector)] += 1,
+                .splat => |x| uses[@backingInt(x.scalar)] += 1,
                 .matmul => |x| {
-                    uses[@intFromEnum(x.a)] += 1;
-                    uses[@intFromEnum(x.b)] += 1;
-                    uses[@intFromEnum(x.c)] += 1;
+                    uses[@backingInt(x.a)] += 1;
+                    uses[@backingInt(x.b)] += 1;
+                    uses[@backingInt(x.c)] += 1;
                 },
                 .struct_new => |x| for (func.valueList(x.fields)) |f| {
-                    uses[@intFromEnum(f)] += 1;
+                    uses[@backingInt(f)] += 1;
                 },
                 .call => |x| for (func.valueList(x.args)) |arg| {
-                    uses[@intFromEnum(arg)] += 1;
+                    uses[@backingInt(arg)] += 1;
                 },
                 .call_indirect => |x| {
-                    uses[@intFromEnum(x.target)] += 1;
-                    for (func.valueList(x.args)) |arg| uses[@intFromEnum(arg)] += 1;
+                    uses[@backingInt(x.target)] += 1;
+                    for (func.valueList(x.args)) |arg| uses[@backingInt(arg)] += 1;
                 },
                 .@"if" => |x| {
-                    uses[@intFromEnum(x.cond)] += 1;
-                    for (func.blockArgs(x.then)) |arg| uses[@intFromEnum(arg)] += 1;
-                    for (func.blockArgs(x.@"else")) |arg| uses[@intFromEnum(arg)] += 1;
+                    uses[@backingInt(x.cond)] += 1;
+                    for (func.blockArgs(x.then)) |arg| uses[@backingInt(arg)] += 1;
+                    for (func.blockArgs(x.@"else")) |arg| uses[@backingInt(arg)] += 1;
                 },
             }
         }
         if (func.terminator(block)) |term| switch (term) {
             .ret => |r| for (r.slice()) |vv| {
-                uses[@intFromEnum(vv)] += 1;
+                uses[@backingInt(vv)] += 1;
             },
             .jump => |j| for (func.blockArgs(j)) |arg| {
-                uses[@intFromEnum(arg)] += 1;
+                uses[@backingInt(arg)] += 1;
             },
         };
     }
@@ -1107,7 +1107,7 @@ fn parallelAdds(n: usize) !Function {
 
 /// True if some arith instruction in block 0 produces a vector of exactly `want` lanes.
 fn hasVectorArith(func: *const Function, want: u32) bool {
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) != .arith) continue;
         const r = func.instResult(inst) orelse continue;
         switch (func.types.type_kind(func.valueType(r))) {
@@ -1122,7 +1122,7 @@ fn hasVectorArith(func: *const Function, want: u32) bool {
 /// `want` lanes. Distinguishes the pi integer path from the f32 path, which `hasVectorArith`
 /// cannot on its own.
 fn hasIntVectorArith(func: *const Function, want: u32) bool {
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) != .arith) continue;
         const r = func.instResult(inst) orelse continue;
         switch (func.types.type_kind(func.valueType(r))) {
@@ -1269,7 +1269,7 @@ test "runModel leaves a scalar model alone" {
 /// Count block-0 instructions whose opcode tag equals `tag`.
 fn countOpcode(func: *const Function, tag: std.meta.Tag(ir.function.Opcode)) usize {
     var n: usize = 0;
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) == tag) n += 1;
     }
     return n;
@@ -1277,7 +1277,7 @@ fn countOpcode(func: *const Function, tag: std.meta.Tag(ir.function.Opcode)) usi
 
 /// True if block 0 has a `load` whose result is a vector (a coalesced wide load).
 fn hasVectorLoad(func: *const Function) bool {
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) != .load) continue;
         const r = func.instResult(inst).?;
         if (func.types.type_kind(func.valueType(r)) == .vector) return true;
@@ -1287,7 +1287,7 @@ fn hasVectorLoad(func: *const Function) bool {
 
 /// True if block 0 has a `store` whose stored value is a vector (a coalesced wide store).
 fn hasVectorStore(func: *const Function) bool {
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) != .store) continue;
         if (func.types.type_kind(func.valueType(func.opcode(inst).store.value)) == .vector) return true;
     }
@@ -1296,7 +1296,7 @@ fn hasVectorStore(func: *const Function) bool {
 
 /// True if block 0 has a `store` whose stored value is a scalar (i.e. not coalesced away).
 fn hasScalarStore(func: *const Function) bool {
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) != .store) continue;
         if (func.types.type_kind(func.valueType(func.opcode(inst).store.value)) != .vector) return true;
     }
@@ -1522,7 +1522,7 @@ fn buildMemElementwiseVol(n: usize, vol_loads: bool, vol_stores: bool) !Function
 /// Count the block-0 loads carrying `want` in their `volatile` flag.
 fn countVolatileLoads(func: *const Function, want: bool) usize {
     var n: usize = 0;
-    for (func.blockInsts(@enumFromInt(0))) |inst| switch (func.opcode(inst)) {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| switch (func.opcode(inst)) {
         .load => |l| if (l.@"volatile" == want) {
             n += 1;
         },
@@ -1534,7 +1534,7 @@ fn countVolatileLoads(func: *const Function, want: bool) usize {
 /// Count the block-0 stores carrying `want` in their `volatile` flag.
 fn countVolatileStores(func: *const Function, want: bool) usize {
     var n: usize = 0;
-    for (func.blockInsts(@enumFromInt(0))) |inst| switch (func.opcode(inst)) {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| switch (func.opcode(inst)) {
         .store => |s| if (s.@"volatile" == want) {
             n += 1;
         },
@@ -1562,7 +1562,7 @@ test "volatile: four volatile loads never fuse into one wide load" {
     // The plain `b` side still coalesces to one wide load, so exactly one non-volatile load remains.
     try std.testing.expectEqual(@as(usize, 1), countVolatileLoads(&func, false));
     // The wide load that did form reads `b`, never the volatile `a` addresses.
-    for (func.blockInsts(@enumFromInt(0))) |inst| switch (func.opcode(inst)) {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| switch (func.opcode(inst)) {
         .load => |l| if (func.types.type_kind(func.valueType(func.instResult(inst).?)) == .vector) {
             try std.testing.expect(!l.@"volatile");
         },
@@ -1639,7 +1639,7 @@ fn buildMemElementwiseEndian(n: usize, tag_loads: bool, tag_stores: bool) !Funct
 /// Count the block-0 instructions of kind `want` whose byte-order tag state is `tagged`.
 fn countTagged(func: *const Function, want: std.meta.Tag(ir.function.Opcode), tagged: bool) usize {
     var n: usize = 0;
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) != want) continue;
         if (func.isByteOrderTagged(inst) == tagged) n += 1;
     }
@@ -1668,7 +1668,7 @@ test "endian: four byte-order-tagged loads never fuse into one wide load" {
     // The plain `b` side still coalesces to one wide load, so exactly one untagged load remains.
     try std.testing.expectEqual(@as(usize, 1), countTagged(&func, .load, false));
     // The wide load that did form reads `b`, never the tagged `a` addresses.
-    for (func.blockInsts(@enumFromInt(0))) |inst| switch (func.opcode(inst)) {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| switch (func.opcode(inst)) {
         .load => if (func.types.type_kind(func.valueType(func.instResult(inst).?)) == .vector) {
             try std.testing.expect(!func.isByteOrderTagged(inst));
         },

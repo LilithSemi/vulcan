@@ -69,7 +69,7 @@ test "aarch64 selects global_addr into adrp+add with two relocs" {
     // The words really are a zero-immediate adrp/add pair, not just relocations
     // claiming so. Re-derive the expected words from the encoders with the extracted
     // rd/rn.
-    const adrp_reg: encode.Reg = @enumFromInt(adrp_rd);
+    const adrp_reg: encode.Reg = @fromBackingInt(@intCast(adrp_rd));
     try std.testing.expectEqual(encode.adrp(adrp_reg, 0), adrp_word);
-    try std.testing.expectEqual(encode.addImm64(adrp_reg, @enumFromInt(add_rn), 0), add_word);
+    try std.testing.expectEqual(encode.addImm64(adrp_reg, @fromBackingInt(@intCast(add_rn)), 0), add_word);
 }

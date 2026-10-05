@@ -110,7 +110,7 @@ pub fn lower(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator.Er
     defer order.deinit(allocator);
 
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         const old = try allocator.dupe(Inst, func.blockInsts(block));
         defer allocator.free(old);
         order.clearRetainingCapacity();
@@ -246,7 +246,7 @@ const testing = std.testing;
 fn onlyCallSym(func: *Function, banned: std.meta.Tag(Opcode)) ![]const u8 {
     var found: ?[]const u8 = null;
     var calls: usize = 0;
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         const op = func.opcode(inst);
         try testing.expect(op != banned);
         if (op == .call) {
@@ -271,7 +271,7 @@ test "f128 add lowers to a single __addtf3 call, no arith left" {
     try testing.expect(try lower(testing.allocator, &f));
     try testing.expectEqualStrings("__addtf3", try onlyCallSym(&f, .arith));
     // The call result, an f128, is what the return now yields.
-    const call = f.blockInsts(@enumFromInt(0))[0];
+    const call = f.blockInsts(@fromBackingInt(@intCast(0)))[0];
     try testing.expect(isF128(&f, f.instResult(call).?));
 }
 
@@ -313,7 +313,7 @@ test "f128 compare lowers to __lttf2 plus a signed status compare against zero" 
     // The final result is now an integer icmp of the i32 status against a zero constant.
     var saw_zero = false;
     var saw_status_cmp = false;
-    for (f.blockInsts(@enumFromInt(0))) |inst| switch (f.opcode(inst)) {
+    for (f.blockInsts(@fromBackingInt(@intCast(0)))) |inst| switch (f.opcode(inst)) {
         .iconst => |v| if (v == 0) {
             saw_zero = true;
         },

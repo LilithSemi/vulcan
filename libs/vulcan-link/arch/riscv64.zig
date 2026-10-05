@@ -72,7 +72,7 @@ const Reg = enum(u5) {
 };
 
 fn num(reg: Reg) u32 {
-    return @intFromEnum(reg);
+    return @backingInt(reg);
 }
 
 fn iType(opcode: u7, funct3: u3, rd_: Reg, rs1_: Reg, imm: i12) u32 {
@@ -145,7 +145,7 @@ fn patchJal(code: []u8, s: usize, delta: i64) Error!void {
     if (s > code.len or 4 > code.len - s) return error.MalformedObject;
     if (delta < -(1 << 20) or delta >= (1 << 20) or (delta & 1) != 0) return error.RelocationOutOfRange;
     const word = std.mem.readInt(u32, code[s..][0..4], .little);
-    const rd_: Reg = @enumFromInt(@as(u5, @truncate(word >> 7)));
+    const rd_: Reg = @fromBackingInt(@intCast(@as(u5, @truncate(word >> 7))));
     const patched = jal(rd_, @intCast(delta));
     std.mem.writeInt(u32, code[s..][0..4], patched, .little);
 }

@@ -79,10 +79,10 @@ test "x86_64 native low float decode is exhaustive and caller IR stays unchanged
             const expected: u32 = @bitCast(try ir.low_float.decode(format, payload));
             try std.testing.expectEqual(expected, code.call(payload));
         }
-        distinguished_decode[@intFromEnum(format)] = .{ code.call(0x7c), code.call(0x7e) };
+        distinguished_decode[@backingInt(format)] = .{ code.call(0x7c), code.call(0x7e) };
     }
-    try std.testing.expect(distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e4m3)][0] != distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e5m2)][0]);
-    try std.testing.expect(distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e4m3)][1] != distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e5m2)][1]);
+    try std.testing.expect(distinguished_decode[@backingInt(ir.low_float.Format.f8_e4m3)][0] != distinguished_decode[@backingInt(ir.low_float.Format.f8_e5m2)][0]);
+    try std.testing.expect(distinguished_decode[@backingInt(ir.low_float.Format.f8_e4m3)][1] != distinguished_decode[@backingInt(ir.low_float.Format.f8_e5m2)][1]);
 }
 
 test "x86_64 native low float encode matches structured and boundary corpora" {
@@ -195,9 +195,9 @@ test "x86_64 native low float memory path supports payload and f32 buffers" {
         var buffer = try jit.CodeBuffer.map(code);
         defer buffer.deinit();
         const run = buffer.entry(*const fn (*const u8, *u32, *const u32, *u8) callconv(.c) void, 0);
-        var input_storage = [_]u8{0xaa} ++ [_]u8{0} ** (element_count * 2);
-        var decoded_bits = [_]u32{0} ** element_count;
-        var output_storage = [_]u8{0} ** (element_count * 2);
+        var input_storage = [_]u8{0xaa} ++ @as([element_count * 2]u8, @splat(0));
+        var decoded_bits: [element_count]u32 = @splat(0);
+        var output_storage: [(element_count * 2)]u8 = @splat(0);
         for (payload_values, 0..) |payload_value, index| {
             input_storage[1 + index * payload_bytes] = @truncate(payload_value);
             if (format == .bf16) input_storage[2 + index * payload_bytes] = @truncate(payload_value >> 8);
@@ -226,7 +226,7 @@ test "x86_64 native low float expansion survives integer spill pressure" {
         const salt = try func.appendInst(block, u32_t, .{ .iconst = @as(i64, @intCast(index * 0x10203)) });
         const bits = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = input, .rhs = salt } });
         const source = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = bits } });
-        const format: ir.low_float.Format = @enumFromInt(index % 3);
+        const format: ir.low_float.Format = @fromBackingInt(@intCast(index % 3));
         const payload_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = format.payloadBits() } });
         const encoded = try func.appendInst(block, payload_t, .{ .encode_low_float = .{ .format = format, .value = source } });
         slot.* = try func.appendInst(block, u32_t, .{ .convert = .{ .value = encoded } });
@@ -243,7 +243,7 @@ test "x86_64 native low float expansion survives integer spill pressure" {
     for (inputs) |input_bits| {
         var expected: u32 = 0;
         for (0..values.len) |index| {
-            const format: ir.low_float.Format = @enumFromInt(index % 3);
+            const format: ir.low_float.Format = @fromBackingInt(@intCast(index % 3));
             const bits = input_bits ^ @as(u32, @intCast(index * 0x10203));
             expected ^= ir.low_float.encode(format, @bitCast(bits));
         }
@@ -330,8 +330,8 @@ test "x86_64 native NVFP4 packed memory crosses a scale block and preserves its 
         0x4060_0000, 0x40a0_0000, 0x7f7f_ffff, 0xff7f_ffff, 0x7f80_0000,
         0xff80_0000, 0x7f80_0001, 0xff80_0001, 0x7fc0_1234,
     };
-    var decoded_bits = [_]u32{0} ** element_count;
-    var output = [_]u8{0xa5} ** packed_count;
+    var decoded_bits: [element_count]u32 = @splat(0);
+    var output: [packed_count]u8 = @splat(0xa5);
     var expected_output = output;
     run(&packed_values[0], &scale_values[0], global_scale_bits, &decoded_bits[0], &source_bits[0], &output[0]);
     const global_scale: f32 = @bitCast(global_scale_bits);

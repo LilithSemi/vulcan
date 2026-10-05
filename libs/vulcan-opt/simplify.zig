@@ -113,18 +113,18 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     defer allocator.free(consts);
     @memset(consts, null);
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .iconst) {
-                if (func.instResult(inst)) |r| consts[@intFromEnum(r)] = func.opcode(inst).iconst;
+                if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
             }
         }
     }
 
     var changed = false;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const result = func.instResult(inst) orelse continue;
-            if (consts[@intFromEnum(result)] != null) continue; // already a constant
+            if (consts[@backingInt(result)] != null) continue; // already a constant
 
             // `select` folds for any type since it just picks an existing value. A constant condition
             // resolves to one arm, and identical arms collapse to that value.
@@ -132,7 +132,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 const sel = func.opcode(inst).select;
                 const repl: ?Value = if (sel.then == sel.@"else")
                     sel.then // select(c, x, x) -> x
-                else if (consts[@intFromEnum(sel.cond)]) |cv|
+                else if (consts[@backingInt(sel.cond)]) |cv|
                     (if (cv != 0) sel.then else sel.@"else") // select(const, a, b) -> a / b
                 else
                     null;
@@ -145,8 +145,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 
             if (!isInt(func, result)) continue; // the identities below are integer-only
             const s: Simplified = switch (func.opcode(inst)) {
-                .arith => |a| simplify(a.op, a.lhs, a.rhs, consts[@intFromEnum(a.lhs)], consts[@intFromEnum(a.rhs)], a.lhs == a.rhs),
-                .arith_imm => |a| simplify(a.op, a.lhs, null, consts[@intFromEnum(a.lhs)], a.imm, false),
+                .arith => |a| simplify(a.op, a.lhs, a.rhs, consts[@backingInt(a.lhs)], consts[@backingInt(a.rhs)], a.lhs == a.rhs),
+                .arith_imm => |a| simplify(a.op, a.lhs, null, consts[@backingInt(a.lhs)], a.imm, false),
                 // A comparison of a value with itself is constant (icmp is integer, so no NaN caveat).
                 .icmp => |c| if (c.lhs == c.rhs) Simplified{ .constant = switch (c.op) {
                     .eq, .le, .ge => @as(i64, 1),
@@ -156,7 +156,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 // non-zero exactly when `b` is true. This kills the round trip the frontend emits for
                 // `if (cond)` (`cond` is already a boolean icmp), so the consumer branch fuses with the
                 // original compare instead of materializing the boolean and testing it against zero.
-                else if (c.op == .ne) boolRoundTrip(func, c.lhs, consts[@intFromEnum(c.lhs)], c.rhs, consts[@intFromEnum(c.rhs)]) else .none,
+                else if (c.op == .ne) boolRoundTrip(func, c.lhs, consts[@backingInt(c.lhs)], c.rhs, consts[@backingInt(c.rhs)]) else .none,
                 else => .none,
             };
             switch (s) {
@@ -167,7 +167,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 },
                 .constant => |c| {
                     func.opcodeMut(inst).* = .{ .iconst = c };
-                    consts[@intFromEnum(result)] = c;
+                    consts[@backingInt(result)] = c;
                     changed = true;
                 },
             }

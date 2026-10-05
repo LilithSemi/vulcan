@@ -81,7 +81,7 @@ pub const Uniformity = struct {
 
     /// Whether two threads of one workgroup can hold different values in `value`.
     pub fn isDivergent(self: *const Uniformity, value: Value) bool {
-        return self.divergent[@intFromEnum(value)];
+        return self.divergent[@backingInt(value)];
     }
 
     /// Whether the workgroup can be split while block `block` runs.
@@ -93,7 +93,7 @@ pub const Uniformity = struct {
 /// The `if` of block `bi` when it branches two ways, or null. A one-way `if` (both edges to the
 /// same block) never splits anything, so it is not a branch for this analysis.
 pub fn twoWayIf(func: *const Function, bi: usize) ?ir.function.If {
-    const block: Block = @enumFromInt(bi);
+    const block: Block = @fromBackingInt(@intCast(bi));
     for (func.blockInsts(block)) |inst| {
         switch (func.opcode(inst)) {
             .@"if" => |cf| {
@@ -117,7 +117,7 @@ pub fn twoWayIf(func: *const Function, bi: usize) ?ir.function.If {
 fn operandsDiverge(func: *const Function, divergent: []const bool, op: ir.function.Opcode) bool {
     const d = struct {
         fn f(set: []const bool, v: Value) bool {
-            return set[@intFromEnum(v)];
+            return set[@backingInt(v)];
         }
     }.f;
     return switch (op) {
@@ -178,7 +178,7 @@ pub fn analyze(allocator: std.mem.Allocator, func: *const Function) Error!Unifor
 
     // Seed: a parameter tagged with a per-thread builtin. Every other value starts uniform.
     for (0..nv) |vi| {
-        const v: Value = @enumFromInt(vi);
+        const v: Value = @fromBackingInt(@intCast(vi));
         const b = gpu.attrs.builtinOf(func, v) orelse continue;
         if (!b.isWorkgroupUniform()) divergent[vi] = true;
     }
@@ -198,7 +198,7 @@ pub fn analyze(allocator: std.mem.Allocator, func: *const Function) Error!Unifor
         // Control: taint the region of every branch whose condition is now divergent.
         for (0..n) |ai| {
             const cf = twoWayIf(func, ai) orelse continue;
-            if (!divergent[@intFromEnum(cf.cond)]) continue;
+            if (!divergent[@backingInt(cf.cond)]) continue;
             // The join is where the two sides meet again. Null means they never do, and then
             // the region runs to the end of the function.
             const join = pdoms.immediatePostDominator(ai);
@@ -213,26 +213,26 @@ pub fn analyze(allocator: std.mem.Allocator, func: *const Function) Error!Unifor
 
         // Data: the transfer over each block's parameters and instructions.
         for (0..n) |bi| {
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             if (split[bi] or join_split[bi]) {
                 for (func.blockParams(block)) |p| {
-                    if (divergent[@intFromEnum(p)]) continue;
-                    divergent[@intFromEnum(p)] = true;
+                    if (divergent[@backingInt(p)]) continue;
+                    divergent[@backingInt(p)] = true;
                     changed = true;
                 }
             }
             for (func.blockInsts(block)) |inst| {
                 const res = func.instResult(inst) orelse continue;
-                if (divergent[@intFromEnum(res)]) continue;
+                if (divergent[@backingInt(res)]) continue;
                 if (!split[bi] and !operandsDiverge(func, divergent, func.opcode(inst))) continue;
-                divergent[@intFromEnum(res)] = true;
+                divergent[@backingInt(res)] = true;
                 changed = true;
             }
         }
 
         // Data across edges: a divergent argument makes the block parameter it feeds divergent.
         for (0..n) |bi| {
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             for (func.blockInsts(block)) |inst| {
                 switch (func.opcode(inst)) {
                     .@"if" => |cf| {
@@ -261,9 +261,9 @@ fn propagateEdge(func: *const Function, divergent: []bool, jump: ir.function.Jum
     const params = func.blockParams(jump.target);
     const count = @min(args.len, params.len);
     for (args[0..count], params[0..count]) |a, p| {
-        if (!divergent[@intFromEnum(a)]) continue;
-        if (divergent[@intFromEnum(p)]) continue;
-        divergent[@intFromEnum(p)] = true;
+        if (!divergent[@backingInt(a)]) continue;
+        if (divergent[@backingInt(p)]) continue;
+        divergent[@backingInt(p)] = true;
         changed.* = true;
     }
 }
@@ -426,14 +426,14 @@ test "a value becomes divergent through CONTROL alone, with every operand unifor
     var uni = try analyze(allocator, &func);
     defer uni.deinit(allocator);
     try testing.expect(uni.isDivergent(c));
-    try testing.expect(uni.blockIsSplit(@intFromEnum(then_b)));
-    try testing.expect(uni.blockIsSplit(@intFromEnum(else_b)));
-    try testing.expect(!uni.blockIsSplit(@intFromEnum(merge))); // the threads are back together
+    try testing.expect(uni.blockIsSplit(@backingInt(then_b)));
+    try testing.expect(uni.blockIsSplit(@backingInt(else_b)));
+    try testing.expect(!uni.blockIsSplit(@backingInt(merge))); // the threads are back together
     try testing.expect(uni.isDivergent(one)); // defined under a divergent branch
     try testing.expect(uni.isDivergent(r)); // and so is the merge parameter
     // The negative control: the entry block runs with the workgroup whole, and the constant it
     // defines stays uniform. Reporting everything divergent fails here.
-    try testing.expect(!uni.blockIsSplit(@intFromEnum(entry)));
+    try testing.expect(!uni.blockIsSplit(@backingInt(entry)));
     try testing.expect(uni.isUniform(four));
 }
 
@@ -525,7 +525,7 @@ test "a uniform branch taints nothing" {
     var uni = try analyze(allocator, &func);
     defer uni.deinit(allocator);
     try testing.expect(uni.isUniform(c));
-    try testing.expect(!uni.blockIsSplit(@intFromEnum(then_b)));
+    try testing.expect(!uni.blockIsSplit(@backingInt(then_b)));
     try testing.expect(uni.isUniform(r));
 }
 
@@ -557,7 +557,7 @@ test "a loop counter against a kernel parameter stays uniform" {
     defer uni.deinit(allocator);
     try testing.expect(uni.isUniform(i));
     try testing.expect(uni.isUniform(c));
-    try testing.expect(!uni.blockIsSplit(@intFromEnum(body)));
+    try testing.expect(!uni.blockIsSplit(@backingInt(body)));
 }
 
 test "a loop counter against thread_id_x is divergent, and so is the loop body" {
@@ -585,7 +585,7 @@ test "a loop counter against thread_id_x is divergent, and so is the loop body" 
     var uni = try analyze(allocator, &func);
     defer uni.deinit(allocator);
     try testing.expect(uni.isDivergent(c));
-    try testing.expect(uni.blockIsSplit(@intFromEnum(body)));
+    try testing.expect(uni.blockIsSplit(@backingInt(body)));
     try testing.expect(uni.isDivergent(i)); // the header parameter, through the region
     try testing.expect(uni.isDivergent(next));
 }
@@ -620,12 +620,12 @@ test "a nested uniform branch inside a divergent arm is still split" {
 
     var uni = try analyze(allocator, &func);
     defer uni.deinit(allocator);
-    try testing.expect(uni.blockIsSplit(@intFromEnum(outer)));
-    try testing.expect(uni.blockIsSplit(@intFromEnum(inner)));
-    try testing.expect(uni.blockIsSplit(@intFromEnum(inner_join)));
+    try testing.expect(uni.blockIsSplit(@backingInt(outer)));
+    try testing.expect(uni.blockIsSplit(@backingInt(inner)));
+    try testing.expect(uni.blockIsSplit(@backingInt(inner_join)));
     try testing.expect(uni.isDivergent(one));
     // The negative control: the entry runs whole and `a` is a kernel parameter.
-    try testing.expect(!uni.blockIsSplit(@intFromEnum(entry)));
+    try testing.expect(!uni.blockIsSplit(@backingInt(entry)));
     try testing.expect(uni.isUniform(a));
 }
 
@@ -653,8 +653,8 @@ test "a branch whose arms never meet again taints everything it reaches" {
 
     var uni = try analyze(allocator, &func);
     defer uni.deinit(allocator);
-    try testing.expect(uni.blockIsSplit(@intFromEnum(left)));
-    try testing.expect(uni.blockIsSplit(@intFromEnum(right)));
+    try testing.expect(uni.blockIsSplit(@backingInt(left)));
+    try testing.expect(uni.blockIsSplit(@backingInt(right)));
     try testing.expect(uni.isDivergent(l));
     try testing.expect(uni.isDivergent(r));
 }
@@ -680,8 +680,8 @@ test "a one-way if splits nothing" {
 
     var uni = try analyze(allocator, &func);
     defer uni.deinit(allocator);
-    try testing.expectEqual(@as(?ir.function.If, null), twoWayIf(&func, @intFromEnum(entry)));
-    try testing.expect(!uni.blockIsSplit(@intFromEnum(after)));
+    try testing.expectEqual(@as(?ir.function.If, null), twoWayIf(&func, @backingInt(entry)));
+    try testing.expect(!uni.blockIsSplit(@backingInt(after)));
     try testing.expect(uni.isUniform(one));
 }
 

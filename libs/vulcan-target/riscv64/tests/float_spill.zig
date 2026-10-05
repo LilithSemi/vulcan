@@ -87,7 +87,7 @@ fn checkSpillSum(io: std.Io, comptime T: type) !void {
     };
     const got: T = if (dbl) @bitCast(got_bits) else @bitCast(@as(u32, @truncate(got_bits)));
     const want = reference(T, a_val);
-    try std.testing.expectEqual(@as(std.meta.Int(.unsigned, @bitSizeOf(T)), @bitCast(want)), @as(std.meta.Int(.unsigned, @bitSizeOf(T)), @bitCast(got)));
+    try std.testing.expectEqual(@as(@Int(.unsigned, @bitSizeOf(T)), @bitCast(want)), @as(@Int(.unsigned, @bitSizeOf(T)), @bitCast(got)));
 }
 
 test "float-spill: f32 sum of 30 simultaneously-live values spills and computes correctly (qemu-riscv64)" {

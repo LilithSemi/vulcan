@@ -54,7 +54,7 @@ fn loadImm(allocator: std.mem.Allocator, w: *std.ArrayList(u32), reg: encode.Reg
 fn runWords(allocator: std.mem.Allocator, code: []const u32, args: []const i64, features: riscv64.Features) !u8 {
     var program: std.ArrayList(u32) = .empty;
     defer program.deinit(allocator);
-    for (args, 0..) |arg, i| try loadImm(allocator, &program, @enumFromInt(@as(u5, @intCast(10 + i))), arg);
+    for (args, 0..) |arg, i| try loadImm(allocator, &program, @fromBackingInt(@intCast(@as(u5, @intCast(10 + i)))), arg);
     const call_idx = program.items.len;
     try program.append(allocator, encode.jal(.x1, 0)); // call entry; displacement patched below
     try program.append(allocator, encode.addi(.x17, .x0, 93)); // return lands here: li a7, 93 (exit)

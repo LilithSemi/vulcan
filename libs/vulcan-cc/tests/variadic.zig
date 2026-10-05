@@ -132,7 +132,7 @@ test "a variadic call default-arg-promotes its variadic args and sets num_fixed"
     const func = module.find("f").?;
     var found = false;
     for (0..func.blockCount()) |bi| {
-        const block: ir.function.Block = @enumFromInt(bi);
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             const op = func.opcode(inst);
             if (op != .call) continue;
@@ -168,7 +168,7 @@ test "a call to a same-TU variadic DEFINITION sets is_variadic and num_fixed" {
     const func = module.find("f").?;
     var found = false;
     for (0..func.blockCount()) |bi| {
-        const block: ir.function.Block = @enumFromInt(bi);
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             const op = func.opcode(inst);
             if (op != .call) continue;
@@ -202,7 +202,7 @@ test "an indirect call through a variadic function pointer sets is_variadic and 
     const func = module.find("f").?;
     var found = false;
     for (0..func.blockCount()) |bi| {
-        const block: ir.function.Block = @enumFromInt(bi);
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             const op = func.opcode(inst);
             if (op != .call_indirect) continue;
@@ -244,7 +244,7 @@ test "a variadic DEFINITION lowers is_variadic/num_fixed_params and its stdarg o
     var saw_arg = false;
     var saw_end = false;
     for (0..func.blockCount()) |bi| {
-        const block: ir.function.Block = @enumFromInt(bi);
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .va_start => saw_start = true,

@@ -106,7 +106,7 @@ const Reader = struct {
         for (0..n) |i| bytes[i] = r.byte();
         // wasm immediates are little-endian on the wire; assemble in that order so
         // f32/f64 constants decode correctly on a big-endian host too.
-        const Bits = std.meta.Int(.unsigned, n * 8);
+        const Bits = @Int(.unsigned, n * 8);
         return @bitCast(std.mem.readInt(Bits, &bytes, .little));
     }
 };

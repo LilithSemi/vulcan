@@ -556,7 +556,7 @@ fn intLitType(l: layout_mod.TargetLayout, value: u64, has_u: bool, long_count: u
     const suffix_rank: ctype.Rank = if (long_count >= 2) .longlong else if (long_count == 1) .long else .int;
     const ranks = [_]ctype.Rank{ .int, .long, .longlong };
     for (ranks) |r| {
-        if (@intFromEnum(r) < @intFromEnum(suffix_rank)) continue;
+        if (@backingInt(r) < @backingInt(suffix_rank)) continue;
         const it: ctype.IntType = .{ .rank = r, .signed = !has_u };
         const bits = it.bits(l);
         // `int`/`long long` are fixed at 32/64. Only `long` varies (32 on ILP32, 64 on

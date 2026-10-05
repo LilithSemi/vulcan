@@ -30,12 +30,12 @@ pub fn Pool(comptime T: type) type {
         pub fn append(self: *Self, item: T) std.mem.Allocator.Error!Ref {
             const index: u32 = @intCast(self.items.items.len);
             try self.items.append(self.allocator, item);
-            return @enumFromInt(index);
+            return @fromBackingInt(@intCast(index));
         }
 
         /// Borrow a mutable pointer to a stored item.
         pub fn get(self: *Self, ref: Ref) *T {
-            return &self.items.items[@intFromEnum(ref)];
+            return &self.items.items[@backingInt(ref)];
         }
     };
 }

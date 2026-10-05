@@ -263,10 +263,10 @@ fn computeDefBlocks(allocator: std.mem.Allocator, func: *const Function) Error![
     const def_block = try allocator.alloc(u32, func.valueCount());
     errdefer allocator.free(def_block);
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
-        for (func.blockParams(block)) |p| def_block[@intFromEnum(p)] = @intCast(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockParams(block)) |p| def_block[@backingInt(p)] = @intCast(bi);
         for (func.blockInsts(block)) |inst| {
-            if (func.instResult(inst)) |r| def_block[@intFromEnum(r)] = @intCast(bi);
+            if (func.instResult(inst)) |r| def_block[@backingInt(r)] = @intCast(bi);
         }
     }
     return def_block;
@@ -364,11 +364,11 @@ fn recognizeNest(allocator: std.mem.Allocator, func: *const Function, info: *con
     const interior = try allocator.alloc(bool, func.blockCount());
     defer allocator.free(interior);
     @memset(interior, false);
-    for (known) |b| interior[@intFromEnum(b)] = true;
-    interior[@intFromEnum(outer.exit)] = false; // outer.exit is the continuation, not interior
+    for (known) |b| interior[@backingInt(b)] = true;
+    interior[@backingInt(outer.exit)] = false; // outer.exit is the continuation, not interior
 
     for (0..func.blockCount()) |bi| {
-        const b: Block = @enumFromInt(bi);
+        const b: Block = @fromBackingInt(@intCast(bi));
         const src_interior = interior[bi];
         const src_is_outer_header = b == outer.header;
         if (src_interior) {
@@ -542,7 +542,7 @@ fn recognizeNest(allocator: std.mem.Allocator, func: *const Function, info: *con
 /// the interior membership bitset. The two sanctioned boundary edges are: any NON-interior block ->
 /// preheader (the single entry), and outer.header -> outer.exit (the single exit).
 fn regionEdgeOk(dst: Block, src_interior: bool, src_is_outer_header: bool, interior: []const bool, preheader: Block, outer_exit: Block) bool {
-    const dst_interior = interior[@intFromEnum(dst)];
+    const dst_interior = interior[@backingInt(dst)];
     if (src_interior) {
         // (b) SINGLE EXIT: an interior block may reach interior blocks freely; the only sanctioned way
         // out of the region is outer.header's edge to outer.exit (the loop-done continuation).
@@ -577,7 +577,7 @@ fn isTrivialVoidExit(func: *const Function, exit: Block, exit_args: []const Valu
 fn functionHasWideFloatValue(func: *const Function) bool {
     var i: usize = 0;
     while (i < func.valueCount()) : (i += 1) {
-        const v: Value = @enumFromInt(@as(u32, @intCast(i)));
+        const v: Value = @fromBackingInt(@intCast(@as(u32, @intCast(i))));
         switch (func.types.type_kind(func.valueType(v))) {
             .float => |f| if (f == .f64) return true,
             .vector => return true,
@@ -592,7 +592,7 @@ fn functionHasWideFloatValue(func: *const Function) bool {
 fn matchLoop(func: *const Function, loop: *const loops.Loop, def_block: []const u32) ?LoopMatch {
     // Need a single preheader to read the induction variable's initial value.
     if (loop.preheader == null) return null;
-    const header: Block = @enumFromInt(loop.header);
+    const header: Block = @fromBackingInt(@intCast(loop.header));
     const body_bits = loop.body;
 
     // Pure test header: exactly [icmp, if], the `if` testing the icmp, comparing `iv < bound`, and no
@@ -628,8 +628,8 @@ fn matchLoop(func: *const Function, loop: *const loops.Loop, def_block: []const 
     const bound = constBound(func, def_block, body_bits, cmp.rhs) orelse return null;
 
     // Exactly one of the `if` successors is in-loop (the immediate body); the other exits the loop.
-    const then_in = inLoop(body_bits, @intFromEnum(iff.then.target));
-    const else_in = inLoop(body_bits, @intFromEnum(iff.@"else".target));
+    const then_in = inLoop(body_bits, @backingInt(iff.then.target));
+    const else_in = inLoop(body_bits, @backingInt(iff.@"else".target));
     const in_edge = if (then_in and !else_in) iff.then else if (else_in and !then_in) iff.@"else" else return null;
     const exit_edge = if (then_in) iff.@"else" else iff.then;
     const body_blk = in_edge.target;
@@ -647,7 +647,7 @@ fn matchLoop(func: *const Function, loop: *const loops.Loop, def_block: []const 
     var latch: ?Block = null;
     for (0..func.blockCount()) |bi| {
         if (!inLoop(body_bits, @intCast(bi))) continue;
-        const b: Block = @enumFromInt(bi);
+        const b: Block = @fromBackingInt(@intCast(bi));
         switch (func.terminator(b) orelse continue) {
             .jump => |j| if (j.target == header) {
                 // More than one back-edge is not the single-latch shape the lowering assumes.
@@ -666,10 +666,10 @@ fn matchLoop(func: *const Function, loop: *const loops.Loop, def_block: []const 
         .ret => return null,
     };
     if (back_args.len != hparams.len) return null;
-    if (!stepsByOne(func, def_block, @intFromEnum(latch_blk), back_args[iv_i], bparams[iv_i])) return null;
+    if (!stepsByOne(func, def_block, @backingInt(latch_blk), back_args[iv_i], bparams[iv_i])) return null;
 
     // The induction variable starts at 0 (the loop is 0-based over the tile dimension).
-    const preheader: Block = @enumFromInt(loop.preheader.?);
+    const preheader: Block = @fromBackingInt(@intCast(loop.preheader.?));
     const p_args = switch (func.terminator(preheader) orelse return null) {
         .jump => |j| blk: {
             if (j.target != header) return null;
@@ -742,7 +742,7 @@ const BodyMatch = struct {
 fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMatch) ?BodyMatch {
     const hparams = func.blockParams(inner.header);
     const bparams = func.blockParams(inner.body);
-    const b_idx: u32 = @intFromEnum(inner.body);
+    const b_idx: u32 = @backingInt(inner.body);
 
     // The k-loop's back-edge args (its latch's jump back to the header), one per header param. matchLoop
     // already proved the latch jumps to the header, so a `ret` here cannot happen; the switch stays total.
@@ -762,7 +762,7 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
     for (0..hparams.len) |k| {
         const upd = back_args[k];
         // An update not computed in this body (e.g. threaded straight through) cannot be the reduction.
-        if (def_block[@intFromEnum(upd)] != b_idx) continue;
+        if (def_block[@backingInt(upd)] != b_idx) continue;
         const di = func.definingInst(upd) orelse continue;
         const op = func.opcode(di);
         if (op != .arith) continue;
@@ -829,7 +829,7 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
     // the two 8-bit loads. The `arith .mul` opcode is shared; the operand type (guaranteed by the
     // accumulator type, since verify pins the mul result to the add operand type) makes it a floating or
     // integer multiply.
-    if (def_block[@intFromEnum(prod)] != b_idx) return null; // the product must be computed in this body
+    if (def_block[@backingInt(prod)] != b_idx) return null; // the product must be computed in this body
     const prod_inst = func.definingInst(prod) orelse return null;
     const mulop = switch (func.opcode(prod_inst)) {
         .arith => |a| a,
@@ -864,7 +864,7 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
         // either shape's checks. A non-convert LHS (including one not even computed in this body) falls
         // through to the fp32 arm, whose own checks fail closed if it turns out not to be a load either.
         const lhs_is_convert = blk: {
-            if (def_block[@intFromEnum(mulop.lhs)] != b_idx) break :blk false;
+            if (def_block[@backingInt(mulop.lhs)] != b_idx) break :blk false;
             const di = func.definingInst(mulop.lhs) orelse break :blk false;
             break :blk func.opcode(di) == .convert;
         };
@@ -875,7 +875,7 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
             const lb_val = convertSourceF32(func, def_block, b_idx, mulop.rhs) orelse return null; // B operand not convert(f32, _)
             const ca_inst = func.definingInst(mulop.lhs).?; // the convert, existence proven by convertSourceF32
             const cb_inst = func.definingInst(mulop.rhs).?;
-            if (def_block[@intFromEnum(la_val)] != b_idx or def_block[@intFromEnum(lb_val)] != b_idx) return null;
+            if (def_block[@backingInt(la_val)] != b_idx or def_block[@backingInt(lb_val)] != b_idx) return null;
             la_inst = func.definingInst(la_val) orelse return null;
             lb_inst = func.definingInst(lb_val) orelse return null;
             la_ptr = switch (func.opcode(la_inst)) {
@@ -898,7 +898,7 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
             extra_len = 2;
         } else {
             // fp32: both mul operands are DIRECT f32 loads (no converts).
-            if (def_block[@intFromEnum(mulop.lhs)] != b_idx or def_block[@intFromEnum(mulop.rhs)] != b_idx) return null;
+            if (def_block[@backingInt(mulop.lhs)] != b_idx or def_block[@backingInt(mulop.rhs)] != b_idx) return null;
             la_inst = func.definingInst(mulop.lhs) orelse return null;
             lb_inst = func.definingInst(mulop.rhs) orelse return null;
             la_ptr = switch (func.opcode(la_inst)) {
@@ -925,7 +925,7 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
         const lb_val = convertSource(func, def_block, b_idx, mulop.rhs) orelse return null; // B operand not convert(i32, _)
         const ca_inst = func.definingInst(mulop.lhs).?; // the convert, existence proven by convertSource
         const cb_inst = func.definingInst(mulop.rhs).?;
-        if (def_block[@intFromEnum(la_val)] != b_idx or def_block[@intFromEnum(lb_val)] != b_idx) return null;
+        if (def_block[@backingInt(la_val)] != b_idx or def_block[@backingInt(lb_val)] != b_idx) return null;
         la_inst = func.definingInst(la_val) orelse return null;
         lb_inst = func.definingInst(lb_val) orelse return null;
         la_ptr = switch (func.opcode(la_inst)) {
@@ -1159,9 +1159,9 @@ fn matchStrides(
     const k_init = jumpArgsOf(func, inner.preheader) orelse return null; // j_body -> k_header resets
     const j_init = jumpArgsOf(func, middle.preheader) orelse return null; // i_body -> j_header resets
     const i_init = jumpArgsOf(func, outer.preheader) orelse return null; // preheader -> i_header init
-    const k_idx: u32 = @intFromEnum(inner.body);
-    const j_latch_idx: u32 = @intFromEnum(middle.latch);
-    const i_latch_idx: u32 = @intFromEnum(outer.latch);
+    const k_idx: u32 = @backingInt(inner.body);
+    const j_latch_idx: u32 = @backingInt(middle.latch);
+    const i_latch_idx: u32 = @backingInt(outer.latch);
 
     const pa_k = body.pa_k_param;
     const pb_k = body.pb_k_param;
@@ -1200,7 +1200,7 @@ fn matchStrides(
     const a_outer = stepImm(func, def_block, i_latch_idx, i_back[pa_i], i_bparams[pa_i]) orelse return null; // A row not a clean per-i add
     if (a_outer != k_i * input_elem_i) return null; // A row length is not k elements
     const a = i_init[pa_i];
-    if (inLoop(outer_bits, def_block[@intFromEnum(a)])) return null; // A base defined inside the nest: not a real base
+    if (inLoop(outer_bits, def_block[@backingInt(a)])) return null; // A base defined inside the nest: not a real base
 
     // 4. B OUTER STRIDE: trace pb_k's k-loop reset to the j-level column pointer, prove it advances one
     //    element per j (B contiguous in j), and that it resets each i to an i-invariant base (the B base).
@@ -1210,7 +1210,7 @@ fn matchStrides(
     const b_jstep = stepImm(func, def_block, j_latch_idx, j_back[pb_j], j_bparams[pb_j]) orelse return null; // B column not a clean per-j add
     if (b_jstep != input_elem_i) return null; // B is not contiguous in j
     const b = j_init[pb_j];
-    if (inLoop(outer_bits, def_block[@intFromEnum(b)])) return null; // B base recomputed inside the i-loop: not i-invariant
+    if (inLoop(outer_bits, def_block[@backingInt(b)])) return null; // B base recomputed inside the i-loop: not i-invariant
 
     // 5. C: the store pointer is a j-level pointer that advances one 32-bit element per j and CONTINUES
     //    across i with no reset (contiguous C, so the i-stride is n*OE implied by n j-steps per row). C is
@@ -1243,7 +1243,7 @@ fn matchStrides(
     if (cont_q >= jexit_args.len) return null; // malformed exit edge: fewer args than the i-latch has params
     if (jexit_args[cont_q] != j_hparams[pc_j]) return null; // i-latch carries out something other than the j-loop's C
     const c = i_init[pc_i];
-    if (inLoop(outer_bits, def_block[@intFromEnum(c)])) return null; // C base defined inside the nest: not a real base
+    if (inLoop(outer_bits, def_block[@backingInt(c)])) return null; // C base defined inside the nest: not a real base
 
     return StrideMatch{ .a = a, .b = b, .c = c };
 }
@@ -1297,7 +1297,7 @@ fn strictSubset(a: []const bool, b: []const bool) bool {
 /// If `v` is a loop-invariant `iconst` in 1..=65535, return its value as the tile bound; else null.
 fn constBound(func: *const Function, def_block: []const u32, body: []const bool, v: Value) ?u16 {
     // The bound must not be defined inside the loop, or it is not a fixed tile dimension.
-    if (inLoop(body, def_block[@intFromEnum(v)])) return null;
+    if (inLoop(body, def_block[@backingInt(v)])) return null;
     // A block-param bound (no defining instruction) is a runtime value, not a compile-time tile size.
     const di = func.definingInst(v) orelse return null;
     const val = switch (func.opcode(di)) {
@@ -1312,7 +1312,7 @@ fn constBound(func: *const Function, def_block: []const u32, body: []const bool,
 
 /// Whether `upd` is `arith_imm add(base, 1)` defined in block index `blk_idx` (the unit induction step).
 fn stepsByOne(func: *const Function, def_block: []const u32, blk_idx: u32, upd: Value, base: Value) bool {
-    if (def_block[@intFromEnum(upd)] != blk_idx) return false;
+    if (def_block[@backingInt(upd)] != blk_idx) return false;
     const di = func.definingInst(upd) orelse return false;
     return switch (func.opcode(di)) {
         .arith_imm => |a| a.op == .add and a.lhs == base and a.imm == 1,
@@ -1331,7 +1331,7 @@ fn isI32(func: *const Function, v: Value) bool {
 /// int8 body multiplies `convert(i32, load_i8)` operands, so recognition steps through the convert to
 /// reach the underlying 8-bit load (the 2D analogue of dotprod.zig's `convertSource`).
 fn convertSource(func: *const Function, def_block: []const u32, b_idx: u32, v: Value) ?Value {
-    if (def_block[@intFromEnum(v)] != b_idx) return null;
+    if (def_block[@backingInt(v)] != b_idx) return null;
     const di = func.definingInst(v) orelse return null;
     return switch (func.opcode(di)) {
         .convert => |c| if (isI32(func, v)) c.value else null,
@@ -1344,7 +1344,7 @@ fn convertSource(func: *const Function, def_block: []const u32, b_idx: u32, v: V
 /// fp16 body multiplies `convert(f32, load_f16)` operands, so recognition steps through the convert to
 /// reach the underlying 16-bit float load (the floating analogue of `convertSource`).
 fn convertSourceF32(func: *const Function, def_block: []const u32, b_idx: u32, v: Value) ?Value {
-    if (def_block[@intFromEnum(v)] != b_idx) return null;
+    if (def_block[@backingInt(v)] != b_idx) return null;
     const di = func.definingInst(v) orelse return null;
     return switch (func.opcode(di)) {
         .convert => |c| if (isF32(func, v)) c.value else null,
@@ -1423,7 +1423,7 @@ fn paramIndex(params: []const Value, v: Value) ?usize {
 /// If `upd` is `arith_imm add(base, imm)` (any immediate; the caller checks the exact stride, Task 3's
 /// job for the two element pointers) defined in block index `blk_idx`, return its instruction; else null.
 fn stepInst(func: *const Function, def_block: []const u32, blk_idx: u32, upd: Value, base: Value) ?Inst {
-    if (def_block[@intFromEnum(upd)] != blk_idx) return null;
+    if (def_block[@backingInt(upd)] != blk_idx) return null;
     const di = func.definingInst(upd) orelse return null;
     return switch (func.opcode(di)) {
         .arith_imm => |a| if (a.op == .add and a.lhs == base) di else null,
@@ -1434,7 +1434,7 @@ fn stepInst(func: *const Function, def_block: []const u32, blk_idx: u32, upd: Va
 /// If `stepped` is `arith_imm add(base, imm)` defined in block index `blk_idx`, return `imm` (the byte
 /// stride); else null. Task 3 reads each pointer's per-loop byte stride off its latch back-edge value.
 fn stepImm(func: *const Function, def_block: []const u32, blk_idx: u32, stepped: Value, base: Value) ?i64 {
-    if (def_block[@intFromEnum(stepped)] != blk_idx) return null;
+    if (def_block[@backingInt(stepped)] != blk_idx) return null;
     const di = func.definingInst(stepped) orelse return null;
     return switch (func.opcode(di)) {
         .arith_imm => |a| if (a.op == .add and a.lhs == base) a.imm else null,
@@ -1450,7 +1450,7 @@ const dominators = @import("../dominators.zig");
 fn countMatmuls(func: *const Function) usize {
     var count: usize = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .matmul) count += 1;
         }
     }
@@ -1892,7 +1892,7 @@ test "the canonical matmul nest is well-formed and recognized with the right bou
 
     // Task 3: the recovered base pointers are exactly the function's A/B/C params (entry params 0/1/2 in
     // builder order), and the element size is the fp32 4 bytes proven from the A inner stride.
-    const entry_params = func.blockParams(@as(Block, @enumFromInt(0)));
+    const entry_params = func.blockParams(@as(Block, @fromBackingInt(@intCast(0))));
     try std.testing.expectEqual(entry_params[0], plan.a);
     try std.testing.expectEqual(entry_params[1], plan.b);
     try std.testing.expectEqual(entry_params[2], plan.c);
@@ -1969,7 +1969,7 @@ test "run transforms the canonical nest into a single matmul, orphaning the loop
     // preheader no longer jumps into it.
     var doms = try dominators.compute(allocator, &func);
     defer doms.deinit(allocator);
-    try std.testing.expect(!doms.isReachable(@intFromEnum(plan.i_header)));
+    try std.testing.expect(!doms.isReachable(@backingInt(plan.i_header)));
 
     // The transformed function, nest orphaned and all, must still be a well-formed program.
     var diags = try ir.verify.verify(allocator, &func, .low);
@@ -2273,7 +2273,7 @@ test "skips a nest whose base pointer is defined inside the nest" {
 /// raised the op with the right dtype and (for mixed) `input_signs`.
 fn firstMatmul(func: *const Function) ?ir.function.MatMul {
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             switch (func.opcode(inst)) {
                 .matmul => |m| return m,
                 else => {},
@@ -2577,7 +2577,7 @@ test "volatile: a memory-accumulator nest whose init load is volatile is not rai
 fn countVolatileAccesses(func: *const Function) usize {
     var n: usize = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
             .load => |l| if (l.@"volatile") {
                 n += 1;
             },
@@ -2595,7 +2595,7 @@ fn countVolatileAccesses(func: *const Function) usize {
 fn countTaggedAccesses(func: *const Function) usize {
     var n: usize = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
             .load, .store => if (func.isByteOrderTagged(inst)) {
                 n += 1;
             },
@@ -2684,8 +2684,8 @@ test "a nest holding an atomic is not raised to a matmul" {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     var inner: ?Block = null;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
-            if (func.opcode(inst) == .store) inner = @enumFromInt(bi);
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (func.opcode(inst) == .store) inner = @fromBackingInt(@intCast(bi));
         }
     }
     const body = inner.?;

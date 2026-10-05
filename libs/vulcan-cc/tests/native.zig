@@ -173,7 +173,7 @@ const ReturnKind = union(enum) { int: u16, f32, f64 };
 fn returnKind(func: *const ir.function.Function) !ReturnKind {
     var bi: usize = 0;
     while (bi < func.blockCount()) : (bi += 1) {
-        const block: ir.function.Block = @enumFromInt(@as(u32, @intCast(bi)));
+        const block: ir.function.Block = @fromBackingInt(@intCast(@as(u32, @intCast(bi))));
         if (func.terminator(block)) |term| switch (term) {
             .ret => |r| if (r.count > 0) {
                 const v = r.values[0];
@@ -2314,7 +2314,7 @@ fn hasVolatileAccess(func: *const ir.function.Function, want_load: bool, want_st
     var has_store = false;
     var bi: usize = 0;
     while (bi < func.blockCount()) : (bi += 1) {
-        const block: ir.function.Block = @enumFromInt(bi);
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .load => |l| if (l.@"volatile") {
@@ -2351,7 +2351,7 @@ fn countAllocaMemAccesses(func: *const ir.function.Function) usize {
     var count: usize = 0;
     var bi: usize = 0;
     while (bi < func.blockCount()) : (bi += 1) {
-        const block: ir.function.Block = @enumFromInt(bi);
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .load => |l| if (func.definingInst(l.ptr) != null and func.opcode(func.definingInst(l.ptr).?) == .alloca) {

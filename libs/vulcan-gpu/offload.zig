@@ -25,7 +25,7 @@ const Builtin = builtin_mod.Builtin;
 pub const Error = std.mem.Allocator.Error || error{Unsupported};
 
 /// The entry block of every function. Its parameters are the function's parameters.
-const entry_block: Block = @enumFromInt(0);
+const entry_block: Block = @fromBackingInt(@intCast(0));
 
 /// The number of axes a grid has. Index 0 is x, index 1 is y, index 2 is z.
 const axes: usize = 3;
@@ -81,7 +81,7 @@ const BuiltinParam = struct { value: Value, source: NestSource };
 /// convention, which belongs with the parameter block and not with the nest.
 fn returnsValue(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
-        const term = func.terminator(@enumFromInt(bi)) orelse continue;
+        const term = func.terminator(@fromBackingInt(@intCast(bi))) orelse continue;
         switch (term) {
             .ret => |r| if (r.count != 0) return true,
             .jump => {},
@@ -159,7 +159,7 @@ pub fn lowerToLoopNest(
 ) Error!Function {
     if (func.blockCount() == 0) return error.Unsupported;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
             .decode_low_float, .encode_low_float => return error.Unsupported,
             .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
             else => {},
@@ -280,7 +280,7 @@ pub fn lowerToLoopNest(
     // One thread of the kernel finishes where the kernel returned. A block with no terminator
     // is an implicit `ret void`, so it ends the thread too and takes the same edge.
     try retireThread(&out, body_entry, nest.thread_latch[0]);
-    for (1..kernel_blocks) |bi| try retireThread(&out, @enumFromInt(bi), nest.thread_latch[0]);
+    for (1..kernel_blocks) |bi| try retireThread(&out, @fromBackingInt(@intCast(bi)), nest.thread_latch[0]);
 
     for (0..axes) |a| {
         const next = try out.appendArithImm(nest.thread_latch[a], i32_t, .add, thread_id[a], 1);
@@ -336,7 +336,7 @@ fn layOutNest(
 
     const body_at = 1 + 2 * axes;
     order[body_at] = nest.body_entry;
-    for (1..kernel_blocks) |bi| order[body_at + bi] = @enumFromInt(bi);
+    for (1..kernel_blocks) |bi| order[body_at + bi] = @fromBackingInt(@intCast(bi));
 
     const latches_at = body_at + kernel_blocks;
     for (0..axes) |a| order[latches_at + a] = nest.thread_latch[a];
@@ -459,7 +459,7 @@ fn defOpcode(func: *const Function, v: Value) ?ir.function.Opcode {
 fn nthStoredValue(func: *const Function, n: usize) ?Value {
     var seen: usize = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             switch (func.opcode(inst)) {
                 .store => |st| {
                     if (seen == n) return st.value;
@@ -486,7 +486,7 @@ test "a kernel with no builtins keeps its parameters and gains the three grid pa
     var lowered = try lowerToLoopNest(allocator, &kernel, .{ 4, 1, 1 });
     defer lowered.deinit();
 
-    const params = lowered.blockParams(@enumFromInt(0));
+    const params = lowered.blockParams(@fromBackingInt(@intCast(0)));
     try std.testing.expectEqual(@as(usize, 5), params.len);
     for (params[0..4]) |p| {
         try std.testing.expectEqual(i32_kind, lowered.types.type_kind(lowered.valueType(p)));
@@ -502,7 +502,7 @@ test "a global_id_x kernel drops the builtin parameter from its signature" {
     var lowered = try lowerToLoopNest(allocator, &kernel, .{ 4, 1, 1 });
     defer lowered.deinit();
 
-    const params = lowered.blockParams(@enumFromInt(0));
+    const params = lowered.blockParams(@fromBackingInt(@intCast(0)));
     try std.testing.expectEqual(@as(usize, 4), params.len);
     for (params[0..3]) |p| {
         try std.testing.expectEqual(i32_kind, lowered.types.type_kind(lowered.valueType(p)));
@@ -590,7 +590,7 @@ test "grid_dim_x, grid_dim_y and grid_dim_z are the three leading parameters in 
 
     // The grid size is not known until the call, so each one must be the parameter itself and
     // not a constant. Parameter 0 is grid_x, parameter 1 is grid_y, parameter 2 is grid_z.
-    const params = lowered.blockParams(@enumFromInt(0));
+    const params = lowered.blockParams(@fromBackingInt(@intCast(0)));
     for (0..3) |i| {
         const stored = nthStoredValue(&lowered, i) orelse return error.MissingStore;
         try std.testing.expectEqual(params[i], stored);
@@ -624,7 +624,7 @@ test "the six thread and block indices are six distinct induction variables" {
     // The thread loops sit inside the workgroup loops, so every thread index is created after
     // every workgroup index.
     for (seen[0..3]) |t| {
-        for (seen[3..]) |b| try std.testing.expect(@intFromEnum(t) > @intFromEnum(b));
+        for (seen[3..]) |b| try std.testing.expect(@backingInt(t) > @backingInt(b));
     }
 }
 
@@ -681,7 +681,7 @@ test "every axis of every supported grid builtin lowers" {
         defer lowered.deinit();
 
         // The builtin left the signature, so only the three grid values and the buffer remain.
-        try std.testing.expectEqual(@as(usize, 4), lowered.blockParams(@enumFromInt(0)).len);
+        try std.testing.expectEqual(@as(usize, 4), lowered.blockParams(@fromBackingInt(@intCast(0))).len);
         var diags = try ir.verify.verify(allocator, &lowered, .high);
         defer diags.deinit();
         try std.testing.expectEqual(@as(usize, 0), diags.count());
@@ -837,7 +837,7 @@ test "a kernel that carries a block attribute is rejected" {
     const allocator = std.testing.allocator;
     var kernel = try builtinKernel(allocator, .global_id_x);
     defer kernel.deinit();
-    try kernel.addAttr(.{ .block = @enumFromInt(0) }, .cold);
+    try kernel.addAttr(.{ .block = @fromBackingInt(@intCast(0)) }, .cold);
 
     try std.testing.expectError(
         error.Unsupported,

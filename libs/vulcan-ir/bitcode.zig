@@ -143,16 +143,16 @@ pub fn encode(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
         var next: u32 = 0;
         var next_inst: u32 = 0;
         for (0..func.blockCount()) |bi| {
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             for (func.blockParams(block)) |p| {
-                serial[@intFromEnum(p)] = next;
+                serial[@backingInt(p)] = next;
                 next += 1;
             }
             for (func.blockInsts(block)) |inst| {
-                inst_serial[@intFromEnum(inst)] = next_inst;
+                inst_serial[@backingInt(inst)] = next_inst;
                 next_inst += 1;
                 if (func.instResult(inst)) |r| {
-                    serial[@intFromEnum(r)] = next;
+                    serial[@backingInt(r)] = next;
                     next += 1;
                 }
             }
@@ -160,7 +160,7 @@ pub fn encode(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
     }
     const sv = struct {
         fn of(s: []const u32, v: Value) u32 {
-            return s[@intFromEnum(v)];
+            return s[@backingInt(v)];
         }
     }.of;
 
@@ -177,7 +177,7 @@ pub fn encode(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
 
     // Types (interned in dependency order, so a kind's nested types precede it).
     try w.u32v(@intCast(func.types.count()));
-    for (0..func.types.count()) |i| try writeType(&w, func.types.type_kind(@enumFromInt(i)));
+    for (0..func.types.count()) |i| try writeType(&w, func.types.type_kind(@fromBackingInt(@intCast(i))));
 
     // Symbols.
     try w.u32v(@intCast(func.symbolCount()));
@@ -190,10 +190,10 @@ pub fn encode(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
     // Blocks.
     try w.u32v(@intCast(func.blockCount()));
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         const params = func.blockParams(block);
         try w.u32v(@intCast(params.len));
-        for (params) |p| try w.u32v(@intFromEnum(func.valueType(p)));
+        for (params) |p| try w.u32v(@backingInt(func.valueType(p)));
 
         const insts = func.blockInsts(block);
         try w.u32v(@intCast(insts.len));
@@ -239,13 +239,13 @@ fn writeAttrs(w: *Writer, func: *const Function, serial: []const u32, inst_seria
 fn attrTargetSerial(target: function.AttrTarget, serial: []const u32, inst_serial: []const u32) ?u32 {
     return switch (target) {
         .func => 0,
-        .block => |b| @intFromEnum(b),
+        .block => |b| @backingInt(b),
         .inst => |i| blk: {
-            const n = inst_serial[@intFromEnum(i)];
+            const n = inst_serial[@backingInt(i)];
             break :blk if (n == no_serial) null else n;
         },
         .value => |v| blk: {
-            const n = serial[@intFromEnum(v)];
+            const n = serial[@backingInt(v)];
             break :blk if (n == no_serial) null else n;
         },
     };
@@ -267,11 +267,11 @@ fn writeAttr(w: *Writer, attr: Attribute) Error!void {
             // The decoder maps this byte back with `std.enums.fromInt`, so pin the tag
             // values here. This follows the `float` and `ptr` arms of `writeType`.
             comptime {
-                std.debug.assert(@intFromEnum(attribute.Endianness.little) == 0);
-                std.debug.assert(@intFromEnum(attribute.Endianness.big) == 1);
-                std.debug.assert(@intFromEnum(attribute.Endianness.native) == 2);
+                std.debug.assert(@backingInt(attribute.Endianness.little) == 0);
+                std.debug.assert(@backingInt(attribute.Endianness.big) == 1);
+                std.debug.assert(@backingInt(attribute.Endianness.native) == 2);
             }
-            try w.u8v(@intFromEnum(e));
+            try w.u8v(@backingInt(e));
         },
         .custom => |c| {
             try w.u8v(attr_custom);
@@ -315,12 +315,12 @@ fn writeType(w: *Writer, kind: types.TypeKind) Error!void {
             // values here: a future reorder would otherwise desync the two
             // sides and silently corrupt streams instead of failing to build.
             comptime {
-                std.debug.assert(@intFromEnum(types.FloatKind.f32) == 0);
-                std.debug.assert(@intFromEnum(types.FloatKind.f64) == 1);
-                std.debug.assert(@intFromEnum(types.FloatKind.f16) == 2);
-                std.debug.assert(@intFromEnum(types.FloatKind.f128) == 3);
+                std.debug.assert(@backingInt(types.FloatKind.f32) == 0);
+                std.debug.assert(@backingInt(types.FloatKind.f64) == 1);
+                std.debug.assert(@backingInt(types.FloatKind.f16) == 2);
+                std.debug.assert(@backingInt(types.FloatKind.f128) == 3);
             }
-            try w.u8v(@intFromEnum(f));
+            try w.u8v(@backingInt(f));
         },
         .ptr => |space| {
             try w.u8v(3);
@@ -328,31 +328,31 @@ fn writeType(w: *Writer, kind: types.TypeKind) Error!void {
             // future reorder would otherwise desync the two sides and silently corrupt
             // streams instead of failing to build.
             comptime {
-                std.debug.assert(@intFromEnum(types.AddressSpace.global) == 0);
-                std.debug.assert(@intFromEnum(types.AddressSpace.shared) == 1);
-                std.debug.assert(@intFromEnum(types.AddressSpace.private) == 2);
-                std.debug.assert(@intFromEnum(types.AddressSpace.constant) == 3);
+                std.debug.assert(@backingInt(types.AddressSpace.global) == 0);
+                std.debug.assert(@backingInt(types.AddressSpace.shared) == 1);
+                std.debug.assert(@backingInt(types.AddressSpace.private) == 2);
+                std.debug.assert(@backingInt(types.AddressSpace.constant) == 3);
             }
-            try w.u8v(@intFromEnum(space));
+            try w.u8v(@backingInt(space));
         },
         .vector => |v| {
             try w.u8v(4);
             try w.u32v(v.len);
-            try w.u32v(@intFromEnum(v.elem));
+            try w.u32v(@backingInt(v.elem));
         },
         .@"struct" => |fields| {
             try w.u8v(5);
             try w.u32v(@intCast(fields.len));
-            for (fields) |f| try w.u32v(@intFromEnum(f));
+            for (fields) |f| try w.u32v(@backingInt(f));
         },
         .array => |a| {
             try w.u8v(6);
             try w.u64v(a.len);
-            try w.u32v(@intFromEnum(a.elem));
+            try w.u32v(@backingInt(a.elem));
         },
         .slice => |s| {
             try w.u8v(7);
-            try w.u32v(@intFromEnum(s.elem));
+            try w.u32v(@backingInt(s.elem));
         },
     }
 }
@@ -360,7 +360,7 @@ fn writeType(w: *Writer, kind: types.TypeKind) Error!void {
 fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32, sv: fn ([]const u32, Value) u32) Error!void {
     const result = func.instResult(inst);
     try w.u8v(if (result != null) 1 else 0);
-    if (result) |r| try w.u32v(@intFromEnum(func.valueType(r)));
+    if (result) |r| try w.u32v(@backingInt(func.valueType(r)));
 
     switch (func.opcode(inst)) {
         .iconst => |v| {
@@ -378,19 +378,19 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
         },
         .arith => |a| {
             try w.u8v(op_arith);
-            try w.u8v(@intFromEnum(a.op));
+            try w.u8v(@backingInt(a.op));
             try w.u32v(sv(serial, a.lhs));
             try w.u32v(sv(serial, a.rhs));
         },
         .arith_imm => |a| {
             try w.u8v(op_arith_imm);
-            try w.u8v(@intFromEnum(a.op));
+            try w.u8v(@backingInt(a.op));
             try w.u32v(sv(serial, a.lhs));
             try w.u64v(@bitCast(a.imm));
         },
         .icmp => |c| {
             try w.u8v(op_icmp);
-            try w.u8v(@intFromEnum(c.op));
+            try w.u8v(@backingInt(c.op));
             try w.u32v(sv(serial, c.lhs));
             try w.u32v(sv(serial, c.rhs));
         },
@@ -418,41 +418,41 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
         .decode_low_float => |cv| {
             try w.u8v(op_decode_low_float);
             comptime {
-                std.debug.assert(@intFromEnum(function.LowFloatFormat.bf16) == 0);
-                std.debug.assert(@intFromEnum(function.LowFloatFormat.f8_e4m3) == 1);
-                std.debug.assert(@intFromEnum(function.LowFloatFormat.f8_e5m2) == 2);
+                std.debug.assert(@backingInt(function.LowFloatFormat.bf16) == 0);
+                std.debug.assert(@backingInt(function.LowFloatFormat.f8_e4m3) == 1);
+                std.debug.assert(@backingInt(function.LowFloatFormat.f8_e5m2) == 2);
             }
-            try w.u8v(@intFromEnum(cv.format));
+            try w.u8v(@backingInt(cv.format));
             try w.u32v(sv(serial, cv.value));
         },
         .encode_low_float => |cv| {
             try w.u8v(op_encode_low_float);
-            try w.u8v(@intFromEnum(cv.format));
+            try w.u8v(@backingInt(cv.format));
             try w.u32v(sv(serial, cv.value));
         },
         .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
             comptime {
-                std.debug.assert(@intFromEnum(nvfp4.ScaleApplication.multiply) == 0);
-                std.debug.assert(@intFromEnum(nvfp4.ScaleApplication.divide) == 1);
+                std.debug.assert(@backingInt(nvfp4.ScaleApplication.multiply) == 0);
+                std.debug.assert(@backingInt(nvfp4.ScaleApplication.divide) == 1);
             }
             try w.u8v(if (std.meta.activeTag(func.opcode(inst)) == .dequantize_nvfp4)
                 op_dequantize_nvfp4
             else
                 op_quantize_nvfp4);
-            try w.u8v(@intFromEnum(cv.block_application));
-            try w.u8v(@intFromEnum(cv.global_application));
+            try w.u8v(@backingInt(cv.block_application));
+            try w.u8v(@backingInt(cv.global_application));
             try w.u32v(sv(serial, cv.value));
             try w.u32v(sv(serial, cv.block_scale));
             try w.u32v(sv(serial, cv.global_scale));
         },
         .unary => |u| {
             try w.u8v(op_unary);
-            try w.u8v(@intFromEnum(u.op));
+            try w.u8v(@backingInt(u.op));
             try w.u32v(sv(serial, u.value));
         },
         .alloca => |al| {
             try w.u8v(op_alloca);
-            try w.u32v(@intFromEnum(al.elem));
+            try w.u32v(@backingInt(al.elem));
         },
         .call => |c| {
             try w.u8v(op_call);
@@ -510,10 +510,10 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
             // instead of failing to build. This follows the `float` and `ptr` arms of
             // `writeType`.
             comptime {
-                std.debug.assert(@intFromEnum(function.BarrierScope.workgroup) == 0);
-                std.debug.assert(@intFromEnum(function.BarrierScope.subgroup) == 1);
+                std.debug.assert(@backingInt(function.BarrierScope.workgroup) == 0);
+                std.debug.assert(@backingInt(function.BarrierScope.subgroup) == 1);
             }
-            try w.u8v(@intFromEnum(bar.scope));
+            try w.u8v(@backingInt(bar.scope));
         },
         .atomic_rmw => |a| {
             try w.u8v(op_atomic_rmw);
@@ -522,26 +522,26 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
             // desync the two sides and silently turn one atomic into another, instead of
             // failing to build. This follows the `barrier` arm above.
             comptime {
-                std.debug.assert(@intFromEnum(function.AtomicOp.add) == 0);
-                std.debug.assert(@intFromEnum(function.AtomicOp.min) == 1);
-                std.debug.assert(@intFromEnum(function.AtomicOp.max) == 2);
-                std.debug.assert(@intFromEnum(function.AtomicOp.bit_and) == 3);
-                std.debug.assert(@intFromEnum(function.AtomicOp.bit_or) == 4);
-                std.debug.assert(@intFromEnum(function.AtomicOp.bit_xor) == 5);
-                std.debug.assert(@intFromEnum(function.AtomicOp.exchange) == 6);
-                std.debug.assert(@intFromEnum(function.AtomicOp.compare_exchange) == 7);
-                std.debug.assert(@intFromEnum(function.AtomicOrdering.relaxed) == 0);
-                std.debug.assert(@intFromEnum(function.AtomicOrdering.acquire) == 1);
-                std.debug.assert(@intFromEnum(function.AtomicOrdering.release) == 2);
-                std.debug.assert(@intFromEnum(function.AtomicOrdering.acq_rel) == 3);
-                std.debug.assert(@intFromEnum(function.AtomicOrdering.seq_cst) == 4);
-                std.debug.assert(@intFromEnum(function.AtomicScope.workgroup) == 0);
-                std.debug.assert(@intFromEnum(function.AtomicScope.device) == 1);
-                std.debug.assert(@intFromEnum(function.AtomicScope.system) == 2);
+                std.debug.assert(@backingInt(function.AtomicOp.add) == 0);
+                std.debug.assert(@backingInt(function.AtomicOp.min) == 1);
+                std.debug.assert(@backingInt(function.AtomicOp.max) == 2);
+                std.debug.assert(@backingInt(function.AtomicOp.bit_and) == 3);
+                std.debug.assert(@backingInt(function.AtomicOp.bit_or) == 4);
+                std.debug.assert(@backingInt(function.AtomicOp.bit_xor) == 5);
+                std.debug.assert(@backingInt(function.AtomicOp.exchange) == 6);
+                std.debug.assert(@backingInt(function.AtomicOp.compare_exchange) == 7);
+                std.debug.assert(@backingInt(function.AtomicOrdering.relaxed) == 0);
+                std.debug.assert(@backingInt(function.AtomicOrdering.acquire) == 1);
+                std.debug.assert(@backingInt(function.AtomicOrdering.release) == 2);
+                std.debug.assert(@backingInt(function.AtomicOrdering.acq_rel) == 3);
+                std.debug.assert(@backingInt(function.AtomicOrdering.seq_cst) == 4);
+                std.debug.assert(@backingInt(function.AtomicScope.workgroup) == 0);
+                std.debug.assert(@backingInt(function.AtomicScope.device) == 1);
+                std.debug.assert(@backingInt(function.AtomicScope.system) == 2);
             }
-            try w.u8v(@intFromEnum(a.op));
-            try w.u8v(@intFromEnum(a.ordering));
-            try w.u8v(@intFromEnum(a.scope));
+            try w.u8v(@backingInt(a.op));
+            try w.u8v(@backingInt(a.ordering));
+            try w.u8v(@backingInt(a.scope));
             try w.u8v(if (a.compare != null) atomic_flag_compare else 0);
             try w.u32v(sv(serial, a.ptr));
             try w.u32v(sv(serial, a.value));
@@ -555,7 +555,7 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
         },
         .reduce => |red| {
             try w.u8v(op_reduce);
-            try w.u8v(@intFromEnum(red.op));
+            try w.u8v(@backingInt(red.op));
             try w.u32v(sv(serial, red.vector));
         },
         .splat => |sp| {
@@ -570,7 +570,7 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
             try w.u16v(mm.m);
             try w.u16v(mm.n);
             try w.u16v(mm.k);
-            try w.u8v(@intFromEnum(mm.dtype)); // MatMulType (u3), widened to a byte
+            try w.u8v(@backingInt(mm.dtype)); // MatMulType (u3), widened to a byte
             try w.u8v(if (mm.accumulate) 1 else 0);
             try w.u8v(if (mm.embedded) 1 else 0); // self-contained (embedded) lowering flag
             if (mm.input_signs) |s| {
@@ -581,7 +581,7 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
             if (mm.quant) |q| {
                 try w.u8v(1);
                 try w.u8v(if (q.relu) 1 else 0);
-                try w.u8v(@intFromEnum(q.out)); // MatMulQuantOut (i8=0, u8=1)
+                try w.u8v(@backingInt(q.out)); // MatMulQuantOut (i8=0, u8=1)
                 try w.u32v(@bitCast(q.zero_point)); // i32 zero-point as u32 bits
                 if (q.bias) |bh| {
                     try w.u8v(1);
@@ -646,7 +646,7 @@ fn writeCallExtras(w: *Writer, is_variadic: bool, num_fixed: u32, sret: bool, re
 }
 
 fn writeJump(w: *Writer, func: *const Function, jump: function.Jump, serial: []const u32, sv: fn ([]const u32, Value) u32) Error!void {
-    try w.u32v(@intFromEnum(jump.target));
+    try w.u32v(@backingInt(jump.target));
     const args = func.blockArgs(jump);
     try w.u32v(@intCast(args.len));
     for (args) |a| try w.u32v(sv(serial, a));
@@ -704,7 +704,7 @@ fn mapType(type_map: []const Type, valid: usize, idx: u32) Error!Type {
 /// that would later index the block list out of bounds.
 fn checkBlock(bnum: u32, block_count: u32) Error!Block {
     if (bnum >= block_count) return error.MalformedBitcode;
-    return @enumFromInt(bnum);
+    return @fromBackingInt(@intCast(bnum));
 }
 
 /// Decode bitcode into an equivalent `Function`. The caller owns it (`deinit`).
@@ -759,9 +759,9 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Function {
     var inst_serial: std.ArrayList(Inst) = .empty;
     defer inst_serial.deinit(allocator);
 
-    const dummy: Value = @enumFromInt(0);
+    const dummy: Value = @fromBackingInt(@intCast(0));
     for (0..block_count) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         const param_count = try r.take(u32);
         for (0..param_count) |_| {
             const ty = try mapType(type_map, type_map.len, try r.take(u32));
@@ -1505,9 +1505,9 @@ test "low float bitcode pins tags and rejects malformed records" {
 
     try std.testing.expectEqual(@as(u8, 26), op_decode_low_float);
     try std.testing.expectEqual(@as(u8, 27), op_encode_low_float);
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(function.LowFloatFormat.bf16));
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(function.LowFloatFormat.f8_e4m3));
-    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(function.LowFloatFormat.f8_e5m2));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(function.LowFloatFormat.bf16));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(function.LowFloatFormat.f8_e4m3));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(function.LowFloatFormat.f8_e5m2));
 
     const formats = [_]function.LowFloatFormat{ .bf16, .f8_e4m3, .f8_e5m2 };
     inline for (.{ true, false }) |decode_direction| {
@@ -1537,7 +1537,7 @@ test "low float bitcode pins tags and rejects malformed records" {
             var decoded = try decode(allocator, bytes);
             defer decoded.deinit();
 
-            const decoded_block: Block = @enumFromInt(0);
+            const decoded_block: Block = @fromBackingInt(@intCast(0));
             const decoded_inst = decoded.blockInsts(decoded_block)[0];
             const decoded_result = decoded.instResult(decoded_inst).?;
             const decoded_source = decoded.blockParams(decoded_block)[0];
@@ -1564,7 +1564,7 @@ test "low float bitcode pins tags and rejects malformed records" {
             var record_at: ?usize = null;
             var i: usize = 5;
             while (i + 5 < bytes.len) : (i += 1) {
-                if (bytes[i] == tag and bytes[i + 1] == @intFromEnum(format) and
+                if (bytes[i] == tag and bytes[i + 1] == @backingInt(format) and
                     std.mem.eql(u8, bytes[i + 2 .. i + 6], &std.mem.toBytes(@as(u32, 0))))
                 {
                     record_at = i;
@@ -1604,7 +1604,7 @@ test "low float bitcode pins tags and rejects malformed records" {
                 {
                     const malformed = try allocator.dupe(u8, bytes);
                     defer allocator.free(malformed);
-                    const wrong_result_type: u32 = @intFromEnum(if (decode_direction) payload_t else f32_t);
+                    const wrong_result_type: u32 = @backingInt(if (decode_direction) payload_t else f32_t);
                     std.mem.writeInt(u32, @ptrCast(malformed[at - 4 .. at].ptr), wrong_result_type, .little);
                     try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed));
                 }
@@ -1624,8 +1624,8 @@ test "NVFP4 bitcode pins fields and rejects every malformed record field" {
     const allocator = std.testing.allocator;
     try std.testing.expectEqual(@as(u8, 28), op_dequantize_nvfp4);
     try std.testing.expectEqual(@as(u8, 29), op_quantize_nvfp4);
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(nvfp4.ScaleApplication.multiply));
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(nvfp4.ScaleApplication.divide));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(nvfp4.ScaleApplication.multiply));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(nvfp4.ScaleApplication.divide));
 
     inline for (.{ true, false }) |dequantize_direction| {
         inline for (.{ nvfp4.ScaleApplication.multiply, nvfp4.ScaleApplication.divide }) |block_application| {
@@ -1666,14 +1666,14 @@ test "NVFP4 bitcode pins fields and rejects every malformed record field" {
                 defer allocator.free(bytes);
                 var decoded = try decode(allocator, bytes);
                 defer decoded.deinit();
-                const decoded_inst = decoded.blockInsts(@enumFromInt(0))[0];
+                const decoded_inst = decoded.blockInsts(@fromBackingInt(@intCast(0)))[0];
                 const decoded_result = decoded.instResult(decoded_inst).?;
                 const decoded_conversion = switch (decoded.opcode(decoded_inst)) {
                     .dequantize_nvfp4 => |cv| cv,
                     .quantize_nvfp4 => |cv| cv,
                     else => return error.TestUnexpectedResult,
                 };
-                const params = decoded.blockParams(@enumFromInt(0));
+                const params = decoded.blockParams(@fromBackingInt(@intCast(0)));
                 try std.testing.expectEqual(params[0], decoded_conversion.value);
                 try std.testing.expectEqual(params[1], decoded_conversion.block_scale);
                 try std.testing.expectEqual(params[2], decoded_conversion.global_scale);
@@ -1687,8 +1687,8 @@ test "NVFP4 bitcode pins fields and rejects every malformed record field" {
                 const tag = if (dequantize_direction) op_dequantize_nvfp4 else op_quantize_nvfp4;
                 const pattern = [_]u8{
                     tag,
-                    @intFromEnum(block_application),
-                    @intFromEnum(global_application),
+                    @backingInt(block_application),
+                    @backingInt(global_application),
                     0,
                     0,
                     0,
@@ -1721,7 +1721,7 @@ test "NVFP4 bitcode pins fields and rejects every malformed record field" {
                     {
                         const malformed = try allocator.dupe(u8, bytes);
                         defer allocator.free(malformed);
-                        const wrong_type: u32 = @intFromEnum(if (dequantize_direction) u8_t else f32_t);
+                        const wrong_type: u32 = @backingInt(if (dequantize_direction) u8_t else f32_t);
                         std.mem.writeInt(u32, @ptrCast(malformed[at - 4 .. at].ptr), wrong_type, .little);
                         try std.testing.expectError(error.MalformedBitcode, decode(allocator, malformed));
                     }
@@ -2198,7 +2198,7 @@ fn expectFullFunction(func: *const Function) !void {
     try std.testing.expect(func.sret);
     try std.testing.expect(func.is_local);
 
-    const entry: Block = @enumFromInt(0);
+    const entry: Block = @fromBackingInt(@intCast(0));
     const params = func.blockParams(entry);
     try std.testing.expectEqual(@as(usize, 5), params.len);
     const insts = func.blockInsts(entry);
@@ -2661,7 +2661,7 @@ test "regression: rejects an unknown address-space byte instead of @enumFromInt 
     try std.testing.expect(space_offset < bytes.len);
     // Prove the offset really names the pointer record before it is patched.
     try std.testing.expectEqual(@as(u8, 3), bytes[tag_offset]);
-    try std.testing.expectEqual(@intFromEnum(types.AddressSpace.global), bytes[space_offset]);
+    try std.testing.expectEqual(@backingInt(types.AddressSpace.global), bytes[space_offset]);
 
     const patched = try allocator.dupe(u8, bytes);
     defer allocator.free(patched);

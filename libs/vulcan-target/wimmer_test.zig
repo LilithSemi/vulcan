@@ -1473,7 +1473,7 @@ test "resolve: an argument feeding a spilled successor parameter becomes a reg-t
     const nparams = 14;
     var params: [nparams]Value = undefined;
     for (&params) |*p| p.* = try func.appendBlockParam(body, t);
-    const args = [_]Value{seed} ** nparams;
+    const args: [nparams]Value = @splat(seed);
     try func.setJump(entry, body, &args);
 
     const called = try func.appendCall(body, t, "callee", &.{params[0]});
@@ -1654,8 +1654,8 @@ fn freeOwnedInterval(allocator: std.mem.Allocator, iv: wimmer.Interval) void {
 
 test "verify: a correct allocation has no violations" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
-    const v1: Value = @enumFromInt(1);
+    const v0: Value = @fromBackingInt(@intCast(0));
+    const v1: Value = @fromBackingInt(@intCast(1));
     // Two same-class values in DIFFERENT registers over the same range, one with a must_have use it
     // covers in a register. Nothing conflicts, nothing is spilled, both are assigned.
     var ivs = [_]wimmer.Interval{
@@ -1671,8 +1671,8 @@ test "verify: a correct allocation has no violations" {
 
 test "verify: two value intervals sharing a register over overlapping ranges is flagged" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
-    const v1: Value = @enumFromInt(1);
+    const v0: Value = @fromBackingInt(@intCast(0));
+    const v1: Value = @fromBackingInt(@intCast(1));
     // Both values are placed in x5 (class 0) with ranges that overlap at [2, 4): the core soundness
     // violation.
     var ivs = [_]wimmer.Interval{
@@ -1690,7 +1690,7 @@ test "verify: two value intervals sharing a register over overlapping ranges is 
 
 test "verify: a must_have_register use covered only by a slot interval is flagged" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
+    const v0: Value = @fromBackingInt(@intCast(0));
     // The only interval of v0 lives in a slot, yet carries a must_have_register use at pos 2. No
     // register-located interval of v0 covers pos 2, so the use is spilled where it may not be.
     var ivs = [_]wimmer.Interval{
@@ -1707,7 +1707,7 @@ test "verify: a must_have_register use covered only by a slot interval is flagge
 
 test "verify: the entry-param fixed interval sharing its own param's register is NOT flagged" {
     const allocator = std.testing.allocator;
-    const p: Value = @enumFromInt(0);
+    const p: Value = @fromBackingInt(@intCast(0));
     // The legitimate [0, 1) overlap: a parameter's value interval in x0 and that same param's
     // entry-param fixed interval pinning x0 at entry. Same value, same reg, but not a real conflict.
     var ivs = [_]wimmer.Interval{
@@ -1723,7 +1723,7 @@ test "verify: the entry-param fixed interval sharing its own param's register is
 
 test "verify: a used value interval with no location is flagged unassigned" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
+    const v0: Value = @fromBackingInt(@intCast(0));
     // A value with a real use that the scan never placed (location stays null) is an unassigned bug.
     var ivs = [_]wimmer.Interval{
         try ownedInterval(allocator, v0, 0, null, &.{.{ .from = 0, .to = 4 }}, &.{.{ .pos = 2, .kind = .should_have_register }}, null),
@@ -1743,8 +1743,8 @@ test "verify: a used value interval with no location is flagged unassigned" {
 
 test "verify: a correct early store has no violations" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
-    const v1: Value = @enumFromInt(1);
+    const v0: Value = @fromBackingInt(@intCast(0));
+    const v1: Value = @fromBackingInt(@intCast(1));
     // The remainder stores into slot 0 at position 7, one position before its own first range. The
     // value is in x3 up to 7, so the store has a live source to read. The foreign value dies AT 7,
     // so its range ends at 7 and it is gone before the store writes its slot, which is a different
@@ -1765,7 +1765,7 @@ test "verify: a correct early store has no violations" {
 
 test "verify: an early store with no live source is flagged" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
+    const v0: Value = @fromBackingInt(@intCast(0));
     // Same shape with the earlier piece removed. The head starts AT the store position, and a store
     // reads what the value held BEFORE that position, so the head is not a source. Nothing holds the
     // value there and the store would write another value's bits.
@@ -1785,8 +1785,8 @@ test "verify: an early store with no live source is flagged" {
 
 test "verify: another value live in the slot at the early-store position is flagged" {
     const allocator = std.testing.allocator;
-    const v0: Value = @enumFromInt(0);
-    const v1: Value = @enumFromInt(1);
+    const v0: Value = @fromBackingInt(@intCast(0));
+    const v1: Value = @fromBackingInt(@intCast(1));
     // The foreign value now shares slot 0 and lives to 8, so it still holds the slot at 7 where the
     // early store writes. Their RANGES never meet, which is why the ranges alone cannot answer this.
     // This is the union `coalesceSpillSlots` must refuse, checked again on the result.

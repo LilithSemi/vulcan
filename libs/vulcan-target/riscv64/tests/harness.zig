@@ -112,7 +112,7 @@ pub const spike = Backend{ .name = "spike", .incompatible = true, .reason = "fir
 pub const qemu = Backend{ .name = "qemu-system-riscv64", .incompatible = true, .reason = "firmware never exits, QEMU needs a shutdown device", .buildArgv = unusedArgv };
 
 fn argReg(i: usize) encode.Reg {
-    return @enumFromInt(@as(u5, @intCast(10 + i)));
+    return @fromBackingInt(@intCast(@as(u5, @intCast(10 + i))));
 }
 
 fn loadImmInto(allocator: std.mem.Allocator, words: *std.ArrayList(u32), reg: encode.Reg, val: i64) std.mem.Allocator.Error!void {
@@ -253,7 +253,7 @@ pub fn buildUserStubFloat(allocator: std.mem.Allocator, dbl: bool, fargs: []cons
 
     for (fargs, 0..) |bits, i| {
         try loadImm64Into(allocator, &w, .x5, .x6, bits);
-        const freg: encode.FReg = @enumFromInt(@as(u5, @intCast(10 + i)));
+        const freg: encode.FReg = @fromBackingInt(@intCast(@as(u5, @intCast(10 + i))));
         try w.append(allocator, if (dbl) encode.fmv_d_x(freg, .x5) else encode.fmv_w_x(freg, .x5));
     }
     const call_idx = w.items.len;

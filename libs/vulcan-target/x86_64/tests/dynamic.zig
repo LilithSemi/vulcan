@@ -317,7 +317,7 @@ fn buildPointerDataObj(allocator: std.mem.Allocator) ![]u8 {
         0x0f, 0x05, // syscall
     };
     // `.data`: g (i32 42) at 0, padding to 8, then p (u64, placeholder 0) at 8.
-    var data: [16]u8 = [_]u8{0} ** 16;
+    var data: [16]u8 = @splat(0);
     w(u32, data[0..4], 42, .little);
 
     // Section indices: NULL(0), .text(1), .data(2), .rela.text(3), .rela.data(4),
@@ -951,7 +951,7 @@ test "x86_64 object.writeModule emits a .rela.data R_X86_64_64 for a pointer-ini
     var module: link.Module = .{};
     defer module.deinit(allocator);
     const g_bytes = [_]u8{ 42, 0, 0, 0 };
-    const p_bytes = [_]u8{0} ** 8;
+    const p_bytes: [8]u8 = @splat(0);
     try module.addWritable(allocator, "g", &g_bytes);
     try module.addWritableRelocs(allocator, "p", &p_bytes, &.{.{ .off = 0, .symbol = "g" }});
 

@@ -31,7 +31,7 @@ pub const Reg = enum(u4) {
 };
 
 fn n(r: Reg) u8 {
-    return @intFromEnum(r);
+    return @backingInt(r);
 }
 
 /// An SSE/AVX vector register (xmm0..xmm15). It uses the same 0..15 index space as `Reg`,
@@ -56,7 +56,7 @@ pub const Xmm = enum(u4) {
 };
 
 fn xn(x: Xmm) u8 {
-    return @intFromEnum(x);
+    return @backingInt(x);
 }
 
 /// A two-xmm SSE op: `prefix` (F3/F2/66), `0F`, `op`, then a register-direct ModRM byte
@@ -746,14 +746,14 @@ pub fn invertCond(cond: Cond) Cond {
 
 /// `cmovcc dst, src` (0F 40+cc /r): move `src` into `dst` if the condition holds.
 pub fn cmovcc(dst: Reg, src: Reg, cond: Cond) Inst {
-    return Inst.of(&.{ rexW(dst, src), 0x0F, 0x40 | @intFromEnum(cond), modrm(dst, src) });
+    return Inst.of(&.{ rexW(dst, src), 0x0F, 0x40 | @backingInt(cond), modrm(dst, src) });
 }
 
 /// `setcc dst8` (0F 90+cc): set the low byte of `dst` to 0 or 1 from the flags. This always
 /// emits a REX prefix, so the encoding addresses the low byte (spl/sil/... for regs 4..7,
 /// r8b.. for 8..15), and never the legacy ah/ch/dh/bh.
 pub fn setcc(dst: Reg, cond: Cond) Inst {
-    return Inst.of(&.{ 0x40 | @as(u8, @intFromBool(n(dst) >= 8)), 0x0F, 0x90 | @intFromEnum(cond), 0xC0 | (n(dst) & 7) });
+    return Inst.of(&.{ 0x40 | @as(u8, @intFromBool(n(dst) >= 8)), 0x0F, 0x90 | @backingInt(cond), 0xC0 | (n(dst) & 7) });
 }
 
 /// `movzx dst, dst8` (REX.W 0F B6 /r): zero-extend `src`'s low byte into `dst`.
@@ -798,7 +798,7 @@ pub fn movReg32(dst: Reg, src: Reg) Inst {
 /// end of the instruction.
 pub fn jcc(cond: Cond, rel: i32) Inst {
     const u: u32 = @bitCast(rel);
-    return Inst.of(&.{ 0x0F, 0x80 | @intFromEnum(cond), @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
+    return Inst.of(&.{ 0x0F, 0x80 | @backingInt(cond), @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
 
 /// `jmp rel32` (E9 cd): unconditional relative jump.
@@ -1422,7 +1422,7 @@ test "invertCond pairs every condition with its logical inverse" {
     // The inverse is an involution and the low bit toggles the sense.
     inline for (std.meta.tags(Cond)) |c| {
         try std.testing.expectEqual(c, invertCond(invertCond(c)));
-        try std.testing.expectEqual(@intFromEnum(c) ^ 1, @intFromEnum(invertCond(c)));
+        try std.testing.expectEqual(@backingInt(c) ^ 1, @backingInt(invertCond(c)));
     }
 }
 

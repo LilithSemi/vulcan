@@ -64,7 +64,7 @@ fn matmulFunc(allocator: std.mem.Allocator, mm: MatMul) !Function {
 fn expandAndVerify(allocator: std.mem.Allocator, func: *Function) !void {
     try std.testing.expect(try ir.expand.expandMatmul(allocator, func));
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             try std.testing.expect(func.opcode(inst) != .matmul); // no matmul survives
         }
     }
@@ -94,9 +94,9 @@ fn bytesOf(comptime T: type, slice: []T) []u8 {
 /// A base `matmul`, with the three pointer operands filled in by `matmulFunc`.
 fn tile(m: u16, n: u16, k: u16, dtype: MatMulType, accumulate: bool) MatMul {
     return .{
-        .a = @enumFromInt(0),
-        .b = @enumFromInt(0),
-        .c = @enumFromInt(0),
+        .a = @fromBackingInt(@intCast(0)),
+        .b = @fromBackingInt(@intCast(0)),
+        .c = @fromBackingInt(@intCast(0)),
         .m = m,
         .n = n,
         .k = k,
@@ -388,7 +388,7 @@ test "expandMatmul: values live across the matmul survive the nest" {
     var a = [_]f32{ 1, 2, 3, 4, 5, 6 };
     var b = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
     var c = [_]f32{ -1, -1, -1, -1, -1, -1, -1, -1 };
-    var out = [_]i32{-1} ** carried.len;
+    var out: [carried.len]i32 = @splat(-1);
     code.entry(SurroundedFn, 0)(&a, &b, &c, &out, 2);
 
     const want_c = [_]f32{ 38, 44, 50, 56, 83, 98, 113, 128 };
@@ -402,14 +402,14 @@ fn successorsOf(func: *const Function, block: Block, out: *std.ArrayList(u32), a
     for (func.blockInsts(block)) |inst| {
         switch (func.opcode(inst)) {
             .@"if" => |cf| {
-                try out.append(allocator, @intFromEnum(cf.then.target));
-                try out.append(allocator, @intFromEnum(cf.@"else".target));
+                try out.append(allocator, @backingInt(cf.then.target));
+                try out.append(allocator, @backingInt(cf.@"else".target));
             },
             else => {},
         }
     }
     switch (func.terminator(block) orelse return) {
-        .jump => |j| try out.append(allocator, @intFromEnum(j.target)),
+        .jump => |j| try out.append(allocator, @backingInt(j.target)),
         .ret => {},
     }
 }
@@ -436,7 +436,7 @@ fn layoutRespectsDominance(allocator: std.mem.Allocator, func: *const Function) 
     defer succ.deinit(allocator);
     for (0..n) |bi| {
         succ.clearRetainingCapacity();
-        try successorsOf(func, @enumFromInt(bi), &succ, allocator);
+        try successorsOf(func, @fromBackingInt(@intCast(bi)), &succ, allocator);
         for (succ.items) |s| try preds[s].append(allocator, @intCast(bi));
     }
 
@@ -497,7 +497,7 @@ test "expandMatmul: the expanded function is laid out for the backends" {
 /// Whether `func` still holds a `matmul`.
 fn holdsMatmul(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .matmul) return true;
         }
     }
@@ -548,7 +548,7 @@ test "expandMatmul: a function carrying a block attribute is left alone" {
     defer func.deinit();
     // `reorderBlocks` does not remap a block id held in an attribute payload, and the layout step
     // uses it, so such a function keeps its matmul rather than getting a stale reference.
-    try func.addAttr(.{ .block = @enumFromInt(0) }, .cold);
+    try func.addAttr(.{ .block = @fromBackingInt(@intCast(0)) }, .cold);
 
     try std.testing.expect(!try ir.expand.expandMatmul(allocator, &func));
     try std.testing.expect(holdsMatmul(&func));
@@ -630,7 +630,7 @@ fn innermostLoop(allocator: std.mem.Allocator, func: *const Function) !LoopSize 
         for (0..func.blockCount()) |bi| {
             if (!loop.contains(bi)) continue;
             blocks += 1;
-            const insts = func.blockInsts(@enumFromInt(bi));
+            const insts = func.blockInsts(@fromBackingInt(@intCast(bi)));
             size.instructions += insts.len;
             for (insts) |inst| {
                 const result = func.instResult(inst) orelse continue;

@@ -51,7 +51,7 @@ fn hoistable(opcode: ir.function.Opcode) bool {
 fn operandsInvariant(func: *const Function, inst: Inst, invariant: []const bool) bool {
     const inv = struct {
         fn f(i: []const bool, v: Value) bool {
-            return i[@intFromEnum(v)];
+            return i[@backingInt(v)];
         }
     }.f;
     return switch (func.opcode(inst)) {
@@ -121,10 +121,10 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         const pre = loop.preheader orelse continue;
 
         for (0..func.blockCount()) |bi| {
-            const block: Block = @enumFromInt(bi);
-            for (func.blockParams(block)) |p| def_block[@intFromEnum(p)] = @intCast(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
+            for (func.blockParams(block)) |p| def_block[@backingInt(p)] = @intCast(bi);
             for (func.blockInsts(block)) |inst| {
-                if (func.instResult(inst)) |r| def_block[@intFromEnum(r)] = @intCast(bi);
+                if (func.instResult(inst)) |r| def_block[@backingInt(r)] = @intCast(bi);
             }
         }
 
@@ -138,12 +138,12 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             again = false;
             for (0..func.blockCount()) |bi| {
                 if (!loop.contains(bi)) continue;
-                for (func.blockInsts(@enumFromInt(bi))) |inst| {
+                for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                     const result = func.instResult(inst) orelse continue;
-                    if (invariant[@intFromEnum(result)]) continue; // already hoisted/invariant
+                    if (invariant[@backingInt(result)]) continue; // already hoisted/invariant
                     if (!hoistable(func.opcode(inst))) continue;
                     if (!operandsInvariant(func, inst, invariant)) continue;
-                    invariant[@intFromEnum(result)] = true;
+                    invariant[@backingInt(result)] = true;
                     try to_hoist.append(allocator, .{ .inst = inst, .from = @intCast(bi) });
                     again = true;
                 }
@@ -154,7 +154,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         // Remove the hoisted instructions from their loop blocks.
         for (0..func.blockCount()) |bi| {
             if (!loop.contains(bi)) continue;
-            const insts = func.blockInstsMut(@enumFromInt(bi));
+            const insts = func.blockInstsMut(@fromBackingInt(@intCast(bi)));
             var w: usize = 0;
             for (insts.items) |inst| {
                 if (isHoisted(to_hoist.items, inst)) continue;
@@ -164,7 +164,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             insts.shrinkRetainingCapacity(w);
         }
         // Append them to the preheader (before its terminator), in order.
-        const pre_insts = func.blockInstsMut(@enumFromInt(pre));
+        const pre_insts = func.blockInstsMut(@fromBackingInt(@intCast(pre)));
         for (to_hoist.items) |h| try pre_insts.append(allocator, h.inst);
         changed = true;
     }
@@ -201,9 +201,9 @@ test "nvfp4 is hoistable only when all three operands are invariant" {
     @memset(invariant, true);
     try std.testing.expect(operandsInvariant(&func, inst, invariant));
     inline for (.{ payload, block_scale, global_scale }) |operand| {
-        invariant[@intFromEnum(operand)] = false;
+        invariant[@backingInt(operand)] = false;
         try std.testing.expect(!operandsInvariant(&func, inst, invariant));
-        invariant[@intFromEnum(operand)] = true;
+        invariant[@backingInt(operand)] = true;
     }
 }
 

@@ -128,7 +128,7 @@ pub fn instrument(allocator: std.mem.Allocator, func: *Function, counters_symbol
     const n = func.blockCount();
 
     for (0..n) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         const before = func.blockInsts(block).len;
 
         // counters[bi] += 1
@@ -274,10 +274,10 @@ test "guided inlining inlines hot calls and skips cold ones" {
     const caller = module.get("caller").?;
     var hot_calls: usize = 0;
     var cold_calls: usize = 0;
-    for (caller.blockInsts(@enumFromInt(1))) |inst| {
+    for (caller.blockInsts(@fromBackingInt(@intCast(1)))) |inst| {
         if (caller.opcode(inst) == .call) hot_calls += 1;
     }
-    for (caller.blockInsts(@enumFromInt(2))) |inst| {
+    for (caller.blockInsts(@fromBackingInt(@intCast(2)))) |inst| {
         if (caller.opcode(inst) == .call) cold_calls += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), hot_calls); // hot inlined

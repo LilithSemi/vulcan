@@ -169,7 +169,7 @@ pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
     // The text relocations, section-relative offsets already. Each `symbol` is the index
     // into `obj.symbols`. The emitter remaps it after its symbol sort.
     const text_relocs = try a.alloc(object_emit.OutReloc, obj.relocs.len);
-    for (obj.relocs, 0..) |r, i| text_relocs[i] = .{ .offset = r.offset, .symbol = r.symbol, .r_type = @intFromEnum(r.type), .addend = r.addend };
+    for (obj.relocs, 0..) |r, i| text_relocs[i] = .{ .offset = r.offset, .symbol = r.symbol, .r_type = @backingInt(r.type), .addend = r.addend };
 
     // The data pointer-init relocations, grouped by the section they modify. Each one is an
     // `R_RISCV_64` against the target symbol.
@@ -320,7 +320,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
         for (compiled.relocs) |r| {
             const off = @as(u64, r.offset) * 4;
             switch (r.kind) {
-                .call, .pcrel_hi20, .got_hi20 => try named_relocs.append(a, .{ .sec = sec_index, .offset = off, .name = r.symbol, .r_type = @intFromEnum(relocTypeOf(r.kind)) }),
+                .call, .pcrel_hi20, .got_hi20 => try named_relocs.append(a, .{ .sec = sec_index, .offset = off, .name = r.symbol, .r_type = @backingInt(relocTypeOf(r.kind)) }),
                 .pcrel_lo12 => {
                     // Synthesize a local label at the paired `auipc`. It lives in THIS
                     // function's section, at the `auipc`'s within-section byte offset (the
@@ -370,7 +370,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
     }
     // Attach each low reloc. Its symbol index (the local label) is already known.
     for (lo12_relocs.items) |p| {
-        try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = p.sym, .r_type = @intFromEnum(RelocType.pcrel_lo12_i) });
+        try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = p.sym, .r_type = @backingInt(RelocType.pcrel_lo12_i) });
     }
     // Resolve every data pointer-init relocation. Its target is an internally defined
     // global. It is an error if the target is missing.
@@ -435,7 +435,7 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
         for (compiled.relocs) |r| {
             const off = @as(u64, r.offset) * 4;
             switch (r.kind) {
-                .call, .pcrel_hi20, .got_hi20 => try named_relocs.append(a, .{ .sec = sec_index, .offset = off, .name = r.symbol, .r_type = @intFromEnum(relocTypeOf(r.kind)) }),
+                .call, .pcrel_hi20, .got_hi20 => try named_relocs.append(a, .{ .sec = sec_index, .offset = off, .name = r.symbol, .r_type = @backingInt(relocTypeOf(r.kind)) }),
                 .pcrel_lo12 => {
                     const aux_index: u32 = @intCast(symbols.items.len);
                     const name = try std.fmt.allocPrint(a, ".Lpcrel_hi{d}", .{aux_counter});
@@ -476,7 +476,7 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
         try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = sym, .r_type = p.r_type });
     }
     for (lo12_relocs.items) |p| {
-        try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = p.sym, .r_type = @intFromEnum(RelocType.pcrel_lo12_i) });
+        try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = p.sym, .r_type = @backingInt(RelocType.pcrel_lo12_i) });
     }
     // The debug variant must not drop a data global's own pointer inits: a second reconstruct
     // site is exactly where an additive field like this one silently goes missing if it is not
@@ -514,7 +514,7 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
 /// non-primitive return. Distinct primitives get distinct names so the base-type dedup keeps them apart.
 fn returnBaseType(func: *const Function) ?dwarf.BaseType {
     const ret_val = for (0..func.blocks.items.len) |bi| {
-        const term = func.terminator(@enumFromInt(bi)) orelse continue;
+        const term = func.terminator(@fromBackingInt(@intCast(bi))) orelse continue;
         switch (term) {
             .ret => |r| switch (r.count) {
                 0 => return null,

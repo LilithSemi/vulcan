@@ -114,7 +114,7 @@ const NumericBuilder = struct {
 pub fn expandLowFloat(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator.Error!bool {
     var has_low_float = false;
     for (0..func.blockCount()) |block_index| {
-        const block: Block = @enumFromInt(block_index);
+        const block: Block = @fromBackingInt(@intCast(block_index));
         for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
             .decode_low_float, .encode_low_float => {
                 has_low_float = true;
@@ -134,7 +134,7 @@ pub fn expandLowFloat(allocator: std.mem.Allocator, func: *Function) std.mem.All
     const bool_t = try func.types.intern(.bool);
 
     for (0..func.blockCount()) |block_index| {
-        const block: Block = @enumFromInt(block_index);
+        const block: Block = @fromBackingInt(@intCast(block_index));
         var contains_low_float = false;
         for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
             .decode_low_float, .encode_low_float => contains_low_float = true,
@@ -183,7 +183,7 @@ pub fn expandLowFloat(allocator: std.mem.Allocator, func: *Function) std.mem.All
 pub fn expandNvFp4(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator.Error!bool {
     var has_nvfp4 = false;
     for (0..func.blockCount()) |block_index| {
-        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(block_index)))) |inst| switch (func.opcode(inst)) {
             .dequantize_nvfp4, .quantize_nvfp4 => {
                 has_nvfp4 = true;
                 break;
@@ -201,7 +201,7 @@ pub fn expandNvFp4(allocator: std.mem.Allocator, func: *Function) std.mem.Alloca
     const bool_t = try func.types.intern(.bool);
 
     for (0..func.blockCount()) |block_index| {
-        const block: Block = @enumFromInt(block_index);
+        const block: Block = @fromBackingInt(@intCast(block_index));
         var contains_nvfp4 = false;
         for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
             .dequantize_nvfp4, .quantize_nvfp4 => contains_nvfp4 = true,
@@ -276,7 +276,7 @@ pub fn expandVectorLanesExcept(
 ) std.mem.Allocator.Error!bool {
     var changed = false;
     for (0..func.blockCount()) |block_index| {
-        const block: Block = @enumFromInt(block_index);
+        const block: Block = @fromBackingInt(@intCast(block_index));
         var has = false;
         for (func.blockInsts(block)) |inst| {
             if (isVectorLaneOp(func, inst) and !keep(func, inst)) {
@@ -375,7 +375,7 @@ fn buildLaneTree(func: *Function, out: *std.ArrayList(Inst), allocator: std.mem.
 pub fn expandF32Div(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator.Error!bool {
     var has_division = false;
     for (0..func.blockCount()) |block_index| {
-        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(block_index)))) |inst| switch (func.opcode(inst)) {
             .arith => |arith| if (arith.op == .div) switch (func.types.type_kind(func.valueType(func.instResult(inst).?))) {
                 .float => |kind| if (kind == .f32) {
                     has_division = true;
@@ -396,7 +396,7 @@ pub fn expandF32Div(allocator: std.mem.Allocator, func: *Function) std.mem.Alloc
     const bool_t = try func.types.intern(.bool);
 
     for (0..func.blockCount()) |block_index| {
-        const block: Block = @enumFromInt(block_index);
+        const block: Block = @fromBackingInt(@intCast(block_index));
         var contains_division = false;
         for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
             .arith => |arith| if (arith.op == .div and func.valueType(func.instResult(inst).?) == f32_t) {
@@ -605,7 +605,7 @@ test "expandF32Div replaces uses attributes and every scalar division in program
     defer diagnostics.deinit();
     try std.testing.expect(diagnostics.ok());
     for (0..func.blockCount()) |block_index| {
-        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(block_index)))) |inst| switch (func.opcode(inst)) {
             .arith => |arithmetic| if (arithmetic.op == .div and
                 func.valueType(func.instResult(inst).?) == f32_t)
             {
@@ -1102,7 +1102,7 @@ test "expandNvFp4 preserves program order and replaces uses across blocks" {
     defer diags.deinit();
     try std.testing.expect(diags.ok());
     for (0..func.blockCount()) |block_index| {
-        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(block_index)))) |inst| switch (func.opcode(inst)) {
             .dequantize_nvfp4, .quantize_nvfp4 => return error.TestUnexpectedResult,
             else => {},
         };
@@ -1343,7 +1343,7 @@ test "expandLowFloat replaces uses across blocks in program order" {
     defer diags.deinit();
     try std.testing.expect(diags.ok());
     for (0..func.blockCount()) |block_index| {
-        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(block_index)))) |inst| switch (func.opcode(inst)) {
             .decode_low_float, .encode_low_float => return error.TestUnexpectedResult,
             else => {},
         };
@@ -1475,7 +1475,7 @@ test "expandLowFloat leaves a function without conversions byte-for-byte unchang
 pub fn expandMulh(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator.Error!bool {
     var changed = false;
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         // Does this block hold a mulh? Rebuild its instruction list only if so.
         var has = false;
         for (func.blockInsts(block)) |inst| {
@@ -1682,7 +1682,7 @@ const Site = struct { block: Block, index: usize, mm: MatMul };
 /// the function holds none.
 fn findSite(func: *const Function) ?Site {
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         var branched = false;
         for (func.blockInsts(block), 0..) |inst, index| {
             switch (func.opcode(inst)) {
@@ -1891,7 +1891,7 @@ fn expandSite(allocator: std.mem.Allocator, func: *Function, site: Site) std.mem
     const next_a_row = try func.appendArithImm(nest.i_latch, ptr_t, .add, a_row, @as(i64, mm.k) * shape.elem_bytes);
     try func.setJump(nest.i_latch, nest.i_head, &.{ next_i, next_a_row, c_elem });
 
-    try layOutNest(allocator, func, @intFromEnum(preheader), old_block_count, nest);
+    try layOutNest(allocator, func, @backingInt(preheader), old_block_count, nest);
 }
 
 /// Put the blocks in an order where every block follows its immediate dominator.
@@ -1921,7 +1921,7 @@ fn layOutNest(
     const order = try allocator.alloc(Block, func.blockCount());
     defer allocator.free(order);
 
-    for (0..preheader_index + 1) |bi| order[bi] = @enumFromInt(bi);
+    for (0..preheader_index + 1) |bi| order[bi] = @fromBackingInt(@intCast(bi));
     const added = [_]Block{
         nest.i_head, nest.j_head,  nest.j_body,  nest.p_head,
         nest.p_body, nest.j_latch, nest.i_latch, nest.cont,
@@ -1930,7 +1930,7 @@ fn layOutNest(
 
     var next = preheader_index + 1 + added.len;
     for (preheader_index + 1..old_block_count) |bi| {
-        order[next] = @enumFromInt(bi);
+        order[next] = @fromBackingInt(@intCast(bi));
         next += 1;
     }
     std.debug.assert(next == order.len); // every block placed exactly once

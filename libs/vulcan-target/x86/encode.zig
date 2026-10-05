@@ -17,7 +17,7 @@ pub const Reg = enum(u3) {
 };
 
 fn n(r: Reg) u8 {
-    return @intFromEnum(r);
+    return @backingInt(r);
 }
 
 /// An encoded instruction: up to 15 bytes.
@@ -248,15 +248,15 @@ pub fn setcc(dst: Reg, cond: Cond) Inst {
     // Byte-addressability invariant: without a REX prefix, only eax/ecx/edx/ebx
     // (enum indices 0..3) have a low-byte alias (al/cl/dl/bl). esi/edi (4/5 are
     // esp/ebp, 6/7 are esi/edi) would silently misencode to a different register.
-    std.debug.assert(@intFromEnum(dst) < 4);
-    return Inst.of(&.{ 0x0F, 0x90 | @intFromEnum(cond), 0xC0 | n(dst) });
+    std.debug.assert(@backingInt(dst) < 4);
+    return Inst.of(&.{ 0x0F, 0x90 | @backingInt(cond), 0xC0 | n(dst) });
 }
 
 /// `movzx dst, src8` (0F B6 /r): zero-extend `src`'s low byte. `src` must be 0..3.
 pub fn movzxByte(dst: Reg, src: Reg) Inst {
     // Byte-addressability invariant: `src`'s low byte is read directly (al/cl/dl/bl),
     // so without a REX prefix `src` MUST be eax/ecx/edx/ebx (enum indices 0..3).
-    std.debug.assert(@intFromEnum(src) < 4);
+    std.debug.assert(@backingInt(src) < 4);
     return Inst.of(&.{ 0x0F, 0xB6, modrm(dst, src) });
 }
 
@@ -264,7 +264,7 @@ pub fn movzxByte(dst: Reg, src: Reg) Inst {
 pub fn movsxByte(dst: Reg, src: Reg) Inst {
     // Byte-addressability invariant: `src`'s low byte is read directly (al/cl/dl/bl),
     // so without a REX prefix `src` MUST be eax/ecx/edx/ebx (enum indices 0..3).
-    std.debug.assert(@intFromEnum(src) < 4);
+    std.debug.assert(@backingInt(src) < 4);
     return Inst.of(&.{ 0x0F, 0xBE, modrm(dst, src) });
 }
 
@@ -283,7 +283,7 @@ pub fn movsxWord(dst: Reg, src: Reg) Inst {
 /// `jcc rel32` (0F 80+cc cd).
 pub fn jcc(cond: Cond, rel: i32) Inst {
     const b = imm32(rel);
-    return Inst.of(&.{ 0x0F, 0x80 | @intFromEnum(cond), b[0], b[1], b[2], b[3] });
+    return Inst.of(&.{ 0x0F, 0x80 | @backingInt(cond), b[0], b[1], b[2], b[3] });
 }
 
 /// `jmp rel32` (E9 cd).

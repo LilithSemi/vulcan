@@ -413,11 +413,11 @@ fn emitFunction(
     defer func.allocator.free(is_entry_param);
     @memset(is_entry_param, false);
 
-    const entry: Block = @enumFromInt(0);
+    const entry: Block = @fromBackingInt(@intCast(0));
     var next_local: u32 = 0;
     for (func.blockParams(entry)) |param| {
-        is_entry_param[@intFromEnum(param)] = true;
-        value_local[@intFromEnum(param)] = next_local;
+        is_entry_param[@backingInt(param)] = true;
+        value_local[@backingInt(param)] = next_local;
         next_local += 1;
     }
 
@@ -425,7 +425,7 @@ fn emitFunction(
     for (leb_order) |vt| {
         for (0..val_count) |vi| {
             if (is_entry_param[vi]) continue;
-            const ty = func.valueType(@enumFromInt(vi));
+            const ty = func.valueType(@fromBackingInt(@intCast(vi)));
             const vvt = valueValtype(types, ty) orelse continue;
             if (vvt != vt) continue;
             value_local[vi] = next_local;
@@ -439,11 +439,11 @@ fn emitFunction(
     @memset(alloca_off, 0);
     var frame_size: u32 = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             switch (func.opcode(inst)) {
                 .alloca => |al| {
                     frame_size = std.mem.alignForward(u32, frame_size, typeAlign(types, al.elem));
-                    if (func.instResult(inst)) |rv| alloca_off[@intFromEnum(rv)] = frame_size;
+                    if (func.instResult(inst)) |rv| alloca_off[@backingInt(rv)] = frame_size;
                     frame_size += typeSize(types, al.elem);
                 },
                 else => {},
@@ -477,13 +477,13 @@ fn emitFunction(
     // Emit the locals vector: the group count, then a (count, valtype) pair per group.
     // The saved-sp local is appended as its own trailing i32 group, so it does not shift
     // the grouped value-local indices.
-    var group_counts = [_]u32{0} ** leb_order.len;
+    var group_counts: [leb_order.len]u32 = @splat(0);
     var n_groups: u32 = 0;
     for (leb_order, 0..) |vt, gi| {
         var count: u32 = 0;
         for (0..val_count) |vi| {
             if (is_entry_param[vi]) continue;
-            const ty = func.valueType(@enumFromInt(vi));
+            const ty = func.valueType(@fromBackingInt(@intCast(vi)));
             const vvt = valueValtype(types, ty) orelse continue;
             if (vvt != vt) continue;
             count += leafCount(types, ty);
@@ -537,7 +537,7 @@ fn emitFunction(
     // already an implicit block. So its instructions and the returned value sit at
     // function scope, where the final `end` returns them.
     if (func.blockCount() == 1) {
-        const block: Block = @enumFromInt(0);
+        const block: Block = @fromBackingInt(@intCast(0));
         for (func.blockInsts(block)) |inst| {
             try emitInst(func, types, value_local, alloca_off, frame, half, inst, code, leb_buf, allocator, resolver);
         }
@@ -548,7 +548,7 @@ fn emitFunction(
                     0 => {},
                     1 => {
                         try code.append(allocator, encode.LocalOp.local_get);
-                        try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(r.values[0])])));
+                        try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(r.values[0])])));
                     },
                     else => return error.Unsupported, // multi-value struct return not yet lowered
                 },
@@ -646,11 +646,11 @@ fn cfAttrInt(func: *const Function, block: Block, key: []const u8) ?usize {
 /// a simple diamond's join.
 fn mergeOf(func: *const Function, block: Block) ?usize {
     const iff = blockIf(func, block) orelse return null;
-    if (iff.then.target == iff.@"else".target) return @intFromEnum(iff.then.target);
+    if (iff.then.target == iff.@"else".target) return @backingInt(iff.then.target);
     if (cfAttrInt(func, block, "merge")) |m| return m;
     const tt = func.terminator(iff.then.target) orelse return null;
     const et = func.terminator(iff.@"else".target) orelse return null;
-    if (tt == .jump and et == .jump and tt.jump.target == et.jump.target) return @intFromEnum(tt.jump.target);
+    if (tt == .jump and et == .jump and tt.jump.target == et.jump.target) return @backingInt(tt.jump.target);
     return null;
 }
 
@@ -689,13 +689,13 @@ fn emitEdgeMoves(ctx: *const EmitCtx, args: ir.function.ValueList, target: Block
     if (arg_vals.len != params.len) return error.Unsupported;
     for (arg_vals) |a| {
         try ctx.code.append(ctx.allocator, encode.LocalOp.local_get);
-        try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@intFromEnum(a)])));
+        try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@backingInt(a)])));
     }
     var k = params.len;
     while (k > 0) {
         k -= 1;
         try ctx.code.append(ctx.allocator, encode.LocalOp.local_set);
-        try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@intFromEnum(params[k])])));
+        try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@backingInt(params[k])])));
     }
 }
 
@@ -703,7 +703,7 @@ fn emitEdgeMoves(ctx: *const EmitCtx, args: ir.function.ValueList, target: Block
 /// enclosing scope, fall through to an enclosing merge, or inline the target region.
 fn emitEdge(ctx: *const EmitCtx, target: Block, args: ir.function.ValueList) Error!void {
     try emitEdgeMoves(ctx, args, target);
-    const tidx = @intFromEnum(target);
+    const tidx = @backingInt(target);
     if (scopeDepth(ctx, tidx)) |depth| {
         try ctx.code.append(ctx.allocator, encode.ControlOp.br);
         try ctx.code.append(ctx.allocator, @as(u8, @intCast(depth)));
@@ -718,7 +718,7 @@ fn emitRet(ctx: *const EmitCtx, r: Ret) Error!void {
         0 => {},
         1 => {
             try ctx.code.append(ctx.allocator, encode.LocalOp.local_get);
-            try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@intFromEnum(r.values[0])])));
+            try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@backingInt(r.values[0])])));
         },
         else => return error.Unsupported, // multi-value struct return not yet lowered
     }
@@ -738,7 +738,7 @@ fn emitBlockBody(ctx: *const EmitCtx, block: Block) Error!void {
 fn emitRegion(ctx: *const EmitCtx, block_idx: usize) Error!void {
     if (ctx.visited[block_idx]) return;
     ctx.visited[block_idx] = true;
-    const block: Block = @enumFromInt(block_idx);
+    const block: Block = @fromBackingInt(@intCast(block_idx));
 
     if (isLoopHeader(ctx.func, block)) {
         try emitLoop(ctx, block_idx);
@@ -762,10 +762,10 @@ fn emitRegion(ctx: *const EmitCtx, block_idx: usize) Error!void {
 /// Emit an `if` as wasm if/else. Both arms take their edge to the merge, which is
 /// emitted after the if/else closes.
 fn emitSelection(ctx: *const EmitCtx, block_idx: usize, iff: ir.function.If) Error!void {
-    const merge = mergeOf(ctx.func, @enumFromInt(block_idx)) orelse return error.Unsupported;
+    const merge = mergeOf(ctx.func, @fromBackingInt(@intCast(block_idx))) orelse return error.Unsupported;
 
     try ctx.code.append(ctx.allocator, encode.LocalOp.local_get);
-    try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@intFromEnum(iff.cond)])));
+    try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@backingInt(iff.cond)])));
     try ctx.code.append(ctx.allocator, encode.ControlOp.if_);
     try ctx.code.append(ctx.allocator, encode.BlockType.empty.toByte());
 
@@ -791,7 +791,7 @@ fn emitSelection(ctx: *const EmitCtx, block_idx: usize, iff: ir.function.If) Err
 /// re-evaluates its condition each iteration. One arm continues the loop, and the other
 /// arm, the merge, exits it.
 fn emitLoop(ctx: *const EmitCtx, header_idx: usize) Error!void {
-    const header: Block = @enumFromInt(header_idx);
+    const header: Block = @fromBackingInt(@intCast(header_idx));
     const iff = blockIf(ctx.func, header).?;
     const exit = mergeOf(ctx.func, header) orelse return error.Unsupported;
 
@@ -800,12 +800,12 @@ fn emitLoop(ctx: *const EmitCtx, header_idx: usize) Error!void {
     var body_args: ir.function.ValueList = undefined;
     var exit_args: ir.function.ValueList = undefined;
     var break_when_true: bool = undefined;
-    if (@intFromEnum(iff.@"else".target) == exit) {
+    if (@backingInt(iff.@"else".target) == exit) {
         body_target = iff.then.target;
         body_args = iff.then.args;
         exit_args = iff.@"else".args;
         break_when_true = false;
-    } else if (@intFromEnum(iff.then.target) == exit) {
+    } else if (@backingInt(iff.then.target) == exit) {
         body_target = iff.@"else".target;
         body_args = iff.@"else".args;
         exit_args = iff.then.args;
@@ -822,9 +822,9 @@ fn emitLoop(ctx: *const EmitCtx, header_idx: usize) Error!void {
     try emitBlockBody(ctx, header);
 
     // Set the exit block's params, then break out when the loop condition is done.
-    try emitEdgeMoves(ctx, exit_args, @enumFromInt(exit));
+    try emitEdgeMoves(ctx, exit_args, @fromBackingInt(@intCast(exit)));
     try ctx.code.append(ctx.allocator, encode.LocalOp.local_get);
-    try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@intFromEnum(iff.cond)])));
+    try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@backingInt(iff.cond)])));
     if (!break_when_true) try ctx.code.append(ctx.allocator, encode.I32Op.eqz);
     try ctx.code.append(ctx.allocator, encode.ControlOp.br_if);
     try ctx.code.append(ctx.allocator, @as(u8, @intCast(scopeDepth(ctx, exit).?)));
@@ -837,7 +837,7 @@ fn emitLoop(ctx: *const EmitCtx, header_idx: usize) Error!void {
     // the continue block, so every path `br`s to it. Then emit its code once, after the
     // inner block closes.
     const cont_b = cfAttrInt(ctx.func, header, "continue");
-    if (cont_b != null and cont_b.? != @intFromEnum(body_target)) {
+    if (cont_b != null and cont_b.? != @backingInt(body_target)) {
         const cb = cont_b.?;
         try ctx.code.append(ctx.allocator, encode.ControlOp.block);
         try ctx.code.append(ctx.allocator, encode.BlockType.empty.toByte());
@@ -848,8 +848,8 @@ fn emitLoop(ctx: *const EmitCtx, header_idx: usize) Error!void {
 
         // The continue block itself: its increment instructions, then its back-edge.
         ctx.visited[cb] = true;
-        try emitBlockBody(ctx, @enumFromInt(cb));
-        if (ctx.func.terminator(@enumFromInt(cb))) |term| switch (term) {
+        try emitBlockBody(ctx, @fromBackingInt(@intCast(cb)));
+        if (ctx.func.terminator(@fromBackingInt(@intCast(cb)))) |term| switch (term) {
             .jump => |j| try emitEdge(ctx, j.target, j.args),
             .ret => |r| try emitRet(ctx, r),
         } else try emitRet(ctx, Ret.none());
@@ -910,7 +910,7 @@ fn emitInst(
             }
             if (result) |rv| {
                 try code.append(allocator, encode.LocalOp.local_set);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
             }
         },
         .fconst => |fval| {
@@ -942,7 +942,7 @@ fn emitInst(
             }
             if (result) |rv| {
                 try code.append(allocator, encode.LocalOp.local_set);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
             }
         },
         .arith => |a| {
@@ -952,7 +952,7 @@ fn emitInst(
             if (a.op == .mulh) return error.Unsupported; // no immediate high-multiply form
             // Materialize imm as a const, then arith.
             const ty = if (result) |r| func.valueType(r) else func.valueType(a.lhs);
-            const lhs_local = value_local[@intFromEnum(a.lhs)];
+            const lhs_local = value_local[@backingInt(a.lhs)];
 
             // Push lhs
             try code.append(allocator, encode.LocalOp.local_get);
@@ -1002,15 +1002,15 @@ fn emitInst(
             // Store result
             if (result) |rv| {
                 try code.append(allocator, encode.LocalOp.local_set);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
             }
         },
         .icmp => |c| {
             // The comparison op is chosen from the operand type. The result type is
             // always bool, so keying off the result would always pick eq.
             const ty = func.valueType(c.lhs);
-            const lhs_local = value_local[@intFromEnum(c.lhs)];
-            const rhs_local = value_local[@intFromEnum(c.rhs)];
+            const lhs_local = value_local[@backingInt(c.lhs)];
+            const rhs_local = value_local[@backingInt(c.rhs)];
 
             try code.append(allocator, encode.LocalOp.local_get);
             try code.append(allocator, @as(u8, @intCast(lhs_local)));
@@ -1038,15 +1038,15 @@ fn emitInst(
 
             if (result) |rv| {
                 try code.append(allocator, encode.LocalOp.local_set);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
             }
         },
         .select => |s| {
             // Wasm `select` is [v1, v2, cond] -> cond ? v1 : v2. So push `then` first, as
             // v1, and `else` second, as v2. This matches the IR `cond ? then : else`.
-            const else_local = value_local[@intFromEnum(s.@"else")];
-            const then_local = value_local[@intFromEnum(s.then)];
-            const cond_local = value_local[@intFromEnum(s.cond)];
+            const else_local = value_local[@backingInt(s.@"else")];
+            const then_local = value_local[@backingInt(s.then)];
+            const cond_local = value_local[@backingInt(s.cond)];
             try code.append(allocator, encode.LocalOp.local_get);
             try code.append(allocator, @as(u8, @intCast(then_local)));
             try code.append(allocator, encode.LocalOp.local_get);
@@ -1056,7 +1056,7 @@ fn emitInst(
             try code.append(allocator, encode.ControlOp.select);
             if (result) |rv| {
                 try code.append(allocator, encode.LocalOp.local_set);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
             }
         },
         .convert => |cv| {
@@ -1064,7 +1064,7 @@ fn emitInst(
             const dst_ty = if (result) |r| func.valueType(r) else src_ty;
             const s = convClass(types, src_ty) orelse return error.Unsupported;
             const d = convClass(types, dst_ty) orelse return error.Unsupported;
-            const src_local = value_local[@intFromEnum(cv.value)];
+            const src_local = value_local[@backingInt(cv.value)];
 
             try code.append(allocator, encode.LocalOp.local_get);
             try code.append(allocator, @as(u8, @intCast(src_local)));
@@ -1111,13 +1111,13 @@ fn emitInst(
 
             if (result) |rv| {
                 try code.append(allocator, encode.LocalOp.local_set);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
             }
         },
         .unary => |u| {
             const ty = if (result) |r| func.valueType(r) else func.valueType(u.value);
             const kind = types.type_kind(ty);
-            const src_local = value_local[@intFromEnum(u.value)];
+            const src_local = value_local[@backingInt(u.value)];
 
             try code.append(allocator, encode.LocalOp.local_get);
             try code.append(allocator, @as(u8, @intCast(src_local)));
@@ -1181,11 +1181,11 @@ fn emitInst(
 
             if (result) |rv| {
                 try code.append(allocator, encode.LocalOp.local_set);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
             }
         },
         .load => |ld| {
-            const ptr_local = value_local[@intFromEnum(ld.ptr)];
+            const ptr_local = value_local[@backingInt(ld.ptr)];
             const ty = if (result) |r| func.valueType(r) else func.valueType(ld.ptr);
             try code.append(allocator, encode.LocalOp.local_get);
             try code.append(allocator, @as(u8, @intCast(ptr_local)));
@@ -1201,12 +1201,12 @@ fn emitInst(
             }
             if (result) |rv| {
                 try code.append(allocator, encode.LocalOp.local_set);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
             }
         },
         .store => |st| {
-            const val_local = value_local[@intFromEnum(st.value)];
-            const ptr_local = value_local[@intFromEnum(st.ptr)];
+            const val_local = value_local[@backingInt(st.value)];
+            const ptr_local = value_local[@backingInt(st.ptr)];
             const val_ty = func.valueType(st.value);
             // Wasm store pops the value from the top of the stack, then the address. So
             // push the address first.
@@ -1253,14 +1253,14 @@ fn emitInst(
             const callee = res.funcIndex(func.symbolName(c.symbol)) orelse return error.Unsupported;
             for (func.valueList(c.args)) |arg| {
                 try code.append(allocator, encode.LocalOp.local_get);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(arg)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(arg)])));
             }
             try code.append(allocator, encode.ControlOp.call);
             const n = encode.encodeU32leb(leb_buf, callee);
             try code.appendSlice(allocator, leb_buf[0..n]);
             if (result) |rv| {
                 try code.append(allocator, encode.LocalOp.local_set);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
             }
         },
         .call_indirect => |ci| {
@@ -1272,10 +1272,10 @@ fn emitInst(
 
             for (args) |arg| {
                 try code.append(allocator, encode.LocalOp.local_get);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(arg)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(arg)])));
             }
             try code.append(allocator, encode.LocalOp.local_get);
-            try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(ci.target)])));
+            try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(ci.target)])));
 
             var pbuf: [16]encode.ValType = undefined;
             if (args.len > pbuf.len) return error.Unsupported;
@@ -1298,14 +1298,14 @@ fn emitInst(
 
             if (result) |rv| {
                 try code.append(allocator, encode.LocalOp.local_set);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
             }
         },
         .alloca => {
             // The address of this alloca's slot: sp + offset when the function has a
             // stack frame, else a static offset from memory base 0.
             const rv = result orelse return error.Unsupported;
-            const off = alloca_off[@intFromEnum(rv)];
+            const off = alloca_off[@backingInt(rv)];
             if (frame) |fr| {
                 try code.append(allocator, encode.GlobalOp.global_get);
                 try code.append(allocator, @as(u8, @intCast(fr.sp_global)));
@@ -1321,7 +1321,7 @@ fn emitInst(
                 try code.appendSlice(allocator, leb_buf[0..n]);
             }
             try code.append(allocator, encode.LocalOp.local_set);
-            try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+            try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
         },
         .global_addr => {
             // Named globals need a data and global layout that the wasm target does not lay
@@ -1332,11 +1332,11 @@ fn emitInst(
             // The aggregate occupies a contiguous run of locals. Copy each field
             // value into its slot.
             const rv = result orelse return error.Unsupported;
-            const base = value_local[@intFromEnum(rv)];
+            const base = value_local[@backingInt(rv)];
             if (base == 0xFFFFFFFF) return error.Unsupported;
             for (func.valueList(sn.fields), 0..) |field, i| {
                 try code.append(allocator, encode.LocalOp.local_get);
-                try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(field)])));
+                try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(field)])));
                 try code.append(allocator, encode.LocalOp.local_set);
                 try code.append(allocator, @as(u8, @intCast(base + i)));
             }
@@ -1344,12 +1344,12 @@ fn emitInst(
         .extract => |ex| {
             // Read the field's slot out of the aggregate's contiguous local run.
             const rv = result orelse return error.Unsupported;
-            const base = value_local[@intFromEnum(ex.aggregate)];
+            const base = value_local[@backingInt(ex.aggregate)];
             if (base == 0xFFFFFFFF) return error.Unsupported;
             try code.append(allocator, encode.LocalOp.local_get);
             try code.append(allocator, @as(u8, @intCast(base + ex.index)));
             try code.append(allocator, encode.LocalOp.local_set);
-            try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+            try code.append(allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
         },
         .@"if" => {
             // The structured emitter handles `if` at the block level. It never emits `if`
@@ -1468,8 +1468,8 @@ fn emitArith(
     // magic-divide lowering emits mulh.
     if (op == .mulh) return error.Unsupported;
     const ty = if (result) |r| func.valueType(r) else func.valueType(lhs);
-    const lhs_local = value_local[@intFromEnum(lhs)];
-    const rhs_local = value_local[@intFromEnum(rhs)];
+    const lhs_local = value_local[@backingInt(lhs)];
+    const rhs_local = value_local[@backingInt(rhs)];
 
     try code.append(func.allocator, encode.LocalOp.local_get);
     try code.append(func.allocator, @as(u8, @intCast(lhs_local)));
@@ -1529,7 +1529,7 @@ fn emitArith(
 
     if (result) |rv| {
         try code.append(func.allocator, encode.LocalOp.local_set);
-        try code.append(func.allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
+        try code.append(func.allocator, @as(u8, @intCast(value_local[@backingInt(rv)])));
     }
 }
 

@@ -50,7 +50,7 @@ pub fn neutralizeUnreachable(allocator: std.mem.Allocator, func: *Function) Erro
         // Each block is pushed at most once (guarded by `reachable`), so the
         // outer walk is bounded by `nblocks`.
         while (stack.pop()) |bi| {
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             for (func.blockInsts(block)) |inst| {
                 switch (func.opcode(inst)) {
                     .@"if" => |cf| {
@@ -72,7 +72,7 @@ pub fn neutralizeUnreachable(allocator: std.mem.Allocator, func: *Function) Erro
     // Neutralize every unreachable block. Bounded by `nblocks`.
     for (0..nblocks) |bi| {
         if (reachable[bi]) continue;
-        const dead: Block = @enumFromInt(bi);
+        const dead: Block = @fromBackingInt(@intCast(bi));
         try func.setBlockParams(dead, &.{});
         func.blockInstsMut(dead).clearRetainingCapacity();
         func.terminatorPtr(dead).* = null;
@@ -83,7 +83,7 @@ pub fn neutralizeUnreachable(allocator: std.mem.Allocator, func: *Function) Erro
 
 /// Mark `target` reachable and queue it if this is the first time it is seen.
 fn visitSucc(allocator: std.mem.Allocator, reachable: []bool, stack: *std.ArrayList(u32), target: Block) Error!void {
-    const ti = @intFromEnum(target);
+    const ti = @backingInt(target);
     if (reachable[ti]) return;
     reachable[ti] = true;
     try stack.append(allocator, ti);

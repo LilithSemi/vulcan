@@ -267,7 +267,7 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
 /// for a void return or a non-primitive return.
 fn returnBaseType(func: *const ir.function.Function) ?dwarf.BaseType {
     const ret_val = for (0..func.blocks.items.len) |bi| {
-        const term = func.terminator(@enumFromInt(bi)) orelse continue;
+        const term = func.terminator(@fromBackingInt(@intCast(bi))) orelse continue;
         switch (term) {
             .ret => |r| switch (r.count) {
                 0 => return null,
@@ -347,7 +347,7 @@ test "isel collects source-line rows from debug.line attributes" {
     const x = try func.appendBlockParam(b, t);
     const add_idx = func.instCount();
     const s = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
-    try func.addAttr(.{ .inst = @enumFromInt(@as(u32, @intCast(add_idx))) }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 7 } } });
+    try func.addAttr(.{ .inst = @fromBackingInt(@intCast(@as(u32, @intCast(add_idx)))) }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 7 } } });
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     var compiled = try isel.compile(allocator, &func);

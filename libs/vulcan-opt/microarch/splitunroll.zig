@@ -109,7 +109,7 @@ fn splitFactor(model: *const mm.Model, latency: u32) u32 {
 }
 
 fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Model, loop: *const loops.Loop, fast_math: bool) Error!?Plan {
-    const header: Block = @enumFromInt(loop.header);
+    const header: Block = @fromBackingInt(@intCast(loop.header));
     const preheader = loop.preheader orelse return null;
 
     // Innermost only: no other loop header inside this loop's body.
@@ -120,8 +120,8 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     var body: ?Block = null;
     var in_loop_blocks: usize = 0;
     for (0..func.blockCount()) |bi| {
-        const b: Block = @enumFromInt(bi);
-        if (@intFromEnum(b) >= loop.body.len or !loop.body[bi]) continue;
+        const b: Block = @fromBackingInt(@intCast(bi));
+        if (@backingInt(b) >= loop.body.len or !loop.body[bi]) continue;
         in_loop_blocks += 1;
         if (b == header) continue;
         const term = func.terminator(b) orelse return null;
@@ -241,7 +241,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         };
         // The accumulator body-alias must be used ONLY by its update (so splitting cannot change a
         // side effect or another value that observed the running total).
-        if (uses[@intFromEnum(bparams[k])] != 1) {
+        if (uses[@backingInt(bparams[k])] != 1) {
             reductions.deinit(allocator);
             return null;
         }
@@ -270,7 +270,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     return Plan{
         .header = header,
         .body = bodyb,
-        .preheader = @enumFromInt(preheader),
+        .preheader = @fromBackingInt(@intCast(preheader)),
         .exit_cond = cmp.op,
         .bound = bound,
         .induction = induction,
@@ -336,8 +336,8 @@ fn definedInLoop(func: *const Function, loop: *const loops.Loop, v: Value) bool 
     };
     // Find the defining instruction's block.
     for (0..func.blockCount()) |bi| {
-        if (@intFromEnum(@as(Block, @enumFromInt(bi))) >= loop.body.len) break;
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        if (@backingInt(@as(Block, @fromBackingInt(@intCast(bi)))) >= loop.body.len) break;
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (inst == di) return bi < loop.body.len and loop.body[bi];
         }
     }
@@ -346,7 +346,7 @@ fn definedInLoop(func: *const Function, loop: *const loops.Loop, v: Value) bool 
 
 fn paramBlockInLoop(func: *const Function, loop: *const loops.Loop, v: Value) bool {
     for (0..func.blockCount()) |bi| {
-        for (func.blockParams(@enumFromInt(bi))) |p| {
+        for (func.blockParams(@fromBackingInt(@intCast(bi)))) |p| {
             if (p == v) return bi < loop.body.len and loop.body[bi];
         }
     }
@@ -608,11 +608,11 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
     @memset(counts, 0);
     const bump = struct {
         fn f(c: []u32, v: Value) void {
-            c[@intFromEnum(v)] += 1;
+            c[@backingInt(v)] += 1;
         }
     }.f;
     for (0..func.instCount()) |i| {
-        switch (func.opcode(@enumFromInt(i))) {
+        switch (func.opcode(@fromBackingInt(@intCast(i)))) {
             .atomic_rmw => |x| {
                 bump(counts, x.ptr);
                 bump(counts, x.value);
@@ -678,7 +678,7 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
         }
     }
     for (0..func.blockCount()) |bi| {
-        if (func.terminator(@enumFromInt(bi))) |term| switch (term) {
+        if (func.terminator(@fromBackingInt(@intCast(bi)))) |term| switch (term) {
             .ret => |r| for (r.slice()) |vv| bump(counts, vv),
             .jump => |jm| for (func.blockArgs(jm)) |v| bump(counts, v),
         };
@@ -987,7 +987,7 @@ test "a body far past the old 6-instruction ceiling now splits, sized off the op
 
     // Structure: the main header (appended 4th, right after entry/header/body/done) carries the
     // induction variable plus K partials for the one accumulator.
-    const mainheader: Block = @enumFromInt(4);
+    const mainheader: Block = @fromBackingInt(@intCast(4));
     try std.testing.expectEqual(@as(usize, 1 + 4), func.blockParams(mainheader).len);
 }
 

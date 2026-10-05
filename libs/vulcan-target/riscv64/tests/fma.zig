@@ -43,7 +43,7 @@ fn buildFmaFunc(allocator: std.mem.Allocator, dbl: bool, shape: FmaShape) !Funct
 
 /// The unsigned integer type with T's bit width, for bit-exact (not `==`) float comparison.
 fn Bits(comptime T: type) type {
-    return std.meta.Int(.unsigned, @bitSizeOf(T));
+    return @Int(.unsigned, @bitSizeOf(T));
 }
 
 /// Build, compile, and check the FMA `shape` in precision `T` on the operands given as raw bit

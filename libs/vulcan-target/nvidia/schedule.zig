@@ -389,8 +389,8 @@ fn dstSpan(opcode: u32, inst: Inst) u32 {
     // the high half emitted no wait and took the address dword STALE, and a later write to
     // it got no write-after-write protection either.
     if (opcode == 0x981 or opcode == 0x984 or opcode == 0xb82) return switch (getField(inst, 73, 3)) {
-        @intFromEnum(encode.MemType.b64) => 2,
-        @intFromEnum(encode.MemType.b128) => 4,
+        @backingInt(encode.MemType.b64) => 2,
+        @backingInt(encode.MemType.b128) => 4,
         else => 1,
     };
     // IMAD.WIDE writes a 64-BIT RESULT into the register pair (dst, dst + 1), in both its
@@ -404,7 +404,7 @@ fn dstSpan(opcode: u32, inst: Inst) u32 {
     if (opcode == encode.ATOMG_OPCODE or opcode == encode.ATOMS_OPCODE or
         opcode == encode.ATOMG_CAS_OPCODE or opcode == encode.ATOMS_CAS_OPCODE)
         return switch (getField(inst, 73, 4)) {
-            @intFromEnum(encode.AtomType.u64), @intFromEnum(encode.AtomType.i64) => 2,
+            @backingInt(encode.AtomType.u64), @backingInt(encode.AtomType.i64) => 2,
             else => 1,
         };
     // A tensor op writes a RUN of registers per lane, and the run length is in the
@@ -412,7 +412,7 @@ fn dstSpan(opcode: u32, inst: Inst) u32 {
     // 128 values. An fp32 result takes one register per value, and an fp16 result packs
     // two values per register. The result type is bit 76.
     if (opcode == encode.HMMA_OPCODE)
-        return if (getField(inst, 76, 1) == @intFromEnum(encode.HmmaDstType.f32)) 4 else 2;
+        return if (getField(inst, 76, 1) == @backingInt(encode.HmmaDstType.f32)) 4 else 2;
     // An IMMA result is int32 whatever the input width is, so one register per value. An
     // m8n8 tile holds 64 values over 32 lanes, that is 2 per lane, and an m16n8 tile holds
     // 128, that is 4. The tile selector is split across bit 75 and bits 85..87.
@@ -425,10 +425,10 @@ fn dstSpan(opcode: u32, inst: Inst) u32 {
     if (opcode == encode.IMMA_OPCODE) {
         const tile: u3 = @intCast(getField(inst, 75, 1) | (getField(inst, 85, 2) << 1));
         return switch (tile) {
-            @intFromEnum(encode.ImmaSize.m8n8k16), @intFromEnum(encode.ImmaSize.m8n8k32) => 2,
-            @intFromEnum(encode.ImmaSize.m16n8k16),
-            @intFromEnum(encode.ImmaSize.m16n8k32),
-            @intFromEnum(encode.ImmaSize.m16n8k64),
+            @backingInt(encode.ImmaSize.m8n8k16), @backingInt(encode.ImmaSize.m8n8k32) => 2,
+            @backingInt(encode.ImmaSize.m16n8k16),
+            @backingInt(encode.ImmaSize.m16n8k32),
+            @backingInt(encode.ImmaSize.m16n8k64),
             => 4,
             // 1, 3 and 7 are gaps in the NAK table and the encoder cannot produce them.
             // The smallest span never tags a register the op does not write.
@@ -440,9 +440,9 @@ fn dstSpan(opcode: u32, inst: Inst) u32 {
     if (opcode == encode.LDSM_OPCODE) {
         const count: u2 = @intCast(getField(inst, 72, 2));
         return switch (count) {
-            @intFromEnum(encode.LdsmCount.x1) => 1,
-            @intFromEnum(encode.LdsmCount.x2) => 2,
-            @intFromEnum(encode.LdsmCount.x4) => 4,
+            @backingInt(encode.LdsmCount.x1) => 1,
+            @backingInt(encode.LdsmCount.x2) => 2,
+            @backingInt(encode.LdsmCount.x4) => 4,
             // NAK panics on any other count and the encoder cannot produce one.
             3 => 1,
         };
@@ -494,8 +494,8 @@ fn srcSpan(opcode: u32, inst: Inst, pos: usize) u32 {
     // alone stores a stale address dword.
     if ((opcode == 0x986 or opcode == 0x988) and pos == 32)
         return switch (getField(inst, 73, 3)) {
-            @intFromEnum(encode.MemType.b64) => 2,
-            @intFromEnum(encode.MemType.b128) => 4,
+            @backingInt(encode.MemType.b64) => 2,
+            @backingInt(encode.MemType.b128) => 4,
             else => 1,
         };
     // The atomics take their operands at the atomic width, which is the WIDER 4-bit field
@@ -507,7 +507,7 @@ fn srcSpan(opcode: u32, inst: Inst, pos: usize) u32 {
         opcode == encode.ATOMS_CAS_OPCODE)
     {
         if (pos == 32 or pos == 64) return switch (getField(inst, 73, 4)) {
-            @intFromEnum(encode.AtomType.u64), @intFromEnum(encode.AtomType.i64) => 2,
+            @backingInt(encode.AtomType.u64), @backingInt(encode.AtomType.i64) => 2,
             else => 1,
         };
     }
@@ -612,9 +612,9 @@ fn texLodRegs(mode: u4) u32 {
 /// register. The floor to one register never names a register the tile does not read.
 fn hmmaOperandRegs(tile: u2, is_b: bool) u32 {
     const shape: struct { m: u32, n: u32, k: u32 } = switch (tile) {
-        @intFromEnum(encode.HmmaSize.m16n8k8) => .{ .m = 16, .n = 8, .k = 8 },
-        @intFromEnum(encode.HmmaSize.m16n8k16) => .{ .m = 16, .n = 8, .k = 16 },
-        @intFromEnum(encode.HmmaSize.m16n8k4) => .{ .m = 16, .n = 8, .k = 4 },
+        @backingInt(encode.HmmaSize.m16n8k8) => .{ .m = 16, .n = 8, .k = 8 },
+        @backingInt(encode.HmmaSize.m16n8k16) => .{ .m = 16, .n = 8, .k = 16 },
+        @backingInt(encode.HmmaSize.m16n8k4) => .{ .m = 16, .n = 8, .k = 4 },
         // 3 is a gap in the NAK table and the encoder cannot produce it. The smallest span
         // never names a register the op does not read.
         3 => return 1,
@@ -633,11 +633,11 @@ fn hmmaOperandRegs(tile: u2, is_b: bool) u32 {
 /// `m16n8k32` reads 4 and 2 at 8 bits or 2 and 1 at 4 bits, and `m16n8k64` reads 4 and 2.
 fn immaOperandRegs(tile: u3, four_bit: bool, is_b: bool) u32 {
     const shape: struct { m: u32, n: u32, k: u32 } = switch (tile) {
-        @intFromEnum(encode.ImmaSize.m8n8k16) => .{ .m = 8, .n = 8, .k = 16 },
-        @intFromEnum(encode.ImmaSize.m8n8k32) => .{ .m = 8, .n = 8, .k = 32 },
-        @intFromEnum(encode.ImmaSize.m16n8k16) => .{ .m = 16, .n = 8, .k = 16 },
-        @intFromEnum(encode.ImmaSize.m16n8k32) => .{ .m = 16, .n = 8, .k = 32 },
-        @intFromEnum(encode.ImmaSize.m16n8k64) => .{ .m = 16, .n = 8, .k = 64 },
+        @backingInt(encode.ImmaSize.m8n8k16) => .{ .m = 8, .n = 8, .k = 16 },
+        @backingInt(encode.ImmaSize.m8n8k32) => .{ .m = 8, .n = 8, .k = 32 },
+        @backingInt(encode.ImmaSize.m16n8k16) => .{ .m = 16, .n = 8, .k = 16 },
+        @backingInt(encode.ImmaSize.m16n8k32) => .{ .m = 16, .n = 8, .k = 32 },
+        @backingInt(encode.ImmaSize.m16n8k64) => .{ .m = 16, .n = 8, .k = 64 },
         // 1, 3 and 7 are gaps in the NAK table and the encoder cannot produce them.
         1, 3, 7 => return 1,
     };
@@ -708,12 +708,12 @@ pub fn scheduleBlocksExit(insts: []Inst, block_starts: []const usize, exit_regs:
     for (block_starts) |b| entry_start = @min(entry_start, b);
     // scoreboard_of[reg] = scoreboard index + 1 (0 = the register has no in-flight
     // variable-latency producer).
-    var scoreboard_of = [_]u8{0} ** 256;
+    var scoreboard_of: [256]u8 = @splat(0);
     // read_scoreboard_of[reg] = scoreboard index + 1 (0 = no in-flight decoupled op has
     // this register as a SOURCE it has not consumed yet). The mirror of `scoreboard_of`
     // on the read side: a write barrier says "the result is not there yet", a read
     // barrier says "the operands are not collected yet". See `readsLate`.
-    var read_scoreboard_of = [_]u8{0} ** 256;
+    var read_scoreboard_of: [256]u8 = @splat(0);
     var free_mask: u8 = (1 << num_scoreboards) - 1; // scoreboards 0..5 free
     // Consecutive global loads can share one write barrier. The hardware barrier counts the whole
     // group, and one consumer wait retires every load assigned to it. ptxas uses this for its k3
@@ -1223,19 +1223,19 @@ pub const Hazard = struct {
 /// The walk is linear, which is the scheduler's own model: it drains every barrier at a block
 /// boundary so a producer on one path cannot reach a consumer on another.
 pub fn findHazard(insts: []const Inst, retire_depth: u32) ?Hazard {
-    var barrier_of = [_]u8{0} ** 256; // a variable-latency producer's barrier + 1, per register
-    var producer_of = [_]usize{0} ** 256;
-    var age_of = [_]u32{0} ** 256; // issue order within the barrier, for a bounded retire
-    var issued = [_]u32{0} ** num_scoreboards;
-    var retired = [_]u32{0} ** num_scoreboards;
+    var barrier_of: [256]u8 = @splat(0); // a variable-latency producer's barrier + 1, per register
+    var producer_of: [256]usize = @splat(0);
+    var age_of: [256]u32 = @splat(0); // issue order within the barrier, for a bounded retire
+    var issued: [num_scoreboards]u32 = @splat(0);
+    var retired: [num_scoreboards]u32 = @splat(0);
     // The fixed-latency side. A coupled result has no barrier: it is ready once enough cycles
     // have passed, and the stall counts are the only thing that makes them pass.
-    var ready_at = [_]u64{0} ** 256;
-    var coupled_by = [_]usize{0} ** 256;
+    var ready_at: [256]u64 = @splat(0);
+    var coupled_by: [256]usize = @splat(0);
     // The read side. A decoupled op collects its sources when its pipe reaches it, not when it
     // issues, so a write to one of them before then reaches the op instead of the old value.
-    var collecting = [_]u8{0} ** 256; // the collecting op's read barrier + 1, per source register
-    var collector_of = [_]usize{0} ** 256;
+    var collecting: [256]u8 = @splat(0); // the collecting op's read barrier + 1, per source register
+    var collector_of: [256]usize = @splat(0);
     var cycle: u64 = 0;
 
     for (insts, 0..) |inst, idx| {
@@ -4410,7 +4410,7 @@ test "the undefined-read check accepts a written register and names an unwritten
     // one gives a different frame every run. That is the only way a deterministic shader on
     // deterministic input can be nondeterministic, and `findHazard` cannot see it: that one asks
     // whether a producer has LANDED and takes for granted that there is one.
-    const empty = [_]bool{false} ** 256;
+    const empty: [256]bool = @splat(false);
     var ok = [_]Inst{
         encode.ldgU32(8, 8, .{}), // writes R8, reads the address pair R8:R9
         encode.iadd3(10, 8, 8, .{}),

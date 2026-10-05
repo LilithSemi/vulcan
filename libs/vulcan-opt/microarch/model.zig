@@ -330,13 +330,13 @@ pub const Model = struct {
         // pure switches on the opcode tag, so the placeholder operand handles are never dereferenced
         // and this evaluates at comptime.
         inline for (comptime std.meta.tags(ir.function.BinOp)) |bop| {
-            const oc: ir.function.Opcode = .{ .arith = .{ .op = bop, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } };
+            const oc: ir.function.Opcode = .{ .arith = .{ .op = bop, .lhs = @fromBackingInt(@intCast(0)), .rhs = @fromBackingInt(@intCast(0)) } };
             inline for (.{ true, false }) |ef| {
                 if (m.throughput(oc, ef) > m.latency(oc))
                     @compileError("throughput(op) must be <= latency(op): a model marked op '" ++ @tagName(bop) ++ "' as issuing faster than it completes");
             }
         }
-        const load_oc: ir.function.Opcode = .{ .load = .{ .ptr = @enumFromInt(0) } };
+        const load_oc: ir.function.Opcode = .{ .load = .{ .ptr = @fromBackingInt(@intCast(0)) } };
         inline for (.{ true, false }) |ef| {
             if (m.throughput(load_oc, ef) > m.latency(load_oc))
                 @compileError("throughput(load) must be <= latency(load)");

@@ -120,7 +120,7 @@ fn classifyX86_64(ty: ctype.CType, l: layout.TargetLayout) ClassResult {
     if (size > 16 or hasUnalignedField(def, l)) {
         return .{ .arg = .memory_stack, .ret = .sret };
     }
-    var byte_class: [16]?Class = .{null} ** 16;
+    var byte_class: [16]?Class = @splat(null);
     if (!def.is_union) collectLeavesX86_64(ty, 0, l, &byte_class);
 
     var pieces: [4]Eightbyte = undefined;

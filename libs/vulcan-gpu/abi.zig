@@ -57,7 +57,7 @@ pub const Abi = struct {
 /// target ABI alone, so a runtime reproduces it by reading `LaunchInfo.launch_shape` and
 /// never has to guess.
 fn needsLaunchShape(func: *const Function, a: Abi) bool {
-    for (func.blockParams(@enumFromInt(0))) |p| {
+    for (func.blockParams(@fromBackingInt(@intCast(0)))) |p| {
         const b = attrs.builtinOf(func, p) orelse continue;
         switch (b) {
             // The grid size comes from the launch on every target. No hardware holds it.
@@ -110,9 +110,9 @@ fn needsLaunchShape(func: *const Function, a: Abi) bool {
 /// the invariant explicit rather than accidental: a caller that finds it true must refuse.
 /// `offload.lowerToLoopNest` refuses the same shape for a different reason of its own.
 pub fn entryIsBranchTarget(func: *const Function) bool {
-    const entry: ir.function.Block = @enumFromInt(0);
+    const entry: ir.function.Block = @fromBackingInt(@intCast(0));
     for (0..func.blockCount()) |bi| {
-        const block: ir.function.Block = @enumFromInt(bi);
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .@"if" => |cf| {
@@ -185,7 +185,7 @@ pub fn layoutParams(
         cursor += a.pointer_bytes;
     }
 
-    for (func.blockParams(@enumFromInt(0))) |p| {
+    for (func.blockParams(@fromBackingInt(@intCast(0)))) |p| {
         if (attrs.builtinOf(func, p) != null) continue;
 
         const param_kind = func.types.type_kind(func.valueType(p));
@@ -309,7 +309,7 @@ fn sharedRun(func: *const Function, elem: ir.types.Type, count: u64) ?SharedShap
 
 /// Whether the entry block takes a `ptr(shared)` parameter, which is the extern-shared model.
 fn hasSharedParam(func: *const Function) bool {
-    for (func.blockParams(@enumFromInt(0))) |p| {
+    for (func.blockParams(@fromBackingInt(@intCast(0)))) |p| {
         switch (func.types.type_kind(func.valueType(p))) {
             .ptr => |space| switch (space) {
                 .shared => return true,
@@ -366,7 +366,7 @@ pub fn layoutSharedFrame(allocator: std.mem.Allocator, func: *const Function, a:
     // the one the hardware actually imposes.
     var cursor: u64 = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const al = switch (func.opcode(inst)) {
                 .alloca => |al| al,
                 .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select => continue,

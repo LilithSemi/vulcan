@@ -280,7 +280,7 @@ test "live: scalar-expanded fp32 matmul is exact over odd and aligned global mem
         defer expanded.deinit();
         try testing.expect(try ir.expand.expandMatmul(allocator, &expanded));
         for (0..expanded.blockCount()) |block_index| {
-            for (expanded.blockInsts(@enumFromInt(block_index))) |inst| {
+            for (expanded.blockInsts(@fromBackingInt(@intCast(block_index)))) |inst| {
                 try testing.expect(expanded.opcode(inst) != .matmul);
             }
         }

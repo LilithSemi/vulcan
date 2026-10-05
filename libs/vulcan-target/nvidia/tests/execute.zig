@@ -112,6 +112,12 @@ const Harness = struct {
         return self.runner.alloc(.system, size);
     }
 
+    /// Give a buffer back. The runner tracks a fixed number of live allocations, so a test that
+    /// allocates inside a loop has to release each round or it runs the runner out.
+    fn free(self: *Harness, buf: compute.Buffer) void {
+        self.runner.freeBuffer(buf);
+    }
+
     fn ensureCodeCapacity(self: *Harness, bytes: usize) !void {
         if (self.runner.code.bytes.len >= bytes) return;
         self.runner.code = try self.runner.alloc(.system_wc, @intCast(bytes));
@@ -654,9 +660,13 @@ fn runNvFp4BufferControl(
     const value_bytes: usize = if (dequantize) 1 else 4;
     const output_bytes: usize = if (dequantize) 4 else 1;
     var value = try guardedBuffer(h, value_offset, value_bytes);
+    defer h.free(value);
     var block = try guardedBuffer(h, block_offset, 1);
+    defer h.free(block);
     var global = try guardedBuffer(h, global_offset, 4);
+    defer h.free(global);
     var output = try guardedBuffer(h, output_offset, output_bytes);
+    defer h.free(output);
     if (dequantize)
         value.bytes[value_offset] = @truncate(value_bits)
     else
@@ -830,8 +840,11 @@ fn runF32BinaryControl(allocator: std.mem.Allocator, h: *Harness, lhs_bits: u32,
     const rhs_offset: usize = 20;
     const output_offset: usize = 28;
     var lhs = try guardedBuffer(h, lhs_offset, 4);
+    defer h.free(lhs);
     var rhs = try guardedBuffer(h, rhs_offset, 4);
+    defer h.free(rhs);
     var output = try guardedBuffer(h, output_offset, 4);
+    defer h.free(output);
     std.mem.writeInt(u32, lhs.bytes[lhs_offset..][0..4], lhs_bits, .little);
     std.mem.writeInt(u32, rhs.bytes[rhs_offset..][0..4], rhs_bits, .little);
     launch.setPtr(launch.kernel.launch.params[0].offset, output.va + output_offset);
@@ -857,9 +870,13 @@ fn runNvFp4UnitQuantizeControl(allocator: std.mem.Allocator, h: *Harness, value_
     const global_offset: usize = 20;
     const output_offset: usize = 3;
     var value = try guardedBuffer(h, value_offset, 4);
+    defer h.free(value);
     var block = try guardedBuffer(h, block_offset, 1);
+    defer h.free(block);
     var global = try guardedBuffer(h, global_offset, 4);
+    defer h.free(global);
     var output = try guardedBuffer(h, output_offset, 1);
+    defer h.free(output);
     std.mem.writeInt(u32, value.bytes[value_offset..][0..4], value_bits, .little);
     block.bytes[block_offset] = 0x38;
     std.mem.writeInt(u32, global.bytes[global_offset..][0..4], 0x3f80_0000, .little);
@@ -1068,7 +1085,7 @@ test "live: NVIDIA NVFP4 packed memory crosses a scale block and preserves its t
     launch.setPtr(launch.kernel.launch.params[5].offset, packed_output.va + packed_output_offset);
     try launch.run(.{ 1, 1, 1 });
 
-    var expected_output = [_]u8{low_float_guard} ** packed_count;
+    var expected_output: [packed_count]u8 = @splat(low_float_guard);
     const global_scale: f32 = @bitCast(global_scale_bits);
     for (0..element_count) |index| {
         const payload = if (index & 1 == 0) packed_values[index / 2] & 0x0f else packed_values[index / 2] >> 4;
@@ -1210,7 +1227,7 @@ fn lowFloatEncodeCorpus(allocator: std.mem.Allocator, format: ir.low_float.Forma
     // Audit the FINAL deduplicated corpus rather than trusting the loops that attempted to
     // populate it. A shortened append helper or a skipped append therefore fails here, before
     // any device allocation or launch can hide the missing coverage.
-    var exponent_seen = [_]bool{false} ** 256;
+    var exponent_seen: [256]bool = @splat(false);
     for (values.items) |bits| exponent_seen[@intCast((bits >> 23) & 0xff)] = true;
     for (exponent_seen) |covered| try testing.expect(covered);
 
@@ -1828,8 +1845,11 @@ test "live: unaligned global scalar loads and stores have exact independent foot
         defer launch.deinit();
         const width = case.payload.byteSize();
         var input = try unalignedBuffer(&h, offset, width);
+        defer h.free(input);
         var stored = try unalignedBuffer(&h, offset, width);
+        defer h.free(stored);
         const result = try h.alloc(16);
+        defer h.free(result);
         @memset(result.bytes, 0);
         writePayload(input.bytes[offset .. offset + width], case.payload, case.loaded);
 

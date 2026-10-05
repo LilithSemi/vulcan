@@ -477,8 +477,8 @@ test "native nvfp4 packed memory crosses a scale block and preserves its tail si
         0x4060_0000, 0x40a0_0000, 0x7f7f_ffff, 0xff7f_ffff, 0x7f80_0000,
         0xff80_0000, 0x7f80_0001, 0xff80_0001, 0x7fc0_1234,
     };
-    var decoded_bits = [_]u32{0} ** element_count;
-    var output = [_]u8{0xa5} ** packed_count;
+    var decoded_bits: [element_count]u32 = @splat(0);
+    var output: [packed_count]u8 = @splat(0xa5);
     var expected_output = output;
     run(&packed_values[0], &scale_values[0], global_scale_bits, &decoded_bits[0], &source_bits[0], &output[0]);
     const global_scale_value: f32 = @bitCast(global_scale_bits);

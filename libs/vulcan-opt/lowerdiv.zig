@@ -32,7 +32,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function) Error!bool {
     defer subst.deinit(allocator);
 
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         if (!blockHasDivision(func, block)) continue;
 
         // Rebuild the block's instruction list, expanding div/rem in place. Existing
@@ -145,7 +145,7 @@ fn isSigned(func: *const Function, v: Value) bool {
 }
 
 fn hasDivision(func: *const Function) bool {
-    for (0..func.blockCount()) |bi| if (blockHasDivision(func, @enumFromInt(bi))) return true;
+    for (0..func.blockCount()) |bi| if (blockHasDivision(func, @fromBackingInt(@intCast(bi)))) return true;
     return false;
 }
 
@@ -165,7 +165,7 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
         }
     }.f;
     for (0..func.instCount()) |i| {
-        switch (func.opcodeMut(@enumFromInt(i)).*) {
+        switch (func.opcodeMut(@fromBackingInt(@intCast(i))).*) {
             .atomic_rmw => |*a| {
                 a.ptr = sub(subst, a.ptr);
                 a.value = sub(subst, a.value);
@@ -235,7 +235,7 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
         }
     }
     for (0..func.blockCount()) |bi| {
-        const term = func.terminatorPtr(@enumFromInt(bi));
+        const term = func.terminatorPtr(@fromBackingInt(@intCast(bi)));
         if (term.*) |*t| switch (t.*) {
             .ret => |*r| for (r.values[0..r.count]) |*vv| {
                 vv.* = sub(subst, vv.*);

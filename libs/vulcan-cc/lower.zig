@@ -3181,7 +3181,7 @@ fn lowerCallArgs(l: *L, args: []const *parser.Expr, params: anytype) Error!std.A
 fn defaultArgPromote(ty: ctype.CType) ctype.CType {
     if (ty.isFloat()) return .{ .float = .f64 };
     if (ty.asInt()) |it| {
-        if (@intFromEnum(it.rank) < @intFromEnum(ctype.Rank.int)) return ctype.int_t;
+        if (@backingInt(it.rank) < @backingInt(ctype.Rank.int)) return ctype.int_t;
     }
     return ty;
 }

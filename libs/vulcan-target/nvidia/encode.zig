@@ -285,7 +285,7 @@ pub fn isetpAnd(dst_pred: u8, a: u8, b: u8, cmp: Cmp, signed: bool, accum: u8, c
     var w = alu(0x00c, 0, a, b, 0, c);
     setBits(&w, 73, 1, if (signed) 1 else 0); // I32 vs U32
     setBits(&w, 74, 2, 0); // set-op = AND
-    setBits(&w, 76, 3, @intFromEnum(cmp)); // comparison
+    setBits(&w, 76, 3, @backingInt(cmp)); // comparison
     setBits(&w, 68, 3, PT); // low compare predicate (unused for 32-bit)
     setBits(&w, 81, 3, dst_pred); // result predicate
     setBits(&w, 84, 3, PT); // second result predicate = none
@@ -298,7 +298,7 @@ pub fn isetpUregAnd(dst_pred: u8, a: u8, ub: u8, cmp: Cmp, signed: bool, accum: 
     var w = aluUregB(0x00c, 0, a, ub, 0, c);
     setBits(&w, 73, 1, if (signed) 1 else 0);
     setBits(&w, 74, 2, 0);
-    setBits(&w, 76, 3, @intFromEnum(cmp));
+    setBits(&w, 76, 3, @backingInt(cmp));
     setBits(&w, 68, 3, PT);
     setBits(&w, 81, 3, dst_pred);
     setBits(&w, 84, 3, PT);
@@ -319,7 +319,7 @@ pub fn isetpUregAnd(dst_pred: u8, a: u8, ub: u8, cmp: Cmp, signed: bool, accum: 
 pub fn fsetp(dst_pred: u8, a: u8, b: u8, cmp: Cmp, c: Control) Inst {
     var w = alu(0x00b, RZ, a, b, RZ, c);
     setBits(&w, 74, 2, 0); // set-op = AND
-    setBits(&w, 76, 4, @intFromEnum(cmp)); // FLOAT comparison (ordered: lt=1..ge=6)
+    setBits(&w, 76, 4, @backingInt(cmp)); // FLOAT comparison (ordered: lt=1..ge=6)
     setBits(&w, 80, 1, 0); // ftz off
     setBits(&w, 81, 3, dst_pred); // result predicate
     setBits(&w, 84, 3, PT); // second result predicate = none
@@ -477,7 +477,7 @@ pub fn f2iRound(dst: u8, src: u8, dst_signed: bool, mode: F2IRound, c: Control) 
     var w = alu(0x105, dst, RZ, src, RZ, c);
     if (dst_signed) setBits(&w, 72, 1, 1);
     setBits(&w, 75, 2, 2); // dst = 4 bytes (i32)
-    setBits(&w, 78, 2, @intFromEnum(mode));
+    setBits(&w, 78, 2, @backingInt(mode));
     setBits(&w, 84, 2, 2); // src = 4 bytes (f32)
     return w;
 }
@@ -495,7 +495,7 @@ pub const MuFuOp = enum(u6) { cos = 0, sin = 1, exp2 = 2, log2 = 3, rcp = 4, rsq
 pub fn mufu(dst: u8, src: u8, mfop: MuFuOp, c: Control) Inst {
     var w = alu(0x108, dst, RZ, src, RZ, c);
     setBits(&w, 72, 1, 0); // op_type = F32
-    setBits(&w, 74, 6, @intFromEnum(mfop)); // MUFU op selector
+    setBits(&w, 74, 6, @backingInt(mfop)); // MUFU op selector
     return w;
 }
 
@@ -799,7 +799,7 @@ pub fn ldcSized(dst: u8, bank: u5, offset: u16, ty: MemType, c: Control) Inst {
     setBits(&w, 24, 8, RZ); // no dynamic offset
     setBits(&w, 38, 16, offset);
     setBits(&w, 54, 5, bank);
-    setBits(&w, 73, 3, @intFromEnum(ty));
+    setBits(&w, 73, 3, @backingInt(ty));
     return w;
 }
 
@@ -814,7 +814,7 @@ pub fn ldcu(udst: u8, bank: u5, offset: u16, c: Control) Inst {
     // like LDC and the IR ABI layout, names offsets in bytes.
     setBits(&w, 38, 16, offset / 2);
     setBits(&w, 54, 5, bank);
-    setBits(&w, 73, 3, @intFromEnum(MemType.b32));
+    setBits(&w, 73, 3, @backingInt(MemType.b32));
     setBits(&w, 91, 1, 1);
     return w;
 }
@@ -914,8 +914,8 @@ pub fn ldgOrdered(dst: u8, addr: u8, offset: i32, ty: MemType, order: MemOrder, 
     setBits(&w, 32, 8, URZ); // uniform base, at 32 for a LOAD
     setBits(&w, 64, 4, 0); // guard = PT, reversed, no negate
     setBits(&w, 72, 1, 1); // 64-bit uniform
-    setBits(&w, 73, 3, @intFromEnum(ty));
-    setBits(&w, 77, 4, @intFromEnum(order));
+    setBits(&w, 73, 3, @backingInt(ty));
+    setBits(&w, 77, 4, @backingInt(order));
     setBits(&w, 81, 3, PT); // fault predicate = none
     setBits(&w, 84, 3, 1); // eviction NORMAL
     setBits(&w, 90, 1, 1); // 64-bit GPR address
@@ -961,8 +961,8 @@ pub fn stgOrdered(addr: u8, data: u8, offset: i32, ty: MemType, order: MemOrder,
     setBits(&w, 64, 8, URZ); // uniform base, at 64 for a STORE
     setBits(&w, 72, 1, 1); // 64-bit uniform
     setBits(&w, 32, 8, data);
-    setBits(&w, 73, 3, @intFromEnum(ty));
-    setBits(&w, 77, 4, @intFromEnum(order));
+    setBits(&w, 73, 3, @backingInt(ty));
+    setBits(&w, 77, 4, @backingInt(order));
     setBits(&w, 84, 3, 1); // eviction NORMAL
     setBits(&w, 91, 1, 1); // UGPR mode (required or the SM traps)
     return w;
@@ -1027,7 +1027,7 @@ pub fn ldsAt(dst: u8, addr: u8, offset: i32, ty: MemType, c: Control) Inst {
     setBits(&w, 24, 8, addr); // 32-bit shared-window offset, ONE register
     setBits(&w, 32, 8, URZ); // no uniform base
     setBits(&w, 40, 24, signedBits(offset, 24)); // signed byte displacement
-    setBits(&w, 73, 3, @intFromEnum(ty));
+    setBits(&w, 73, 3, @backingInt(ty));
     setBits(&w, 78, 2, 0); // offset stride X1
     setBits(&w, 87, 3, PT); // UPT: unconditional
     setBits(&w, 91, 1, 1); // UGPR mode
@@ -1066,7 +1066,7 @@ pub fn stsAt(addr: u8, data: u8, offset: i32, ty: MemType, c: Control) Inst {
     setBits(&w, 32, 8, data);
     setBits(&w, 40, 24, signedBits(offset, 24)); // signed byte displacement
     setBits(&w, 64, 8, URZ); // no uniform base
-    setBits(&w, 73, 3, @intFromEnum(ty));
+    setBits(&w, 73, 3, @backingInt(ty));
     setBits(&w, 78, 2, 0); // offset stride X1
     setBits(&w, 91, 1, 1); // UGPR mode
     return w;
@@ -1187,11 +1187,11 @@ pub fn atomg(dst: u8, addr: u8, data: u8, op: AtomOp, ty: AtomType, c: Control) 
     setBits(&w, 63, 1, 1); // the address GPR is a 64-bit pair
     setBits(&w, 64, 8, URZ); // no uniform base
     setBits(&w, 72, 1, 1); // the uniform base is 64 bits
-    setBits(&w, 73, 4, @intFromEnum(ty));
+    setBits(&w, 73, 4, @backingInt(ty));
     setBits(&w, 77, 4, 0xa); // STRONG / SYS
     setBits(&w, 81, 3, PT); // no fault predicate
     setBits(&w, 84, 3, 1); // eviction NORMAL
-    setBits(&w, 87, 4, @intFromEnum(op));
+    setBits(&w, 87, 4, @backingInt(op));
     setBits(&w, 91, 1, 1); // UGPR mode
     return w;
 }
@@ -1225,10 +1225,10 @@ pub fn redg(addr: u8, data: u8, op: AtomOp, ty: AtomType, c: Control) Inst {
     setBits(&w, 40, 24, 0); // immediate address offset
     setBits(&w, 64, 8, URZ); // no uniform base
     setBits(&w, 72, 1, 1); // the uniform base is 64 bits
-    setBits(&w, 73, 4, @intFromEnum(ty));
+    setBits(&w, 73, 4, @backingInt(ty));
     setBits(&w, 77, 4, 0xa); // STRONG / SYS
     setBits(&w, 84, 3, 1); // eviction NORMAL
-    setBits(&w, 87, 3, @intFromEnum(op));
+    setBits(&w, 87, 3, @backingInt(op));
     setBits(&w, 90, 1, 1); // the address GPR is a 64-bit pair
     setBits(&w, 91, 1, 1); // UGPR mode
     return w;
@@ -1266,9 +1266,9 @@ pub fn atoms(dst: u8, addr: u8, data: u8, op: AtomOp, ty: AtomType, c: Control) 
     setBits(&w, 32, 8, data);
     setBits(&w, 40, 24, 0); // immediate offset
     setBits(&w, 64, 8, URZ); // no uniform base
-    setBits(&w, 73, 4, @intFromEnum(ty));
+    setBits(&w, 73, 4, @backingInt(ty));
     setBits(&w, 78, 2, 0); // offset stride X1
-    setBits(&w, 87, 4, @intFromEnum(op));
+    setBits(&w, 87, 4, @backingInt(op));
     setBits(&w, 91, 1, 1); // UGPR mode
     return w;
 }
@@ -1300,7 +1300,7 @@ pub fn atomgCas(dst: u8, addr: u8, cmp: u8, data: u8, ty: AtomType, c: Control) 
     setBits(&w, 40, 24, 0); // immediate address offset
     setBits(&w, 64, 8, data);
     setBits(&w, 72, 1, 1); // the address GPR is a 64-bit pair
-    setBits(&w, 73, 4, @intFromEnum(ty));
+    setBits(&w, 73, 4, @backingInt(ty));
     setBits(&w, 77, 4, 0xa); // STRONG / SYS
     setBits(&w, 81, 3, PT); // no fault predicate
     setBits(&w, 84, 3, 1); // eviction NORMAL
@@ -1329,7 +1329,7 @@ pub fn atomsCas(dst: u8, addr: u8, cmp: u8, data: u8, ty: AtomType, c: Control) 
     setBits(&w, 32, 8, cmp);
     setBits(&w, 40, 24, 0); // immediate offset
     setBits(&w, 64, 8, data);
-    setBits(&w, 73, 4, @intFromEnum(ty));
+    setBits(&w, 73, 4, @backingInt(ty));
     setBits(&w, 78, 2, 0); // offset stride X1
     return w;
 }
@@ -1606,7 +1606,7 @@ pub fn fswzadd(dst: u8, src0: u8, src1: u8, lane_ops: [4]SwzOp, c: Control) Inst
     // Pack the four lane ops: op[i] occupies bits ((len-1-i)*2) of the
     // sub-op byte, exactly NAK's `subop |= swz_op << ((ops.len()-i-1)*2)`.
     var subop: u8 = 0;
-    inline for (lane_ops, 0..) |o, i| subop |= @as(u8, @intFromEnum(o)) << ((3 - i) * 2);
+    inline for (lane_ops, 0..) |o, i| subop |= @as(u8, @backingInt(o)) << ((3 - i) * 2);
     setBits(&w, 32, 8, subop);
     setBits(&w, 77, 1, 1); // deriv_mode = NonDivergent (sm>=100, fswzadd.ndv)
     setBits(&w, 78, 2, 0); // round mode = nearest-even
@@ -1905,10 +1905,10 @@ pub fn hmma(dst: u8, a: u8, b: u8, c_in: u8, size: HmmaSize, dst_type: HmmaDstTy
     setBits(&w, 24, 8, a);
     setBits(&w, 32, 8, b);
     setBits(&w, 64, 8, c_in);
-    const tile = @intFromEnum(size);
+    const tile = @backingInt(size);
     setBits(&w, 75, 1, tile & 1); // tile selector, low bit
     setBits(&w, 78, 1, tile >> 1); // tile selector, high bit
-    setBits(&w, 76, 1, @intFromEnum(dst_type));
+    setBits(&w, 76, 1, @backingInt(dst_type));
     setBits(&w, 82, 2, 0); // source type F16, the only confirmed value
     return w;
 }
@@ -1983,7 +1983,7 @@ pub fn imma(
     setBits(&w, 32, 8, b);
     setBits(&w, 64, 8, c_in);
     setBits(&w, 74, 1, 1); // SRC1.COL
-    const tile = @intFromEnum(size);
+    const tile = @backingInt(size);
     setBits(&w, 75, 1, tile & 1); // tile selector, low bit
     setBits(&w, 85, 2, tile >> 1); // tile selector, two high bits
     setBits(&w, 76, 1, @intFromBool(a_op.signed));
@@ -2045,7 +2045,7 @@ pub fn ldsm(dst: u8, addr: u8, count: LdsmCount, transpose: bool, c: Control) In
     setBits(&w, 24, 8, addr); // 32-bit shared-window offset, ONE register
     setBits(&w, 32, 8, URZ); // no uniform base
     setBits(&w, 40, 24, 0); // immediate offset
-    setBits(&w, 72, 2, @intFromEnum(count));
+    setBits(&w, 72, 2, @backingInt(count));
     setBits(&w, 78, 2, @intFromBool(transpose)); // M8N8 = 0, MT8N8 = 1
     setBits(&w, 91, 1, 0); // no uniform address
     return w;
@@ -2211,7 +2211,7 @@ test "the guard predicate and control bits land in the right fields" {
 test "ISETP places the comparison and result predicate (NAK layout)" {
     const w = isetp(0, 1, 2, .lt, true, .{});
     try std.testing.expectEqual(@as(u32, 0x20c), w[0] & 0xfff); // base 0x00c + reg form
-    try std.testing.expectEqual(@as(u32, @intFromEnum(Cmp.lt)), (w[2] >> 12) & 0x7); // cmp at bit 76
+    try std.testing.expectEqual(@as(u32, @backingInt(Cmp.lt)), (w[2] >> 12) & 0x7); // cmp at bit 76
     try std.testing.expectEqual(@as(u32, 1), (w[2] >> 9) & 0x1); // signed (I32) at bit 73
     try std.testing.expectEqual(@as(u32, 0), (w[2] >> 17) & 0x7); // dst predicate P0 at bit 81
 }
@@ -2327,7 +2327,7 @@ test "FSETP encodes the float ordered compare (vs ISETP integer)" {
     try std.testing.expectEqual(@as(u32, 0x20b), w[0] & 0xfff); // base 0x00b | reg form (1<<9)
     try std.testing.expectEqual(@as(u32, 6), (w[0] >> 24) & 0xff); // srcA R6
     try std.testing.expectEqual(@as(u32, 7), (w[1] >> 0) & 0xff); // srcB R7 at bit 32
-    try std.testing.expectEqual(@as(u32, @intFromEnum(Cmp.gt)), (w[2] >> (76 - 64)) & 0xf); // float cmp at 76..80
+    try std.testing.expectEqual(@as(u32, @backingInt(Cmp.gt)), (w[2] >> (76 - 64)) & 0xf); // float cmp at 76..80
     try std.testing.expectEqual(@as(u32, 0), (w[2] >> (81 - 64)) & 0x7); // P0 at 81..84
     // The opcode must differ from ISETP (0x00c) so a float compare is not an integer one.
     try std.testing.expect((w[0] & 0xfff) != (isetp(0, 6, 7, .gt, false, .{})[0] & 0xfff));
@@ -2547,7 +2547,7 @@ test "the memory type field carries every access width (NAK set_mem_type)" {
         .{ .ty = .b128, .code = 6, .regs = 4, .bytes = 16 },
     };
     for (cases) |c| {
-        try std.testing.expectEqual(c.code, @as(u32, @intFromEnum(c.ty)));
+        try std.testing.expectEqual(c.code, @as(u32, @backingInt(c.ty)));
         try std.testing.expectEqual(c.regs, c.ty.regCount());
         try std.testing.expectEqual(c.bytes, c.ty.byteSize());
         // The same 3-bit field at 73..76 in all four memory encoders.

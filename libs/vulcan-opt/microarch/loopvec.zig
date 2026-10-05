@@ -215,7 +215,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     const V: u32 = @min(model.vector_bits / ELEM_BITS, MAX_LANES);
     if (V < 2) return null;
 
-    const header: Block = @enumFromInt(loop.header);
+    const header: Block = @fromBackingInt(@intCast(loop.header));
     const preheader = loop.preheader orelse return null;
 
     // Single-block straight-line body that is the only latch, no `if`/`matmul`.
@@ -224,7 +224,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     for (0..func.blockCount()) |bi| {
         if (bi >= loop.body.len or !loop.body[bi]) continue;
         in_loop_blocks += 1;
-        const b: Block = @enumFromInt(bi);
+        const b: Block = @fromBackingInt(@intCast(bi));
         if (b == header) continue;
         switch (func.terminator(b) orelse return null) {
             .jump => |j| if (j.target == header) {
@@ -316,7 +316,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     return Plan{
         .header = header,
         .body = bodyb,
-        .preheader = @enumFromInt(preheader),
+        .preheader = @fromBackingInt(@intCast(preheader)),
         .exit_cond = cmp.op,
         .bound = bound,
         .induction = induction,
@@ -481,14 +481,14 @@ fn usesValue(func: *const Function, inst: Inst, v: Value) bool {
 fn definedInLoop(func: *const Function, loop: *const loops.Loop, v: Value) bool {
     if (func.definingInst(v)) |di| {
         for (0..func.blockCount()) |bi| {
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 if (inst == di) return bi < loop.body.len and loop.body[bi];
             }
         }
         return false;
     }
     for (0..func.blockCount()) |bi| {
-        for (func.blockParams(@enumFromInt(bi))) |p| {
+        for (func.blockParams(@fromBackingInt(@intCast(bi)))) |p| {
             if (p == v) return bi < loop.body.len and loop.body[bi];
         }
     }
@@ -523,7 +523,7 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
     const V: u32 = @min(model.vector_bits / ELEM_BITS, MAX_LANES);
     if (V < 2) return null;
 
-    const header: Block = @enumFromInt(loop.header);
+    const header: Block = @fromBackingInt(@intCast(loop.header));
     const preheader = loop.preheader orelse return null;
 
     // Single-block straight-line body, only latch, no if/matmul.
@@ -532,7 +532,7 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
     for (0..func.blockCount()) |bi| {
         if (bi >= loop.body.len or !loop.body[bi]) continue;
         in_loop_blocks += 1;
-        const b: Block = @enumFromInt(bi);
+        const b: Block = @fromBackingInt(@intCast(bi));
         if (b == header) continue;
         switch (func.terminator(b) orelse return null) {
             .jump => |j| if (j.target == header) {
@@ -658,7 +658,7 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
 
     return RedPlan{
         .header = header,
-        .preheader = @enumFromInt(preheader),
+        .preheader = @fromBackingInt(@intCast(preheader)),
         .exit_cond = cmp.op,
         .bound = cmp.rhs,
         .induction = induction,
@@ -1000,7 +1000,7 @@ test "volatile: a map loop whose access is volatile is not widened" {
 
         // The access is still in the body, still volatile: refusing kept it, it was not rewritten.
         var seen = false;
-        for (func.blockInsts(@enumFromInt(2))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(2)))) |inst| switch (func.opcode(inst)) {
             .load => |l| if (l.@"volatile") {
                 seen = true;
             },
@@ -1032,7 +1032,7 @@ test "volatile: a reduction over a volatile load is not widened" {
     defer func.deinit();
     try buildIntReduction(&func, false);
     // Mark the body's one load volatile, changing nothing else about the shape.
-    const body: Block = @enumFromInt(2);
+    const body: Block = @fromBackingInt(@intCast(2));
     var marked: usize = 0;
     for (func.blockInsts(body)) |inst| {
         if (func.opcode(inst) != .load) continue;
@@ -1057,7 +1057,7 @@ test "the map path carries a body instruction's endian attribute onto every lane
     try buildSaxpy(&func, .none);
 
     // Tag the `x` load's result. Body block 2 holds off, xaddr, xv, yaddr, yv, mul, add, store.
-    const body: Block = @enumFromInt(2);
+    const body: Block = @fromBackingInt(@intCast(2));
     const xv = func.instResult(func.blockInsts(body)[2]).?;
     try func.addAttr(.{ .value = xv }, .{ .endian = .big });
     try testing.expectEqual(@as(usize, 1), countBigEndianValues(&func));
@@ -1076,7 +1076,7 @@ test "the map path does not carry a block attribute onto a rewritten block" {
     var func = Function.init(allocator);
     defer func.deinit();
     try buildSaxpy(&func, .none);
-    const body: Block = @enumFromInt(2);
+    const body: Block = @fromBackingInt(@intCast(2));
     try func.addAttr(.{ .block = body }, .cold);
 
     try testing.expect(try run(allocator, &func, registry.modelFor(.@"ampere-altra")));
@@ -1128,7 +1128,7 @@ test "endian: a reduction over a byte-order-tagged load is not widened" {
     defer func.deinit();
     try buildIntReduction(&func, false);
     // Tag the body's one load, changing nothing else about the shape.
-    const body: Block = @enumFromInt(2);
+    const body: Block = @fromBackingInt(@intCast(2));
     var marked: usize = 0;
     for (func.blockInsts(body)) |inst| {
         if (func.opcode(inst) != .load) continue;
@@ -1164,9 +1164,9 @@ test "a reduction body holding an atomic is declined" {
     defer func.deinit();
     try buildIntReduction(&func, false);
     // The same body plus one atomic increment of the second pointer, changing nothing else.
-    const body: Block = @enumFromInt(2);
+    const body: Block = @fromBackingInt(@intCast(2));
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const entry: Block = @enumFromInt(0);
+    const entry: Block = @fromBackingInt(@intCast(0));
     const b_ptr = func.blockParams(entry)[1];
     const one = try func.appendInst(body, i32_t, .{ .iconst = 1 });
     try func.appendAtomicRmwStmt(body, .{ .op = .add, .ptr = b_ptr, .value = one, .ordering = .relaxed, .scope = .device });

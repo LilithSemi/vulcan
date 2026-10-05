@@ -53,7 +53,7 @@ const VECTOR_MEM_COST: f64 = PACK_COST_PER_LANE;
 /// functions switch on `.arith.op` alone and never read the operands, so placeholder operand
 /// handles are safe (and never dereferenced: Value is an opaque index).
 fn arithOpcode(op: BinOp) ir.function.Opcode {
-    return .{ .arith = .{ .op = op, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } };
+    return .{ .arith = .{ .op = op, .lhs = @fromBackingInt(@intCast(0)), .rhs = @fromBackingInt(@intCast(0)) } };
 }
 
 /// The op's per-port cost weight: its reciprocal THROUGHPUT, i.e. the cycles between two back-to-back

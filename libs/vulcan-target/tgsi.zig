@@ -180,8 +180,8 @@ fn ifOf(func: *const Function, blk: Block) ?ir.function.If {
 /// jump target, or none (a `ret`, which flows to the virtual exit node `n`).
 fn blockSuccIdx(func: *const Function, blk: Block, n: usize, buf: *[2]usize) []const usize {
     if (ifOf(func, blk)) |c| {
-        buf[0] = @intFromEnum(c.then.target);
-        buf[1] = @intFromEnum(c.@"else".target);
+        buf[0] = @backingInt(c.then.target);
+        buf[1] = @backingInt(c.@"else".target);
         return buf[0..2];
     }
     switch (func.terminator(blk) orelse ir.function.Terminator{ .ret = ir.function.Ret.none() }) {
@@ -190,7 +190,7 @@ fn blockSuccIdx(func: *const Function, blk: Block, n: usize, buf: *[2]usize) []c
             return buf[0..1];
         },
         .jump => |j| {
-            buf[0] = @intFromEnum(j.target);
+            buf[0] = @backingInt(j.target);
             return buf[0..1];
         },
     }
@@ -220,7 +220,7 @@ fn computeIpdom(allocator: std.mem.Allocator, func: *const Function) Error![]usi
         var i: usize = 0;
         while (i < n) : (i += 1) {
             var buf: [2]usize = undefined;
-            const succs = blockSuccIdx(func, @enumFromInt(i), n, &buf);
+            const succs = blockSuccIdx(func, @fromBackingInt(@intCast(i)), n, &buf);
             var inter: u64 = all;
             for (succs) |s| inter &= pdom[s];
             const next = (@as(u64, 1) << @intCast(i)) | inter;
@@ -290,7 +290,7 @@ fn computeLoopHeaders(allocator: std.mem.Allocator, func: *const Function) Error
             var u: usize = 0;
             while (u < n) : (u += 1) {
                 var buf: [2]usize = undefined;
-                const succs = blockSuccIdx(func, @enumFromInt(u), n, &buf);
+                const succs = blockSuccIdx(func, @fromBackingInt(@intCast(u)), n, &buf);
                 for (succs) |s| {
                     if (s == i) inter &= dom[u];
                 }
@@ -309,7 +309,7 @@ fn computeLoopHeaders(allocator: std.mem.Allocator, func: *const Function) Error
     var u: usize = 0;
     while (u < n) : (u += 1) {
         var buf: [2]usize = undefined;
-        const succs = blockSuccIdx(func, @enumFromInt(u), n, &buf);
+        const succs = blockSuccIdx(func, @fromBackingInt(@intCast(u)), n, &buf);
         for (succs) |s| {
             // v = s dominates u  ==>  u->s is a back edge and s is a loop header.
             if (s < n and (dom[u] & (@as(u64, 1) << @intCast(s))) != 0) headers[s] = true;
@@ -336,7 +336,7 @@ const Planner = struct {
     /// block), else `.cont` to keep planning at `target`.
     fn edge(self: Planner, target: Block, args: []const Value, stop: usize, loop: ?Loop) Error!enum { done, cont } {
         try self.steps.append(self.allocator, .{ .phi = .{ .target = target, .args = args } });
-        const ti = @intFromEnum(target);
+        const ti = @backingInt(target);
         if (loop) |lp| {
             if (ti == lp.header) return .done; // back edge: ENDLOOP jumps back to the top
             if (ti == lp.merge) {
@@ -367,12 +367,12 @@ const Planner = struct {
                 continue;
             }
 
-            const blk: Block = @enumFromInt(c);
+            const blk: Block = @fromBackingInt(@intCast(c));
             for (self.func.blockInsts(blk)) |inst| try self.steps.append(self.allocator, .{ .inst = inst });
 
             if (ifOf(self.func, blk)) |ifc| {
-                const t_i = @intFromEnum(ifc.then.target);
-                const e_i = @intFromEnum(ifc.@"else".target);
+                const t_i = @backingInt(ifc.then.target);
+                const e_i = @backingInt(ifc.@"else".target);
                 if (t_i == e_i) {
                     if (try self.edge(ifc.then.target, self.func.valueList(ifc.then.args), stop, loop) == .done) return;
                     c = t_i;
@@ -397,7 +397,7 @@ const Planner = struct {
                     };
                     try self.steps.append(self.allocator, .end_if);
                     if (try self.edge(cont.target, self.func.valueList(cont.args), stop, loop) == .done) return;
-                    c = @intFromEnum(cont.target);
+                    c = @backingInt(cont.target);
                     continue;
                 }
                 if (merge == c or (merge == n and stop != n)) return error.Unsupported;
@@ -411,7 +411,7 @@ const Planner = struct {
                 .ret => return,
                 .jump => |j| {
                     if (try self.edge(j.target, self.func.valueList(j.args), stop, loop) == .done) return;
-                    c = @intFromEnum(j.target);
+                    c = @backingInt(j.target);
                 },
             }
         }
@@ -421,7 +421,7 @@ const Planner = struct {
     /// `merge` (unless the edge is a back edge / break / straight-to-merge).
     fn arm(self: Planner, target: Block, args: []const Value, merge: usize, loop: ?Loop) Error!void {
         if (try self.edge(target, args, merge, loop) == .done) return;
-        try self.region(@intFromEnum(target), merge, loop);
+        try self.region(@backingInt(target), merge, loop);
     }
 };
 
@@ -435,7 +435,7 @@ pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
 
     const stage = stageOf(func) orelse return error.Unsupported;
 
-    const entry: Block = @enumFromInt(0);
+    const entry: Block = @fromBackingInt(@intCast(0));
     const params = func.blockParams(entry);
 
     // Classify params. `attr` -> an IN[reg].comp input, `binding` (without a
@@ -452,7 +452,7 @@ pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
     var addr_of = std.AutoHashMapUnmanaged(Value, Addr){};
     defer addr_of.deinit(allocator);
     var addr_used = false; // whether any relative CONST read declared DCL ADDR[0]
-    var const_dynamic = [_]bool{false} ** 16; // CONST unit -> read with a dynamic index
+    var const_dynamic: [16]bool = @splat(false); // CONST unit -> read with a dynamic index
     // Derivative (dFdx/dFdy/fwidth) gradient buffer: a load from grad_base + i*4 is a
     // DDX/DDY of the varying named by the i-th `grad_slot` func attr. grad_addr tracks
     // the byte offset from the base param.
@@ -475,11 +475,11 @@ pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
     // Sampler descriptor param -> its SAMP unit (the Vulkan binding).
     var samp_of = std.AutoHashMapUnmanaged(Value, u32){};
     defer samp_of.deinit(allocator);
-    var in_present = [_]bool{false} ** 32;
-    var const_used = [_]bool{false} ** 16; // CONST unit -> referenced
-    var const_max_idx = [_]u32{0} ** 16; // CONST unit -> highest vec4 index read
-    var samp_used = [_]bool{false} ** 16; // SAMP unit -> a TEX referenced it
-    var sv_sem = [_]Sysval{.vertexid} ** 4; // SV index -> its semantic
+    var in_present: [32]bool = @splat(false);
+    var const_used: [16]bool = @splat(false); // CONST unit -> referenced
+    var const_max_idx: [16]u32 = @splat(0); // CONST unit -> highest vec4 index read
+    var samp_used: [16]bool = @splat(false); // SAMP unit -> a TEX referenced it
+    var sv_sem: [4]Sysval = @splat(.vertexid); // SV index -> its semantic
     var sv_count: u32 = 0; // number of declared system values
     var fc_used = false; // gl_FragCoord (a POSITION input) is read
     for (params) |p| {
@@ -551,7 +551,7 @@ pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
     const TexElem = struct { temp: u32, comp: u8 };
     var tex_addr = std.AutoHashMapUnmanaged(Value, TexElem){};
     defer tex_addr.deinit(allocator);
-    var out_regs = [_]OutReg{.{}} ** 32;
+    var out_regs: [32]OutReg = @splat(.{});
     var temp_count: u32 = 0;
     var line: u32 = 1;
 
@@ -588,7 +588,7 @@ pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
     } else {
         var bi: usize = 1;
         while (bi < nblocks) : (bi += 1) {
-            for (func.blockParams(@enumFromInt(bi))) |p| {
+            for (func.blockParams(@fromBackingInt(@intCast(bi)))) |p| {
                 const t = temp_count;
                 temp_count += 1;
                 try src_of.put(allocator, p, .{ .temp = t });

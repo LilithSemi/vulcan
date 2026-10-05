@@ -22,13 +22,13 @@ stdenv.mkDerivation (finalAttrs: {
 
   nativeBuildInputs = [ zig ];
 
-  deps = zig.fetchDeps {
+  zigDeps = zig.fetchDeps {
     inherit (finalAttrs) pname version src;
-    hash = "sha256-UkIUguR9b6DaZHs73Kaay/OV5yaJ563XVXpuZ1Ef+VA=";
+    hash = "sha256-zCP3Yk9/byB0kvyTQT24m27o22CJ78YH5n+c8J1WD/Y=";
   };
 
   postConfigure = ''
-    ln -s $deps $ZIG_GLOBAL_CACHE_DIR/p
+    ln -s $zigDeps $ZIG_GLOBAL_CACHE_DIR/p
   '';
 
   doCheck = true;

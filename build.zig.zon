@@ -2,15 +2,15 @@
     .name = .vulcan,
     .version = "0.0.0",
     .fingerprint = 0xb0060bbb641fa177,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .uefi = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/uefi.zig#e5c9c30f847845c406da08dea2faf79964b0e793",
-            .hash = "uefi-0.1.0-1okz4b5QAAD-ImP4Q86o97td2DpQNfFhltlBjgnLdL8X",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/uefi.zig#986da3d3257af14381194a9f6d3305b42ab5c200",
+            .hash = "uefi-0.1.0-1okz4W9QAABRgMd4j0-GeQLna8qyVgujEeAsasKoOP4O",
         },
         .nvidia = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/nvidia.zig#c278df01ad3dcf3568a2ed530719eb7b8ac178de",
-            .hash = "nvidia-0.1.0-nX_095kyCwArp7mMdvRev_44U2oXxZXf7y8Q66L6PdhZ",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/nvidia.zig#05e7ddedfc17c5d95d6c4d5435a467d5fc884a2c",
+            .hash = "nvidia-0.1.0-nX_09yYxCwBzixjrJ8xdHL3cUo3DBntoSWQHr2Mi_5Fn",
         },
     },
     .paths = .{

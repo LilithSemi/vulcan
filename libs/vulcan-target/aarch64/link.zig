@@ -367,7 +367,7 @@ test "compileModule aligns data objects per-symbol within a section" {
     // A 1-byte object is followed by an 8-byte one. The 8-byte object must land at
     // offset 8, aligned up from 1, not at offset 1 packed by byte.
     const one = [_]u8{0xAA};
-    const eight = [_]u8{0} ** 8;
+    const eight: [8]u8 = @splat(0);
     try module.addData(allocator, "small", &one);
     try module.addData(allocator, "big", &eight);
 
@@ -424,12 +424,12 @@ test "applyGlobalReloc patches adrp/add immediates to the resolved page delta an
     const decoded_target_page: i64 = @as(i64, @intCast(site_addr & ~@as(usize, 0xFFF))) + @as(i64, imm) * 4096;
     try std.testing.expectEqual(@as(i64, @intCast(target_addr & ~@as(usize, 0xFFF))), decoded_target_page);
     // The rd field, bits [4:0], is untouched by the patch.
-    try std.testing.expectEqual(@as(u32, @intFromEnum(encode.Reg.x3)), adrp_word & 0x1F);
+    try std.testing.expectEqual(@as(u32, @backingInt(encode.Reg.x3)), adrp_word & 0x1F);
 
     // The add's imm12 (bits [21:10]) decodes to the target's low 12 bits.
     const lo12 = (add_word >> 10) & 0xFFF;
     try std.testing.expectEqual(@as(u32, @intCast(target_addr & 0xFFF)), lo12);
     // The rd and rn fields, bits [4:0] and [9:5], are untouched.
-    try std.testing.expectEqual(@as(u32, @intFromEnum(encode.Reg.x3)), add_word & 0x1F);
-    try std.testing.expectEqual(@as(u32, @intFromEnum(encode.Reg.x3)), (add_word >> 5) & 0x1F);
+    try std.testing.expectEqual(@as(u32, @backingInt(encode.Reg.x3)), add_word & 0x1F);
+    try std.testing.expectEqual(@as(u32, @backingInt(encode.Reg.x3)), (add_word >> 5) & 0x1F);
 }

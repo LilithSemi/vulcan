@@ -86,7 +86,7 @@ fn reference(kind: Kind, a: f32, b: f32) f32 {
 
 /// True if block 0 of `func` has a `load` producing a vector value (a coalesced wide load).
 fn hasVectorLoad(func: *const Function) bool {
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) != .load) continue;
         const r = func.instResult(inst).?;
         if (func.types.type_kind(func.valueType(r)) == .vector) return true;
@@ -96,7 +96,7 @@ fn hasVectorLoad(func: *const Function) bool {
 
 /// True if block 0 of `func` has a `store` of a vector value (a coalesced wide store).
 fn hasVectorStore(func: *const Function) bool {
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) != .store) continue;
         if (func.types.type_kind(func.valueType(func.opcode(inst).store.value)) == .vector) return true;
     }
@@ -106,7 +106,7 @@ fn hasVectorStore(func: *const Function) bool {
 /// Count block-0 scalar (non-vector-result) loads.
 fn scalarLoadCount(func: *const Function) usize {
     var n: usize = 0;
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) != .load) continue;
         const r = func.instResult(inst).?;
         if (func.types.type_kind(func.valueType(r)) != .vector) n += 1;
@@ -177,10 +177,10 @@ fn expectCoalescingCorrect(kind: Kind, store_between: bool, expect_coalesced: bo
         var a_t = a;
         var bb_b = b;
         var bb_t = b;
-        var out_b = [_]f32{0} ** N;
-        var out_t = [_]f32{0} ** N;
-        var scratch_b = [_]f32{0} ** N;
-        var scratch_t = [_]f32{0} ** N;
+        var out_b: [N]f32 = @splat(0);
+        var out_t: [N]f32 = @splat(0);
+        var scratch_b: [N]f32 = @splat(0);
+        var scratch_t: [N]f32 = @splat(0);
         f_b(&a_b, &bb_b, &out_b, &scratch_b);
         f_t(&a_t, &bb_t, &out_t, &scratch_t);
         for (0..N) |i| {

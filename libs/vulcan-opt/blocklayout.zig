@@ -84,7 +84,7 @@ pub fn layout(allocator: std.mem.Allocator, func: *Function, profile: ?[]const u
     // Convert to the Block-typed permutation `reorderBlocks` expects.
     const block_order = try allocator.alloc(Block, n);
     defer allocator.free(block_order);
-    for (order, 0..) |b, i| block_order[i] = @enumFromInt(b);
+    for (order, 0..) |b, i| block_order[i] = @fromBackingInt(@intCast(b));
     try func.reorderBlocks(allocator, block_order);
     return true;
 }
@@ -288,7 +288,7 @@ test "blocklayout: reorders so a forward successor falls through" {
     defer cfg.deinit(allocator);
     const succs = cfg.successors(0);
     try testing.expect(succs[0] == 1 or succs[1] == 1);
-    try testing.expectEqual(@as(i64, 2), blockConst(&func, @enumFromInt(1)).?);
+    try testing.expectEqual(@as(i64, 2), blockConst(&func, @fromBackingInt(@intCast(1))).?);
 
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
@@ -312,7 +312,7 @@ test "blocklayout: a profile picks the hot successor to fall through" {
     defer cfg.deinit(allocator);
     const succs = cfg.successors(0);
     try testing.expect(succs[0] == 1 or succs[1] == 1);
-    try testing.expectEqual(@as(i64, 1), blockConst(&func, @enumFromInt(1)).?);
+    try testing.expectEqual(@as(i64, 1), blockConst(&func, @fromBackingInt(@intCast(1))).?);
 
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();

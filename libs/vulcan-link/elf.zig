@@ -528,31 +528,31 @@ fn parseObject64(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
             const typ: u32 = @truncate(r_info & 0xffffffff);
             const sym_index: u32 = @intCast(r_info >> 32);
             const rt: RelocType = switch (typ) {
-                @intFromEnum(RelocType.jal) => .jal,
-                @intFromEnum(RelocType.call) => .call,
-                @intFromEnum(RelocType.pcrel_hi20) => .pcrel_hi20,
-                @intFromEnum(RelocType.pcrel_lo12_i) => .pcrel_lo12_i,
-                @intFromEnum(RelocType.got_hi20) => .got_hi20,
-                @intFromEnum(RelocType.adr_prel_pg_hi21) => .adr_prel_pg_hi21,
-                @intFromEnum(RelocType.add_abs_lo12_nc) => .add_abs_lo12_nc,
-                @intFromEnum(RelocType.call26) => .call26,
-                @intFromEnum(RelocType.jump26) => .jump26,
-                @intFromEnum(RelocType.prel32) => .prel32,
-                @intFromEnum(RelocType.abs64) => .abs64,
-                @intFromEnum(RelocType.adr_got_page) => .adr_got_page,
-                @intFromEnum(RelocType.ld64_got_lo12_nc) => .ld64_got_lo12_nc,
-                @intFromEnum(RelocType.ldst64_abs_lo12_nc) => .ldst64_abs_lo12_nc,
+                @backingInt(RelocType.jal) => .jal,
+                @backingInt(RelocType.call) => .call,
+                @backingInt(RelocType.pcrel_hi20) => .pcrel_hi20,
+                @backingInt(RelocType.pcrel_lo12_i) => .pcrel_lo12_i,
+                @backingInt(RelocType.got_hi20) => .got_hi20,
+                @backingInt(RelocType.adr_prel_pg_hi21) => .adr_prel_pg_hi21,
+                @backingInt(RelocType.add_abs_lo12_nc) => .add_abs_lo12_nc,
+                @backingInt(RelocType.call26) => .call26,
+                @backingInt(RelocType.jump26) => .jump26,
+                @backingInt(RelocType.prel32) => .prel32,
+                @backingInt(RelocType.abs64) => .abs64,
+                @backingInt(RelocType.adr_got_page) => .adr_got_page,
+                @backingInt(RelocType.ld64_got_lo12_nc) => .ld64_got_lo12_nc,
+                @backingInt(RelocType.ldst64_abs_lo12_nc) => .ldst64_abs_lo12_nc,
                 // `R_RISCV_64` (numeric 2) ALSO collides with x86_64's `R_X86_64_PC32`
                 // (numeric 2, `RelocType.pc32` above). riscv64 never emits a numeric-2 TEXT
                 // reloc (its text relocs are jal/call/pcrel_hi20/pcrel_lo12_i/got_hi20), so a
                 // riscv64 numeric-2 RELA entry appears only in `.rela.data`/`.rela.rodata` (a
                 // pointer-init slot, riscv64's analog of aarch64's ABS64) - gate on `arch`,
                 // mirroring the `1 =>` x86-64/i386 gate below.
-                @intFromEnum(RelocType.pc32) => if (arch == .riscv64) .abs64 else .pc32,
-                @intFromEnum(RelocType.plt32) => .plt32,
-                @intFromEnum(RelocType.gotpcrel) => .gotpcrel,
-                @intFromEnum(RelocType.gotpcrelx) => .gotpcrelx,
-                @intFromEnum(RelocType.rex_gotpcrelx) => .rex_gotpcrelx,
+                @backingInt(RelocType.pc32) => if (arch == .riscv64) .abs64 else .pc32,
+                @backingInt(RelocType.plt32) => .plt32,
+                @backingInt(RelocType.gotpcrel) => .gotpcrel,
+                @backingInt(RelocType.gotpcrelx) => .gotpcrelx,
+                @backingInt(RelocType.rex_gotpcrelx) => .rex_gotpcrelx,
                 // `R_X86_64_64` (numeric 1): a 64-bit absolute address in a DATA section
                 // (a pointer-init slot), x86-64's analog of aarch64's ABS64. Gated on
                 // `arch == .x86_64` since numeric 1 is ALSO i386's `R_386_32` - but that is
@@ -717,9 +717,9 @@ fn parseObject32(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
             const typ: u32 = r_info & 0xff;
             const sym_index: u32 = r_info >> 8;
             const rt: RelocType = switch (typ) {
-                @intFromEnum(RelocType.abs32) => .abs32,
-                @intFromEnum(RelocType.pc32) => .pc32,
-                @intFromEnum(RelocType.got32) => .got32,
+                @backingInt(RelocType.abs32) => .abs32,
+                @backingInt(RelocType.pc32) => .pc32,
+                @backingInt(RelocType.got32) => .got32,
                 else => return error.UnsupportedReloc,
             };
             const reloc: Reloc = .{

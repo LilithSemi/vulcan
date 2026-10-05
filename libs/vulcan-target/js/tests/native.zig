@@ -61,7 +61,7 @@ fn runJs(io: std.Io, allocator: std.mem.Allocator, program: []const u8) ![]u8 {
 
 fn returnType(func: *const Function) ?Type {
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
+        const block: Block = @fromBackingInt(@intCast(@as(u32, @intCast(bi))));
         if (func.terminator(block)) |term| switch (term) {
             .ret => |r| if (r.count > 0) return func.valueType(r.values[0]),
             .jump => {},
@@ -476,7 +476,7 @@ test "JS backend: auto-vectorized GLSL vec4 shader runs through JS" {
 
     var has_vec = false;
     for (0..func.instCount()) |i| {
-        const res = func.instResult(@enumFromInt(i)) orelse continue;
+        const res = func.instResult(@fromBackingInt(@intCast(i))) orelse continue;
         if (func.types.type_kind(func.valueType(res)) == .vector) has_vec = true;
     }
     try std.testing.expect(has_vec);

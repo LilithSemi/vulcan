@@ -35,7 +35,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         avail.clearRetainingCapacity(); // availability does not cross block boundaries here
         keep.clearRetainingCapacity();
         var block_changed = false;
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             switch (func.opcode(inst)) {
                 .load => |ld| {
                     // A `volatile` load (SM9 Plan 2 Task 4) must observably re-read memory every
@@ -119,7 +119,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             try keep.append(allocator, inst);
         }
         if (block_changed) {
-            try func.setBlockInsts(@enumFromInt(bi), keep.items);
+            try func.setBlockInsts(@fromBackingInt(@intCast(bi)), keep.items);
             changed = true;
         }
     }

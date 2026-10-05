@@ -76,7 +76,7 @@ pub fn writeUefiImage(allocator: std.mem.Allocator, code: []const u8, mem_size: 
 
     // COFF file header.
     const coff = buf[dos_size + pe_sig_size ..];
-    w(u16, coff[0..], @intFromEnum(machine));
+    w(u16, coff[0..], @backingInt(machine));
     w(u16, coff[2..], 1); // NumberOfSections
     w(u16, coff[16..], @intCast(opt_size)); // SizeOfOptionalHeader
     w(u16, coff[18..], FILE_EXECUTABLE | FILE_LARGE_ADDRESS_AWARE | FILE_LINE_NUMS_STRIPPED);
@@ -135,5 +135,5 @@ test "emits a well-formed UEFI PE32+ header" {
     const sect = coff[coff_size + opt_size ..];
     const praw = std.mem.readInt(u32, sect[20..24], .little);
     try std.testing.expectEqualSlices(u8, &code, img[praw..][0..code.len]);
-    try std.testing.expectEqual(@as(u16, 0x5064), @intFromEnum(Machine.riscv64));
+    try std.testing.expectEqual(@as(u16, 0x5064), @backingInt(Machine.riscv64));
 }

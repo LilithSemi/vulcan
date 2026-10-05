@@ -53,7 +53,7 @@ pub fn legalize(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator
 /// recording the field mapping and the original parameter list per block.
 fn splitStructParams(allocator: std.mem.Allocator, func: *Function, param_fields: *ParamFields, old_params: *OldParams) std.mem.Allocator.Error!void {
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         const old = try allocator.dupe(Value, func.blockParams(block));
 
         var new_params: std.ArrayList(Value) = .empty;
@@ -90,7 +90,7 @@ fn splitStructParams(allocator: std.mem.Allocator, func: *Function, param_fields
 /// struct. Edges from `if` instructions are not handled here yet.
 fn rewriteJumpEdges(allocator: std.mem.Allocator, func: *Function, param_fields: *const ParamFields, old_params: *const OldParams) std.mem.Allocator.Error!void {
     for (0..func.blockCount()) |bi| {
-        const src: Block = @enumFromInt(bi);
+        const src: Block = @fromBackingInt(@intCast(bi));
         const jump = switch (func.terminator(src) orelse continue) {
             .jump => |j| j,
             .ret => continue,
@@ -121,7 +121,7 @@ fn rewriteJumpEdges(allocator: std.mem.Allocator, func: *Function, param_fields:
 /// the block's terminator.
 fn rewriteIfEdges(allocator: std.mem.Allocator, func: *Function, param_fields: *const ParamFields, old_params: *const OldParams) std.mem.Allocator.Error!void {
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
 
         const insts = try allocator.dupe(function.Inst, func.blockInsts(block));
         defer allocator.free(insts);
@@ -195,7 +195,7 @@ fn expandEdge(
 /// constant, in place (the result value is unchanged).
 fn foldConstants(func: *Function) void {
     for (0..func.instCount()) |i| {
-        const op = func.opcodeMut(@enumFromInt(i));
+        const op = func.opcodeMut(@fromBackingInt(@intCast(i)));
         switch (op.*) {
             .arith => |a| {
                 const lhs = constValue(func, a.lhs) orelse continue;
@@ -213,7 +213,7 @@ fn foldConstants(func: *Function) void {
 /// is then dropped if this was its last use. Ranges are RISC-V immediate widths.
 fn foldImmediates(func: *Function) void {
     for (0..func.instCount()) |i| {
-        const op = func.opcodeMut(@enumFromInt(i));
+        const op = func.opcodeMut(@fromBackingInt(@intCast(i)));
         const a = switch (op.*) {
             .arith => |a| a,
             else => continue,
@@ -339,7 +339,7 @@ fn isPure(op: function.Opcode) bool {
 /// Map each `extract` of a `struct` construction to the field value it selects.
 fn buildSubst(allocator: std.mem.Allocator, func: *const Function, subst: *Subst, param_fields: *const ParamFields) std.mem.Allocator.Error!void {
     for (0..func.instCount()) |i| {
-        const inst: function.Inst = @enumFromInt(i);
+        const inst: function.Inst = @fromBackingInt(@intCast(i));
         switch (func.opcode(inst)) {
             .extract => |ex| {
                 // Resolve the aggregate through the substitution first, so an
@@ -380,7 +380,7 @@ fn sub(subst: *const Subst, value: Value) Value {
 /// Rewrite every operand through the substitution.
 fn applySubst(func: *Function, subst: *const Subst) void {
     for (0..func.instCount()) |i| {
-        const op = func.opcodeMut(@enumFromInt(i));
+        const op = func.opcodeMut(@fromBackingInt(@intCast(i)));
         switch (op.*) {
             .atomic_rmw => |*a| {
                 a.ptr = sub(subst, a.ptr);
@@ -451,7 +451,7 @@ fn applySubst(func: *Function, subst: *const Subst) void {
         }
     }
     for (0..func.blockCount()) |bi| {
-        const term = func.terminatorPtr(@enumFromInt(bi));
+        const term = func.terminatorPtr(@fromBackingInt(@intCast(bi)));
         if (term.*) |*t| switch (t.*) {
             .ret => |*r| {
                 for (r.values[0..r.count]) |*vv| vv.* = sub(subst, vv.*);
@@ -477,11 +477,11 @@ fn dropDeadInstructions(allocator: std.mem.Allocator, func: *Function) std.mem.A
 
         var removed = false;
         for (0..func.blockCount()) |bi| {
-            const insts = func.blockInstsMut(@enumFromInt(bi));
+            const insts = func.blockInstsMut(@fromBackingInt(@intCast(bi)));
             var w: usize = 0;
             for (insts.items) |inst| {
                 const dead = isPure(func.opcode(inst)) and
-                    if (func.instResult(inst)) |r| uses[@intFromEnum(r)] == 0 else false;
+                    if (func.instResult(inst)) |r| uses[@backingInt(r)] == 0 else false;
                 if (dead) {
                     removed = true;
                     continue;
@@ -499,85 +499,85 @@ fn dropDeadInstructions(allocator: std.mem.Allocator, func: *Function) std.mem.A
 /// their terminators.
 fn countUses(func: *const Function, uses: []u32) void {
     for (0..func.blockCount()) |bi| {
-        const block: function.Block = @enumFromInt(bi);
+        const block: function.Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .atomic_rmw => |a| {
-                    uses[@intFromEnum(a.ptr)] += 1;
-                    uses[@intFromEnum(a.value)] += 1;
-                    if (a.compare) |c| uses[@intFromEnum(c)] += 1;
+                    uses[@backingInt(a.ptr)] += 1;
+                    uses[@backingInt(a.value)] += 1;
+                    if (a.compare) |c| uses[@backingInt(c)] += 1;
                 },
                 // A barrier carries no Value operand, so it joins the constants here.
                 .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |a| {
-                    uses[@intFromEnum(a.lhs)] += 1;
-                    uses[@intFromEnum(a.rhs)] += 1;
+                    uses[@backingInt(a.lhs)] += 1;
+                    uses[@backingInt(a.rhs)] += 1;
                 },
-                .arith_imm => |a| uses[@intFromEnum(a.lhs)] += 1,
+                .arith_imm => |a| uses[@backingInt(a.lhs)] += 1,
                 .icmp => |cmp| {
-                    uses[@intFromEnum(cmp.lhs)] += 1;
-                    uses[@intFromEnum(cmp.rhs)] += 1;
+                    uses[@backingInt(cmp.lhs)] += 1;
+                    uses[@backingInt(cmp.rhs)] += 1;
                 },
                 .select => |sel| {
-                    uses[@intFromEnum(sel.cond)] += 1;
-                    uses[@intFromEnum(sel.then)] += 1;
-                    uses[@intFromEnum(sel.@"else")] += 1;
+                    uses[@backingInt(sel.cond)] += 1;
+                    uses[@backingInt(sel.then)] += 1;
+                    uses[@backingInt(sel.@"else")] += 1;
                 },
-                .extract => |ex| uses[@intFromEnum(ex.aggregate)] += 1,
-                .convert => |cv| uses[@intFromEnum(cv.value)] += 1,
-                .decode_low_float, .encode_low_float => |cv| uses[@intFromEnum(cv.value)] += 1,
+                .extract => |ex| uses[@backingInt(ex.aggregate)] += 1,
+                .convert => |cv| uses[@backingInt(cv.value)] += 1,
+                .decode_low_float, .encode_low_float => |cv| uses[@backingInt(cv.value)] += 1,
                 .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
-                    uses[@intFromEnum(cv.value)] += 1;
-                    uses[@intFromEnum(cv.block_scale)] += 1;
-                    uses[@intFromEnum(cv.global_scale)] += 1;
+                    uses[@backingInt(cv.value)] += 1;
+                    uses[@backingInt(cv.block_scale)] += 1;
+                    uses[@backingInt(cv.global_scale)] += 1;
                 },
-                .unary => |u| uses[@intFromEnum(u.value)] += 1,
-                .load => |ld| uses[@intFromEnum(ld.ptr)] += 1,
+                .unary => |u| uses[@backingInt(u.value)] += 1,
+                .load => |ld| uses[@backingInt(ld.ptr)] += 1,
                 .store => |st| {
-                    uses[@intFromEnum(st.value)] += 1;
-                    uses[@intFromEnum(st.ptr)] += 1;
+                    uses[@backingInt(st.value)] += 1;
+                    uses[@backingInt(st.ptr)] += 1;
                 },
-                .prefetch => |pf| uses[@intFromEnum(pf.ptr)] += 1,
-                .va_start => |vs| uses[@intFromEnum(vs.list)] += 1,
-                .va_arg => |va| uses[@intFromEnum(va.list)] += 1,
-                .va_end => |ve| uses[@intFromEnum(ve.list)] += 1,
+                .prefetch => |pf| uses[@backingInt(pf.ptr)] += 1,
+                .va_start => |vs| uses[@backingInt(vs.list)] += 1,
+                .va_arg => |va| uses[@backingInt(va.list)] += 1,
+                .va_end => |ve| uses[@backingInt(ve.list)] += 1,
                 .dot => |d| {
-                    uses[@intFromEnum(d.acc)] += 1;
-                    uses[@intFromEnum(d.a)] += 1;
-                    uses[@intFromEnum(d.b)] += 1;
+                    uses[@backingInt(d.acc)] += 1;
+                    uses[@backingInt(d.a)] += 1;
+                    uses[@backingInt(d.b)] += 1;
                 },
-                .reduce => |red| uses[@intFromEnum(red.vector)] += 1,
-                .splat => |sp| uses[@intFromEnum(sp.scalar)] += 1,
+                .reduce => |red| uses[@backingInt(red.vector)] += 1,
+                .splat => |sp| uses[@backingInt(sp.scalar)] += 1,
                 .matmul => |mm| {
-                    uses[@intFromEnum(mm.a)] += 1;
-                    uses[@intFromEnum(mm.b)] += 1;
-                    uses[@intFromEnum(mm.c)] += 1;
+                    uses[@backingInt(mm.a)] += 1;
+                    uses[@backingInt(mm.b)] += 1;
+                    uses[@backingInt(mm.c)] += 1;
                 },
                 .struct_new => |sn| for (func.valueList(sn.fields)) |f| {
-                    uses[@intFromEnum(f)] += 1;
+                    uses[@backingInt(f)] += 1;
                 },
                 .call => |c| {
-                    for (func.valueList(c.args)) |arg| uses[@intFromEnum(arg)] += 1;
-                    if (c.ret_dest) |rd| uses[@intFromEnum(rd)] += 1; // ret_dest is a use too.
+                    for (func.valueList(c.args)) |arg| uses[@backingInt(arg)] += 1;
+                    if (c.ret_dest) |rd| uses[@backingInt(rd)] += 1; // ret_dest is a use too.
                 },
                 .call_indirect => |c| {
-                    uses[@intFromEnum(c.target)] += 1;
-                    for (func.valueList(c.args)) |arg| uses[@intFromEnum(arg)] += 1;
-                    if (c.ret_dest) |rd| uses[@intFromEnum(rd)] += 1; // ret_dest is a use too.
+                    uses[@backingInt(c.target)] += 1;
+                    for (func.valueList(c.args)) |arg| uses[@backingInt(arg)] += 1;
+                    if (c.ret_dest) |rd| uses[@backingInt(rd)] += 1; // ret_dest is a use too.
                 },
                 .@"if" => |cf| {
-                    uses[@intFromEnum(cf.cond)] += 1;
-                    for (func.blockArgs(cf.then)) |arg| uses[@intFromEnum(arg)] += 1;
-                    for (func.blockArgs(cf.@"else")) |arg| uses[@intFromEnum(arg)] += 1;
+                    uses[@backingInt(cf.cond)] += 1;
+                    for (func.blockArgs(cf.then)) |arg| uses[@backingInt(arg)] += 1;
+                    for (func.blockArgs(cf.@"else")) |arg| uses[@backingInt(arg)] += 1;
                 },
             }
         }
         if (func.terminator(block)) |term| switch (term) {
             .ret => |r| for (r.slice()) |vv| {
-                uses[@intFromEnum(vv)] += 1;
+                uses[@backingInt(vv)] += 1;
             },
             .jump => |j| for (func.blockArgs(j)) |arg| {
-                uses[@intFromEnum(arg)] += 1;
+                uses[@backingInt(arg)] += 1;
             },
         };
     }

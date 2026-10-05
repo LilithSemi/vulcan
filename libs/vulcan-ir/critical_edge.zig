@@ -33,18 +33,18 @@ pub fn splitCriticalEdges(allocator: std.mem.Allocator, func: *Function) Error!v
     @memset(pred_count, 0);
 
     for (0..original_count) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .@"if" => |cf| {
-                    pred_count[@intFromEnum(cf.then.target)] += 1;
-                    pred_count[@intFromEnum(cf.@"else".target)] += 1;
+                    pred_count[@backingInt(cf.then.target)] += 1;
+                    pred_count[@backingInt(cf.@"else".target)] += 1;
                 },
                 else => {},
             }
         }
         if (func.terminator(block)) |term| switch (term) {
-            .jump => |j| pred_count[@intFromEnum(j.target)] += 1,
+            .jump => |j| pred_count[@backingInt(j.target)] += 1,
             .ret => {},
         };
     }
@@ -53,7 +53,7 @@ pub fn splitCriticalEdges(allocator: std.mem.Allocator, func: *Function) Error!v
     // outgoing edges are the only critical-edge candidates. Split each edge
     // whose target has more than one predecessor.
     for (0..original_count) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .@"if" => {
@@ -78,7 +78,7 @@ fn splitEdge(allocator: std.mem.Allocator, func: *Function, inst: function.Inst,
 
     // The pred already has two successors (it ends in `if`); the edge is
     // critical only when the target also has more than one predecessor.
-    if (pred_count[@intFromEnum(edge.target)] <= 1) return;
+    if (pred_count[@backingInt(edge.target)] <= 1) return;
 
     // Copy the edge arguments before any interning can reallocate the value-list
     // pool the slice points into.
@@ -132,7 +132,7 @@ test "critical edges: a diamond with a critical edge gets a forwarding block" {
 
     // Exactly one forwarding block was added for the one critical edge.
     try std.testing.expectEqual(before + 1, func.blockCount());
-    const fwd: Block = @enumFromInt(before);
+    const fwd: Block = @fromBackingInt(@intCast(before));
 
     // The forwarding block jumps to b with no parameters of its own.
     try std.testing.expectEqual(@as(usize, 0), func.blockParams(fwd).len);
@@ -203,7 +203,7 @@ test "critical edges: forwarding block forwards the original edge arguments" {
     try splitCriticalEdges(std.testing.allocator, &func);
 
     try std.testing.expectEqual(before + 1, func.blockCount());
-    const fwd: Block = @enumFromInt(before);
+    const fwd: Block = @fromBackingInt(@intCast(before));
 
     // The forwarding block's jump carries exactly the original edge argument x,
     // satisfying b's single parameter.

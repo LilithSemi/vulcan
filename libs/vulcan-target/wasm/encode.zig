@@ -22,7 +22,7 @@ pub const SectionId = enum(u8) {
     data,
 
     pub fn toByte(id: SectionId) u8 {
-        return @intFromEnum(id);
+        return @backingInt(id);
     }
 };
 

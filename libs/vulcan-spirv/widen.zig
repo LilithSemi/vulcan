@@ -81,7 +81,7 @@ pub fn widenGraphics(func: *Function) Error!void {
 /// float-only vectorizable subset. (A `load`/`call`/`alloca`/`if`/ptr-param FS is NOT -
 /// it goes to the heavy widener instead.)
 fn singleBlockWidenable(func: *const Function) bool {
-    const entry: Block = @enumFromInt(0);
+    const entry: Block = @fromBackingInt(@intCast(0));
     for (func.blockParams(entry)) |pv| {
         if (isPtr(func, func.valueType(pv))) return false;
     }
@@ -107,7 +107,7 @@ fn singleBlockWidenable(func: *const Function) bool {
 /// Widen a single-entry-block, straight-line, buffer-free fragment `Function` in place so
 /// every f32 value carries 4 fragments (lanes) at once.
 fn widenSingleBlock(func: *Function) Error!void {
-    const entry: Block = @enumFromInt(0);
+    const entry: Block = @fromBackingInt(@intCast(0));
     const vec_ty = try f32VecType(func);
 
     for (func.blockParams(entry)) |pv| {
@@ -198,14 +198,14 @@ fn flattenToSingleBlock(func: *Function) Error!void {
     const nval0 = func.valueCount();
     var subst = try func.allocator.alloc(Value, nval0);
     defer func.allocator.free(subst);
-    for (0..nval0) |i| subst[i] = @enumFromInt(i);
+    for (0..nval0) |i| subst[i] = @fromBackingInt(@intCast(i));
 
     var cur: usize = 0;
     while (true) {
         if (cur >= nblocks) return error.NotWidenable;
         if (visited[cur]) return error.NotWidenable; // back-edge / loop
         visited[cur] = true;
-        const block: Block = @enumFromInt(cur);
+        const block: Block = @fromBackingInt(@intCast(cur));
 
         var if_inst: ?Inst = null;
         for (func.blockInsts(block)) |inst| {
@@ -223,7 +223,7 @@ fn flattenToSingleBlock(func: *Function) Error!void {
             }
             const cf = func.opcode(ifi).@"if";
             const merge = try flattenDiamond(func, &out_insts, visited, subst, cf);
-            cur = @intFromEnum(merge);
+            cur = @backingInt(merge);
             continue;
         }
 
@@ -241,7 +241,7 @@ fn flattenToSingleBlock(func: *Function) Error!void {
                 const mparams = func.blockParams(j.target);
                 if (args.len != mparams.len) return error.NotWidenable;
                 for (mparams, args) |mp, arg| recordSubst(subst, mp, arg);
-                cur = @intFromEnum(j.target);
+                cur = @backingInt(j.target);
             },
         }
     }
@@ -249,12 +249,12 @@ fn flattenToSingleBlock(func: *Function) Error!void {
     // Resolve the substitution transitively (a param may map to another param that maps on),
     // then apply it across every instruction operand + terminator. We apply by RAUW per entry.
     for (0..nval0) |i| {
-        const from: Value = @enumFromInt(i);
+        const from: Value = @fromBackingInt(@intCast(i));
         const to = resolveSubst(subst, from);
         if (to != from) func.replaceAllUses(from, to);
     }
 
-    const entry: Block = @enumFromInt(0);
+    const entry: Block = @fromBackingInt(@intCast(0));
     try func.setBlockInsts(entry, out_insts.items);
     func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
@@ -262,16 +262,16 @@ fn flattenToSingleBlock(func: *Function) Error!void {
     // sees block0.
     var bi: usize = 1;
     while (bi < nblocks) : (bi += 1) {
-        try func.setBlockInsts(@enumFromInt(bi), &.{});
-        try func.setBlockParams(@enumFromInt(bi), &.{});
-        func.setTerminator(@enumFromInt(bi), .{ .ret = ir.function.Ret.none() });
+        try func.setBlockInsts(@fromBackingInt(@intCast(bi)), &.{});
+        try func.setBlockParams(@fromBackingInt(@intCast(bi)), &.{});
+        func.setTerminator(@fromBackingInt(@intCast(bi)), .{ .ret = ir.function.Ret.none() });
     }
 }
 
 /// Record `from -> to` in the substitution table (no-op if `from` is out of range, which only
 /// happens for a freshly-created select, which is never substituted).
 fn recordSubst(subst: []Value, from: Value, to: Value) void {
-    const i = @intFromEnum(from);
+    const i = @backingInt(from);
     if (i < subst.len) subst[i] = to;
 }
 
@@ -280,8 +280,8 @@ fn recordSubst(subst: []Value, from: Value, to: Value) void {
 fn resolveSubst(subst: []const Value, v: Value) Value {
     var cur = v;
     var guard: usize = 0;
-    while (@intFromEnum(cur) < subst.len) {
-        const next = subst[@intFromEnum(cur)];
+    while (@backingInt(cur) < subst.len) {
+        const next = subst[@backingInt(cur)];
         if (next == cur) break;
         cur = next;
         guard += 1;
@@ -344,7 +344,7 @@ const ArmResult = struct { target: Block, args: []const Value };
 /// a store or a sampler write inside an arm). A `store` inside an arm IS rejected (it would
 /// need real predication).
 fn emitArm(func: *Function, out: *std.ArrayListUnmanaged(Inst), visited: []bool, arm: Block) Error!ArmResult {
-    const bi = @intFromEnum(arm);
+    const bi = @backingInt(arm);
     if (visited[bi]) return error.NotWidenable;
     visited[bi] = true;
     for (func.blockInsts(arm)) |inst| {
@@ -412,7 +412,7 @@ fn emitArm(func: *Function, out: *std.ArrayListUnmanaged(Inst), visited: []bool,
 const SamplerSlots = struct { base: Value, slots: [lanes]Value };
 
 fn widenFlattened(func: *Function) Error!void {
-    const entry: Block = @enumFromInt(0);
+    const entry: Block = @fromBackingInt(@intCast(0));
     const vec_ty = try f32VecType(func);
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const ptr_t = try func.types.ptrGlobal();
@@ -578,7 +578,7 @@ fn splatAndReplace(func: *Function, out: *std.ArrayListUnmanaged(Inst), sv: Valu
 /// Whether `rv` (an alloca result) is a sampler out-slot: it is the `out_ptr` arg of a
 /// `call_indirect(desc, u, v, out_ptr)` (the void sampler call). Pattern-matched over block0.
 fn isSamplerOutSlot(func: *const Function, rv: Value) bool {
-    const entry: Block = @enumFromInt(0);
+    const entry: Block = @fromBackingInt(@intCast(0));
     for (func.blockInsts(entry)) |inst| {
         if (func.opcode(inst) == .call_indirect) {
             const c = func.opcode(inst).call_indirect;
@@ -952,11 +952,11 @@ test "widen heavy: an if/else merge-phi diamond FLATTENS to one block with a sel
     // Flattened: ALL content collapses into block0 (sibling blocks are emptied, not removed -
     // value handles are dense indices, so blocks cannot be deleted). block0 holds a `select`
     // replacing the merge phi, and every other block is empty with no params.
-    try testing.expect(countOp(&func, @enumFromInt(0), .select) >= 1);
+    try testing.expect(countOp(&func, @fromBackingInt(@intCast(0)), .select) >= 1);
     var bi: usize = 1;
     while (bi < func.blockCount()) : (bi += 1) {
-        try testing.expectEqual(@as(usize, 0), func.blockInsts(@enumFromInt(bi)).len);
-        try testing.expectEqual(@as(usize, 0), func.blockParams(@enumFromInt(bi)).len);
+        try testing.expectEqual(@as(usize, 0), func.blockInsts(@fromBackingInt(@intCast(bi))).len);
+        try testing.expectEqual(@as(usize, 0), func.blockParams(@fromBackingInt(@intCast(bi))).len);
     }
     // Both arms' arithmetic execute unconditionally (vectorized): the result is a vector.
     try testing.expect(isF32Vec(&func, func.valueType(x)));

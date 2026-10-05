@@ -108,7 +108,7 @@ fn pointerArithChangesSpace(func: *const Function, a: function.Arith, result: Va
 fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocator.Error!void {
     var bi: usize = 0;
     while (bi < func.blockCount()) : (bi += 1) {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .arith => |a| if (func.instResult(inst)) |result| {
@@ -432,18 +432,18 @@ const Dominance = struct {
         for (succ) |*s| s.* = .empty;
 
         for (0..n) |bi| {
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             for (func.blockInsts(block)) |inst| {
                 switch (func.opcode(inst)) {
                     .@"if" => |cond| {
-                        try succ[bi].append(allocator, @intFromEnum(cond.then.target));
-                        try succ[bi].append(allocator, @intFromEnum(cond.@"else".target));
+                        try succ[bi].append(allocator, @backingInt(cond.then.target));
+                        try succ[bi].append(allocator, @backingInt(cond.@"else".target));
                     },
                     else => {},
                 }
             }
             if (func.terminator(block)) |term| switch (term) {
-                .jump => |j| try succ[bi].append(allocator, @intFromEnum(j.target)),
+                .jump => |j| try succ[bi].append(allocator, @backingInt(j.target)),
                 .ret => {},
             };
         }
@@ -512,15 +512,15 @@ fn checkDominance(func: *const Function, diags: *Diagnostics) std.mem.Allocator.
     const def_block = try diags.allocator.alloc(u32, func.valueCount());
     defer diags.allocator.free(def_block);
     for (0..n) |bi| {
-        const block: Block = @enumFromInt(bi);
-        for (func.blockParams(block)) |param| def_block[@intFromEnum(param)] = @intCast(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockParams(block)) |param| def_block[@backingInt(param)] = @intCast(bi);
         for (func.blockInsts(block)) |inst| {
-            if (func.instResult(inst)) |result| def_block[@intFromEnum(result)] = @intCast(bi);
+            if (func.instResult(inst)) |result| def_block[@backingInt(result)] = @intCast(bi);
         }
     }
 
     for (0..n) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 // A barrier uses no Value, so it has nothing to check for dominance.
@@ -609,9 +609,9 @@ fn checkUse(
     value: Value,
     use_block: usize,
 ) std.mem.Allocator.Error!void {
-    const db = def_block[@intFromEnum(value)];
+    const db = def_block[@backingInt(value)];
     if (db != use_block and !dominance.dominates(db, use_block)) {
-        try diags.add(.{ .not_dominated = .{ .value = value, .block = @enumFromInt(use_block) } });
+        try diags.add(.{ .not_dominated = .{ .value = value, .block = @fromBackingInt(@intCast(use_block)) } });
     }
 }
 
@@ -620,7 +620,7 @@ fn checkUse(
 fn checkEdges(func: *const Function, diags: *Diagnostics) std.mem.Allocator.Error!void {
     var bi: usize = 0;
     while (bi < func.blockCount()) : (bi += 1) {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .@"if" => |cond| {
@@ -666,7 +666,7 @@ fn checkEdge(func: *const Function, diags: *Diagnostics, jump: Jump) std.mem.All
 fn checkPrimitiveTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocator.Error!void {
     var bi: usize = 0;
     while (bi < func.blockCount()) : (bi += 1) {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockParams(block)) |param| try checkValueType(func, diags, param);
         for (func.blockInsts(block)) |inst| {
             if (func.instResult(inst)) |result| try checkValueType(func, diags, result);

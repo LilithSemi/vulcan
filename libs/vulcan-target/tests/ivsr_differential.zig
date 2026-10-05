@@ -286,8 +286,8 @@ test "ivsr differential: a chain step that escapes leaves the whole address chai
 
     var arr: [32]i32 = undefined;
     for (&arr, 0..) |*e, idx| e.* = @intCast(idx);
-    var sink_b = [_]i32{0} ** 32;
-    var sink_t = [_]i32{0} ** 32;
+    var sink_b: [32]i32 = @splat(0);
+    var sink_t: [32]i32 = @splat(0);
 
     const trips = [_]i32{ 0, 1, 2, 3, 5, 8 };
     for (trips) |n| {

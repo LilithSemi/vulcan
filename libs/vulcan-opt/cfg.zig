@@ -82,18 +82,18 @@ pub fn build(allocator: std.mem.Allocator, func: *const Function) std.mem.Alloca
 
     // A block's successors come from its `if` edges (high IR) and its terminator.
     for (0..n) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
                 .@"if" => |cf| {
-                    try succ[bi].append(allocator, @intFromEnum(cf.then.target));
-                    try succ[bi].append(allocator, @intFromEnum(cf.@"else".target));
+                    try succ[bi].append(allocator, @backingInt(cf.then.target));
+                    try succ[bi].append(allocator, @backingInt(cf.@"else".target));
                 },
                 else => {},
             }
         }
         if (func.terminator(block)) |term| switch (term) {
-            .jump => |j| try succ[bi].append(allocator, @intFromEnum(j.target)),
+            .jump => |j| try succ[bi].append(allocator, @backingInt(j.target)),
             .ret => {},
         };
     }

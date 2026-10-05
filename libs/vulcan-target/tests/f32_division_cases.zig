@@ -136,9 +136,9 @@ pub fn build(allocator: std.mem.Allocator) !Corpus {
     }
     try std.testing.expectEqual(@as(usize, 65_536), random_count);
 
-    var exponent_pairs = [_]bool{false} ** 65_536;
-    var numerator_coverage = [_][5][2]bool{.{.{ false, false }} ** 5} ** 256;
-    var denominator_coverage = [_][5][2]bool{.{.{ false, false }} ** 5} ** 256;
+    var exponent_pairs: [65_536]bool = @splat(false);
+    var numerator_coverage: [256][5][2]bool = @splat(@splat(.{ false, false }));
+    var denominator_coverage: [256][5][2]bool = @splat(@splat(.{ false, false }));
     for (pairs.items) |pair| {
         const numerator_exponent: usize = @intCast((pair.numerator >> 23) & 0xff);
         const denominator_exponent: usize = @intCast((pair.denominator >> 23) & 0xff);

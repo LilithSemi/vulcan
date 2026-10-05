@@ -48,15 +48,15 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     defer allocator.free(consts);
     @memset(consts, null);
     for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @enumFromInt(i);
+        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
         if (func.opcode(inst) == .iconst) {
-            if (func.instResult(inst)) |r| consts[@intFromEnum(r)] = func.opcode(inst).iconst;
+            if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
         }
     }
 
     var changed = false;
     for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @enumFromInt(i);
+        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
         // Extract (op, x, c) where `c` is the constant operand, or skip.
         var op: BinOp = undefined;
         var x: Value = undefined;
@@ -70,16 +70,16 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             .arith => |a| {
                 op = a.op;
                 if (a.op == .mul) { // commutative: either operand may be the constant
-                    if (consts[@intFromEnum(a.rhs)]) |cc| {
+                    if (consts[@backingInt(a.rhs)]) |cc| {
                         x = a.lhs;
                         c = cc;
-                    } else if (consts[@intFromEnum(a.lhs)]) |cc| {
+                    } else if (consts[@backingInt(a.lhs)]) |cc| {
                         x = a.rhs;
                         c = cc;
                     } else continue;
                 } else if (a.op == .div or a.op == .rem) { // only the divisor (rhs)
                     x = a.lhs;
-                    c = consts[@intFromEnum(a.rhs)] orelse continue;
+                    c = consts[@backingInt(a.rhs)] orelse continue;
                 } else continue;
             },
             else => continue,
@@ -114,7 +114,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 fn magicPhase(allocator: std.mem.Allocator, func: *Function, consts: []const ?i64) pass.Error!bool {
     var changed = false;
     for (0..func.blockCount()) |bi| {
-        const block: ir.function.Block = @enumFromInt(bi);
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
         var has = false;
         for (func.blockInsts(block)) |inst| {
             if (magicDivisor(func, consts, inst) != null) {
@@ -159,7 +159,7 @@ fn magicDivisor(func: *const Function, consts: []const ?i64, inst: ir.function.I
         8, 16, 32, 64 => {},
         else => return null,
     }
-    const d = consts[@intFromEnum(a.rhs)] orelse return null;
+    const d = consts[@backingInt(a.rhs)] orelse return null;
     const ad: u64 = @abs(d);
     if (ad < 3) return null; // 0/1 are handled elsewhere, 2 is a power of two
     if (ad & (ad - 1) == 0) return null; // a power of two: the shift path already handled it

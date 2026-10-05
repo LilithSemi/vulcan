@@ -106,9 +106,9 @@ const scratch_imm: Reg = .x16; // arith-immediate constant / remainder quotient 
 const scratch_move: Reg = .x17; // GPR parallel-move cycle breaking
 // FP scratch (same index space names v-registers, v24..v27 are caller-saved and
 // outside every FP pool).
-const fp_spill_op = [_]Reg{ @as(Reg, @enumFromInt(24)), @as(Reg, @enumFromInt(25)) };
-const fp_spill_res: Reg = @enumFromInt(26);
-const fp_move: Reg = @enumFromInt(27);
+const fp_spill_op = [_]Reg{ @as(Reg, @fromBackingInt(@intCast(24))), @as(Reg, @fromBackingInt(@intCast(25))) };
+const fp_spill_res: Reg = @fromBackingInt(@intCast(26));
+const fp_move: Reg = @fromBackingInt(@intCast(27));
 
 /// A value lives in either the general-register file (gpr) or the FP/SIMD file
 /// (fpr), decided by its type. The same numeric register index names x_n or v_n.
@@ -526,7 +526,7 @@ fn lineOf(func: *const Function, inst: ir.function.Inst) ?u32 {
 
 fn isLeaf(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .call or func.opcode(inst) == .call_indirect) return false;
         }
     }
@@ -538,7 +538,7 @@ fn isLeaf(func: *const Function) bool {
 fn maxCallArgs(func: *const Function) usize {
     var max: usize = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             switch (func.opcode(inst)) {
                 .call => |c| max = @max(max, func.valueList(c.args).len),
                 .call_indirect => |c| max = @max(max, func.valueList(c.args).len),
@@ -593,7 +593,7 @@ fn applyFoldRewrite(func: *Function, fold: *const addrfold.Analysis) void {
     // result is unused. Assert that (a surviving use would mean dropping a live def = a miscompile)
     // before removing it. Removal order is irrelevant: no dead add's result feeds another instruction.
     for (0..func.blockCount()) |bi| {
-        const list = func.blockInstsMut(@enumFromInt(bi));
+        const list = func.blockInstsMut(@fromBackingInt(@intCast(bi)));
         var i: usize = 0;
         while (i < list.items.len) {
             const inst = list.items[i];
@@ -800,7 +800,7 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
 /// the same behavior byte-for-byte (each `str x{gp}, [base + i*8]`).
 fn emitStructRetStore(allocator: std.mem.Allocator, code: *std.ArrayList(u32), pieces: [4]ir.function.RetPiece, count: u8, base: Reg) Error!void {
     const gpr_ret = [_]Reg{ .x0, .x1 };
-    const fpr_ret = [4]Reg{ @enumFromInt(0), @enumFromInt(1), @enumFromInt(2), @enumFromInt(3) };
+    const fpr_ret = [4]Reg{ @fromBackingInt(@intCast(0)), @fromBackingInt(@intCast(1)), @fromBackingInt(@intCast(2)), @fromBackingInt(@intCast(3)) };
     var gp_i: usize = 0;
     var fp_i: usize = 0;
     for (0..count) |i| {
@@ -933,17 +933,17 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     if (func.is_variadic) {
         var gi: u5 = 0;
         while (gi < 8) : (gi += 1) {
-            try code.append(allocator, encode.strOff(@enumFromInt(gi), sp, @intCast(gr_save_off + @as(usize, gi) * 8)));
+            try code.append(allocator, encode.strOff(@fromBackingInt(@intCast(gi)), sp, @intCast(gr_save_off + @as(usize, gi) * 8)));
         }
         var vi: u5 = 0;
         while (vi < 8) : (vi += 1) {
-            try code.append(allocator, encode.strQ(@enumFromInt(vi), sp, @intCast(vr_save_off + @as(usize, vi) * 16)));
+            try code.append(allocator, encode.strQ(@fromBackingInt(@intCast(vi)), sp, @intCast(vr_save_off + @as(usize, vi) * 16)));
         }
     }
     // Move register arguments into their parameter registers (a leaf keeps them
     // pinned, so no move), and load stack parameters (the 9th onward) from the
     // caller's outgoing-argument area.
-    const eparams = func.blockParams(@enumFromInt(0));
+    const eparams = func.blockParams(@fromBackingInt(@intCast(0)));
     const plocs = try allocator.alloc(ArgLoc, eparams.len);
     defer allocator.free(plocs);
     computeArgLocs(func, eparams, plocs, func.sret);
@@ -1010,7 +1010,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             switch (segs[0].loc) {
                 .reg => |first_reg| {
                     if (l.idx < 8) {
-                        const incoming: Reg = @enumFromInt(@as(u5, @intCast(l.idx)));
+                        const incoming: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(l.idx))));
                         if (first_reg != incoming) {
                             try code.append(allocator, if (l.class == .fpr)
                                 (if (vec) encode.movVec(first_reg, incoming) else encode.fmovReg(first_reg, incoming))
@@ -1026,7 +1026,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 .slot => |slot| {
                     const slot_off: u15 = @intCast(spill_base + slot * 16);
                     if (l.idx < 8) {
-                        const incoming: Reg = @enumFromInt(@as(u5, @intCast(l.idx)));
+                        const incoming: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(l.idx))));
                         if (l.class == .fpr) {
                             try code.append(allocator, if (vec) encode.strQ(incoming, sp, slot_off) else encode.strFp(incoming, sp, slot_off, true));
                         } else {
@@ -1054,7 +1054,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         if (alloc.reg.get(p) == null) {
             const slot_off: u15 = @intCast(spill_base + alloc.spill.get(p).? * 16);
             if (l.idx < 8) {
-                const incoming: Reg = @enumFromInt(@as(u5, @intCast(l.idx)));
+                const incoming: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(l.idx))));
                 if (l.class == .fpr) {
                     try code.append(allocator, if (isVector(func, p) or isQuad(func, p)) encode.strQ(incoming, sp, slot_off) else encode.strFp(incoming, sp, slot_off, true));
                 } else {
@@ -1080,7 +1080,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             // own ABI register, so `pr` equals `incoming` and no move is needed. But a high-pressure
             // leaf can now relocate a parameter into a callee-saved register (`pr != incoming`), and
             // that move MUST be emitted, or the parameter never reaches its register.
-            const incoming: Reg = @enumFromInt(@as(u5, @intCast(l.idx)));
+            const incoming: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(l.idx))));
             if (!leaf or pr != incoming) {
                 try code.append(allocator, if (l.class == .fpr) encode.fmovReg(pr, incoming) else encode.mov(pr, incoming));
             }
@@ -1117,7 +1117,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     var pos: u32 = 0;
     var action_cursor: usize = 0;
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         ctx.block = block; // the predecessor for any edge this block terminates in (edge-move keying)
         // A neutralized (unreachable) block: `neutralizeUnreachable` emptied its params, instructions,
         // and terminator so downstream passes see only the reachable CFG. It carries no code and no
@@ -1161,7 +1161,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             }
             // The pos coupling is otherwise unobservable while `segments` is empty, so assert it now:
             // an instruction with a result must be emitted at exactly that result's def position.
-            if (func.instResult(inst)) |r| std.debug.assert(ctx.pos == alloc.def_pos[@intFromEnum(r)]);
+            if (func.instResult(inst)) |r| std.debug.assert(ctx.pos == alloc.def_pos[@backingInt(r)]);
             // Drain split-boundary actions landing at this position BEFORE emitting the instruction.
             // A tail-split store writes the victim's register to its slot before the taker `iv` (the
             // instruction defined at `p`) computes its result into that same register. The victim's
@@ -1406,7 +1406,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try code.append(allocator, encode.movVec(fp_move, cm));
                         try code.append(allocator, encode.bslVec(fp_move, tr, el));
                         const rd = ctx.resultReg(result);
-                        if (@intFromEnum(rd) != @intFromEnum(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
+                        if (@backingInt(rd) != @backingInt(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
                         try storeResult(allocator, &code, ctx, result, rd);
                         continue;
                     }
@@ -1739,7 +1739,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         // returns its quad in v0), so capture it with the 128-bit `movVec`, not the
                         // 64-bit `fmovReg` an f32/f64 uses.
                         try code.append(allocator, if (regClass(func, result) == .fpr)
-                            (if (isQuad(func, result)) encode.movVec(rd, @enumFromInt(0)) else encode.fmovReg(rd, @enumFromInt(0)))
+                            (if (isQuad(func, result)) encode.movVec(rd, @fromBackingInt(@intCast(0))) else encode.fmovReg(rd, @fromBackingInt(@intCast(0))))
                         else
                             encode.mov(rd, .x0));
                         try storeResult(allocator, &code, ctx, result, rd);
@@ -1767,7 +1767,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         // An f128 result comes back in the whole 128-bit v0, so capture it with the
                         // 128-bit `movVec`, not the 64-bit `fmovReg` an f32/f64 uses.
                         try code.append(allocator, if (regClass(func, result) == .fpr)
-                            (if (isQuad(func, result)) encode.movVec(rd, @enumFromInt(0)) else encode.fmovReg(rd, @enumFromInt(0)))
+                            (if (isQuad(func, result)) encode.movVec(rd, @fromBackingInt(@intCast(0))) else encode.fmovReg(rd, @fromBackingInt(@intCast(0))))
                         else
                             encode.mov(rd, .x0));
                         try storeResult(allocator, &code, ctx, result, rd);
@@ -1783,7 +1783,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 .@"if" => |cf| {
                     // The block emitted immediately after this one, in array order. An `if` edge to it
                     // can fall through (elide its branch) instead of jumping around one instruction.
-                    const next_block: ?Block = if (bi + 1 < nblocks) @enumFromInt(bi + 1) else null;
+                    const next_block: ?Block = if (bi + 1 < nblocks) @fromBackingInt(@intCast(bi + 1)) else null;
                     try ctx.emitIf(allocator, &code, &fixups, cf, insts, inst_idx, next_block);
                     terminated = true;
                 },
@@ -1802,7 +1802,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try code.append(allocator, encode.movVec(fp_move, racc));
                     try code.append(allocator, if (dotSigned(func, d.a)) encode.sdot(fp_move, ra, rb) else encode.udot(fp_move, ra, rb));
                     const rd = ctx.resultReg(result);
-                    if (@intFromEnum(rd) != @intFromEnum(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
+                    if (@backingInt(rd) != @backingInt(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 // AAPCS64 variadic define side. `va_start` seeds the `va_list`, `va_arg`
@@ -1849,9 +1849,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                                 switch (ctx.locationAt(value)) {
                                     .slot => |slot| {
                                         const off: u15 = @intCast(spill_base + slot * 16);
-                                        try code.append(allocator, if (vec) encode.ldrQ(@enumFromInt(0), sp, off) else encode.ldrFp(@enumFromInt(0), sp, off, true));
+                                        try code.append(allocator, if (vec) encode.ldrQ(@fromBackingInt(@intCast(0)), sp, off) else encode.ldrFp(@fromBackingInt(@intCast(0)), sp, off, true));
                                     },
-                                    .reg => |src| if (@intFromEnum(src) != 0) try code.append(allocator, if (vec) encode.movVec(@enumFromInt(0), src) else encode.fmovReg(@enumFromInt(0), src)),
+                                    .reg => |src| if (@backingInt(src) != 0) try code.append(allocator, if (vec) encode.movVec(@fromBackingInt(@intCast(0)), src) else encode.fmovReg(@fromBackingInt(@intCast(0)), src)),
                                 }
                             } else switch (ctx.locationAt(value)) {
                                 .slot => |slot| try code.append(allocator, encode.ldrOff(.x0, sp, @intCast(spill_base + slot * 16))),
@@ -1871,8 +1871,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             // into a return register cannot clobber another that still lives in one
                             // (the source registers can overlap the return set in any permutation).
                             const gpr_ret = [_]Reg{ .x0, .x1 };
-                            const fpr_ret = [4]Reg{ @enumFromInt(0), @enumFromInt(1), @enumFromInt(2), @enumFromInt(3) };
-                            const fpr_scratch = [4]Reg{ @enumFromInt(24), @enumFromInt(25), @enumFromInt(26), @enumFromInt(27) };
+                            const fpr_ret = [4]Reg{ @fromBackingInt(@intCast(0)), @fromBackingInt(@intCast(1)), @fromBackingInt(@intCast(2)), @fromBackingInt(@intCast(3)) };
+                            const fpr_scratch = [4]Reg{ @fromBackingInt(@intCast(24)), @fromBackingInt(@intCast(25)), @fromBackingInt(@intCast(26)), @fromBackingInt(@intCast(27)) };
                             var dst: [4]Reg = undefined;
                             var staged: [4]Reg = undefined;
                             var is_fp: [4]bool = undefined;
@@ -1913,7 +1913,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 .jump => |j| {
                     // The block emitted immediately after this one, in array order. A jump to it needs
                     // no branch (fall through), which `emitJump` elides.
-                    const next_block: ?Block = if (bi + 1 < nblocks) @enumFromInt(bi + 1) else null;
+                    const next_block: ?Block = if (bi + 1 < nblocks) @fromBackingInt(@intCast(bi + 1)) else null;
                     try ctx.emitJump(allocator, &code, &fixups, j, next_block);
                 },
             }
@@ -1985,7 +1985,7 @@ const Ctx = struct {
     /// The block currently being emitted (the PREDECESSOR of any edge this block terminates in).
     /// `emitMoves` reads it with the jump target to key into the precomputed `edge_moves`. Defaults
     /// to the entry block. The emission loop sets it per block.
-    block: Block = @enumFromInt(0),
+    block: Block = @fromBackingInt(@intCast(0)),
 
     /// The location of `v` at the current instruction position (`self.pos`): its active segment if
     /// `v` was split, otherwise its whole-life register or spill slot. With no splits (segments
@@ -2167,7 +2167,7 @@ const Ctx = struct {
                 .sub => encode.fmlsVec(fp_move, a, b),
                 else => unreachable, // the caller only routes .add/.sub here (see the switch above)
             });
-            if (@intFromEnum(rd) != @intFromEnum(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
+            if (@backingInt(rd) != @backingInt(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
             try storeResult(allocator, code, self, result, rd);
             return;
         }
@@ -2430,7 +2430,7 @@ const Ctx = struct {
                 .reg_eqz => |reg| encode.cbz(reg, 0),
             });
             try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves on the else path
-            try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(else_target) });
+            try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target) });
             try code.append(allocator, encode.b(0));
             const then_at = code.items.len;
             const disp: i21 = @intCast((@as(i64, @intCast(then_at)) - @as(i64, @intCast(bcc_at))) * 4);
@@ -2455,7 +2455,7 @@ const Ctx = struct {
                 .reg_eqz => |reg| encode.cbnz(reg, 0),
             });
             try self.emitMoves(allocator, code, cf.then); // THEN-moves on the then (not-taken) path
-            try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(then_target) });
+            try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target) });
             try code.append(allocator, encode.b(0));
             const else_at = code.items.len;
             const disp: i21 = @intCast((@as(i64, @intCast(else_at)) - @as(i64, @intCast(bcc_at))) * 4);
@@ -2476,7 +2476,7 @@ const Ctx = struct {
             .reg_eqz => |reg| encode.cbz(reg, 0),
         });
         try self.emitMoves(allocator, code, cf.@"else");
-        try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(else_target) });
+        try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target) });
         try code.append(allocator, encode.b(0));
         const then_at = code.items.len;
         const disp: i21 = @intCast((@as(i64, @intCast(then_at)) - @as(i64, @intCast(bcc_at))) * 4);
@@ -2486,7 +2486,7 @@ const Ctx = struct {
             .reg_eqz => |reg| encode.cbz(reg, disp),
         };
         try self.emitMoves(allocator, code, cf.then);
-        try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(then_target) });
+        try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target) });
         try code.append(allocator, encode.b(0));
     }
 
@@ -2502,7 +2502,7 @@ const Ctx = struct {
         // A jump to the block emitted immediately after this one falls through: the edge-moves above
         // still run, but the `b` (and its fixup) is elided.
         if (next_block != null and jump.target == next_block.?) return;
-        try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(jump.target) });
+        try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(jump.target) });
         try code.append(allocator, encode.b(0));
     }
 
@@ -2593,7 +2593,7 @@ const Ctx = struct {
         switch (m.src) {
             .reg => |sr| switch (m.dst) {
                 .reg => |dr| {
-                    if (@intFromEnum(sr) == @intFromEnum(dr)) return; // identity move
+                    if (@backingInt(sr) == @backingInt(dr)) return; // identity move
                     try code.append(allocator, if (fpr) encode.movVec(dr, sr) else encode.mov(dr, sr));
                 },
                 .slot => |ds| {
@@ -2641,7 +2641,7 @@ const Ctx = struct {
                     try code.append(allocator, encode.mov(.x8, src));
                     continue;
                 }
-                const target: Reg = @enumFromInt(@as(u5, @intCast(loc.idx)));
+                const target: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(loc.idx))));
                 if (loc.class == .fpr) {
                     const src = try self.loadOp(allocator, code, arg, fp_spill_op[0]);
                     if (loc.idx >= 8) return error.Unsupported; // fp stack args not handled
@@ -2685,7 +2685,7 @@ const Ctx = struct {
         for (args, locs) |arg, loc| {
             if (loc.sret_ptr) continue; // already moved to x8 in phase 1
             if (loc.idx >= 8) continue;
-            const target: Reg = @enumFromInt(@as(u5, @intCast(loc.idx)));
+            const target: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(loc.idx))));
             switch (self.locationAt(arg)) {
                 .reg => |src| {
                     const m = Move{ .src = src, .dst = target };
@@ -2706,7 +2706,7 @@ const Ctx = struct {
         for (args, locs) |arg, loc| {
             if (loc.sret_ptr) continue; // already moved to x8 in phase 1
             if (loc.idx >= 8) continue;
-            const target: Reg = @enumFromInt(@as(u5, @intCast(loc.idx)));
+            const target: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(loc.idx))));
             switch (self.locationAt(arg)) {
                 .slot => |slot| {
                     const off: u15 = @intCast(self.spill_base + slot * 16);
@@ -2733,7 +2733,7 @@ const Ctx = struct {
 /// UNNAMED argument. The classification (`regClass`) is exactly the prologue's param-homing split.
 const NamedRegCounts = struct { gp: u32, fp: u32 };
 fn namedRegCounts(func: *const Function) NamedRegCounts {
-    const eparams = func.blockParams(@enumFromInt(0));
+    const eparams = func.blockParams(@fromBackingInt(@intCast(0)));
     const n_fixed = @min(func.num_fixed_params, @as(u32, @intCast(eparams.len)));
     var gp: u32 = 0;
     var fp: u32 = 0;
@@ -2868,7 +2868,7 @@ fn linearize(allocator: std.mem.Allocator, func: *const Function, fold: *const a
         err: ?Error = null,
 
         fn visit(self: *@This(), v: Value, is_edge_arg: bool) void {
-            const vi = @intFromEnum(v);
+            const vi = @backingInt(v);
             markUse(self.last_use, v, self.pos);
             if (is_edge_arg) {
                 self.is_intra[vi] = false;
@@ -2883,13 +2883,13 @@ fn linearize(allocator: std.mem.Allocator, func: *const Function, fold: *const a
 
     var pos: u32 = 0;
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockParams(block)) |p| {
-            def_pos[@intFromEnum(p)] = pos;
-            last_use[@intFromEnum(p)] = pos;
-            is_param[@intFromEnum(p)] = true;
-            is_intra[@intFromEnum(p)] = false;
-            def_block[@intFromEnum(p)] = @intCast(bi);
+            def_pos[@backingInt(p)] = pos;
+            last_use[@backingInt(p)] = pos;
+            is_param[@backingInt(p)] = true;
+            is_intra[@backingInt(p)] = false;
+            def_block[@backingInt(p)] = @intCast(bi);
         }
         pos += 1;
         for (func.blockInsts(block)) |inst| {
@@ -2905,8 +2905,8 @@ fn linearize(allocator: std.mem.Allocator, func: *const Function, fold: *const a
             forEachOperand(func, inst, fold, &col, Collector.visit);
             if (col.err) |e| return e;
             if (func.instResult(inst)) |r| {
-                def_pos[@intFromEnum(r)] = pos;
-                def_block[@intFromEnum(r)] = @intCast(bi);
+                def_pos[@backingInt(r)] = pos;
+                def_block[@backingInt(r)] = @intCast(bi);
             }
             switch (func.opcode(inst)) {
                 .call, .call_indirect => try call_positions.append(allocator, pos),
@@ -2981,7 +2981,7 @@ const aarch64_reg_ctx: AArch64RegCtx = .{};
 /// exactly as `regClass` decides (float/vector -> fpr, everything else -> gpr).
 fn aarch64ClassOf(ctx: *const anyopaque, func: *const Function, v: Value) u16 {
     _ = ctx;
-    return @intFromEnum(regClass(func, v));
+    return @backingInt(regClass(func, v));
 }
 
 /// `RegDescription.isNarrow` for aarch64: a value survives a clobber of a `narrow_preserved` register
@@ -3066,7 +3066,7 @@ fn aarch64CopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Va
 pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function) Error!wimmer.RegDescription {
     const leaf = isLeaf(func);
 
-    const eparams = func.blockParams(@enumFromInt(0));
+    const eparams = func.blockParams(@fromBackingInt(@intCast(0)));
     const plocs = try allocator.alloc(ArgLoc, eparams.len);
     defer allocator.free(plocs);
     computeArgLocs(func, eparams, plocs, func.sret);
@@ -3203,8 +3203,8 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
     // reserves for parallel moves, kept out of every pool.
     const scratch = try allocator.alloc(u16, 2);
     errdefer allocator.free(scratch);
-    scratch[0] = @intCast(@intFromEnum(scratch_move));
-    scratch[1] = @intCast(@intFromEnum(fp_move));
+    scratch[0] = @intCast(@backingInt(scratch_move));
+    scratch[1] = @intCast(@backingInt(fp_move));
 
     // Second per-class scratch for breaking a parallel-move cycle that involves a spill slot (so
     // spill-slot coalescing commits on high-pressure functions instead of reverting). Reuses regs the
@@ -3214,8 +3214,8 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
     // every allocatable pool unchanged, so no existing codegen shifts.
     const scratch2 = try allocator.alloc(u16, 2);
     errdefer allocator.free(scratch2);
-    scratch2[0] = @intCast(@intFromEnum(scratch_imm));
-    scratch2[1] = @intCast(@intFromEnum(fp_spill_res));
+    scratch2[0] = @intCast(@backingInt(scratch_imm));
+    scratch2[1] = @intCast(@backingInt(fp_spill_res));
 
     return .{
         .classes = classes,
@@ -3343,7 +3343,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
 
     // Entry params of a leaf: each is pinned by the hint to its ABI arg register, so the prologue
     // needs no move. Collect them (and their ABI arg locations) to require exactly that shape below.
-    const eparams = func.blockParams(@enumFromInt(0));
+    const eparams = func.blockParams(@fromBackingInt(@intCast(0)));
     const plocs = try allocator.alloc(ArgLoc, eparams.len);
     defer allocator.free(plocs);
     computeArgLocs(func, eparams, plocs, func.sret);
@@ -3353,7 +3353,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
         const value = e.key_ptr.*;
         const wsegs = e.value_ptr.*;
         std.debug.assert(wsegs.len > 0);
-        const class: u16 = @intFromEnum(regClass(func, value)); // 0 gpr, 1 fpr, matching desc classes
+        const class: u16 = @backingInt(regClass(func, value)); // 0 gpr, 1 fpr, matching desc classes
         const param_loc = entryParamArgLoc(eparams, plocs, value);
 
         if (wsegs.len == 1) {
@@ -3377,7 +3377,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
                             if (!pl.sret_ptr and pl.idx < 8 and @as(usize, ri) != pl.idx) return error.Unsupported;
                         }
                     }
-                    try alloc.reg.put(allocator, value, @enumFromInt(@as(u5, @intCast(ri))));
+                    try alloc.reg.put(allocator, value, @fromBackingInt(@intCast(@as(u5, @intCast(ri)))));
                 },
                 // A whole-life, immediately-spilled entry param (gap #4, e.g. a param whose whole
                 // range the allocator decided to keep in memory under pressure): the emission
@@ -3440,7 +3440,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
     // callee-saved registers) but populated for a high-pressure leaf that did use one, or any
     // non-leaf.
     for (walloc.used_callee_saved) |us| {
-        const reg: Reg = @enumFromInt(@as(u5, @intCast(us.reg)));
+        const reg: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(us.reg))));
         if (us.class == 0) try alloc.saved_gpr.append(allocator, reg) else try alloc.saved_fpr.append(allocator, reg);
     }
     std.mem.sort(Reg, alloc.saved_gpr.items, {}, regLessThan);
@@ -3479,7 +3479,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
 }
 
 fn regLessThan(_: void, a: Reg, b: Reg) bool {
-    return @intFromEnum(a) < @intFromEnum(b);
+    return @backingInt(a) < @backingInt(b);
 }
 
 /// The ABI argument location of `v` if it is one of the entry block's parameters, else null.
@@ -3493,7 +3493,7 @@ fn entryParamArgLoc(eparams: []const Value, plocs: []const ArgLoc, v: Value) ?Ar
 /// (gpr) or `v_n` (fpr) via the shared enum, and a per-class slot maps through `aarch64Slot`.
 fn translateLoc(loc: wimmer.Location, class: u16, gpr_slots: u32) Location {
     return switch (loc) {
-        .reg => |ri| .{ .reg = @enumFromInt(@as(u5, @intCast(ri))) },
+        .reg => |ri| .{ .reg = @fromBackingInt(@intCast(@as(u5, @intCast(ri)))) },
         .slot => |s| .{ .slot = aarch64Slot(class, s, gpr_slots) },
     };
 }
@@ -3517,7 +3517,7 @@ fn translateTransition(value: Value, src: Location, dst: Location, at: u32) Erro
 }
 
 fn markUse(last_use: []u32, v: Value, pos: u32) void {
-    if (pos > last_use[@intFromEnum(v)]) last_use[@intFromEnum(v)] = pos;
+    if (pos > last_use[@backingInt(v)]) last_use[@backingInt(v)] = pos;
 }
 
 /// Visit every operand VALUE used by `inst`, calling `f(ctx, value, is_edge_arg)`. `is_edge_arg` is
@@ -3971,7 +3971,7 @@ fn foldsAsCmpImm(func: *const Function, insts: []const ir.function.Inst, inst_id
 fn countUses(func: *const Function, v: Value) usize {
     var count: usize = 0;
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| count += usesOfInInst(func, inst, v);
         if (func.terminator(block)) |term| count += usesOfInTerm(func, term, v);
     }
@@ -4097,7 +4097,7 @@ fn usesOfInTerm(func: *const Function, term: Terminator, v: Value) usize {
 }
 
 fn setUsed(row: []bool, v: Value) void {
-    row[@intFromEnum(v)] = true;
+    row[@backingInt(v)] = true;
 }
 
 fn markUsedBitset(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, row: []bool) void {
@@ -4197,21 +4197,21 @@ fn extendLiveRanges(allocator: std.mem.Allocator, func: *const Function, last_us
     @memset(used, false);
 
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         const row = used[bi * nval ..][0..nval];
-        for (func.blockParams(block)) |p| defined[bi * nval + @intFromEnum(p)] = true;
+        for (func.blockParams(block)) |p| defined[bi * nval + @backingInt(p)] = true;
         for (func.blockInsts(block)) |inst| {
             markUsedBitset(func, inst, fold, row);
-            if (func.instResult(inst)) |r| defined[bi * nval + @intFromEnum(r)] = true;
+            if (func.instResult(inst)) |r| defined[bi * nval + @backingInt(r)] = true;
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
-                try succ[bi].append(allocator, @intFromEnum(cf.then.target));
-                try succ[bi].append(allocator, @intFromEnum(cf.@"else".target));
+                try succ[bi].append(allocator, @backingInt(cf.then.target));
+                try succ[bi].append(allocator, @backingInt(cf.@"else".target));
             }
         }
         if (func.terminator(block)) |term| {
             markUsedTermBitset(func, term, row);
-            if (term == .jump) try succ[bi].append(allocator, @intFromEnum(term.jump.target));
+            if (term == .jump) try succ[bi].append(allocator, @backingInt(term.jump.target));
         }
     }
 
@@ -4331,7 +4331,7 @@ fn typeAlign(func: *const Function, ty: ir.types.Type) usize {
 fn computeAllocaSlots(allocator: std.mem.Allocator, func: *const Function, map: *std.AutoHashMapUnmanaged(Value, u32)) Error!usize {
     var cur: usize = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             switch (func.opcode(inst)) {
                 .alloca => |al| {
                     const sz = typeSize(func, al.elem);
@@ -4733,16 +4733,16 @@ test "intra-block predicate and use positions" {
     var lin = try debugLiveness(allocator, &func);
     defer lin.deinit(allocator);
 
-    try std.testing.expect(lin.is_intra[@intFromEnum(v)]);
-    try std.testing.expect(!lin.is_intra[@intFromEnum(w)]);
-    try std.testing.expect(!lin.is_intra[@intFromEnum(x)]);
+    try std.testing.expect(lin.is_intra[@backingInt(v)]);
+    try std.testing.expect(!lin.is_intra[@backingInt(w)]);
+    try std.testing.expect(!lin.is_intra[@backingInt(x)]);
     // Params are never intra-splittable.
-    try std.testing.expect(!lin.is_intra[@intFromEnum(a)]);
-    try std.testing.expect(!lin.is_intra[@intFromEnum(bp)]);
-    try std.testing.expect(!lin.is_intra[@intFromEnum(p)]);
+    try std.testing.expect(!lin.is_intra[@backingInt(a)]);
+    try std.testing.expect(!lin.is_intra[@backingInt(bp)]);
+    try std.testing.expect(!lin.is_intra[@backingInt(p)]);
 
     // V's use positions are non-empty and strictly ascending.
-    const vuses = lin.use_positions[@intFromEnum(v)];
+    const vuses = lin.use_positions[@backingInt(v)];
     try std.testing.expect(vuses.len > 0);
     var i: usize = 1;
     while (i < vuses.len) : (i += 1) try std.testing.expect(vuses[i] > vuses[i - 1]);

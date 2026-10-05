@@ -275,7 +275,7 @@ pub fn runVpuKernelInt(io: std.Io, allocator: std.mem.Allocator, code: []const u
 
 /// True if block 0 of `func` has a `load` producing a vector value (a coalesced wide vector load).
 fn hasVectorLoad(func: *const Function) bool {
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) != .load) continue;
         const r = func.instResult(inst).?;
         if (func.types.type_kind(func.valueType(r)) == .vector) return true;
@@ -285,7 +285,7 @@ fn hasVectorLoad(func: *const Function) bool {
 
 /// True if block 0 of `func` has a `store` of a vector value (a coalesced wide vector store).
 fn hasVectorStore(func: *const Function) bool {
-    for (func.blockInsts(@enumFromInt(0))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(0)))) |inst| {
         if (func.opcode(inst) != .store) continue;
         if (func.types.type_kind(func.valueType(func.opcode(inst).store.value)) == .vector) return true;
     }
@@ -1030,7 +1030,7 @@ fn hasCsrw(code: []const u32, csr: u12) bool {
 /// site is that descriptor. Used to inspect the tensor_fma descriptors' first_pass bit. Caller owns
 /// the returned list.
 fn collectCsrwDescriptors(allocator: std.mem.Allocator, code: []const u32, csr: u12) std.mem.Allocator.Error![]u64 {
-    var regs = [_]u64{0} ** 32;
+    var regs: [32]u64 = @splat(0);
     var out: std.ArrayList(u64) = .empty;
     errdefer out.deinit(allocator);
     for (code) |word| {
@@ -2553,7 +2553,7 @@ test "et-soc matmul quant differential: mixed-signedness asymmetric inference, u
 fn countIrMatmuls(func: *const Function) usize {
     var count: usize = 0;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .matmul) count += 1;
         }
     }
@@ -2637,7 +2637,7 @@ test "matmul_recog differential: recognized matmul matches the host reference on
 
         var found: ?ir.function.MatMul = null;
         for (0..func_recog.blockCount()) |bi| {
-            for (func_recog.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func_recog.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 switch (func_recog.opcode(inst)) {
                     .matmul => |mm2| found = mm2,
                     else => {},
@@ -2645,7 +2645,7 @@ test "matmul_recog differential: recognized matmul matches the host reference on
             }
         }
         const raised_mm = found orelse return error.TestUnexpectedResult;
-        const entry_params = func_recog.blockParams(@as(ir.function.Block, @enumFromInt(0)));
+        const entry_params = func_recog.blockParams(@as(ir.function.Block, @fromBackingInt(@intCast(0))));
         try std.testing.expectEqual(entry_params[0], raised_mm.a);
         try std.testing.expectEqual(entry_params[1], raised_mm.b);
         try std.testing.expectEqual(entry_params[2], raised_mm.c);
@@ -2743,7 +2743,7 @@ test "matmul_recog differential: a MEMORY-accumulator nest raises to accumulate=
 
         var found: ?ir.function.MatMul = null;
         for (0..func_recog.blockCount()) |bi| {
-            for (func_recog.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func_recog.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 switch (func_recog.opcode(inst)) {
                     .matmul => |mm2| found = mm2,
                     else => {},
@@ -2751,7 +2751,7 @@ test "matmul_recog differential: a MEMORY-accumulator nest raises to accumulate=
             }
         }
         const raised_mm = found orelse return error.TestUnexpectedResult;
-        const entry_params = func_recog.blockParams(@as(ir.function.Block, @enumFromInt(0)));
+        const entry_params = func_recog.blockParams(@as(ir.function.Block, @fromBackingInt(@intCast(0))));
         try std.testing.expectEqual(entry_params[0], raised_mm.a);
         try std.testing.expectEqual(entry_params[1], raised_mm.b);
         try std.testing.expectEqual(entry_params[2], raised_mm.c);
@@ -2964,7 +2964,7 @@ test "matmul_recog differential: a SURROUNDED nest is raised to an embedded matm
 
     var raised: ?ir.function.MatMul = null;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
             .matmul => |mm2| raised = mm2,
             else => {},
         };
@@ -3049,7 +3049,7 @@ test "matmul_recog differential: a SURROUNDED memory-accumulator nest raises an 
 
     var raised: ?ir.function.MatMul = null;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
             .matmul => |mm2| raised = mm2,
             else => {},
         };
@@ -3168,7 +3168,7 @@ test "matmul_recog differential: recognized int8/uint8/mixed matmul matches the 
 
         var found: ?ir.function.MatMul = null;
         for (0..func_recog.blockCount()) |bi| {
-            for (func_recog.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func_recog.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 switch (func_recog.opcode(inst)) {
                     .matmul => |mm2| found = mm2,
                     else => {},
@@ -3176,7 +3176,7 @@ test "matmul_recog differential: recognized int8/uint8/mixed matmul matches the 
             }
         }
         const raised_mm = found orelse return error.TestUnexpectedResult;
-        const entry_params = func_recog.blockParams(@as(ir.function.Block, @enumFromInt(0)));
+        const entry_params = func_recog.blockParams(@as(ir.function.Block, @fromBackingInt(@intCast(0))));
         try std.testing.expectEqual(entry_params[0], raised_mm.a);
         try std.testing.expectEqual(entry_params[1], raised_mm.b);
         try std.testing.expectEqual(entry_params[2], raised_mm.c);
@@ -3284,7 +3284,7 @@ test "matmul_recog differential: recognized fp16 matmul matches the host referen
 
         var found: ?ir.function.MatMul = null;
         for (0..func_recog.blockCount()) |bi| {
-            for (func_recog.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func_recog.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 switch (func_recog.opcode(inst)) {
                     .matmul => |mm2| found = mm2,
                     else => {},
@@ -3292,7 +3292,7 @@ test "matmul_recog differential: recognized fp16 matmul matches the host referen
             }
         }
         const raised_mm = found orelse return error.TestUnexpectedResult;
-        const entry_params = func_recog.blockParams(@as(ir.function.Block, @enumFromInt(0)));
+        const entry_params = func_recog.blockParams(@as(ir.function.Block, @fromBackingInt(@intCast(0))));
         try std.testing.expectEqual(entry_params[0], raised_mm.a);
         try std.testing.expectEqual(entry_params[1], raised_mm.b);
         try std.testing.expectEqual(entry_params[2], raised_mm.c);

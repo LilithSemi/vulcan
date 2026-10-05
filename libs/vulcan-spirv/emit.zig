@@ -208,16 +208,16 @@ const Emitter = struct {
     }
 
     fn setVal(self: *Emitter, v: Value, id: u32) void {
-        self.value_ids[@intFromEnum(v)] = id;
+        self.value_ids[@backingInt(v)] = id;
     }
     /// SPIR-V id of a value, allocating one on first reference. Makes forward references
     /// work: a loop-header `OpPhi` naming a back-edge value defined later gets the same id
     /// the definition will use.
     fn idFor(self: *Emitter, v: Value) u32 {
-        const existing = self.value_ids[@intFromEnum(v)];
+        const existing = self.value_ids[@backingInt(v)];
         if (existing != 0) return existing;
         const id = self.fresh();
-        self.value_ids[@intFromEnum(v)] = id;
+        self.value_ids[@backingInt(v)] = id;
         return id;
     }
 
@@ -337,13 +337,13 @@ const Emitter = struct {
         try self.emit(&self.preamble, op.MemoryModel, &.{ 0, 1 }); // Logical, GLSL450
 
         const n = self.func.blockCount();
-        const entry: Block = @enumFromInt(0);
+        const entry: Block = @fromBackingInt(@intCast(0));
         const params = self.func.blockParams(entry);
 
         // Return type and value: from whichever block returns (one in an if/else diamond).
         var ret_val: ?Value = null;
         for (0..n) |i| {
-            if (self.func.terminator(@enumFromInt(i))) |t| switch (t) {
+            if (self.func.terminator(@fromBackingInt(@intCast(i)))) |t| switch (t) {
                 .ret => |r| {
                     if (r.count > 1) return error.UnsupportedConstruct; // multi-value struct return not yet lowered (M4d-c)
                     ret_val = if (r.count == 1) r.values[0] else null;
@@ -378,7 +378,7 @@ const Emitter = struct {
         try link_ops.append(self.allocator, 0); // Export linkage type
         try self.emit(&self.annotations, op.Decorate, link_ops.items);
 
-        for (0..n) |i| try self.hoistConstants(@enumFromInt(i));
+        for (0..n) |i| try self.hoistConstants(@fromBackingInt(@intCast(i)));
 
         // Pre-assign a label id per block (branches forward-reference them).
         const labels = try self.allocator.alloc(u32, n);
@@ -478,7 +478,7 @@ const Emitter = struct {
         const tt = self.func.terminator(iff.then.target) orelse return null;
         const et = self.func.terminator(iff.@"else".target) orelse return null;
         if (tt != .jump or et != .jump or tt.jump.target != et.jump.target) return null;
-        return @intFromEnum(tt.jump.target);
+        return @backingInt(tt.jump.target);
     }
 
     fn continueOf(self: *Emitter, block: Block) ?u32 {
@@ -489,7 +489,7 @@ const Emitter = struct {
     /// last, so each construct's merge follows the whole construct as SPIR-V requires.
     /// `stops` holds the merges of enclosing constructs, which this level must not emit.
     fn emitBlock(self: *Emitter, block: Block, stops: *std.ArrayList(u32), visited: []bool, labels: []const u32, shader: ?ShaderBlockCtx) Error!void {
-        const idx = @intFromEnum(block);
+        const idx = @backingInt(block);
         for (stops.items) |s| if (s == idx) return;
         if (visited[idx]) return;
         visited[idx] = true;
@@ -501,7 +501,7 @@ const Emitter = struct {
             try self.emitBlock(iff.then.target, stops, visited, labels, shader);
             if (self.continueOf(block) == null) try self.emitBlock(iff.@"else".target, stops, visited, labels, shader);
             _ = stops.pop();
-            try self.emitBlock(@enumFromInt(merge), stops, visited, labels, shader);
+            try self.emitBlock(@fromBackingInt(@intCast(merge)), stops, visited, labels, shader);
         } else if (self.func.terminator(block)) |t| switch (t) {
             .jump => |j| try self.emitBlock(j.target, stops, visited, labels, shader),
             .ret => {},
@@ -513,7 +513,7 @@ const Emitter = struct {
     /// control-flow exit (with the shader output store before any `return`).
     fn emitFunctionBlock(self: *Emitter, block: Block, labels: []const u32, shader: ?ShaderBlockCtx) Error!void {
         const n = self.func.blockCount();
-        const idx = @intFromEnum(block);
+        const idx = @backingInt(block);
         try self.emit(&self.body, op.Label, &.{labels[idx]});
 
         if (idx == 0) {
@@ -531,7 +531,7 @@ const Emitter = struct {
                 try phi.append(self.allocator, phi_ty);
                 try phi.append(self.allocator, self.idFor(param));
                 for (0..n) |j| {
-                    if (self.edgeArgsTo(@enumFromInt(j), block)) |args| {
+                    if (self.edgeArgsTo(@fromBackingInt(@intCast(j)), block)) |args| {
                         try phi.append(self.allocator, self.idFor(args[pi]));
                         try phi.append(self.allocator, labels[j]);
                     }
@@ -553,9 +553,9 @@ const Emitter = struct {
             } else {
                 try self.emit(&self.body, op.SelectionMerge, &.{ labels[merge], 0 });
             }
-            try self.emit(&self.body, op.BranchConditional, &.{ self.idFor(iff.cond), labels[@intFromEnum(iff.then.target)], labels[@intFromEnum(iff.@"else".target)] });
+            try self.emit(&self.body, op.BranchConditional, &.{ self.idFor(iff.cond), labels[@backingInt(iff.then.target)], labels[@backingInt(iff.@"else".target)] });
         } else if (self.func.terminator(block)) |t| switch (t) {
-            .jump => |j| try self.emit(&self.body, op.Branch, &.{labels[@intFromEnum(j.target)]}),
+            .jump => |j| try self.emit(&self.body, op.Branch, &.{labels[@backingInt(j.target)]}),
             .ret => |r| {
                 // `discard` (fragment kill) is a `ret` block tagged `cf.discard`: emit
                 // OpKill instead of writing the output and returning.
@@ -639,7 +639,7 @@ const Emitter = struct {
     /// variable each, loaded at entry). The output value, if any, maps to a single
     /// `Output` variable stored before `OpReturn`. `main` itself is `void()`.
     fn runShader(self: *Emitter, info: ShaderInfo) Error!void {
-        const entry: Block = @enumFromInt(0);
+        const entry: Block = @fromBackingInt(@intCast(0));
         const params = self.func.blockParams(entry);
 
         var total_in: usize = 0;
@@ -696,7 +696,7 @@ const Emitter = struct {
             // must be found in the module, not interned.
             if (f32_ty == 0) {
                 outer: for (0..self.func.blockCount()) |bi| {
-                    for (self.func.blockInsts(@enumFromInt(bi))) |inst| {
+                    for (self.func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                         if (self.func.instResult(inst)) |r| {
                             const t = self.func.valueType(r);
                             if (self.func.types.type_kind(t) == .float) {
@@ -853,7 +853,7 @@ const Emitter = struct {
         }
 
         const n = self.func.blockCount();
-        for (0..n) |i| try self.hoistConstants(@enumFromInt(i));
+        for (0..n) |i| try self.hoistConstants(@fromBackingInt(@intCast(i)));
 
         // Pre-assign a label id per block (branches forward-reference them).
         const labels = try self.allocator.alloc(u32, n);

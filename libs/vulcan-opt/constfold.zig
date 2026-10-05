@@ -129,9 +129,9 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     defer allocator.free(consts);
     @memset(consts, null);
     for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @enumFromInt(i);
+        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
         if (func.opcode(inst) == .iconst) {
-            if (func.instResult(inst)) |r| consts[@intFromEnum(r)] = func.opcode(inst).iconst;
+            if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
         }
     }
 
@@ -141,24 +141,24 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     while (again) {
         again = false;
         for (0..func.instCount()) |i| {
-            const inst: ir.function.Inst = @enumFromInt(i);
+            const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
             const result = func.instResult(inst) orelse continue;
-            if (consts[@intFromEnum(result)] != null) continue; // already a constant
+            if (consts[@backingInt(result)] != null) continue; // already a constant
             const folded: ?i64 = switch (func.opcode(inst)) {
                 .arith => |a| blk: {
-                    const lc = consts[@intFromEnum(a.lhs)] orelse break :blk null;
-                    const rc = consts[@intFromEnum(a.rhs)] orelse break :blk null;
+                    const lc = consts[@backingInt(a.lhs)] orelse break :blk null;
+                    const rc = consts[@backingInt(a.rhs)] orelse break :blk null;
                     const ty = intType(func, result) orelse break :blk null;
                     break :blk evalBin(a.op, lc, rc, ty);
                 },
                 .arith_imm => |a| blk: {
-                    const lc = consts[@intFromEnum(a.lhs)] orelse break :blk null;
+                    const lc = consts[@backingInt(a.lhs)] orelse break :blk null;
                     const ty = intType(func, result) orelse break :blk null;
                     break :blk evalBin(a.op, lc, a.imm, ty);
                 },
                 .icmp => |c| blk: {
-                    const lc = consts[@intFromEnum(c.lhs)] orelse break :blk null;
-                    const rc = consts[@intFromEnum(c.rhs)] orelse break :blk null;
+                    const lc = consts[@backingInt(c.lhs)] orelse break :blk null;
+                    const rc = consts[@backingInt(c.rhs)] orelse break :blk null;
                     const ty = intType(func, c.lhs) orelse break :blk null;
                     break :blk evalCmp(c.op, lc, rc, ty);
                 },
@@ -170,7 +170,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             };
             if (folded) |value| {
                 func.opcodeMut(inst).* = .{ .iconst = value };
-                consts[@intFromEnum(result)] = value;
+                consts[@backingInt(result)] = value;
                 changed = true;
                 again = true;
             }

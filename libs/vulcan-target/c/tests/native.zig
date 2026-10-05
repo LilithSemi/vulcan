@@ -111,7 +111,7 @@ fn wrapProgram(allocator: std.mem.Allocator, func: *const Function, args: []cons
         try emitCType(allocator, &out, func, ret.?);
         try out.appendSlice(allocator, " r = f(");
     }
-    const params = func.blockParams(@enumFromInt(0));
+    const params = func.blockParams(@fromBackingInt(@intCast(0)));
     for (args, 0..) |arg, i| {
         if (i != 0) try out.appendSlice(allocator, ", ");
         // Cast each argument literal to the parameter's C type.
@@ -148,7 +148,7 @@ fn wrapProgram(allocator: std.mem.Allocator, func: *const Function, args: []cons
 
 fn returnType(func: *const Function) ?Type {
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
+        const block: Block = @fromBackingInt(@intCast(@as(u32, @intCast(bi))));
         if (func.terminator(block)) |term| switch (term) {
             .ret => |r| if (r.count > 0) return func.valueType(r.values[0]),
             .jump => {},
@@ -527,7 +527,7 @@ test "C backend: auto-vectorized GLSL vec4 shader runs through C" {
     // the aggregate path and not just scalars.
     var has_vec = false;
     for (0..func.instCount()) |i| {
-        const res = func.instResult(@enumFromInt(i)) orelse continue;
+        const res = func.instResult(@fromBackingInt(@intCast(i))) orelse continue;
         if (func.types.type_kind(func.valueType(res)) == .vector) has_vec = true;
     }
     try std.testing.expect(has_vec);

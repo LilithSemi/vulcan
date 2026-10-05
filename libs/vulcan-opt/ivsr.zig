@@ -301,13 +301,13 @@ const LoopCtx = struct {
 
     /// Whether `v` holds one value for the whole loop.
     fn invariant(self: *const LoopCtx, v: Value) bool {
-        if (self.substitute[@intFromEnum(v)] != null) return true;
-        return !self.loop.contains(self.def_block[@intFromEnum(v)]);
+        if (self.substitute[@backingInt(v)] != null) return true;
+        return !self.loop.contains(self.def_block[@backingInt(v)]);
     }
 
     /// The value to name in the preheader when an expression reads `v`.
     fn outsideName(self: *const LoopCtx, v: Value) Value {
-        return self.substitute[@intFromEnum(v)] orelse v;
+        return self.substitute[@backingInt(v)] orelse v;
     }
 };
 
@@ -338,9 +338,9 @@ fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_
     var ctx = LoopCtx{
         .func = func,
         .loop = loop,
-        .header = @enumFromInt(loop.header),
-        .latch = @enumFromInt(latch_index),
-        .preheader = @enumFromInt(preheader_index),
+        .header = @fromBackingInt(@intCast(loop.header)),
+        .latch = @fromBackingInt(@intCast(latch_index)),
+        .preheader = @fromBackingInt(@intCast(preheader_index)),
         .def_block = def_block,
         .alias = alias,
         .affine = affine,
@@ -374,17 +374,17 @@ fn findLatch(func: *const Function, loop: *const loops_mod.Loop) ?u32 {
     var latch: ?u32 = null;
     for (0..func.blockCount()) |bi| {
         if (!loop.contains(bi)) continue;
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
             .@"if" => |cf| {
-                if (@intFromEnum(cf.then.target) == loop.header) return null;
-                if (@intFromEnum(cf.@"else".target) == loop.header) return null;
+                if (@backingInt(cf.then.target) == loop.header) return null;
+                if (@backingInt(cf.@"else".target) == loop.header) return null;
             },
             else => {},
         };
         const term = func.terminator(block) orelse continue;
         switch (term) {
-            .jump => |j| if (@intFromEnum(j.target) == loop.header) {
+            .jump => |j| if (@backingInt(j.target) == loop.header) {
                 if (latch != null) return null; // more than one back edge
                 latch = @intCast(bi);
             },
@@ -393,7 +393,7 @@ fn findLatch(func: *const Function, loop: *const loops_mod.Loop) ?u32 {
     }
     const found = latch orelse return null;
     // The increment goes at the end of the latch, so the latch must not leave early.
-    for (func.blockInsts(@enumFromInt(found))) |inst| {
+    for (func.blockInsts(@fromBackingInt(@intCast(found)))) |inst| {
         if (func.opcode(inst) == .@"if") return null;
     }
     return found;
@@ -404,10 +404,10 @@ fn fillDefBlocks(func: *const Function, def_block: []u32) void {
     // which makes it invariant, never an induction variable. Same default `licm` uses.
     @memset(def_block, 0);
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
-        for (func.blockParams(block)) |p| def_block[@intFromEnum(p)] = @intCast(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockParams(block)) |p| def_block[@backingInt(p)] = @intCast(bi);
         for (func.blockInsts(block)) |inst| {
-            if (func.instResult(inst)) |r| def_block[@intFromEnum(r)] = @intCast(bi);
+            if (func.instResult(inst)) |r| def_block[@backingInt(r)] = @intCast(bi);
         }
     }
 }
@@ -436,9 +436,9 @@ fn termOf(allocator: std.mem.Allocator, ctx: *const LoopCtx, pool: *Pool, ty: Ty
 /// the header back to itself.
 fn fillSubstitutions(ctx: *LoopCtx, header_params: []const Value, latch_args: []const Value, pre_args: []const Value) void {
     for (header_params, 0..) |hp, i| {
-        const carried = ctx.alias[@intFromEnum(latch_args[i])] orelse continue;
+        const carried = ctx.alias[@backingInt(latch_args[i])] orelse continue;
         if (carried != hp) continue;
-        ctx.substitute[@intFromEnum(hp)] = pre_args[i];
+        ctx.substitute[@backingInt(hp)] = pre_args[i];
     }
     // Every value that carries such a parameter unchanged holds the same one value too, so it gets
     // the same substitute. A loop body that re-declares the header's parameters, which is what the
@@ -446,7 +446,7 @@ fn fillSubstitutions(ctx: *LoopCtx, header_params: []const Value, latch_args: []
     // without this the whole rule would reach nothing in the shape it exists for.
     for (0..ctx.alias.len) |vi| {
         const carried = ctx.alias[vi] orelse continue;
-        if (ctx.substitute[@intFromEnum(carried)]) |outside| ctx.substitute[vi] = outside;
+        if (ctx.substitute[@backingInt(carried)]) |outside| ctx.substitute[vi] = outside;
     }
 }
 
@@ -489,11 +489,11 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
         again = false;
         for (0..func.blockCount()) |bi| {
             if (!ctx.loop.contains(bi)) continue;
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 const result = func.instResult(inst) orelse continue;
-                if (ctx.affine[@intFromEnum(result)] != null) continue;
+                if (ctx.affine[@backingInt(result)] != null) continue;
                 const rep = try affineOf(allocator, ctx, pool, inst, result) orelse continue;
-                ctx.affine[@intFromEnum(result)] = rep;
+                ctx.affine[@backingInt(result)] = rep;
                 again = true;
             }
         }
@@ -523,9 +523,9 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
 
     for (0..func.blockCount()) |bi| {
         if (!ctx.loop.contains(bi)) continue;
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const result = func.instResult(inst) orelse continue;
-            const rep = ctx.affine[@intFromEnum(result)] orelse continue;
+            const rep = ctx.affine[@backingInt(result)] orelse continue;
             if (!worthReducing(ctx, pool, result, rep)) continue;
 
             const family = coalescable(ctx, pool, rep);
@@ -535,16 +535,16 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
                         const width = intInfo(func, rep.scale_ty).?; // coalescable already checked this
                         const diff = wrapTo(f.offset -% keeper.offset, width);
                         try riders.append(allocator, .{ .inst = inst, .plan_index = keeper.plan_index, .diff = diff });
-                        reduced[@intFromEnum(result)] = true;
+                        reduced[@backingInt(result)] = true;
                         continue;
                     }
                 }
             }
 
             if (chainPredecessor(ctx, inst)) |pred| {
-                if (reduced[@intFromEnum(pred)]) continue;
+                if (reduced[@backingInt(pred)]) continue;
             }
-            reduced[@intFromEnum(result)] = true;
+            reduced[@backingInt(result)] = true;
 
             const ty = func.valueType(result);
             const biv = func.blockParams(ctx.header)[rep.biv];
@@ -584,7 +584,7 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
 fn fillAliases(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
     const func = ctx.func;
     @memset(ctx.alias, null);
-    for (func.blockParams(ctx.header)) |hp| ctx.alias[@intFromEnum(hp)] = hp;
+    for (func.blockParams(ctx.header)) |hp| ctx.alias[@backingInt(hp)] = hp;
 
     var edges: std.ArrayList(Edge) = .empty;
     defer edges.deinit(allocator);
@@ -594,14 +594,14 @@ fn fillAliases(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
         again = false;
         for (0..func.blockCount()) |bi| {
             if (!ctx.loop.contains(bi) or bi == ctx.loop.header) continue;
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             const params = func.blockParams(block);
             if (params.len == 0) continue;
             edges.clearRetainingCapacity();
             try collectEdgesInto(allocator, func, block, &edges);
 
             for (params, 0..) |p, pi| {
-                if (ctx.alias[@intFromEnum(p)] != null) continue;
+                if (ctx.alias[@backingInt(p)] != null) continue;
                 var merged: ?Value = null;
                 var ok = edges.items.len > 0;
                 for (edges.items) |edge| {
@@ -610,7 +610,7 @@ fn fillAliases(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
                         ok = false;
                         break;
                     }
-                    const cand = ctx.alias[@intFromEnum(args[pi])] orelse {
+                    const cand = ctx.alias[@backingInt(args[pi])] orelse {
                         ok = false;
                         break;
                     };
@@ -622,7 +622,7 @@ fn fillAliases(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
                     } else merged = cand;
                 }
                 if (!ok) continue;
-                ctx.alias[@intFromEnum(p)] = merged.?;
+                ctx.alias[@backingInt(p)] = merged.?;
                 again = true;
             }
         }
@@ -644,7 +644,7 @@ const Edge = struct {
 
 fn collectEdgesInto(allocator: std.mem.Allocator, func: *const Function, target: Block, out: *std.ArrayList(Edge)) pass.Error!void {
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
             .@"if" => |cf| {
                 if (cf.then.target == target) try out.append(allocator, .{ .from = block, .site = .{ .if_then = inst } });
@@ -674,12 +674,12 @@ const Step = union(enum) { konst: i64, value: Value };
 /// that value is not `hp` plus a loop-invariant amount.
 fn stepOf(ctx: *const LoopCtx, hp: Value, next: Value) ?Step {
     const func = ctx.func;
-    if (ctx.alias[@intFromEnum(next)] != null) return null; // carried through, never advanced
+    if (ctx.alias[@backingInt(next)] != null) return null; // carried through, never advanced
     const inst = func.definingInst(next) orelse return null;
-    if (!ctx.loop.contains(ctx.def_block[@intFromEnum(next)])) return null;
+    if (!ctx.loop.contains(ctx.def_block[@backingInt(next)])) return null;
     const carries = struct {
         fn f(c: *const LoopCtx, target: Value, v: Value) bool {
-            const a = c.alias[@intFromEnum(v)] orelse return false;
+            const a = c.alias[@backingInt(v)] orelse return false;
             return a == target;
         }
     }.f;
@@ -778,8 +778,8 @@ fn affineOf(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, inst: Inst
 
 fn affineArith(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, op: BinOp, lhs: Value, rhs: Value, ty: Type) pass.Error!?Affine {
     const func = ctx.func;
-    const l = ctx.affine[@intFromEnum(lhs)];
-    const r = ctx.affine[@intFromEnum(rhs)];
+    const l = ctx.affine[@backingInt(lhs)];
+    const r = ctx.affine[@backingInt(rhs)];
     const l_inv = ctx.invariant(lhs);
     const r_inv = ctx.invariant(rhs);
     const is_ptr = func.types.type_kind(ty) == .ptr;
@@ -864,7 +864,7 @@ fn affineArith(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, op: Bin
 
 fn affineArithImm(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, op: BinOp, lhs: Value, imm: i64, ty: Type) pass.Error!?Affine {
     const func = ctx.func;
-    const la = ctx.affine[@intFromEnum(lhs)] orelse return null;
+    const la = ctx.affine[@backingInt(lhs)] orelse return null;
     const is_ptr = func.types.type_kind(ty) == .ptr;
     if (is_ptr) {
         if (la.base == null) return null; // an integer cannot become a pointer by adding a constant
@@ -955,22 +955,22 @@ fn countUses(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
     defer operands.deinit(allocator);
 
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         const in_loop = ctx.loop.contains(bi);
         for (func.blockInsts(block)) |inst| {
             const result = func.instResult(inst);
             // A use inside a reducible consumer disappears with that consumer. Any other use has
             // to keep reading a real value, which is what makes this value worth its own variable.
-            const consumer_is_affine = in_loop and result != null and ctx.affine[@intFromEnum(result.?)] != null;
+            const consumer_is_affine = in_loop and result != null and ctx.affine[@backingInt(result.?)] != null;
             operands.clearRetainingCapacity();
             try appendOperands(allocator, func, inst, &operands);
             for (operands.items) |v| {
-                ctx.total_uses[@intFromEnum(v)] += 1;
-                if (!consumer_is_affine) ctx.demanding_uses[@intFromEnum(v)] += 1;
+                ctx.total_uses[@backingInt(v)] += 1;
+                if (!consumer_is_affine) ctx.demanding_uses[@backingInt(v)] += 1;
             }
 
             const deref = if (in_loop) dereferencedPointer(func, inst) else null;
-            if (deref) |p| ctx.address_uses[@intFromEnum(p)] += 1;
+            if (deref) |p| ctx.address_uses[@backingInt(p)] += 1;
 
             if (!in_loop) continue;
             for (operands.items) |v| {
@@ -982,7 +982,7 @@ fn countUses(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
                 if (consumer_is_affine) {
                     try edges.append(allocator, .{ .from = v, .to = result.? });
                 } else {
-                    ctx.chain_safe[@intFromEnum(v)] = false;
+                    ctx.chain_safe[@backingInt(v)] = false;
                 }
             }
         }
@@ -992,9 +992,9 @@ fn countUses(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
                 .ret => |r| r.slice(),
             };
             for (args) |v| {
-                ctx.total_uses[@intFromEnum(v)] += 1;
-                ctx.demanding_uses[@intFromEnum(v)] += 1;
-                if (func.types.type_kind(func.valueType(v)) == .ptr) ctx.chain_safe[@intFromEnum(v)] = false;
+                ctx.total_uses[@backingInt(v)] += 1;
+                ctx.demanding_uses[@backingInt(v)] += 1;
+                if (func.types.type_kind(func.valueType(v)) == .ptr) ctx.chain_safe[@backingInt(v)] = false;
             }
         }
     }
@@ -1006,8 +1006,8 @@ fn countUses(allocator: std.mem.Allocator, ctx: *LoopCtx) pass.Error!void {
     while (again) {
         again = false;
         for (edges.items) |e| {
-            if (ctx.chain_safe[@intFromEnum(e.from)] and !ctx.chain_safe[@intFromEnum(e.to)]) {
-                ctx.chain_safe[@intFromEnum(e.from)] = false;
+            if (ctx.chain_safe[@backingInt(e.from)] and !ctx.chain_safe[@backingInt(e.to)]) {
+                ctx.chain_safe[@backingInt(e.from)] = false;
                 again = true;
             }
         }
@@ -1080,7 +1080,7 @@ fn worthReducing(ctx: *const LoopCtx, pool: *const Pool, v: Value, rep: Affine) 
     // the base add, so one advance per trip replaces two operations, and it is kept.
     if (rep.base == null and pool.constOf(rep.scale) == @as(?i64, 1)) return false;
     // Nothing left that has to read it: reducing it would only add a dead variable.
-    if (ctx.demanding_uses[@intFromEnum(v)] == 0) return false;
+    if (ctx.demanding_uses[@backingInt(v)] == 0) return false;
     // A value the back edge already carries to the header is already a loop recurrence, so a
     // second one only renames it and feeds the old parameter from the new one.
     //
@@ -1105,7 +1105,7 @@ fn worthReducing(ctx: *const LoopCtx, pool: *const Pool, v: Value, rep: Affine) 
 fn chainPredecessor(ctx: *const LoopCtx, inst: Inst) ?Value {
     const stepsFrom = struct {
         fn f(c: *const LoopCtx, v: Value) bool {
-            const a = c.affine[@intFromEnum(v)] orelse return false;
+            const a = c.affine[@backingInt(v)] orelse return false;
             return a.base != null;
         }
     }.f;
@@ -1177,7 +1177,7 @@ fn isCarriedBack(ctx: *const LoopCtx, v: Value) bool {
 /// earns a variable of its own. Only an escaping use anywhere in the chain can make a wrapped offset
 /// observable, and `chain_safe` already refuses the whole chain back to its root when one exists.
 fn pointerUsesAreAddresses(ctx: *const LoopCtx, v: Value) bool {
-    const i = @intFromEnum(v);
+    const i = @backingInt(v);
     return ctx.address_uses[i] > 0 and ctx.chain_safe[i];
 }
 
@@ -1855,7 +1855,7 @@ fn loopHeaderWidth(allocator: std.mem.Allocator, func: *const Function) !usize {
     var info = try loops_mod.analyze(allocator, func);
     defer info.deinit(allocator);
     try testing.expectEqual(@as(usize, 1), info.loops.len);
-    return func.blockParams(@enumFromInt(info.loops[0].header)).len;
+    return func.blockParams(@fromBackingInt(@intCast(info.loops[0].header))).len;
 }
 
 test "leaves an integer offset of the counter alone, and still walks a pointer by one" {
@@ -1978,7 +1978,7 @@ test "splitunroll's cloned address chains coalesce to one carried pointer instea
 
     // K = 2 for an i32 `add` accumulator on this model (splitunroll clamps latency 1 up to 2). The
     // main header is the block appended right after entry/head/body/done.
-    const mainheader: Block = @enumFromInt(4);
+    const mainheader: Block = @fromBackingInt(@intCast(4));
     const k: usize = 2;
     try testing.expectEqual(@as(usize, 1 + k), func.blockParams(mainheader).len);
 

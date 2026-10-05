@@ -229,7 +229,7 @@ test "loopvec differential: pure square map through the full pipeline, all trip 
 fn hasVectorValue(func: *const Function) bool {
     var i: usize = 0;
     while (i < func.valueCount()) : (i += 1) {
-        const v: ir.function.Value = @enumFromInt(@as(u32, @intCast(i)));
+        const v: ir.function.Value = @fromBackingInt(@intCast(@as(u32, @intCast(i))));
         if (func.types.type_kind(func.valueType(v)) == .vector) return true;
     }
     return false;

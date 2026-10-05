@@ -481,8 +481,8 @@ test "buildBackendModule: a translated data reloc survives past its own loop ite
     // silently dropped from every emitted `.o`), but a separate one from the
     // use-after-free this test guards against, and out of scope for this fix.
     const B = @import("riscv64.zig");
-    const g_bytes = [_]u8{0} ** 4;
-    const p_bytes = [_]u8{0} ** 8;
+    const g_bytes: [4]u8 = @splat(0);
+    const p_bytes: [8]u8 = @splat(0);
 
     var built = try buildBackendModule(B, allocator, &.{}, &.{
         .{ .name = "g", .bytes = &g_bytes, .kind = .data, .size = g_bytes.len },
@@ -789,7 +789,7 @@ test "jitModuleData: a .data global is written by one function and read by anoth
         f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
 
-    const zeros = [_]u8{0} ** 4;
+    const zeros: [4]u8 = @splat(0);
     var jm = try jitModuleData(
         allocator,
         &.{ .{ .name = "setw", .func = &setw }, .{ .name = "f", .func = &f } },
@@ -821,7 +821,7 @@ test "jitModuleData: a .data global's internal reloc is patched to another objec
     f.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     const s_bytes = [_]u8{ 'h', 'i', 0 };
-    const p_bytes = [_]u8{0} ** 8;
+    const p_bytes: [8]u8 = @splat(0);
     var jm = try jitModuleData(
         allocator,
         &.{.{ .name = "f", .func = &f }},
@@ -893,7 +893,7 @@ test "jitModuleData: sections are mapped W^X (rodata r--, code r-x, data rw-)" {
     f.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     const ro = [_]u8{42};
-    const wr = [_]u8{0} ** 4;
+    const wr: [4]u8 = @splat(0);
     var jm = try jitModuleData(
         allocator,
         &.{.{ .name = "f", .func = &f }},

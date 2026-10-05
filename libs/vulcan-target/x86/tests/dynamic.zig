@@ -590,7 +590,7 @@ fn buildPointerDataObj32(allocator: std.mem.Allocator) ![]u8 {
         0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
         0xcd, 0x80, // int 0x80
     };
-    var data: [8]u8 = [_]u8{0} ** 8;
+    var data: [8]u8 = @splat(0);
     w(u32, data[0..4], 42, .little); // g = 42
     // p's slot (offset 4) stays 0. The linker (not the object) fills it in.
 
@@ -974,7 +974,7 @@ test "i386 object.writeModule emits a .rel.data R_386_32 for a pointer-initializ
     var module: link.Module = .{};
     defer module.deinit(allocator);
     const g_bytes = [_]u8{ 42, 0, 0, 0 };
-    const p_bytes = [_]u8{0} ** 4;
+    const p_bytes: [4]u8 = @splat(0);
     try module.addWritable(allocator, "g", &g_bytes);
     try module.addWritableRelocs(allocator, "p", &p_bytes, &.{.{ .off = 0, .symbol = "g" }});
 

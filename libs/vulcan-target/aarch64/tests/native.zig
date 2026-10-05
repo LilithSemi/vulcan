@@ -66,7 +66,7 @@ test "native low float conversions match exhaustive and structured references" {
             try std.testing.expectEqual(expected_bits, actual_bits);
             try std.testing.expectEqual(@as(u32, ir.low_float.encode(format, @bitCast(expected_bits))), encode_fn(actual_bits));
         }
-        distinguished_decode[@intFromEnum(format)] = .{ decode(0x7c), decode(0x7e) };
+        distinguished_decode[@backingInt(format)] = .{ decode(0x7c), decode(0x7e) };
         switch (format) {
             .bf16 => for (ir.low_float.bf16_encode_boundary_cases) |case| {
                 try std.testing.expectEqual(@as(u32, case.expected), encode_fn(case.source));
@@ -93,8 +93,8 @@ test "native low float conversions match exhaustive and structured references" {
             }
         }
     }
-    try std.testing.expect(distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e4m3)][0] != distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e5m2)][0]);
-    try std.testing.expect(distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e4m3)][1] != distinguished_decode[@intFromEnum(ir.low_float.Format.f8_e5m2)][1]);
+    try std.testing.expect(distinguished_decode[@backingInt(ir.low_float.Format.f8_e4m3)][0] != distinguished_decode[@backingInt(ir.low_float.Format.f8_e5m2)][0]);
+    try std.testing.expect(distinguished_decode[@backingInt(ir.low_float.Format.f8_e4m3)][1] != distinguished_decode[@backingInt(ir.low_float.Format.f8_e5m2)][1]);
 }
 
 fn f32DivisionWrapper(allocator: std.mem.Allocator) !Function {
@@ -666,8 +666,8 @@ test "vectorize: 4 parallel f32 adds fuse into a NEON vector add (same result)" 
     // A vector-typed arith now exists (the four scalar adds became one).
     var has_vec = false;
     for (0..func.instCount()) |i| {
-        if (func.opcodeMut(@enumFromInt(i)).* == .arith) {
-            const res = func.instResult(@enumFromInt(i)).?;
+        if (func.opcodeMut(@fromBackingInt(@intCast(i))).* == .arith) {
+            const res = func.instResult(@fromBackingInt(@intCast(i))).?;
             if (func.types.type_kind(func.valueType(res)) == .vector) has_vec = true;
         }
     }
@@ -732,9 +732,9 @@ test "vectorize: chained (a+b)*c keeps the intermediate in a vector (pack reuse)
     var vadd_res: ?ir.function.Value = null;
     var vmul_lhs: ?ir.function.Value = null;
     for (0..func.instCount()) |i| {
-        const o = func.opcodeMut(@enumFromInt(i)).*;
+        const o = func.opcodeMut(@fromBackingInt(@intCast(i))).*;
         if (o != .arith) continue;
-        const res = func.instResult(@enumFromInt(i)).?;
+        const res = func.instResult(@fromBackingInt(@intCast(i))).?;
         if (func.types.type_kind(func.valueType(res)) != .vector) continue;
         if (o.arith.op == .add) vadd_res = res;
         if (o.arith.op == .mul) vmul_lhs = o.arith.lhs;
@@ -1379,7 +1379,7 @@ fn callFma3(comptime T: type, buf: *const jit.CodeBuffer, a: T, b: T, c: T) T {
 
 /// The unsigned integer type with T's bit width, for bit-exact (not `==`) float comparison.
 fn Bits(comptime T: type) type {
-    return std.meta.Int(.unsigned, @bitSizeOf(T));
+    return @Int(.unsigned, @bitSizeOf(T));
 }
 
 /// Build, JIT, and run the FMA `shape` in precision `T` on the operands given as raw bit
@@ -1614,9 +1614,9 @@ test "neon fma: vector f32 a*b+c matches @mulAdd bit-exactly per lane and fuses 
     // lane would fail without fusion, not just one.
     try checkVecFma(
         .add,
-        .{0xc40ac54c} ** 4,
-        .{0x43a8f6ea} ** 4,
-        .{0xc28c5708} ** 4,
+        @splat(0xc40ac54c),
+        @splat(0x43a8f6ea),
+        @splat(0xc28c5708),
         encode.fmlaVec(.x0, .x0, .x0),
     );
 }
@@ -1625,9 +1625,9 @@ test "neon fma: vector f32 c-a*b matches @mulAdd bit-exactly per lane and fuses 
     // Same operand triple as the scalar "fma: scalar f32 c-a*b" test above.
     try checkVecFma(
         .csub,
-        .{0xc44a1c46} ** 4,
-        .{0x44559447} ** 4,
-        .{0x43b99ce8} ** 4,
+        @splat(0xc44a1c46),
+        @splat(0x44559447),
+        @splat(0x43b99ce8),
         encode.fmlsVec(.x0, .x0, .x0),
     );
 }
@@ -3684,7 +3684,7 @@ test "multi-block inlining preserves semantics on aarch64 (callee has a loop)" {
         defer caller1.deinit();
         var lk = Lk{ .callee = &callee1 };
         try std.testing.expect(try opt.inlining.run(allocator, &caller1, .{ .context = &lk, .func = Lk.get }));
-        for (0..caller1.blockCount()) |bi| for (caller1.blockInsts(@enumFromInt(bi))) |inst| {
+        for (0..caller1.blockCount()) |bi| for (caller1.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             try std.testing.expect(caller1.opcode(inst) != .call); // the call was inlined away
         };
         const inlined = try run(allocator, &caller1, &.{arg});

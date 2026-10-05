@@ -193,7 +193,7 @@ pub const Tensor = struct {
 };
 
 /// Every dtype `MatMul` can hold. The scalar nest and the et-soc tensor unit both take all four.
-const all_dtypes: std.EnumSet(MatMulType) = .initFull();
+const all_dtypes: std.EnumSet(MatMulType) = .full;
 
 /// The scalar loop nest `vulcan-ir.expand.expandMatmul` writes. It is the reference answer every
 /// tensor lowering gets checked against, so it must be the least demanding descriptor here.
@@ -270,7 +270,7 @@ pub const et_soc: Tensor = .{
 /// set and the tile list stay empty until the lowering that fills them is written.
 pub const nvidia: Tensor = .{
     .operand_align = 1,
-    .dtypes = .initEmpty(),
+    .dtypes = .empty,
     .warp_collective = true,
     .shapes = .{ .list = &.{} },
     .quant = false,
@@ -281,9 +281,9 @@ pub const nvidia: Tensor = .{
 /// so placeholder handles are enough.
 fn testMatmul(dtype: MatMulType, m: u16, n: u16, k: u16) MatMul {
     return .{
-        .a = @enumFromInt(0),
-        .b = @enumFromInt(1),
-        .c = @enumFromInt(2),
+        .a = @fromBackingInt(@intCast(0)),
+        .b = @fromBackingInt(@intCast(1)),
+        .c = @fromBackingInt(@intCast(2)),
         .m = m,
         .n = n,
         .k = k,

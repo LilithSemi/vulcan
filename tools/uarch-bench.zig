@@ -711,7 +711,7 @@ const IrStats = struct { blocks: usize, insts: usize };
 fn irStats(func: *const Function) IrStats {
     var insts: usize = 0;
     var bi: usize = 0;
-    while (bi < func.blockCount()) : (bi += 1) insts += func.blockInsts(@enumFromInt(bi)).len;
+    while (bi < func.blockCount()) : (bi += 1) insts += func.blockInsts(@fromBackingInt(@intCast(bi))).len;
     return .{ .blocks = func.blockCount(), .insts = insts };
 }
 
@@ -722,7 +722,7 @@ fn perfOpenCycles() !i32 {
     var attr = std.mem.zeroes(linux.perf_event_attr);
     attr.type = .HARDWARE;
     attr.size = @sizeOf(linux.perf_event_attr);
-    attr.config = @intFromEnum(linux.PERF.COUNT.HW.CPU_CYCLES);
+    attr.config = @backingInt(linux.PERF.COUNT.HW.CPU_CYCLES);
     attr.flags.disabled = true;
     attr.flags.exclude_kernel = true;
     attr.flags.exclude_hv = true;
@@ -951,7 +951,7 @@ pub fn benchModel(allocator: std.mem.Allocator, io: std.Io, model: *const Model,
     // the register-input slp-adds above which correctly stays declined (1.0x).
     var mem_a = [8]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
     var mem_b = [8]f32{ 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0 };
-    var mem_out = [_]f32{0} ** 8;
+    var mem_out: [8]f32 = @splat(0);
     try benchGeneric(
         *const fn ([*]f32, [*]f32, [*]f32) callconv(.c) f32,
         allocator,
@@ -970,7 +970,7 @@ pub fn benchModel(allocator: std.mem.Allocator, io: std.Io, model: *const Model,
     // mem-add and measures FASTER; without it the mul group would decline and the kernel stay scalar.
     var mma_a = [8]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
     var mma_b = [8]f32{ 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0 };
-    var mma_out = [_]f32{0} ** 8;
+    var mma_out: [8]f32 = @splat(0);
     try benchGeneric(
         *const fn ([*]f32, [*]f32, [*]f32) callconv(.c) f32,
         allocator,
@@ -988,7 +988,7 @@ pub fn benchModel(allocator: std.mem.Allocator, io: std.Io, model: *const Model,
     // kernel's cycles and confirms it runs correctly (baseline == tuned) under fusion.
     var pair_in: [16]i64 = undefined;
     for (&pair_in, 0..) |*v, idx| v.* = @as(i64, @intCast(idx)) * 7 - 3;
-    var pair_out = [_]i64{0} ** 16;
+    var pair_out: [16]i64 = @splat(0);
     try benchGeneric(
         *const fn ([*]i64, [*]i64) callconv(.c) i64,
         allocator,
@@ -1003,9 +1003,9 @@ pub fn benchModel(allocator: std.mem.Allocator, io: std.Io, model: *const Model,
 
     // The SAXPY map LOOP over real f32 arrays: exercises the loop vectorizer (main body unrolled by the
     // SIMD width, SLP-widened to wide load / vector fmul / vector fadd / wide store, `a` a splat dup).
-    var sax_x = [_]f32{0} ** 1024;
-    var sax_y = [_]f32{0} ** 1024;
-    var sax_out = [_]f32{0} ** 1024;
+    var sax_x: [1024]f32 = @splat(0);
+    var sax_y: [1024]f32 = @splat(0);
+    var sax_out: [1024]f32 = @splat(0);
     for (0..1024) |k| {
         sax_x[k] = @floatFromInt(k + 1);
         sax_y[k] = @floatFromInt(1024 - @as(i32, @intCast(k)));
@@ -1024,7 +1024,7 @@ pub fn benchModel(allocator: std.mem.Allocator, io: std.Io, model: *const Model,
 
     // The contiguous f32 sum reduction: the loop vectorizer builds a vector accumulator (wide loads +
     // vector fadd) with a horizontal reduce at the end.
-    var fsum_a = [_]f32{0} ** 1024;
+    var fsum_a: [1024]f32 = @splat(0);
     for (0..1024) |k| fsum_a[k] = @floatFromInt((k % 13) + 1);
     try benchGeneric(
         *const fn ([*]f32, i32) callconv(.c) f32,

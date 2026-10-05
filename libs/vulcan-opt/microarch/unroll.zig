@@ -649,7 +649,7 @@ const Plan = struct {
 /// Whether `b` is inside the loop described by `in_loop`. Blocks added after the
 /// bitset was captured (index past its end) are, by construction, outside.
 fn inLoop(in_loop: []const bool, b: Block) bool {
-    const idx = @intFromEnum(b);
+    const idx = @backingInt(b);
     return idx < in_loop.len and in_loop[idx];
 }
 
@@ -707,7 +707,7 @@ fn eligible(
 ) Error!?Plan {
     const n = func.blockCount();
     const h_idx = loop.header;
-    const header: Block = @enumFromInt(h_idx);
+    const header: Block = @fromBackingInt(@intCast(h_idx));
     const in_loop = loop.body; // borrowed, length == blockCount at analysis time
 
     // A preheader must exist (a single, clean entry into the loop).
@@ -755,7 +755,7 @@ fn eligible(
         body_entry = cf.@"else".target;
         exit = cf.then.target;
     } else return null; // need exactly one in-loop and one out-of-loop edge
-    if (@intFromEnum(body_entry) == h_idx) return null; // need a real body to clone
+    if (@backingInt(body_entry) == h_idx) return null; // need a real body to clone
 
     // Single latch: exactly one in-loop block whose *terminator* jumps back to
     // the header. Conditional (if-edge) back-edges are not modeled.
@@ -763,15 +763,15 @@ fn eligible(
     var bi: usize = 0;
     while (bi < n) : (bi += 1) {
         if (!(bi < in_loop.len and in_loop[bi])) continue;
-        const b: Block = @enumFromInt(bi);
+        const b: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(b)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const c2 = func.opcode(inst).@"if";
-                if (@intFromEnum(c2.then.target) == h_idx or @intFromEnum(c2.@"else".target) == h_idx) return null;
+                if (@backingInt(c2.then.target) == h_idx or @backingInt(c2.@"else".target) == h_idx) return null;
             }
         }
         if (func.terminator(b)) |term| switch (term) {
-            .jump => |j| if (@intFromEnum(j.target) == h_idx) {
+            .jump => |j| if (@backingInt(j.target) == h_idx) {
                 if (bi == h_idx) return null; // header is not its own latch
                 if (latch != null) return null; // more than one latch
                 latch = b;
@@ -787,7 +787,7 @@ fn eligible(
     bi = 0;
     while (bi < n) : (bi += 1) {
         if (!(bi < in_loop.len and in_loop[bi])) continue;
-        const b: Block = @enumFromInt(bi);
+        const b: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(b)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const c2 = func.opcode(inst).@"if";
@@ -834,7 +834,7 @@ fn eligible(
         if (bi == h_idx) continue;
         var uses: std.AutoHashMapUnmanaged(Value, void) = .empty;
         defer uses.deinit(allocator);
-        try collectOperands(func, @enumFromInt(bi), &uses, allocator);
+        try collectOperands(func, @fromBackingInt(@intCast(bi)), &uses, allocator);
         var it = uses.keyIterator();
         while (it.next()) |u| {
             if (header_results.contains(u.*)) return null;
@@ -845,7 +845,7 @@ fn eligible(
     var body_ops: u32 = 0;
     bi = 0;
     while (bi < n) : (bi += 1) {
-        if (bi < in_loop.len and in_loop[bi]) body_ops += @intCast(func.blockInsts(@enumFromInt(bi)).len);
+        if (bi < in_loop.len and in_loop[bi]) body_ops += @intCast(func.blockInsts(@fromBackingInt(@intCast(bi))).len);
     }
     var factor = unrollFactor(model, body_ops);
     if (factor < 2) return null;
@@ -855,7 +855,7 @@ fn eligible(
     errdefer body_list.deinit(allocator);
     bi = 0;
     while (bi < n) : (bi += 1) {
-        if (bi < in_loop.len and in_loop[bi] and bi != h_idx) try body_list.append(allocator, @enumFromInt(bi));
+        if (bi < in_loop.len and in_loop[bi] and bi != h_idx) try body_list.append(allocator, @fromBackingInt(@intCast(bi)));
     }
     const in_loop_copy = try allocator.dupe(bool, in_loop);
     errdefer allocator.free(in_loop_copy);
@@ -891,7 +891,7 @@ fn eligible(
         .body_blocks = try body_list.toOwnedSlice(allocator),
         .in_loop = in_loop_copy,
         .factor = factor,
-        .preheader = @enumFromInt(loop.preheader.?),
+        .preheader = @fromBackingInt(@intCast(loop.preheader.?)),
         .counted = counted,
     };
 }
@@ -901,7 +901,7 @@ fn arithmeticRecurrenceCanUseFour(func: *const Function, in_loop: []const bool, 
     var float_arith: u32 = 0;
     for (in_loop, 0..) |member, block_index| {
         if (!member) continue;
-        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(block_index)))) |inst| switch (func.opcode(inst)) {
             .load, .store, .call, .call_indirect, .prefetch, .matmul, .atomic_rmw, .barrier, .va_start, .va_arg, .va_end => return false,
             .arith, .arith_imm => if (func.instResult(inst)) |result| switch (func.types.type_kind(func.valueType(result))) {
                 .float => float_arith += 1,
@@ -1049,14 +1049,14 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     var used_out: std.AutoHashMapUnmanaged(Value, void) = .empty;
     var b: usize = 0;
     while (b < func.blockCount()) : (b += 1) {
-        if (inLoop(plan.in_loop, @enumFromInt(b))) continue;
-        try collectOperands(func, @enumFromInt(b), &used_out, a);
+        if (inLoop(plan.in_loop, @fromBackingInt(@intCast(b)))) continue;
+        try collectOperands(func, @fromBackingInt(@intCast(b)), &used_out, a);
     }
     // Values defined inside the loop and used outside it, in definition order.
     var escaping: std.ArrayList(Value) = .empty;
     b = 0;
     while (b < func.blockCount()) : (b += 1) {
-        const blk: Block = @enumFromInt(b);
+        const blk: Block = @fromBackingInt(@intCast(b));
         if (!inLoop(plan.in_loop, blk)) continue;
         for (func.blockParams(blk)) |p| {
             if (used_out.contains(p)) try escaping.append(a, p);
@@ -1076,7 +1076,7 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         const p = try func.appendBlockParam(plan.exit, func.valueType(v));
         var bx: usize = 0;
         while (bx < func.blockCount()) : (bx += 1) {
-            const blk: Block = @enumFromInt(bx);
+            const blk: Block = @fromBackingInt(@intCast(bx));
             if (inLoop(plan.in_loop, blk)) continue;
             replaceInBlock(func, blk, v, p);
         }
@@ -1844,7 +1844,7 @@ fn countLoads(func: *const Function) u32 {
     var loads: u32 = 0;
     var bi: usize = 0;
     while (bi < func.blockCount()) : (bi += 1) {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .load) loads += 1;
         }
     }
@@ -1940,9 +1940,9 @@ test "a counted sm_120 loop becomes one unguarded main block plus a guarded rema
     var func = Function.init(allocator);
     defer func.deinit();
     try buildGpuLoop(&func, 0);
-    const entry: Block = @enumFromInt(0);
-    const loop: Block = @enumFromInt(1);
-    const body: Block = @enumFromInt(2);
+    const entry: Block = @fromBackingInt(@intCast(0));
+    const loop: Block = @fromBackingInt(@intCast(1));
+    const body: Block = @fromBackingInt(@intCast(2));
 
     const changed = try run(allocator, &func, registry.modelFor(.sm_120));
     try std.testing.expect(changed);
@@ -2017,7 +2017,7 @@ test "a counted sm_120 loop becomes one unguarded main block plus a guarded rema
         }
         switch (cmp.op) {
             .gt => gt = cmp.rhs == func.blockParams(h_main)[0],
-            .lt => lt = cmp.rhs == func.blockParams(@enumFromInt(0))[0],
+            .lt => lt = cmp.rhs == func.blockParams(@fromBackingInt(@intCast(0)))[0],
             else => {},
         }
     }
@@ -2058,7 +2058,7 @@ test "the main header's guard works in the counter's own width, with no converts
     const changed = try run(allocator, &func, registry.modelFor(.sm_120));
     try std.testing.expect(changed);
 
-    const h_main = func.terminator(@enumFromInt(0)).?.jump.target;
+    const h_main = func.terminator(@fromBackingInt(@intCast(0))).?.jump.target;
     var converts: usize = 0;
     var add: ?Inst = null;
     for (func.blockInsts(h_main)) |inst| {
@@ -2085,7 +2085,7 @@ test "a counted loop with a runtime trip count still verifies, and keeps both lo
     var func = Function.init(allocator);
     defer func.deinit();
     try buildGpuLoop(&func, 0);
-    const loop: Block = @enumFromInt(1);
+    const loop: Block = @fromBackingInt(@intCast(1));
 
     const changed = try run(allocator, &func, registry.modelFor(.sm_120));
     try std.testing.expect(changed);
@@ -2094,7 +2094,7 @@ test "a counted loop with a runtime trip count still verifies, and keeps both lo
     defer info.deinit(allocator);
     var loop_is_header = false;
     for (info.loops) |l| {
-        if (@as(Block, @enumFromInt(l.header)) == loop) loop_is_header = true;
+        if (@as(Block, @fromBackingInt(@intCast(l.header))) == loop) loop_is_header = true;
     }
     try std.testing.expect(loop_is_header);
     try std.testing.expectEqual(@as(usize, 2), info.loops.len);
@@ -2451,7 +2451,7 @@ test "cloneBlocks does not carry a block attribute onto the copied block" {
     try func.addAttr(.{ .block = b0 }, .{ .custom = .{
         .namespace = "cf",
         .key = "merge",
-        .value = .{ .int = @intFromEnum(exit) },
+        .value = .{ .int = @backingInt(exit) },
     } });
 
     var vmap: ValueMap = .empty;

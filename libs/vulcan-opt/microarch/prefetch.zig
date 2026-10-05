@@ -47,7 +47,7 @@ const Site = struct {
 
 /// Whether `b` is inside a loop's body bitset. Mirrors `unroll.zig`'s helper of the same name.
 fn inLoop(in_loop: []const bool, b: Block) bool {
-    const idx = @intFromEnum(b);
+    const idx = @backingInt(b);
     return idx < in_loop.len and in_loop[idx];
 }
 
@@ -92,7 +92,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const mm.Model
 fn loopShape(func: *const Function, all_loops: []const loops.Loop, loop: *const loops.Loop) ?Candidate {
     const n = func.blockCount();
     const h_idx = loop.header;
-    const header: Block = @enumFromInt(h_idx);
+    const header: Block = @fromBackingInt(@intCast(h_idx));
     const in_loop = loop.body;
 
     // Innermost only: an outer loop's stride is only meaningful once its inner loop has already
@@ -136,23 +136,23 @@ fn loopShape(func: *const Function, all_loops: []const loops.Loop, loop: *const 
         body_entry = cf.@"else".target;
         exit = cf.then.target;
     } else return null; // need exactly one in-loop and one out-of-loop edge
-    if (@intFromEnum(body_entry) == h_idx) return null; // need a real body
+    if (@backingInt(body_entry) == h_idx) return null; // need a real body
 
     // Single latch: exactly one in-loop block whose *terminator* jumps back to the header.
     // Conditional (if-edge) back-edges are not modeled.
     var latch: ?Block = null;
     var bi: usize = 0;
     while (bi < n) : (bi += 1) {
-        if (!inLoop(in_loop, @enumFromInt(bi))) continue;
-        const b: Block = @enumFromInt(bi);
+        if (!inLoop(in_loop, @fromBackingInt(@intCast(bi)))) continue;
+        const b: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(b)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const c2 = func.opcode(inst).@"if";
-                if (@intFromEnum(c2.then.target) == h_idx or @intFromEnum(c2.@"else".target) == h_idx) return null;
+                if (@backingInt(c2.then.target) == h_idx or @backingInt(c2.@"else".target) == h_idx) return null;
             }
         }
         if (func.terminator(b)) |term| switch (term) {
-            .jump => |j| if (@intFromEnum(j.target) == h_idx) {
+            .jump => |j| if (@backingInt(j.target) == h_idx) {
                 if (bi == h_idx) return null; // header is not its own latch
                 if (latch != null) return null; // more than one latch
                 latch = b;
@@ -166,8 +166,8 @@ fn loopShape(func: *const Function, all_loops: []const loops.Loop, loop: *const 
     var out_edges: usize = 0;
     bi = 0;
     while (bi < n) : (bi += 1) {
-        if (!inLoop(in_loop, @enumFromInt(bi))) continue;
-        const b: Block = @enumFromInt(bi);
+        if (!inLoop(in_loop, @fromBackingInt(@intCast(bi)))) continue;
+        const b: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(b)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const c2 = func.opcode(inst).@"if";
@@ -318,7 +318,7 @@ fn isAffine(func: *const Function, block: Block, biv: Value, ptr: Value) bool {
 fn prefetchDistance(model: *const mm.Model, stride: i64) i64 {
     if (stride == 0) return 0;
     // Any opcode payload works: every latency table switches on the opcode's tag only.
-    const load_latency = model.latency(.{ .load = .{ .ptr = @enumFromInt(0) } });
+    const load_latency = model.latency(.{ .load = .{ .ptr = @fromBackingInt(@intCast(0)) } });
     const magnitude: u64 = @intCast(@abs(stride));
     const bytes_needed = @as(u64, load_latency) * magnitude;
     const line: u64 = model.cache_line;
@@ -404,7 +404,7 @@ fn countPrefetches(func: *const Function) usize {
     var count: usize = 0;
     var bi: usize = 0;
     while (bi < func.blockCount()) : (bi += 1) {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .prefetch) count += 1;
         }
     }

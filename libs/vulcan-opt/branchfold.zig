@@ -26,15 +26,15 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     defer allocator.free(consts);
     @memset(consts, null);
     for (0..func.instCount()) |i| {
-        const inst: Inst = @enumFromInt(i);
+        const inst: Inst = @fromBackingInt(@intCast(i));
         if (func.opcode(inst) == .iconst) {
-            if (func.instResult(inst)) |r| consts[@intFromEnum(r)] = func.opcode(inst).iconst;
+            if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
         }
     }
 
     var changed = false;
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         // Find this block's structured `if` exit (if any).
         var if_at: ?usize = null;
         for (func.blockInsts(block), 0..) |inst, j| {
@@ -50,7 +50,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         // edge (same target and same arguments) is pointless whatever the condition, so it collapses
         // to that single jump. Either way the `if` is dropped and the block gets an unconditional
         // terminator.
-        const taken: ir.function.Jump = if (consts[@intFromEnum(cf.cond)]) |cv|
+        const taken: ir.function.Jump = if (consts[@backingInt(cf.cond)]) |cv|
             (if (cv != 0) cf.then else cf.@"else")
         else if (cf.then.target == cf.@"else".target and sameArgs(func, cf.then, cf.@"else"))
             cf.then

@@ -133,7 +133,7 @@ fn perfOpenCycles() !i32 {
     var attr = std.mem.zeroes(linux.perf_event_attr);
     attr.type = .HARDWARE;
     attr.size = @sizeOf(linux.perf_event_attr);
-    attr.config = @intFromEnum(linux.PERF.COUNT.HW.CPU_CYCLES);
+    attr.config = @backingInt(linux.PERF.COUNT.HW.CPU_CYCLES);
     attr.flags.disabled = true;
     attr.flags.exclude_kernel = true;
     attr.flags.exclude_hv = true;

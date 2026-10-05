@@ -169,7 +169,7 @@ test "not calling optimize leaves a function exactly as built: today's behavior 
     try std.testing.expectEqual(a.blockCount(), b.blockCount());
     var bi: usize = 0;
     while (bi < a.blockCount()) : (bi += 1) {
-        const block: ir.function.Block = @enumFromInt(bi);
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
         try std.testing.expectEqual(a.blockInsts(block).len, b.blockInsts(block).len);
     }
 

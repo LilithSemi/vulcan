@@ -1350,7 +1350,7 @@ test "x86 (i386): a struct-by-value arg decomposes into two 32-bit .memory_stack
     for (mod.funcs) |*nf| {
         if (!std.mem.eql(u8, nf.name, "take")) continue;
         found = true;
-        const params = nf.func.blockParams(@enumFromInt(0));
+        const params = nf.func.blockParams(@fromBackingInt(@intCast(0)));
         try std.testing.expectEqual(@as(usize, 2), params.len);
         for (params) |p| {
             const k = nf.func.types.type_kind(nf.func.valueType(p));
@@ -1547,7 +1547,7 @@ test "x86 (i386): an over-16-byte struct return threads a hidden result pointer 
         if (!std.mem.eql(u8, nf.name, "mk")) continue;
         found = true;
         try std.testing.expect(nf.func.sret);
-        const params = nf.func.blockParams(@enumFromInt(0));
+        const params = nf.func.blockParams(@fromBackingInt(@intCast(0)));
         try std.testing.expectEqual(@as(usize, 1), params.len); // only the hidden pointer (mk is void-param)
         try std.testing.expect(nf.func.types.type_kind(nf.func.valueType(params[0])) == .ptr);
     }

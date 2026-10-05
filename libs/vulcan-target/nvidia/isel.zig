@@ -96,7 +96,7 @@ fn fragDepthReg(func: *const Function) u8 {
 /// the interpolated z value.
 fn writesFragDepth(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .store and attrTag(func, func.opcode(inst).store.ptr, "frag_depth") != null) return true;
         }
     }
@@ -113,7 +113,7 @@ fn writesFragDepth(func: *const Function) bool {
 fn colorTargetCount(func: *const Function) u8 {
     var max_comp: i32 = -1;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) != .store) continue;
             if (attrTag(func, func.opcode(inst).store.ptr, "color_out")) |comp| {
                 if (@as(i32, comp) > max_comp) max_comp = comp;
@@ -202,19 +202,19 @@ const Convergence = struct {
 
 /// Successors of a block: the `if` then/else targets, or the jump target, or none.
 fn blockSuccessors(func: *const Function, bi: usize, buf: *[2]usize) []const usize {
-    const block: Block = @enumFromInt(bi);
+    const block: Block = @fromBackingInt(@intCast(bi));
     for (func.blockInsts(block)) |inst| {
         if (func.opcode(inst) == .@"if") {
             const cf = func.opcode(inst).@"if";
-            buf[0] = @intFromEnum(cf.then.target);
-            buf[1] = @intFromEnum(cf.@"else".target);
+            buf[0] = @backingInt(cf.then.target);
+            buf[1] = @backingInt(cf.@"else".target);
             return buf[0..2];
         }
     }
     switch (func.terminator(block) orelse Terminator{ .ret = ir.function.Ret.none() }) {
         .ret => return buf[0..0],
         .jump => |j| {
-            buf[0] = @intFromEnum(j.target);
+            buf[0] = @backingInt(j.target);
             return buf[0..1];
         },
     }
@@ -224,7 +224,7 @@ fn blockSuccessors(func: *const Function, bi: usize, buf: *[2]usize) []const usi
 /// arms reach different blocks). A degenerate `if` whose then and else target
 /// the same block is not divergent and needs no barrier.
 fn divergentIf(func: *const Function, uni: *const opt.uniform.Uniformity, bi: usize) ?ir.function.If {
-    const block: Block = @enumFromInt(bi);
+    const block: Block = @fromBackingInt(@intCast(bi));
     for (func.blockInsts(block)) |inst| {
         if (func.opcode(inst) == .@"if") {
             const cf = func.opcode(inst).@"if";
@@ -259,7 +259,7 @@ fn computeConvergence(allocator: std.mem.Allocator, func: *const Function, uni: 
     @memset(bar_at_if, null);
     errdefer allocator.free(bar_at_if);
     const merge_of_if = try allocator.alloc(Block, n);
-    @memset(merge_of_if, @enumFromInt(0));
+    @memset(merge_of_if, @fromBackingInt(@intCast(0)));
     errdefer allocator.free(merge_of_if);
     const syncs_at = try allocator.alloc([]u4, n);
     @memset(syncs_at, &.{});
@@ -367,14 +367,14 @@ fn computeConvergence(allocator: std.mem.Allocator, func: *const Function, uni: 
             // so than reuse.
             bar_at_if[bi] = depth;
             depth = (depth + 1) & 0xf;
-            merge_of_if[bi] = @enumFromInt(m);
+            merge_of_if[bi] = @fromBackingInt(@intCast(m));
         }
     }
 
     // Collect, per merge block, the barrier registers whose BSYNC fires there.
     for (0..n) |bi| {
         if (bar_at_if[bi]) |bar| {
-            const m = @intFromEnum(merge_of_if[bi]);
+            const m = @backingInt(merge_of_if[bi]);
             const old = syncs_at[m];
             const grown = try allocator.alloc(u4, old.len + 1);
             @memcpy(grown[0..old.len], old);
@@ -389,7 +389,7 @@ fn computeConvergence(allocator: std.mem.Allocator, func: *const Function, uni: 
 
 /// Whether `block` holds a `barrier` instruction.
 fn blockHasBarrier(func: *const Function, bi: usize) bool {
-    for (func.blockInsts(@as(Block, @enumFromInt(bi)))) |inst| {
+    for (func.blockInsts(@as(Block, @fromBackingInt(@intCast(bi))))) |inst| {
         if (func.opcode(inst) == .barrier) return true;
     }
     return false;
@@ -463,8 +463,8 @@ fn isUniformLoopExit(
     if (uni.blockIsSplit(ai) or uni.blockIsSplit(b)) return false;
     const cf = opt.uniform.twoWayIf(func, ai) orelse return false;
     if (uni.isDivergent(cf.cond)) return false;
-    const then_i: usize = @intFromEnum(cf.then.target);
-    const else_i: usize = @intFromEnum(cf.@"else".target);
+    const then_i: usize = @backingInt(cf.then.target);
+    const else_i: usize = @backingInt(cf.@"else".target);
     for (info.loops) |*l| {
         if (!l.contains(ai) or !l.contains(b)) continue;
         if (l.contains(then_i) == l.contains(else_i)) continue; // not an exit branch
@@ -526,7 +526,7 @@ fn checkBarrierConvergence(allocator: std.mem.Allocator, func: *const Function, 
         // `computeConvergence` records a join only where it found an immediate post-dominator.
         // Without one the two arms never meet again (each one exits), so nothing reconverges
         // the warp and every barrier the branch can reach runs split.
-        const merge: ?usize = if (conv.bar_at_if[ai] != null) @intFromEnum(conv.merge_of_if[ai]) else null;
+        const merge: ?usize = if (conv.bar_at_if[ai] != null) @backingInt(conv.merge_of_if[ai]) else null;
 
         for (0..n) |b| {
             if (!blockHasBarrier(func, b)) continue;
@@ -629,7 +629,7 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
     if (ir.function.functionUsesF16(func)) return error.Unsupported;
     if (ir.function.functionUsesF128(func)) return error.Unsupported;
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
             .decode_low_float, .encode_low_float => return error.Unsupported,
             .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
             .arith => |arithmetic| if (stage == .compute and arithmetic.op == .div and
@@ -761,7 +761,7 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
     var block_start = try allocator.alloc(usize, nblocks);
     defer allocator.free(block_start);
 
-    const eparams = func.blockParams(@enumFromInt(0));
+    const eparams = func.blockParams(@fromBackingInt(@intCast(0)));
     // The graphics slice is allocated rather than a `&.{}` literal so `Kernel.deinit` can free
     // it unconditionally, with no special case for a zero-length non-heap slice. A graphics
     // shader sources its inputs from the attribute interface and not from a parameter block,
@@ -1044,7 +1044,7 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
     try checkBarrierConvergence(allocator, func, &conv, &uni);
 
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         // Reconverge: emit a BSYNC for every divergent region whose join is
         // this block. block_start[bi] points at the BSYNC, so branches into
         // the merge block (the arm BRAs, the BSSY) land on it. The warp then
@@ -1067,7 +1067,7 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
                     try code.append(allocator, encode.bclear(bar, .{ .stall = 1 }));
                     const at = code.items.len;
                     try code.append(allocator, encode.bssy(bar, 0, .{ .stall = 1 }));
-                    try fixups.append(allocator, .{ .at = at, .target = @intFromEnum(conv.merge_of_if[bi]), .is_bssy = true });
+                    try fixups.append(allocator, .{ .at = at, .target = @backingInt(conv.merge_of_if[bi]), .is_bssy = true });
                 }
                 try emitIf(allocator, func, stage, &loc, &code, &fixups, bi + 1, func.opcode(inst).@"if");
                 terminated = true;
@@ -1260,15 +1260,15 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, stage: Stage,
     defer allocator.free(feeds_color);
     @memset(feeds_color, false);
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockParams(block)) |p| {
-            def_pos[@intFromEnum(p)] = pos;
-            last_use[@intFromEnum(p)] = pos;
+            def_pos[@backingInt(p)] = pos;
+            last_use[@backingInt(p)] = pos;
         }
         pos += 1;
         for (func.blockInsts(block)) |inst| {
             forEachUse(func, inst, last_use, pos);
-            if (func.instResult(inst)) |r| def_pos[@intFromEnum(r)] = pos;
+            if (func.instResult(inst)) |r| def_pos[@backingInt(r)] = pos;
             // A contracted multiply-add reads the MULTIPLY'S OPERANDS here, at the add,
             // because the multiply itself emits nothing. `forEachUse` cannot see that: it
             // reads the IR, where those operands are read by the multiply and nowhere
@@ -1294,7 +1294,7 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, stage: Stage,
             if (func.opcode(inst) == .store) {
                 const st = func.opcode(inst).store;
                 if (attrTag(func, st.ptr, "color_out") != null) {
-                    feeds_color[@intFromEnum(st.value)] = true;
+                    feeds_color[@backingInt(st.value)] = true;
                     last_color_pos = pos;
                 }
             }
@@ -1323,7 +1323,7 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, stage: Stage,
     // param's live range to it. This keeps the IPA'd varying registers the
     // SHFL sources live until the last derivative.
     var grad_buf_param: ?Value = null;
-    for (func.blockParams(@enumFromInt(0))) |p| {
+    for (func.blockParams(@fromBackingInt(@intCast(0)))) |p| {
         if (hasGpuKey(func, p, "grad_buf")) {
             grad_buf_param = p;
             break;
@@ -1335,13 +1335,13 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, stage: Stage,
         const is_grad_ptr = try allocator.alloc(bool, nval);
         defer allocator.free(is_grad_ptr);
         @memset(is_grad_ptr, false);
-        is_grad_ptr[@intFromEnum(gbp)] = true;
+        is_grad_ptr[@backingInt(gbp)] = true;
         for (0..nblocks) |bi| {
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 if (func.opcode(inst) != .arith) continue;
                 const a = func.opcode(inst).arith;
                 if (a.op != .add or a.lhs != gbp) continue;
-                if (func.instResult(inst)) |r| is_grad_ptr[@intFromEnum(r)] = true;
+                if (func.instResult(inst)) |r| is_grad_ptr[@backingInt(r)] = true;
             }
         }
         // The position of the last grad_buf load (re-walk in the same linearization).
@@ -1349,22 +1349,22 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, stage: Stage,
         var p2: u32 = 0;
         for (0..nblocks) |bi| {
             p2 += 1; // block-param slot (matches the first walk)
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 if (func.opcode(inst) == .load) {
                     const l = func.opcode(inst).load;
-                    if (is_grad_ptr[@intFromEnum(l.ptr)]) last_grad_pos = p2;
+                    if (is_grad_ptr[@backingInt(l.ptr)]) last_grad_pos = p2;
                 }
                 p2 += 1;
             }
             p2 += 1; // terminator slot
         }
         if (last_grad_pos != 0) {
-            for (func.blockParams(@enumFromInt(0))) |p| {
+            for (func.blockParams(@fromBackingInt(@intCast(0)))) |p| {
                 // A fragment input-attribute varying param, IPA'd in the
                 // prologue into the register the SHFL sources. Identified by
                 // the `attr` tag the frontend set.
                 if (attrTag(func, p, "attr") != null) {
-                    const idx = @intFromEnum(p);
+                    const idx = @backingInt(p);
                     if (last_use[idx] < last_grad_pos) last_use[idx] = last_grad_pos;
                 }
             }
@@ -1396,20 +1396,20 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, stage: Stage,
     // sensitive defect that this steers into. Removing an unproven hazard is not worth waking
     // a measured one. Cover the vertex stage only with evidence that its exposure fires.
     if (stage == .fragment) {
-        for (func.blockParams(@enumFromInt(0))) |p| {
-            if (attrTag(func, p, "attr") != null) last_use[@intFromEnum(p)] = pos;
+        for (func.blockParams(@fromBackingInt(@intCast(0)))) |p| {
+            if (attrTag(func, p, "attr") != null) last_use[@backingInt(p)] = pos;
         }
     }
     try extendLiveRanges(allocator, func, last_use, block_end);
 
     var ivals = try allocator.alloc(Interval, nval);
     defer allocator.free(ivals);
-    for (0..nval) |i| ivals[i] = .{ .value = @enumFromInt(i), .start = def_pos[i], .end = last_use[i] };
+    for (0..nval) |i| ivals[i] = .{ .value = @fromBackingInt(@intCast(i)), .start = def_pos[i], .end = last_use[i] };
     std.mem.sort(Interval, ivals, {}, lessByStart);
 
     // Free pools: GPRs R4..R254 (R0:R3 stay outside the graphics value pool), and
     // predicates P0..P5. The two high graphics scratch registers are removed below.
-    var gpr_free = [_]bool{false} ** 256;
+    var gpr_free: [256]bool = @splat(false);
     for (value_reg_base..encode.RZ) |r| gpr_free[r] = true;
     gpr_free[graphics_pad_reg] = false; // reserved as the graphics prologue pad scratch
     gpr_free[graphics_memory_scratch_reg] = false; // paired graphics memory scratch
@@ -1429,7 +1429,7 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, stage: Stage,
             while (r < @as(usize, nt) * 4) : (r += 1) gpr_free[r] = false;
         }
     }
-    var pred_free = [_]bool{true} ** carry_pred;
+    var pred_free: [carry_pred]bool = @splat(true);
 
     const Active = struct { end: u32, loc: Loc, is_ptr: bool };
     var active: std.ArrayList(Active) = .empty;
@@ -1871,7 +1871,7 @@ fn isCommutativeBinOp(op: ir.function.BinOp) bool {
 fn foldConstantsToImm(func: *Function) void {
     var i: usize = 0;
     while (i < func.instCount()) : (i += 1) {
-        const inst: ir.function.Inst = @enumFromInt(i);
+        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
         const op = func.opcodeMut(inst);
         const a = switch (op.*) {
             .arith => |a| a,
@@ -2029,7 +2029,7 @@ fn globalAccessIsAligned(func: *const Function, ptr: Value, displacement: i32, w
 /// bypassed steps.
 fn collapsePointerAddChains(func: *Function) void {
     for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const result = func.instResult(inst) orelse continue;
             if (ptrSpace(func, result) == null or hasTagAttribute(func, result)) continue;
             const op = func.opcodeMut(inst);
@@ -2074,7 +2074,7 @@ fn collapsePointerAddChains(func: *Function) void {
 fn foldAddressDisplacements(allocator: std.mem.Allocator, func: *Function, out: *DispFold) Error!void {
     const nblocks = func.blockCount();
     for (0..nblocks) |bi| {
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const access = func.opcode(inst);
             const ptr = switch (access) {
                 .load => |l| l.ptr,
@@ -2141,7 +2141,7 @@ fn foldAddressDisplacements(allocator: std.mem.Allocator, func: *Function, out: 
         changed = false;
         @memset(used, false);
         for (0..nblocks) |bi| {
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             for (func.blockInsts(block)) |inst| {
                 if (out.dead.contains(inst)) continue;
                 markUsedBitset(func, inst, used);
@@ -2149,12 +2149,12 @@ fn foldAddressDisplacements(allocator: std.mem.Allocator, func: *Function, out: 
             if (func.terminator(block)) |term| markUsedTermBitset(func, term, used);
         }
         for (0..nblocks) |bi| {
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 if (out.dead.contains(inst)) continue;
                 if (func.opcode(inst) != .arith_imm) continue;
                 const r = func.instResult(inst) orelse continue;
                 if (ptrSpace(func, r) == null) continue; // an address, not a value
-                if (used[@intFromEnum(r)]) continue;
+                if (used[@backingInt(r)]) continue;
                 try out.dead.put(allocator, inst, {});
                 changed = true;
             }
@@ -2252,8 +2252,8 @@ const FmaFold = struct {
     /// instruction's own immediate field. For an INTEGER site it is the ADDEND, because
     /// IMAD has no immediate addend. `commitHoists` fills the constants and
     /// `reserveHoistRegs` fills the registers.
-    hoist_imm: [hoist_reg_cap]u32 = [_]u32{0} ** hoist_reg_cap,
-    hoist_reg: [hoist_reg_cap]u8 = [_]u8{0} ** hoist_reg_cap,
+    hoist_imm: [hoist_reg_cap]u32 = @splat(0),
+    hoist_reg: [hoist_reg_cap]u8 = @splat(0),
     hoist_len: usize = 0,
 
     fn deinit(self: *FmaFold, allocator: std.mem.Allocator) void {
@@ -2323,7 +2323,7 @@ fn scanUniformParams(allocator: std.mem.Allocator, func: *const Function, out: *
     opt.dce.countUses(func, uses);
 
     var next_ureg: u16 = 4;
-    for (func.blockParams(@enumFromInt(0))) |param| {
+    for (func.blockParams(@fromBackingInt(@intCast(0)))) |param| {
         if (gpu.attrs.builtinOf(func, param) != null) continue;
         const int = switch (func.types.type_kind(func.valueType(param))) {
             .int => |x| x,
@@ -2334,7 +2334,7 @@ fn scanUniformParams(allocator: std.mem.Allocator, func: *const Function, out: *
         var supported: u32 = 0;
         var multiplies: u32 = 0;
         for (0..func.blockCount()) |bi| {
-            for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
                 .icmp => |cmp| {
                     if (cmp.lhs == param) supported += 1;
                     if (cmp.rhs == param) supported += 1;
@@ -2356,7 +2356,7 @@ fn scanUniformParams(allocator: std.mem.Allocator, func: *const Function, out: *
         // A compare-only parameter does not repay the extra uniform-data-path
         // dependency. k2 measures faster with its bound in a GPR. Mixed IMAD
         // is the profitable shape until loop induction itself is uniform.
-        if (multiplies == 0 or supported < 3 or supported != uses[@intFromEnum(param)]) continue;
+        if (multiplies == 0 or supported < 3 or supported != uses[@backingInt(param)]) continue;
         if (next_ureg >= encode.URZ) return error.Unsupported;
         try out.regs.put(allocator, param, @intCast(next_ureg));
         next_ureg += 1;
@@ -2382,7 +2382,7 @@ fn scanPredicateAnds(allocator: std.mem.Allocator, func: *const Function, out: *
         var has_load = false;
         for (loop.body, 0..) |in_loop, block_index| {
             if (!in_loop) continue;
-            for (func.blockInsts(@enumFromInt(block_index))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(block_index)))) |inst| {
                 if (func.opcode(inst) == .load) has_load = true;
             }
         }
@@ -2398,7 +2398,7 @@ fn scanPredicateAnds(allocator: std.mem.Allocator, func: *const Function, out: *
         compare_pos.clearRetainingCapacity();
         if (avoid[bi]) continue;
         var pos: u32 = 0;
-        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const op = func.opcode(inst);
             if (op == .icmp) {
                 const result = func.instResult(inst).?;
@@ -2410,7 +2410,7 @@ fn scanPredicateAnds(allocator: std.mem.Allocator, func: *const Function, out: *
                 const rhs_pos = compare_pos.get(op.arith.rhs) orelse continue;
                 const later = if (lhs_pos > rhs_pos) op.arith.lhs else op.arith.rhs;
                 const earlier = if (lhs_pos > rhs_pos) op.arith.rhs else op.arith.lhs;
-                if (uses[@intFromEnum(later)] != 1) continue;
+                if (uses[@backingInt(later)] != 1) continue;
                 try out.at.put(allocator, later, .{ .dst = result, .accum = earlier });
                 try out.combined.put(allocator, result, {});
             }
@@ -2464,16 +2464,16 @@ fn loopBlocks(allocator: std.mem.Allocator, func: *const Function) Error![]bool 
     const out = try allocator.alloc(bool, nblocks);
     @memset(out, false);
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
-                markBackEdge(out, bi, @intFromEnum(cf.then.target));
-                markBackEdge(out, bi, @intFromEnum(cf.@"else".target));
+                markBackEdge(out, bi, @backingInt(cf.then.target));
+                markBackEdge(out, bi, @backingInt(cf.@"else".target));
             }
         }
         if (func.terminator(block)) |term| {
-            if (term == .jump) markBackEdge(out, bi, @intFromEnum(term.jump.target));
+            if (term == .jump) markBackEdge(out, bi, @backingInt(term.jump.target));
         }
     }
     return out;
@@ -2510,7 +2510,7 @@ fn fmaOperand(
     v: Value,
     same_type_as: Value,
 ) ?Fma {
-    if (uses[@intFromEnum(v)] != 1) return null;
+    if (uses[@backingInt(v)] != 1) return null;
     if (!in_block.contains(v)) return null;
     // Both sources of the fused instruction must be the SAME 32-bit type. Checking the
     // add's result alone would not say that, so each operand is tested here.
@@ -2581,7 +2581,7 @@ fn scanFma(allocator: std.mem.Allocator, func: *const Function, options: Options
     defer in_block.deinit(allocator);
 
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         in_block.clearRetainingCapacity();
         for (func.blockParams(block)) |p| try in_block.put(allocator, p, {});
         for (func.blockInsts(block)) |inst| {
@@ -3385,7 +3385,7 @@ fn attrTag(func: *const Function, v: Value, key: []const u8) ?u16 {
 
 fn returnsValue(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
-        if (func.terminator(@enumFromInt(bi))) |t| switch (t) {
+        if (func.terminator(@fromBackingInt(@intCast(bi)))) |t| switch (t) {
             .ret => |r| if (r.count != 0) return true,
             else => {},
         };
@@ -3479,7 +3479,7 @@ const TexLowering = struct {
         var fconst_of = std.AutoHashMapUnmanaged(Value, f64){};
         defer fconst_of.deinit(self.allocator);
         for (0..nblocks) |bi| {
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             for (func.blockInsts(block)) |inst| {
                 if (func.opcode(inst) == .iconst) {
                     if (func.instResult(inst)) |r| try iconst_of.put(self.allocator, r, func.opcode(inst).iconst);
@@ -3489,7 +3489,7 @@ const TexLowering = struct {
             }
         }
         for (0..nblocks) |bi| {
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             for (func.blockInsts(block)) |inst| {
                 if (func.opcode(inst) != .call_indirect) continue;
                 const c = func.opcode(inst).call_indirect;
@@ -3545,7 +3545,7 @@ const TexLowering = struct {
                         const scratch: u8 = @intCast(@as(u32, max_reg.*) + 1);
                         if (@as(u32, scratch) + cube_scratch_regs - 1 >= encode.RZ) return error.Unsupported;
                         max_reg.* = scratch + cube_scratch_regs - 1;
-                        try self.calls.put(self.allocator, @intFromEnum(inst), .{
+                        try self.calls.put(self.allocator, @backingInt(inst), .{
                             .out = args[0], // unused for shadow (no out block); kept non-undefined
                             .u = args[1], // x
                             .v = args[2], // y
@@ -3564,7 +3564,7 @@ const TexLowering = struct {
                         coord = std.mem.alignForward(u8, coord, 4);
                         if (@as(u32, coord) + 6 - 1 >= encode.RZ) return error.Unsupported;
                         max_reg.* = coord + 5;
-                        try self.calls.put(self.allocator, @intFromEnum(inst), .{
+                        try self.calls.put(self.allocator, @backingInt(inst), .{
                             .out = args[0],
                             .u = args[1],
                             .v = args[2],
@@ -3590,7 +3590,7 @@ const TexLowering = struct {
                         coord = std.mem.alignForward(u8, coord, 2);
                         if (@as(u32, coord) + 4 - 1 >= encode.RZ) return error.Unsupported;
                         max_reg.* = coord + 3;
-                        try self.calls.put(self.allocator, @intFromEnum(inst), .{
+                        try self.calls.put(self.allocator, @backingInt(inst), .{
                             .out = args[0],
                             .u = args[1],
                             .v = args[2],
@@ -3694,7 +3694,7 @@ const TexLowering = struct {
                     max_reg.* = scratch + cube_scratch_regs - 1;
                 }
                 try self.out_base.put(self.allocator, out, base);
-                try self.calls.put(self.allocator, @intFromEnum(inst), .{
+                try self.calls.put(self.allocator, @backingInt(inst), .{
                     .out = out,
                     .u = args[1],
                     .v = args[2],
@@ -3716,7 +3716,7 @@ const TexLowering = struct {
         // components. The lowering builds these as
         // `arith add(out_ptr, iconst c*4)`. Match that shape.
         for (0..nblocks) |bi| {
-            const block: Block = @enumFromInt(bi);
+            const block: Block = @fromBackingInt(@intCast(bi));
             for (func.blockInsts(block)) |inst| {
                 if (func.opcode(inst) != .arith) continue;
                 const a = func.opcode(inst).arith;
@@ -3797,7 +3797,7 @@ const DerivLowering = struct {
     /// per load.
     fn scan(self: *DerivLowering, func: *const Function, max_reg: *u8) Error!void {
         // The grad_buf entry param (tagged on the entry block's parameters).
-        for (func.blockParams(@enumFromInt(0))) |p| {
+        for (func.blockParams(@fromBackingInt(@intCast(0)))) |p| {
             if (hasGpuKey(func, p, "grad_buf")) {
                 self.grad_buf = p;
                 break;
@@ -3830,7 +3830,7 @@ const DerivLowering = struct {
         var iconst_of = std.AutoHashMapUnmanaged(Value, i64){};
         defer iconst_of.deinit(self.allocator);
         for (0..nblocks) |bi| {
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 if (func.opcode(inst) == .iconst) {
                     if (func.instResult(inst)) |r| try iconst_of.put(self.allocator, r, func.opcode(inst).iconst);
                 }
@@ -3840,7 +3840,7 @@ const DerivLowering = struct {
         try self.grad_ptr.put(self.allocator, self.grad_buf.?, 0);
         // `add(grad_buf, iconst k)` addresses index k/4.
         for (0..nblocks) |bi| {
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 if (func.opcode(inst) != .arith) continue;
                 const a = func.opcode(inst).arith;
                 if (a.op != .add or a.lhs != self.grad_buf.?) continue;
@@ -3851,7 +3851,7 @@ const DerivLowering = struct {
         }
         // Each grad_buf load maps to its slot, axis, and two reserved scratch registers.
         for (0..nblocks) |bi| {
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 if (func.opcode(inst) != .load) continue;
                 const l = func.opcode(inst).load;
                 const index = self.grad_ptr.get(l.ptr) orelse continue;
@@ -3922,14 +3922,14 @@ const MathLowering = struct {
         var iconst_of = std.AutoHashMapUnmanaged(Value, i64){};
         defer iconst_of.deinit(self.allocator);
         for (0..nblocks) |bi| {
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 if (func.opcode(inst) == .iconst) {
                     if (func.instResult(inst)) |r| try iconst_of.put(self.allocator, r, func.opcode(inst).iconst);
                 }
             }
         }
         for (0..nblocks) |bi| {
-            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
                 if (func.opcode(inst) != .call_indirect) continue;
                 const c = func.opcode(inst).call_indirect;
                 if (!isMathFn(func, c.target)) continue;
@@ -3939,7 +3939,7 @@ const MathLowering = struct {
                 const scratch: u8 = @intCast(@as(u32, max_reg.*) + 1);
                 if (@as(u32, scratch) >= encode.RZ) return error.Unsupported;
                 max_reg.* = scratch;
-                try self.calls.put(self.allocator, @intFromEnum(inst), .{ .op = op, .scratch = scratch });
+                try self.calls.put(self.allocator, @backingInt(inst), .{ .op = op, .scratch = scratch });
             }
         }
     }
@@ -4443,7 +4443,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, stage: Stage, 
             // log2, sin, cos) ignore b. pow, exp, and log compose two MUFUs
             // around an FMUL through a reserved scratch register.
             if (isMathFn(func, c.target)) {
-                const m = math.calls.get(@intFromEnum(inst)) orelse return error.Unsupported;
+                const m = math.calls.get(@backingInt(inst)) orelse return error.Unsupported;
                 const args = func.valueList(c.args);
                 const rd = gprOf(loc.*, func.instResult(inst).?);
                 const a = gprOf(loc.*, args[1]); // primary operand
@@ -4476,7 +4476,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, stage: Stage, 
                 return;
             }
             if (!isSamplerFn(func, c.target) and !isSamplerVec3Fn(func, c.target) and !isAnyShadowFn(func, c.target) and !isSamplerGatherFn(func, c.target) and !isSamplerFetchFn(func, c.target) and !isSamplerFetch3Fn(func, c.target)) return error.Unsupported;
-            const call = tex.calls.get(@intFromEnum(inst)) orelse return error.Unsupported;
+            const call = tex.calls.get(@backingInt(inst)) orelse return error.Unsupported;
             // sampler2DShadow: a depth-compare TEX (z_cmpr) that returns a
             // scalar into the call's SSA result register, with no out
             // block. Build src0 = (u, v) and src1 = [handle, dref] in the
@@ -4810,7 +4810,7 @@ fn emitIf(allocator: std.mem.Allocator, func: *const Function, stage: Stage, loc
     try emitMoves(allocator, func, stage, loc, code, cf.@"else");
     const else_bra = code.items.len;
     try code.append(allocator, encode.bra(0, .{}));
-    try fixups.append(allocator, .{ .at = else_bra, .target = @intFromEnum(cf.@"else".target) });
+    try fixups.append(allocator, .{ .at = else_bra, .target = @backingInt(cf.@"else".target) });
     // L_then: the then edge moves. With none, the guarded branch jumps
     // straight to the then block, and a taken path costs one branch instead
     // of two: the old layout landed it on a bare trampoline BRA that only
@@ -4818,7 +4818,7 @@ fn emitIf(allocator: std.mem.Allocator, func: *const Function, stage: Stage, loc
     const then_moves_start = code.items.len;
     try emitMoves(allocator, func, stage, loc, code, cf.then);
     if (code.items.len == then_moves_start) {
-        try fixups.append(allocator, .{ .at = skip_else, .target = @intFromEnum(cf.then.target) });
+        try fixups.append(allocator, .{ .at = skip_else, .target = @backingInt(cf.then.target) });
         return;
     }
     try fixups.append(allocator, .{ .at = skip_else, .target_inst = then_moves_start });
@@ -4827,10 +4827,10 @@ fn emitIf(allocator: std.mem.Allocator, func: *const Function, stage: Stage, loc
     // and a branch latency for nothing. ptxas emits no such trampoline. The else
     // branch below cannot elide the same way, because the then-edge moves sit between
     // it and the next block.
-    if (@intFromEnum(cf.then.target) != next) {
+    if (@backingInt(cf.then.target) != next) {
         const then_bra = code.items.len;
         try code.append(allocator, encode.bra(0, .{}));
-        try fixups.append(allocator, .{ .at = then_bra, .target = @intFromEnum(cf.then.target) });
+        try fixups.append(allocator, .{ .at = then_bra, .target = @backingInt(cf.then.target) });
     }
 }
 
@@ -4838,10 +4838,10 @@ fn emitJump(allocator: std.mem.Allocator, func: *const Function, stage: Stage, l
     try emitMoves(allocator, func, stage, loc, code, jump);
     // The same fallthrough rule as the then-branch of an `if`: a jump to the next
     // emitted block needs no BRA.
-    if (@intFromEnum(jump.target) == next) return;
+    if (@backingInt(jump.target) == next) return;
     const at = code.items.len;
     try code.append(allocator, encode.bra(0, .{}));
-    try fixups.append(allocator, .{ .at = at, .target = @intFromEnum(jump.target) });
+    try fixups.append(allocator, .{ .at = at, .target = @backingInt(jump.target) });
 }
 
 /// One register-to-register copy on a control-flow edge.
@@ -4949,7 +4949,7 @@ fn emitParallelCopy(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), mo
 // Liveness (for the allocator).
 
 fn markUse(last_use: []u32, v: Value, pos: u32) void {
-    if (pos > last_use[@intFromEnum(v)]) last_use[@intFromEnum(v)] = pos;
+    if (pos > last_use[@backingInt(v)]) last_use[@backingInt(v)] = pos;
 }
 
 fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, pos: u32) void {
@@ -5027,7 +5027,7 @@ fn forEachTermUse(func: *const Function, term: Terminator, last_use: []u32, pos:
 }
 
 fn setUsed(row: []bool, v: Value) void {
-    row[@intFromEnum(v)] = true;
+    row[@backingInt(v)] = true;
 }
 
 fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) void {
@@ -5125,21 +5125,21 @@ fn extendLiveRanges(allocator: std.mem.Allocator, func: *const Function, last_us
     @memset(used, false);
 
     for (0..nblocks) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         const row = used[bi * nval ..][0..nval];
-        for (func.blockParams(block)) |p| defined[bi * nval + @intFromEnum(p)] = true;
+        for (func.blockParams(block)) |p| defined[bi * nval + @backingInt(p)] = true;
         for (func.blockInsts(block)) |inst| {
             markUsedBitset(func, inst, row);
-            if (func.instResult(inst)) |r| defined[bi * nval + @intFromEnum(r)] = true;
+            if (func.instResult(inst)) |r| defined[bi * nval + @backingInt(r)] = true;
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
-                try succ[bi].append(allocator, @intFromEnum(cf.then.target));
-                try succ[bi].append(allocator, @intFromEnum(cf.@"else".target));
+                try succ[bi].append(allocator, @backingInt(cf.then.target));
+                try succ[bi].append(allocator, @backingInt(cf.@"else".target));
             }
         }
         if (func.terminator(block)) |term| {
             markUsedTermBitset(func, term, row);
-            if (term == .jump) try succ[bi].append(allocator, @intFromEnum(term.jump.target));
+            if (term == .jump) try succ[bi].append(allocator, @backingInt(term.jump.target));
         }
     }
 
@@ -5601,7 +5601,7 @@ test "sixteen multiply-adds that share one constant share ONE register and ONE M
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const steps = [_]HoistStep{.{ .mul = 0.9, .add = 0.05 }} ** 16;
+    const steps: [16]HoistStep = @splat(.{ .mul = 0.9, .add = 0.05 });
     try buildHoistLoop(&func, true, &steps);
 
     var kernel = try compileKernel(allocator, &func, nvidia_abi);
@@ -6166,7 +6166,7 @@ test "all NVIDIA compute funnels expand every low float conversion without mutat
             var diags = try ir.verify.verify(allocator, &expanded, .low);
             defer diags.deinit();
             try testing.expect(diags.ok());
-            for (0..expanded.blockCount()) |block_index| for (expanded.blockInsts(@enumFromInt(block_index))) |inst| switch (expanded.opcode(inst)) {
+            for (0..expanded.blockCount()) |block_index| for (expanded.blockInsts(@fromBackingInt(@intCast(block_index)))) |inst| switch (expanded.opcode(inst)) {
                 .decode_low_float, .encode_low_float => return error.TestUnexpectedResult,
                 else => {},
             };
@@ -7181,8 +7181,8 @@ test "a shared pointer parameter is 32 bits: ONE LDC, and its accesses are LDS a
 
     // The outptr LDC.64 fills a PAIR and the tile LDC fills ONE register, so a b64 width
     // field on the first and a b32 on the second is what keeps the two apart.
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b64)), (kernel.code[2] >> (73 - 64)) & 0x7);
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b32)), (kernel.code[6] >> (73 - 64)) & 0x7);
+    try testing.expectEqual(@as(u32, @backingInt(encode.MemType.b64)), (kernel.code[2] >> (73 - 64)) & 0x7);
+    try testing.expectEqual(@as(u32, @backingInt(encode.MemType.b32)), (kernel.code[6] >> (73 - 64)) & 0x7);
 
     // The tile parameter occupies exactly ONE register: the next parameter takes the very
     // next register. A pair would have pushed `n` one further along.
@@ -7385,8 +7385,8 @@ test "a byte access uses the 8-bit memory type, not a 32-bit one" {
 
     const ld = findOp(kernel.code, 0x981).?; // LDG
     const st = findOp(kernel.code, 0x986).?; // STG
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.i8)), memTypeAt(kernel.code, ld));
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.i8)), memTypeAt(kernel.code, st));
+    try testing.expectEqual(@as(u32, @backingInt(encode.MemType.i8)), memTypeAt(kernel.code, ld));
+    try testing.expectEqual(@as(u32, @backingInt(encode.MemType.i8)), memTypeAt(kernel.code, st));
     // The address is still the 64-bit pointer pair, and the data register is still at bit 32.
     try testing.expectEqual(regAt(kernel.code, ld, 24), regAt(kernel.code, st, 24));
     try testing.expectEqual(regAt(kernel.code, ld, 16), regAt(kernel.code, st, 32));
@@ -7439,7 +7439,7 @@ test "ordinary global multi-byte accesses use exact-footprint unsigned byte oper
         for (0..kernel.code.len / 4) |i| switch (opAt(kernel.code, i)) {
             0x981 => {
                 try testing.expect(load_lane < case.bytes);
-                try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, i));
+                try testing.expectEqual(@as(u32, @backingInt(encode.MemType.u8)), memTypeAt(kernel.code, i));
                 try testing.expectEqual(@as(i32, @intCast(displacement + load_lane)), addressOffsetAt(kernel.code, i));
                 const dst = regAt(kernel.code, i, 16);
                 if (load_lane % 4 == 0) {
@@ -7463,7 +7463,7 @@ test "ordinary global multi-byte accesses use exact-footprint unsigned byte oper
             },
             0x986 => {
                 try testing.expect(store_lane < case.bytes);
-                try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, i));
+                try testing.expectEqual(@as(u32, @backingInt(encode.MemType.u8)), memTypeAt(kernel.code, i));
                 try testing.expectEqual(@as(i32, @intCast(displacement + store_lane)), addressOffsetAt(kernel.code, i));
                 const src = regAt(kernel.code, i, 32);
                 if (store_lane == 0) first_store_src = src;
@@ -7590,12 +7590,12 @@ test "fragment bytewise global memory uses high scratch after color and depth ou
             switch (op) {
                 0x981 => {
                     byte_loads += 1;
-                    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, i));
+                    try testing.expectEqual(@as(u32, @backingInt(encode.MemType.u8)), memTypeAt(kernel.code, i));
                     try testing.expect(dst == graphics_pad_reg or dst == graphics_memory_scratch_reg);
                 },
                 0x986 => {
                     byte_stores += 1;
-                    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, i));
+                    try testing.expectEqual(@as(u32, @backingInt(encode.MemType.u8)), memTypeAt(kernel.code, i));
                 },
                 0x212 => {
                     packs += 1;
@@ -7707,8 +7707,8 @@ test "a shared byte access uses the 8-bit memory type on LDS and STS too" {
 
     const ld = findOp(kernel.code, 0x984).?; // LDS
     const st = findOp(kernel.code, 0x988).?; // STS
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, ld));
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, st));
+    try testing.expectEqual(@as(u32, @backingInt(encode.MemType.u8)), memTypeAt(kernel.code, ld));
+    try testing.expectEqual(@as(u32, @backingInt(encode.MemType.u8)), memTypeAt(kernel.code, st));
     // A shared access still reads ONE address register, and the STS data is at bit 32.
     try testing.expectEqual(regAt(kernel.code, ld, 24), regAt(kernel.code, st, 24));
     try testing.expectEqual(regAt(kernel.code, ld, 16), regAt(kernel.code, st, 32));
@@ -8196,11 +8196,11 @@ test "a global atomic whose result is READ lowers to ATOMG with the right operat
 
     const at = try onlyOpAt(kernel.code, encode.ATOMG_OPCODE);
     // The operation selector is the 4-bit field at bit 87, and `min` is 1.
-    try testing.expectEqual(@intFromEnum(encode.AtomOp.min), nibbleAt(kernel.code, at, 87));
+    try testing.expectEqual(@backingInt(encode.AtomOp.min), nibbleAt(kernel.code, at, 87));
     // The atomic TYPE is the 4-bit field at bit 73, and a signed 32-bit operand is `i32`.
     // Signedness comes from the operand type alone, and it is what makes `min` a signed
     // comparison.
-    try testing.expectEqual(@intFromEnum(encode.AtomType.i32), nibbleAt(kernel.code, at, 73));
+    try testing.expectEqual(@backingInt(encode.AtomType.i32), nibbleAt(kernel.code, at, 73));
     // No RED was emitted: the reading form is the ATOMG one.
     try testing.expectError(error.NotFound, onlyOpAt(kernel.code, encode.RED_OPCODE));
 }
@@ -8226,9 +8226,9 @@ test "a global atomic whose result is UNREAD lowers to RED, which claims no scor
 
     const at = try onlyOpAt(kernel.code, encode.RED_OPCODE);
     // RED's operation selector is only 3 bits wide, and `add` is 0.
-    try testing.expectEqual(@as(u32, @intFromEnum(encode.AtomOp.add)), (kernel.code[at * 4 + 2] >> (87 - 64)) & 0x7);
+    try testing.expectEqual(@as(u32, @backingInt(encode.AtomOp.add)), (kernel.code[at * 4 + 2] >> (87 - 64)) & 0x7);
     // An unsigned operand selects the unsigned atomic type.
-    try testing.expectEqual(@intFromEnum(encode.AtomType.u32), nibbleAt(kernel.code, at, 73));
+    try testing.expectEqual(@backingInt(encode.AtomType.u32), nibbleAt(kernel.code, at, 73));
     // The destination field reads RZ, so no consumer can wait on it and the scheduler
     // records no write.
     try testing.expectEqual(encode.RZ, regAt(kernel.code, at, 16));
@@ -8255,7 +8255,7 @@ test "an unread global EXCHANGE lowers to ATOMG with an RZ destination, not RED"
     defer kernel.deinit(allocator);
 
     const at = try onlyOpAt(kernel.code, encode.ATOMG_OPCODE);
-    try testing.expectEqual(@intFromEnum(encode.AtomOp.exch), nibbleAt(kernel.code, at, 87));
+    try testing.expectEqual(@backingInt(encode.AtomOp.exch), nibbleAt(kernel.code, at, 87));
     try testing.expectEqual(encode.RZ, regAt(kernel.code, at, 16));
     try testing.expectError(error.NotFound, onlyOpAt(kernel.code, encode.RED_OPCODE));
 }
@@ -8279,8 +8279,8 @@ test "a SHARED-pointer atomic lowers to ATOMS, from the pointer type alone" {
     defer kernel.deinit(allocator);
 
     const at = try onlyOpAt(kernel.code, encode.ATOMS_OPCODE);
-    try testing.expectEqual(@intFromEnum(encode.AtomOp.bit_xor), nibbleAt(kernel.code, at, 87));
-    try testing.expectEqual(@intFromEnum(encode.AtomType.i32), nibbleAt(kernel.code, at, 73));
+    try testing.expectEqual(@backingInt(encode.AtomOp.bit_xor), nibbleAt(kernel.code, at, 87));
+    try testing.expectEqual(@backingInt(encode.AtomType.i32), nibbleAt(kernel.code, at, 73));
     try testing.expectError(error.NotFound, onlyOpAt(kernel.code, encode.ATOMG_OPCODE));
     try testing.expectError(error.NotFound, onlyOpAt(kernel.code, encode.RED_OPCODE));
 }
@@ -8336,7 +8336,7 @@ test "a compare-exchange lowers to the CAS opcode of its address space" {
         defer kernel.deinit(allocator);
 
         const at = try onlyOpAt(kernel.code, s.want);
-        try testing.expectEqual(@intFromEnum(encode.AtomType.i32), nibbleAt(kernel.code, at, 73));
+        try testing.expectEqual(@backingInt(encode.AtomType.i32), nibbleAt(kernel.code, at, 73));
         // The compare operand goes in the bit-32 register field and the swap data in the
         // bit-64 one. Swapping the two silently inverts what the instruction does.
         try testing.expectEqual(gprOfTest(&func, expected), regAt(kernel.code, at, 32));
@@ -8422,7 +8422,7 @@ test "address folding accepts only complete B16 B32 and B64 byte ranges" {
                 const value = try func.appendBlockParam(b, value_t);
                 const index = func.instCount();
                 try func.appendStore(b, value, address);
-                break :access @enumFromInt(index);
+                break :access @fromBackingInt(@intCast(index));
             } else func.definingInst(try func.appendInst(b, value_t, .{ .load = .{ .ptr = address } })).?;
             func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
@@ -8831,7 +8831,7 @@ test "a CYCLE of edge moves still delivers every value" {
         .{ .dst = 8, .src = 5 },
         .{ .dst = 9, .src = 8 },
     };
-    var initial = [_]u32{0} ** 256;
+    var initial: [256]u32 = @splat(0);
     for (4..10) |r| initial[r] = @intCast(0x100 + r);
 
     const regs = try simulateParallelCopy(allocator, &moves, initial);
@@ -8847,7 +8847,7 @@ test "a SWAP of two edge moves still delivers both values" {
         .{ .dst = 4, .src = 5 },
         .{ .dst = 5, .src = 4 },
     };
-    var initial = [_]u32{0} ** 256;
+    var initial: [256]u32 = @splat(0);
     initial[4] = 0xaaaa;
     initial[5] = 0xbbbb;
 
@@ -8892,7 +8892,7 @@ const MOV_REG: u32 = 0x202;
 fn edgeCopyCount(func: *const Function, locs: std.AutoHashMapUnmanaged(Value, Loc)) usize {
     var n: usize = 0;
     for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
+        const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             if (func.opcode(inst) != .@"if") continue;
             const cf = func.opcode(inst).@"if";
@@ -9387,7 +9387,7 @@ test "a fragment shader never writes onto a delivered attribute register, a vert
         var k = try compileShader(allocator, &func, stage, nvidia_abi);
         defer k.deinit(allocator);
         // Every register an asynchronous attribute delivery writes: ALD in vertex, IPA in fragment.
-        var delivered = [_]bool{false} ** 256;
+        var delivered: [256]bool = @splat(false);
         var i: usize = 0;
         while (i < k.code.len) : (i += 4) {
             const op = k.code[i] & 0xfff;

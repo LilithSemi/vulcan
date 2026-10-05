@@ -45,7 +45,7 @@ fn addInt(func: *Function, target: ir.function.AttrTarget, key: []const u8, n: i
 
 /// Tag `value` as sourced from hardware rather than from the parameter block.
 pub fn setBuiltin(func: *Function, value: Value, b: Builtin) Error!void {
-    try addInt(func, .{ .value = value }, key_builtin, @intFromEnum(b));
+    try addInt(func, .{ .value = value }, key_builtin, @backingInt(b));
 }
 
 /// The builtin `value` carries, or null when it is an ordinary parameter.
