@@ -717,6 +717,21 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(nvidia_addressing).step);
 
+    // The Glacier GPU target. A Glacier core's instruction words ARE RISC-V words, so the only
+    // thing this proves about encoding is that the shared riscv64 encoders emit them: the kernel
+    // below is diffed against the word stream Glacier's own assembler produces for a program that
+    // runs on an ECP5 FPGA today. Codegen from IR is checked against the same oracle as it lands.
+    const glacier_mandelbrot = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/glacier/tests/mandelbrot.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(glacier_mandelbrot).step);
+
     // Scalar-expanded matmul over deliberately odd global pointers. The expansion is test-owned:
     // NVIDIA production codegen receives the ordinary scalar IR, then real hardware proves its
     // bytewise memory lowering preserves the exact footprint and fp32 bits.
