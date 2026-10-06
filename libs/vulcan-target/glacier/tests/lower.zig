@@ -590,3 +590,37 @@ test "a kernel that does not spill never touches the stack pointer" {
     const load_sp = glacier.encode.rv.csrrs(.x2, glacier.encode.Csr.mscratch, .x0);
     for (words) |w| try std.testing.expect(w != load_sp);
 }
+
+test "a workgroup barrier emits nothing, because a workgroup is one warp" {
+    // The lanes of a warp are elements of one instruction stream, so they cannot be at different
+    // points in the program. Glacier's own barrier synchronizes WARPS, which is wider than this
+    // opcode asks for, and emitting it would park a warp until every other warp arrived.
+    const allocator = std.testing.allocator;
+
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    var barriered = Function.init(allocator);
+    defer barriered.deinit();
+
+    for ([_]*Function{ &plain, &barriered }, 0..) |f, i| {
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const v = try f.appendInst(entry, u32_t, .{ .iconst = 5 });
+        if (i == 1) try f.appendBarrier(entry, .workgroup);
+        try f.appendStore(entry, v, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    }
+
+    const without = try compile(allocator, &plain);
+    defer allocator.free(without);
+    const with = try compile(allocator, &barriered);
+    defer allocator.free(with);
+    try std.testing.expectEqualSlices(u32, without, with);
+
+    // And the cross-warp barrier is recorded even though nothing emits it, so the encoding and
+    // the caution about its reserved FENCE field live where a reader will look.
+    try std.testing.expectEqual(@as(u32, 0x1000000F), glacier.encode.warp_barrier);
+    for (with) |w| try std.testing.expect(w != glacier.encode.warp_barrier);
+}

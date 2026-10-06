@@ -194,6 +194,9 @@ fn checkSupported(func: *const Function, opts: Options) Error!void {
             .store => |st| if (!isWord(func, func.valueType(st.value))) return error.Unsupported,
             .global_addr => |g| _ = addressOf(opts, func.symbolName(g.symbol)) orelse return error.Unsupported,
             .unary => |u| if (u.op != .reinterpret) return error.Unsupported,
+            .barrier => |b| switch (b.scope) {
+                .workgroup, .subgroup => {},
+            },
             // A conditional transfers control, so nothing may follow it in its block, and its
             // block must have no terminator: a terminator there is an edge the allocator would
             // resolve and this emits nothing for.
@@ -474,6 +477,17 @@ const Emitter = struct {
             .select => |s| try self.emitSelect(s, dst, pos),
             .load => |l| try self.put(rv.lw(dst, try self.reg(l.ptr, pos), 0)),
             .store => |st| try self.put(rv.sw(try self.reg(st.value, pos), try self.reg(st.ptr, pos), 0)),
+            // A barrier over a workgroup or a subgroup emits NOTHING, and that is the answer
+            // rather than a shortcut. A workgroup here is one warp, and the lanes of a warp are
+            // elements of one instruction stream, so they cannot reach different points in the
+            // program and have nothing to wait for. The memory half needs nothing either: one
+            // stream, one bus, and in-order completion already order the accesses.
+            //
+            // Glacier's own `warp_barrier` is deliberately NOT emitted here. It synchronizes
+            // WARPS, which is wider than this opcode asks for, and over-synchronizing is not
+            // conservative: a warp parks until every other live warp arrives, so a warp that took
+            // a different amount of work would hang here. The IR has no grid scope to spell that.
+            .barrier => {},
             else => return error.Unsupported,
         }
         if (home) |h| switch (h) {
