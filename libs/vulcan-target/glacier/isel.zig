@@ -42,11 +42,20 @@ pub const Error = std.mem.Allocator.Error || error{Unsupported};
 /// allocatable, so no value ever lives here across an instruction boundary.
 const scratch: Reg = .x31;
 
-/// x1 to x30. A Glacier kernel has neither a call nor a stack, so the usual return-address and
-/// stack-pointer reservations buy nothing and both registers carry data instead.
-const allocatable: [30]u16 = blk: {
-    var regs: [30]u16 = undefined;
-    for (&regs, 1..) |*r, i| r.* = i;
+/// The stack pointer. Reserved by the Glacier ABI whether or not a kernel spills, and loaded from
+/// `mscratch`, which reads one past the top of the reading hart's own scratch region.
+const sp: Reg = .x2;
+
+/// x1 and x3 to x30. A Glacier kernel has no call, so the return-address register carries data
+/// like any other. `x2` is the ABI stack pointer and `x31` is the lowering's scratch.
+const allocatable: [29]u16 = blk: {
+    var regs: [29]u16 = undefined;
+    var n: usize = 0;
+    for (1..31) |i| {
+        if (i == @backingInt(sp)) continue;
+        regs[n] = i;
+        n += 1;
+    }
     break :blk regs;
 };
 
@@ -100,15 +109,19 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     var walloc = try wimmer.allocate(allocator, &work, &desc);
     defer walloc.deinit(allocator);
 
-    // A spill needs a stack and a warp has no stack. Refuse here rather than emit a store to an
-    // address the hardware never promised.
-    for (walloc.slot_count_per_class) |n| if (n != 0) return error.Unsupported;
+    // A spill goes into the hart's own scratch region, so the kernel must fit there. The region
+    // belongs to one hart, which is why no other hart's slots are counted against it.
+    const slots = walloc.slot_count_per_class[0];
+    if (slots > opts.profile.scratchBytes() / 4) return error.Unsupported;
+    // The deepest slot is reached by one signed 12-bit displacement from `sp`.
+    if (slots * 4 > 2048) return error.Unsupported;
 
     var e: Emitter = .{
         .allocator = allocator,
         .func = &work,
         .opts = opts,
         .alloc = &walloc,
+        .spills = slots != 0,
     };
     defer e.deinit();
     try e.run();
@@ -138,10 +151,9 @@ fn copySource(_: *const anyopaque, func: *const Function, v: Value) ?Value {
 
 /// Whether `ty` is a value a Glacier register holds. One 32-bit word, nothing narrower.
 ///
-/// A narrow store is refused because the hardware has none: a byte store writes a whole word and
-/// destroys its neighbours (see `encode.zig`). A narrow LOAD does exist, so what blocks a sub-word
-/// value here is this lowering and not the core: every operation on one would have to truncate to
-/// its width, and silently skipping that truncation is a wrong answer rather than a refusal.
+/// The core has sub-word loads AND sub-word stores (see `encode.zig`), so what blocks a narrower
+/// value here is this lowering and not the hardware: every operation on one would have to truncate
+/// to its width, and silently skipping that truncation is a wrong answer rather than a refusal.
 fn isWord(func: *const Function, ty: Type) bool {
     return switch (func.types.type_kind(ty)) {
         .bool, .ptr => true,
@@ -256,6 +268,8 @@ const Emitter = struct {
     func: *const Function,
     opts: Options,
     alloc: *const wimmer.Allocation,
+    /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
+    spills: bool,
     words: std.ArrayList(u32) = .empty,
     block_start: std.ArrayList(u32) = .empty,
     fixups: std.ArrayList(Fixup) = .empty,
@@ -274,24 +288,28 @@ const Emitter = struct {
         try self.words.appendSlice(self.allocator, ws);
     }
 
-    /// The register holding `v` at position `pos`, or null when the allocator placed nothing
-    /// there because nothing reads it.
-    fn regAt(self: *Emitter, v: Value, pos: u32) Error!?Reg {
+    /// Where `v` lives at position `pos`, or null when the allocator placed it nowhere because
+    /// nothing reads it.
+    fn locAt(self: *const Emitter, v: Value, pos: u32) ?wimmer.Location {
         const segs = self.alloc.segments.get(v) orelse return null;
         var found: ?wimmer.Location = null;
         for (segs) |s| {
             if (s.from > pos) break;
             found = s.loc;
         }
-        const loc = found orelse return null;
-        return switch (loc) {
-            .reg => |r| @as(Reg, @fromBackingInt(@as(u5, @intCast(r)))),
-            .slot => error.Unsupported,
-        };
+        return found;
     }
 
-    fn reg(self: *Emitter, v: Value, pos: u32) Error!Reg {
-        return (try self.regAt(v, pos)) orelse error.Unsupported;
+    /// The register holding operand `v` at `pos`.
+    ///
+    /// Every operand here is `must_have_register`, so the allocator reloads a spilled one into a
+    /// register before the instruction that reads it. A slot here would mean that contract broke,
+    /// so refuse rather than invent a reload the liveness never accounted for.
+    fn reg(self: *const Emitter, v: Value, pos: u32) Error!Reg {
+        return switch (self.locAt(v, pos) orelse return error.Unsupported) {
+            .reg => |r| regOf(r),
+            .slot => error.Unsupported,
+        };
     }
 
     /// Materialize `value` into `dst`, using one or two words.
@@ -339,13 +357,26 @@ const Emitter = struct {
 
     /// The entry prologue: every entry parameter is a hardware builtin, so each one is a CSR read
     /// or a core constant written into the register the allocator gave it.
+    ///
+    /// A kernel that spills loads `sp` here. A kernel that does not leaves it alone: nothing else
+    /// reads it, because this target has no calls, and a core built with no scratch region reads
+    /// zero from `mscratch` anyway.
     fn prologue(self: *Emitter, block: Block) Error!void {
+        if (self.spills) try self.put(glacier.csrr(sp, glacier.Csr.mscratch));
         for (self.func.blockParams(block)) |p| {
-            const dst = (try self.regAt(p, 0)) orelse continue;
+            const home = self.locAt(p, 0) orelse continue;
+            const dst: Reg = switch (home) {
+                .reg => |r| regOf(r),
+                .slot => scratch,
+            };
             const b = gpu.attrs.builtinOf(self.func, p) orelse return error.Unsupported;
             switch (builtinSource(b) orelse return error.Unsupported) {
                 .csr => |c| try self.put(glacier.csrr(dst, c)),
                 .lanes => try self.constant(dst, self.opts.profile.lanes()),
+            }
+            switch (home) {
+                .slot => |n| try self.put(rv.sw(dst, sp, try self.slotOffset(n))),
+                .reg => {},
             }
         }
     }
@@ -375,53 +406,80 @@ const Emitter = struct {
         }
     }
 
+    /// Realize one parallel-move set: register moves, spills, reloads, and the slot-to-slot step
+    /// the Wimmer resolver already routes through the class scratch.
     fn emitMoves(self: *Emitter, moves: []const wimmer.Move) Error!void {
-        for (moves) |m| {
-            const src = switch (m.src) {
-                .reg => |r| @as(Reg, @fromBackingInt(@as(u5, @intCast(r)))),
-                .slot => return error.Unsupported,
-            };
-            const dst = switch (m.dst) {
-                .reg => |r| @as(Reg, @fromBackingInt(@as(u5, @intCast(r)))),
-                .slot => return error.Unsupported,
-            };
-            try self.move(dst, src);
-        }
+        for (moves) |m| switch (m.src) {
+            .reg => |s| switch (m.dst) {
+                .reg => |d| try self.move(regOf(d), regOf(s)),
+                .slot => |d| try self.put(rv.sw(regOf(s), sp, try self.slotOffset(d))),
+            },
+            .slot => |s| switch (m.dst) {
+                .reg => |d| try self.put(rv.lw(regOf(d), sp, try self.slotOffset(s))),
+                .slot => |d| {
+                    try self.put(rv.lw(scratch, sp, try self.slotOffset(s)));
+                    try self.put(rv.sw(scratch, sp, try self.slotOffset(d)));
+                },
+            },
+        };
     }
 
-    /// The allocator's own moves at `pos`. A split with no stack can only be a register-to-
-    /// register move, so a store or a reload here means something spilled after all.
+    /// The displacement of spill slot `n` from `sp`. The stack grows DOWN from `mscratch`, which
+    /// reads one past the top of the hart's region, so every slot sits below the pointer.
+    ///
+    /// Refusing when `spills` is clear is not redundant. `spills` decides whether the prologue
+    /// loads `sp` at all, so a slot reference without it would address off an uninitialized
+    /// register, and that is a silent wrong answer rather than a refusal.
+    fn slotOffset(self: *const Emitter, n: u32) Error!i12 {
+        if (!self.spills) return error.Unsupported;
+        const off: i64 = -(@as(i64, n) + 1) * 4;
+        if (off < std.math.minInt(i12)) return error.Unsupported;
+        return @intCast(off);
+    }
+
+    /// The allocator's own spills, reloads and moves at `pos`.
     fn actionsAt(self: *Emitter, pos: u32) Error!void {
         for (self.alloc.actions) |a| {
             if (a.at != pos) continue;
-            if (a.kind != .move) return error.Unsupported;
             try self.emitMoves(&[_]wimmer.Move{.{ .src = a.src, .dst = a.dst, .class = a.class, .value = a.value }});
         }
     }
 
     fn emitInst(self: *Emitter, inst: Inst, pos: u32) Error!void {
-        const result = self.func.instResult(inst);
-        // A pure instruction nothing reads has no register to write to, so it is dropped.
-        const dst: ?Reg = if (result) |r| try self.regAt(r, pos) else null;
+        // A pure instruction nothing reads has no home, so it is dropped. An instruction with no
+        // result at all (a store) has no home either, and must NOT be dropped.
+        const home: ?wimmer.Location = if (self.func.instResult(inst)) |r|
+            (self.locAt(r, pos) orelse return)
+        else
+            null;
+        // A result that lives in a spill slot is computed in the scratch register and stored
+        // afterwards, so the opcode below never has to know where its result goes.
+        const dst: Reg = switch (home orelse wimmer.Location{ .reg = @backingInt(scratch) }) {
+            .reg => |r| regOf(r),
+            .slot => scratch,
+        };
         switch (self.func.opcode(inst)) {
-            .iconst => |c| try self.constant(dst orelse return, lowWord(c)),
+            .iconst => |c| try self.constant(dst, lowWord(c)),
             .global_addr => |g| try self.constant(
-                dst orelse return,
+                dst,
                 @bitCast(addressOf(self.opts, self.func.symbolName(g.symbol)) orelse return error.Unsupported),
             ),
-            .unary => |u| try self.move(dst orelse return, try self.reg(u.value, pos)),
+            .unary => |u| try self.move(dst, try self.reg(u.value, pos)),
             .arith => |a| {
-                const d = dst orelse return;
                 const f = binOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
-                try self.put(f(d, try self.reg(a.lhs, pos), try self.reg(a.rhs, pos)));
+                try self.put(f(dst, try self.reg(a.lhs, pos), try self.reg(a.rhs, pos)));
             },
-            .arith_imm => |a| try self.emitArithImm(a, dst orelse return, pos),
-            .icmp => |c| try self.emitCompare(c, dst orelse return, pos),
-            .select => |s| try self.emitSelect(s, dst orelse return, pos),
-            .load => |l| try self.put(rv.lw(dst orelse return, try self.reg(l.ptr, pos), 0)),
+            .arith_imm => |a| try self.emitArithImm(a, dst, pos),
+            .icmp => |c| try self.emitCompare(c, dst, pos),
+            .select => |s| try self.emitSelect(s, dst, pos),
+            .load => |l| try self.put(rv.lw(dst, try self.reg(l.ptr, pos), 0)),
             .store => |st| try self.put(rv.sw(try self.reg(st.value, pos), try self.reg(st.ptr, pos), 0)),
             else => return error.Unsupported,
         }
+        if (home) |h| switch (h) {
+            .slot => |n| try self.put(rv.sw(dst, sp, try self.slotOffset(n))),
+            .reg => {},
+        };
     }
 
     fn emitArithImm(self: *Emitter, a: ir.function.ArithImm, dst: Reg, pos: u32) Error!void {
@@ -482,17 +540,23 @@ const Emitter = struct {
         }
     }
 
-    /// A value-producing conditional. Glacier has no conditional move, so this is a move, a
-    /// branch over one word, and a move. The taken value goes through the scratch register first
-    /// so that a destination aliasing either source still reads the right bits.
+    /// A value-producing conditional. Glacier has no conditional move, so each arm moves its own
+    /// value and the branch picks the arm.
+    ///
+    /// The branch comes FIRST so no temporary is needed. Every source is read either by the branch
+    /// or by the one move that runs, and `dst` is written once after that read, so a destination
+    /// that aliases the condition or either source is still correct. A temporary here would have
+    /// to be the scratch register, and that is where a spilled result is computed.
     fn emitSelect(self: *Emitter, s: ir.function.Select, dst: Reg, pos: u32) Error!void {
         const cond = try self.reg(s.cond, pos);
         const then = try self.reg(s.then, pos);
         const other = try self.reg(s.@"else", pos);
-        try self.move(scratch, then);
-        try self.move(dst, other);
-        try self.put(rv.beq(cond, .x0, 8));
-        try self.move(dst, scratch);
+        // Always four words, even when a move is onto its own register, so the branch offsets do
+        // not depend on which registers these turn out to be.
+        try self.put(rv.beq(cond, .x0, 12)); // false takes the else arm
+        try self.put(rv.addi(dst, then, 0));
+        try self.put(rv.jal(.x0, 8)); // over the else arm
+        try self.put(rv.addi(dst, other, 0));
     }
 
     fn emitIf(self: *Emitter, inst: Inst, pos: u32, bi: usize) Error!void {
@@ -542,6 +606,12 @@ const Emitter = struct {
         }
     }
 };
+
+/// The register a Wimmer class-relative index names. The numbering is the register's own, so
+/// index n is x_n.
+fn regOf(index: u16) Reg {
+    return @fromBackingInt(@as(u5, @intCast(index)));
+}
 
 /// Whether `block` leaves by a conditional rather than by its terminator. A conditional transfers
 /// control itself, so the terminator after one is never reached and never emitted.

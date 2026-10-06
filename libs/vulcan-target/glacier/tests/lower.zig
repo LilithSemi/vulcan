@@ -400,9 +400,23 @@ test "both word streams render what the plain algorithm renders" {
 /// halves of a wide constant rather than a single immediate.
 const data_base: u32 = 0x1000;
 
+/// Run one warp over `data`, with the words after `scratch_at` standing in for the hart scratch
+/// region the SoC build reserves. A hart reads one past the top of its own slice from `mscratch`.
 fn runOnce(code: []const u32, data: []u32, hart_id: u32, hart_count: u32) !void {
-    var mem: warp.Memory = .{ .base = data_base, .words = data };
-    var one: warp.Warp = .{ .hart_id = hart_id, .hart_count = hart_count };
+    const stride = glacier.encode.Profile.@"gc1.n".scratchBytes();
+    const scratch_words = (stride / 4) * hart_count;
+    const scratch_at = if (data.len > scratch_words) data.len - scratch_words else data.len;
+    const scratch_base = data_base + @as(u32, @intCast(scratch_at)) * 4;
+    var mem: warp.Memory = .{
+        .base = data_base,
+        .words = data,
+        .scratch = .{ .base = scratch_base, .stride = stride, .harts = hart_count },
+    };
+    var one: warp.Warp = .{
+        .hart_id = hart_id,
+        .hart_count = hart_count,
+        .stack_top = scratch_base + (hart_id + 1) * stride,
+    };
     _ = try warp.run(code, &mem, &one, budget);
 }
 
@@ -501,4 +515,78 @@ test "a conditional reaches both arms whichever one is laid out next" {
     try std.testing.expectEqual(@as(u32, 22), data[0]);
     try runOnce(words, &data, 1, 2);
     try std.testing.expectEqual(@as(u32, 11), data[0]);
+}
+
+/// A kernel that loads `count` words, holds them all live at once, and stores their sum. Every
+/// load happens before the first add, so `count` values are live together and anything above the
+/// register file has to go to the scratch region.
+fn buildSumKernel(allocator: std.mem.Allocator, count: usize) !Function {
+    var f = Function.init(allocator);
+    errdefer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+
+    const loaded = try allocator.alloc(Value, count);
+    defer allocator.free(loaded);
+    for (loaded, 0..) |*v, i| {
+        const at = try f.appendArithImm(entry, ptr_t, .add, base, @intCast(i * 4));
+        v.* = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at } });
+    }
+    var total = loaded[0];
+    for (loaded[1..]) |v| total = try add(&f, entry, u32_t, total, v);
+    const out = try f.appendArithImm(entry, ptr_t, .add, base, @intCast(count * 4));
+    try f.appendStore(entry, total, out);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    return f;
+}
+
+test "a kernel with more live values than registers spills into the hart's scratch" {
+    const allocator = std.testing.allocator;
+    const count = 40; // above the 29 allocatable registers
+
+    var f = try buildSumKernel(allocator, count);
+    defer f.deinit();
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    // The spill path has to have actually run, or this test passes for the wrong reason. A kernel
+    // that spills reads `sp` from mscratch in its prologue, and nothing else here reads a CSR.
+    try std.testing.expectEqual(
+        glacier.encode.rv.csrrs(.x2, glacier.encode.Csr.mscratch, .x0),
+        words[0],
+    );
+
+    // The words past the inputs and the output stand in for the hart's scratch region, so a spill
+    // that walked out of its slice would be caught rather than silently land in the inputs.
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [count + 1 + scratch_words]u32 = @splat(0);
+    var want: u32 = 0;
+    for (0..count) |i| {
+        data[i] = @intCast(i * 7 + 1);
+        want +%= data[i];
+    }
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(want, data[count]);
+}
+
+test "a kernel that needs more scratch than the core has is refused" {
+    // gc1.n holds 256 bytes per hart, so 64 slots. Far more live values than that cannot spill
+    // anywhere, and walking below the region would corrupt the hart underneath.
+    const allocator = std.testing.allocator;
+    var f = try buildSumKernel(allocator, 400);
+    defer f.deinit();
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a kernel that does not spill never touches the stack pointer" {
+    // The ABI reserves x2, and a kernel that has nothing to spill leaves it alone rather than
+    // paying a word for a pointer it will not use.
+    const allocator = std.testing.allocator;
+    const words = try lower(allocator, hand.View.fit(width, height));
+    defer allocator.free(words);
+    const load_sp = glacier.encode.rv.csrrs(.x2, glacier.encode.Csr.mscratch, .x0);
+    for (words) |w| try std.testing.expect(w != load_sp);
 }

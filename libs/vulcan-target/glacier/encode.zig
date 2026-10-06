@@ -45,6 +45,12 @@ pub const Csr = struct {
     /// strides its work by this and offsets it by `mhartid`, so one entry point fills whatever
     /// core it is launched on without being told the shape by its host.
     pub const hart_count: u12 = 0xFC0;
+
+    /// Standard machine scratch CSR, read only here: the INITIAL STACK POINTER of the hart doing
+    /// the read, one past the top of its own scratch region. It is the top and not the base so a
+    /// downward stack never needs the region size, which lets the size change with the core
+    /// generation without a kernel changing. Reads zero on a core built with no scratch.
+    pub const mscratch: u12 = 0x340;
 };
 
 /// Read a CSR into `rd`. CSRRS with x0 as the set mask, so it reads without writing.
@@ -78,6 +84,21 @@ pub const Profile = enum {
             .@"gc1.n" => 4,
             .@"gc1.mi", .@"gc1.s", .@"gc1.f" => 8,
             .@"gc1.ma" => 16,
+        };
+    }
+
+    /// Bytes of private scratch one hart owns, which is the whole stack a kernel gets.
+    ///
+    /// A kernel never reads this number: `mscratch` gives it one past the top of its own region
+    /// and the stack grows down from there, so the size can change without a kernel changing. A
+    /// COMPILER does read it, because it must know when a spill would walk out of the region and
+    /// into the hart below, and the generation is in the profile name so a later core cannot
+    /// quietly move it.
+    pub fn scratchBytes(self: Profile) u32 {
+        return switch (self) {
+            .@"gc1.n", .@"gc1.mi" => 256,
+            .@"gc1.s" => 512,
+            .@"gc1.f", .@"gc1.ma" => 1024,
         };
     }
 };

@@ -15,11 +15,14 @@ const std = @import("std");
 pub const Error = error{
     /// A word this model does not decode. Either the kernel is wrong or the model is behind.
     Illegal,
-    /// An access outside the framebuffer the test gave the warp.
+    /// An access outside the memory the test gave the warp.
     OutOfRange,
     Unaligned,
     /// The warp ran longer than the caller allowed, so it is in a loop that does not end.
     Budget,
+    /// A warp reached into another hart's scratch slice. On hardware this corrupts that hart and
+    /// shows up as its wrong answer somewhere else, so it is caught here instead.
+    CrossHart,
 };
 
 /// The CSRs a Glacier core answers. Anything else is an illegal word here, because a kernel that
@@ -27,13 +30,34 @@ pub const Error = error{
 const csr_mhartid: u12 = 0xF14;
 const csr_hart_count: u12 = 0xFC0;
 
+const csr_mscratch: u12 = 0x340;
+
 const ebreak: u32 = 0x00100073;
+
+/// The per-hart scratch region, as the SoC build lays it out: one slice of `stride` bytes per hart,
+/// starting at `base`. A hart reads one past the top of ITS OWN slice from `mscratch` and the stack
+/// grows down from there.
+///
+/// Modelling it is worth the lines because it makes the one failure the ABI warns about visible. A
+/// hart that walks out of its slice is corrupting the hart below, and on real hardware that shows
+/// up as another hart's wrong answer somewhere else entirely.
+pub const Scratch = struct { base: u32, stride: u32, harts: u32 };
 
 /// The memory a kernel writes, as words at `base`. A Glacier kernel reaches memory by absolute
 /// address, so the base is part of the program's contract with its host.
 pub const Memory = struct {
     base: u32,
     words: []u32,
+    /// The scratch region, when the core has one. It lies inside `words` like any other memory.
+    scratch: ?Scratch = null,
+
+    /// Whether `addr` falls in a hart's scratch slice other than `hart_id`'s own.
+    fn crossesHart(self: Memory, addr: u32, hart_id: u32) bool {
+        const s = self.scratch orelse return false;
+        if (addr < s.base or addr >= s.base + s.stride * s.harts) return false;
+        const owner = (addr - s.base) / s.stride;
+        return owner != hart_id;
+    }
 
     fn index(self: Memory, addr: u32) Error!usize {
         if (addr % 4 != 0) return error.Unaligned;
@@ -50,6 +74,9 @@ pub const Warp = struct {
     pc: u32 = 0,
     hart_id: u32,
     hart_count: u32,
+    /// What `mscratch` reads: one past the top of this hart's own scratch slice. Zero on a core
+    /// built with no scratch, same as the hardware.
+    stack_top: u32 = 0,
 
     fn set(self: *Warp, rd: u5, value: u32) void {
         if (rd != 0) self.x[rd] = value;
@@ -148,16 +175,19 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
             };
             if (taken) warp.pc = (warp.pc -% 4) +% @as(u32, @bitCast(immB(word)));
         },
-        // Loads.
+        // Loads. Only LW: the lowering emits nothing narrower, so a narrow load here would be a
+        // lowering this model has not been taught rather than one it should quietly accept.
         0x03 => {
             const addr = a +% @as(u32, @bitCast(immI(word)));
-            if (funct3 != 2) return error.Illegal; // only LW, see encode.zig on narrow access
+            if (funct3 != 2) return error.Illegal;
+            if (mem.crossesHart(addr, warp.hart_id)) return error.CrossHart;
             warp.set(rd, mem.words[try mem.index(addr)]);
         },
-        // Stores.
+        // Stores. Only SW, for the same reason as the loads.
         0x23 => {
             const addr = a +% @as(u32, @bitCast(immS(word)));
-            if (funct3 != 2) return error.Illegal; // only SW, see encode.zig on narrow stores
+            if (funct3 != 2) return error.Illegal;
+            if (mem.crossesHart(addr, warp.hart_id)) return error.CrossHart;
             mem.words[try mem.index(addr)] = b;
         },
         // Register-immediate arithmetic.
@@ -189,6 +219,7 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
             warp.set(rd, switch (@as(u12, @intCast(word >> 20))) {
                 csr_mhartid => warp.hart_id,
                 csr_hart_count => warp.hart_count,
+                csr_mscratch => warp.stack_top,
                 else => return error.Illegal,
             });
         },
