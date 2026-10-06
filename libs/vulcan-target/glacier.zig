@@ -17,3 +17,4 @@
 //! thing to a workgroup id the hardware has.
 
 pub const encode = @import("glacier/encode.zig");
+pub const isel = @import("glacier/isel.zig");

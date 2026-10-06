@@ -15,8 +15,9 @@
 //! instruction selector rather than an encoder of its own. The one thing Glacier adds is `ebreak`.
 //!
 //! WHAT THIS IS NOT is a test of code generation. The program below is hand-assembled, exactly as
-//! the Dart is. Lowering the same image from Vulcan IR and landing on these words is the next
-//! step, and this is what it will be checked against.
+//! the Dart is. `lower.zig` compiles the same image from Vulcan IR and checks it against this one.
+//! It compares the FRAME the two render, not the words: a compiler picks other registers and
+//! another instruction order, so the two word streams differ by design.
 
 const std = @import("std");
 const glacier = @import("vulcan-target").glacier.encode;
@@ -29,7 +30,7 @@ const fraction_bits: u5 = 12;
 
 /// The complex-plane rectangle a render covers, in fixed point. The kernel walks the view by
 /// adding `dx` and `dy` to a register, so the pixel grid IS these integers.
-const View = struct {
+pub const View = struct {
     x_min: i32,
     y_min: i32,
     dx: i32,
@@ -38,7 +39,7 @@ const View = struct {
     /// The whole set in a `width` x `height` frame with square pixels and the real axis exactly on
     /// the middle row. Deriving `y_min` as a whole number of `dy` steps is what makes the image
     /// mirror about its middle row, which a render can then be checked against.
-    fn fit(width: i32, height: i32) View {
+    pub fn fit(width: i32, height: i32) View {
         const span_x = toFixed(3.0);
         const centre_x = toFixed(-0.6);
         const dx = @divTrunc(span_x, width);
@@ -57,7 +58,7 @@ const View = struct {
 
 /// How far to shift the surviving iteration count to make a colour: the largest shift that keeps
 /// the brightest pixel inside one byte lane, so a shade cannot carry into the next channel.
-fn colourShift(iterations: u32) u5 {
+pub fn colourShift(iterations: u32) u5 {
     var shift: u5 = 0;
     while ((iterations << (shift + 1)) <= 0xFF) shift += 1;
     return shift;
