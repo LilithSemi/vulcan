@@ -483,10 +483,14 @@ const Emitter = struct {
             // program and have nothing to wait for. The memory half needs nothing either: one
             // stream, one bus, and in-order completion already order the accesses.
             //
-            // Glacier's own `warp_barrier` is deliberately NOT emitted here. It synchronizes
-            // WARPS, which is wider than this opcode asks for, and over-synchronizing is not
-            // conservative: a warp parks until every other live warp arrives, so a warp that took
-            // a different amount of work would hang here. The IR has no grid scope to spell that.
+            // Glacier's own `warp_barrier` is deliberately NOT emitted here. It synchronizes every
+            // warp of one core, which is wider than this opcode asks for, and a wider barrier is
+            // NOT the safe choice: a warp parks until its siblings arrive, so a warp that took a
+            // different amount of work waits for warps that had no reason to meet it. The core can
+            // time that out and raise a sticky error instead of waiting, but the watchdog budget
+            // defaults to zero, which disables it, so a build as generated today waits forever.
+            // Either way the barrier does not do what the IR asked. The IR has no scope for one
+            // core's warps, so there is nothing to spell it with.
             .barrier => {},
             else => return error.Unsupported,
         }

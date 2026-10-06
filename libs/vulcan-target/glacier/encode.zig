@@ -53,14 +53,15 @@ pub const Csr = struct {
     pub const mscratch: u12 = 0x340;
 };
 
-/// The cross-WARP barrier: FENCE with fm = 0001, which has no operands, so it is one constant.
-/// A warp parks here until every other LIVE warp reaches one, and a warp that has already retired
-/// does not hold the rest.
+/// The cross-warp barrier: FENCE with fm = 0001, which has no operands, so it is one constant.
 ///
-/// This is NOT what Vulcan's `barrier` opcode means. That one synchronizes a workgroup, a workgroup
-/// here is one warp, and the lanes of a warp are elements of a single instruction stream, so they
-/// cannot be at different points in the program and have nothing to wait for. This barrier is
-/// wider: it is a GRID barrier, which the IR has no scope for. See `isel.zig`.
+/// The scope is ONE CORE. A warp parks until every other live warp OF ITS OWN CORE arrives, and a
+/// warp that has already retired does not hold the rest. A second core's warps are not involved, so
+/// a barrier across cores has to be built from the atomics instead.
+///
+/// That scope has no name in Vulcan's IR, which offers only a workgroup and a subgroup. Both of
+/// those are one warp here, so this instruction is wider than either and `isel.zig` emits it for
+/// neither. See there for why a wider barrier is not the safe choice.
 ///
 /// fm = 0001 is a RESERVED FENCE encoding. A future RISC-V spec version could claim it and give
 /// this word another meaning.
