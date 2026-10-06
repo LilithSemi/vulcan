@@ -189,6 +189,36 @@ fn isQuad(func: *const Function, v: Value) bool {
     };
 }
 
+/// Whether `func` passes or returns an `f128`, which the Apple ABI cannot express the way this
+/// backend emits it.
+///
+/// AAPCS64 passes an `f128` by value in v0..v7 and returns it in v0, which is the Q register
+/// traffic the rest of this file emits. Zig targeting aarch64-macos passes the same signature in
+/// INTEGER REGISTER PAIRS: a function returning its second argument becomes `mov x1, x3` then
+/// `mov x0, x2`, so the arguments live in x0:x1 and x2:x3 and the result is read from x0:x1. The
+/// same source for aarch64-linux is `mov v0.16b, v1.16b`.
+///
+/// Emitting the Q register form under that ABI is a silent wrong answer: the caller reads a result
+/// out of registers the callee never wrote. A function that merely returns its argument untouched
+/// is correct under either convention, so the simplest case hides it. Refusing until the
+/// integer-pair convention is implemented is how this file already treats every quad operation it
+/// has no instruction for.
+fn usesQuadAbi(func: *const Function) bool {
+    for (func.blockParams(@fromBackingInt(0))) |p| {
+        if (isQuad(func, p)) return true;
+    }
+    for (0..func.blockCount()) |bi| {
+        const term = func.terminator(@fromBackingInt(@as(u32, @intCast(bi)))) orelse continue;
+        switch (term) {
+            .ret => |r| for (r.values[0..r.count]) |v| {
+                if (isQuad(func, v)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 /// The scalar-FP `ftype` selector for `v`'s register view. Under `fp16` (native FEAT_FP16), an
 /// f16 lives in an H register and selects `.half`. Otherwise (the emulation, where an f16 lives
 /// as its exact f32 widening in an S register) an f16 selects `.single` exactly as f32 does, so
@@ -634,6 +664,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // raw-vector path and miscompile the half lanes, so reject that composite case cleanly.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
     if (func.blockCount() == 0) return error.Unsupported;
+    if (caps.abi == .apple and usesQuadAbi(func)) return error.Unsupported;
 
     // The Wimmer resolver needs a block on every critical edge to place its shuffle moves, so split
     // them FIRST, before any numbering is built. `splitCriticalEdges` MUTATES the function (it appends
@@ -3273,6 +3304,7 @@ pub fn compileFunctionWimmer(allocator: std.mem.Allocator, func: *Function) Erro
 pub fn compileFunctionWimmerAbi(allocator: std.mem.Allocator, func: *Function, caps: ModelCaps) Error!Compiled {
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
     if (func.blockCount() == 0) return error.Unsupported;
+    if (caps.abi == .apple and usesQuadAbi(func)) return error.Unsupported;
 
     // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls in place,
     // before any numbering is built, so the call clobbers and f128 argument placement are visible to

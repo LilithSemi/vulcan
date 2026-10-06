@@ -5930,11 +5930,24 @@ test "an unreachable block that uses a reachable value compiles and the reachabl
 // the JIT-mapped function is called directly (its own oracle), like the f32/f64 runners above.
 
 /// Compile a binary128 function, JIT-map it, and call it with `qargs` (each an f128 passed by
-/// value in v0..). Returns the full 16-byte result read from v0. Skips off aarch64.
+/// value in v0..). Returns the full 16-byte result read from v0. Skips off aarch64, and on
+/// Darwin, where the backend refuses an `f128` signature because the ABI there is not the Q
+/// register one this traffic assumes.
 fn runQuad(allocator: std.mem.Allocator, func: *const Function, qargs: []const f128) !f128 {
     if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
-    const code = try isel.selectFunction(allocator, func);
-    defer allocator.free(code);
+    // Compiled for the HOST calling convention, because the call below goes through Zig's C ABI
+    // and that is the only oracle here. On a non-Darwin host the host ABI is AAPCS64 and the Q
+    // register traffic below is exactly what is emitted. Darwin REFUSES: Zig passes an `f128`
+    // there in integer register pairs, not a Q register, and the backend does not implement that
+    // convention, so it declines rather than emitting a call the caller cannot read. See the
+    // Apple-ABI note in `compileFunction`.
+    const host_abi: isel.Abi = if (builtin.os.tag.isDarwin()) .apple else .aapcs64;
+    var compiled = isel.compileFunction(allocator, func, .{ .abi = host_abi }) catch |err| switch (err) {
+        error.Unsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compiled.deinit(allocator);
+    const code = compiled.code;
     var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
     defer buf.deinit();
     const ptr = buf.memory.ptr; // page-aligned, satisfies the function-pointer alignment
@@ -5951,6 +5964,33 @@ fn runQuad(allocator: std.mem.Allocator, func: *const Function, qargs: []const f
 fn expectRunQuad(allocator: std.mem.Allocator, func: *const Function, qargs: []const f128, expected: f128) !void {
     const got = try runQuad(allocator, func, qargs);
     try std.testing.expectEqual(@as(u128, @bitCast(expected)), @as(u128, @bitCast(got)));
+}
+
+test "f128 is refused under the Apple ABI, and accepted under AAPCS64" {
+    // Zig targeting aarch64-macos passes `fn (f128, f128) f128` in INTEGER register pairs: a
+    // function returning its second argument compiles to `mov x1, x3` then `mov x0, x2`, so the
+    // arguments sit in x0:x1 and x2:x3 and the result is read from x0:x1. The same source for
+    // aarch64-linux is `mov v0.16b, v1.16b`, which is what this backend emits. Under the Apple
+    // ABI it must therefore decline, not hand back a result the caller reads out of registers the
+    // callee never wrote.
+    //
+    // The ABI is a parameter here, not the host, so this runs everywhere. A function that merely
+    // returns its argument untouched would pass under either convention, which is why the case
+    // below returns its SECOND argument.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f128 });
+    const b = try f.appendBlock();
+    _ = try f.appendBlockParam(b, t);
+    const second = try f.appendBlockParam(b, t);
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(second) });
+
+    try std.testing.expectError(error.Unsupported, isel.compileFunction(allocator, &f, .{ .abi = .apple }));
+
+    var ok = try isel.compileFunction(allocator, &f, .{ .abi = .aapcs64 });
+    defer ok.deinit(allocator);
+    try std.testing.expect(ok.code.len > 0);
 }
 
 test "native f128: identity carries all 128 bits through v0" {
