@@ -14,9 +14,17 @@
 //!   - No LR/SC. The A extension atomics are there, the load-reserved pair is not.
 //!   - No FP square root, and FP32 truncates toward zero with subnormals flushed rather than
 //!     rounding to nearest. Anything that assumes IEEE default rounding differs in the last bit.
-//!   - No narrow stores. The load/store unit drives SEL=0xF on every store, so a store is always
-//!     a full 32-bit word and there is no SH encoding at all. Sub-word writes have to be packed
-//!     in registers before the store.
+//!   - No narrow stores, and a narrow store is DESTRUCTIVE rather than merely wide. The scalar
+//!     store data path zero pads rs2 with no byte-lane placement and SEL is hardwired to 0xF, so
+//!     SB writes a whole word: the value in the low byte and zeros in the other three. Against
+//!     memory it destroys the three neighbouring bytes. SB and SH are unusable, and the only
+//!     lowering for a sub-word write is to pack it into a word and use SW. A memory-mapped
+//!     register can tolerate this (Harbor's UART decodes with a mix of address bit two and two SEL
+//!     bits, which is why a banner kernel appears to work), so check the device, never the
+//!     precedent.
+//!   - Narrow LOADS are fine. LB, LBU, LH and LHU all decode: the core reads the word, selects
+//!     the byte by the low two address bits or the halfword by bit one, then extends by the
+//!     instruction's unsigned bit. SEL does not apply to a read.
 
 const std = @import("std");
 
