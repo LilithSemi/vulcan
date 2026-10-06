@@ -14,17 +14,13 @@
 //!   - No LR/SC. The A extension atomics are there, the load-reserved pair is not.
 //!   - No FP square root, and FP32 truncates toward zero with subnormals flushed rather than
 //!     rounding to nearest. Anything that assumes IEEE default rounding differs in the last bit.
-//!   - No narrow stores, and a narrow store is DESTRUCTIVE rather than merely wide. The scalar
-//!     store data path zero pads rs2 with no byte-lane placement and SEL is hardwired to 0xF, so
-//!     SB writes a whole word: the value in the low byte and zeros in the other three. Against
-//!     memory it destroys the three neighbouring bytes. SB and SH are unusable, and the only
-//!     lowering for a sub-word write is to pack it into a word and use SW. A memory-mapped
-//!     register can tolerate this (Harbor's UART decodes with a mix of address bit two and two SEL
-//!     bits, which is why a banner kernel appears to work), so check the device, never the
-//!     precedent.
-//!   - Narrow LOADS are fine. LB, LBU, LH and LHU all decode: the core reads the word, selects
-//!     the byte by the low two address bits or the halfword by bit one, then extends by the
-//!     instruction's unsigned bit. SEL does not apply to a read.
+//!
+//! Sub-word access is NOT one of the absences. Both halves work: LB, LBU, LH and LHU extend from
+//! the addressed byte or halfword, and SB and SH drive the bus byte select for the lane they
+//! address, so a neighbouring byte in the same word is untouched. This lowering emits word access
+//! only, which is a limit of the lowering and not of the core: a sub-word value needs every
+//! operation on it truncated to its width, and skipping that is a wrong answer rather than a
+//! refusal. Packing into a word and using SW stays correct, it is just no longer forced.
 
 const std = @import("std");
 
