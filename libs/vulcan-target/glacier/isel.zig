@@ -17,9 +17,11 @@
 //!
 //! Floating point is admitted narrowly, because the core decodes five float instructions and no
 //! more (see `encode.zig` and `glacier.fdiv`). An f32 and an f16 are values here, a float constant
-//! is its bit pattern, the three converts the core has are selected, and an f32 divide becomes the
-//! one scalar divide. Everything else is refused: there is no float add, no float compare, and no
-//! per-lane divide. An f16 never reaches memory, since it is only the low half of a lane.
+//! is its bit pattern, the three converts the core has are selected, an f32 divide becomes the one
+//! scalar divide, and a per-lane `acc + f32(a) * f32(b)` over f16 factors becomes the widening MAC
+//! (see `findMacs`). Everything else is refused: there is no float add or multiply on its own, no
+//! float compare, and no per-lane divide. An f16 never reaches memory, since it is only the low
+//! half of a lane.
 //!
 //! One thing it deliberately does NOT do yet is fuse a compare into its branch. A fused branch
 //! reads the COMPARE's operands at the branch, and the allocator only knows the branch reads the
@@ -121,9 +123,17 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
 
     const divergent = try analyzeDivergence(allocator, &work);
     defer allocator.free(divergent);
-    var ctx: Ctx = .{ .divergent = divergent };
 
-    try checkSupported(&work, opts, divergent);
+    const uses = try allocator.alloc(u32, work.valueCount());
+    defer allocator.free(uses);
+    opt.dce.countUses(&work, uses);
+
+    var macs = try findMacs(allocator, &work, uses, divergent);
+    defer macs.deinit(allocator);
+
+    var ctx: Ctx = .{ .divergent = divergent, .mac = macs.mac };
+
+    try checkSupported(&work, opts, divergent, &macs);
 
     const classes = [_]wimmer.RegClass{
         .{
@@ -159,9 +169,6 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     if (slots > opts.profile.scratchBytes() / 4) return error.Unsupported;
     // The deepest slot is reached by one signed 12-bit displacement from `sp`.
     if (slots * 4 > 2048) return error.Unsupported;
-    const uses = try allocator.alloc(u32, work.valueCount());
-    defer allocator.free(uses);
-    opt.dce.countUses(&work, uses);
 
     // A spilled VECTOR would need a vector store to the scratch region and a reload from it.
     // Nothing emits those yet, so refuse rather than drop the spill and miscompile.
@@ -174,6 +181,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
         .alloc = &walloc,
         .divergent = divergent,
         .uses = uses,
+        .macs = &macs,
         .spills = slots != 0,
     };
     defer e.deinit();
@@ -193,7 +201,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
 // value came from, not of its type, and `thread_id_x` already says a thread is a lane.
 
 /// What the analysis and the emitter share. `desc.ctx` points at it.
-const Ctx = struct { divergent: []const bool };
+const Ctx = struct { divergent: []const bool, mac: []const ?Mac };
 
 /// Whether a builtin differs between the lanes of one warp. A warp index is the same in every
 /// lane; a lane or thread index is the point of the exercise.
@@ -333,8 +341,14 @@ fn useKind(_: *const anyopaque, _: *const Function, _: Inst, _: Value) wimmer.Us
 
 /// A `reinterpret` between two 32-bit values moves no bits, so the allocator may put its result
 /// and its source in one register and leave the move out. Nothing else here is a pure copy.
-fn copySource(_: *const anyopaque, func: *const Function, v: Value) ?Value {
+///
+/// A MAC is reported too, which is not a copy. It accumulates into its own destination, so the
+/// result and the accumulator want one register, and this hint is how the allocator is asked for
+/// that. A different register is still correct and costs one `vmv.v.v`.
+fn copySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
+    const c: *const Ctx = @ptrCast(@alignCast(ctx));
     const inst = func.definingInst(v) orelse return null;
+    if (c.mac[@backingInt(inst)]) |m| return m.acc;
     return switch (func.opcode(inst)) {
         .unary => |u| if (u.op == .reinterpret) u.value else null,
         .convert => |cv| if (isBitPreservingConvert(func, inst, cv)) cv.value else null,
@@ -465,6 +479,153 @@ fn isBitPreservingConvert(func: *const Function, inst: Inst, cv: ir.function.Con
     return convertKind(func, inst, cv) == .move;
 }
 
+// ===========================================================================
+// The widening multiply-accumulate.
+
+/// A `vfwmacc.vv` found in the IR: `result = acc + a * b`, where `a` and `b` are f16 and `acc` and
+/// the result are f32.
+const Mac = struct { acc: Value, a: Value, b: Value };
+
+/// Where the MACs are. `mac` is indexed by instruction and holds the operands of the `add` that
+/// becomes the instruction; `folded` marks the multiply and the two widening converts that the
+/// same instruction absorbs, so the emitter writes nothing for them.
+const Macs = struct {
+    mac: []const ?Mac,
+    folded: []const bool,
+
+    fn deinit(self: *Macs, allocator: std.mem.Allocator) void {
+        allocator.free(self.mac);
+        allocator.free(self.folded);
+    }
+
+    fn at(self: *const Macs, inst: Inst) ?Mac {
+        return self.mac[@backingInt(inst)];
+    }
+
+    fn isFolded(self: *const Macs, inst: Inst) bool {
+        return self.folded[@backingInt(inst)];
+    }
+};
+
+/// Find every `acc + f32(a) * f32(b)` over f16 inputs, which is the one vector float operation the
+/// core has.
+///
+/// The IR has no fused multiply-add and no widening multiply, so the hardware instruction only
+/// reaches a kernel through this tree. Nothing is rewritten: the multiply and the converts stay in
+/// the function and keep their registers, because a Glacier `arith` takes two operands and this
+/// instruction reads three values. The registers cost little, since each intermediate lives for
+/// one instruction and a chain of MACs reuses the same three.
+///
+/// This needs no consent attribute. The product of two f16 is exact in f32, so the fusion loses
+/// nothing; the core truncates the sum where the IR asks for nearest even, and that is the
+/// rounding every Glacier float operation has, recorded in `encode.zig`.
+fn findMacs(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    uses: []const u32,
+    divergent: []const bool,
+) Error!Macs {
+    const mac = try allocator.alloc(?Mac, func.instCount());
+    errdefer allocator.free(mac);
+    @memset(mac, null);
+    const folded = try allocator.alloc(bool, func.instCount());
+    errdefer allocator.free(folded);
+    @memset(folded, false);
+
+    // The function has no instruction to block map, and the match needs one to keep an absorbed
+    // value inside one block.
+    const block_of = try allocator.alloc(u32, func.instCount());
+    defer allocator.free(block_of);
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| block_of[@backingInt(inst)] = @intCast(bi);
+    }
+
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            const sum = matchMac(func, uses, divergent, block_of, inst) orelse continue;
+            mac[@backingInt(inst)] = sum.mac;
+            folded[@backingInt(sum.product)] = true;
+            folded[@backingInt(sum.wide_a)] = true;
+            folded[@backingInt(sum.wide_b)] = true;
+        }
+    }
+    return .{ .mac = mac, .folded = folded };
+}
+
+/// The one `add` in `block` at `inst`, read as a MAC. Null when it is not one.
+fn matchMac(
+    func: *const Function,
+    uses: []const u32,
+    divergent: []const bool,
+    block_of: []const u32,
+    inst: Inst,
+) ?struct { mac: Mac, product: Inst, wide_a: Inst, wide_b: Inst } {
+    const a = switch (func.opcode(inst)) {
+        .arith => |x| x,
+        else => return null,
+    };
+    if (a.op != .add) return null;
+    const result = func.instResult(inst) orelse return null;
+    if (!isF32(func, func.valueType(result))) return null;
+
+    // Either side can hold the product, so both orders are tried.
+    for ([_][2]Value{ .{ a.rhs, a.lhs }, .{ a.lhs, a.rhs } }) |pair| {
+        const product = pair[0];
+        const acc = pair[1];
+        const mul = soleUseInBlock(func, uses, block_of, inst, product) orelse continue;
+        const m = switch (func.opcode(mul)) {
+            .arith => |x| x,
+            else => continue,
+        };
+        if (m.op != .mul or !isF32(func, func.valueType(m.lhs))) continue;
+        const wide_a = soleUseInBlock(func, uses, block_of, inst, m.lhs) orelse continue;
+        const wide_b = soleUseInBlock(func, uses, block_of, inst, m.rhs) orelse continue;
+        const ha = widenedHalf(func, wide_a) orelse continue;
+        const hb = widenedHalf(func, wide_b) orelse continue;
+        // Every operand must be per-lane. The instruction is a vector one, and it reads three
+        // values where the lowering has one vector scratch to broadcast a warp-uniform operand
+        // into, so a mixed MAC is left to the refusal above rather than half handled.
+        if (!divergent[@backingInt(acc)] or !divergent[@backingInt(ha)] or !divergent[@backingInt(hb)]) continue;
+        return .{
+            .mac = .{ .acc = acc, .a = ha, .b = hb },
+            .product = mul,
+            .wide_a = wide_a,
+            .wide_b = wide_b,
+        };
+    }
+    return null;
+}
+
+/// The instruction defining `v`, when `v` is read exactly once and defined in `block`. One use is
+/// what makes absorbing the instruction safe, and one block keeps the absorbed value from being
+/// live across an edge the resolver would then shuffle.
+fn soleUseInBlock(func: *const Function, uses: []const u32, block_of: []const u32, at: Inst, v: Value) ?Inst {
+    if (uses[@backingInt(v)] != 1) return null;
+    const inst = func.definingInst(v) orelse return null;
+    if (block_of[@backingInt(inst)] != block_of[@backingInt(at)]) return null;
+    return inst;
+}
+
+/// The f16 that `inst` widens to f32, or null when `inst` is not that convert.
+fn widenedHalf(func: *const Function, inst: Inst) ?Value {
+    const cv = switch (func.opcode(inst)) {
+        .convert => |c| c,
+        else => return null,
+    };
+    const result = func.instResult(inst) orelse return null;
+    if (!isF32(func, func.valueType(result))) return null;
+    if (!isHalf(func, func.valueType(cv.value))) return null;
+    return cv.value;
+}
+
+fn isF32(func: *const Function, ty: Type) bool {
+    return switch (func.types.type_kind(ty)) {
+        .float => |f| f == .f32,
+        else => false,
+    };
+}
+
 /// Whether `inst`'s result is per-lane, which is what decides the emitter's path. Mirrors
 /// `Emitter.isVector` for an instruction that has a result.
 fn resultDivergent(func: *const Function, inst: Inst, divergent: []const bool) bool {
@@ -474,7 +635,7 @@ fn resultDivergent(func: *const Function, inst: Inst, divergent: []const bool) b
 
 /// Reject every shape this lowering does not handle, before anything is emitted. A refusal here
 /// is a clear error; a refusal halfway through emission is a truncated program.
-fn checkSupported(func: *const Function, opts: Options, divergent: []const bool) Error!void {
+fn checkSupported(func: *const Function, opts: Options, divergent: []const bool, macs: *const Macs) Error!void {
     for (0..func.valueCount()) |vi| {
         const v: Value = @fromBackingInt(@intCast(vi));
         if (!isWord(func, func.valueType(v))) return error.Unsupported;
@@ -488,67 +649,89 @@ fn checkSupported(func: *const Function, opts: Options, divergent: []const bool)
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         const insts = func.blockInsts(block);
-        for (insts, 0..) |inst, i| switch (func.opcode(inst)) {
-            // A constant must fit a 32-bit register. An unsigned type reaches 0xFFFFFFFF and a
-            // signed one reaches the most negative value, so the window spans both.
-            .iconst => |c| if (c < std.math.minInt(i32) or c > std.math.maxInt(u32)) return error.Unsupported,
-            // The result type is swept above, so it is already an f32 or an f16 here.
-            .fconst => |c| _ = floatBits(func, inst, c) orelse return error.Unsupported,
-            // The emitter picks the scalar or the vector table from the result's divergence, so
-            // admission has to ask the same table it will use. The integer tables are both
-            // complete, but the float ones are not: a divide is scalar only.
-            .arith => |a| if (resultDivergent(func, inst, divergent)) {
-                _ = vectorBinOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
-            } else {
-                _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
-            },
-            .arith_imm => |a| {
-                // The immediate is an integer, so this opcode never carries a float operand.
-                if (isFloat(func, func.valueType(a.lhs))) return error.Unsupported;
-                _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
-            },
-            // A per-lane compare writes a MASK, and a per-lane select reads one. Masks are the
-            // next slice of this lowering, so refuse rather than compare lane 0 and call it the
-            // answer for the whole warp.
-            .icmp => |c| {
-                // Glacier has no float compare in any form. An integer compare over float bits
-                // answers a different relation, and it is wrong for a negative value and for NaN.
-                if (isFloat(func, func.valueType(c.lhs))) return error.Unsupported;
-                if (divergent[@backingInt(c.lhs)] or divergent[@backingInt(c.rhs)]) return error.Unsupported;
-            },
-            .select => |s| if (divergent[@backingInt(s.cond)]) return error.Unsupported,
-            .load => |l| {
-                if (!isWord(func, func.valueType(l.ptr))) return error.Unsupported;
-                const r = func.instResult(inst) orelse return error.Unsupported;
-                // An f16 is the low half of a lane, not a word in memory. See `isHalf`.
-                if (isHalf(func, func.valueType(r))) return error.Unsupported;
-            },
-            .store => |st| {
-                if (!isWord(func, func.valueType(st.value))) return error.Unsupported;
-                if (isHalf(func, func.valueType(st.value))) return error.Unsupported;
-            },
-            .global_addr => |g| _ = addressOf(opts, func.symbolName(g.symbol)) orelse return error.Unsupported,
-            .unary => |u| if (u.op != .reinterpret) return error.Unsupported,
-            .convert => |cv| _ = convertKind(func, inst, cv) orelse return error.Unsupported,
-            .barrier => |b| switch (b.scope) {
-                .workgroup, .subgroup => {},
-            },
-            // A conditional transfers control, so nothing may follow it in its block, and its
-            // block must have no terminator: a terminator there is an edge the allocator would
-            // resolve and this emits nothing for.
-            .@"if" => |cf| {
-                if (i + 1 != insts.len or func.terminator(block) != null) return error.Unsupported;
-                // A branch on a per-lane condition is DIVERGENCE: the lanes would need to take
-                // both arms under masks. A scalar branch here would send the whole warp whichever
-                // way lane 0 went, which is a wrong answer and not a slow one.
-                if (divergent[@backingInt(cf.cond)]) return error.Unsupported;
-            },
-            else => return error.Unsupported,
-        };
+        for (insts, 0..) |inst, i| {
+            // The multiply and the two converts a MAC absorbs are emitted by the `add`, so the
+            // rules below do not apply to them: on their own the core has neither instruction.
+            if (macs.isFolded(inst)) continue;
+            try checkInst(func, opts, divergent, macs, block, insts, inst, i);
+        }
         if (func.terminator(block)) |term| switch (term) {
             .ret => |r| if (r.count != 0) return error.Unsupported,
             .jump => {},
         };
+    }
+}
+
+fn checkInst(
+    func: *const Function,
+    opts: Options,
+    divergent: []const bool,
+    macs: *const Macs,
+    block: Block,
+    insts: []const Inst,
+    inst: Inst,
+    i: usize,
+) Error!void {
+    switch (func.opcode(inst)) {
+        // A constant must fit a 32-bit register. An unsigned type reaches 0xFFFFFFFF and a
+        // signed one reaches the most negative value, so the window spans both.
+        .iconst => |c| if (c < std.math.minInt(i32) or c > std.math.maxInt(u32)) return error.Unsupported,
+        // The result type is swept above, so it is already an f32 or an f16 here.
+        .fconst => |c| _ = floatBits(func, inst, c) orelse return error.Unsupported,
+        // The emitter picks the scalar or the vector table from the result's divergence, so
+        // admission has to ask the same table it will use. The integer tables are both
+        // complete, but the float ones are not: a divide is scalar only.
+        // An `add` the recognizer claimed becomes the widening MAC, which is the only float
+        // arithmetic the vector unit has.
+        .arith => |a| if (macs.at(inst) == null) {
+            if (resultDivergent(func, inst, divergent)) {
+                _ = vectorBinOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
+            } else {
+                _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
+            }
+        },
+        .arith_imm => |a| {
+            // The immediate is an integer, so this opcode never carries a float operand.
+            if (isFloat(func, func.valueType(a.lhs))) return error.Unsupported;
+            _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
+        },
+        // A per-lane compare writes a MASK, and a per-lane select reads one. Masks are the
+        // next slice of this lowering, so refuse rather than compare lane 0 and call it the
+        // answer for the whole warp.
+        .icmp => |c| {
+            // Glacier has no float compare in any form. An integer compare over float bits
+            // answers a different relation, and it is wrong for a negative value and for NaN.
+            if (isFloat(func, func.valueType(c.lhs))) return error.Unsupported;
+            if (divergent[@backingInt(c.lhs)] or divergent[@backingInt(c.rhs)]) return error.Unsupported;
+        },
+        .select => |s| if (divergent[@backingInt(s.cond)]) return error.Unsupported,
+        .load => |l| {
+            if (!isWord(func, func.valueType(l.ptr))) return error.Unsupported;
+            const r = func.instResult(inst) orelse return error.Unsupported;
+            // An f16 is the low half of a lane, not a word in memory. See `isHalf`.
+            if (isHalf(func, func.valueType(r))) return error.Unsupported;
+        },
+        .store => |st| {
+            if (!isWord(func, func.valueType(st.value))) return error.Unsupported;
+            if (isHalf(func, func.valueType(st.value))) return error.Unsupported;
+        },
+        .global_addr => |g| _ = addressOf(opts, func.symbolName(g.symbol)) orelse return error.Unsupported,
+        .unary => |u| if (u.op != .reinterpret) return error.Unsupported,
+        .convert => |cv| _ = convertKind(func, inst, cv) orelse return error.Unsupported,
+        .barrier => |b| switch (b.scope) {
+            .workgroup, .subgroup => {},
+        },
+        // A conditional transfers control, so nothing may follow it in its block, and its
+        // block must have no terminator: a terminator there is an edge the allocator would
+        // resolve and this emits nothing for.
+        .@"if" => |cf| {
+            if (i + 1 != insts.len or func.terminator(block) != null) return error.Unsupported;
+            // A branch on a per-lane condition is DIVERGENCE: the lanes would need to take
+            // both arms under masks. A scalar branch here would send the whole warp whichever
+            // way lane 0 went, which is a wrong answer and not a slow one.
+            if (divergent[@backingInt(cf.cond)]) return error.Unsupported;
+        },
+        else => return error.Unsupported,
     }
 }
 
@@ -661,6 +844,8 @@ const Emitter = struct {
     uses: []const u32,
     /// Which values are per-lane, so live in a vector register. See `analyzeDivergence`.
     divergent: []const bool,
+    /// Which `add` instructions are a widening MAC, and which instructions one absorbs.
+    macs: *const Macs,
     /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
     spills: bool,
     words: std.ArrayList(u32) = .empty,
@@ -930,6 +1115,7 @@ const Emitter = struct {
             },
             .arith => |a| {
                 const dst = try self.vreg(self.func.instResult(inst).?, pos);
+                if (self.macs.at(inst)) |m| return self.emitMac(m, dst, pos);
                 const f = vectorBinOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
                 // The scalar-operand form when only the right side is warp-uniform, which is the
                 // common shape: a per-lane value combined with a loop invariant.
@@ -945,6 +1131,28 @@ const Emitter = struct {
             .arith_imm => |a| try self.emitVectorArithImm(a, inst, pos),
             else => return error.Unsupported,
         }
+    }
+
+    /// `vfwmacc.vv`: the destination accumulates the f32 product of two f16, so the accumulator
+    /// has to be in the destination before the instruction runs. The allocator is asked for that
+    /// register in `copySource`, and a `vmv.v.v` covers the case where it could not give it.
+    ///
+    /// A source that already sits in the destination is copied aside first. The allocator may
+    /// reuse a factor's register for the result, since the factor dies where the result is born,
+    /// and whether the core reads both factors before it writes the destination is not recorded.
+    /// No test reaches this, so it is a guard and not a verified path. Ask the hardware before
+    /// removing it.
+    fn emitMac(self: *Emitter, m: Mac, dst: VReg, pos: u32) Error!void {
+        const acc = try self.vreg(m.acc, pos);
+        var a = try self.vreg(m.a, pos);
+        var b = try self.vreg(m.b, pos);
+        if (a == dst or b == dst) {
+            try self.put(rv.vmv_v_v(vscratch, dst));
+            if (a == dst) a = vscratch;
+            if (b == dst) b = vscratch;
+        }
+        if (dst != acc) try self.put(rv.vmv_v_v(dst, acc));
+        try self.put(rv.vfwmacc_vv(dst, a, b));
     }
 
     fn emitVectorArithImm(self: *Emitter, a: ir.function.ArithImm, inst: Inst, pos: u32) Error!void {
@@ -977,6 +1185,9 @@ const Emitter = struct {
     }
 
     fn emitInst(self: *Emitter, inst: Inst, pos: u32) Error!void {
+        // The multiply and the converts a MAC absorbed. Their registers stay allocated and hold
+        // nothing, because a three-operand instruction cannot be spelled as one `arith`.
+        if (self.macs.isFolded(inst)) return;
         // A pure instruction nothing reads is dropped. The allocator still places its result, so
         // the home lookup below would not catch it: a frontend that emits a constant whose only
         // consumer was removed (an eliminated bounds check leaves the array length behind) would

@@ -307,6 +307,19 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
     // that names a source register everywhere else is a selector here. An f32 fills a lane and an
     // f16 is its LOW HALF, because the core has no f register file.
     if (funct3 == 0b001) {
+        // vfwmacc.vv: the destination accumulates the f32 product of two f16. The product is
+        // exact, because two 11-bit significands fit an f32 one, so the only rounding is the sum,
+        // and the core TRUNCATES that.
+        if (funct6 == 0b111100) {
+            for (0..warp.lanes) |i| {
+                const a: f32 = asHalf(warp.v[src][i]);
+                const b: f32 = asHalf(warp.v[vs2][i]);
+                const product = ftz(f32, a * b);
+                const sum = @as(f64, asFloat(warp.v[vd][i])) + @as(f64, product);
+                warp.v[vd][i] = @bitCast(ftz(f32, truncToF32(sum)));
+            }
+            return;
+        }
         if (funct6 != 0b010010) return error.Illegal;
         for (0..warp.lanes) |i| {
             const x = warp.v[vs2][i];
@@ -357,6 +370,11 @@ fn asFloat(bits: u32) f32 {
     return @bitCast(bits);
 }
 
+/// The low half of a lane read as an f16, which is where Glacier keeps one.
+fn asHalf(bits: u32) f16 {
+    return @bitCast(@as(u16, @truncate(bits)));
+}
+
 fn halfBits(v: f16) u32 {
     return @as(u16, @bitCast(v));
 }
@@ -382,10 +400,14 @@ fn unsignedFromFloat(v: f32) u32 {
 /// the exact quotient sits just under a value f32 can name and the f64 step lifts it onto that
 /// value. No test here is near such a quotient.
 fn divTowardZero(x: f32, y: f32) f32 {
-    const q = @as(f64, x) / @as(f64, y);
-    const near: f32 = @floatCast(q);
+    return truncToF32(@as(f64, x) / @as(f64, y));
+}
+
+/// `v` as the nearest f32 toward zero.
+fn truncToF32(v: f64) f32 {
+    const near: f32 = @floatCast(v);
     if (!std.math.isFinite(near)) return near;
-    if (@abs(@as(f64, near)) <= @abs(q)) return near;
+    if (@abs(@as(f64, near)) <= @abs(v)) return near;
     // Rounding to nearest went away from zero, so step back one representable value.
     const bits: u32 = @bitCast(near);
     const magnitude = bits & 0x7FFF_FFFF;

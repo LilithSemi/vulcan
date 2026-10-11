@@ -1003,3 +1003,163 @@ test "the backend refuses the float work Glacier cannot do" {
         try std.testing.expectError(error.Unsupported, compile(allocator, &f));
     }
 }
+
+/// How many words in `code` are `vfwmacc.vv`: OP-V, OPFVV, funct6 111100.
+fn countMacs(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0x7 != 0b001) continue;
+        if (w >> 26 != 0b111100) continue;
+        n += 1;
+    }
+    return n;
+}
+
+test "a per-lane multiply-accumulate over f16 becomes one widening MAC" {
+    // `out[lane] += (lane + 1) * (lane + 2)`, with the two factors as f16 and the accumulator as
+    // f32, which is the shape a GEMM inner loop has. The IR spells it as two widening converts, a
+    // multiply and an add, and Glacier has an instruction for none of those on their own.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    // The accumulator is read per lane, which is the only way to get a per-lane f32: nothing
+    // widens an f16 outside the MAC itself.
+    const acc = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const first = try f.appendArithImm(entry, i32_t, .add, lane, 1);
+    const second = try f.appendArithImm(entry, i32_t, .add, lane, 2);
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = first } });
+    const hb = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = second } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wb } });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+    try f.appendStore(entry, sum, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    var data: [8]u32 = @splat(0);
+    for (0..lanes) |i| data[i] = @bitCast(@as(f32, 100.0));
+    try runOnce(words, &data, 0, 1);
+    for (0..lanes) |i| {
+        const n: f32 = @floatFromInt(i);
+        const want: f32 = 100.0 + (n + 1.0) * (n + 2.0);
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), data[i]);
+    }
+}
+
+test "an f32 multiply and add outside a MAC are refused" {
+    // The fold is what makes the tree legal. A product read twice cannot be absorbed, and then
+    // the multiply and the widening converts stand on their own, which the core cannot do.
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |second_reader| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const f16_t = try f.types.intern(.{ .float = .f16 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        const acc = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+        const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+        const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+        const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+        const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wa } });
+        const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+        try f.appendStore(entry, sum, at);
+        if (second_reader) {
+            const other = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = product, .rhs = product } });
+            try f.appendStore(entry, other, base);
+        }
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        // `wa` is read twice even in the first case, so neither shape folds.
+        try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    }
+}
+
+test "a warp-uniform multiply-accumulate is refused, because the MAC is per lane" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const acc = try f.appendInst(entry, f32_t, .{ .fconst = 1.0 });
+    const three = try f.appendInst(entry, i32_t, .{ .iconst = 3 });
+    const four = try f.appendInst(entry, i32_t, .{ .iconst = 4 });
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = three } });
+    const hb = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = four } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wb } });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
+    try f.appendStore(entry, raw, base);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a MAC with one warp-uniform factor is refused, not given a scalar register" {
+    // The accumulator is per lane, so the add's result is too and the vector path takes it. The
+    // factor is warp-uniform and lives in a SCALAR register, and the two files are indexed by the
+    // same number, so recognizing this MAC would read whatever that scalar register holds.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const acc = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const seven = try f.appendInst(entry, i32_t, .{ .iconst = 7 });
+    const eight = try f.appendInst(entry, i32_t, .{ .iconst = 8 });
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = seven } });
+    const hb = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = eight } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wb } });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+    try f.appendStore(entry, sum, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
