@@ -782,15 +782,21 @@ const Emitter = struct {
                 else => if (isSigned(self.func, ty)) rv.vsra_vi(dst, lhs, shamt) else rv.vsrl_vi(dst, lhs, shamt),
             });
         }
-        // Everything else takes the constant through a scalar register and the `.vx` form. The
-        // 5-bit immediate the vector-immediate encoding offers is rarely wide enough to be worth
-        // a second path.
-        const g = vectorBinOpVx(self.func, a.op, ty) orelse return error.Unsupported;
+        // Everything else takes the constant through a scalar register. Subtraction has no
+        // immediate form, so it is an add of the negated constant, same as the scalar path.
+        const op: ir.function.BinOp = if (a.op == .sub) .add else a.op;
         const imm: i64 = if (a.op == .sub) -a.imm else a.imm;
         try self.constant(scratch, lowWord(imm));
-        const op: ir.function.BinOp = if (a.op == .sub) .add else a.op;
-        const h = vectorBinOpVx(self.func, op, ty) orelse g;
-        try self.put(h(dst, lhs, scratch));
+        // The `.vx` form when the vector unit has one. Only a few ops do, so everything else
+        // broadcasts the constant into a vector first: a bitwise AND against a mask and a modulo
+        // by a constant are both common per-lane shapes, and refusing them would send a kernel
+        // back to scalar for the sake of one instruction.
+        if (vectorBinOpVx(self.func, op, ty)) |g| return self.put(g(dst, lhs, scratch));
+        const f = vectorBinOp(self.func, op, ty) orelse return error.Unsupported;
+        // `lhs` is never the vector scratch here: an `arith_imm` whose result is per-lane has a
+        // per-lane operand, so `vectorOperand` returned that operand's own register.
+        try self.put(rv.vmv_v_x(vscratch, scratch));
+        try self.put(f(dst, lhs, vscratch));
     }
 
     fn emitInst(self: *Emitter, inst: Inst, pos: u32) Error!void {

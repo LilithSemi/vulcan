@@ -415,6 +415,9 @@ fn runOnce(code: []const u32, data: []u32, hart_id: u32, hart_count: u32) !void 
     var one: warp.Warp = .{
         .hart_id = hart_id,
         .hart_count = hart_count,
+        // The warp runs the full width of the profile the kernels here are built for. Leaving
+        // this at its default ran ONE lane, which made a per-lane test pass on lane zero alone.
+        .lanes = glacier.encode.Profile.@"gc1.n".lanes(),
         .stack_top = scratch_base + (hart_id + 1) * stride,
     };
     _ = try warp.run(code, &mem, &one, budget);
@@ -655,4 +658,45 @@ test "a constant nobody reads costs no words" {
     const with = try compile(allocator, &littered);
     defer allocator.free(with);
     try std.testing.expectEqualSlices(u32, without, with);
+}
+
+test "a per-lane operation against a constant has a vector form for every operator" {
+    // The vector unit has a scalar-operand form for only a few operators, so everything else
+    // broadcasts the constant and uses vector-vector. A bitwise AND against a mask and a modulo
+    // by a constant are both ordinary per-lane shapes, and refusing them would send a whole
+    // kernel back to scalar for the sake of one instruction.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    // (tid & 6) ^ 1, then % 3, then - 1: and, xor, rem and sub all lack a scalar-operand form.
+    const masked = try f.appendArithImm(entry, u32_t, .bit_and, tid, 6);
+    const flipped = try f.appendArithImm(entry, u32_t, .bit_xor, masked, 1);
+    const wrapped = try f.appendArithImm(entry, u32_t, .rem, flipped, 3);
+    const less = try f.appendArithImm(entry, u32_t, .sub, wrapped, 1);
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, less, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    std.debug.print("DATA:", .{});
+    for (data) |d| std.debug.print(" {x}", .{d});
+    std.debug.print("\n", .{});
+    for (0..lanes) |i| {
+        const tidv: u32 = @intCast(i);
+        const want = (((tidv & 6) ^ 1) % 3) -% 1;
+        try std.testing.expectEqual(want, data[i]);
+    }
 }
