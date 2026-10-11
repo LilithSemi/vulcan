@@ -205,3 +205,85 @@ test "a kernel in Zig's SPIR-V shape runs on Glacier" {
         try std.testing.expectEqual(want, got);
     }
 }
+
+/// The shape `std.spirv` produces, which is what a Zig kernel written the supported way emits.
+/// Verified against real `zig build-obj -target spirv32-vulkan` output for:
+///
+///     out.elems[std.spirv.workgroup_id[0]] = std.spirv.num_workgroups[0];
+///
+/// `std.spirv` declares each builtin as an `extern const @Vector(3, u32) addrspace(.input)`, so
+/// indexing it emits a chain to `.x` and a SCALAR load rather than a whole-vector load. The two
+/// wrinkles a hand-built module would not think to include are the memory operands trailing
+/// `OpLoad`/`OpStore` and the unreachable block Zig leaves after the return.
+fn stdSpirvShapedModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 u32=2 v3u32=3 pInV3=4 pInU=5 c4096=6 arr=7 struct=8 pSbStruct=9 pSbArr=10
+    //      pSbU32=11 voidfn=12 c0=13 wid=14 nwg=15 out=16 main=17 entry=18 widx=19 i=20
+    //      cast=21 pElems=22 pElem=23 nidx=24 n=25 dead=26.
+    var b = try spirv.binary.Builder.init(allocator, 27);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 17, 0x6E69616D, 0, 14, 15, 16 });
+    try b.emit(allocator, op.Name, &.{ 16, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.builtin, op.BuiltIn.workgroup_id });
+    try b.emit(allocator, op.Decorate, &.{ 15, op.Decoration.builtin, op.BuiltIn.num_workgroups });
+    try b.emit(allocator, op.MemberDecorate, &.{ 8, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 3, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.input, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.Constant, &.{ 2, 6, 4096 });
+    try b.emit(allocator, op.TypeArray, &.{ 7, 2, 6 });
+    try b.emit(allocator, op.TypeStruct, &.{ 8, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 12, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 13, 0 });
+    try b.emit(allocator, op.Variable, &.{ 4, 14, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 4, 15, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 9, 16, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 17, 0, 12 });
+    try b.emit(allocator, op.Label, &.{18});
+    try b.emit(allocator, op.Line, &.{ 1, 6, 5 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 5, 19, 14, 13 }); // &workgroup_id[0]
+    try b.emit(allocator, op.Load, &.{ 2, 20, 19, 2, 4 }); // scalar, with memory operands
+    try b.emit(allocator, op.Bitcast, &.{ 2, 21, 20 }); // u32 to u32, a no-op Zig still emits
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 10, 22, 16, 13 }); // &out.elems
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 23, 22, 21 }); // &out.elems[i]
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 5, 24, 15, 13 }); // &num_workgroups[0]
+    try b.emit(allocator, op.Load, &.{ 2, 25, 24, 2, 4 });
+    try b.emit(allocator, op.Store, &.{ 23, 25, 2, 4 });
+    try b.emit(allocator, op.Return, &.{});
+    // Zig leaves an unreachable block after the return. Nothing branches to it.
+    try b.emit(allocator, op.Label, &.{26});
+    try b.emit(allocator, op.Unreachable, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "a kernel in std.spirv's shape runs on Glacier" {
+    const allocator = std.testing.allocator;
+    var b = try stdSpirvShapedModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    // The same answer the hand-built module gives, which is the point: each warp writes the hart
+    // count into its own slot. Checked against real Zig output, which lowers to 13 words.
+    for ([_]u32{ 1, 4 }) |warps| {
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        var mem: warp.Memory = .{ .base = data_base, .words = &data };
+        for (0..warps) |w| {
+            var one: warp.Warp = .{ .hart_id = @intCast(w), .hart_count = warps };
+            _ = try warp.run(words, &mem, &one, 10_000);
+        }
+        for (data, 0..) |got, i| {
+            try std.testing.expectEqual(if (i < warps) warps else 0xFFFF_FFFF, got);
+        }
+    }
+}
