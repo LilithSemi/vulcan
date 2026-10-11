@@ -325,6 +325,7 @@ fn copySource(_: *const anyopaque, func: *const Function, v: Value) ?Value {
     const inst = func.definingInst(v) orelse return null;
     return switch (func.opcode(inst)) {
         .unary => |u| if (u.op == .reinterpret) u.value else null,
+        .convert => |cv| if (isBitPreservingConvert(func, inst, cv)) cv.value else null,
         else => null,
     };
 }
@@ -347,6 +348,21 @@ fn isSigned(func: *const Function, ty: Type) bool {
         .int => |i| i.signedness == .signed,
         else => false,
     };
+}
+
+/// Whether a `convert` only changes how the bits are read, so it needs no instruction.
+///
+/// `convert` covers int to float as well as an integer width change, and the SPIR-V frontend
+/// emits it for `OpUConvert` and `OpSConvert`. Everything here is one word wide, so a convert
+/// between two integers of that width changes the signedness and nothing else, and a move is the
+/// whole lowering. A width change or a float would be real work, and `isWord` refuses both before
+/// this is ever asked.
+fn isBitPreservingConvert(func: *const Function, inst: Inst, cv: ir.function.Convert) bool {
+    const result = func.instResult(inst) orelse return false;
+    const from = func.types.type_kind(func.valueType(cv.value));
+    const to = func.types.type_kind(func.valueType(result));
+    if (from != .int or to != .int) return false;
+    return from.int.bits == to.int.bits;
 }
 
 /// Reject every shape this lowering does not handle, before anything is emitted. A refusal here
@@ -380,6 +396,7 @@ fn checkSupported(func: *const Function, opts: Options, divergent: []const bool)
             .store => |st| if (!isWord(func, func.valueType(st.value))) return error.Unsupported,
             .global_addr => |g| _ = addressOf(opts, func.symbolName(g.symbol)) orelse return error.Unsupported,
             .unary => |u| if (u.op != .reinterpret) return error.Unsupported,
+            .convert => |cv| if (!isBitPreservingConvert(func, inst, cv)) return error.Unsupported,
             .barrier => |b| switch (b.scope) {
                 .workgroup, .subgroup => {},
             },
@@ -762,6 +779,10 @@ const Emitter = struct {
                 try self.vreg(self.func.instResult(inst).?, pos),
                 try self.vectorOperand(u.value, pos),
             )),
+            .convert => |cv| try self.put(rv.vmv_v_v(
+                try self.vreg(self.func.instResult(inst).?, pos),
+                try self.vectorOperand(cv.value, pos),
+            )),
             .arith => |a| {
                 const dst = try self.vreg(self.func.instResult(inst).?, pos);
                 const f = vectorBinOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
@@ -838,6 +859,7 @@ const Emitter = struct {
                 @bitCast(addressOf(self.opts, self.func.symbolName(g.symbol)) orelse return error.Unsupported),
             ),
             .unary => |u| try self.move(dst, try self.reg(u.value, pos)),
+            .convert => |cv| try self.move(dst, try self.reg(cv.value, pos)),
             .arith => |a| {
                 const f = binOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
                 try self.put(f(dst, try self.reg(a.lhs, pos), try self.reg(a.rhs, pos)));

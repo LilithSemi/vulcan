@@ -698,6 +698,44 @@ test "a per-lane operation against a constant has a vector form for every operat
     }
 }
 
+test "a same-width convert costs no instruction" {
+    // The SPIR-V frontend emits `convert` for `OpUConvert` and `OpSConvert`, and a kernel that
+    // only ever holds words gets one between two 32-bit integers, which changes the signedness
+    // and nothing else. Refusing it sent a whole kernel back when a move, coalesced away, is the
+    // entire lowering.
+    const allocator = std.testing.allocator;
+
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    var converted = Function.init(allocator);
+    defer converted.deinit();
+
+    for ([_]*Function{ &plain, &converted }, 0..) |f, i| {
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const v = try f.appendInst(entry, u32_t, .{ .iconst = 9 });
+        const stored = if (i == 1) blk: {
+            const as_signed = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = v } });
+            break :blk try f.appendInst(entry, u32_t, .{ .convert = .{ .value = as_signed } });
+        } else v;
+        try f.appendStore(entry, stored, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    }
+
+    const without = try compile(allocator, &plain);
+    defer allocator.free(without);
+    const with = try compile(allocator, &converted);
+    defer allocator.free(with);
+    try std.testing.expectEqualSlices(u32, without, with);
+
+    var data: [1]u32 = .{0};
+    try runOnce(with, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 9), data[0]);
+}
+
 test "the scalar divide matches the standard layout" {
     // `fdiv.s f8, f9, f10` from `zig cc -target riscv64-linux-musl -mcpu=generic_rv64+v+f`.
     // Glacier has no f register file, so the fields name X registers: the same word, read against
