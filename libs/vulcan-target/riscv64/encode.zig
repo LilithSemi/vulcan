@@ -196,6 +196,120 @@ pub fn vmv_v_v(vd: VReg, vs1: VReg) u32 {
     return 0b1010111 | (vnum(vd) << 7) | (0b000 << 12) | (vnum(vs1) << 15) | (@as(u32, 1) << 25) | (@as(u32, 0b010111) << 26);
 }
 
+// Integer RVV. The same OP-V layout as the float ops above, selected by funct3: OPIVV/OPIVX/OPIVI
+// take an integer `funct6`, OPMVV/OPMVX take a different one, so a `funct6` value means two
+// different instructions depending on which helper encodes it (0b100101 is `vsll` under OPIVV and
+// `vmul` under OPMVV). All unmasked (vm=1). Every word below is cross-checked against
+// `zig cc -target riscv64-linux-musl -mcpu=generic_rv64+v`, see the test at the end of this file.
+
+/// An OPIVV op (vector-vector integer, funct3=000): `vd = vs2 <op> vs1`.
+fn opivv(funct6: u6, vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b000 << 12) | (vnum(vs1) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, funct6) << 26);
+}
+/// An OPIVX op (vector-scalar integer, funct3=100): `vd = vs2 <op> rs1`, the scalar broadcast.
+fn opivx(funct6: u6, vd: VReg, vs2: VReg, rs1: Reg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b100 << 12) | (num(rs1) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, funct6) << 26);
+}
+/// An OPIVI op (vector-immediate integer, funct3=011): `vd = vs2 <op> imm`, imm in the vs1 field.
+fn opivi(funct6: u6, vd: VReg, vs2: VReg, imm: u5) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b011 << 12) | (@as(u32, imm) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, funct6) << 26);
+}
+/// An OPMVV op (vector-vector, the multiply/divide group, funct3=010).
+fn opmvv(funct6: u6, vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b010 << 12) | (vnum(vs1) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, funct6) << 26);
+}
+/// An OPMVX op (vector-scalar, the multiply/divide group, funct3=110).
+fn opmvx(funct6: u6, vd: VReg, vs2: VReg, rs1: Reg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b110 << 12) | (num(rs1) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, funct6) << 26);
+}
+
+pub fn vadd_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b000000, vd, vs2, vs1);
+}
+pub fn vadd_vx(vd: VReg, vs2: VReg, rs1: Reg) u32 {
+    return opivx(0b000000, vd, vs2, rs1);
+}
+pub fn vsub_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b000010, vd, vs2, vs1);
+}
+pub fn vand_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b001001, vd, vs2, vs1);
+}
+pub fn vor_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b001010, vd, vs2, vs1);
+}
+pub fn vxor_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b001011, vd, vs2, vs1);
+}
+pub fn vsll_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b100101, vd, vs2, vs1);
+}
+pub fn vsll_vx(vd: VReg, vs2: VReg, rs1: Reg) u32 {
+    return opivx(0b100101, vd, vs2, rs1);
+}
+pub fn vsll_vi(vd: VReg, vs2: VReg, shamt: u5) u32 {
+    return opivi(0b100101, vd, vs2, shamt);
+}
+pub fn vsrl_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b101000, vd, vs2, vs1);
+}
+pub fn vsrl_vi(vd: VReg, vs2: VReg, shamt: u5) u32 {
+    return opivi(0b101000, vd, vs2, shamt);
+}
+pub fn vsra_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b101001, vd, vs2, vs1);
+}
+pub fn vsra_vi(vd: VReg, vs2: VReg, shamt: u5) u32 {
+    return opivi(0b101001, vd, vs2, shamt);
+}
+pub fn vmul_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b100101, vd, vs2, vs1);
+}
+pub fn vmul_vx(vd: VReg, vs2: VReg, rs1: Reg) u32 {
+    return opmvx(0b100101, vd, vs2, rs1);
+}
+pub fn vmulh_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b100111, vd, vs2, vs1);
+}
+pub fn vmulhu_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b100100, vd, vs2, vs1);
+}
+pub fn vdiv_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b100001, vd, vs2, vs1);
+}
+pub fn vdivu_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b100000, vd, vs2, vs1);
+}
+pub fn vrem_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b100011, vd, vs2, vs1);
+}
+pub fn vremu_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b100010, vd, vs2, vs1);
+}
+
+/// `vid.v vd`: write each lane its own index. The per-lane thread identity.
+pub fn vid_v(vd: VReg) u32 {
+    return opmvv(0b010100, vd, .v0, @fromBackingInt(@intCast(17)));
+}
+/// `vmv.v.x vd, rs1`: broadcast a scalar into every lane.
+pub fn vmv_v_x(vd: VReg, rs1: Reg) u32 {
+    return opivx(0b010111, vd, .v0, rs1);
+}
+/// `vmv.x.s rd, vs2`: move lane 0 into a scalar register.
+pub fn vmv_x_s(rd: Reg, vs2: VReg) u32 {
+    return 0b1010111 | (num(rd) << 7) | (0b010 << 12) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010000) << 26);
+}
+
+/// `vluxei32.v vd, (rs1), vs2`: gather. Lane i loads from `rs1 + vs2[i]`, so an unrelated
+/// address per lane costs one instruction. `mop=01` selects indexed-unordered.
+pub fn vluxei32(vd: VReg, rs1: Reg, vs2: VReg) u32 {
+    return 0b0000111 | (vnum(vd) << 7) | (0b110 << 12) | (num(rs1) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b01) << 26);
+}
+/// `vsuxei32.v vs3, (rs1), vs2`: scatter. Lane i stores to `rs1 + vs2[i]`.
+pub fn vsuxei32(vs3: VReg, rs1: Reg, vs2: VReg) u32 {
+    return 0b0100111 | (vnum(vs3) << 7) | (0b110 << 12) | (num(rs1) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b01) << 26);
+}
+
 /// Encode an OP-FP (floating-point R-type) instruction. `rm` is the rounding
 /// mode (0b111 = dynamic).
 fn fpRType(funct7: u7, rm: u3, rd: FReg, rs1: FReg, rs2: FReg) u32 {
@@ -1483,6 +1597,38 @@ test "encodes RVV vector FMA (vfmacc/vfmsac/vfnmsac, cross-checked against `zig 
     try std.testing.expectEqual(@as(u32, 0xb22091d7), vfmacc_vv(.v3, .v1, .v2)); // vfmacc.vv v3, v1, v2
     try std.testing.expectEqual(@as(u32, 0xba2091d7), vfmsac_vv(.v3, .v1, .v2)); // vfmsac.vv v3, v1, v2
     try std.testing.expectEqual(@as(u32, 0xbe2091d7), vfnmsac_vv(.v3, .v1, .v2)); // vfnmsac.vv v3, v1, v2
+}
+
+test "integer RVV encodings match LLVM's assembler" {
+    // Reference words from `zig cc -target riscv64-linux-musl -mcpu=generic_rv64+v`, assembling
+    // the same mnemonics and reading back the .text bytes. A hand-derived field layout is exactly
+    // the kind of thing that looks right and decodes to another instruction.
+    try std.testing.expectEqual(@as(u32, 0x5208a2d7), vid_v(.v5));
+    try std.testing.expectEqual(@as(u32, 0x5e054357), vmv_v_x(.v6, .x10));
+    try std.testing.expectEqual(@as(u32, 0x427025d7), vmv_x_s(.x11, .v7));
+    try std.testing.expectEqual(@as(u32, 0x02950457), vadd_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x02954457), vadd_vx(.v8, .v9, .x10));
+    try std.testing.expectEqual(@as(u32, 0x0a950457), vsub_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x26950457), vand_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x2a950457), vor_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x2e950457), vxor_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x9691b457), vsll_vi(.v8, .v9, 3));
+    try std.testing.expectEqual(@as(u32, 0x96954457), vsll_vx(.v8, .v9, .x10));
+    try std.testing.expectEqual(@as(u32, 0xa291b457), vsrl_vi(.v8, .v9, 3));
+    try std.testing.expectEqual(@as(u32, 0xa691b457), vsra_vi(.v8, .v9, 3));
+    try std.testing.expectEqual(@as(u32, 0x96952457), vmul_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x96956457), vmul_vx(.v8, .v9, .x10));
+    try std.testing.expectEqual(@as(u32, 0x9e952457), vmulh_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x92952457), vmulhu_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x86952457), vdiv_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x82952457), vdivu_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x8e952457), vrem_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x8a952457), vremu_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x06c66587), vluxei32(.v11, .x12, .v12));
+    try std.testing.expectEqual(@as(u32, 0x06c666a7), vsuxei32(.v13, .x12, .v12));
+    // The two unit-stride forms already here, pinned by the same reference.
+    try std.testing.expectEqual(@as(u32, 0x0206e707), vle32(.v14, .x13));
+    try std.testing.expectEqual(@as(u32, 0x0206e7a7), vse32(.v15, .x13));
 }
 
 test "encodes single-precision float arithmetic" {
