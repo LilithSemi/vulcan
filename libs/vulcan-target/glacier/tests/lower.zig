@@ -697,3 +697,14 @@ test "a per-lane operation against a constant has a vector form for every operat
         try std.testing.expectEqual(want, data[i]);
     }
 }
+
+test "the scalar divide matches the standard layout" {
+    // `fdiv.s f8, f9, f10` from `zig cc -target riscv64-linux-musl -mcpu=generic_rv64+v+f`.
+    // Glacier has no f register file, so the fields name X registers: the same word, read against
+    // a different file.
+    //
+    // This sits here rather than beside the encoder because `glacier/encode.zig` is not a test
+    // root of its own and `refAllDecls` does not reach into it, so a test written there runs
+    // nowhere. Checked: it did not appear in any suite until it moved.
+    try std.testing.expectEqual(@as(u32, 0x18a4f453), glacier.encode.fdiv(.x8, .x9, .x10));
+}

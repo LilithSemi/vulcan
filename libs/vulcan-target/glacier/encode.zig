@@ -67,6 +67,22 @@ pub const Csr = struct {
 /// this word another meaning.
 pub const warp_barrier: u32 = 0x1000000F;
 
+/// `fdiv.s rd, rs1, rs2`, with the register fields naming X REGISTERS.
+///
+/// Glacier has no f register file, so every field of an FP instruction names a scalar register.
+/// The bit layout is the standard one, which is why the test pins it against an assembler's
+/// `fdiv.s f8, f9, f10`: the same word, read as a different register file.
+///
+/// It is the ONLY scalar FP operation the core decodes, and the only FP operation of any kind that
+/// is not per-lane. A per-lane divide therefore costs one of these per lane with a `vmv.x.s` and a
+/// `vmv.v.x` around it, which is why a renderer divides per vertex or per scanline and not per
+/// pixel. It always truncates: the rounding mode in `funct3` is accepted and ignored.
+pub fn fdiv(rd: Reg, rs1: Reg, rs2: Reg) u32 {
+    return 0b1010011 | (@as(u32, @backingInt(rd)) << 7) | (0b111 << 12) |
+        (@as(u32, @backingInt(rs1)) << 15) | (@as(u32, @backingInt(rs2)) << 20) |
+        (@as(u32, 0b0001100) << 25);
+}
+
 /// Read a CSR into `rd`. CSRRS with x0 as the set mask, so it reads without writing.
 pub fn csrr(rd: Reg, csr: u12) u32 {
     return rv.csrrs(rd, csr, .x0);

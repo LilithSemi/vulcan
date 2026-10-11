@@ -175,6 +175,24 @@ pub fn vfmsac_vv(vd: VReg, vs1: VReg, vs2: VReg) u32 {
 pub fn vfnmsac_vv(vd: VReg, vs1: VReg, vs2: VReg) u32 {
     return opfvv(0b101111, vd, vs2, vs1);
 }
+/// `vfwmacc.vv vd, vs1, vs2`: WIDENING per-lane multiply-accumulate, `vd += vs1 * vs2`, with
+/// operands one width and the accumulator two. Distinct from `vfmacc_vv` above, which keeps the
+/// product at the operand width: a core may decode one and not the other.
+pub fn vfwmacc_vv(vd: VReg, vs1: VReg, vs2: VReg) u32 {
+    return opfvv(0b111100, vd, vs2, vs1);
+}
+
+/// `vfcvt.f.x.v vd, vs2`: per-lane signed integer to float. The converts are one `funct6` and are
+/// told apart by the `vs1` field, which holds a function selector rather than a register.
+pub fn vfcvt_f_x_v(vd: VReg, vs2: VReg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (@as(u32, 0b00011) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010010) << 26);
+}
+
+/// `vfcvt.rtz.xu.f.v vd, vs2`: per-lane float to unsigned integer, truncating toward zero.
+pub fn vfcvt_rtz_xu_f_v(vd: VReg, vs2: VReg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (@as(u32, 0b00110) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010010) << 26);
+}
+
 /// `vfmv.f.s rd, vs2`: move lane 0 to a float register (the unpack primitive).
 pub fn vfmv_f_s(rd: FReg, vs2: VReg) u32 {
     return 0b1010111 | (fnum(rd) << 7) | (0b001 << 12) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010000) << 26);
@@ -1629,6 +1647,12 @@ test "integer RVV encodings match LLVM's assembler" {
     // The two unit-stride forms already here, pinned by the same reference.
     try std.testing.expectEqual(@as(u32, 0x0206e707), vle32(.v14, .x13));
     try std.testing.expectEqual(@as(u32, 0x0206e7a7), vse32(.v15, .x13));
+}
+
+test "the widening MAC and the two converts match LLVM's assembler" {
+    try std.testing.expectEqual(@as(u32, 0xf2a49457), vfwmacc_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x4a919457), vfcvt_f_x_v(.v8, .v9));
+    try std.testing.expectEqual(@as(u32, 0x4a931457), vfcvt_rtz_xu_f_v(.v8, .v9));
 }
 
 test "encodes single-precision float arithmetic" {
