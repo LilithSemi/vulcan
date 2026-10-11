@@ -1391,6 +1391,38 @@ fn builtinScalarOf(module: *const Module, id: u32) ?Value {
     };
 }
 
+/// Whether `ty` is an integer or a pointer of the width `bits`, so two of them hold the same bits
+/// and a `reinterpret` between them moves nothing.
+fn sameWidthInt(func: *const Function, a: Type, b: Type) bool {
+    const ka = func.types.type_kind(a);
+    const kb = func.types.type_kind(b);
+    if (ka != .int or kb != .int) return false;
+    return ka.int.bits == kb.int.bits;
+}
+
+/// `v` as type `ty`, through a bit-identical `reinterpret` when it is some other integer of the
+/// same width.
+///
+/// This exists because the lowering mixes two sources of type. A value the MODULE declared carries
+/// the module's signedness, and a value the lowering SYNTHESIZES carries `i32`: the builtin entry
+/// parameters, the access-chain strides and offsets. `arith` requires its two operands to agree, so
+/// a `uint` index times an i32 stride is invalid IR, and `ir.verify` says so. A width change is not
+/// a reinterpret, so that is refused rather than silently truncated.
+fn coerceTo(func: *Function, block: Block, ty: Type, v: Value) Error!Value {
+    if (func.valueType(v) == ty) return v;
+    if (!sameWidthInt(func, func.valueType(v), ty)) return error.Unsupported;
+    return func.appendInst(block, ty, .{ .unary = .{ .op = .reinterpret, .value = v } });
+}
+
+/// An `arith` whose operands are both coerced to the result type first. Use this wherever either
+/// operand might be a synthesized value; do NOT use it for pointer arithmetic, where the two
+/// operand types differ on purpose.
+fn appendArith(func: *Function, block: Block, ty: Type, bop: ir.function.BinOp, lhs: Value, rhs: Value) Error!Value {
+    const l = try coerceTo(func, block, ty, lhs);
+    const r = try coerceTo(func, block, ty, rhs);
+    return func.appendInst(block, ty, .{ .arith = .{ .op = bop, .lhs = l, .rhs = r } });
+}
+
 /// Lower a non-terminator body instruction, recording its result Value.
 fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
     const value_of = module.value_of;
@@ -1402,7 +1434,7 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
         const lhs = try valueOf(module, try operandAt(inst.operands, 2));
         const rhs = try valueOf(module, try operandAt(inst.operands, 3));
-        value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .arith = .{ .op = bop, .lhs = lhs, .rhs = rhs } });
+        value_of[inst.operands[1]] = try appendArith(func, block, ty, bop, lhs, rhs);
         return;
     }
     if (cmpOpOf(inst.opcode)) |cop| {
@@ -1441,7 +1473,7 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 try func.appendInst(block, ty, .{ .fconst = 0 })
             else
                 try func.appendInst(block, ty, .{ .iconst = 0 });
-            value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = v } });
+            value_of[inst.operands[1]] = try appendArith(func, block, ty, .sub, zero, v);
         },
         op.Not => {
             // Bitwise complement: x ^ -1 (all ones).
@@ -1490,7 +1522,10 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 if (vi.len > 4) return error.Unsupported;
                 const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
                 var out: Vec = .{ .len = @intCast(vi.len) };
-                out.comps[0] = builtinScalarOf(module, ptr_id).?;
+                // The synthesized parameter is i32 and the vector's element type is whatever the
+                // module declared, so the component is coerced rather than left to mismatch the
+                // zeros beside it the first time something does arithmetic on the vector.
+                out.comps[0] = try coerceTo(func, block, elem, builtinScalarOf(module, ptr_id).?);
                 for (1..vi.len) |i| out.comps[i] = try func.appendInst(block, elem, .{ .iconst = 0 });
                 module.vec_of[result] = out;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .sampler) {
@@ -1719,7 +1754,7 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
             const vec = v_of[try idOperandAt(inst.operands, 2, bound)];
             const s = try valueOf(module, try operandAt(inst.operands, 3));
             var out: Vec = .{ .len = vi.len };
-            for (0..vi.len) |i| out.comps[i] = try func.appendInst(block, elem, .{ .arith = .{ .op = .mul, .lhs = vec.comps[i], .rhs = s } });
+            for (0..vi.len) |i| out.comps[i] = try appendArith(func, block, elem, .mul, vec.comps[i], s);
             v_of[inst.operands[1]] = out;
             return true;
         },
@@ -1781,7 +1816,7 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
                     const a = v_of[try idOperandAt(inst.operands, 2, bound)];
                     const b = v_of[try idOperandAt(inst.operands, 3, bound)];
                     var out: Vec = .{ .len = vi.len };
-                    for (0..vi.len) |i| out.comps[i] = try func.appendInst(block, elem, .{ .arith = .{ .op = bop, .lhs = a.comps[i], .rhs = b.comps[i] } });
+                    for (0..vi.len) |i| out.comps[i] = try appendArith(func, block, elem, bop, a.comps[i], b.comps[i]);
                     v_of[inst.operands[1]] = out;
                     return true;
                 }
@@ -2225,7 +2260,9 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
             },
             .array => |arr| {
                 const stride: u32 = if (module.array_stride[cur_type] != 0) module.array_stride[cur_type] else @intCast(vulcanScalarSize(func, scalarType(module.types, arr.elem) orelse return error.Unsupported));
-                const idx = try valueOf(module, idx_id);
+                // Offsets are computed in i32 throughout, so a module-typed index (a `uint` array
+                // subscript, say) is coerced into that once rather than mixed with it.
+                const idx = try coerceTo(func, block, module.i32_t, try valueOf(module, idx_id));
                 const stride_c = try func.appendInst(block, module.i32_t, .{ .iconst = stride });
                 const term = try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .mul, .lhs = idx, .rhs = stride_c } });
                 offset_val = if (offset_val) |o| try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .add, .lhs = o, .rhs = term } }) else term;

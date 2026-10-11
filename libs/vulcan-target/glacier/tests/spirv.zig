@@ -399,3 +399,29 @@ test "a per-lane branch is refused rather than sent whichever way lane zero went
         glacier.isel.compileKernel(allocator, &f, .{ .profile = .@"gc1.n" }),
     );
 }
+
+test "every lowered module is valid IR" {
+    // The lowering mixes types the module declared with i32 values it synthesizes itself, so an
+    // `arith` between them used to be invalid IR that `ir.verify` rejected. Nothing downstream
+    // noticed, because the Glacier selector reads signedness from the left operand and add, sub
+    // and mul have identical bits either way. A consumer that verifies, or a pass that trusts
+    // operand types, would not have been so forgiving.
+    const allocator = std.testing.allocator;
+    const builders = [_]*const fn (std.mem.Allocator) anyerror!spirv.binary.Builder{
+        fillModule,
+        zigShapedModule,
+        stdSpirvShapedModule,
+        perLaneModule,
+    };
+    for (builders) |build| {
+        var b = try build(allocator);
+        defer b.deinit(allocator);
+        for ([_]bool{ false, true }) |as_globals| {
+            var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = as_globals });
+            defer func.deinit();
+            var diags = try ir.verify.verify(allocator, &func, .low);
+            defer diags.deinit();
+            try std.testing.expectEqualSlices(ir.verify.Diagnostic, &.{}, diags.items());
+        }
+    }
+}
