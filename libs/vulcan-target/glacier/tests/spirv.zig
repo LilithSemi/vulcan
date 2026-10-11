@@ -649,3 +649,73 @@ fn widthModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
     try b.emit(allocator, op.FunctionEnd, &.{});
     return b;
 }
+
+/// A FUNCTION-storage local typed as a two-field struct of u32, the shape Zig's SPIR-V backend
+/// emits for a small local struct. Each field is stored through a constant-index access chain,
+/// then the whole struct is loaded back and its fields extracted and summed, which exercises the
+/// scalar replacement that turns the local into one alloca per field.
+///
+/// `out.elems[0] = local.a + local.b` where `local.a = 10`, `local.b = 20`.
+fn structLocalModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 u32=2 structT=3 pFnStruct=4 pFnU32=5 c0=6 c1=7 c10=8 c20=9 c4096=10 arr=11
+    //      structSB=12 pSbStruct=13 pSbArr=14 pSbU32=15 voidfn=16 out=17 main=18 entry=19
+    //      local=20 chain0=21 chain1=22 loaded=23 ext0=24 ext1=25 sum=26 pElems=27 pElem=28.
+    var b = try spirv.binary.Builder.init(allocator, 29);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 18, 0x6E69616D, 0, 17 });
+    try b.emit(allocator, op.Name, &.{ 17, 0x0074756F });
+    try b.emit(allocator, op.MemberDecorate, &.{ 12, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeStruct, &.{ 3, 2, 2 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.function, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.function, 2 });
+    try b.emit(allocator, op.Constant, &.{ 2, 6, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 7, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 8, 10 });
+    try b.emit(allocator, op.Constant, &.{ 2, 9, 20 });
+    try b.emit(allocator, op.Constant, &.{ 2, 10, 4096 });
+    try b.emit(allocator, op.TypeArray, &.{ 11, 2, 10 });
+    try b.emit(allocator, op.TypeStruct, &.{ 12, 11 });
+    try b.emit(allocator, op.TypePointer, &.{ 13, op.StorageClass.storage_buffer, 12 });
+    try b.emit(allocator, op.TypePointer, &.{ 14, op.StorageClass.storage_buffer, 11 });
+    try b.emit(allocator, op.TypePointer, &.{ 15, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 16, 1 });
+    try b.emit(allocator, op.Variable, &.{ 13, 17, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 18, 0, 16 });
+    try b.emit(allocator, op.Label, &.{19});
+    try b.emit(allocator, op.Variable, &.{ 4, 20, op.StorageClass.function });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 5, 21, 20, 6 });
+    try b.emit(allocator, op.Store, &.{ 21, 8 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 5, 22, 20, 7 });
+    try b.emit(allocator, op.Store, &.{ 22, 9 });
+    try b.emit(allocator, op.Load, &.{ 3, 23, 20 });
+    try b.emit(allocator, op.CompositeExtract, &.{ 2, 24, 23, 0 });
+    try b.emit(allocator, op.CompositeExtract, &.{ 2, 25, 23, 1 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 26, 24, 25 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 14, 27, 17, 6 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 15, 28, 27, 6 });
+    try b.emit(allocator, op.Store, &.{ 28, 26 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "a function-storage struct local scalarizes to one alloca per field" {
+    const allocator = std.testing.allocator;
+    var b = try structLocalModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    var data: [1]u32 = .{0xFFFF_FFFF};
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    _ = try warp.run(words, &mem, &one, 10_000);
+    try std.testing.expectEqual(@as(u32, 30), data[0]);
+}

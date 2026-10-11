@@ -164,6 +164,13 @@ const Module = struct {
     local_is_vec: []bool, // id -> whether it is a tracked Function-storage vector local
     local_vec: []Vec, // local var id -> the scalarized vector last stored to it
     local_comp_of: []?LocalComp, // access-chain result id -> (local var id, component index)
+    // A Function-storage local whose pointee is a flat (all-scalar-member) struct scalarizes to
+    // one alloca per field, in member order, so mem2reg promotes each field exactly like a plain
+    // scalar local. A constant-index access chain into it resolves straight to that field's
+    // alloca (see lowerAccessChain), so loads and stores through the chain need no new code; only
+    // a whole-struct OpLoad/OpStore (operand IS the var id, not a chain result) needs one. Null
+    // for anything that is not a tracked struct local.
+    local_struct: []?[]Value,
     buffers: std.ArrayList(u32) = .empty, // storage-buffer var ids, declaration order
     has_global_id: bool = false,
     // A compute kernel that divides work by WARP rather than by thread reads WorkgroupId and
@@ -566,6 +573,7 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         .local_is_vec = undefined,
         .local_vec = undefined,
         .local_comp_of = undefined,
+        .local_struct = undefined,
         .is_builtin_ptr = undefined,
         .sampler_ptr_of = undefined,
         .input_comp_of = undefined,
@@ -945,6 +953,13 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     defer allocator.free(local_comp_of);
     @memset(local_comp_of, null);
     module.local_comp_of = local_comp_of;
+    const local_struct = try allocator.alloc(?[]Value, bound);
+    defer {
+        for (local_struct) |maybe_fields| if (maybe_fields) |fields| allocator.free(fields);
+        allocator.free(local_struct);
+    }
+    @memset(local_struct, null);
+    module.local_struct = local_struct;
     // Classify surviving Function-storage vector OpVariables (mem2reg leaves these when a
     // component's address is taken) so the body's store/load/access-chain scalarize them.
     {
@@ -1571,6 +1586,19 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 const lv = module.local_vec[lc.local];
                 if (lc.comp >= lv.len) return error.MalformedModule;
                 value_of[result] = lv.comps[lc.comp];
+            } else if (ptr_id < module.local_struct.len and module.local_struct[ptr_id] != null) {
+                // A whole-struct load of a tracked Function-storage struct local: fetch each
+                // field's current value and scalarize them into a Vec, exactly like a whole
+                // vector load, so the following OpCompositeExtract narrows it the same way.
+                const fields = module.local_struct[ptr_id].?;
+                const struct_ty = module.var_pointee(ptr_id) orelse return error.MalformedModule;
+                var out: Vec = .{ .len = @intCast(fields.len) };
+                for (fields, 0..) |slot, i| {
+                    const m = module.members.get(memberKey(struct_ty, @intCast(i))) orelse return error.MalformedModule;
+                    const fty = scalarType(module.types, m.type_id) orelse return error.Unsupported;
+                    out.comps[i] = try func.appendInst(block, fty, .{ .load = .{ .ptr = slot } });
+                }
+                module.vec_of[result] = out;
             } else if (builtinScalarOf(module, ptr_id) != null and vectorInfo(module.types, inst.operands[0]) != null) {
                 // A WHOLE-VECTOR load of a uvec3 builtin, which a following OpCompositeExtract
                 // then narrows. Zig's SPIR-V backend writes it this way where glslang reads `.x`
@@ -1676,6 +1704,15 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 module.local_vec[lc.local].comps[lc.comp] = sv;
                 return;
             }
+            // A whole-struct store to a tracked Function-storage struct local: write each
+            // scalarized component into its field's alloca.
+            if (ptr_id < module.local_struct.len and module.local_struct[ptr_id] != null) {
+                const fields = module.local_struct[ptr_id].?;
+                const comps = scalarComps(module, val_id) catch return error.MalformedModule;
+                if (comps.len != fields.len) return error.MalformedModule;
+                for (fields, comps) |slot, cv| try func.appendStore(block, cv, slot);
+                return;
+            }
             // Pattern B: a store through the gl_PerVertex Position member access chain is
             // the clip-space position output (routed to ATTR_POSITION). A store through a
             // non-position member (PointSize etc.) is dropped - we model position only.
@@ -1726,11 +1763,19 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             // store/load/access-chain are handled below). Its declaration needs no IR.
             if (module.local_is_vec[result]) return;
             if (try operandAt(inst.operands, 2) != op.StorageClass.function) return error.Unsupported;
+            const pointee = module.var_pointee(result) orelse return error.Unsupported;
+            // A flat (all-scalar-member) struct local scalarizes to one alloca per field (see
+            // structFieldAllocas); an initializer would need decomposing into per-field stores,
+            // which no caller here needs, so it is refused rather than guessed at.
+            if (module.types[pointee]) |ti| if (ti == .@"struct") {
+                if (inst.operands.len >= 4) return error.Unsupported;
+                module.local_struct[result] = try structFieldAllocas(allocator, func, module, block, pointee);
+                return;
+            };
             // A scalar Function-storage local becomes an `alloca`, and its loads and stores stay
             // loads and stores. The shared `mem2reg` promotes it to SSA with real phis afterwards,
             // which is where that belongs: a frontend tracking "the last value stored" cannot
             // build a phi, and a loop counter is exactly a value that needs one.
-            const pointee = module.var_pointee(result) orelse return error.Unsupported;
             const elem = scalarType(module.types, pointee) orelse return error.Unsupported;
             const slot = try func.appendInst(block, module.ptr_t, .{ .alloca = .{ .elem = elem } });
             value_of[result] = slot;
@@ -2232,6 +2277,24 @@ fn lowerExtInst(allocator: std.mem.Allocator, func: *Function, module: *Module, 
     }
 }
 
+/// Scalarize a flat, all-scalar-member struct into one `alloca` per field, in member order, so
+/// the shared `mem2reg` promotes each field exactly like a plain scalar local would. A member
+/// that is itself a struct/array/vector is not flat, and refuses with `error.Unsupported` (only
+/// the flat case is scalarized); so does a struct with no members, or more than a `Vec` can hold
+/// a whole load into (`vec_of`'s component cap, matched below).
+fn structFieldAllocas(allocator: std.mem.Allocator, func: *Function, module: *Module, block: Block, struct_ty: u32) Error![]Value {
+    var fields: std.ArrayList(Value) = .empty;
+    errdefer fields.deinit(allocator);
+    var i: u32 = 0;
+    while (true) : (i += 1) {
+        const m = module.members.get(memberKey(struct_ty, i)) orelse break;
+        const fty = scalarType(module.types, m.type_id) orelse return error.Unsupported;
+        try fields.append(allocator, try func.appendInst(block, module.ptr_t, .{ .alloca = .{ .elem = fty } }));
+    }
+    if (fields.items.len == 0 or fields.items.len > 4) return error.Unsupported;
+    return fields.toOwnedSlice(allocator);
+}
+
 /// Lower `OpAccessChain`: produce a pointer Value by walking the index chain (a
 /// getelementpointer). A chain into the `gl_GlobalInvocationID` builtin is marked (a later
 /// load yields the invocation id). Otherwise the byte offset is accumulated: a struct
@@ -2252,6 +2315,18 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     if (base < module.local_is_vec.len and module.local_is_vec[base] and indices.len == 1) {
         const comp: u32 = @intCast(try constValOf(module, indices[0]));
         module.local_comp_of[result] = .{ .local = base, .comp = @intCast(comp) };
+        return;
+    }
+    // A constant-index chain into a tracked Function-storage struct local: the member index
+    // resolves straight to that field's alloca (struct member indices are always OpConstant per
+    // the SPIR-V spec), so the following OpLoad/OpStore is an ordinary load/store and needs no
+    // further tracking. A multi-index chain (nesting into the field) is not scalarized.
+    if (base < module.local_struct.len and module.local_struct[base] != null) {
+        const fields = module.local_struct[base].?;
+        if (indices.len != 1) return error.Unsupported;
+        const member: u32 = @intCast(try constValOf(module, indices[0]));
+        if (member >= fields.len) return error.MalformedModule;
+        module.value_of[result] = fields[member];
         return;
     }
     // A chain into gl_VertexIndex / gl_InstanceIndex (a scalar BuiltIn input): the result
