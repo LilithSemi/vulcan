@@ -271,6 +271,10 @@ pub const MatrixTimesMatrix = 146;
 pub const Dot = 148;
 
 // Misc.
+/// `OpCopyObject`: the result IS the operand, with no change of bits or type. spirv-opt leaves
+/// these behind where it folded something away, and it is an ordinary instruction any producer may
+/// emit, so the lowering aliases the value rather than copying it.
+pub const CopyObject = 83;
 pub const Select = 169;
 pub const Variable = 59;
 pub const Load = 61;

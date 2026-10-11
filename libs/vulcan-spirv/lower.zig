@@ -1495,6 +1495,26 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             const v = try valueOf(module, try operandAt(inst.operands, 2));
             value_of[inst.operands[1]] = try func.appendArithImm(block, ty, .bit_xor, v, -1);
         },
+        op.LogicalNot => {
+            // A bool holds 0 or 1, so the complement is x ^ 1, NOT the all-ones flip above: that
+            // would turn `true` into a value no comparison produces.
+            const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            const v = try valueOf(module, try operandAt(inst.operands, 2));
+            value_of[inst.operands[1]] = try func.appendArithImm(block, ty, .bit_xor, v, 1);
+        },
+        op.CopyObject => {
+            // The result IS the operand. A vector or matrix operand is carried as the scalarized
+            // form it already has, so the copy is an alias in every case and emits nothing.
+            const src = try idOperandAt(inst.operands, 2, bound);
+            const result = inst.operands[1];
+            if (module.vec_of[src].len != 0) {
+                module.vec_of[result] = module.vec_of[src];
+            } else if (module.mat_of[src].cols != 0) {
+                module.mat_of[result] = module.mat_of[src];
+            } else {
+                value_of[result] = try valueOf(module, src);
+            }
+        },
         op.ExtInst => try lowerExtInst(allocator, func, module, block, inst),
         op.DPdx, op.DPdy, op.Fwidth => {
             // A scalar screen-space derivative of a varying scalar.
