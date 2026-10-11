@@ -746,3 +746,35 @@ test "the scalar divide matches the standard layout" {
     // nowhere. Checked: it did not appear in any suite until it moved.
     try std.testing.expectEqual(@as(u32, 0x18a4f453), glacier.encode.fdiv(.x8, .x9, .x10));
 }
+
+test "a per-lane value stays per-lane through a signedness convert" {
+    // `convert` is in the set `checkSupported` accepts, so the divergence analysis has to visit
+    // its operand. Without that the result of a convert reads as warp-uniform while its source
+    // sits in a vector register, and the two register files are indexed by the same number.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const signed = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const shifted = try f.appendArithImm(entry, i32_t, .add, signed, 100);
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, shifted, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(100 + i)), data[i]);
+    }
+}

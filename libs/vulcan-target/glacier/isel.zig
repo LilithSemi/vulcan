@@ -198,8 +198,13 @@ fn laneVarying(b: gpu.builtin.Builtin) bool {
     };
 }
 
-/// Visit every value `inst` reads. Exhaustive over the opcodes `checkSupported` accepts, so a new
-/// one cannot quietly get an empty operand list and be treated as uniform.
+/// Visit every value `inst` reads.
+///
+/// Every opcode `checkSupported` accepts must have an arm here. The trailing `else` cannot be
+/// `unreachable`, because this runs BEFORE admission and so sees opcodes that are about to be
+/// refused. That makes the two lists a pair that has to be kept in step by hand: an opcode added
+/// to the accepted set and not added here reads as warp-uniform, and its result then names a
+/// scalar register with a vector register's number. `convert` did exactly that.
 fn forEachOperand(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value) void) void {
     switch (func.opcode(inst)) {
         .iconst, .global_addr, .barrier => {},
@@ -209,6 +214,7 @@ fn forEachOperand(func: *const Function, inst: Inst, ctx: anytype, comptime f: f
             f(ctx, a.rhs);
         },
         .arith_imm => |a| f(ctx, a.lhs),
+        .convert => |cv| f(ctx, cv.value),
         .icmp => |c| {
             f(ctx, c.lhs);
             f(ctx, c.rhs);
