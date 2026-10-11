@@ -193,6 +193,12 @@ pub fn vfcvt_rtz_xu_f_v(vd: VReg, vs2: VReg) u32 {
     return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (@as(u32, 0b00110) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010010) << 26);
 }
 
+/// `vfncvt.f.f.w vd, vs2`: per-lane NARROWING float to float, one width down. The third member of
+/// the same `funct6` family as the two converts above, again selected by the `vs1` field.
+pub fn vfncvt_f_f_w(vd: VReg, vs2: VReg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (@as(u32, 0b10100) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010010) << 26);
+}
+
 /// `vfmv.f.s rd, vs2`: move lane 0 to a float register (the unpack primitive).
 pub fn vfmv_f_s(rd: FReg, vs2: VReg) u32 {
     return 0b1010111 | (fnum(rd) << 7) | (0b001 << 12) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010000) << 26);
@@ -1649,10 +1655,11 @@ test "integer RVV encodings match LLVM's assembler" {
     try std.testing.expectEqual(@as(u32, 0x0206e7a7), vse32(.v15, .x13));
 }
 
-test "the widening MAC and the two converts match LLVM's assembler" {
+test "the widening MAC and the three converts match LLVM's assembler" {
     try std.testing.expectEqual(@as(u32, 0xf2a49457), vfwmacc_vv(.v8, .v9, .v10));
     try std.testing.expectEqual(@as(u32, 0x4a919457), vfcvt_f_x_v(.v8, .v9));
     try std.testing.expectEqual(@as(u32, 0x4a931457), vfcvt_rtz_xu_f_v(.v8, .v9));
+    try std.testing.expectEqual(@as(u32, 0x4a9a1457), vfncvt_f_f_w(.v8, .v9));
 }
 
 test "encodes single-precision float arithmetic" {
