@@ -148,6 +148,9 @@ pub const BuiltIn = struct {
     pub const front_facing = 17; // gl_FrontFacing (a fragment-shader bool input)
     pub const frag_depth = 22; // gl_FragDepth (a fragment-shader depth output)
     pub const num_workgroups = 24; // gl_NumWorkGroups (a compute-shader uvec3 input)
+    /// gl_WorkGroupSize. The Vulkan convention decorates a CONSTANT with this, but Zig's SPIR-V
+    /// backend declares it as an ordinary Input variable, which is the form handled here.
+    pub const workgroup_size = 25;
     pub const workgroup_id = 26;
     pub const local_invocation_id = 27;
     pub const global_invocation_id = 28;

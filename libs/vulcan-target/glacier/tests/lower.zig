@@ -691,9 +691,6 @@ test "a per-lane operation against a constant has a vector form for every operat
     const lanes = glacier.encode.Profile.@"gc1.n".lanes();
     var data: [8]u32 = @splat(0xFFFF_FFFF);
     try runOnce(words, &data, 0, 1);
-    std.debug.print("DATA:", .{});
-    for (data) |d| std.debug.print(" {x}", .{d});
-    std.debug.print("\n", .{});
     for (0..lanes) |i| {
         const tidv: u32 = @intCast(i);
         const want = (((tidv & 6) ^ 1) % 3) -% 1;

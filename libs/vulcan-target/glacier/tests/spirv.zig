@@ -502,3 +502,150 @@ test "gl_LocalInvocationID is the lane index" {
     // rising sequence instead.
     for (data, 0..) |got, i| try std.testing.expectEqual(@as(u32, @intCast(i % lanes)) * 10, got);
 }
+
+/// A kernel that keeps a value in a FUNCTION-storage local across a branch, which is the shape
+/// Zig's SPIR-V backend emits for any local variable. The two arms store different values and the
+/// merge block loads it, so promoting the slot needs a real phi: tracking "the last value stored"
+/// cannot answer what the merge sees. The shared `mem2reg` does that, which is why the selector
+/// runs it before anything else.
+///
+/// `out.elems[0] = if (gl_WorkGroupID.x < 1) 10 else 20`
+fn functionLocalModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 u32=2 bool=3 v3u32=4 pInV3=5 pInU=6 pFnU=7 c4096=8 arr=9 struct=10
+    //      pSbStruct=11 pSbArr=12 pSbU32=13 voidfn=14 c0=15 c1=16 c10=17 c20=18 wid=19 out=20
+    //      main=21 entry=22 slot=23 widx=24 w=25 cmp=26 then=27 els=28 merge=29 got=30
+    //      pElems=31 pElem=32.
+    var b = try spirv.binary.Builder.init(allocator, 33);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 21, 0x6E69616D, 0, 19, 20 });
+    try b.emit(allocator, op.Name, &.{ 20, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 19, op.Decoration.builtin, op.BuiltIn.workgroup_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 10, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeBool, &.{3});
+    try b.emit(allocator, op.TypeVector, &.{ 4, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.TypePointer, &.{ 7, op.StorageClass.function, 2 });
+    try b.emit(allocator, op.Constant, &.{ 2, 8, 4096 });
+    try b.emit(allocator, op.TypeArray, &.{ 9, 2, 8 });
+    try b.emit(allocator, op.TypeStruct, &.{ 10, 9 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 10 });
+    try b.emit(allocator, op.TypePointer, &.{ 12, op.StorageClass.storage_buffer, 9 });
+    try b.emit(allocator, op.TypePointer, &.{ 13, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 14, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 15, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 16, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 17, 10 });
+    try b.emit(allocator, op.Constant, &.{ 2, 18, 20 });
+    try b.emit(allocator, op.Variable, &.{ 5, 19, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 11, 20, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 21, 0, 14 });
+    try b.emit(allocator, op.Label, &.{22});
+    try b.emit(allocator, op.Variable, &.{ 7, 23, op.StorageClass.function });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 6, 24, 19, 15 });
+    try b.emit(allocator, op.Load, &.{ 2, 25, 24 });
+    try b.emit(allocator, op.ULessThan, &.{ 3, 26, 25, 16 });
+    try b.emit(allocator, op.SelectionMerge, &.{ 29, 0 });
+    try b.emit(allocator, op.BranchConditional, &.{ 26, 27, 28 });
+    try b.emit(allocator, op.Label, &.{27});
+    try b.emit(allocator, op.Store, &.{ 23, 17 });
+    try b.emit(allocator, op.Branch, &.{29});
+    try b.emit(allocator, op.Label, &.{28});
+    try b.emit(allocator, op.Store, &.{ 23, 18 });
+    try b.emit(allocator, op.Branch, &.{29});
+    try b.emit(allocator, op.Label, &.{29});
+    try b.emit(allocator, op.Load, &.{ 2, 30, 23 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 12, 31, 20, 15 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 13, 32, 31, 15 });
+    try b.emit(allocator, op.Store, &.{ 32, 30 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "a function-storage local survives a branch" {
+    const allocator = std.testing.allocator;
+    var b = try functionLocalModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    // No `alloca` reaches the selector: a warp has no stack, so a slot that survived promotion
+    // would have been refused rather than compiled.
+    for ([_]struct { u32, u32 }{ .{ 0, 10 }, .{ 1, 20 } }) |case| {
+        var data: [2]u32 = @splat(0xFFFF_FFFF);
+        var mem: warp.Memory = .{ .base = data_base, .words = &data };
+        var one: warp.Warp = .{ .hart_id = case[0], .hart_count = 2, .lanes = 4 };
+        _ = try warp.run(words, &mem, &one, 10_000);
+        try std.testing.expectEqual(case[1], data[0]);
+    }
+}
+
+test "gl_WorkGroupSize comes from the profile, not from the module" {
+    // A kernel reads the workgroup width to stride its own inner loop. Answering it from the
+    // profile rather than folding the module's declared LocalSize is what lets one kernel fit a
+    // wider or narrower core without being rebuilt.
+    const allocator = std.testing.allocator;
+    var b = try widthModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+
+    for ([_]glacier.encode.Profile{ .@"gc1.n", .@"gc1.s", .@"gc1.f" }) |profile| {
+        const words = try glacier.isel.compileKernel(allocator, &func, .{
+            .profile = profile,
+            .globals = &.{.{ .name = "out", .address = data_base }},
+        });
+        defer allocator.free(words);
+        var data: [1]u32 = .{0xFFFF_FFFF};
+        var mem: warp.Memory = .{ .base = data_base, .words = &data };
+        var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = profile.lanes() };
+        _ = try warp.run(words, &mem, &one, 10_000);
+        try std.testing.expectEqual(@as(u32, profile.lanes()), data[0]);
+    }
+}
+
+/// `out.elems[0] = gl_WorkGroupSize.x`
+fn widthModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 u32=2 v3u32=3 pInV3=4 pInU=5 c4096=6 arr=7 struct=8 pSbStruct=9 pSbArr=10
+    //      pSbU32=11 voidfn=12 c0=13 size=14 out=15 main=16 entry=17 sidx=18 s=19 pElems=20
+    //      pElem=21.
+    var b = try spirv.binary.Builder.init(allocator, 22);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 16, 0x6E69616D, 0, 14, 15 });
+    try b.emit(allocator, op.Name, &.{ 15, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.builtin, op.BuiltIn.workgroup_size });
+    try b.emit(allocator, op.MemberDecorate, &.{ 8, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 3, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.input, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.Constant, &.{ 2, 6, 4096 });
+    try b.emit(allocator, op.TypeArray, &.{ 7, 2, 6 });
+    try b.emit(allocator, op.TypeStruct, &.{ 8, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 12, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 13, 0 });
+    try b.emit(allocator, op.Variable, &.{ 4, 14, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 9, 15, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 16, 0, 12 });
+    try b.emit(allocator, op.Label, &.{17});
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 5, 18, 14, 13 });
+    try b.emit(allocator, op.Load, &.{ 2, 19, 18 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 10, 20, 15, 13 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 21, 20, 13 });
+    try b.emit(allocator, op.Store, &.{ 21, 19 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}

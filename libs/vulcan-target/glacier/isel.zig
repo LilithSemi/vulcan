@@ -98,6 +98,17 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     // splitting mutates the function, so split a clone and leave the caller's input alone.
     var work = try func.clone(allocator);
     defer work.deinit();
+
+    // Promote every stack slot to an SSA value BEFORE anything else looks at the function. A
+    // warp has no stack, so an `alloca` that survives is refused below, and a frontend that keeps
+    // its loop counters in memory (Zig's SPIR-V backend does) would otherwise be rejected for a
+    // reason that has nothing to do with the hardware. This is also why the promotion belongs
+    // here rather than in a frontend: it needs real phis, which only an SSA construction gives.
+    {
+        var analyses: opt.pass.Analyses = .{ .allocator = allocator, .func = &work };
+        defer analyses.deinit();
+        _ = try opt.mem2reg.run(allocator, &work, &analyses);
+    }
     try ir.critical_edge.splitCriticalEdges(allocator, &work);
     const reachable = try ir.reachable.neutralizeUnreachable(allocator, &work);
     allocator.free(reachable);

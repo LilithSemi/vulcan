@@ -130,7 +130,7 @@ pub const GradDesc = struct { slot: u32, axis: enum { x, y } };
 /// `vertex_index` / `instance_index` are vertex-shader BuiltIn INPUTs (gl_VertexIndex /
 /// gl_InstanceIndex): each becomes a synthesized i32 entry param the dispatch supplies
 /// per vertex, exactly like the compute `global_id`.
-const VarKind = enum { buffer, sampler, global_id, workgroup_id, num_workgroups, local_id, vertex_index, instance_index, input, output, other };
+const VarKind = enum { buffer, sampler, global_id, workgroup_id, num_workgroups, local_id, workgroup_size, vertex_index, instance_index, input, output, other };
 
 /// The shader stage an `OpEntryPoint` selects. Lowering produces the attribute interface
 /// for graphics stages, the kernel ABI for compute.
@@ -172,6 +172,7 @@ const Module = struct {
     has_workgroup_id: bool = false,
     has_num_workgroups: bool = false,
     has_local_id: bool = false,
+    has_workgroup_size: bool = false,
     value_of: []?Value, // id -> the Vulcan value it lowers to (scalars)
     vec_of: []Vec, // id -> a scalarized vector value's components (len 0 = not a vector)
     mat_of: []Mat, // id -> a scalarized matrix value's elements (cols 0 = not a matrix)
@@ -291,6 +292,7 @@ const Module = struct {
     workgroup_id_value: ?Value = null,
     num_workgroups_value: ?Value = null,
     local_id_value: ?Value = null,
+    workgroup_size_value: ?Value = null,
     has_vertex_index: bool = false,
     vertex_index_value: ?Value = null,
     has_instance_index: bool = false,
@@ -777,6 +779,14 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
             // The const result ids index value_of / vec_of when the constants are materialized.
             op.ConstantTrue => try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 1 }),
             op.ConstantFalse => try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 0 }),
+            // `OpUndef` is legal at MODULE scope as well as in a body, and spirv-opt hoists one
+            // there when it rewrites a dead loop-carried phi. A module-scope one is not a body
+            // instruction, so it registers as the zero constant it lowers to; nothing reads an
+            // undefined value, so any concrete value is sound and zero is the cheapest.
+            op.Undef => if (in_function)
+                try insts.append(allocator, inst)
+            else
+                try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 0 }),
             op.ConstantComposite => {
                 // [type, result, comp0, comp1, ...]: a vector constant whose components
                 // are themselves OpConstants. Record the component ids, materialized
@@ -792,6 +802,10 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
                 try pending_vars.append(allocator, .{ result, storage });
                 var_type[result] = type_id; // the variable's pointer type
                 var_storage[result] = storage;
+                // A variable declared INSIDE the function is also a body instruction: it
+                // allocates a stack slot where a module-scope one names an interface. This arm
+                // claims the opcode, so without this the body lowering would never see it.
+                if (in_function) try insts.append(allocator, inst);
             },
             op.Function => {
                 if (in_function) return error.Unsupported; // only the first function
@@ -849,6 +863,9 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         } else if (builtin_decor[id] == op.BuiltIn.num_workgroups) {
             var_kind[id] = .num_workgroups;
             module.has_num_workgroups = true;
+        } else if (builtin_decor[id] == op.BuiltIn.workgroup_size) {
+            var_kind[id] = .workgroup_size;
+            module.has_workgroup_size = true;
         } else if (builtin_decor[id] == op.BuiltIn.local_invocation_id) {
             var_kind[id] = .local_id;
             module.has_local_id = true;
@@ -1029,6 +1046,14 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         const l = try func.appendBlockParam(entry, module.i32_t);
         module.local_id_value = l;
         try gpu.attrs.setBuiltin(func, l, .thread_id_x);
+    }
+    // The workgroup WIDTH. A kernel reads it to stride its own inner loop, and a backend answers
+    // it from the shape it is building for, so the same kernel fits a wider or narrower one
+    // without being rebuilt. That is the point of not folding the module's own LocalSize here.
+    if (module.has_workgroup_size) {
+        const s = try func.appendBlockParam(entry, module.i32_t);
+        module.workgroup_size_value = s;
+        try gpu.attrs.setBuiltin(func, s, .block_dim_x);
     }
     // Vertex-shader BuiltIn inputs (gl_VertexIndex / gl_InstanceIndex) become synthesized
     // i32 entry params BEFORE the f32 attribute inputs and the buffer pointers, tagged so
@@ -1401,6 +1426,7 @@ fn builtinScalarOf(module: *const Module, id: u32) ?Value {
         .workgroup_id => module.workgroup_id_value,
         .num_workgroups => module.num_workgroups_value,
         .local_id => module.local_id_value,
+        .workgroup_size => module.workgroup_size_value,
         else => null,
     };
 }
@@ -1584,6 +1610,8 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 value_of[result] = module.num_workgroups_value orelse return error.MalformedModule;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .local_id) {
                 value_of[result] = module.local_id_value orelse return error.MalformedModule;
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .workgroup_size) {
+                value_of[result] = module.workgroup_size_value orelse return error.MalformedModule;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .vertex_index) {
                 // A load of gl_VertexIndex (directly or through a scalar access chain) is
                 // the synthesized per-vertex index param.
@@ -1693,10 +1721,23 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         },
         op.ImageFetch => try lowerImageFetch(func, module, block, inst),
         op.Variable => {
+            const result = try idOperandAt(inst.operands, 1, bound);
             // A tracked Function-storage vector local is scalarized via local_vec (its
             // store/load/access-chain are handled below). Its declaration needs no IR.
-            if (inst.operands[1] < module.local_is_vec.len and module.local_is_vec[inst.operands[1]]) return;
-            return error.Unsupported; // other function-local variables (alloca) not yet modeled
+            if (module.local_is_vec[result]) return;
+            if (try operandAt(inst.operands, 2) != op.StorageClass.function) return error.Unsupported;
+            // A scalar Function-storage local becomes an `alloca`, and its loads and stores stay
+            // loads and stores. The shared `mem2reg` promotes it to SSA with real phis afterwards,
+            // which is where that belongs: a frontend tracking "the last value stored" cannot
+            // build a phi, and a loop counter is exactly a value that needs one.
+            const pointee = module.var_pointee(result) orelse return error.Unsupported;
+            const elem = scalarType(module.types, pointee) orelse return error.Unsupported;
+            const slot = try func.appendInst(block, module.ptr_t, .{ .alloca = .{ .elem = elem } });
+            value_of[result] = slot;
+            // An OpVariable may carry an initializer, which is a store at the declaration.
+            if (inst.operands.len >= 4) {
+                try func.appendStore(block, try valueOf(module, inst.operands[3]), slot);
+            }
         },
         op.Phi, op.FunctionParameter => {},
         op.SelectionMerge, op.LoopMerge, op.Name, op.MemberName, op.Decorate, op.MemberDecorate => {},
@@ -2224,7 +2265,7 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     // A chain into gl_WorkGroupID / gl_NumWorkGroups. These ARE uvec3, so a kernel reads `.x`
     // through a chain rather than loading the variable, which makes this the normal path and not
     // the defensive one above.
-    if (base < module.var_kind.len and (module.var_kind[base] == .workgroup_id or module.var_kind[base] == .num_workgroups or module.var_kind[base] == .local_id)) {
+    if (base < module.var_kind.len and (module.var_kind[base] == .workgroup_id or module.var_kind[base] == .num_workgroups or module.var_kind[base] == .local_id or module.var_kind[base] == .workgroup_size)) {
         if (result < module.var_kind.len) module.var_kind[result] = module.var_kind[base];
         return;
     }
