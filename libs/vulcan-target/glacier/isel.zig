@@ -29,6 +29,7 @@ const glacier = @import("encode.zig");
 
 const rv = glacier.rv;
 const Reg = glacier.Reg;
+const VReg = rv.VReg;
 const Function = ir.function.Function;
 const Value = ir.function.Value;
 const Block = ir.function.Block;
@@ -59,7 +60,20 @@ const allocatable: [29]u16 = blk: {
     break :blk regs;
 };
 
-const scratch_set: [1]u16 = .{@backingInt(scratch)};
+/// The vector register this lowering keeps for itself, to splat a warp-uniform value into a lane
+/// vector and to break a parallel-copy cycle. Never allocatable.
+const vscratch: VReg = .v31;
+
+/// v1 to v30. `v0` is reserved because it is the only register that PREDICATES: a mask has to be
+/// moved into it to be applied. Nothing here predicates yet, so reserving it costs one register
+/// and buys the guarantee that no value can be sitting in it when masks arrive.
+const allocatable_v: [30]u16 = blk: {
+    var regs: [30]u16 = undefined;
+    for (&regs, 1..) |*r, i| r.* = i;
+    break :blk regs;
+};
+
+const scratch_set: [2]u16 = .{ @backingInt(scratch), @backingInt(vscratch) };
 
 /// Where a global the kernel names lives. A Glacier kernel reaches memory by absolute address:
 /// the host knows where it put the framebuffer, and the kernel is built for that address.
@@ -87,14 +101,26 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     const reachable = try ir.reachable.neutralizeUnreachable(allocator, &work);
     allocator.free(reachable);
 
-    try checkSupported(&work, opts);
+    const divergent = try analyzeDivergence(allocator, &work);
+    defer allocator.free(divergent);
+    var ctx: Ctx = .{ .divergent = divergent };
 
-    const classes = [_]wimmer.RegClass{.{
-        .name = "gpr",
-        .allocatable = &allocatable,
-        .callee_saved = &.{},
-        .slot_bytes = 4,
-    }};
+    try checkSupported(&work, opts, divergent);
+
+    const classes = [_]wimmer.RegClass{
+        .{
+            .name = "gpr",
+            .allocatable = &allocatable,
+            .callee_saved = &.{},
+            .slot_bytes = 4,
+        },
+        .{
+            .name = "vreg",
+            .allocatable = &allocatable_v,
+            .callee_saved = &.{},
+            .slot_bytes = @intCast(opts.profile.lanes() * 4),
+        },
+    };
     var desc: wimmer.RegDescription = .{
         .classes = &classes,
         .classOf = classOf,
@@ -102,7 +128,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
         .entry_fixed = &.{},
         .call_sites = &.{},
         .scratch = &scratch_set,
-        .ctx = undefined,
+        .ctx = &ctx,
         .copySource = copySource,
         .coalesce_block_params = true,
     };
@@ -115,12 +141,16 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     if (slots > opts.profile.scratchBytes() / 4) return error.Unsupported;
     // The deepest slot is reached by one signed 12-bit displacement from `sp`.
     if (slots * 4 > 2048) return error.Unsupported;
+    // A spilled VECTOR would need a vector store to the scratch region and a reload from it.
+    // Nothing emits those yet, so refuse rather than drop the spill and miscompile.
+    if (walloc.slot_count_per_class[1] != 0) return error.Unsupported;
 
     var e: Emitter = .{
         .allocator = allocator,
         .func = &work,
         .opts = opts,
         .alloc = &walloc,
+        .divergent = divergent,
         .spills = slots != 0,
     };
     defer e.deinit();
@@ -129,10 +159,133 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
 }
 
 // ===========================================================================
+// Divergence: which values are per-lane.
+//
+// A Glacier warp is one workgroup and its LANES are the threads, so a value derived from the lane
+// index varies across the lanes and a value that is not is the same in all of them. That split is
+// the whole of the vector lowering: a DIVERGENT value lives in a vector register and its
+// instructions are the RVV forms, a UNIFORM value lives in a scalar register exactly as before.
+//
+// The IR carries no vector type for this. It does not have to: the shape is a property of where a
+// value came from, not of its type, and `thread_id_x` already says a thread is a lane.
+
+/// What the analysis and the emitter share. `desc.ctx` points at it.
+const Ctx = struct { divergent: []const bool };
+
+/// Whether a builtin differs between the lanes of one warp. A warp index is the same in every
+/// lane; a lane or thread index is the point of the exercise.
+fn laneVarying(b: gpu.builtin.Builtin) bool {
+    return switch (b) {
+        .thread_id_x, .lane_id, .global_id_x => true,
+        else => false,
+    };
+}
+
+/// Visit every value `inst` reads. Exhaustive over the opcodes `checkSupported` accepts, so a new
+/// one cannot quietly get an empty operand list and be treated as uniform.
+fn forEachOperand(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value) void) void {
+    switch (func.opcode(inst)) {
+        .iconst, .global_addr, .barrier => {},
+        .unary => |u| f(ctx, u.value),
+        .arith => |a| {
+            f(ctx, a.lhs);
+            f(ctx, a.rhs);
+        },
+        .arith_imm => |a| f(ctx, a.lhs),
+        .icmp => |c| {
+            f(ctx, c.lhs);
+            f(ctx, c.rhs);
+        },
+        .select => |s| {
+            f(ctx, s.cond);
+            f(ctx, s.then);
+            f(ctx, s.@"else");
+        },
+        .load => |l| f(ctx, l.ptr),
+        .store => |st| {
+            f(ctx, st.value);
+            f(ctx, st.ptr);
+        },
+        .@"if" => |cf| f(ctx, cf.cond),
+        else => {},
+    }
+}
+
+/// Which values are per-lane. Seeded from the lane-varying entry builtins and propagated forward
+/// to a fixpoint, because a loop can carry divergence backwards into a block parameter.
+fn analyzeDivergence(allocator: std.mem.Allocator, func: *const Function) Error![]bool {
+    const div = try allocator.alloc(bool, func.valueCount());
+    errdefer allocator.free(div);
+    @memset(div, false);
+
+    for (func.blockParams(@fromBackingInt(0))) |p| {
+        const b = gpu.attrs.builtinOf(func, p) orelse continue;
+        if (laneVarying(b)) div[@backingInt(p)] = true;
+    }
+
+    const Spread = struct {
+        div: []bool,
+        any: bool = false,
+        fn see(self: *@This(), v: Value) void {
+            if (self.div[@backingInt(v)]) self.any = true;
+        }
+    };
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (0..func.blockCount()) |bi| {
+            const block: Block = @fromBackingInt(@intCast(bi));
+            for (func.blockInsts(block)) |inst| {
+                var s: Spread = .{ .div = div };
+                forEachOperand(func, inst, &s, Spread.see);
+                // An operand that varies per lane makes the result vary too.
+                if (func.instResult(inst)) |r| {
+                    if (s.any and !div[@backingInt(r)]) {
+                        div[@backingInt(r)] = true;
+                        changed = true;
+                    }
+                }
+                // An edge argument that varies makes the parameter it feeds vary.
+                if (func.opcode(inst) == .@"if") {
+                    const cf = func.opcode(inst).@"if";
+                    for ([_]ir.function.Jump{ cf.then, cf.@"else" }) |j| {
+                        if (spreadToParams(func, div, j)) changed = true;
+                    }
+                }
+            }
+            if (func.terminator(block)) |term| switch (term) {
+                .jump => |j| if (spreadToParams(func, div, j)) {
+                    changed = true;
+                },
+                .ret => {},
+            };
+        }
+    }
+    return div;
+}
+
+/// Mark each of `j`'s target parameters divergent when the argument feeding it is. Returns whether
+/// anything changed.
+fn spreadToParams(func: *const Function, div: []bool, j: ir.function.Jump) bool {
+    const args = func.blockArgs(j);
+    const params = func.blockParams(j.target);
+    var changed = false;
+    for (args, 0..) |arg, i| {
+        if (i >= params.len) break;
+        if (div[@backingInt(arg)] and !div[@backingInt(params[i])]) {
+            div[@backingInt(params[i])] = true;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// ===========================================================================
 // What this backend accepts.
 
-fn classOf(_: *const anyopaque, _: *const Function, _: Value) u16 {
-    return 0;
+fn classOf(ctx: *const anyopaque, _: *const Function, v: Value) u16 {
+    const c: *const Ctx = @ptrCast(@alignCast(ctx));
+    return if (c.divergent[@backingInt(v)]) 1 else 0;
 }
 
 fn useKind(_: *const anyopaque, _: *const Function, _: Inst, _: Value) wimmer.UseKind {
@@ -171,14 +324,16 @@ fn isSigned(func: *const Function, ty: Type) bool {
 
 /// Reject every shape this lowering does not handle, before anything is emitted. A refusal here
 /// is a clear error; a refusal halfway through emission is a truncated program.
-fn checkSupported(func: *const Function, opts: Options) Error!void {
+fn checkSupported(func: *const Function, opts: Options, divergent: []const bool) Error!void {
     for (0..func.valueCount()) |vi| {
         const v: Value = @fromBackingInt(@intCast(vi));
         if (!isWord(func, func.valueType(v))) return error.Unsupported;
     }
     for (func.blockParams(@fromBackingInt(0))) |p| {
         const b = gpu.attrs.builtinOf(func, p) orelse return error.Unsupported;
-        _ = builtinSource(b) orelse return error.Unsupported;
+        // A lane-varying builtin comes from `vid.v` rather than from a CSR, so it has no
+        // `builtinSource`. See `lanewiseBuiltin`.
+        if (!laneVarying(b)) _ = builtinSource(b) orelse return error.Unsupported;
     }
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
@@ -189,7 +344,11 @@ fn checkSupported(func: *const Function, opts: Options) Error!void {
             .iconst => |c| if (c < std.math.minInt(i32) or c > std.math.maxInt(u32)) return error.Unsupported,
             .arith => |a| _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported,
             .arith_imm => |a| _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported,
-            .icmp, .select => {},
+            // A per-lane compare writes a MASK, and a per-lane select reads one. Masks are the
+            // next slice of this lowering, so refuse rather than compare lane 0 and call it the
+            // answer for the whole warp.
+            .icmp => |c| if (divergent[@backingInt(c.lhs)] or divergent[@backingInt(c.rhs)]) return error.Unsupported,
+            .select => |s| if (divergent[@backingInt(s.cond)]) return error.Unsupported,
             .load => |l| if (!isWord(func, func.valueType(l.ptr))) return error.Unsupported,
             .store => |st| if (!isWord(func, func.valueType(st.value))) return error.Unsupported,
             .global_addr => |g| _ = addressOf(opts, func.symbolName(g.symbol)) orelse return error.Unsupported,
@@ -200,7 +359,13 @@ fn checkSupported(func: *const Function, opts: Options) Error!void {
             // A conditional transfers control, so nothing may follow it in its block, and its
             // block must have no terminator: a terminator there is an edge the allocator would
             // resolve and this emits nothing for.
-            .@"if" => if (i + 1 != insts.len or func.terminator(block) != null) return error.Unsupported,
+            .@"if" => |cf| {
+                if (i + 1 != insts.len or func.terminator(block) != null) return error.Unsupported;
+                // A branch on a per-lane condition is DIVERGENCE: the lanes would need to take
+                // both arms under masks. A scalar branch here would send the whole warp whichever
+                // way lane 0 went, which is a wrong answer and not a slow one.
+                if (divergent[@backingInt(cf.cond)]) return error.Unsupported;
+            },
             else => return error.Unsupported,
         };
         if (func.terminator(block)) |term| switch (term) {
@@ -210,12 +375,12 @@ fn checkSupported(func: *const Function, opts: Options) Error!void {
     }
 }
 
-/// Where a hardware builtin comes from on a Glacier core, or null when the core cannot answer.
+/// Where a WARP-UNIFORM hardware builtin comes from, or null when the core cannot answer.
 ///
 /// A warp is the workgroup: it owns a program counter and a register file, and `mhartid` is
 /// unique across the whole SoC, which is what a workgroup index is. The lanes inside a warp are
-/// the threads, and a lane index is a VECTOR value (`vid.v`), so `thread_id_*` and `lane_id` are
-/// not scalar builtins and are not answered here.
+/// the threads, so a thread or lane index differs between the lanes and comes from `vid.v`
+/// instead. Those are answered by `lanewiseBuiltin`, not here.
 fn builtinSource(b: gpu.builtin.Builtin) ?union(enum) { csr: u12, lanes } {
     return switch (b) {
         .block_id_x => .{ .csr = glacier.Csr.mhartid },
@@ -258,6 +423,40 @@ fn binOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const fn (Reg
     };
 }
 
+/// The vector-vector encoder for a binary operation, or null when the vector unit has no form of
+/// it. The divides are present but NOT worth vectorizing: the integer divider is the one unit the
+/// lanes share and it walks them one at a time, so a vector divide costs what the scalar ones
+/// would. It is still correct, and emitting it keeps a kernel that divides from being refused.
+fn vectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const fn (VReg, VReg, VReg) u32 {
+    const signed = isSigned(func, ty);
+    return switch (op) {
+        .add => rv.vadd_vv,
+        .sub => rv.vsub_vv,
+        .mul => rv.vmul_vv,
+        .div => if (signed) rv.vdiv_vv else rv.vdivu_vv,
+        .rem => if (signed) rv.vrem_vv else rv.vremu_vv,
+        .mulh => if (signed) rv.vmulh_vv else rv.vmulhu_vv,
+        .bit_and => rv.vand_vv,
+        .bit_or => rv.vor_vv,
+        .bit_xor => rv.vxor_vv,
+        .shl => rv.vsll_vv,
+        .shr => if (signed) rv.vsra_vv else rv.vsrl_vv,
+    };
+}
+
+/// The vector-scalar encoder for a binary operation, for the shape where one operand is the same
+/// in every lane. Only the forms that exist; the rest broadcast and use the vector-vector form.
+fn vectorBinOpVx(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const fn (VReg, VReg, Reg) u32 {
+    _ = func;
+    _ = ty;
+    return switch (op) {
+        .add => rv.vadd_vx,
+        .mul => rv.vmul_vx,
+        .shl => rv.vsll_vx,
+        else => null,
+    };
+}
+
 // ===========================================================================
 // Emission.
 
@@ -271,6 +470,8 @@ const Emitter = struct {
     func: *const Function,
     opts: Options,
     alloc: *const wimmer.Allocation,
+    /// Which values are per-lane, so live in a vector register. See `analyzeDivergence`.
+    divergent: []const bool,
     /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
     spills: bool,
     words: std.ArrayList(u32) = .empty,
@@ -313,6 +514,29 @@ const Emitter = struct {
             .reg => |r| regOf(r),
             .slot => error.Unsupported,
         };
+    }
+
+    fn isDivergent(self: *const Emitter, v: Value) bool {
+        return self.divergent[@backingInt(v)];
+    }
+
+    /// The vector register holding per-lane value `v` at `pos`.
+    fn vreg(self: *const Emitter, v: Value, pos: u32) Error!VReg {
+        return switch (self.locAt(v, pos) orelse return error.Unsupported) {
+            .reg => |r| @as(VReg, @fromBackingInt(@as(u5, @intCast(r)))),
+            .slot => error.Unsupported, // a spilled vector; refused before emission
+        };
+    }
+
+    /// `v` as a vector operand. A warp-uniform value is broadcast into the vector scratch first,
+    /// since one operand of a per-lane operation may well be the same in every lane.
+    ///
+    /// At most one operand of an instruction can need this: if every operand were uniform the
+    /// result would be uniform too and the scalar path would have taken it.
+    fn vectorOperand(self: *Emitter, v: Value, pos: u32) Error!VReg {
+        if (self.isDivergent(v)) return self.vreg(v, pos);
+        try self.put(rv.vmv_v_x(vscratch, try self.reg(v, pos)));
+        return vscratch;
     }
 
     /// Materialize `value` into `dst`, using one or two words.
@@ -368,11 +592,15 @@ const Emitter = struct {
         if (self.spills) try self.put(glacier.csrr(sp, glacier.Csr.mscratch));
         for (self.func.blockParams(block)) |p| {
             const home = self.locAt(p, 0) orelse continue;
+            const b = gpu.attrs.builtinOf(self.func, p) orelse return error.Unsupported;
+            if (self.isDivergent(p)) {
+                try self.lanewiseBuiltin(b, try self.vreg(p, 0));
+                continue;
+            }
             const dst: Reg = switch (home) {
                 .reg => |r| regOf(r),
                 .slot => scratch,
             };
-            const b = gpu.attrs.builtinOf(self.func, p) orelse return error.Unsupported;
             switch (builtinSource(b) orelse return error.Unsupported) {
                 .csr => |c| try self.put(glacier.csrr(dst, c)),
                 .lanes => try self.constant(dst, self.opts.profile.lanes()),
@@ -382,6 +610,24 @@ const Emitter = struct {
                 .reg => {},
             }
         }
+    }
+
+    /// A builtin that differs between lanes, into `dst`.
+    ///
+    /// `vid.v` numbers the lanes the launch mask names and leaves the rest holding whatever the
+    /// previous kernel put there. That is safe to build an address from: the vector load and store
+    /// units are gated by the same mask, so a dead lane's address is computed and dropped. It is
+    /// NOT safe to reduce across, which is why a lane count comes from the profile.
+    fn lanewiseBuiltin(self: *Emitter, b: gpu.builtin.Builtin, dst: VReg) Error!void {
+        try self.put(rv.vid_v(dst));
+        if (b != .global_id_x) return;
+        // A global index is this warp's base plus the lane: `mhartid * lanes + vid`. The lane
+        // count is a power of two, so the multiply is a shift.
+        const lanes = self.opts.profile.lanes();
+        try self.put(glacier.csrr(scratch, glacier.Csr.mhartid));
+        try self.put(rv.slli(scratch, scratch, @intCast(std.math.log2_int(u8, lanes))));
+        try self.put(rv.vmv_v_x(vscratch, scratch));
+        try self.put(rv.vadd_vv(dst, dst, vscratch));
     }
 
     /// The parallel copies on the edges that END at `block`, for the edges the predecessor cannot
@@ -448,7 +694,89 @@ const Emitter = struct {
         }
     }
 
+    /// Whether `inst` operates on lanes rather than on one warp-wide value. A result that varies
+    /// per lane decides it; a store has no result, so its address and its value decide instead.
+    fn isVector(self: *const Emitter, inst: Inst) bool {
+        if (self.func.instResult(inst)) |r| return self.isDivergent(r);
+        return switch (self.func.opcode(inst)) {
+            .store => |st| self.isDivergent(st.ptr) or self.isDivergent(st.value),
+            else => false,
+        };
+    }
+
+    /// The per-lane form of an instruction. Every op is unmasked, so it writes every lane the
+    /// launch mask names.
+    fn emitVectorInst(self: *Emitter, inst: Inst, pos: u32) Error!void {
+        switch (self.func.opcode(inst)) {
+            // A gather and a scatter take a scalar base plus a per-lane byte offset. The offset
+            // vector carries the whole address and the base is x0, so no analysis has to prove
+            // the lanes are contiguous. A unit-stride access is the faster form when they are,
+            // and recognizing that is the next optimization rather than a correctness matter.
+            .load => |l| try self.put(rv.vluxei32(
+                try self.vreg(self.func.instResult(inst).?, pos),
+                .x0,
+                try self.vectorOperand(l.ptr, pos),
+            )),
+            .store => |st| {
+                const addr = try self.vectorOperand(st.ptr, pos);
+                // Both operands cannot need the scratch: the address is per-lane here whenever
+                // the value is not, because a uniform store to a uniform address is not a vector
+                // instruction at all.
+                const val = if (self.isDivergent(st.value)) try self.vreg(st.value, pos) else blk: {
+                    if (addr == vscratch) return error.Unsupported;
+                    try self.put(rv.vmv_v_x(vscratch, try self.reg(st.value, pos)));
+                    break :blk vscratch;
+                };
+                try self.put(rv.vsuxei32(val, .x0, addr));
+            },
+            .unary => |u| try self.put(rv.vmv_v_v(
+                try self.vreg(self.func.instResult(inst).?, pos),
+                try self.vectorOperand(u.value, pos),
+            )),
+            .arith => |a| {
+                const dst = try self.vreg(self.func.instResult(inst).?, pos);
+                const f = vectorBinOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
+                // The scalar-operand form when only the right side is warp-uniform, which is the
+                // common shape: a per-lane value combined with a loop invariant.
+                if (self.isDivergent(a.lhs) and !self.isDivergent(a.rhs)) {
+                    if (vectorBinOpVx(self.func, a.op, self.func.valueType(a.lhs))) |g| {
+                        return self.put(g(dst, try self.vreg(a.lhs, pos), try self.reg(a.rhs, pos)));
+                    }
+                }
+                const lhs = try self.vectorOperand(a.lhs, pos);
+                const rhs = try self.vectorOperand(a.rhs, pos);
+                try self.put(f(dst, lhs, rhs));
+            },
+            .arith_imm => |a| try self.emitVectorArithImm(a, inst, pos),
+            else => return error.Unsupported,
+        }
+    }
+
+    fn emitVectorArithImm(self: *Emitter, a: ir.function.ArithImm, inst: Inst, pos: u32) Error!void {
+        const dst = try self.vreg(self.func.instResult(inst).?, pos);
+        const ty = self.func.valueType(a.lhs);
+        const lhs = try self.vectorOperand(a.lhs, pos);
+        if (a.op == .shl or a.op == .shr) {
+            if (a.imm < 0 or a.imm > 31) return error.Unsupported;
+            const shamt: u5 = @intCast(a.imm);
+            return self.put(switch (a.op) {
+                .shl => rv.vsll_vi(dst, lhs, shamt),
+                else => if (isSigned(self.func, ty)) rv.vsra_vi(dst, lhs, shamt) else rv.vsrl_vi(dst, lhs, shamt),
+            });
+        }
+        // Everything else takes the constant through a scalar register and the `.vx` form. The
+        // 5-bit immediate the vector-immediate encoding offers is rarely wide enough to be worth
+        // a second path.
+        const g = vectorBinOpVx(self.func, a.op, ty) orelse return error.Unsupported;
+        const imm: i64 = if (a.op == .sub) -a.imm else a.imm;
+        try self.constant(scratch, lowWord(imm));
+        const op: ir.function.BinOp = if (a.op == .sub) .add else a.op;
+        const h = vectorBinOpVx(self.func, op, ty) orelse g;
+        try self.put(h(dst, lhs, scratch));
+    }
+
     fn emitInst(self: *Emitter, inst: Inst, pos: u32) Error!void {
+        if (self.isVector(inst)) return self.emitVectorInst(inst, pos);
         // A pure instruction nothing reads has no home, so it is dropped. An instruction with no
         // result at all (a store) has no home either, and must NOT be dropped.
         const home: ?wimmer.Location = if (self.func.instResult(inst)) |r|

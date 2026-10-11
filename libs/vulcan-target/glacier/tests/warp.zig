@@ -1,14 +1,19 @@
-//! A model of one Glacier warp's scalar execution, so two word streams can be compared by what
-//! they RENDER rather than by how they are spelled.
+//! A model of one Glacier warp, so two word streams can be compared by what they COMPUTE rather
+//! than by how they are spelled.
 //!
 //! A compiler and a hand assembler pick different registers and a different instruction order, so
-//! a word diff says nothing about whether they agree. Running both and diffing the framebuffer
-//! does. The FPGA is the real answer, and this is what makes a disagreement visible before a
-//! kernel ever reaches it.
+//! a word diff says nothing about whether they agree. Running both and diffing the result does.
+//! The FPGA is the real answer, and this is what makes a disagreement visible before a kernel ever
+//! reaches it.
 //!
-//! It models only what a Glacier core decodes and only what a scalar kernel uses: RV32I, RV32M,
-//! and a CSR read. An unknown word is an error, never a no-op, so a lowering that emits something
-//! this model does not know about is caught rather than silently skipped.
+//! It models only what a Glacier core decodes and only what a kernel uses: RV32I, RV32M, a CSR
+//! read, and the RVV integer subset the lowering emits. An unknown word is an error, never a
+//! no-op, so a lowering that emits something this model does not know about is caught rather than
+//! silently skipped.
+//!
+//! Lane behaviour is modelled faithfully because it cannot be checked any other way here: every
+//! vector write is gated by the launch mask, and a lane outside it keeps `stale_lane`. A kernel
+//! that reads an inactive lane therefore gets an obviously wrong answer instead of a plausible one.
 
 const std = @import("std");
 
@@ -68,12 +73,26 @@ pub const Memory = struct {
     }
 };
 
+/// The widest warp any GC1 profile runs.
+pub const max_lanes = 16;
+
+/// A value left in a lane the launch mask does not name. The hardware leaves whatever the previous
+/// kernel wrote; this model leaves something recognisable instead, so a kernel that reads an
+/// inactive lane produces an obviously wrong answer rather than a plausible one.
+pub const stale_lane: u32 = 0xBAD0_BAD0;
+
 /// One warp: a register file, a program counter, and the identity the hardware gives it.
 pub const Warp = struct {
     x: [32]u32 = @splat(0),
+    /// The vector registers, `lanes` elements of each in use. Lanes past the launch mask hold
+    /// `stale_lane`: every vector write is gated by that mask, so they are never written.
+    v: [32][max_lanes]u32 = @splat(@splat(stale_lane)),
     pc: u32 = 0,
     hart_id: u32,
     hart_count: u32,
+    /// Lanes this warp runs. A warp may be launched NARROWER than the core is wide, and then the
+    /// rest are inactive for its whole life with no instruction able to turn them on.
+    lanes: u8 = 1,
     /// What `mscratch` reads: one past the top of this hart's own scratch slice. Zero on a core
     /// built with no scratch, same as the hardware.
     stack_top: u32 = 0,
@@ -175,6 +194,19 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
             };
             if (taken) warp.pc = (warp.pc -% 4) +% @as(u32, @bitCast(immB(word)));
         },
+        // Vector loads and stores. Only the 32-bit indexed forms, which is what the lowering
+        // emits: lane i accesses `rs1 + vs2[i]`, and only for a lane the launch mask names.
+        0x07, 0x27 => {
+            if (funct3 != 0b110) return error.Illegal; // width must be 32-bit
+            if ((word >> 26) & 0b11 != 0b01) return error.Illegal; // mop must be indexed-unordered
+            if ((word >> 25) & 1 != 1) return error.Illegal; // unmasked only
+            for (0..warp.lanes) |i| {
+                const addr = a +% warp.v[rs2][i];
+                if (mem.crossesHart(addr, warp.hart_id)) return error.CrossHart;
+                const at = try mem.index(addr);
+                if (opcode == 0x07) warp.v[rd][i] = mem.words[at] else mem.words[at] = warp.v[rd][i];
+            }
+        },
         // Loads. Only LW: the lowering emits nothing narrower, so a narrow load here would be a
         // lowering this model has not been taught rather than one it should quietly accept.
         0x03 => {
@@ -213,6 +245,8 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
         },
         // Register-register arithmetic, including the M extension.
         0x33 => warp.set(rd, try arith(funct3, funct7, a, b)),
+        // OP-V: every vector arithmetic form.
+        0x57 => try vectorOp(word, warp),
         // CSR read. CSRRS with x0 as the set mask is the only CSR access a Glacier core decodes.
         0x73 => {
             if (funct3 != 2 or rs1 != 0) return error.Illegal;
@@ -225,6 +259,80 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
         },
         else => return error.Illegal,
     }
+}
+
+/// One OP-V instruction. Every write is gated by the launch mask, so a lane outside it keeps what
+/// it held, which in this model is `stale_lane`.
+fn vectorOp(word: u32, warp: *Warp) Error!void {
+    const vd: u5 = @intCast((word >> 7) & 0x1F);
+    const funct3 = (word >> 12) & 0x7;
+    const src: u5 = @intCast((word >> 15) & 0x1F); // vs1, rs1, or a 5-bit immediate
+    const vs2: u5 = @intCast((word >> 20) & 0x1F);
+    const funct6 = word >> 26;
+    if ((word >> 25) & 1 != 1) return error.Illegal; // unmasked only
+
+    // vid.v and vmv.v.x write a value that does not come from vs2, so they are taken first.
+    if (funct3 == 0b010 and funct6 == 0b010100) {
+        if (src != 17) return error.Illegal; // only vid.v in this group
+        for (0..warp.lanes) |i| warp.v[vd][i] = @intCast(i);
+        return;
+    }
+    if (funct3 == 0b100 and funct6 == 0b010111) {
+        for (0..warp.lanes) |i| warp.v[vd][i] = warp.x[src];
+        return;
+    }
+    if (funct3 == 0b000 and funct6 == 0b010111) {
+        for (0..warp.lanes) |i| warp.v[vd][i] = warp.v[src][i];
+        return;
+    }
+    // vmv.x.s moves lane 0 to a scalar register, so it writes no vector lane.
+    if (funct3 == 0b010 and funct6 == 0b010000) {
+        warp.set(vd, warp.v[vs2][0]);
+        return;
+    }
+
+    for (0..warp.lanes) |i| {
+        const x = warp.v[vs2][i];
+        const y: u32 = switch (funct3) {
+            0b000, 0b010 => warp.v[src][i], // vector-vector
+            0b100, 0b110 => warp.x[src], // vector-scalar
+            0b011 => src, // vector-immediate, zero extended
+            else => return error.Illegal,
+        };
+        // The integer funct6 space is read differently by category: OPIVV/OPIVX/OPIVI take the
+        // shift and bitwise set, OPMVV/OPMVX the multiply and divide set, so 0b100101 is `vsll`
+        // in one and `vmul` in the other.
+        const multiply_group = funct3 == 0b010 or funct3 == 0b110;
+        warp.v[vd][i] = if (multiply_group)
+            try arith(mulFunct3(funct6) orelse return error.Illegal, 0x01, x, y)
+        else switch (funct6) {
+            0b000000 => x +% y,
+            0b000010 => x -% y,
+            0b000011 => y -% x, // vrsub
+            0b001001 => x & y,
+            0b001010 => x | y,
+            0b001011 => x ^ y,
+            0b100101 => x << @truncate(y),
+            0b101000 => x >> @truncate(y),
+            0b101001 => @bitCast(@as(i32, @bitCast(x)) >> @truncate(y)),
+            else => return error.Illegal,
+        };
+    }
+}
+
+/// The scalar M-extension funct3 that computes the same thing as an OPMVV/OPMVX `funct6`, so the
+/// lane arithmetic reuses `arith` instead of restating the multiply and divide rules.
+fn mulFunct3(funct6: u32) ?u32 {
+    return switch (funct6) {
+        0b100101 => 0, // vmul   -> mul
+        0b100111 => 1, // vmulh  -> mulh
+        0b100100 => 3, // vmulhu -> mulhu
+        0b100001 => 4, // vdiv   -> div
+        0b100000 => 5, // vdivu  -> divu
+        0b100011 => 6, // vrem   -> rem
+        0b100010 => 7, // vremu  -> remu
+        else => null,
+    };
 }
 
 fn arith(funct3: u32, funct7: u32, a: u32, b: u32) Error!u32 {
@@ -297,4 +405,64 @@ pub fn render(
         _ = try run(code, &mem, &warp, budget);
     }
     return frame;
+}
+
+const rv = @import("vulcan-target").glacier.encode.rv;
+
+test "vid.v numbers only the launched lanes" {
+    var frame: [4]u32 = @splat(0);
+    var mem: Memory = .{ .base = 0, .words = &frame };
+    // A four-lane warp on a core that could run more. Lanes past the launch mask are never
+    // written, so they keep the recognisable stale value rather than their index.
+    var w: Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    const code = [_]u32{ rv.vid_v(.v1), ebreak };
+    _ = try run(&code, &mem, &w, 10);
+    for (0..4) |i| try std.testing.expectEqual(@as(u32, @intCast(i)), w.v[1][i]);
+    for (4..max_lanes) |i| try std.testing.expectEqual(stale_lane, w.v[1][i]);
+}
+
+test "a scatter writes one word per lane and a gather reads them back" {
+    var frame: [8]u32 = @splat(0);
+    var mem: Memory = .{ .base = 0, .words = &frame };
+    var w: Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    // offsets = vid*4, values = vid+10, scatter to (x0), gather back into v4.
+    const code = [_]u32{
+        rv.vid_v(.v1),
+        rv.vsll_vi(.v2, .v1, 2), // byte offsets
+        rv.addi(.x5, .x0, 10),
+        rv.vadd_vx(.v3, .v1, .x5), // values
+        rv.vsuxei32(.v3, .x0, .v2),
+        rv.vluxei32(.v4, .x0, .v2),
+        ebreak,
+    };
+    _ = try run(&code, &mem, &w, 20);
+    for (0..4) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)) + 10, frame[i]);
+        try std.testing.expectEqual(@as(u32, @intCast(i)) + 10, w.v[4][i]);
+    }
+    // Only the launched lanes touched memory.
+    for (4..8) |i| try std.testing.expectEqual(@as(u32, 0), frame[i]);
+}
+
+test "vector arithmetic covers the forms the lowering emits" {
+    var frame: [1]u32 = @splat(0);
+    var mem: Memory = .{ .base = 0, .words = &frame };
+    var w: Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    const code = [_]u32{
+        rv.vid_v(.v1), // 0 1 2 3
+        rv.addi(.x5, .x0, 3),
+        rv.vmv_v_x(.v2, .x5), // 3 3 3 3
+        rv.vmul_vv(.v3, .v1, .v2), // 0 3 6 9
+        rv.vadd_vv(.v4, .v3, .v1), // 0 4 8 12
+        rv.vsub_vv(.v5, .v4, .v1), // 0 3 6 9
+        rv.vxor_vv(.v6, .v5, .v2), // 3 0 5 10
+        rv.vsrl_vi(.v7, .v4, 2), // 0 1 2 3
+        rv.vmv_x_s(.x6, .v6), // lane 0 of v6 = 3
+        ebreak,
+    };
+    _ = try run(&code, &mem, &w, 30);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 6, 9 }, w.v[5][0..4]);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 0, 5, 10 }, w.v[6][0..4]);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, w.v[7][0..4]);
+    try std.testing.expectEqual(@as(u32, 3), w.x[6]);
 }

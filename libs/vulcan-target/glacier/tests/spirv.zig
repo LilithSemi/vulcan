@@ -11,6 +11,8 @@
 const std = @import("std");
 const spirv = @import("vulcan-spirv");
 const glacier = @import("vulcan-target").glacier;
+const ir = @import("vulcan-ir");
+const gpu = @import("vulcan-gpu");
 
 const warp = @import("warp.zig");
 const op = spirv.opcodes;
@@ -286,4 +288,114 @@ test "a kernel in std.spirv's shape runs on Glacier" {
             try std.testing.expectEqual(if (i < warps) warps else 0xFFFF_FFFF, got);
         }
     }
+}
+
+/// `out.elems[gl_GlobalInvocationID.x] = id * 3 + 1`.
+///
+/// A global invocation id is per-THREAD, and a thread on Glacier is a LANE, so this is the kernel
+/// shape that has to vectorize: the index differs between the lanes of one warp, which makes the
+/// address and the store per-lane too. Compare `fillModule`, which divides work by warp and stays
+/// scalar.
+fn perLaneModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 u32=2 v3u32=3 pInV3=4 pInU=5 c4096=6 arr=7 struct=8 pSbStruct=9 pSbArr=10
+    //      pSbU32=11 voidfn=12 c0=13 gid=14 c3=15 out=16 main=17 entry=18 gidx=19 id=20
+    //      pElems=21 pElem=22 scaled=23 sum=24 c1=25.
+    var b = try spirv.binary.Builder.init(allocator, 26);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 17, 0x6E69616D, 0, 14, 16 });
+    try b.emit(allocator, op.Name, &.{ 16, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.builtin, op.BuiltIn.global_invocation_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 8, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 3, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.input, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.Constant, &.{ 2, 6, 4096 });
+    try b.emit(allocator, op.TypeArray, &.{ 7, 2, 6 });
+    try b.emit(allocator, op.TypeStruct, &.{ 8, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 12, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 13, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 15, 3 });
+    try b.emit(allocator, op.Constant, &.{ 2, 25, 1 });
+    try b.emit(allocator, op.Variable, &.{ 4, 14, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 9, 16, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 17, 0, 12 });
+    try b.emit(allocator, op.Label, &.{18});
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 5, 19, 14, 13 });
+    try b.emit(allocator, op.Load, &.{ 2, 20, 19 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 10, 21, 16, 13 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 22, 21, 20 });
+    try b.emit(allocator, op.IMul, &.{ 2, 23, 20, 15 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 24, 23, 25 });
+    try b.emit(allocator, op.Store, &.{ 22, 24 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "a per-thread kernel fills every lane in one pass" {
+    const allocator = std.testing.allocator;
+    var b = try perLaneModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n", // 4 lanes
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    // One warp of four lanes covers four elements, so two warps cover eight. A scalar lowering
+    // would write one element per warp and leave three of every four untouched.
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    for ([_]u32{ 1, 2 }) |warps| {
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        var mem: warp.Memory = .{ .base = data_base, .words = &data };
+        for (0..warps) |w| {
+            var one: warp.Warp = .{ .hart_id = @intCast(w), .hart_count = warps, .lanes = lanes };
+            _ = try warp.run(words, &mem, &one, 10_000);
+        }
+        const covered = warps * lanes;
+        for (data, 0..) |got, i| {
+            const id: u32 = @intCast(i);
+            try std.testing.expectEqual(if (i < covered) id * 3 + 1 else 0xFFFF_FFFF, got);
+        }
+    }
+
+    // The store really is a scatter, not a scalar store repeated.
+    var scatters: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0x27 and (w >> 26) & 0b11 == 0b01) scatters += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), scatters);
+}
+
+test "a per-lane branch is refused rather than sent whichever way lane zero went" {
+    // Divergence needs masks, which this lowering does not emit yet. The wrong answer it would
+    // otherwise give is the whole warp taking one arm, so this refuses instead.
+    const allocator = std.testing.allocator;
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const then_b = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const c = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = tid, .rhs = zero } });
+    try f.appendIf(entry, c, .{ .target = then_b }, .{ .target = else_b });
+    f.setTerminator(then_b, .{ .ret = ir.function.Ret.none() });
+    f.setTerminator(else_b, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(
+        error.Unsupported,
+        glacier.isel.compileKernel(allocator, &f, .{ .profile = .@"gc1.n" }),
+    );
 }

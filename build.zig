@@ -754,6 +754,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-gpu", .module = vulcan_gpu },
             .{ .name = "vulcan-spirv", .module = vulcan_spirv },
             .{ .name = "vulcan-target", .module = vulcan_target },
         },
