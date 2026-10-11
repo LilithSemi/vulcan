@@ -425,3 +425,80 @@ test "every lowered module is valid IR" {
         }
     }
 }
+
+/// `out.elems[gl_WorkGroupID.x * lanes + gl_LocalInvocationID.x] = gl_LocalInvocationID.x * 10`.
+///
+/// `gl_LocalInvocationID` is the thread's index INSIDE its workgroup, and a workgroup here is one
+/// warp, so this is the lane index. It is the builtin a kernel reaches for when it wants to place
+/// its own lane, and it was unmapped until this test existed. Verified against real Zig output for
+/// `std.spirv.local_invocation_id[0]`.
+fn laneIdModule(allocator: std.mem.Allocator, lanes: u32) !spirv.binary.Builder {
+    // ids: void=1 u32=2 v3u32=3 pInV3=4 pInU=5 c4096=6 arr=7 struct=8 pSbStruct=9 pSbArr=10
+    //      pSbU32=11 voidfn=12 c0=13 wid=14 lid=15 out=16 main=17 entry=18 widx=19 w=20
+    //      lidx=21 l=22 base=23 idx=24 pElems=25 pElem=26 val=27 cLanes=28 cTen=29.
+    var b = try spirv.binary.Builder.init(allocator, 30);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 17, 0x6E69616D, 0, 14, 15, 16 });
+    try b.emit(allocator, op.Name, &.{ 16, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.builtin, op.BuiltIn.workgroup_id });
+    try b.emit(allocator, op.Decorate, &.{ 15, op.Decoration.builtin, op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 8, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 3, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.input, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.Constant, &.{ 2, 6, 4096 });
+    try b.emit(allocator, op.TypeArray, &.{ 7, 2, 6 });
+    try b.emit(allocator, op.TypeStruct, &.{ 8, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 12, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 13, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 28, lanes });
+    try b.emit(allocator, op.Constant, &.{ 2, 29, 10 });
+    try b.emit(allocator, op.Variable, &.{ 4, 14, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 4, 15, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 9, 16, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 17, 0, 12 });
+    try b.emit(allocator, op.Label, &.{18});
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 5, 19, 14, 13 });
+    try b.emit(allocator, op.Load, &.{ 2, 20, 19 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 5, 21, 15, 13 });
+    try b.emit(allocator, op.Load, &.{ 2, 22, 21 });
+    try b.emit(allocator, op.IMul, &.{ 2, 23, 20, 28 }); // warp * lanes
+    try b.emit(allocator, op.IAdd, &.{ 2, 24, 23, 22 }); // + lane
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 10, 25, 16, 13 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 26, 25, 24 });
+    try b.emit(allocator, op.IMul, &.{ 2, 27, 22, 29 }); // lane * 10
+    try b.emit(allocator, op.Store, &.{ 26, 27 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "gl_LocalInvocationID is the lane index" {
+    const allocator = std.testing.allocator;
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    var b = try laneIdModule(allocator, lanes);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    for (0..2) |w| {
+        var one: warp.Warp = .{ .hart_id = @intCast(w), .hart_count = 2, .lanes = lanes };
+        _ = try warp.run(words, &mem, &one, 10_000);
+    }
+    // Each warp writes its own four slots, and the value is the LANE's index times ten, so the
+    // pattern repeats per warp. A lowering that confused the lane with the warp would write a
+    // rising sequence instead.
+    for (data, 0..) |got, i| try std.testing.expectEqual(@as(u32, @intCast(i % lanes)) * 10, got);
+}

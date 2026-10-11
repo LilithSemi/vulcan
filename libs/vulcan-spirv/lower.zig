@@ -130,7 +130,7 @@ pub const GradDesc = struct { slot: u32, axis: enum { x, y } };
 /// `vertex_index` / `instance_index` are vertex-shader BuiltIn INPUTs (gl_VertexIndex /
 /// gl_InstanceIndex): each becomes a synthesized i32 entry param the dispatch supplies
 /// per vertex, exactly like the compute `global_id`.
-const VarKind = enum { buffer, sampler, global_id, workgroup_id, num_workgroups, vertex_index, instance_index, input, output, other };
+const VarKind = enum { buffer, sampler, global_id, workgroup_id, num_workgroups, local_id, vertex_index, instance_index, input, output, other };
 
 /// The shader stage an `OpEntryPoint` selects. Lowering produces the attribute interface
 /// for graphics stages, the kernel ABI for compute.
@@ -171,6 +171,7 @@ const Module = struct {
     // workgroup, so these two are how a kernel finds its own share.
     has_workgroup_id: bool = false,
     has_num_workgroups: bool = false,
+    has_local_id: bool = false,
     value_of: []?Value, // id -> the Vulcan value it lowers to (scalars)
     vec_of: []Vec, // id -> a scalarized vector value's components (len 0 = not a vector)
     mat_of: []Mat, // id -> a scalarized matrix value's elements (cols 0 = not a matrix)
@@ -289,6 +290,7 @@ const Module = struct {
     global_id_value: ?Value = null,
     workgroup_id_value: ?Value = null,
     num_workgroups_value: ?Value = null,
+    local_id_value: ?Value = null,
     has_vertex_index: bool = false,
     vertex_index_value: ?Value = null,
     has_instance_index: bool = false,
@@ -847,6 +849,9 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         } else if (builtin_decor[id] == op.BuiltIn.num_workgroups) {
             var_kind[id] = .num_workgroups;
             module.has_num_workgroups = true;
+        } else if (builtin_decor[id] == op.BuiltIn.local_invocation_id) {
+            var_kind[id] = .local_id;
+            module.has_local_id = true;
         }
     }
 
@@ -1016,6 +1021,14 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         const n = try func.appendBlockParam(entry, module.i32_t);
         module.num_workgroups_value = n;
         try gpu.attrs.setBuiltin(func, n, .grid_dim_x);
+    }
+    // The thread's index INSIDE its workgroup. On a target whose workgroup is one SIMD warp this
+    // is the lane index, which is why it is the one builtin here that a backend may answer with a
+    // per-lane value rather than a scalar.
+    if (module.has_local_id) {
+        const l = try func.appendBlockParam(entry, module.i32_t);
+        module.local_id_value = l;
+        try gpu.attrs.setBuiltin(func, l, .thread_id_x);
     }
     // Vertex-shader BuiltIn inputs (gl_VertexIndex / gl_InstanceIndex) become synthesized
     // i32 entry params BEFORE the f32 attribute inputs and the buffer pointers, tagged so
@@ -1387,6 +1400,7 @@ fn builtinScalarOf(module: *const Module, id: u32) ?Value {
         .global_id => module.global_id_value,
         .workgroup_id => module.workgroup_id_value,
         .num_workgroups => module.num_workgroups_value,
+        .local_id => module.local_id_value,
         else => null,
     };
 }
@@ -1548,6 +1562,8 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 value_of[result] = module.workgroup_id_value orelse return error.MalformedModule;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .num_workgroups) {
                 value_of[result] = module.num_workgroups_value orelse return error.MalformedModule;
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .local_id) {
+                value_of[result] = module.local_id_value orelse return error.MalformedModule;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .vertex_index) {
                 // A load of gl_VertexIndex (directly or through a scalar access chain) is
                 // the synthesized per-vertex index param.
@@ -2188,7 +2204,7 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     // A chain into gl_WorkGroupID / gl_NumWorkGroups. These ARE uvec3, so a kernel reads `.x`
     // through a chain rather than loading the variable, which makes this the normal path and not
     // the defensive one above.
-    if (base < module.var_kind.len and (module.var_kind[base] == .workgroup_id or module.var_kind[base] == .num_workgroups)) {
+    if (base < module.var_kind.len and (module.var_kind[base] == .workgroup_id or module.var_kind[base] == .num_workgroups or module.var_kind[base] == .local_id)) {
         if (result < module.var_kind.len) module.var_kind[result] = module.var_kind[base];
         return;
     }
