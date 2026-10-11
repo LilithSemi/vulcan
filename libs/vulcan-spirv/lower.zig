@@ -10,8 +10,14 @@
 //! synthesized entry parameters (dispatch supplies the buffer base address and the
 //! per-thread invocation id). `OpAccessChain` lowers to pointer arithmetic
 //! (`base + index*stride`), `OpLoad`/`OpStore` to IR load/store. Synthesized
-//! entry-parameter order: invocation id (if the builtin is present), then each storage
-//! buffer in declaration order, then explicit function parameters.
+//! entry-parameter order: invocation id (if the builtin is present), then the workgroup id
+//! and workgroup count (same), then each storage buffer in declaration order, then explicit
+//! function parameters.
+//!
+//! A kernel may divide work by WORKGROUP instead of by thread, reading `gl_WorkGroupID` and
+//! `gl_NumWorkGroups` rather than `gl_GlobalInvocationID`. That is the shape a target whose
+//! workgroup is one SIMD warp needs, since a per-thread index there is a vector and not a
+//! scalar. See `Options.buffers_as_globals` for the other half such a target needs.
 //!
 //! Assumes a storage buffer is `{ T elems[] }` (single array member at offset 0).
 //! Multi-member / nested-struct offsets are not modeled. Vectors, function calls, and
@@ -124,7 +130,7 @@ pub const GradDesc = struct { slot: u32, axis: enum { x, y } };
 /// `vertex_index` / `instance_index` are vertex-shader BuiltIn INPUTs (gl_VertexIndex /
 /// gl_InstanceIndex): each becomes a synthesized i32 entry param the dispatch supplies
 /// per vertex, exactly like the compute `global_id`.
-const VarKind = enum { buffer, sampler, global_id, vertex_index, instance_index, input, output, other };
+const VarKind = enum { buffer, sampler, global_id, workgroup_id, num_workgroups, vertex_index, instance_index, input, output, other };
 
 /// The shader stage an `OpEntryPoint` selects. Lowering produces the attribute interface
 /// for graphics stages, the kernel ABI for compute.
@@ -160,6 +166,11 @@ const Module = struct {
     local_comp_of: []?LocalComp, // access-chain result id -> (local var id, component index)
     buffers: std.ArrayList(u32) = .empty, // storage-buffer var ids, declaration order
     has_global_id: bool = false,
+    // A compute kernel that divides work by WARP rather than by thread reads WorkgroupId and
+    // NumWorkgroups instead of GlobalInvocationID. Glacier is that shape: one warp is the
+    // workgroup, so these two are how a kernel finds its own share.
+    has_workgroup_id: bool = false,
+    has_num_workgroups: bool = false,
     value_of: []?Value, // id -> the Vulcan value it lowers to (scalars)
     vec_of: []Vec, // id -> a scalarized vector value's components (len 0 = not a vector)
     mat_of: []Mat, // id -> a scalarized matrix value's elements (cols 0 = not a matrix)
@@ -272,6 +283,8 @@ const Module = struct {
     ptr_t: Type,
     i32_t: Type,
     global_id_value: ?Value = null,
+    workgroup_id_value: ?Value = null,
+    num_workgroups_value: ?Value = null,
     has_vertex_index: bool = false,
     vertex_index_value: ?Value = null,
     has_instance_index: bool = false,
@@ -293,6 +306,8 @@ const Module = struct {
     is_front_facing: []bool, // input var id -> whether it is the gl_FrontFacing builtin
     is_frag_depth: []bool, // output var id -> whether it is the gl_FragDepth builtin
     var_storage: []u32, // variable id -> its SPIR-V storage class
+    name_words: []const []const u32, // id -> the operand words of its OpName (empty if unnamed)
+    opts: Options, // the lowering choices the caller asked for
 
     fn pointee(self: *const Module, type_id: u32) ?u32 {
         if (type_id >= self.types.len) return null;
@@ -373,9 +388,62 @@ fn valueOf(module: *const Module, id: u32) Error!Value {
     return module.value_of[id] orelse error.MalformedModule;
 }
 
+/// The longest storage-buffer name `buffers_as_globals` accepts. A longer one is refused rather
+/// than truncated: a truncated symbol would quietly fail to match the address the host supplied.
+const max_symbol_len = 128;
+
+/// Decode a SPIR-V literal string from the operand words that hold it, into `out`.
+///
+/// SPIR-V packs four bytes per word, low-order byte first, and terminates with a NUL. The bytes
+/// are read with shifts rather than by reinterpreting the words, so the result does not depend on
+/// the host's byte order. Returns null when the string is unterminated or longer than `out`.
+fn literalString(words: []const u32, out: []u8) ?[]const u8 {
+    var n: usize = 0;
+    for (words) |w| {
+        for (0..4) |i| {
+            const byte: u8 = @truncate(w >> @intCast(i * 8));
+            if (byte == 0) return out[0..n];
+            if (n == out.len) return null;
+            out[n] = byte;
+            n += 1;
+        }
+    }
+    return null;
+}
+
+test "literalString decodes a SPIR-V packed name" {
+    var buf: [16]u8 = undefined;
+    // "out" plus the terminator fills exactly one word.
+    try std.testing.expectEqualStrings("out", literalString(&.{0x00_74_75_6F}, &buf).?);
+    // A name whose length is a multiple of four needs a whole word of padding for the terminator.
+    try std.testing.expectEqualStrings("data", literalString(&.{ 0x61_74_61_64, 0 }, &buf).?);
+    // Unterminated, and longer than the buffer: both refused rather than guessed.
+    try std.testing.expectEqual(@as(?[]const u8, null), literalString(&.{0x64_63_62_61}, &buf));
+    var tiny: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), literalString(&.{0x00_74_75_6F}, &tiny));
+}
+
+pub const Options = struct {
+    /// Lower each storage buffer to a `global_addr` naming the variable, instead of to a pointer
+    /// entry parameter.
+    ///
+    /// A dispatch supplies a buffer's base address at launch, which is why the default is an entry
+    /// parameter. A target with no parameter block cannot receive one: a Glacier kernel reaches
+    /// memory by absolute address and is built for the address the host already chose, so the
+    /// buffer is a symbol the backend resolves (see `vulcan-target/glacier/isel.zig`
+    /// `Options.globals`). The name comes from the variable's `OpName`, so a module that does not
+    /// name its buffers is refused under this option.
+    buffers_as_globals: bool = false,
+};
+
 /// Lower the first function of the SPIR-V module in `words` to a fresh Vulcan IR
 /// function. Caller owns and must `deinit` it.
 pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Function {
+    return lowerModuleFor(allocator, words, .{});
+}
+
+/// `lowerModule` with the lowering choices in `opts`. See `Options`.
+pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Options) Error!Function {
     var r = try binary.Reader.init(words);
     const bound = r.header.id_bound;
 
@@ -429,6 +497,12 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
     const has_binding = try allocator.alloc(bool, bound);
     defer allocator.free(has_binding);
     @memset(has_binding, false);
+    // The operand words of each id's `OpName`, which hold its source name. These are slices into
+    // the caller's `words`, not copies: a name is only read while lowering, and `internSymbol`
+    // copies the one name that outlives it. Empty means the module named nothing for that id.
+    const name_words = try allocator.alloc([]const u32, bound);
+    defer allocator.free(name_words);
+    @memset(name_words, &.{});
     const is_position = try allocator.alloc(bool, bound);
     defer allocator.free(is_position);
     @memset(is_position, false);
@@ -501,6 +575,8 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
         .is_front_facing = is_front_facing,
         .is_frag_depth = is_frag_depth,
         .var_storage = var_storage,
+        .name_words = name_words,
+        .opts = opts,
     };
     defer module.buffers.deinit(allocator);
     defer module.members.deinit(allocator);
@@ -619,6 +695,11 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
                     op.ExecutionModel.fragment => .fragment,
                     else => .compute,
                 };
+            },
+            // [target, name...]. Only kept so a storage buffer can become a `global_addr` under
+            // the source name the host knows it by. See `Options.buffers_as_globals`.
+            op.Name => if (inst.operands.len >= 2) {
+                name_words[try checkId(inst.operands[0], bound)] = inst.operands[1..];
             },
             op.Decorate => if (inst.operands.len >= 3 and inst.operands[1] == op.Decoration.builtin) {
                 const target = try checkId(inst.operands[0], bound);
@@ -755,6 +836,12 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
         } else if (builtin_decor[id] == op.BuiltIn.global_invocation_id) {
             var_kind[id] = .global_id;
             module.has_global_id = true;
+        } else if (builtin_decor[id] == op.BuiltIn.workgroup_id) {
+            var_kind[id] = .workgroup_id;
+            module.has_workgroup_id = true;
+        } else if (builtin_decor[id] == op.BuiltIn.num_workgroups) {
+            var_kind[id] = .num_workgroups;
+            module.has_num_workgroups = true;
         }
     }
 
@@ -908,6 +995,19 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         // tag and treat it as an ordinary register parameter.
         try gpu.attrs.setBuiltin(func, gid, .global_id_x);
     }
+    // A kernel that divides work by workgroup rather than by thread reads these two instead of
+    // the invocation id. They come after it so a module that reads both keeps the invocation id
+    // in the leading slot every existing consumer expects.
+    if (module.has_workgroup_id) {
+        const wid = try func.appendBlockParam(entry, module.i32_t);
+        module.workgroup_id_value = wid;
+        try gpu.attrs.setBuiltin(func, wid, .block_id_x);
+    }
+    if (module.has_num_workgroups) {
+        const n = try func.appendBlockParam(entry, module.i32_t);
+        module.num_workgroups_value = n;
+        try gpu.attrs.setBuiltin(func, n, .grid_dim_x);
+    }
     // Vertex-shader BuiltIn inputs (gl_VertexIndex / gl_InstanceIndex) become synthesized
     // i32 entry params BEFORE the f32 attribute inputs and the buffer pointers, tagged so
     // a GPU backend sources them from the hardware (vertex/instance id registers) and the
@@ -929,6 +1029,20 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     module.grad_entry = entry;
     if (module.stage != .compute) try synthInputAttribs(allocator, func, module, entry);
     for (module.buffers.items) |buf_id| {
+        // A buffer the backend resolves by symbol rather than receives at launch. A sampler is
+        // never this: it is an opaque descriptor the host binds, not memory at an address.
+        if (module.opts.buffers_as_globals) {
+            if (module.var_kind[buf_id] == .sampler) return error.Unsupported;
+            var name_buf: [max_symbol_len]u8 = undefined;
+            const name = literalString(module.name_words[buf_id], &name_buf) orelse return error.Unsupported;
+            if (name.len == 0) return error.Unsupported;
+            const g = try func.appendGlobalAddr(entry, module.ptr_t, name);
+            value_of[buf_id] = g;
+            // The same four-byte promise the parameter form carries, for the same reason: a
+            // backend that cannot assume alignment reads every scalar one byte at a time.
+            try func.addAttr(.{ .value = g }, .{ .@"align" = 4 });
+            continue;
+        }
         const p = try func.appendBlockParam(entry, module.ptr_t);
         value_of[buf_id] = p;
         // Tag a combined-image-sampler descriptor param distinctly from a plain buffer
@@ -1357,6 +1471,11 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             } else if (module.is_builtin_ptr[ptr_id]) {
                 // A load of gl_GlobalInvocationID.x is the synthesized invocation id.
                 value_of[result] = module.global_id_value orelse return error.MalformedModule;
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .workgroup_id) {
+                // A load of gl_WorkGroupID.x is the synthesized workgroup index param.
+                value_of[result] = module.workgroup_id_value orelse return error.MalformedModule;
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .num_workgroups) {
+                value_of[result] = module.num_workgroups_value orelse return error.MalformedModule;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .vertex_index) {
                 // A load of gl_VertexIndex (directly or through a scalar access chain) is
                 // the synthesized per-vertex index param.
@@ -1989,6 +2108,13 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     // the synthesized i32 index param. (These are scalar ints, so glslang usually loads the
     // variable directly - this handles a chain too, defensively.)
     if (base < module.var_kind.len and (module.var_kind[base] == .vertex_index or module.var_kind[base] == .instance_index)) {
+        if (result < module.var_kind.len) module.var_kind[result] = module.var_kind[base];
+        return;
+    }
+    // A chain into gl_WorkGroupID / gl_NumWorkGroups. These ARE uvec3, so a kernel reads `.x`
+    // through a chain rather than loading the variable, which makes this the normal path and not
+    // the defensive one above.
+    if (base < module.var_kind.len and (module.var_kind[base] == .workgroup_id or module.var_kind[base] == .num_workgroups)) {
         if (result < module.var_kind.len) module.var_kind[result] = module.var_kind[base];
         return;
     }

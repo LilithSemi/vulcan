@@ -144,6 +144,7 @@ pub const BuiltIn = struct {
     pub const point_coord = 16; // gl_PointCoord (a fragment-shader vec2 point-sprite coord, 0..1)
     pub const front_facing = 17; // gl_FrontFacing (a fragment-shader bool input)
     pub const frag_depth = 22; // gl_FragDepth (a fragment-shader depth output)
+    pub const num_workgroups = 24; // gl_NumWorkGroups (a compute-shader uvec3 input)
     pub const workgroup_id = 26;
     pub const local_invocation_id = 27;
     pub const global_invocation_id = 28;
