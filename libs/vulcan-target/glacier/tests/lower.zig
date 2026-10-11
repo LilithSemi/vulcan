@@ -778,3 +778,228 @@ test "a per-lane value stays per-lane through a signedness convert" {
         try std.testing.expectEqual(@as(u32, @intCast(100 + i)), data[i]);
     }
 }
+
+test "a float constant is its bit pattern, with a subnormal flushed to zero" {
+    // The lane flushes a subnormal on every operation, so a constant that stayed subnormal would
+    // not equal the same number the hardware computes.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { value: f64, want: u32 }{
+        .{ .value = 1.0, .want = 0x3F80_0000 },
+        .{ .value = -2.5, .want = 0xC020_0000 },
+        .{ .value = 0.0, .want = 0 },
+        // Smaller than the smallest normal f32, so it flushes and keeps its sign.
+        .{ .value = 1.0e-40, .want = 0 },
+        .{ .value = -1.0e-40, .want = 0x8000_0000 },
+    };
+
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const k = try f.appendInst(entry, f32_t, .{ .fconst = c.value });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = k } });
+        try f.appendStore(entry, raw, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var data: [1]u32 = .{0xDEAD_BEEF};
+        try runOnce(words, &data, 0, 1);
+        try std.testing.expectEqual(c.want, data[0]);
+    }
+}
+
+test "the three converts the core decodes run per lane" {
+    // `vfcvt.f.x.v` reads its source SIGNED, `vfcvt.rtz.xu.f.v` writes an UNSIGNED result, and
+    // `vfncvt.f.f.w` rounds to nearest even, so an overflow gives infinity. Each lane gets its
+    // own value, so a convert that collapsed to lane zero shows up here.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    // lane - 1, so lane zero is negative and proves the source is read signed.
+    const signed = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const biased = try f.appendArithImm(entry, i32_t, .sub, signed, 1);
+    const half = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = biased } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = half } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, raw, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [8]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const want: f16 = @floatFromInt(@as(i32, @intCast(i)) - 1);
+        try std.testing.expectEqual(@as(u32, @as(u16, @bitCast(want))), data[i]);
+    }
+}
+
+test "a narrowing convert rounds to nearest even and overflows to infinity" {
+    // Two things are pinned here. The ROUNDING: 2051 sits exactly between the halves 2050 and
+    // 2052, so nearest even gives 2052 while a toward-zero narrowing gives 2050. The OVERFLOW:
+    // nearest even carries a value past the largest finite half up to infinity, where toward zero
+    // would stop at 0x7BFF.
+    //
+    // 1.5 is here because it is what tells a narrowing convert apart from the integer one: read
+    // as a signed integer, 1.5's bit pattern is about 1.07e9 and converts to infinity, which is
+    // the same answer the overflow case wants.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { value: f64, want: u32, not: u32 }{
+        .{ .value = 1.5, .want = 0x3E00, .not = 0x7C00 },
+        .{ .value = 2051.0, .want = 0x6802, .not = 0x6801 },
+        .{ .value = 100000.0, .want = 0x7C00, .not = 0x7BFF },
+    };
+    // The expectations above are what nearest even gives, and the rejected ones what toward zero
+    // gives one step below.
+    try std.testing.expectEqual(cases[1].want, @as(u32, @as(u16, @bitCast(@as(f16, 2052.0)))));
+    try std.testing.expectEqual(cases[1].not, @as(u32, @as(u16, @bitCast(@as(f16, 2050.0)))));
+
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const f16_t = try f.types.intern(.{ .float = .f16 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const wide = try f.appendInst(entry, f32_t, .{ .fconst = c.value });
+        const half = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = wide } });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = half } });
+        try f.appendStore(entry, raw, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var data: [1]u32 = .{0};
+        try runOnce(words, &data, 0, 1);
+        try std.testing.expectEqual(c.want, data[0]);
+    }
+}
+
+test "a float to unsigned convert truncates toward zero" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const v = try f.appendInst(entry, f32_t, .{ .fconst = 7.9 });
+    const n = try f.appendInst(entry, u32_t, .{ .convert = .{ .value = v } });
+    try f.appendStore(entry, n, base);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [1]u32 = .{0};
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 7), data[0]);
+}
+
+test "a warp-uniform float divide becomes the one scalar divide" {
+    // The perspective divide is what this exists for: one divide per vertex or per scanline, not
+    // per pixel. It truncates, which 1.0 / 3.0 shows.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const one = try f.appendInst(entry, f32_t, .{ .fconst = 1.0 });
+    const three = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+    const q = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = one, .rhs = three } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = q } });
+    try f.appendStore(entry, raw, base);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [1]u32 = .{0};
+    try runOnce(words, &data, 0, 1);
+    // 1.0 / 3.0 rounds to nearest UP, so truncating gives one unit in the last place less.
+    try std.testing.expectEqual(@as(u32, @as(u32, @bitCast(@as(f32, 1.0) / @as(f32, 3.0))) - 1), data[0]);
+}
+
+test "the backend refuses the float work Glacier cannot do" {
+    const allocator = std.testing.allocator;
+    const Shape = enum { add, compare, half_store, per_lane_divide, widen };
+    for ([_]Shape{ .add, .compare, .half_store, .per_lane_divide, .widen }) |shape| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const f16_t = try f.types.intern(.{ .float = .f16 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const a = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+        const b = try f.appendInst(entry, f32_t, .{ .fconst = 5.0 });
+        const stored = switch (shape) {
+            // There is no float add in any width.
+            .add => blk: {
+                const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+                break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
+            },
+            // There is no float compare, and an integer compare over the bits is a different
+            // relation.
+            .compare => blk: {
+                const lt = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
+                const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+                const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+                break :blk try f.appendInst(entry, u32_t, .{ .select = .{ .cond = lt, .then = one, .@"else" = zero } });
+            },
+            // An f16 is the low half of a lane, so a word store would write bits that are not
+            // part of the value.
+            .half_store => blk: {
+                const signed_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+                const s = try f.appendInst(entry, signed_t, .{ .convert = .{ .value = tid } });
+                break :blk try f.appendInst(entry, f16_t, .{ .convert = .{ .value = s } });
+            },
+            // A per-lane divide would have to feed the single scalar divider a lane at a time.
+            .per_lane_divide => blk: {
+                const lane = try f.appendInst(entry, f32_t, .{ .unary = .{ .op = .reinterpret, .value = tid } });
+                const q = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = lane, .rhs = b } });
+                break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = q } });
+            },
+            // Nothing WIDENS an f16: the core has no `vfwcvt`.
+            .widen => blk: {
+                const signed_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+                const s = try f.appendInst(entry, signed_t, .{ .convert = .{ .value = tid } });
+                const h = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = s } });
+                const wide = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = h } });
+                break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = wide } });
+            },
+        };
+        try f.appendStore(entry, stored, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    }
+}

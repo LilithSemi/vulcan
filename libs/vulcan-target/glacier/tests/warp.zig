@@ -7,9 +7,14 @@
 //! reaches it.
 //!
 //! It models only what a Glacier core decodes and only what a kernel uses: RV32I, RV32M, a CSR
-//! read, and the RVV integer subset the lowering emits. An unknown word is an error, never a
-//! no-op, so a lowering that emits something this model does not know about is caught rather than
-//! silently skipped.
+//! read, the RVV integer subset the lowering emits, and the float converts and scalar divide. An
+//! unknown word is an error, never a no-op, so a lowering that emits something this model does not
+//! know about is caught rather than silently skipped.
+//!
+//! The float rules are the ones the core implements, which are NOT the ones the mnemonics imply:
+//! the scalar divide always truncates, the integer-to-float and the narrowing converts round to
+//! nearest even, and every lane flushes a subnormal result to a signed zero. A model that rounded
+//! the way the names suggest would disagree with the hardware in the last bit.
 //!
 //! Lane behaviour is modelled faithfully because it cannot be checked any other way here: every
 //! vector write is gated by the launch mask, and a lane outside it keeps `stale_lane`. A kernel
@@ -247,6 +252,13 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
         0x33 => warp.set(rd, try arith(funct3, funct7, a, b)),
         // OP-V: every vector arithmetic form.
         0x57 => try vectorOp(word, warp),
+        // OP-FP. Glacier decodes exactly one of these, FDIV.S, and its register fields name X
+        // registers because the core has no f register file. It always truncates: the rounding
+        // mode in funct3 is accepted and ignored.
+        0x53 => {
+            if (funct7 != 0b0001100) return error.Illegal;
+            warp.set(rd, @bitCast(ftz(f32, divTowardZero(asFloat(a), asFloat(b)))));
+        },
         // CSR read. CSRRS with x0 as the set mask is the only CSR access a Glacier core decodes.
         0x73 => {
             if (funct3 != 2 or rs1 != 0) return error.Illegal;
@@ -291,6 +303,27 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
         return;
     }
 
+    // The float converts. One funct6 holds all three and the vs1 field picks which, so the field
+    // that names a source register everywhere else is a selector here. An f32 fills a lane and an
+    // f16 is its LOW HALF, because the core has no f register file.
+    if (funct3 == 0b001) {
+        if (funct6 != 0b010010) return error.Illegal;
+        for (0..warp.lanes) |i| {
+            const x = warp.v[vs2][i];
+            warp.v[vd][i] = switch (src) {
+                // vfcvt.f.x.v: a SIGNED integer to f16, nearest even.
+                0b00011 => halfBits(ftz(f16, @floatFromInt(@as(i32, @bitCast(x))))),
+                // vfcvt.rtz.xu.f.v: an f32 to an UNSIGNED integer, toward zero.
+                0b00110 => unsignedFromFloat(asFloat(x)),
+                // vfncvt.f.f.w: an f32 narrowed to f16, nearest even, so an overflow gives
+                // INFINITY rather than the largest finite value.
+                0b10100 => halfBits(ftz(f16, @floatCast(asFloat(x)))),
+                else => return error.Illegal,
+            };
+        }
+        return;
+    }
+
     for (0..warp.lanes) |i| {
         const x = warp.v[vs2][i];
         const y: u32 = switch (funct3) {
@@ -318,6 +351,46 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
             else => return error.Illegal,
         };
     }
+}
+
+fn asFloat(bits: u32) f32 {
+    return @bitCast(bits);
+}
+
+fn halfBits(v: f16) u32 {
+    return @as(u16, @bitCast(v));
+}
+
+/// A lane flushes a subnormal result to a zero of the same sign, on every operation. A NaN and an
+/// infinity pass through.
+fn ftz(comptime T: type, v: T) T {
+    if (v != 0 and @abs(v) < std.math.floatMin(T)) return std.math.copysign(@as(T, 0.0), v);
+    return v;
+}
+
+/// An f32 to a u32, truncating toward zero. A value outside the range saturates, which is what
+/// RVV defines. What Glacier itself answers there is not recorded, so no test may depend on it.
+fn unsignedFromFloat(v: f32) u32 {
+    if (std.math.isNan(v)) return std.math.maxInt(u32);
+    if (v <= 0) return 0;
+    if (v >= 4294967296.0) return std.math.maxInt(u32);
+    return @intFromFloat(v);
+}
+
+/// An f32 divide that truncates toward zero, which is the only rounding Glacier's divider does.
+/// The quotient is formed in f64 first, so the one case left wrong is the double rounding where
+/// the exact quotient sits just under a value f32 can name and the f64 step lifts it onto that
+/// value. No test here is near such a quotient.
+fn divTowardZero(x: f32, y: f32) f32 {
+    const q = @as(f64, x) / @as(f64, y);
+    const near: f32 = @floatCast(q);
+    if (!std.math.isFinite(near)) return near;
+    if (@abs(@as(f64, near)) <= @abs(q)) return near;
+    // Rounding to nearest went away from zero, so step back one representable value.
+    const bits: u32 = @bitCast(near);
+    const magnitude = bits & 0x7FFF_FFFF;
+    if (magnitude == 0) return near;
+    return @bitCast((bits & 0x8000_0000) | (magnitude - 1));
 }
 
 /// The scalar M-extension funct3 that computes the same thing as an OPMVV/OPMVX `funct6`, so the

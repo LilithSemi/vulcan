@@ -15,6 +15,12 @@
 //! liveness across a loop and the parallel copies on a control-flow edge are not reimplemented
 //! here. This file owns the register model and the encoding.
 //!
+//! Floating point is admitted narrowly, because the core decodes five float instructions and no
+//! more (see `encode.zig` and `glacier.fdiv`). An f32 and an f16 are values here, a float constant
+//! is its bit pattern, the three converts the core has are selected, and an f32 divide becomes the
+//! one scalar divide. Everything else is refused: there is no float add, no float compare, and no
+//! per-lane divide. An f16 never reaches memory, since it is only the low half of a lane.
+//!
 //! One thing it deliberately does NOT do yet is fuse a compare into its branch. A fused branch
 //! reads the COMPARE's operands at the branch, and the allocator only knows the branch reads the
 //! boolean, so fusing needs `wimmer.RegDescription.fusedOperands` to tell it. Until that is
@@ -207,7 +213,7 @@ fn laneVarying(b: gpu.builtin.Builtin) bool {
 /// scalar register with a vector register's number. `convert` did exactly that.
 fn forEachOperand(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value) void) void {
     switch (func.opcode(inst)) {
-        .iconst, .global_addr, .barrier => {},
+        .iconst, .fconst, .global_addr, .barrier => {},
         .unary => |u| f(ctx, u.value),
         .arith => |a| {
             f(ctx, a.lhs);
@@ -341,12 +347,31 @@ fn copySource(_: *const anyopaque, func: *const Function, v: Value) ?Value {
 /// The core has sub-word loads AND sub-word stores (see `encode.zig`), so what blocks a narrower
 /// value here is this lowering and not the hardware: every operation on one would have to truncate
 /// to its width, and silently skipping that truncation is a wrong answer rather than a refusal.
+/// An f16 is admitted here even though it is half a word, because it never reaches memory. See
+/// `isHalf`.
 fn isWord(func: *const Function, ty: Type) bool {
     return switch (func.types.type_kind(ty)) {
         .bool, .ptr => true,
         .int => |i| i.bits == 32,
+        .float => |f| f == .f32 or f == .f16,
         else => false,
     };
+}
+
+/// Whether `ty` is an f16.
+///
+/// A Glacier f16 occupies the LOW HALF of a 32-bit lane: that is where `vfcvt.f.x.v` and
+/// `vfncvt.f.f.w` write one and where `vfwmacc.vv` reads one. The upper half is not part of the
+/// value, so an f16 cannot travel through a word load or store and `checkSupported` refuses both.
+fn isHalf(func: *const Function, ty: Type) bool {
+    return switch (func.types.type_kind(ty)) {
+        .float => |f| f == .f16,
+        else => false,
+    };
+}
+
+fn isFloat(func: *const Function, ty: Type) bool {
+    return func.types.type_kind(ty) == .float;
 }
 
 fn isSigned(func: *const Function, ty: Type) bool {
@@ -356,19 +381,95 @@ fn isSigned(func: *const Function, ty: Type) bool {
     };
 }
 
-/// Whether a `convert` only changes how the bits are read, so it needs no instruction.
+/// The register value of a float constant: its bit pattern, with a subnormal flushed to zero.
 ///
-/// `convert` covers int to float as well as an integer width change, and the SPIR-V frontend
-/// emits it for `OpUConvert` and `OpSConvert`. Everything here is one word wide, so a convert
-/// between two integers of that width changes the signedness and nothing else, and a move is the
-/// whole lowering. A width change or a float would be real work, and `isWord` refuses both before
-/// this is ever asked.
-fn isBitPreservingConvert(func: *const Function, inst: Inst, cv: ir.function.Convert) bool {
-    const result = func.instResult(inst) orelse return false;
+/// The lane flushes subnormals on every operation, so a constant that stayed subnormal here would
+/// not equal the same number the hardware computes, and a folded path would disagree with an
+/// unfolded one near zero.
+fn floatBits(func: *const Function, inst: Inst, c: f64) ?u32 {
+    const result = func.instResult(inst) orelse return null;
+    return switch (func.types.type_kind(func.valueType(result))) {
+        .float => |k| switch (k) {
+            .f32 => @as(u32, @bitCast(flushToZero(f32, @floatCast(c)))),
+            .f16 => @as(u32, @as(u16, @bitCast(flushToZero(f16, @floatCast(c))))),
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// `v` with a subnormal replaced by a zero of the same sign. A NaN and an infinity pass through.
+fn flushToZero(comptime T: type, v: T) T {
+    if (v != 0 and @abs(v) < std.math.floatMin(T)) return std.math.copysign(@as(T, 0.0), v);
+    return v;
+}
+
+/// What a `convert` costs on Glacier, or null when the core has no instruction for it.
+///
+/// Glacier decodes three converts and no scalar form of any of them, so each one is a vector
+/// instruction even when both sides are warp-uniform. Nothing here WIDENS an f16: the core has no
+/// `vfwcvt`, and the only instruction that reads an f16 as an f32 is the widening MAC.
+const ConvertKind = enum {
+    /// Same width and same kind, so the bits already are the value and a move is the whole
+    /// lowering.
+    move,
+    /// `vfcvt.f.x.v`: a SIGNED 32-bit integer to f16, rounding to nearest even.
+    int_to_half,
+    /// `vfcvt.rtz.xu.f.v`: an f32 to an UNSIGNED 32-bit integer, truncating toward zero.
+    float_to_uint,
+    /// `vfncvt.f.f.w`: an f32 to an f16, rounding to nearest even, so an overflow gives infinity
+    /// rather than the largest finite value.
+    narrow_half,
+};
+
+fn convertKind(func: *const Function, inst: Inst, cv: ir.function.Convert) ?ConvertKind {
+    const result = func.instResult(inst) orelse return null;
     const from = func.types.type_kind(func.valueType(cv.value));
     const to = func.types.type_kind(func.valueType(result));
-    if (from != .int or to != .int) return false;
-    return from.int.bits == to.int.bits;
+    if (from == .int and to == .int) {
+        // Everything here is one word wide, so this changes the signedness and nothing else.
+        return if (from.int.bits == to.int.bits) .move else null;
+    }
+    if (from == .int and to == .float) {
+        // The instruction reads its source as signed, so an unsigned value above the signed range
+        // would come out negative.
+        if (from.int.bits != 32 or from.int.signedness != .signed) return null;
+        return if (to.float == .f16) .int_to_half else null;
+    }
+    if (from == .float and to == .int) {
+        // The instruction writes an unsigned result, so a signed destination would read a large
+        // value as negative.
+        if (from.float != .f32 or to.int.bits != 32 or to.int.signedness != .unsigned) return null;
+        return .float_to_uint;
+    }
+    if (from == .float and to == .float) {
+        return if (from.float == .f32 and to.float == .f16) .narrow_half else null;
+    }
+    return null;
+}
+
+/// The encoder for a convert the vector unit performs. `move` has none, because it is not an
+/// instruction.
+fn convertEncoder(kind: ConvertKind) *const fn (VReg, VReg) u32 {
+    return switch (kind) {
+        .move => unreachable,
+        .int_to_half => rv.vfcvt_f_x_v,
+        .float_to_uint => rv.vfcvt_rtz_xu_f_v,
+        .narrow_half => rv.vfncvt_f_f_w,
+    };
+}
+
+/// Whether a `convert` only changes how the bits are read, so it needs no instruction. This is
+/// what lets the allocator coalesce the result with the source; see `copySource`.
+fn isBitPreservingConvert(func: *const Function, inst: Inst, cv: ir.function.Convert) bool {
+    return convertKind(func, inst, cv) == .move;
+}
+
+/// Whether `inst`'s result is per-lane, which is what decides the emitter's path. Mirrors
+/// `Emitter.isVector` for an instruction that has a result.
+fn resultDivergent(func: *const Function, inst: Inst, divergent: []const bool) bool {
+    const r = func.instResult(inst) orelse return false;
+    return divergent[@backingInt(r)];
 }
 
 /// Reject every shape this lowering does not handle, before anything is emitted. A refusal here
@@ -391,18 +492,44 @@ fn checkSupported(func: *const Function, opts: Options, divergent: []const bool)
             // A constant must fit a 32-bit register. An unsigned type reaches 0xFFFFFFFF and a
             // signed one reaches the most negative value, so the window spans both.
             .iconst => |c| if (c < std.math.minInt(i32) or c > std.math.maxInt(u32)) return error.Unsupported,
-            .arith => |a| _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported,
-            .arith_imm => |a| _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported,
+            // The result type is swept above, so it is already an f32 or an f16 here.
+            .fconst => |c| _ = floatBits(func, inst, c) orelse return error.Unsupported,
+            // The emitter picks the scalar or the vector table from the result's divergence, so
+            // admission has to ask the same table it will use. The integer tables are both
+            // complete, but the float ones are not: a divide is scalar only.
+            .arith => |a| if (resultDivergent(func, inst, divergent)) {
+                _ = vectorBinOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
+            } else {
+                _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
+            },
+            .arith_imm => |a| {
+                // The immediate is an integer, so this opcode never carries a float operand.
+                if (isFloat(func, func.valueType(a.lhs))) return error.Unsupported;
+                _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
+            },
             // A per-lane compare writes a MASK, and a per-lane select reads one. Masks are the
             // next slice of this lowering, so refuse rather than compare lane 0 and call it the
             // answer for the whole warp.
-            .icmp => |c| if (divergent[@backingInt(c.lhs)] or divergent[@backingInt(c.rhs)]) return error.Unsupported,
+            .icmp => |c| {
+                // Glacier has no float compare in any form. An integer compare over float bits
+                // answers a different relation, and it is wrong for a negative value and for NaN.
+                if (isFloat(func, func.valueType(c.lhs))) return error.Unsupported;
+                if (divergent[@backingInt(c.lhs)] or divergent[@backingInt(c.rhs)]) return error.Unsupported;
+            },
             .select => |s| if (divergent[@backingInt(s.cond)]) return error.Unsupported,
-            .load => |l| if (!isWord(func, func.valueType(l.ptr))) return error.Unsupported,
-            .store => |st| if (!isWord(func, func.valueType(st.value))) return error.Unsupported,
+            .load => |l| {
+                if (!isWord(func, func.valueType(l.ptr))) return error.Unsupported;
+                const r = func.instResult(inst) orelse return error.Unsupported;
+                // An f16 is the low half of a lane, not a word in memory. See `isHalf`.
+                if (isHalf(func, func.valueType(r))) return error.Unsupported;
+            },
+            .store => |st| {
+                if (!isWord(func, func.valueType(st.value))) return error.Unsupported;
+                if (isHalf(func, func.valueType(st.value))) return error.Unsupported;
+            },
             .global_addr => |g| _ = addressOf(opts, func.symbolName(g.symbol)) orelse return error.Unsupported,
             .unary => |u| if (u.op != .reinterpret) return error.Unsupported,
-            .convert => |cv| if (!isBitPreservingConvert(func, inst, cv)) return error.Unsupported,
+            .convert => |cv| _ = convertKind(func, inst, cv) orelse return error.Unsupported,
             .barrier => |b| switch (b.scope) {
                 .workgroup, .subgroup => {},
             },
@@ -457,6 +584,13 @@ fn addressOf(opts: Options, name: []const u8) ?u32 {
 /// Glacier has no instruction for it. Signedness comes from the operand type, so one `shr`
 /// becomes a logical or an arithmetic shift depending on it.
 fn binOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const fn (Reg, Reg, Reg) u32 {
+    // Glacier decodes ONE float operation that is not per-lane, and it is a divide of two f32.
+    // There is no fadd, no fsub and no non-widening fmul in any width, so everything else is a
+    // refusal rather than a sequence. See `encode.zig`.
+    switch (func.types.type_kind(ty)) {
+        .float => |f| return if (op == .div and f == .f32) glacier.fdiv else null,
+        else => {},
+    }
     const signed = isSigned(func, ty);
     return switch (op) {
         .add => rv.add,
@@ -478,6 +612,10 @@ fn binOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const fn (Reg
 /// lanes share and it walks them one at a time, so a vector divide costs what the scalar ones
 /// would. It is still correct, and emitting it keeps a kernel that divides from being refused.
 fn vectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const fn (VReg, VReg, VReg) u32 {
+    // There is no per-lane float arithmetic. The widening MAC is the only vector float operation
+    // and it is not a binary op, because it accumulates into its own destination. A per-lane
+    // divide would have to feed the single scalar divider one lane at a time.
+    if (isFloat(func, ty)) return null;
     const signed = isSigned(func, ty);
     return switch (op) {
         .add => rv.vadd_vv,
@@ -497,8 +635,7 @@ fn vectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const f
 /// The vector-scalar encoder for a binary operation, for the shape where one operand is the same
 /// in every lane. Only the forms that exist; the rest broadcast and use the vector-vector form.
 fn vectorBinOpVx(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const fn (VReg, VReg, Reg) u32 {
-    _ = func;
-    _ = ty;
+    if (isFloat(func, ty)) return null;
     return switch (op) {
         .add => rv.vadd_vx,
         .mul => rv.vmul_vx,
@@ -785,10 +922,12 @@ const Emitter = struct {
                 try self.vreg(self.func.instResult(inst).?, pos),
                 try self.vectorOperand(u.value, pos),
             )),
-            .convert => |cv| try self.put(rv.vmv_v_v(
-                try self.vreg(self.func.instResult(inst).?, pos),
-                try self.vectorOperand(cv.value, pos),
-            )),
+            .convert => |cv| {
+                const dst = try self.vreg(self.func.instResult(inst).?, pos);
+                const src = try self.vectorOperand(cv.value, pos);
+                const kind = convertKind(self.func, inst, cv) orelse return error.Unsupported;
+                try self.put(if (kind == .move) rv.vmv_v_v(dst, src) else convertEncoder(kind)(dst, src));
+            },
             .arith => |a| {
                 const dst = try self.vreg(self.func.instResult(inst).?, pos);
                 const f = vectorBinOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
@@ -860,12 +999,13 @@ const Emitter = struct {
         };
         switch (self.func.opcode(inst)) {
             .iconst => |c| try self.constant(dst, lowWord(c)),
+            .fconst => |c| try self.constant(dst, @bitCast(floatBits(self.func, inst, c) orelse return error.Unsupported)),
             .global_addr => |g| try self.constant(
                 dst,
                 @bitCast(addressOf(self.opts, self.func.symbolName(g.symbol)) orelse return error.Unsupported),
             ),
             .unary => |u| try self.move(dst, try self.reg(u.value, pos)),
-            .convert => |cv| try self.move(dst, try self.reg(cv.value, pos)),
+            .convert => |cv| try self.emitConvert(cv, inst, dst, pos),
             .arith => |a| {
                 const f = binOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
                 try self.put(f(dst, try self.reg(a.lhs, pos), try self.reg(a.rhs, pos)));
@@ -896,6 +1036,21 @@ const Emitter = struct {
             .slot => |n| try self.put(rv.sw(dst, sp, try self.slotOffset(n))),
             .reg => {},
         };
+    }
+
+    /// A warp-uniform convert. Glacier has no scalar convert of any kind, so the value goes out
+    /// to the vector unit and comes back: a splat, the per-lane convert, then a read of lane
+    /// zero. Three words rather than one, which still beats refusing the kernel.
+    ///
+    /// Source and destination are the same vector register here. That is the ordinary shape for
+    /// every op in this file, because a Glacier lane is a fixed 32 bits and no vector op moves a
+    /// value between lanes.
+    fn emitConvert(self: *Emitter, cv: ir.function.Convert, inst: Inst, dst: Reg, pos: u32) Error!void {
+        const kind = convertKind(self.func, inst, cv) orelse return error.Unsupported;
+        if (kind == .move) return self.move(dst, try self.reg(cv.value, pos));
+        try self.put(rv.vmv_v_x(vscratch, try self.reg(cv.value, pos)));
+        try self.put(convertEncoder(kind)(vscratch, vscratch));
+        try self.put(rv.vmv_x_s(dst, vscratch));
     }
 
     fn emitArithImm(self: *Emitter, a: ir.function.ArithImm, dst: Reg, pos: u32) Error!void {

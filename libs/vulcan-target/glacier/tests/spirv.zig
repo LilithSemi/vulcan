@@ -412,6 +412,7 @@ test "every lowered module is valid IR" {
         zigShapedModule,
         stdSpirvShapedModule,
         perLaneModule,
+        floatDivideModule,
     };
     for (builders) |build| {
         var b = try build(allocator);
@@ -718,4 +719,82 @@ test "a function-storage struct local scalarizes to one alloca per field" {
     var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
     _ = try warp.run(words, &mem, &one, 10_000);
     try std.testing.expectEqual(@as(u32, 30), data[0]);
+}
+
+/// The perspective divide, which is what Glacier's one scalar float instruction is for: a divide
+/// per warp, then an integer screen coordinate. The buffer holds the denominator first and the
+/// results after it.
+fn floatDivideModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 uint=2 float=3 v3uint=4 pInV3=5 pInU=6 arr=7 struct=8 pSbStruct=9 pSbU32=10
+    //      voidfn=11 c0=12 c1=13 wid=14 out=15 main=16 entry=17 widptr=18 w=19 pDenom=20
+    //      denom=21 c100=22 q=23 n=24 pElem=26 pSbF32=27.
+    var b = try spirv.binary.Builder.init(allocator, 28);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 16, 0x6E69616D, 0, 14, 15 });
+    try b.emit(allocator, op.Name, &.{ 15, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.builtin, op.BuiltIn.workgroup_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 8, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.MemberDecorate, &.{ 8, 1, op.Decoration.offset, 4 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 7, 2 });
+    try b.emit(allocator, op.TypeStruct, &.{ 8, 3, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypePointer, &.{ 27, op.StorageClass.storage_buffer, 3 });
+    try b.emit(allocator, op.TypeFunction, &.{ 11, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 12, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 13, 1 });
+    try b.emit(allocator, op.Constant, &.{ 3, 22, @as(u32, @bitCast(@as(f32, 100.0))) });
+    try b.emit(allocator, op.Variable, &.{ 5, 14, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 9, 15, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 16, 0, 11 });
+    try b.emit(allocator, op.Label, &.{17});
+    try b.emit(allocator, op.AccessChain, &.{ 6, 18, 14, 12 }); // &gl_WorkGroupID.x
+    try b.emit(allocator, op.Load, &.{ 2, 19, 18 });
+    try b.emit(allocator, op.AccessChain, &.{ 27, 20, 15, 12 }); // &out.denominator
+    try b.emit(allocator, op.Load, &.{ 3, 21, 20 });
+    try b.emit(allocator, op.FDiv, &.{ 3, 23, 22, 21 });
+    try b.emit(allocator, op.ConvertFToU, &.{ 2, 24, 23 });
+    try b.emit(allocator, op.AccessChain, &.{ 10, 26, 15, 13, 19 }); // &out.results[warp]
+    try b.emit(allocator, op.Store, &.{ 26, 24 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "a float divide and a float to integer convert run on Glacier" {
+    const allocator = std.testing.allocator;
+    var b = try floatDivideModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    const warps: u32 = 3;
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    data[0] = @bitCast(@as(f32, 8.0));
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    for (0..warps) |w| {
+        var one: warp.Warp = .{ .hart_id = @intCast(w), .hart_count = warps };
+        _ = try warp.run(words, &mem, &one, 10_000);
+    }
+    // 100.0 / 8.0 is exact, so the truncation has nothing to remove.
+    for (0..warps) |w| try std.testing.expectEqual(@as(u32, 12), data[1 + w]);
+
+    // 100.0 / 3.0 is not exact, and the divider truncates rather than rounding, so the integer
+    // result is 33 either way. The float quotient is what shows the truncation; see `lower.zig`.
+    data = @splat(0xFFFF_FFFF);
+    data[0] = @bitCast(@as(f32, 3.0));
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1 };
+    _ = try warp.run(words, &mem, &one, 10_000);
+    try std.testing.expectEqual(@as(u32, 33), data[1]);
 }
