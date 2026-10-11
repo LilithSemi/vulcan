@@ -624,3 +624,35 @@ test "a workgroup barrier emits nothing, because a workgroup is one warp" {
     try std.testing.expectEqual(@as(u32, 0x1000000F), glacier.encode.warp_barrier);
     for (with) |w| try std.testing.expect(w != glacier.encode.warp_barrier);
 }
+
+test "a constant nobody reads costs no words" {
+    // A frontend leaves these behind: an eliminated bounds check removes the only consumer of the
+    // array length but not the constant itself. The allocator still places a result nobody reads,
+    // so the emitter has to drop it on the use count rather than on whether it has a home.
+    const allocator = std.testing.allocator;
+
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    var littered = Function.init(allocator);
+    defer littered.deinit();
+
+    for ([_]*Function{ &plain, &littered }, 0..) |f, i| {
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        if (i == 1) {
+            _ = try f.appendInst(entry, u32_t, .{ .iconst = 4096 });
+            _ = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+        }
+        const v = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+        try f.appendStore(entry, v, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    }
+
+    const without = try compile(allocator, &plain);
+    defer allocator.free(without);
+    const with = try compile(allocator, &littered);
+    defer allocator.free(with);
+    try std.testing.expectEqualSlices(u32, without, with);
+}

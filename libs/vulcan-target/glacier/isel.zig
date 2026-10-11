@@ -25,6 +25,7 @@ const std = @import("std");
 const ir = @import("vulcan-ir");
 const gpu = @import("vulcan-gpu");
 const wimmer = @import("../wimmer.zig");
+const opt = @import("vulcan-opt");
 const glacier = @import("encode.zig");
 
 const rv = glacier.rv;
@@ -141,6 +142,10 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     if (slots > opts.profile.scratchBytes() / 4) return error.Unsupported;
     // The deepest slot is reached by one signed 12-bit displacement from `sp`.
     if (slots * 4 > 2048) return error.Unsupported;
+    const uses = try allocator.alloc(u32, work.valueCount());
+    defer allocator.free(uses);
+    opt.dce.countUses(&work, uses);
+
     // A spilled VECTOR would need a vector store to the scratch region and a reload from it.
     // Nothing emits those yet, so refuse rather than drop the spill and miscompile.
     if (walloc.slot_count_per_class[1] != 0) return error.Unsupported;
@@ -151,6 +156,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
         .opts = opts,
         .alloc = &walloc,
         .divergent = divergent,
+        .uses = uses,
         .spills = slots != 0,
     };
     defer e.deinit();
@@ -213,6 +219,16 @@ fn forEachOperand(func: *const Function, inst: Inst, ctx: anytype, comptime f: f
 
 /// Which values are per-lane. Seeded from the lane-varying entry builtins and propagated forward
 /// to a fixpoint, because a loop can carry divergence backwards into a block parameter.
+///
+/// This propagates through OPERANDS only. That is sound ONLY BECAUSE `checkSupported` refuses a
+/// branch on a per-lane condition: with no divergent branch there is no control divergence, so a
+/// value cannot become per-lane by being defined on one side of a split. ADDING MASK SUPPORT
+/// WITHOUT ADDING THE CONTROL RULE HERE WOULD BE A SILENT MISCOMPILE.
+///
+/// `vulcan-opt`'s `uniform.zig` already answers a similar question and does model control
+/// dependence, but it answers a different one: it seeds EVERY load divergent, because it exists to
+/// decide barrier legality and a load could differ per thread. That is the right conservatism for a
+/// barrier and the wrong one here, where it would put every loaded value in a vector register.
 fn analyzeDivergence(allocator: std.mem.Allocator, func: *const Function) Error![]bool {
     const div = try allocator.alloc(bool, func.valueCount());
     errdefer allocator.free(div);
@@ -470,6 +486,8 @@ const Emitter = struct {
     func: *const Function,
     opts: Options,
     alloc: *const wimmer.Allocation,
+    /// How many times each value is read, so a pure instruction nobody reads is not emitted.
+    uses: []const u32,
     /// Which values are per-lane, so live in a vector register. See `analyzeDivergence`.
     divergent: []const bool,
     /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
@@ -776,6 +794,13 @@ const Emitter = struct {
     }
 
     fn emitInst(self: *Emitter, inst: Inst, pos: u32) Error!void {
+        // A pure instruction nothing reads is dropped. The allocator still places its result, so
+        // the home lookup below would not catch it: a frontend that emits a constant whose only
+        // consumer was removed (an eliminated bounds check leaves the array length behind) would
+        // otherwise cost a word per launch for a register nobody reads.
+        if (self.func.instResult(inst)) |r| {
+            if (self.uses[@backingInt(r)] == 0) return;
+        }
         if (self.isVector(inst)) return self.emitVectorInst(inst, pos);
         // A pure instruction nothing reads has no home, so it is dropped. An instruction with no
         // result at all (a store) has no home either, and must NOT be dropped.
