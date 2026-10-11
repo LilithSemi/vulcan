@@ -6,6 +6,9 @@ pub const Undef = 1;
 
 // Debug / annotation (skipped by the frontend).
 pub const Name = 5;
+/// `OpLine`, a debug annotation interleaved between real instructions. Carries no value.
+pub const Line = 8;
+pub const NoLine = 317;
 pub const MemberName = 6;
 pub const Decorate = 71;
 pub const MemberDecorate = 72;
@@ -273,3 +276,6 @@ pub const Variable = 59;
 pub const Load = 61;
 pub const Store = 62;
 pub const AccessChain = 65;
+/// `OpInBoundsAccessChain`. InBounds is a promise about the index, not a different operation,
+/// so it lowers exactly as `AccessChain` does. Zig's SPIR-V backend emits this one, not 65.
+pub const InBoundsAccessChain = 66;

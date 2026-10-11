@@ -176,6 +176,10 @@ const Module = struct {
     mat_of: []Mat, // id -> a scalarized matrix value's elements (cols 0 = not a matrix)
     mat_ptr: []?MatPtr, // access-chain result id -> matrix-in-memory layout (for OpLoad)
     vec_ptr: []?VecPtr, // access-chain result id -> vector-in-memory layout (for OpLoad)
+    // An access-chain result id -> the type its pointer points AT. Zig splits a chain in two (one
+    // step to the struct member, a second to index the array), so the second chain's base is a
+    // previous chain's result and not a variable. 0 means unknown.
+    chain_pointee: []u32,
     is_builtin_ptr: []bool, // id -> a pointer into the gl_GlobalInvocationID builtin
     // Combined-image-sampler descriptor pointer per value: an OpLoad of a sampler
     // variable, or an OpSampledImage, records here the descriptor pointer Value the
@@ -554,6 +558,7 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         .mat_of = undefined,
         .mat_ptr = undefined,
         .vec_ptr = undefined,
+        .chain_pointee = undefined,
         .local_is_vec = undefined,
         .local_vec = undefined,
         .local_comp_of = undefined,
@@ -902,6 +907,10 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     defer allocator.free(vec_ptr);
     @memset(vec_ptr, null);
     module.vec_ptr = vec_ptr;
+    const chain_pointee = try allocator.alloc(u32, bound);
+    defer allocator.free(chain_pointee);
+    @memset(chain_pointee, 0);
+    module.chain_pointee = chain_pointee;
     const local_is_vec = try allocator.alloc(bool, bound);
     defer allocator.free(local_is_vec);
     @memset(local_is_vec, false);
@@ -1363,8 +1372,22 @@ fn definesResult(opcode: u16) bool {
         op.Decorate,
         op.MemberDecorate,
         op.Nop,
+        op.Line,
+        op.NoLine,
         => false,
         else => true,
+    };
+}
+
+/// The synthesized scalar parameter a builtin variable's first component resolves to, or null when
+/// `id` is not one of the scalar-sourced builtin variables.
+fn builtinScalarOf(module: *const Module, id: u32) ?Value {
+    if (id >= module.var_kind.len) return null;
+    return switch (module.var_kind[id]) {
+        .global_id => module.global_id_value,
+        .workgroup_id => module.workgroup_id_value,
+        .num_workgroups => module.num_workgroups_value,
+        else => null,
     };
 }
 
@@ -1441,7 +1464,7 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 try func.appendInst(block, ty, .{ .iconst = 0 });
         },
         op.Nop => {},
-        op.AccessChain => try lowerAccessChain(func, module, block, inst),
+        op.AccessChain, op.InBoundsAccessChain => try lowerAccessChain(func, module, block, inst),
         op.Load => {
             const result = inst.operands[1];
             const ptr_id = try idOperandAt(inst.operands, 2, bound); // indexes many per-id arrays below
@@ -1456,6 +1479,20 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 const lv = module.local_vec[lc.local];
                 if (lc.comp >= lv.len) return error.MalformedModule;
                 value_of[result] = lv.comps[lc.comp];
+            } else if (builtinScalarOf(module, ptr_id) != null and vectorInfo(module.types, inst.operands[0]) != null) {
+                // A WHOLE-VECTOR load of a uvec3 builtin, which a following OpCompositeExtract
+                // then narrows. Zig's SPIR-V backend writes it this way where glslang reads `.x`
+                // through an access chain, so both spellings reach the same synthesized param.
+                //
+                // Only the x component carries anything. A workgroup index here is linear (one
+                // warp, one id), so y and z are zero rather than a second and third axis.
+                const vi = vectorInfo(module.types, inst.operands[0]).?;
+                if (vi.len > 4) return error.Unsupported;
+                const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
+                var out: Vec = .{ .len = @intCast(vi.len) };
+                out.comps[0] = builtinScalarOf(module, ptr_id).?;
+                for (1..vi.len) |i| out.comps[i] = try func.appendInst(block, elem, .{ .iconst = 0 });
+                module.vec_of[result] = out;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .sampler) {
                 // A load of a combined-image-sampler variable yields its descriptor
                 // pointer (the synthesized pointer entry param). The following
@@ -1592,6 +1629,8 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         },
         op.Phi, op.FunctionParameter => {},
         op.SelectionMerge, op.LoopMerge, op.Name, op.MemberName, op.Decorate, op.MemberDecorate => {},
+        // Debug annotations interleaved between real instructions. They carry no value.
+        op.Line, op.NoLine => {},
         op.Branch, op.BranchConditional, op.Switch, op.Return, op.ReturnValue, op.Unreachable, op.Kill => {}, // terminators (Pass 2)
         else => return error.Unsupported,
     }
@@ -2160,7 +2199,12 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     }
 
     const base_ptr = try valueOf(module, base);
-    var cur_type = module.var_pointee(base) orelse return error.Unsupported; // the pointee of the variable
+    // What the base points at: the pointee of a variable, or of an earlier chain when a chain is
+    // split across two instructions.
+    var cur_type = module.var_pointee(base) orelse blk: {
+        if (base < module.chain_pointee.len and module.chain_pointee[base] != 0) break :blk module.chain_pointee[base];
+        return error.Unsupported;
+    };
     var const_off: i64 = 0; // accumulated compile-time byte offset
     var offset_val: ?Value = null; // accumulated runtime byte offset (i32)
     // If the chain steps into a matrix member, remember its layout so a matrix `OpLoad`
@@ -2201,6 +2245,8 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     else
         base_ptr;
     module.value_of[result] = result_ptr;
+    // Record what this pointer points at, so a second chain can continue from it.
+    if (result < module.chain_pointee.len) module.chain_pointee[result] = cur_type;
 
     // The chain addresses a whole matrix member: record its in-memory layout so the
     // following `OpLoad %matrix` reads each element from the buffer (a matrix is not a

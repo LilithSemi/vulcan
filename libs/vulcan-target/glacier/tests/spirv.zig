@@ -128,3 +128,80 @@ test "a buffer the host did not place is refused, not guessed" {
         glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" }),
     );
 }
+
+/// The same kernel in the shape ZIG's SPIR-V backend emits, which differs from a hand-built or
+/// glslang module in ways that each broke the lowering:
+///
+///   - `OpInBoundsAccessChain` (66) rather than `OpAccessChain` (65), and SPLIT in two: one chain
+///     to the struct member, a second to index the array.
+///   - the builtin read as a WHOLE uvec3 with `OpLoad`, narrowed by `OpCompositeExtract`, where
+///     glslang reads `.x` through an access chain so the loaded value is never vector-typed.
+///   - `OpLine` debug annotations interleaved between real instructions.
+///   - a fixed `OpTypeArray` rather than `OpTypeRuntimeArray`.
+///
+/// `out.elems[id] = id * 3 + 1`, from `@workGroupId(0)`.
+fn zigShapedModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 u32=2 v3u32=3 pInV3=4 c4096=5 arr=6 struct=7 pSbStruct=8 pSbArr=9 pSbU32=10
+    //      voidfn=11 c0=12 c3=13 c1=14 wid=15 out=16 main=17 entry=18 loaded=19 id=20
+    //      pElems=21 pElem=22 scaled=23 sum=24.
+    var b = try spirv.binary.Builder.init(allocator, 25);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 17, 0x6E69616D, 0, 15, 16 });
+    try b.emit(allocator, op.Name, &.{ 16, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 15, op.Decoration.builtin, op.BuiltIn.workgroup_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 7, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 3, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.input, 3 });
+    try b.emit(allocator, op.Constant, &.{ 2, 5, 4096 });
+    try b.emit(allocator, op.TypeArray, &.{ 6, 2, 5 });
+    try b.emit(allocator, op.TypeStruct, &.{ 7, 6 });
+    try b.emit(allocator, op.TypePointer, &.{ 8, op.StorageClass.storage_buffer, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 6 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 11, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 12, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 13, 3 });
+    try b.emit(allocator, op.Constant, &.{ 2, 14, 1 });
+    try b.emit(allocator, op.Variable, &.{ 4, 15, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 8, 16, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 17, 0, 11 });
+    try b.emit(allocator, op.Label, &.{18});
+    try b.emit(allocator, op.Line, &.{ 1, 7, 5 });
+    try b.emit(allocator, op.Load, &.{ 3, 19, 15 }); // the whole uvec3
+    try b.emit(allocator, op.CompositeExtract, &.{ 2, 20, 19, 0 }); // .x
+    try b.emit(allocator, op.Line, &.{ 1, 8, 5 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 9, 21, 16, 12 }); // &out.elems
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 10, 22, 21, 20 }); // &out.elems[id]
+    try b.emit(allocator, op.IMul, &.{ 2, 23, 20, 13 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 24, 23, 14 });
+    try b.emit(allocator, op.Store, &.{ 22, 24 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "a kernel in Zig's SPIR-V shape runs on Glacier" {
+    const allocator = std.testing.allocator;
+    var b = try zigShapedModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    for (0..4) |w| {
+        var one: warp.Warp = .{ .hart_id = @intCast(w), .hart_count = 4 };
+        _ = try warp.run(words, &mem, &one, 10_000);
+    }
+    for (data, 0..) |got, i| {
+        const want: u32 = if (i < 4) @as(u32, @intCast(i)) * 3 + 1 else 0xFFFF_FFFF;
+        try std.testing.expectEqual(want, got);
+    }
+}
