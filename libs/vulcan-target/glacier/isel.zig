@@ -1982,8 +1982,18 @@ fn checkSupported(
         const v: Value = @fromBackingInt(@intCast(vi));
         if (!isWord(func, func.valueType(v))) return error.Unsupported;
     }
+    var args: usize = 0;
     for (func.blockParams(@fromBackingInt(0))) |p| {
-        const b = gpu.attrs.builtinOf(func, p) orelse return error.Unsupported;
+        const b = gpu.attrs.builtinOf(func, p) orelse {
+            // An entry parameter with no builtin is a KERNEL PARAMETER, read from a launch
+            // argument CSR. See `launchArgOf` for the ordering rule.
+            //
+            // Its TYPE needs no check here: the loop above refuses any value this core cannot
+            // hold in a register, so a parameter wider than a word is already gone.
+            if (launchArgOf(args) == null) return error.Unsupported;
+            args += 1;
+            continue;
+        };
         // A lane-varying builtin comes from `vid.v` rather than from a CSR, so it has no
         // `builtinSource`. See `lanewiseBuiltin`.
         if (!laneVarying(b)) _ = builtinSource(b) orelse return error.Unsupported;
@@ -2129,6 +2139,21 @@ fn checkInst(
         },
         else => return error.Unsupported,
     }
+}
+
+/// The CSR a kernel parameter is read from, by its position among the entry parameters that are
+/// NOT builtins.
+///
+/// That ordering is not invented here: `gpu.abi.layoutParams` places a kernel's parameters by
+/// walking the entry parameters and skipping the builtins, so the i'th parameter a host writes is
+/// the i'th non-builtin entry parameter on every target. NVIDIA delivers it from constant memory
+/// and this core delivers it from a CSR, which is the only difference.
+///
+/// A parameter is WARP UNIFORM, and by construction rather than by analysis: one dispatch gives
+/// every warp the same values. `analyzeDivergence` seeds divergence only from lane-varying
+/// builtins, so nothing has to be told.
+fn launchArgOf(index: usize) ?u12 {
+    return glacier.Csr.launchArg(index);
 }
 
 /// Where a WARP-UNIFORM hardware builtin comes from, or null when the core cannot answer.
@@ -2481,18 +2506,32 @@ const Emitter = struct {
     /// zero from `mscratch` anyway.
     fn prologue(self: *Emitter, block: Block) Error!void {
         if (self.spills) try self.put(glacier.csrr(sp, glacier.Csr.mscratch));
+        // Counted over EVERY non-builtin parameter, including one the allocator gave no home,
+        // because the position is the host's argument number and not a register index.
+        var args: usize = 0;
         for (self.func.blockParams(block)) |p| {
+            const b = gpu.attrs.builtinOf(self.func, p);
+            const arg: ?u12 = if (b == null) blk: {
+                defer args += 1;
+                break :blk launchArgOf(args) orelse return error.Unsupported;
+            } else null;
+            // A parameter nothing reads costs no instruction. The allocator still gives a dead
+            // definition a register, so the home lookup below would not catch it, and a kernel
+            // that declares eight arguments and reads one would pay eight CSR reads per launch.
+            // The ARGUMENT NUMBER still advances: it is the host's, not the register file's.
+            if (arg != null and self.uses[@backingInt(p)] == 0) continue;
             const home = self.locAt(p, 0) orelse continue;
-            const b = gpu.attrs.builtinOf(self.func, p) orelse return error.Unsupported;
             if (self.isDivergent(p)) {
-                try self.lanewiseBuiltin(b, try self.vreg(p, 0));
+                try self.lanewiseBuiltin(b orelse return error.Unsupported, try self.vreg(p, 0));
                 continue;
             }
             const dst: Reg = switch (home) {
                 .reg => |r| regOf(r),
                 .slot => scratch,
             };
-            switch (builtinSource(b) orelse return error.Unsupported) {
+            if (arg) |csr| {
+                try self.put(glacier.csrr(dst, csr));
+            } else switch (builtinSource(b.?) orelse return error.Unsupported) {
                 .csr => |c| try self.put(glacier.csrr(dst, c)),
                 .lanes => try self.constant(dst, self.opts.profile.lanes()),
             }

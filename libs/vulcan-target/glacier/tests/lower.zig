@@ -310,14 +310,14 @@ test "the backend refuses what a Glacier warp cannot do" {
         );
     }
 
-    // An entry parameter that is not a hardware builtin. A kernel has no parameter block to read
-    // it from, so the value would have to come from nowhere.
+    // A NINTH kernel parameter. The core carries eight launch arguments, so there is no CSR to
+    // read the ninth from and the value would have to come from nowhere.
     {
         var f = Function.init(allocator);
         defer f.deinit();
         const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
         const entry = try f.appendBlock();
-        _ = try f.appendBlockParam(entry, u32_t);
+        for (0..9) |_| _ = try f.appendBlockParam(entry, u32_t);
         f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
         try std.testing.expectError(
             error.Unsupported,
@@ -403,6 +403,18 @@ const data_base: u32 = 0x1000;
 /// Run one warp over `data`, with the words after `scratch_at` standing in for the hart scratch
 /// region the SoC build reserves. A hart reads one past the top of its own slice from `mscratch`.
 fn runOnce(code: []const u32, data: []u32, hart_id: u32, hart_count: u32) !void {
+    return runOnceWithArgs(code, data, hart_id, hart_count, @splat(0));
+}
+
+/// `runOnce` with the launch arguments a host wrote before the strobe. One dispatch gives every
+/// warp the same values, so a caller running several warps passes the same array to each.
+fn runOnceWithArgs(
+    code: []const u32,
+    data: []u32,
+    hart_id: u32,
+    hart_count: u32,
+    launch_args: [8]u32,
+) !void {
     const stride = glacier.encode.Profile.@"gc1.n".scratchBytes();
     const scratch_words = (stride / 4) * hart_count;
     const scratch_at = if (data.len > scratch_words) data.len - scratch_words else data.len;
@@ -419,6 +431,7 @@ fn runOnce(code: []const u32, data: []u32, hart_id: u32, hart_count: u32) !void 
         // this at its default ran ONE lane, which made a per-lane test pass on lane zero alone.
         .lanes = glacier.encode.Profile.@"gc1.n".lanes(),
         .stack_top = scratch_base + (hart_id + 1) * stride,
+        .launch_args = launch_args,
     };
     _ = try warp.run(code, &mem, &one, budget);
 }
@@ -3672,4 +3685,103 @@ test "a mask nothing else reads is still kept alive for its load" {
     try runOnce(words, &data, 0, 1);
     try std.testing.expectEqual(@as(u32, 11), data[0]);
     try std.testing.expectEqual(@as(u32, 22), data[1]);
+}
+
+test "a kernel parameter comes from the launch argument the host wrote" {
+    // `out[lane] = arg0 + arg1 * lane`, where arg0 and arg1 are KERNEL PARAMETERS. Nothing about
+    // them is in the instruction stream: the host writes them before the strobe and the kernel
+    // reads 0xFC1 and 0xFC2. That is what lets a buffer be bound without a rebuild.
+    //
+    // Both arguments are read, with different values, so a lowering that confused the two or read
+    // one CSR twice gives the wrong answer rather than a plausible one.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    // The builtin sits BETWEEN the two parameters, so the argument number counts only the
+    // parameters and skips it, the same rule `gpu.abi.layoutParams` uses.
+    const arg0 = try f.appendBlockParam(entry, u32_t);
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const arg1 = try f.appendBlockParam(entry, u32_t);
+
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const scaled = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = arg1, .rhs = tid } });
+    const value = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .add, .lhs = arg0, .rhs = scaled } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, value, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // Two CSR reads of the launch arguments, 0xFC1 and 0xFC2, and in that order.
+    var seen: std.ArrayList(u32) = .empty;
+    defer seen.deinit(allocator);
+    for (words) |w| {
+        if (w & 0x7F != 0b1110011) continue;
+        if ((w >> 12) & 0b111 != 2) continue;
+        const csr = w >> 20;
+        if (csr < 0xFC1 or csr > 0xFC8) continue;
+        try seen.append(allocator, csr);
+    }
+    try std.testing.expectEqualSlices(u32, &.{ 0xFC1, 0xFC2 }, seen.items);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    var args: [8]u32 = @splat(0);
+    args[0] = 100;
+    args[1] = 7;
+    try runOnceWithArgs(words, &data, 0, 1, args);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(100 + 7 * i)), data[i]);
+    }
+}
+
+test "an unused kernel parameter does not shift the ones after it" {
+    // `out[lane] = arg1`, with arg0 declared and never read. The host still wrote it to 0xFC1, so
+    // arg1 is 0xFC2 whatever the kernel does with arg0. Numbering by the parameters the ALLOCATOR
+    // gave a register to would renumber the host's arguments behind its back.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    _ = try f.appendBlockParam(entry, u32_t); // arg0, never read
+    const arg1 = try f.appendBlockParam(entry, u32_t);
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, arg1, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var seen: std.ArrayList(u32) = .empty;
+    defer seen.deinit(allocator);
+    for (words) |w| {
+        if (w & 0x7F != 0b1110011) continue;
+        if ((w >> 12) & 0b111 != 2) continue;
+        const csr = w >> 20;
+        if (csr < 0xFC1 or csr > 0xFC8) continue;
+        try seen.append(allocator, csr);
+    }
+    // Only the one that is read is emitted, and it is the SECOND argument.
+    try std.testing.expectEqualSlices(u32, &.{0xFC2}, seen.items);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    var args: [8]u32 = @splat(0);
+    args[0] = 11;
+    args[1] = 22;
+    try runOnceWithArgs(words, &data, 0, 1, args);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, 22), data[i]);
+    }
 }

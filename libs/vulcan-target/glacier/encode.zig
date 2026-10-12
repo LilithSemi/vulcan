@@ -54,6 +54,30 @@ pub const Csr = struct {
     /// core it is launched on without being told the shape by its host.
     pub const hart_count: u12 = 0xFC0;
 
+    /// How many launch arguments a GC1 core carries.
+    pub const launch_args: usize = 8;
+
+    /// The custom read-only CSR holding launch argument `i`, 0xFC1 through 0xFC8, or null when the
+    /// core has no such argument.
+    ///
+    /// These belong to the CORE and not to a warp: one dispatch gives every warp the same values,
+    /// so a launch argument is WARP UNIFORM BY CONSTRUCTION rather than because an analysis proved
+    /// it. A host writes them through the core's CSR window before the launch strobe, and the
+    /// STROBE LATCHES THEM into a second set that the kernel reads, so a write during a dispatch
+    /// lands on the next launch and a read is constant for the whole of this one.
+    ///
+    /// The honest edge, since the launch is one strobe per warp: a host that writes different
+    /// values BETWEEN the strobes of one dispatch gives different warps different values. Writing
+    /// once and then strobing is safe; interleaving is not, and the hardware does not forbid it.
+    ///
+    /// This is what lets a kernel reach a buffer whose address nothing knew at compile time. The
+    /// alternative, resolving an address to a constant in the instruction stream, means a new
+    /// BUILD to bind a different buffer, which no graphics driver can do between draws.
+    pub fn launchArg(i: usize) ?u12 {
+        if (i >= launch_args) return null;
+        return @intCast(0xFC1 + i);
+    }
+
     /// Standard machine scratch CSR, read only here: the INITIAL STACK POINTER of the hart doing
     /// the read, one past the top of its own scratch region. It is the top and not the base so a
     /// downward stack never needs the region size, which lets the size change with the core

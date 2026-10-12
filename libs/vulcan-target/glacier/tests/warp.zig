@@ -49,6 +49,11 @@ const csr_hart_count: u12 = 0xFC0;
 
 const csr_mscratch: u12 = 0x340;
 
+/// The launch arguments, 0xFC1 through 0xFC8. The strobe latches them, so every warp of one
+/// dispatch reads the same values and a read is constant for the whole of it.
+const csr_launch_arg_first: u12 = 0xFC1;
+const csr_launch_arg_last: u12 = 0xFC8;
+
 const ebreak: u32 = 0x00100073;
 
 /// The per-hart scratch region, as the SoC build lays it out: one slice of `stride` bytes per hart,
@@ -108,6 +113,9 @@ pub const Warp = struct {
     /// What `mscratch` reads: one past the top of this hart's own scratch slice. Zero on a core
     /// built with no scratch, same as the hardware.
     stack_top: u32 = 0,
+    /// What the launch argument CSRs read. A dispatch gives every warp the same values, so a test
+    /// that runs several warps sets these once.
+    launch_args: [8]u32 = @splat(0),
 
     fn set(self: *Warp, rd: u5, value: u32) void {
         if (rd != 0) self.x[rd] = value;
@@ -315,7 +323,12 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
         // CSR read. CSRRS with x0 as the set mask is the only CSR access a Glacier core decodes.
         0x73 => {
             if (funct3 != 2 or rs1 != 0) return error.Illegal;
-            warp.set(rd, switch (@as(u12, @intCast(word >> 20))) {
+            const csr: u12 = @intCast(word >> 20);
+            if (csr >= csr_launch_arg_first and csr <= csr_launch_arg_last) {
+                warp.set(rd, warp.launch_args[csr - csr_launch_arg_first]);
+                return;
+            }
+            warp.set(rd, switch (csr) {
                 csr_mhartid => warp.hart_id,
                 csr_hart_count => warp.hart_count,
                 csr_mscratch => warp.stack_top,

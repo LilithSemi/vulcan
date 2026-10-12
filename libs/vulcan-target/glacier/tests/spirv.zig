@@ -95,28 +95,43 @@ test "a SPIR-V compute kernel runs on Glacier" {
     }
 }
 
-test "the storage buffer became an address and not a parameter" {
+test "a storage buffer arrives either as an address or as a launch argument" {
     const allocator = std.testing.allocator;
     var b = try fillModule(allocator);
     defer b.deinit(allocator);
 
-    // Under the option, the buffer is a `global_addr` and the entry block takes only the two
-    // builtin parameters. Without it the buffer is a third, pointer-typed parameter, which a
-    // Glacier kernel has no way to receive.
+    // Under the option the buffer is a `global_addr`, baked into the instruction stream, and the
+    // entry block takes only the two builtin parameters.
     var as_global = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
     defer as_global.deinit();
     try std.testing.expectEqual(@as(usize, 2), as_global.blockParams(@fromBackingInt(0)).len);
 
+    // Without it the buffer is a third, POINTER-TYPED parameter, which is a kernel parameter like
+    // any other and comes from the first launch argument. This is the path that matters for a
+    // driver: the same words bind a different buffer, with no rebuild.
     var as_param = try spirv.lowerModule(allocator, b.words.items);
     defer as_param.deinit();
     try std.testing.expectEqual(@as(usize, 3), as_param.blockParams(@fromBackingInt(0)).len);
-    try std.testing.expectError(
-        error.Unsupported,
-        glacier.isel.compileKernel(allocator, &as_param, .{
-            .profile = .@"gc1.n",
-            .globals = &.{.{ .name = "out", .address = data_base }},
-        }),
-    );
+    const words = try glacier.isel.compileKernel(allocator, &as_param, .{ .profile = .@"gc1.n" });
+    defer allocator.free(words);
+
+    // Nothing in the stream names an address, and 0xFC1 is read once.
+    var reads: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1110011) continue;
+        if ((w >> 12) & 0b111 != 2) continue;
+        if (w >> 20 == 0xFC1) reads += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), reads);
+
+    // And the buffer the host passes is the buffer it writes.
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1 };
+    one.launch_args[0] = data_base;
+    _ = try warp.run(words, &mem, &one, 10_000);
+    try std.testing.expectEqual(@as(u32, 1), data[0]);
+    for (data[1..]) |got| try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), got);
 }
 
 test "a buffer the host did not place is refused, not guessed" {
