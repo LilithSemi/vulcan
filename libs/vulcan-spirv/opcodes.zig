@@ -286,3 +286,9 @@ pub const AccessChain = 65;
 /// `OpInBoundsAccessChain`. InBounds is a promise about the index, not a different operation,
 /// so it lowers exactly as `AccessChain` does. Zig's SPIR-V backend emits this one, not 65.
 pub const InBoundsAccessChain = 66;
+
+/// The optional Memory Operands mask on `OpLoad` and `OpStore`. Only `volatile` matters here: it
+/// says the access must happen exactly as written, which is what keeps a poll inside a spin loop.
+pub const MemoryOperand = struct {
+    pub const @"volatile": u32 = 0x0001;
+};

@@ -1479,6 +1479,17 @@ fn appendArith(func: *Function, block: Block, ty: Type, bop: ir.function.BinOp, 
 }
 
 /// Lower a non-terminator body instruction, recording its result Value.
+/// Whether the optional Memory Operands at `at` mark the access volatile.
+///
+/// A volatile access must happen exactly as written, which is what keeps a poll inside a spin loop
+/// instead of being hoisted out of it. Nothing in the Glacier pipeline moves memory today, so a
+/// spin loop survives either way; carrying the flag is what keeps that true when a pass that does
+/// move memory is added.
+fn isVolatile(operands: []const u32, at: usize) bool {
+    if (operands.len <= at) return false;
+    return operands[at] & op.MemoryOperand.@"volatile" != 0;
+}
+
 /// `v` with its integer signedness restated, which moves no bits.
 ///
 /// A SPIR-V integer type says nothing about signedness, so a conversion opcode is the only place
@@ -1716,7 +1727,10 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             } else {
                 const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
                 const ptr = value_of[ptr_id] orelse return error.MalformedModule;
-                value_of[result] = try func.appendInst(block, ty, .{ .load = .{ .ptr = ptr } });
+                value_of[result] = try func.appendInst(block, ty, .{ .load = .{
+                    .ptr = ptr,
+                    .@"volatile" = isVolatile(inst.operands, 3),
+                } });
             }
         },
         op.Store => {
@@ -1776,7 +1790,7 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             }
             const ptr = try valueOf(module, ptr_id);
             const val = try valueOf(module, val_id);
-            try func.appendStore(block, val, ptr);
+            try func.appendStoreVol(block, val, ptr, isVolatile(inst.operands, 2));
         },
         op.SampledImage => {
             // [type, result, image, sampler]. A combined-image-sampler is already a

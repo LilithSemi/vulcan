@@ -878,3 +878,81 @@ test "an integer to float convert reaches the hardware from a signless module" {
     _ = try warp.run(words, &mem, &one, 10_000);
     try std.testing.expectEqual(@as(u32, 42), data[1]);
 }
+
+/// `out.results[warp] = out.results[warp]`, with the load and the store optionally marked volatile
+/// by the module. A spin loop polling a flag word is written exactly this way.
+fn volatileCopyModule(allocator: std.mem.Allocator, mark: bool) !spirv.binary.Builder {
+    // ids: void=1 uint=2 v3uint=3 pInV3=4 pInU=5 arr=6 struct=7 pSbStruct=8 pSbU32=9 voidfn=10
+    //      c0=11 wid=12 out=13 main=14 entry=15 widptr=16 w=17 pElem=18 v=19.
+    var b = try spirv.binary.Builder.init(allocator, 20);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 14, 0x6E69616D, 0, 12, 13 });
+    try b.emit(allocator, op.Name, &.{ 13, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 12, op.Decoration.builtin, op.BuiltIn.workgroup_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 7, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 3, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.input, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 6, 2 });
+    try b.emit(allocator, op.TypeStruct, &.{ 7, 6 });
+    try b.emit(allocator, op.TypePointer, &.{ 8, op.StorageClass.storage_buffer, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 10, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 11, 0 });
+    try b.emit(allocator, op.Variable, &.{ 4, 12, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 8, 13, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 14, 0, 10 });
+    try b.emit(allocator, op.Label, &.{15});
+    try b.emit(allocator, op.AccessChain, &.{ 5, 16, 12, 11 });
+    try b.emit(allocator, op.Load, &.{ 2, 17, 16 });
+    try b.emit(allocator, op.AccessChain, &.{ 9, 18, 13, 11, 17 });
+    if (mark) {
+        try b.emit(allocator, op.Load, &.{ 2, 19, 18, op.MemoryOperand.@"volatile" });
+        try b.emit(allocator, op.Store, &.{ 18, 19, op.MemoryOperand.@"volatile" });
+    } else {
+        try b.emit(allocator, op.Load, &.{ 2, 19, 18 });
+        try b.emit(allocator, op.Store, &.{ 18, 19 });
+    }
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "a volatile load and store keep their flag through the lowering" {
+    // Nothing in the Glacier pipeline moves memory, so a poll survives a spin loop either way
+    // today. Carrying the flag is what keeps that true the day a pass that does move memory is
+    // added, and dropping it would be invisible until then.
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |mark| {
+        var b = try volatileCopyModule(allocator, mark);
+        defer b.deinit(allocator);
+        var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+        defer func.deinit();
+
+        var loads: usize = 0;
+        var stores: usize = 0;
+        for (0..func.blockCount()) |bi| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
+                .load => |l| {
+                    if (l.@"volatile") loads += 1;
+                },
+                .store => |st| {
+                    if (st.@"volatile") stores += 1;
+                },
+                else => {},
+            };
+        }
+        try std.testing.expectEqual(@as(usize, if (mark) 1 else 0), loads);
+        try std.testing.expectEqual(@as(usize, if (mark) 1 else 0), stores);
+
+        // Either way it still reaches the hardware, because a Glacier load is a load.
+        const words = try glacier.isel.compileKernel(allocator, &func, .{
+            .profile = .@"gc1.mi",
+            .globals = &.{.{ .name = "out", .address = data_base }},
+        });
+        defer allocator.free(words);
+        try std.testing.expect(words.len > 0);
+    }
+}
