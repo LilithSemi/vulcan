@@ -613,6 +613,19 @@ fn findMacs(
             record(mac, folded, inst, found);
         }
     }
+    // Last, a widening convert nothing absorbed. The core has no `vfwcvt`, so the MAC is the only
+    // instruction that reads an f16 as an f32, and multiplying by 1.0 into a zeroed destination
+    // widens one on its own. This is what lets an f16 reach a divide, which no MAC can absorb.
+    //
+    // The skip keeps `mac` and `folded` disjoint, which is the invariant `Macs` carries: an
+    // instruction is either a MAC of its own or part of one, never both.
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (folded[@backingInt(inst)] or mac[@backingInt(inst)] != null) continue;
+            const found = m.matchWiden(inst) orelse continue;
+            record(mac, folded, inst, found);
+        }
+    }
     return .{ .mac = mac, .folded = folded };
 }
 
@@ -677,6 +690,16 @@ const Matcher = struct {
         return .{
             .mac = .{ .acc = null, .a = p.a, .b = p.b },
             .folded = .{ p.folded[0], p.folded[1], null },
+        };
+    }
+
+    /// A widening convert on its own, as a MAC of the f16 against 1.0 into a zeroed destination.
+    /// Nothing is absorbed: this instruction IS the MAC, and its operand stays a real value.
+    fn matchWiden(self: *const Matcher, inst: Inst) ?Match {
+        const ha = self.widened(inst) orelse return null;
+        return .{
+            .mac = .{ .acc = null, .a = .{ .value = ha }, .b = .{ .constant = half_one } },
+            .folded = .{ null, null, null },
         };
     }
 
@@ -851,7 +874,10 @@ fn checkInst(
         },
         .global_addr => |g| _ = addressOf(opts, func.symbolName(g.symbol)) orelse return error.Unsupported,
         .unary => |u| if (u.op != .reinterpret) return error.Unsupported,
-        .convert => |cv| _ = convertKind(func, inst, cv) orelse return error.Unsupported,
+        // A widening convert has no instruction of its own; the recognizer turns one into a MAC.
+        .convert => |cv| if (macs.at(inst) == null) {
+            _ = convertKind(func, inst, cv) orelse return error.Unsupported;
+        },
         .barrier => |b| switch (b.scope) {
             .workgroup, .subgroup => {},
         },
@@ -1246,6 +1272,7 @@ const Emitter = struct {
                 try self.vectorOperand(u.value, pos),
             ),
             .convert => |cv| {
+                if (self.macs.at(inst)) |m| return self.emitVectorMac(m, inst, pos);
                 const dst = try self.vreg(self.func.instResult(inst).?, pos);
                 const src = try self.vectorOperand(cv.value, pos);
                 const kind = convertKind(self.func, inst, cv) orelse return error.Unsupported;
@@ -1409,7 +1436,10 @@ const Emitter = struct {
                 @bitCast(addressOf(self.opts, self.func.symbolName(g.symbol)) orelse return error.Unsupported),
             ),
             .unary => |u| try self.move(dst, try self.reg(u.value, pos)),
-            .convert => |cv| try self.emitConvert(cv, inst, dst, pos),
+            .convert => |cv| if (self.macs.at(inst)) |m|
+                try self.emitScalarMac(m, dst, pos)
+            else
+                try self.emitConvert(cv, inst, dst, pos),
             .arith => |a| {
                 if (self.macs.at(inst)) |m| {
                     try self.emitScalarMac(m, dst, pos);

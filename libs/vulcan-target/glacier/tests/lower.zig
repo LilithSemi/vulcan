@@ -945,8 +945,8 @@ test "a warp-uniform float divide becomes the one scalar divide" {
 
 test "the backend refuses the float work Glacier cannot do" {
     const allocator = std.testing.allocator;
-    const Shape = enum { add, compare, half_store, per_lane_divide, widen };
-    for ([_]Shape{ .add, .compare, .half_store, .per_lane_divide, .widen }) |shape| {
+    const Shape = enum { add, compare, half_store, per_lane_divide };
+    for ([_]Shape{ .add, .compare, .half_store, .per_lane_divide }) |shape| {
         var f = Function.init(allocator);
         defer f.deinit();
         const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
@@ -991,14 +991,6 @@ test "the backend refuses the float work Glacier cannot do" {
                 const lane = try f.appendInst(entry, f32_t, .{ .unary = .{ .op = .reinterpret, .value = tid } });
                 const q = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = lane, .rhs = b } });
                 break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = q } });
-            },
-            // Nothing WIDENS an f16: the core has no `vfwcvt`.
-            .widen => blk: {
-                const signed_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-                const s = try f.appendInst(entry, signed_t, .{ .convert = .{ .value = tid } });
-                const h = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = s } });
-                const wide = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = h } });
-                break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = wide } });
             },
         };
         try f.appendStore(entry, stored, base);
@@ -1064,8 +1056,8 @@ test "a per-lane multiply-accumulate over f16 becomes one widening MAC" {
     const base = try f.appendGlobalAddr(entry, ptr_t, "data");
     const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
     const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
-    // The accumulator is read per lane, which is the only way to get a per-lane f32: nothing
-    // widens an f16 outside the MAC itself.
+    // The accumulator is read per lane, which is the GEMM shape: load the running sum, accumulate
+    // into it, store it back.
     const acc = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
     const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
     const first = try f.appendArithImm(entry, i32_t, .add, lane, 1);
@@ -1096,8 +1088,8 @@ test "a per-lane multiply-accumulate over f16 becomes one widening MAC" {
 
 test "a widening convert read twice cannot be absorbed, so the tree is refused" {
     // Absorbing an instruction is only safe when one reader exists. Here the convert feeds both
-    // factors, so neither the full MAC nor the bare product matches, and a widening convert has no
-    // instruction of its own.
+    // factors, so no product matches, and what is left is a multiply of two f32 VALUES, which the
+    // core cannot do. The converts themselves are fine on their own.
     const allocator = std.testing.allocator;
     for ([_]bool{ false, true }) |second_reader| {
         var f = Function.init(allocator);
@@ -1397,9 +1389,10 @@ test "a per-lane same-width convert costs no instruction either" {
     }
 }
 
-test "an addition of two widened f16 is refused rather than split into two MACs" {
-    // `f32(x) + f32(y)` has no accumulator on either side. It would take a zeroed destination and
-    // then two MACs against one, which means synthesizing an intermediate the IR does not hold.
+test "an addition of two widened f16 becomes two MACs" {
+    // Neither side is an accumulator, so one convert widens on its own into a zeroed destination
+    // and the addition accumulates the other against 1.0. No intermediate has to be invented: the
+    // standalone widening convert IS the first MAC.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -1425,7 +1418,54 @@ test "an addition of two widened f16 is refused rather than split into two MACs"
     try f.appendStore(entry, sum, at);
     f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
-    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 2), countMacs(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(n + (n + 1.0))), data[i]);
+    }
+}
+
+test "a widening convert on its own is a MAC against one" {
+    // The core has no `vfwcvt`, so reading an f16 as an f32 outside any arithmetic still goes
+    // through the MAC: zero the destination, multiply by 1.0. That is what lets an f16 reach an
+    // operation no MAC can absorb, a divide being the one that matters.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+    const wide = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = wide } });
+    try f.appendStore(entry, raw, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(n)), data[i]);
+    }
 }
 
 test "a constant factor reaches the MAC already widened by the frontend" {
