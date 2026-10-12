@@ -2390,3 +2390,307 @@ test "a per-lane float compare answers false where it should" {
         }
     }
 }
+
+test "a divergent branch becomes straight-line code with a select" {
+    // `out[lane] = (lane < 2) ? lane * 10 : lane + 100`, written as a BRANCH rather than a select.
+    // Lanes disagree about which side to take, which used to be refused outright because a scalar
+    // branch would have sent the whole warp whichever way lane zero went.
+    //
+    // Note what the join parameter would look like to an analysis that only follows operands: both
+    // incoming values are per-lane here, but they need not be, and that is the case this shape is
+    // converted to avoid rather than to tolerate.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const ten = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+    const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+    const result = try f.appendBlockParam(join, u32_t);
+
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+    try f.setJump(then_b, join, &.{ten});
+    try f.setJump(else_b, join, &.{hundred});
+
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, result, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One compare into a mask and one merge, and NO branch: the arms were spliced in and the join
+    // parameter became a select, so nothing jumps anywhere.
+    try std.testing.expectEqual(@as(usize, 1), countCompares(words));
+    try std.testing.expectEqual(@as(usize, 1), countMerges(words));
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011); // no conditional branch
+        try std.testing.expect(w & 0x7F != 0b1101111); // no jump
+    }
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const want: u32 = if (i < 2) @intCast(i * 10) else @intCast(i + 100);
+        try std.testing.expectEqual(want, data[i]);
+    }
+}
+
+test "a divergent branch whose arm writes memory is still refused" {
+    // Both arms run for every lane once converted, so a store in one would reach lanes that did
+    // not choose it. That needs a MASKED store, which the core does not offer yet, and inventing
+    // a read-modify-write to fake one would add a load the program never had.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const offset = try f.appendArithImm(then_b, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(then_b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(then_b, two, at);
+
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = join });
+    try f.setJump(then_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a warp-uniform branch keeps its branch instead of running both arms" {
+    // Converting this would be correct and slower: every lane agrees, so one jump runs one arm,
+    // where a merge would run both and then throw one away.
+    const allocator = std.testing.allocator;
+    for ([_]i64{ 0, 1 }) |flag| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const then_b = try f.appendBlock();
+        const else_b = try f.appendBlock();
+        const join = try f.appendBlock();
+
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const cond = try f.appendInst(entry, bool_t, .{ .iconst = flag });
+        const ten = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+        const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+        const result = try f.appendBlockParam(join, u32_t);
+
+        try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+        try f.setJump(then_b, join, &.{ten});
+        try f.setJump(else_b, join, &.{hundred});
+
+        const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        try f.appendStore(join, result, at);
+        f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 0), countMerges(words));
+        var branches: usize = 0;
+        for (words) |w| {
+            if (w & 0x7F == 0b1100011) branches += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), branches);
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            const want: u32 = if (flag == 1) @intCast(i * 10) else @intCast(i + 100);
+            try std.testing.expectEqual(want, data[i]);
+        }
+    }
+}
+
+test "a divergent branch sharing an arm with another path is refused" {
+    // `then` is also the target of a jump the branch does not control, so moving its body into the
+    // branch would leave that other path running an empty block. Nothing converts here and the
+    // refusal answers instead.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const other = try f.appendBlock();
+    const fork = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const flag = try f.appendInst(entry, bool_t, .{ .iconst = 1 });
+    try f.appendIf(entry, flag, .{ .target = other }, .{ .target = fork });
+    try f.setJump(other, then_b, &.{});
+
+    const two = try f.appendInst(fork, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(fork, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(fork, cond, .{ .target = then_b }, .{ .target = else_b });
+
+    const ten = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+    const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+    const result = try f.appendBlockParam(join, u32_t);
+    try f.setJump(then_b, join, &.{ten});
+    try f.setJump(else_b, join, &.{hundred});
+
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, result, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a join reached from outside the branch keeps its parameters" {
+    // A third path reaches the join, so its parameter takes a value the two arms never pass and
+    // cannot become a select between them.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const other = try f.appendBlock();
+    const fork = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const flag = try f.appendInst(entry, bool_t, .{ .iconst = 1 });
+    try f.appendIf(entry, flag, .{ .target = other }, .{ .target = fork });
+
+    const seven = try f.appendInst(other, u32_t, .{ .iconst = 7 });
+    try f.setJump(other, join, &.{seven});
+
+    const two = try f.appendInst(fork, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(fork, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(fork, cond, .{ .target = then_b }, .{ .target = else_b });
+
+    const ten = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+    const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+    const result = try f.appendBlockParam(join, u32_t);
+    try f.setJump(then_b, join, &.{ten});
+    try f.setJump(else_b, join, &.{hundred});
+
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, result, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a divergent branch that passes an argument to its arm is refused" {
+    // The arm reads a parameter the branch edge supplies, which if-conversion has nowhere to put:
+    // splicing the body into the branch would leave that parameter with no value. So the shape is
+    // one of those the refusal has to catch, and this pins that it does.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const ten = try f.appendArithImm(entry, u32_t, .mul, tid, 10);
+
+    const carried = try f.appendBlockParam(then_b, u32_t);
+    const bumped = try f.appendArithImm(then_b, u32_t, .add, carried, 1);
+    const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+    const result = try f.appendBlockParam(join, u32_t);
+
+    try f.appendIf(entry, cond, .{ .target = then_b, .args = &.{ten} }, .{ .target = else_b });
+    try f.setJump(then_b, join, &.{bumped});
+    try f.setJump(else_b, join, &.{hundred});
+
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, result, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a divergent branch whose arms go to different places is refused" {
+    // There is no one join to turn into selects: each arm ends somewhere of its own. Nothing here
+    // converts, so the refusal is what answers.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const then_end = try f.appendBlock();
+    const else_end = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+
+    const ten = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+    const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+    try f.setJump(then_b, then_end, &.{});
+    try f.setJump(else_b, else_end, &.{});
+
+    try f.appendStore(then_end, ten, at);
+    f.setTerminator(then_end, .{ .ret = ir.function.Ret.none() });
+    try f.appendStore(else_end, hundred, at);
+    f.setTerminator(else_end, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}

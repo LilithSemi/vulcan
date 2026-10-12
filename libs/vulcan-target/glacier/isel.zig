@@ -149,6 +149,17 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     const reachable = try ir.reachable.neutralizeUnreachable(allocator, &work);
     allocator.free(reachable);
 
+    // If-convert the divergent diamonds, then analyse again: converting one turns a join parameter
+    // into a select, which can make an enclosing condition per-lane that operand propagation had
+    // called uniform, and that can expose another diamond. So it iterates to a fixpoint.
+    while (true) {
+        const d = try analyzeDivergence(allocator, &work);
+        defer allocator.free(d);
+        if (!try ifConvert(allocator, &work, d)) break;
+    }
+    const reachable_after = try ir.reachable.neutralizeUnreachable(allocator, &work);
+    allocator.free(reachable_after);
+
     const divergent = try analyzeDivergence(allocator, &work);
     defer allocator.free(divergent);
 
@@ -556,6 +567,167 @@ fn isBitPreservingConvert(func: *const Function, inst: Inst, cv: ir.function.Con
     return convertKind(func, inst, cv) == .move;
 }
 
+// ===========================================================================
+// If-conversion: a divergent branch becomes straight-line code with selects.
+
+/// Rewrite every divergent if-then-else diamond into one block with selects at the join, and
+/// report whether anything changed.
+///
+/// WHY THIS AND NOT A CONTROL-DEPENDENCE RULE. `analyzeDivergence` propagates through operands
+/// only, and the case it gets wrong once lanes can take different sides is a join parameter whose
+/// two incoming values are both warp-uniform: operand propagation calls the parameter uniform and
+/// the lanes disagree about it. Adding a rule for that means the analysis and the emitter have to
+/// agree about control dependence forever, and my own warning said getting it wrong is a silent
+/// miscompile.
+///
+/// Converting instead makes the hazard structural. The join parameter becomes a `select` whose
+/// CONDITION is the per-lane value, so the divergence arrives as an operand and the analysis that
+/// already exists is already right. Nothing is control-dependent on anything, because no branch is
+/// left.
+///
+/// And the refusal stays. `checkSupported` still rejects a divergent `if`, so a shape this cannot
+/// transform is refused rather than mis-emitted: the safety comes from never lifting the refusal
+/// rather than from a rule that has to be kept in step.
+///
+/// Both arms then execute for every lane, which is why only PURE arms convert. An instruction with
+/// a side effect would take effect in lanes that did not choose it, and the answer for that is a
+/// masked form of the instruction rather than this.
+fn ifConvert(allocator: std.mem.Allocator, func: *Function, divergent: []const bool) Error!bool {
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const a: Block = @fromBackingInt(@intCast(bi));
+        const found = candidate(func, a, divergent) orelse continue;
+        try convert(allocator, func, a, found);
+        changed = true;
+    }
+    return changed;
+}
+
+/// One convertible diamond: the branch, its two arms and the join they share.
+const Diamond = struct {
+    cond: Value,
+    then_block: Block,
+    else_block: Block,
+    join: Block,
+    then_args: ir.function.ValueList,
+    else_args: ir.function.ValueList,
+};
+
+/// Whether the `if` ending `a` is a diamond this can convert. Every condition here is a reason it
+/// would otherwise be wrong, not a simplification of convenience.
+fn candidate(func: *const Function, a: Block, divergent: []const bool) ?Diamond {
+    const insts = func.blockInsts(a);
+    if (insts.len == 0) return null;
+    const cf = switch (func.opcode(insts[insts.len - 1])) {
+        .@"if" => |x| x,
+        else => return null,
+    };
+    // A uniform branch is left alone: it costs one jump and runs one side, where converting it
+    // would run both.
+    if (!divergent[@backingInt(cf.cond)]) return null;
+    const t = cf.then.target;
+    const e = cf.@"else".target;
+    if (t == e) return null;
+    // An arm with another predecessor is reached from somewhere this branch does not control, so
+    // its instructions cannot move into `a`. Critical-edge splitting runs first and gives every arm
+    // its own predecessor, so this holds structurally today and stands against a change of order.
+    if (predCount(func, t) != 1 or predCount(func, e) != 1) return null;
+    // An arm taking parameters receives them from the branch, and moving its body out would leave
+    // them undefined.
+    if (func.blockParams(t).len != 0 or func.blockParams(e).len != 0) return null;
+    // Both arms must leave by a plain jump to one join, and nothing may follow the branch.
+    if (func.blockArgs(cf.then).len != 0 or func.blockArgs(cf.@"else").len != 0) return null;
+    const t_jump = soleJump(func, t) orelse return null;
+    const e_jump = soleJump(func, e) orelse return null;
+    if (t_jump.target != e_jump.target) return null;
+    const join = t_jump.target;
+    if (join == t or join == e or join == a) return null;
+    // The entry block is reachable without a predecessor, so it cannot be absorbed into another.
+    if (@backingInt(join) == 0) return null;
+    // A join reached from anywhere else takes parameters from a path this does not control, so
+    // they cannot all become selects.
+    if (predCount(func, join) != 2) return null;
+    if (func.blockArgs(t_jump).len != func.blockParams(join).len) return null;
+    if (func.blockArgs(e_jump).len != func.blockParams(join).len) return null;
+    // Both arms run for every lane after this, so a side effect in one would reach lanes that did
+    // not choose it.
+    for ([_]Block{ t, e }) |arm| {
+        for (func.blockInsts(arm)) |inst| if (!convertible(func.opcode(inst))) return null;
+    }
+    return .{
+        .cond = cf.cond,
+        .then_block = t,
+        .else_block = e,
+        .join = join,
+        .then_args = t_jump.args,
+        .else_args = e_jump.args,
+    };
+}
+
+/// The jump leaving `block`, when that is all it does by way of control flow.
+fn soleJump(func: *const Function, block: Block) ?ir.function.Jump {
+    for (func.blockInsts(block)) |inst| {
+        if (func.opcode(inst) == .@"if") return null;
+    }
+    return switch (func.terminator(block) orelse return null) {
+        .jump => |j| j,
+        .ret => null,
+    };
+}
+
+/// Whether an instruction may run for lanes that did not choose its arm. Anything that writes
+/// memory, or reads an address a lane never meant to compute, may not.
+fn convertible(code: ir.function.Opcode) bool {
+    return switch (code) {
+        .iconst, .fconst, .global_addr, .arith, .arith_imm, .icmp, .select, .convert, .unary => true,
+        else => false,
+    };
+}
+
+fn convert(allocator: std.mem.Allocator, func: *Function, a: Block, d: Diamond) Error!void {
+    // Drop the branch first, so the arms' instructions land where it was.
+    const a_insts = func.blockInstsMut(a);
+    _ = a_insts.pop();
+    for ([_]Block{ d.then_block, d.else_block }) |arm| {
+        const body = func.blockInstsMut(arm);
+        try func.blockInstsMut(a).appendSlice(allocator, body.items);
+        body.clearRetainingCapacity();
+    }
+
+    // Each join parameter becomes a select between what the two arms would have passed it.
+    const count = func.blockParams(d.join).len;
+    var args: std.ArrayList(Value) = .empty;
+    defer args.deinit(allocator);
+    for (0..count) |i| {
+        const then_v = func.valueList(d.then_args)[i];
+        const else_v = func.valueList(d.else_args)[i];
+        const ty = func.valueType(func.blockParams(d.join)[i]);
+        try args.append(allocator, try func.appendInst(a, ty, .{ .select = .{
+            .cond = d.cond,
+            .then = then_v,
+            .@"else" = else_v,
+        } }));
+    }
+    for (0..count) |i| {
+        func.replaceAllUses(func.blockParams(d.join)[i], args.items[i]);
+    }
+    try func.setBlockParams(d.join, &.{});
+
+    // Absorb the join as well. Both arms came from `a` and nothing else reaches the join, so `a`
+    // dominates it and taking its body leaves no jump anywhere in the diamond. Its terminator
+    // comes over as it is, which is null when the join itself ends in an `if`: that branch moves
+    // across with the body and the next round of this pass sees it.
+    const join_body = func.blockInstsMut(d.join);
+    try func.blockInstsMut(a).appendSlice(allocator, join_body.items);
+    join_body.clearRetainingCapacity();
+    func.terminatorPtr(a).* = func.terminatorPtr(d.join).*;
+
+    // The arms and the join are now unreachable; `neutralizeUnreachable` takes them out of the
+    // picture.
+    for ([_]Block{ d.then_block, d.else_block, d.join }) |dead| {
+        func.setTerminator(dead, .{ .ret = ir.function.Ret.none() });
+    }
+}
 // ===========================================================================
 // The widening multiply-accumulate.
 
