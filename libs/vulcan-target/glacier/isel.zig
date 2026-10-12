@@ -140,6 +140,10 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
         var analyses: opt.pass.Analyses = .{ .allocator = allocator, .func = &work };
         defer analyses.deinit();
         _ = try opt.mem2reg.run(allocator, &work, &analyses);
+        // A SPIR-V module constant lands at the top of the entry block, so a kernel that writes a
+        // table of them holds every one at once and spills the lot. A warp has little scratch, so
+        // that is a refusal rather than slow code.
+        _ = try opt.sink.run(allocator, &work, &analyses);
     }
     try ir.critical_edge.splitCriticalEdges(allocator, &work);
     const reachable = try ir.reachable.neutralizeUnreachable(allocator, &work);

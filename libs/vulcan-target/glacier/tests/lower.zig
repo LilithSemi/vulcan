@@ -1771,3 +1771,37 @@ test "a MAC keeps its factors alive past the converts it absorbed" {
         try std.testing.expectEqual(@as(u32, @bitCast(n * (n + 1.0))), data[i]);
     }
 }
+
+test "a table of constants written once spills nothing" {
+    // A SPIR-V module constant has nowhere natural to live, so the lowering puts every one at the
+    // top of the entry block. A kernel that writes a table of them then holds the whole table at
+    // once and the allocator spills it, which costs a store and a reload each where re-emitting
+    // the constant costs one word. A warp has 256 bytes of scratch on the small profiles, so past
+    // about 64 entries that stops being slow code and becomes a refusal.
+    const allocator = std.testing.allocator;
+    const entries = 48;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    var consts: [entries]Value = undefined;
+    for (&consts, 0..) |*c, i| c.* = try f.appendInst(entry, u32_t, .{ .iconst = @intCast(0x1234_0000 + i) });
+    for (consts, 0..) |c, i| {
+        const at = try f.appendArithImm(entry, ptr_t, .add, base, @intCast(i * 4));
+        try f.appendStore(entry, c, at);
+    }
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // The prologue loads the stack pointer only when something spills.
+    const load_sp = glacier.encode.rv.csrrs(.x2, glacier.encode.Csr.mscratch, .x0);
+    for (words) |w| try std.testing.expect(w != load_sp);
+
+    var data: [64]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    for (0..entries) |i| try std.testing.expectEqual(@as(u32, @intCast(0x1234_0000 + i)), data[i]);
+}

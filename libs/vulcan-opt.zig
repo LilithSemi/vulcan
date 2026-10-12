@@ -24,6 +24,7 @@ pub const licm = @import("vulcan-opt/licm.zig");
 pub const ivsr = @import("vulcan-opt/ivsr.zig");
 pub const inlining = @import("vulcan-opt/inline.zig");
 pub const dce = @import("vulcan-opt/dce.zig");
+pub const sink = @import("vulcan-opt/sink.zig");
 pub const lto = @import("vulcan-opt/lto.zig");
 pub const pgo = @import("vulcan-opt/pgo.zig");
 pub const lowerdiv = @import("vulcan-opt/lowerdiv.zig");
