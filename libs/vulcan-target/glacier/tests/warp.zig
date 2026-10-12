@@ -335,10 +335,11 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
     // The plain float arithmetic. These read WHOLE lanes as f32: the element width is fixed at 32
     // bits, so there is no f16 form of any of them.
     //
-    // THE ROUNDING MODE OF THESE IS NOT RECORDED. The MAC truncates and two of the converts round
-    // to nearest even, so the lane is not uniform about it and it cannot be inferred. Nearest even
-    // is assumed here because it is the IEEE default, and every test of them uses operands whose
-    // result is EXACT, so no test depends on the assumption.
+    // These round to NEAREST EVEN, from Harbor's `fp_round_pack.dart`, which uses the RISC-V
+    // encoding where rm 0 is rne. The lane is NOT uniform about rounding: the widening MAC and the
+    // float-to-integer convert truncate toward zero while these and the other converts round to
+    // nearest. Getting one of them wrong moves a low bit with no error anywhere, so the two modes
+    // are pinned against each other by test rather than left to a comment.
     if (funct3 == 0b001) switch (funct6) {
         0b000000, 0b000010, 0b100100, 0b000100, 0b000110 => {
             for (0..warp.lanes) |i| {

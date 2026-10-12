@@ -2100,3 +2100,75 @@ test "per-lane float arithmetic over widened f16" {
         try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 2.0))), data[i]);
     }
 }
+
+test "a float add rounds to nearest even and the MAC truncates" {
+    // The lane is not uniform about rounding, so the two modes are pinned against each other on
+    // the SAME arithmetic value. 1 + 3*2^-25 is three quarters of an ulp above 1.0 in f32, so
+    // nearest even carries it up one ulp and truncation leaves it at 1.0. A rounding mux that
+    // flipped either way would move that bit with no error anywhere, which is how it would be
+    // missed: every other float test here uses operands whose result is exact.
+    //
+    // This pins the MODEL and the selection, not the hardware. The hardware's modes are recorded
+    // in `warp.zig` with where they were read from.
+    const allocator = std.testing.allocator;
+    const quarter_ulp: f32 = @floatCast(@as(f64, 3.0) / 33554432.0); // 3 * 2^-25, exact in f32
+    const rounded_up: f32 = 1.0 + std.math.floatEps(f32);
+    try std.testing.expect(rounded_up != 1.0);
+
+    // The add: nearest even, so the answer is one ulp above 1.0.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const one = try f.appendInst(entry, f32_t, .{ .fconst = 1.0 });
+        const tiny = try f.appendInst(entry, f32_t, .{ .fconst = quarter_ulp });
+        const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = one, .rhs = tiny } });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
+        try f.appendStore(entry, raw, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
+        var data: [4]u32 = @splat(0);
+        try runOnce(words, &data, 0, 1);
+        try std.testing.expectEqual(@as(u32, @bitCast(rounded_up)), data[0]);
+    }
+
+    // The MAC: toward zero on the same quantity, so the answer stays 1.0. The factors are exact
+    // f16 and their product is exactly the three quarters of an ulp the add rounded up.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const f16_t = try f.types.intern(.{ .float = .f16 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const acc = try f.appendInst(entry, f32_t, .{ .fconst = 1.0 });
+        // 3 * 2^-13 and 2^-12, both normal halves, whose product is 3 * 2^-25 exactly.
+        const ha = try f.appendInst(entry, f16_t, .{ .fconst = @as(f64, 3.0) / 8192.0 });
+        const hb = try f.appendInst(entry, f16_t, .{ .fconst = @as(f64, 1.0) / 4096.0 });
+        const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+        const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+        const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wb } });
+        const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
+        try f.appendStore(entry, raw, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+        var data: [4]u32 = @splat(0);
+        try runOnce(words, &data, 0, 1);
+        try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.0))), data[0]);
+    }
+}
