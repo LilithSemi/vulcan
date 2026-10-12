@@ -155,6 +155,43 @@ pub fn vfmul_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
 pub fn vfdiv_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
     return opfvv(0b100000, vd, vs2, vs1);
 }
+pub fn vfmin_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opfvv(0b000100, vd, vs2, vs1);
+}
+pub fn vfmax_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opfvv(0b000110, vd, vs2, vs1);
+}
+
+/// `vfsgnjn.vv vd, vs2, vs1`: the sign of `vs1` inverted onto `vs2`. With one register for both
+/// sources it is a negate, which is the only way to spell one: there is no `vfneg`.
+pub fn vfsgnjn_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opfvv(0b001001, vd, vs2, vs1);
+}
+
+/// The float compares, which write one BIT per lane into a mask register exactly as the integer
+/// ones do. There is no greater-than in the vector-vector form; it is less-than with the operands
+/// swapped.
+pub fn vmfeq_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opfvv(0b011000, vd, vs2, vs1);
+}
+pub fn vmfne_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opfvv(0b011100, vd, vs2, vs1);
+}
+pub fn vmflt_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opfvv(0b011011, vd, vs2, vs1);
+}
+pub fn vmfle_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opfvv(0b011001, vd, vs2, vs1);
+}
+
+/// `vfwcvt.f.f.v vd, vs2`: per-lane WIDENING float to float, the direction `vfncvt.f.f.w` does not
+/// go. Selected by the `vs1` field out of the same `funct6` as the other converts.
+///
+/// Widening an f16 is exact in every case, including a subnormal, so there is no rounding to do.
+/// Without it a widened f16 costs a zeroed destination, a materialized 1.0 and a MAC.
+pub fn vfwcvt_f_f_v(vd: VReg, vs2: VReg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (@as(u32, 0b01100) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010010) << 26);
+}
 // Fused multiply-add/sub family (OPFVV). Unlike the plain arithmetic ops above, these
 // accumulate INTO vd (vd is a third source operand as well as the destination), so the
 // assembler operand order is conventionally written `vd, vs1, vs2` (the two multiplicands)
@@ -2350,4 +2387,24 @@ test "the A extension word atomics match LLVM's assembler" {
     try std.testing.expectEqual(@as(u32, 0x04b6252f), amo(.add, .x10, .x12, .x11, true, false));
     try std.testing.expectEqual(@as(u32, 0x02b6252f), amo(.add, .x10, .x12, .x11, false, true));
     try std.testing.expectEqual(@as(u32, 0x06b6252f), amo(.add, .x10, .x12, .x11, true, true));
+}
+
+test "the RVV float arithmetic, compares and widening convert match LLVM's assembler" {
+    // Reference words from `zig cc -target riscv64-linux-musl -mcpu=generic_rv64+v+f`. The first
+    // three existed already and were derived by hand from the funct6 table rather than pinned;
+    // they are right, which is luck worth converting into a test now that they carry real work.
+    try std.testing.expectEqual(@as(u32, 0x0a1111d7), vfsub_vv(.v3, .v1, .v2));
+    try std.testing.expectEqual(@as(u32, 0x921111d7), vfmul_vv(.v3, .v1, .v2));
+    try std.testing.expectEqual(@as(u32, 0x821111d7), vfdiv_vv(.v3, .v1, .v2));
+    try std.testing.expectEqual(@as(u32, 0x121111d7), vfmin_vv(.v3, .v1, .v2));
+    try std.testing.expectEqual(@as(u32, 0x1a1111d7), vfmax_vv(.v3, .v1, .v2));
+    try std.testing.expectEqual(@as(u32, 0x261111d7), vfsgnjn_vv(.v3, .v1, .v2));
+    try std.testing.expectEqual(@as(u32, 0x62951457), vmfeq_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x72951457), vmfne_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x6e951457), vmflt_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x66951457), vmfle_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x4a961457), vfwcvt_f_f_v(.v8, .v9));
+    // The same reference run pins the add this file already had, which checks the parse of the
+    // dump the other words came from.
+    try std.testing.expectEqual(@as(u32, 0x021111d7), vfadd_vv(.v3, .v1, .v2));
 }

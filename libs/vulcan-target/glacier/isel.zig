@@ -1073,12 +1073,16 @@ fn vectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const f
     // and it is not a binary op, because it accumulates into its own destination. A per-lane
     // divide would have to feed the single scalar divider one lane at a time.
     //
-    // BEFORE SELECTING A NON-WIDENING FLOAT MULTIPLY HERE, CHECK THE BITSTREAM. The lane sizes its
-    // significand product from the multiply formats and the narrow side of the widening pair, and
-    // Glacier leaves the multiply formats empty on purpose, for the MAC. A multiply whose format
-    // does not fit that width returns the canonical NaN and raises the invalid flag. So a kernel
-    // built against today's core would compile, run, and produce NaN. The core has to set its
-    // multiply format to f32 and a bitstream has to be built from it first.
+    // BEFORE SELECTING ANY OF THESE, THREE THINGS HAVE TO BE TRUE OF THE CORE, and they are
+    // separate. A LANE that can perform the operation. A DECODER that decodes the instruction and
+    // routes it to that lane, with the element width, the format select and the rounding mode
+    // wired. A BITSTREAM built from both. A lane that can add is not a core that can be told to.
+    //
+    // Each one fails differently and none of them fails as a compile error. Without the lane, a
+    // multiply whose format does not fit the significand product width returns the canonical NaN
+    // and raises the invalid flag, because the width is sized from the multiply formats and the
+    // narrow side of the widening pair. Without the decode, the instruction is never executed at
+    // all. Without the bitstream, neither of the first two is in the hardware anyone loads.
     if (isFloat(func, ty)) return null;
     const signed = isSigned(func, ty);
     return switch (op) {
