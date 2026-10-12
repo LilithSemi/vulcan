@@ -658,7 +658,12 @@ const Matcher = struct {
         // Either side can hold the product, so both orders are tried.
         for ([_][2]Value{ .{ a.rhs, a.lhs }, .{ a.lhs, a.rhs } }) |pair| {
             const term = pair[0];
-            const acc = pair[1];
+            // A positive zero is not an accumulator. `0.0 + x` IS `x`, apart from a minus zero
+            // coming back as plus zero, and zeroing the destination does exactly that anyway. A
+            // hand-written `mac(0.0, a, b)` reaches the bare-product form this way rather than
+            // needing an optimiser pass to delete the addition first. A MINUS zero is kept, since
+            // it is the one accumulator value that changes the answer.
+            const acc: ?Value = if (self.isPositiveZero(pair[1])) null else pair[1];
 
             // `acc + f32(a) * f32(b)`.
             if (self.soleUseInBlock(inst, term)) |defining| {
@@ -680,6 +685,16 @@ const Matcher = struct {
             }
         }
         return null;
+    }
+
+    /// Whether `v` is the float constant positive zero.
+    fn isPositiveZero(self: *const Matcher, v: Value) bool {
+        const inst = self.func.definingInst(v) orelse return false;
+        const c = switch (self.func.opcode(inst)) {
+            .fconst => |x| x,
+            else => return false,
+        };
+        return c == 0.0 and !std.math.signbit(c);
     }
 
     /// A product with nothing to accumulate into, which zeroes its destination and then

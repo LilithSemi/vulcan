@@ -1616,3 +1616,52 @@ test "a MAC mixes a warp-uniform accumulator with a per-lane factor" {
         try std.testing.expectEqual(@as(u32, @bitCast(1000.0 + n * 2.0)), data[i]);
     }
 }
+
+test "a positive zero accumulator becomes a zeroed destination, a negative one does not" {
+    // `mac(0.0, a, b)` written by hand carries a real `0.0 +`. Reading that as a bare product
+    // costs one word instead of materializing the zero into a register and broadcasting it.
+    //
+    // A MINUS zero is kept, because it is the one accumulator value the shortcut would change:
+    // adding plus zero to a minus zero product gives plus zero.
+    const allocator = std.testing.allocator;
+    for ([_]f64{ 0.0, -0.0 }) |zero| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const f16_t = try f.types.intern(.{ .float = .f16 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        const acc = try f.appendInst(entry, f32_t, .{ .fconst = zero });
+        const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+        const one_more = try f.appendArithImm(entry, i32_t, .add, lane, 1);
+        const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = one_more } });
+        const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+        const three = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+        const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = three } });
+        const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+        try f.appendStore(entry, sum, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+        // A plus zero zeroes the destination from x0; a minus zero is broadcast like any value.
+        const want_splats: usize = if (zero == 0.0 and !std.math.signbit(zero)) 1 else 0;
+        try std.testing.expectEqual(want_splats, countZeroSplats(words));
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            const n: f32 = @floatFromInt(i);
+            try std.testing.expectEqual(@as(u32, @bitCast((n + 1.0) * 3.0)), data[i]);
+        }
+    }
+}
