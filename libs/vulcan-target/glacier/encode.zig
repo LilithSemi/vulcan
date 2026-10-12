@@ -11,7 +11,15 @@
 //!
 //!   - No `vsetvl`. The vector length is fixed by the core profile and is not a runtime register,
 //!     so the lane count is a compile-time target parameter. See `Profile`.
-//!   - No LR/SC. The A extension atomics are there, the load-reserved pair is not.
+//!   - No LR/SC. The A extension atomics are there, the load-reserved pair is not, so there is no
+//!     compare-and-swap and a barrier built on one is not available.
+//!   - An AMO's `aq` and `rl` bits are accepted and IGNORED. The lowering still emits what the
+//!     program asked for, and today that is correct and inert: one bus, one outstanding access and
+//!     in-order completion already give the ordering the bits ask for, so a `seq_cst` atomic and a
+//!     relaxed one execute identically and both are right. THAT EXPIRES WITH THE MOVE TO AXI4,
+//!     which has independent read and write channels and more than one transaction in flight. At
+//!     that point every clause of the justification goes at once and the bits become a promise the
+//!     core has to keep.
 //!   - No FP square root, and FP32 truncates toward zero with subnormals flushed rather than
 //!     rounding to nearest. Anything that assumes IEEE default rounding differs in the last bit.
 //!
