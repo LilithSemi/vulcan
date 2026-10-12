@@ -631,24 +631,42 @@ fn findMacs(
 
     var m: Matcher = .{ .func = func, .uses = uses, .divergent = divergent, .block_of = block_of };
 
+    // How many MACs took each instruction's result as an operand of their own.
+    const absorbed = try allocator.alloc(u32, func.instCount());
+    defer allocator.free(absorbed);
+    @memset(absorbed, 0);
+
     // The additions come first, so a multiply that feeds one is absorbed by it rather than being
     // claimed as a product of its own.
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const found = m.matchAdd(inst) orelse continue;
-            record(mac, folded, inst, found);
+            record(mac, absorbed, inst, found);
         }
     }
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
-            if (folded[@backingInt(inst)]) continue;
+            if (absorbed[@backingInt(inst)] != 0) continue;
             const found = m.matchProduct(inst) orelse continue;
-            record(mac, folded, inst, found);
+            record(mac, absorbed, inst, found);
         }
     }
-    // Last, a widening convert nothing absorbed. The core has no `vfwcvt`, so the MAC is the only
-    // instruction that reads an f16 as an f32, and multiplying by 1.0 into a zeroed destination
-    // widens one on its own. This is what lets an f16 reach a divide, which no MAC can absorb.
+
+    // An absorbed instruction is suppressed only when EVERY reader absorbed it. A multiply is read
+    // once by construction, so it always is. A widening convert can be read several times, and a
+    // reader that is not a MAC still needs the f32, so it stays and is widened below. The MACs
+    // read the f16 source either way, which is sound because `fusedOperands` reports it.
+    for (0..func.instCount()) |ii| {
+        const inst: Inst = @fromBackingInt(@intCast(ii));
+        if (absorbed[ii] == 0) continue;
+        const result = func.instResult(inst) orelse continue;
+        if (absorbed[ii] == uses[@backingInt(result)]) folded[ii] = true;
+    }
+
+    // Last, a widening convert nothing suppressed. The core has no `vfwcvt`, so the MAC is the
+    // only instruction that reads an f16 as an f32, and multiplying by 1.0 into a zeroed
+    // destination widens one on its own. This is what lets an f16 reach a divide, which no MAC can
+    // absorb, and what lets a PARTLY absorbed convert still produce its f32.
     //
     // The skip keeps `mac` and `folded` disjoint, which is the invariant `Macs` carries: an
     // instruction is either a MAC of its own or part of one, never both.
@@ -656,16 +674,16 @@ fn findMacs(
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (folded[@backingInt(inst)] or mac[@backingInt(inst)] != null) continue;
             const found = m.matchWiden(inst) orelse continue;
-            record(mac, folded, inst, found);
+            record(mac, absorbed, inst, found);
         }
     }
     return .{ .mac = mac, .folded = folded };
 }
 
-fn record(mac: []?Mac, folded: []bool, inst: Inst, found: Match) void {
+fn record(mac: []?Mac, absorbed: []u32, inst: Inst, found: Match) void {
     mac[@backingInt(inst)] = found.mac;
     for (found.folded) |f| {
-        if (f) |absorbed| folded[@backingInt(absorbed)] = true;
+        if (f) |taken| absorbed[@backingInt(taken)] += 1;
     }
 }
 
@@ -765,14 +783,26 @@ const Matcher = struct {
 
     /// `v` as one factor of a MAC: a widening convert the instruction at `at` can absorb, or a
     /// float constant an f16 holds exactly.
+    /// A widening convert does NOT have to be read once to be absorbed. The MAC reads the f16
+    /// source, not the f32, and reusing a widened value is the ordinary thing to write: one
+    /// `sphi` feeds two products in any sphere. Whether the convert is then suppressed is decided
+    /// afterwards, from whether every reader absorbed it.
     fn factor(self: *const Matcher, at: Inst, v: Value) ?struct { factor: Factor, folded: ?Inst } {
-        if (self.soleUseInBlock(at, v)) |inst| {
+        if (self.sameBlock(at, v)) |inst| {
             if (self.widened(inst)) |ha| {
                 return .{ .factor = .{ .value = ha }, .folded = inst };
             }
         }
         if (self.halfConstant(v)) |bits| return .{ .factor = .{ .constant = bits }, .folded = null };
         return null;
+    }
+
+    /// The instruction defining `v`, when it shares a block with `at`. One block bounds how far
+    /// the f16 source has to stay live, which matters because a spilled vector is refused.
+    fn sameBlock(self: *const Matcher, at: Inst, v: Value) ?Inst {
+        const inst = self.func.definingInst(v) orelse return null;
+        if (self.block_of[@backingInt(inst)] != self.block_of[@backingInt(at)]) return null;
+        return inst;
     }
 
     /// The f16 bit pattern of the float constant `v`, when an f16 holds its value exactly.

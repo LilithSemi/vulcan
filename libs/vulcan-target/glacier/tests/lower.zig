@@ -1086,41 +1086,95 @@ test "a per-lane multiply-accumulate over f16 becomes one widening MAC" {
     }
 }
 
-test "a widening convert read twice cannot be absorbed, so the tree is refused" {
-    // Absorbing an instruction is only safe when one reader exists. Here the convert feeds both
-    // factors, so no product matches, and what is left is a multiply of two f32 VALUES, which the
-    // core cannot do. The converts themselves are fine on their own.
+test "one widened f16 feeds two products" {
+    // `sphi` widened once and read by both `ux` and `uz` is what a sphere writes, and absorbing a
+    // convert used to need exactly one reader. The MAC reads the f16 SOURCE, so the number of
+    // readers of the f32 never mattered; what it needed was for the allocator to be told, which
+    // `fusedOperands` now does.
     const allocator = std.testing.allocator;
-    for ([_]bool{ false, true }) |second_reader| {
-        var f = Function.init(allocator);
-        defer f.deinit();
-        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
-        const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-        const f32_t = try f.types.intern(.{ .float = .f32 });
-        const f16_t = try f.types.intern(.{ .float = .f16 });
-        const ptr_t = try f.types.ptrGlobal();
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
 
-        const entry = try f.appendBlock();
-        const tid = try f.appendBlockParam(entry, u32_t);
-        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
-        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
-        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
-        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
-        const acc = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
-        const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
-        const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
-        const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
-        const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wa } });
-        const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
-        try f.appendStore(entry, sum, at);
-        if (second_reader) {
-            const other = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = product, .rhs = product } });
-            try f.appendStore(entry, other, base);
-        }
-        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const plus = try f.appendArithImm(entry, i32_t, .add, lane, 2);
 
-        // `wa` is read twice even in the first case, so neither shape folds.
-        try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    const shared = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = plus } });
+    const other = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+    // One widening convert, two readers.
+    const wide = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = shared } });
+    const wother = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = other } });
+    const ux = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wide, .rhs = wother } });
+    const uz = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wide, .rhs = wide } });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = ux, .rhs = uz } });
+    try f.appendStore(entry, sum, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // `uz` is a bare product; `ux` accumulates it, so two MACs cover all three operations.
+    try std.testing.expectEqual(@as(usize, 2), countMacs(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        const shared_v = n + 2.0;
+        try std.testing.expectEqual(@as(u32, @bitCast(shared_v * n + shared_v * shared_v)), data[i]);
+    }
+}
+
+test "a partly absorbed widening convert still produces its f32" {
+    // One reader is a MAC and the other is a store, so the convert cannot be suppressed: it is
+    // widened on its own for the store, and the MAC reads the f16 beside it.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const far = try f.appendArithImm(entry, u32_t, .add, offset, 64);
+    const at2 = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = far } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const plus = try f.appendArithImm(entry, i32_t, .add, lane, 3);
+    const h = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = plus } });
+    const wide = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = h } });
+    const two = try f.appendInst(entry, f32_t, .{ .fconst = 2.0 });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wide, .rhs = two } });
+    try f.appendStore(entry, product, at);
+    try f.appendStore(entry, wide, at2);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One MAC for the product, one for the convert the store still needs.
+    try std.testing.expectEqual(@as(usize, 2), countMacs(words));
+
+    var data: [32]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast((n + 3.0) * 2.0)), data[i]);
+        try std.testing.expectEqual(@as(u32, @bitCast(n + 3.0)), data[16 + i]);
     }
 }
 
