@@ -18,9 +18,10 @@
 //! Floating point is admitted narrowly, because the core decodes five float instructions and no
 //! more (see `encode.zig` and `glacier.fdiv`). An f32 and an f16 are values here, a float constant
 //! is its bit pattern, the three converts the core has are selected, an f32 divide becomes the one
-//! scalar divide, and a per-lane `acc + f32(a) * f32(b)` over f16 factors becomes the widening MAC
-//! (see `findMacs`). Everything else is refused: there is no float add or multiply on its own, no
-//! float compare, and no per-lane divide. An f16 never reaches memory, since it is only the low
+//! scalar divide. The widening MAC covers all per-lane float arithmetic, in three shapes: the MAC
+//! itself, a product with a zeroed destination, and an addition against a factor of 1.0. See
+//! `findMacs`. Everything else is refused: no float compare, no per-lane divide, and no float
+//! arithmetic that is not over f16 factors. An f16 never reaches memory, since it is only the low
 //! half of a lane.
 //!
 //! One thing it deliberately does NOT do yet is fuse a compare into its branch. A fused branch
@@ -73,11 +74,16 @@ const allocatable: [29]u16 = blk: {
 /// vector and to break a parallel-copy cycle. Never allocatable.
 const vscratch: VReg = .v31;
 
-/// v1 to v30. `v0` is reserved because it is the only register that PREDICATES: a mask has to be
+/// A second scratch, for the widening MAC alone. It needs two at once: one holds the constant 1.0
+/// when the MAC stands in for an addition, and the other stages a factor that the allocator put in
+/// the MAC's own destination. See `Emitter.emitMac`.
+const vscratch2: VReg = .v30;
+
+/// v1 to v29. `v0` is reserved because it is the only register that PREDICATES: a mask has to be
 /// moved into it to be applied. Nothing here predicates yet, so reserving it costs one register
 /// and buys the guarantee that no value can be sitting in it when masks arrive.
-const allocatable_v: [30]u16 = blk: {
-    var regs: [30]u16 = undefined;
+const allocatable_v: [29]u16 = blk: {
+    var regs: [29]u16 = undefined;
     for (&regs, 1..) |*r, i| r.* = i;
     break :blk regs;
 };
@@ -348,6 +354,8 @@ fn useKind(_: *const anyopaque, _: *const Function, _: Inst, _: Value) wimmer.Us
 fn copySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
     const c: *const Ctx = @ptrCast(@alignCast(ctx));
     const inst = func.definingInst(v) orelse return null;
+    // A MAC reports its accumulator, or nothing when it has none and zeroes its destination
+    // instead. Either way the switch below must not read the instruction as a plain arithmetic op.
     if (c.mac[@backingInt(inst)]) |m| return m.acc;
     return switch (func.opcode(inst)) {
         .unary => |u| if (u.op == .reinterpret) u.value else null,
@@ -483,8 +491,20 @@ fn isBitPreservingConvert(func: *const Function, inst: Inst, cv: ir.function.Con
 // The widening multiply-accumulate.
 
 /// A `vfwmacc.vv` found in the IR: `result = acc + a * b`, where `a` and `b` are f16 and `acc` and
-/// the result are f32.
-const Mac = struct { acc: Value, a: Value, b: Value };
+/// the result are f32. Either end can be missing, because the core has no float add and no float
+/// multiply on its own and this instruction stands in for both. See `findMacs`.
+const Mac = struct {
+    /// What the product adds to. Null when the IR asked for the product alone, and the destination
+    /// is zeroed first.
+    acc: ?Value,
+    a: Value,
+    /// The second factor. Null when the IR asked for an addition with no multiply, and the factor
+    /// is the constant 1.0.
+    b: ?Value,
+};
+
+/// An f16 1.0, which is the second factor of a MAC that stands in for an addition.
+const half_one: i32 = 0x3C00;
 
 /// Where the MACs are. `mac` is indexed by instruction and holds the operands of the `add` that
 /// becomes the instruction; `folded` marks the multiply and the two widening converts that the
@@ -507,18 +527,23 @@ const Macs = struct {
     }
 };
 
-/// Find every `acc + f32(a) * f32(b)` over f16 inputs, which is the one vector float operation the
-/// core has.
+/// Find every shape the widening MAC answers. There are three, because the core has no float add
+/// and no float multiply of its own, so `vfwmacc.vv` has to stand in for both:
+///
+///   - `acc + f32(a) * f32(b)`, the instruction's own shape.
+///   - `f32(a) * f32(b)` alone, which accumulates into a zeroed destination. The sum of a zero and
+///     the exact product is the product, so this costs one extra word and no accuracy.
+///   - `acc + f32(a)`, which is a MAC whose second factor is the constant 1.0.
 ///
 /// The IR has no fused multiply-add and no widening multiply, so the hardware instruction only
-/// reaches a kernel through this tree. Nothing is rewritten: the multiply and the converts stay in
-/// the function and keep their registers, because a Glacier `arith` takes two operands and this
-/// instruction reads three values. The registers cost little, since each intermediate lives for
-/// one instruction and a chain of MACs reuses the same three.
+/// reaches a kernel through these trees. Nothing is rewritten: the multiply and the converts stay
+/// in the function and keep their registers, because a Glacier `arith` takes two operands and this
+/// instruction reads three values. The registers cost little, since each intermediate lives for one
+/// instruction and a chain reuses the same ones.
 ///
 /// This needs no consent attribute. The product of two f16 is exact in f32, so the fusion loses
-/// nothing; the core truncates the sum where the IR asks for nearest even, and that is the
-/// rounding every Glacier float operation has, recorded in `encode.zig`.
+/// nothing; the core truncates the sum where the IR asks for nearest even, and that is the rounding
+/// every Glacier float operation has, recorded in `encode.zig`.
 fn findMacs(
     allocator: std.mem.Allocator,
     func: *const Function,
@@ -540,84 +565,140 @@ fn findMacs(
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| block_of[@backingInt(inst)] = @intCast(bi);
     }
 
+    var m: Matcher = .{ .func = func, .uses = uses, .divergent = divergent, .block_of = block_of };
+
+    // The additions come first, so a multiply that feeds one is absorbed by it rather than being
+    // claimed as a product of its own.
     for (0..func.blockCount()) |bi| {
-        const block: Block = @fromBackingInt(@intCast(bi));
-        for (func.blockInsts(block)) |inst| {
-            const sum = matchMac(func, uses, divergent, block_of, inst) orelse continue;
-            mac[@backingInt(inst)] = sum.mac;
-            folded[@backingInt(sum.product)] = true;
-            folded[@backingInt(sum.wide_a)] = true;
-            folded[@backingInt(sum.wide_b)] = true;
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const found = m.matchAdd(inst) orelse continue;
+            record(mac, folded, inst, found);
+        }
+    }
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (folded[@backingInt(inst)]) continue;
+            const found = m.matchProduct(inst) orelse continue;
+            record(mac, folded, inst, found);
         }
     }
     return .{ .mac = mac, .folded = folded };
 }
 
-/// The one `add` in `block` at `inst`, read as a MAC. Null when it is not one.
-fn matchMac(
+fn record(mac: []?Mac, folded: []bool, inst: Inst, found: Match) void {
+    mac[@backingInt(inst)] = found.mac;
+    for (found.folded) |f| {
+        if (f) |absorbed| folded[@backingInt(absorbed)] = true;
+    }
+}
+
+/// One recognized MAC: its operands, and the instructions it absorbs.
+const Match = struct { mac: Mac, folded: [3]?Inst };
+
+const Matcher = struct {
     func: *const Function,
     uses: []const u32,
     divergent: []const bool,
     block_of: []const u32,
-    inst: Inst,
-) ?struct { mac: Mac, product: Inst, wide_a: Inst, wide_b: Inst } {
-    const a = switch (func.opcode(inst)) {
-        .arith => |x| x,
-        else => return null,
-    };
-    if (a.op != .add) return null;
-    const result = func.instResult(inst) orelse return null;
-    if (!isF32(func, func.valueType(result))) return null;
 
-    // Either side can hold the product, so both orders are tried.
-    for ([_][2]Value{ .{ a.rhs, a.lhs }, .{ a.lhs, a.rhs } }) |pair| {
-        const product = pair[0];
-        const acc = pair[1];
-        const mul = soleUseInBlock(func, uses, block_of, inst, product) orelse continue;
-        const m = switch (func.opcode(mul)) {
+    /// An `add` read as a MAC: either a full one, or an addition of a widened f16 whose second
+    /// factor is an implicit 1.0.
+    fn matchAdd(self: *const Matcher, inst: Inst) ?Match {
+        const a = switch (self.func.opcode(inst)) {
             .arith => |x| x,
-            else => continue,
+            else => return null,
         };
-        if (m.op != .mul or !isF32(func, func.valueType(m.lhs))) continue;
-        const wide_a = soleUseInBlock(func, uses, block_of, inst, m.lhs) orelse continue;
-        const wide_b = soleUseInBlock(func, uses, block_of, inst, m.rhs) orelse continue;
-        const ha = widenedHalf(func, wide_a) orelse continue;
-        const hb = widenedHalf(func, wide_b) orelse continue;
-        // Every operand must be per-lane. The instruction is a vector one, and it reads three
-        // values where the lowering has one vector scratch to broadcast a warp-uniform operand
-        // into, so a mixed MAC is left to the refusal above rather than half handled.
-        if (!divergent[@backingInt(acc)] or !divergent[@backingInt(ha)] or !divergent[@backingInt(hb)]) continue;
+        if (a.op != .add) return null;
+        if (!self.resultIsPerLaneF32(inst)) return null;
+
+        // Either side can hold the product, so both orders are tried.
+        for ([_][2]Value{ .{ a.rhs, a.lhs }, .{ a.lhs, a.rhs } }) |pair| {
+            const term = pair[0];
+            const acc = pair[1];
+            if (!self.divergent[@backingInt(acc)]) continue;
+            const defining = self.soleUseInBlock(inst, term) orelse continue;
+
+            // `acc + f32(a) * f32(b)`.
+            if (self.product(inst, defining)) |factors| {
+                return .{
+                    .mac = .{ .acc = acc, .a = factors.a, .b = factors.b },
+                    .folded = .{ defining, factors.wide_a, factors.wide_b },
+                };
+            }
+
+            // `acc + f32(a)`. When the other side is a widening convert too there is no accumulator
+            // at all, and nothing folds it, so the convert rule refuses the kernel.
+            if (self.widened(defining)) |ha| {
+                if (!self.divergent[@backingInt(ha)]) continue;
+                return .{ .mac = .{ .acc = acc, .a = ha, .b = null }, .folded = .{ defining, null, null } };
+            }
+        }
+        return null;
+    }
+
+    /// A `mul` of two widened f16 with nothing to accumulate into, which zeroes its destination
+    /// and then accumulates.
+    fn matchProduct(self: *const Matcher, inst: Inst) ?Match {
+        if (!self.resultIsPerLaneF32(inst)) return null;
+        const factors = self.product(inst, inst) orelse return null;
         return .{
-            .mac = .{ .acc = acc, .a = ha, .b = hb },
-            .product = mul,
-            .wide_a = wide_a,
-            .wide_b = wide_b,
+            .mac = .{ .acc = null, .a = factors.a, .b = factors.b },
+            .folded = .{ factors.wide_a, factors.wide_b, null },
         };
     }
-    return null;
-}
 
-/// The instruction defining `v`, when `v` is read exactly once and defined in `block`. One use is
-/// what makes absorbing the instruction safe, and one block keeps the absorbed value from being
-/// live across an edge the resolver would then shuffle.
-fn soleUseInBlock(func: *const Function, uses: []const u32, block_of: []const u32, at: Inst, v: Value) ?Inst {
-    if (uses[@backingInt(v)] != 1) return null;
-    const inst = func.definingInst(v) orelse return null;
-    if (block_of[@backingInt(inst)] != block_of[@backingInt(at)]) return null;
-    return inst;
-}
+    /// `mul` read as a product of two widened f16, with both converts absorbable at `at`.
+    fn product(self: *const Matcher, at: Inst, mul: Inst) ?struct { a: Value, b: Value, wide_a: Inst, wide_b: Inst } {
+        const m = switch (self.func.opcode(mul)) {
+            .arith => |x| x,
+            else => return null,
+        };
+        if (m.op != .mul or !isF32(self.func, self.func.valueType(m.lhs))) return null;
+        const wide_a = self.foldableConvert(at, m.lhs) orelse return null;
+        const wide_b = self.foldableConvert(at, m.rhs) orelse return null;
+        const ha = self.widened(wide_a).?;
+        const hb = self.widened(wide_b).?;
+        if (!self.divergent[@backingInt(ha)] or !self.divergent[@backingInt(hb)]) return null;
+        return .{ .a = ha, .b = hb, .wide_a = wide_a, .wide_b = wide_b };
+    }
 
-/// The f16 that `inst` widens to f32, or null when `inst` is not that convert.
-fn widenedHalf(func: *const Function, inst: Inst) ?Value {
-    const cv = switch (func.opcode(inst)) {
-        .convert => |c| c,
-        else => return null,
-    };
-    const result = func.instResult(inst) orelse return null;
-    if (!isF32(func, func.valueType(result))) return null;
-    if (!isHalf(func, func.valueType(cv.value))) return null;
-    return cv.value;
-}
+    /// The widening convert defining `v`, when it can be absorbed by the instruction at `at`.
+    fn foldableConvert(self: *const Matcher, at: Inst, v: Value) ?Inst {
+        const inst = self.soleUseInBlock(at, v) orelse return null;
+        _ = self.widened(inst) orelse return null;
+        return inst;
+    }
+
+    /// Whether the result of `inst` is a per-lane f32. Everything a MAC produces is, so this is
+    /// also what keeps the emitter on its vector path.
+    fn resultIsPerLaneF32(self: *const Matcher, inst: Inst) bool {
+        const result = self.func.instResult(inst) orelse return false;
+        if (!isF32(self.func, self.func.valueType(result))) return false;
+        return self.divergent[@backingInt(result)];
+    }
+
+    /// The instruction defining `v`, when `v` is read exactly once and shares a block with `at`.
+    /// One use is what makes absorbing the instruction safe, and one block keeps the absorbed
+    /// value from being live across an edge the resolver would then shuffle.
+    fn soleUseInBlock(self: *const Matcher, at: Inst, v: Value) ?Inst {
+        if (self.uses[@backingInt(v)] != 1) return null;
+        const inst = self.func.definingInst(v) orelse return null;
+        if (self.block_of[@backingInt(inst)] != self.block_of[@backingInt(at)]) return null;
+        return inst;
+    }
+
+    /// The f16 that `inst` widens to f32, or null when `inst` is not that convert.
+    fn widened(self: *const Matcher, inst: Inst) ?Value {
+        const cv = switch (self.func.opcode(inst)) {
+            .convert => |c| c,
+            else => return null,
+        };
+        const result = self.func.instResult(inst) orelse return null;
+        if (!isF32(self.func, self.func.valueType(result))) return null;
+        if (!isHalf(self.func, self.func.valueType(cv.value))) return null;
+        return cv.value;
+    }
+};
 
 fn isF32(func: *const Function, ty: Type) bool {
     return switch (func.types.type_kind(ty)) {
@@ -923,6 +1004,10 @@ const Emitter = struct {
         if (dst != src) try self.put(rv.addi(dst, src, 0));
     }
 
+    fn vmove(self: *Emitter, dst: VReg, src: VReg) Error!void {
+        if (dst != src) try self.put(rv.vmv_v_v(dst, src));
+    }
+
     fn run(self: *Emitter) Error!void {
         const nblocks = self.func.blockCount();
         try self.block_start.appendNTimes(self.allocator, 0, nblocks);
@@ -1103,15 +1188,16 @@ const Emitter = struct {
                 };
                 try self.put(rv.vsuxei32(val, .x0, addr));
             },
-            .unary => |u| try self.put(rv.vmv_v_v(
+            .unary => |u| try self.vmove(
                 try self.vreg(self.func.instResult(inst).?, pos),
                 try self.vectorOperand(u.value, pos),
-            )),
+            ),
             .convert => |cv| {
                 const dst = try self.vreg(self.func.instResult(inst).?, pos);
                 const src = try self.vectorOperand(cv.value, pos);
                 const kind = convertKind(self.func, inst, cv) orelse return error.Unsupported;
-                try self.put(if (kind == .move) rv.vmv_v_v(dst, src) else convertEncoder(kind)(dst, src));
+                if (kind == .move) return self.vmove(dst, src);
+                try self.put(convertEncoder(kind)(dst, src));
             },
             .arith => |a| {
                 const dst = try self.vreg(self.func.instResult(inst).?, pos);
@@ -1137,21 +1223,35 @@ const Emitter = struct {
     /// has to be in the destination before the instruction runs. The allocator is asked for that
     /// register in `copySource`, and a `vmv.v.v` covers the case where it could not give it.
     ///
-    /// A source that already sits in the destination is copied aside first. The allocator may
-    /// reuse a factor's register for the result, since the factor dies where the result is born,
-    /// and whether the core reads both factors before it writes the destination is not recorded.
-    /// No test reaches this, so it is a guard and not a verified path. Ask the hardware before
-    /// removing it.
+    /// A factor dies where the result is born, so the allocator may give the result that factor's
+    /// register, and the accumulator has to be in the result's register before the instruction
+    /// runs. A factor sitting there is therefore staged aside first. This is not theoretical: a
+    /// bare product gets `vfwmacc.vv v2, v1, v2` and would read a zeroed destination as its own
+    /// factor.
     fn emitMac(self: *Emitter, m: Mac, dst: VReg, pos: u32) Error!void {
-        const acc = try self.vreg(m.acc, pos);
         var a = try self.vreg(m.a, pos);
-        var b = try self.vreg(m.b, pos);
+        // A missing second factor means the MAC is standing in for an addition, so the factor is
+        // 1.0 and the product is the widened operand itself.
+        var b = if (m.b) |v| try self.vreg(v, pos) else blk: {
+            try self.constant(scratch, half_one);
+            try self.put(rv.vmv_v_x(vscratch, scratch));
+            break :blk vscratch;
+        };
         if (a == dst or b == dst) {
-            try self.put(rv.vmv_v_v(vscratch, dst));
-            if (a == dst) a = vscratch;
-            if (b == dst) b = vscratch;
+            try self.put(rv.vmv_v_v(vscratch2, dst));
+            if (a == dst) a = vscratch2;
+            if (b == dst) b = vscratch2;
         }
-        if (dst != acc) try self.put(rv.vmv_v_v(dst, acc));
+        if (m.acc) |acc| {
+            const from = try self.vreg(acc, pos);
+            if (dst != from) try self.put(rv.vmv_v_v(dst, from));
+        } else {
+            // A product with nothing to add to accumulates into zero. The product of two f16 is
+            // exact in f32, so this answers the product itself. The one difference is a product of
+            // minus zero, which comes back as plus zero: adding zeroes of opposite sign gives plus
+            // zero in every rounding mode this core has.
+            try self.put(rv.vmv_v_x(dst, .x0));
+        }
         try self.put(rv.vfwmacc_vv(dst, a, b));
     }
 
