@@ -160,6 +160,19 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     const reachable_after = try ir.reachable.neutralizeUnreachable(allocator, &work);
     allocator.free(reachable_after);
 
+    // Put every one-word-per-lane address into the shape `findStrides` reads, then clear out the
+    // arithmetic that is left over. The divergence analysis runs again below, because the rewrite
+    // adds values and moves work from the vector side to the scalar side.
+    {
+        const d = try analyzeDivergence(allocator, &work);
+        defer allocator.free(d);
+        if (try hoistLaneAddresses(allocator, &work, d)) {
+            var analyses: opt.pass.Analyses = .{ .allocator = allocator, .func = &work };
+            defer analyses.deinit();
+            _ = try opt.dce.run(allocator, &work, &analyses);
+        }
+    }
+
     const divergent = try analyzeDivergence(allocator, &work);
     defer allocator.free(divergent);
 
@@ -831,6 +844,170 @@ fn convert(allocator: std.mem.Allocator, func: *Function, a: Block, d: Diamond) 
         func.setTerminator(dead, .{ .ret = ir.function.Ret.none() });
     }
 }
+// ===========================================================================
+// Hoisting the lane term out of an address.
+
+/// An address taken apart as a warp-uniform sum plus a multiple of the lane index.
+const Affine = struct {
+    /// A per-lane address with more independent terms than this is refused rather than grown. Six
+    /// covers a base, a row product, a column and a constant with room to spare.
+    const max_terms = 6;
+
+    const Term = struct { value: Value, scale: i64 };
+
+    terms: [max_terms]Term = undefined,
+    count: usize = 0,
+    constant: i64 = 0,
+    /// Bytes between the address of one lane and the next.
+    stride: i64 = 0,
+    /// The lane index itself, so the rewrite can scale it again.
+    lane: ?Value = null,
+
+    fn push(self: *Affine, value: Value, scale: i64) bool {
+        if (self.count == max_terms) return false;
+        self.terms[self.count] = .{ .value = value, .scale = scale };
+        self.count += 1;
+        return true;
+    }
+};
+
+/// Take `v` apart into `out` as `uniform terms + constant + lane * stride`, scaling everything by
+/// `scale`. False when it is not that shape.
+///
+/// Arithmetic here WRAPS, like the address arithmetic it describes. A term scaled past 32 bits
+/// addresses the same word either way, so wrapping is the answer rather than a refusal.
+fn peelAffine(func: *const Function, divergent: []const bool, v: Value, scale: i64, out: *Affine) bool {
+    if (!divergent[@backingInt(v)]) return out.push(v, scale);
+    if (gpu.attrs.builtinOf(func, v)) |b| {
+        if (b != .thread_id_x and b != .lane_id) return false;
+        if (out.lane) |already| {
+            if (already != v) return false;
+        }
+        out.lane = v;
+        out.stride +%= scale;
+        return true;
+    }
+    const inst = func.definingInst(v) orelse return false;
+    switch (func.opcode(inst)) {
+        .arith => |a| {
+            if (a.op != .add) return false;
+            if (!peelAffine(func, divergent, a.lhs, scale, out)) return false;
+            return peelAffine(func, divergent, a.rhs, scale, out);
+        },
+        .arith_imm => |a| switch (a.op) {
+            .add => {
+                out.constant +%= a.imm *% scale;
+                return peelAffine(func, divergent, a.lhs, scale, out);
+            },
+            .shl => {
+                if (a.imm < 0 or a.imm > 31) return false;
+                const factor = @as(i64, 1) << @intCast(a.imm);
+                return peelAffine(func, divergent, a.lhs, scale *% factor, out);
+            },
+            .mul => return peelAffine(func, divergent, a.lhs, scale *% a.imm, out),
+            else => return false,
+        },
+        else => return false,
+    }
+}
+
+/// Rewrite every per-lane address that steps ONE WORD per lane into `uniform + lane * 4`, and
+/// report whether anything changed.
+///
+/// An index by lane reaches the IR with the lane term buried: `w[base + y * row + x + lane]`
+/// scales the whole index at once, so the address is `ptr + (uniform + lane) * 4` and the lane
+/// term is inside the shift. `findStrides` reads a shape and cannot see through that, so this
+/// turns the address into the shape it reads, which also moves the uniform arithmetic from the
+/// vector side to the scalar side. The old address instructions are left for `dce`.
+///
+/// Nothing is rewritten unless the stride comes out at exactly one word, so this never fires
+/// speculatively: the shape it produces is the shape the unit-stride access wants.
+fn hoistLaneAddresses(allocator: std.mem.Allocator, func: *Function, divergent: []const bool) Error!bool {
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        // One address can feed several accesses, a read-modify-write of a pixel for instance. The
+        // first one rewrites it and the rest reuse that, which holds because they all sit in this
+        // block after the arithmetic that was put in for the first.
+        var done: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+        defer done.deinit(allocator);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const before = switch (func.opcode(inst)) {
+                .load => |l| l.ptr,
+                .store => |st| st.ptr,
+                else => {
+                    try func.blockInstsMut(block).append(allocator, inst);
+                    continue;
+                },
+            };
+            const rebuilt = done.get(before) orelse try hoistOne(func, block, divergent, inst);
+            try func.blockInstsMut(block).append(allocator, inst);
+            if (rebuilt) |ptr| {
+                switch (func.opcodeMut(inst).*) {
+                    .load => |*l| l.ptr = ptr,
+                    .store => |*st| st.ptr = ptr,
+                    else => unreachable,
+                }
+                try done.put(allocator, before, ptr);
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+/// The rewritten address for `inst`, appended to `block`, or null when it is left alone. The
+/// caller appends `inst` itself afterwards, which is what puts the new arithmetic in front of it.
+fn hoistOne(func: *Function, block: Block, divergent: []const bool, inst: Inst) Error!?Value {
+    const ptr = switch (func.opcode(inst)) {
+        .load => |l| l.ptr,
+        .store => |st| st.ptr,
+        else => return null,
+    };
+    if (!divergent[@backingInt(ptr)]) return null;
+    // Already the shape `findStrides` reads, so rewriting it would only churn.
+    if (laneRun(func, ptr) != null) return null;
+    var aff: Affine = .{};
+    if (!peelAffine(func, divergent, ptr, 1, &aff)) return null;
+    if (aff.stride != 4) return null;
+    const lane = aff.lane orelse return null;
+
+    // One term carries the address and the rest are offsets into it. Two pointers in one sum is
+    // not an address this builds, and neither is a scaled one.
+    var carrier: ?usize = null;
+    for (aff.terms[0..aff.count], 0..) |t, i| {
+        if (func.types.type_kind(func.valueType(t.value)) != .ptr) continue;
+        if (carrier != null) return null;
+        if (t.scale != 1) return null;
+        carrier = i;
+    }
+    const ci = carrier orelse return null;
+    const ptr_ty = func.valueType(aff.terms[ci].value);
+
+    var sum = aff.terms[ci].value;
+    for (aff.terms[0..aff.count], 0..) |t, i| {
+        if (i == ci) continue;
+        const scaled = if (t.scale == 1) t.value else try func.appendInst(
+            block,
+            func.valueType(t.value),
+            .{ .arith_imm = .{ .op = .mul, .lhs = t.value, .imm = t.scale } },
+        );
+        sum = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = scaled } });
+    }
+    if (aff.constant != 0) {
+        sum = try func.appendInst(block, ptr_ty, .{ .arith_imm = .{ .op = .add, .lhs = sum, .imm = aff.constant } });
+    }
+    const offset = try func.appendInst(
+        block,
+        func.valueType(lane),
+        .{ .arith_imm = .{ .op = .shl, .lhs = lane, .imm = 2 } },
+    );
+    return try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = offset } });
+}
+
 // ===========================================================================
 // Unit-stride accesses.
 
