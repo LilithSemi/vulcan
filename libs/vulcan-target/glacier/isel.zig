@@ -18,10 +18,12 @@
 //! Floating point is admitted narrowly, because the core decodes five float instructions and no
 //! more (see `encode.zig` and `glacier.fdiv`). An f32 and an f16 are values here, a float constant
 //! is its bit pattern, the three converts the core has are selected, an f32 divide becomes the one
-//! scalar divide. The widening MAC covers all per-lane float arithmetic, in three shapes: the MAC
+//! scalar divide. The widening MAC covers all other float arithmetic, in three shapes: the MAC
 //! itself, a product with a zeroed destination, and an addition against a factor of 1.0. See
-//! `findMacs`. Everything else is refused: no float compare, no per-lane divide, and no float
-//! arithmetic that is not over f16 factors. An f16 never reaches memory, since it is only the low
+//! `findMacs`. A warp-uniform MAC runs on the vector unit as well, since that is the only float
+//! multiplier the core has, and comes back out of lane zero. Everything else is refused: no float
+//! compare, no per-lane divide, and no float arithmetic that is not over f16 factors or a constant
+//! an f16 holds exactly. An f16 never reaches memory, since it is only the low
 //! half of a lane.
 //!
 //! One thing it deliberately does NOT do yet is fuse a compare into its branch. A fused branch
@@ -74,16 +76,32 @@ const allocatable: [29]u16 = blk: {
 /// vector and to break a parallel-copy cycle. Never allocatable.
 const vscratch: VReg = .v31;
 
-/// A second scratch, for the widening MAC alone. It needs two at once: one holds the constant 1.0
-/// when the MAC stands in for an addition, and the other stages a factor that the allocator put in
-/// the MAC's own destination. See `Emitter.emitMac`.
+/// The scratch pool the widening MAC draws from, which is the only thing that needs more than one
+/// at a time. Three is the most one MAC can want: a warp-uniform MAC accumulates in one and
+/// broadcasts both operands into the others, and a per-lane MAC can broadcast two warp-uniform
+/// operands and still have to stage a factor out of its own destination. See `Emitter.mac`.
 const vscratch2: VReg = .v30;
+const vscratch3: VReg = .v29;
+const vscratch_pool: [3]VReg = .{ vscratch, vscratch2, vscratch3 };
 
-/// v1 to v29. `v0` is reserved because it is the only register that PREDICATES: a mask has to be
+/// Hands out `vscratch_pool` in order, so two users in one instruction cannot pick the same one.
+const Pool = struct {
+    next: usize = 0,
+
+    /// The next free scratch. Running out is a lowering bug rather than an unsupported kernel,
+    /// since no shape needs four, but refusing beats naming a register another value is in.
+    fn take(self: *Pool) Error!VReg {
+        if (self.next >= vscratch_pool.len) return error.Unsupported;
+        defer self.next += 1;
+        return vscratch_pool[self.next];
+    }
+};
+
+/// v1 to v28. `v0` is reserved because it is the only register that PREDICATES: a mask has to be
 /// moved into it to be applied. Nothing here predicates yet, so reserving it costs one register
 /// and buys the guarantee that no value can be sitting in it when masks arrive.
-const allocatable_v: [29]u16 = blk: {
-    var regs: [29]u16 = undefined;
+const allocatable_v: [28]u16 = blk: {
+    var regs: [28]u16 = undefined;
     for (&regs, 1..) |*r, i| r.* = i;
     break :blk regs;
 };
@@ -356,12 +374,15 @@ fn copySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
     const inst = func.definingInst(v) orelse return null;
     // A MAC reports its accumulator, or nothing when it has none and zeroes its destination
     // instead. Either way the switch below must not read the instruction as a plain arithmetic op.
-    if (c.mac[@backingInt(inst)]) |m| return m.acc;
-    return switch (func.opcode(inst)) {
-        .unary => |u| if (u.op == .reinterpret) u.value else null,
-        .convert => |cv| if (isBitPreservingConvert(func, inst, cv)) cv.value else null,
-        else => null,
+    const src = if (c.mac[@backingInt(inst)]) |m| (m.acc orelse return null) else switch (func.opcode(inst)) {
+        .unary => |u| if (u.op == .reinterpret) u.value else return null,
+        .convert => |cv| if (isBitPreservingConvert(func, inst, cv)) cv.value else return null,
+        else => return null,
     };
+    // A MAC can report an accumulator in the other register file, which happens when the result
+    // is per-lane and the accumulator is not. That needs no guard here: `wimmer.buildIntervals`
+    // drops a hint whose source is in another class, because the two share no register pool.
+    return src;
 }
 
 /// Whether `ty` is a value a Glacier register holds. One 32-bit word, nothing narrower.
@@ -619,13 +640,12 @@ const Matcher = struct {
             else => return null,
         };
         if (a.op != .add) return null;
-        if (!self.resultIsPerLaneF32(inst)) return null;
+        if (!self.resultIsF32(inst)) return null;
 
         // Either side can hold the product, so both orders are tried.
         for ([_][2]Value{ .{ a.rhs, a.lhs }, .{ a.lhs, a.rhs } }) |pair| {
             const term = pair[0];
             const acc = pair[1];
-            if (!self.divergent[@backingInt(acc)]) continue;
 
             // `acc + f32(a) * f32(b)`.
             if (self.soleUseInBlock(inst, term)) |defining| {
@@ -652,7 +672,7 @@ const Matcher = struct {
     /// A product with nothing to accumulate into, which zeroes its destination and then
     /// accumulates.
     fn matchProduct(self: *const Matcher, inst: Inst) ?Match {
-        if (!self.resultIsPerLaneF32(inst)) return null;
+        if (!self.resultIsF32(inst)) return null;
         const p = self.product(inst, inst) orelse return null;
         return .{
             .mac = .{ .acc = null, .a = p.a, .b = p.b },
@@ -677,10 +697,6 @@ const Matcher = struct {
     fn factor(self: *const Matcher, at: Inst, v: Value) ?struct { factor: Factor, folded: ?Inst } {
         if (self.soleUseInBlock(at, v)) |inst| {
             if (self.widened(inst)) |ha| {
-                // A warp-uniform factor lives in a SCALAR register, and the two register files are
-                // indexed by the same number, so reading one here would read whatever that scalar
-                // register holds.
-                if (!self.divergent[@backingInt(ha)]) return null;
                 return .{ .factor = .{ .value = ha }, .folded = inst };
             }
         }
@@ -706,12 +722,12 @@ const Matcher = struct {
         if (flushToZero(f16, narrow) != narrow) return null;
         return @bitCast(narrow);
     }
-    /// Whether the result of `inst` is a per-lane f32. Everything a MAC produces is, so this is
-    /// also what keeps the emitter on its vector path.
-    fn resultIsPerLaneF32(self: *const Matcher, inst: Inst) bool {
+    /// Whether `inst` produces an f32, which everything a MAC produces does. Divergence does NOT
+    /// come into it: a warp-uniform MAC runs on the vector unit too, because that is the only
+    /// float multiplier the core has. See `Emitter.emitScalarMac`.
+    fn resultIsF32(self: *const Matcher, inst: Inst) bool {
         const result = self.func.instResult(inst) orelse return false;
-        if (!isF32(self.func, self.func.valueType(result))) return false;
-        return self.divergent[@backingInt(result)];
+        return isF32(self.func, self.func.valueType(result));
     }
 
     /// The instruction defining `v`, when `v` is read exactly once and shares a block with `at`.
@@ -1238,7 +1254,7 @@ const Emitter = struct {
             },
             .arith => |a| {
                 const dst = try self.vreg(self.func.instResult(inst).?, pos);
-                if (self.macs.at(inst)) |m| return self.emitMac(m, dst, pos);
+                if (self.macs.at(inst)) |m| return self.emitVectorMac(m, inst, pos);
                 const f = vectorBinOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
                 // The scalar-operand form when only the right side is warp-uniform, which is the
                 // common shape: a per-lane value combined with a loop invariant.
@@ -1265,21 +1281,44 @@ const Emitter = struct {
     /// runs. A factor sitting there is therefore staged aside first. This is not theoretical: a
     /// bare product gets `vfwmacc.vv v2, v1, v2` and would read a zeroed destination as its own
     /// factor.
-    fn emitMac(self: *Emitter, m: Mac, dst: VReg, pos: u32) Error!void {
-        // A constant factor is splatted into a scratch, and two of them take both scratches. That
-        // is safe: staging below only has work when a factor is a VALUE sitting in `dst`, and two
-        // constants leave no value factor at all.
-        var next: VReg = vscratch;
-        var a = try self.factorReg(m.a, pos, &next);
-        var b = try self.factorReg(m.b, pos, &next);
+    /// A per-lane MAC, whose result stays in a vector register.
+    fn emitVectorMac(self: *Emitter, m: Mac, inst: Inst, pos: u32) Error!void {
+        var pool: Pool = .{};
+        try self.mac(m, try self.vreg(self.func.instResult(inst).?, pos), &pool, pos);
+    }
+
+    /// A warp-uniform MAC. It still runs on the vector unit, because that is the only float
+    /// multiplier the core has, so it accumulates in a scratch and the answer comes back out of
+    /// lane zero. Around six words where a scalar float unit would take one, which is the price of
+    /// a core that has no scalar float multiply at all.
+    fn emitScalarMac(self: *Emitter, m: Mac, dst: Reg, pos: u32) Error!void {
+        var pool: Pool = .{};
+        const at = try pool.take();
+        try self.mac(m, at, &pool, pos);
+        try self.put(rv.vmv_x_s(dst, at));
+    }
+
+    fn mac(self: *Emitter, m: Mac, dst: VReg, pool: *Pool, pos: u32) Error!void {
+        var a = try self.macOperand(m.a, pool, pos);
+        var b = try self.macOperand(m.b, pool, pos);
+        // A factor dies where the result is born, so the allocator may give the result that
+        // factor's register, and the accumulator has to be in the result's register before the
+        // instruction runs. A factor sitting there is therefore staged aside first. This is not
+        // theoretical: a bare product gets `vfwmacc.vv v2, v1, v2` and would otherwise read a
+        // zeroed destination as its own factor.
         if (a == dst or b == dst) {
-            try self.put(rv.vmv_v_v(vscratch2, dst));
-            if (a == dst) a = vscratch2;
-            if (b == dst) b = vscratch2;
+            const staged = try pool.take();
+            try self.put(rv.vmv_v_v(staged, dst));
+            if (a == dst) a = staged;
+            if (b == dst) b = staged;
         }
         if (m.acc) |acc| {
-            const from = try self.vreg(acc, pos);
-            if (dst != from) try self.put(rv.vmv_v_v(dst, from));
+            if (self.isDivergent(acc)) {
+                const from = try self.vreg(acc, pos);
+                if (dst != from) try self.put(rv.vmv_v_v(dst, from));
+            } else {
+                try self.put(rv.vmv_v_x(dst, try self.reg(acc, pos)));
+            }
         } else {
             // A product with nothing to add to accumulates into zero. The product of two f16 is
             // exact in f32, so this answers the product itself. The one difference is a product of
@@ -1290,14 +1329,18 @@ const Emitter = struct {
         try self.put(rv.vfwmacc_vv(dst, a, b));
     }
 
-    /// The vector register holding one MAC factor. A constant goes into the scratch `next` names,
-    /// which then moves on so a second constant gets the other one.
-    fn factorReg(self: *Emitter, f: Factor, pos: u32, next: *VReg) Error!VReg {
+    /// The vector register holding one MAC factor. A warp-uniform value and a constant both live
+    /// outside the vector file, so each is broadcast into a scratch first.
+    fn macOperand(self: *Emitter, f: Factor, pool: *Pool, pos: u32) Error!VReg {
         switch (f) {
-            .value => |v| return self.vreg(v, pos),
+            .value => |v| {
+                if (self.isDivergent(v)) return self.vreg(v, pos);
+                const into = try pool.take();
+                try self.put(rv.vmv_v_x(into, try self.reg(v, pos)));
+                return into;
+            },
             .constant => |bits| {
-                const into = next.*;
-                next.* = vscratch2;
+                const into = try pool.take();
                 try self.constant(scratch, bits);
                 try self.put(rv.vmv_v_x(into, scratch));
                 return into;
@@ -1368,8 +1411,12 @@ const Emitter = struct {
             .unary => |u| try self.move(dst, try self.reg(u.value, pos)),
             .convert => |cv| try self.emitConvert(cv, inst, dst, pos),
             .arith => |a| {
-                const f = binOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
-                try self.put(f(dst, try self.reg(a.lhs, pos), try self.reg(a.rhs, pos)));
+                if (self.macs.at(inst)) |m| {
+                    try self.emitScalarMac(m, dst, pos);
+                } else {
+                    const f = binOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
+                    try self.put(f(dst, try self.reg(a.lhs, pos), try self.reg(a.rhs, pos)));
+                }
             },
             .arith_imm => |a| try self.emitArithImm(a, dst, pos),
             .icmp => |c| try self.emitCompare(c, dst, pos),
