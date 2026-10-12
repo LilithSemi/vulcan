@@ -248,7 +248,12 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     // belongs to one hart, which is why no other hart's slots are counted against it.
     const slots = walloc.slot_count_per_class[0];
     if (slots > opts.profile.scratchBytes() / 4) return error.Unsupported;
-    // The deepest slot is reached by one signed 12-bit displacement from `sp`.
+    // The deepest slot is reached by one signed 12-bit displacement from `sp`, and the stack grows
+    // down, so 2048 bytes is all one displacement can name.
+    //
+    // At a 2048-byte region the two ceilings now MEET: 512 slots either way, so the check above
+    // never fires on its own. Raising the region again buys nothing until a deep slot is addressed
+    // with more than one instruction, which is the thing to change first rather than the number.
     if (slots * 4 > 2048) return error.Unsupported;
 
     // A spilled VECTOR would need a vector store to the scratch region and a reload from it.

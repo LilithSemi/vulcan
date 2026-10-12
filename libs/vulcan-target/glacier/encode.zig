@@ -132,16 +132,24 @@ pub const Profile = enum {
     /// COMPILER does read it, because it must know when a spill would walk out of the region and
     /// into the hart below, and the generation is in the profile name so a later core cannot
     /// quietly move it.
-    /// One kilobyte on every GC1 profile. The region is carved from the top of the largest memory
+    /// Two kilobytes on every GC1 profile. The region is carved from the top of the largest memory
     /// device, SDRAM or DDR3 and not on-chip SRAM, so the size costs address space and no logic:
-    /// eight resident warps on gc1.mi reserve 8 KiB out of 32 MiB.
+    /// eight resident warps on gc1.mi reserve 16 KiB out of 32 MiB. A board whose largest memory
+    /// IS on-chip pays visibly, and the answer there is fewer resident warps rather than a smaller
+    /// region.
     ///
-    /// THIS NUMBER MUST MATCH `GlacierConfig.scratchBytesPerHart` IN THE CORE. A compiler that
-    /// believes the region is larger than the hardware gives it spills into the hart below and
-    /// corrupts a neighbour, which surfaces as that hart's wrong answer somewhere else.
+    /// THIS NUMBER MUST MATCH `GlacierConfig.scratchBytesPerHart` IN THE CORE, and the two
+    /// directions are not equally bad. A core that reserves MORE than this wastes address space. A
+    /// core that reserves LESS lets a spill walk into the hart below and corrupt a neighbour,
+    /// which surfaces as that hart's wrong answer somewhere else. So the core is raised first and
+    /// this follows, never the other way round.
+    ///
+    /// That makes a NEW compiler against an OLD bitstream the dangerous pairing, and nothing in
+    /// either half detects it: the number is fixed at compile time, so no CSR a kernel could read
+    /// would help. Pairing a kernel with the core generation it was built for is the host's job.
     pub fn scratchBytes(self: Profile) u32 {
         return switch (self) {
-            .@"gc1.n", .@"gc1.mi", .@"gc1.s", .@"gc1.f", .@"gc1.ma" => 1024,
+            .@"gc1.n", .@"gc1.mi", .@"gc1.s", .@"gc1.f", .@"gc1.ma" => 2048,
         };
     }
 };

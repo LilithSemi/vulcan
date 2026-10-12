@@ -576,10 +576,10 @@ test "a kernel with more live values than registers spills into the hart's scrat
 }
 
 test "a kernel that needs more scratch than the core has is refused" {
-    // A hart holds 1024 bytes, so 256 slots. Far more live values than that cannot spill anywhere,
+    // A hart holds 2048 bytes, so 512 slots. Far more live values than that cannot spill anywhere,
     // and walking below the region would corrupt the hart underneath.
     const allocator = std.testing.allocator;
-    var f = try buildSumKernel(allocator, 400);
+    var f = try buildSumKernel(allocator, 800);
     defer f.deinit();
     try std.testing.expectError(error.Unsupported, compile(allocator, &f));
 }
