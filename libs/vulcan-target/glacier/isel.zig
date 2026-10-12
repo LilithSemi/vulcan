@@ -719,9 +719,9 @@ fn convertible(code: ir.function.Opcode) bool {
         .iconst, .fconst, .global_addr, .arith, .arith_imm, .icmp, .select, .convert, .unary => true,
         // A store converts because the core can predicate one. An inactive lane makes no bus
         // access at all, so a store spliced out of an arm writes exactly the lanes that chose it.
-        // A store that already carries a mask does NOT convert: combining two masks is a bitwise
-        // AND of mask registers, and this does not lean on that.
-        .store => |st| st.mask == null,
+        // A store that already carries a mask converts too: the two masks are ANDed, which is a
+        // mask op and exact at any lane count. See `maskBinOp`.
+        .store => true,
         else => false,
     };
 }
@@ -741,12 +741,32 @@ fn convert(allocator: std.mem.Allocator, func: *Function, a: Block, d: Diamond) 
     for ([_]Block{ d.then_block, d.else_block }) |arm| {
         const mask = if (arm == d.else_block) else_mask else d.cond;
         const body = func.blockInstsMut(arm);
-        const from = func.blockInsts(a).len;
-        try func.blockInstsMut(a).appendSlice(allocator, body.items);
+        const moved = try allocator.dupe(Inst, body.items);
+        defer allocator.free(moved);
         body.clearRetainingCapacity();
         // Both arms run for every lane now, so a store that was under the branch becomes a store
         // under the mask. The lanes the mask excludes make no access at all.
-        for (func.blockInsts(a)[from..]) |inst| {
+        //
+        // A store that arrives already masked came from a diamond this converted earlier, and it
+        // has to run where BOTH conditions hold, so the two masks are ANDed. The AND is appended
+        // before the store it feeds, which is why the body moves one instruction at a time rather
+        // than in one slice.
+        for (moved) |inst| {
+            const carried: ?Value = switch (func.opcode(inst)) {
+                .store => |st| st.mask,
+                else => null,
+            };
+            if (carried) |inner| {
+                const both = try func.appendInst(a, func.valueType(inner), .{ .arith = .{
+                    .op = .bit_and,
+                    .lhs = inner,
+                    .rhs = mask.?,
+                } });
+                try func.blockInstsMut(a).append(allocator, inst);
+                func.opcodeMut(inst).store.mask = both;
+                continue;
+            }
+            try func.blockInstsMut(a).append(allocator, inst);
             switch (func.opcodeMut(inst).*) {
                 .store => |*st| st.mask = mask,
                 else => {},
@@ -1134,6 +1154,17 @@ fn checkInst(
         // the plain float ops are two or more.
         .arith => |a| if (macs.at(inst) == null) {
             const ty = func.valueType(a.lhs);
+            // Two per-lane bools combine with a mask op. Both sides have to BE masks: a
+            // warp-uniform bool sits in a scalar register as a 0 or a 1, and broadcasting that
+            // gives one value per element rather than one bit per lane, so it is refused rather
+            // than quietly read as a mask.
+            if (isBool(func, ty) and resultDivergent(func, inst, divergent)) {
+                _ = maskBinOp(a.op) orelse return error.Unsupported;
+                if (!divergent[@backingInt(a.lhs)] or !divergent[@backingInt(a.rhs)]) {
+                    return error.Unsupported;
+                }
+                return;
+            }
             // Float arithmetic runs on the vector unit either way, so its table is the same one
             // whether or not the operands vary per lane; only the plumbing around it differs.
             if (floatVectorBinOp(func, a.op, ty) == null) {
@@ -1378,6 +1409,29 @@ fn vectorCmpOp(func: *const Function, op: ir.function.CmpOp, ty: Type) ?struct {
         .le => .{ .encode = if (signed) rv.vmsle_vv else rv.vmsleu_vv },
         .gt => .{ .encode = if (signed) rv.vmslt_vv else rv.vmsltu_vv, .swap = true },
         .ge => .{ .encode = if (signed) rv.vmsle_vv else rv.vmsleu_vv, .swap = true },
+    };
+}
+
+/// Whether `ty` is a bool. A PER-LANE bool is a mask: one bit per lane, packed into the first
+/// element of the register. It is not a word per lane, so nothing may read one as a value and the
+/// ops that combine two of them are the mask ops.
+fn isBool(func: *const Function, ty: Type) bool {
+    return func.types.type_kind(ty) == .bool;
+}
+
+/// The mask op for a bitwise operation between two per-lane bools.
+///
+/// `vand.vv` gives the same answer today, because sixteen lanes of mask fit inside the first
+/// element and a bitwise AND of that element is a bitwise AND of the mask. That stops at
+/// thirty-two lanes, where the mask spills into the second element and an element-wise op reads
+/// the lanes of one register against the wrong lanes of the other. These ops are right at any
+/// width, so the coincidence is not used.
+fn maskBinOp(op: ir.function.BinOp) ?*const fn (VReg, VReg, VReg) u32 {
+    return switch (op) {
+        .bit_and => rv.vmand_mm,
+        .bit_or => rv.vmor_mm,
+        .bit_xor => rv.vmxor_mm,
+        else => null,
     };
 }
 
@@ -1695,6 +1749,10 @@ const Emitter = struct {
             .arith => |a| {
                 const dst = try self.vreg(self.func.instResult(inst).?, pos);
                 if (self.macs.at(inst)) |m| return self.emitVectorMac(m, inst, pos);
+                if (isBool(self.func, self.func.valueType(a.lhs))) {
+                    const mask_op = maskBinOp(a.op) orelse return error.Unsupported;
+                    return self.put(mask_op(dst, try self.vreg(a.lhs, pos), try self.vreg(a.rhs, pos)));
+                }
                 const f = vectorBinOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
                 // The scalar-operand form when only the right side is warp-uniform, which is the
                 // common shape: a per-lane value combined with a loop invariant.

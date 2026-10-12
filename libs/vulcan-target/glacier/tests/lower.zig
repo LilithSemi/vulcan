@@ -2832,11 +2832,11 @@ test "a masked store whose address and value are the same in every lane writes n
     try std.testing.expectEqual(sentinel, data[0]);
 }
 
-test "a store already under one mask is not converted a second time" {
+test "a store under two conditions runs where both hold" {
     // `if (lane < 3) { if (lane > 0) data[lane] = 0xDD }`. The inner diamond converts first and
-    // leaves the store carrying the inner condition. Combining that with the outer condition is a
-    // bitwise AND of two mask registers, which this does not do, so the outer diamond stays a
-    // branch and the refusal catches it. Overwriting the inner mask would write lane 0.
+    // leaves the store carrying the inner condition, then the outer one ANDs the two masks. Lane
+    // 0 fails the inner test and lane 3 the outer one, so both ends of the span are the
+    // assertion: dropping either mask writes a word that has to stay as it was.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -2869,7 +2869,43 @@ test "a store already under one mask is not converted a second time" {
     try f.setJump(inner_join, join, &.{});
     f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
 
-    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var masked_stores: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b0100111) continue;
+        try std.testing.expectEqual(@as(u32, 0), (w >> 25) & 1);
+        masked_stores += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), masked_stores);
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011);
+        try std.testing.expect(w & 0x7F != 0b1101111);
+    }
+
+    // The two masks combine with `vmand.mm`, funct6 011001 in the OPMVV form, and NOT with the
+    // element-wise `vand.vv`. Both give the same answer at every width this core is built in,
+    // because sixteen lanes of mask fit in the first element, so the structure is the only place
+    // the difference shows. Nothing here can tell them apart by value.
+    // The one into v0 is the move that applies the finished mask to the store, so it is not
+    // counted: the combine is the one that writes an ordinary register.
+    var mask_ands: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0b111 != 0b010) continue;
+        if (w >> 26 != 0b011001) continue;
+        if ((w >> 7) & 0x1F == 0) continue;
+        mask_ands += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), mask_ands);
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const want: u32 = if (i > 0 and i < 3) 0xDD else sentinel;
+        try std.testing.expectEqual(want, data[i]);
+    }
 }
 
 test "a masked store whose mask is the same in every lane is refused" {
@@ -2887,6 +2923,33 @@ test "a masked store whose mask is the same in every lane is refused" {
     const fill = try f.appendInst(entry, u32_t, .{ .iconst = 0xEE });
     const always = try f.appendInst(entry, bool_t, .{ .iconst = 1 });
     try f.appendStoreMasked(entry, fill, base, always);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a mask combined with a warp-uniform bool is refused" {
+    // A per-lane bool is mask BITS and a warp-uniform one is a 0 or a 1 in a scalar register.
+    // Broadcasting the second gives one value per element, not one bit per lane, so reading it as
+    // a mask would make the store write by the wrong rule. Only hand-written IR says this.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const lanes = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const always = try f.appendInst(entry, bool_t, .{ .iconst = 1 });
+    const both = try f.appendInst(entry, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = lanes, .rhs = always } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStoreMasked(entry, two, at, both);
     f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
     try std.testing.expectError(error.Unsupported, compile(allocator, &f));
