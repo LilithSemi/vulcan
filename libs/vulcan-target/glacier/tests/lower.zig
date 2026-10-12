@@ -1401,3 +1401,111 @@ test "an addition of two widened f16 is refused rather than split into two MACs"
 
     try std.testing.expectError(error.Unsupported, compile(allocator, &f));
 }
+
+test "a constant factor reaches the MAC already widened by the frontend" {
+    // `@as(f32, a) * @as(f32, b)` with a comptime `b` arrives as a multiply by an f32 CONSTANT:
+    // widening a constant folds in the frontend, so only one side is a convert. Every rotation
+    // constant in a renderer has this shape.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const three = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = three } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = product } });
+    try f.appendStore(entry, raw, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(n * 3.0)), data[i]);
+    }
+}
+
+test "an addition of a constant is a MAC with both factors constant" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const acc = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const two = try f.appendInst(entry, f32_t, .{ .fconst = 2.0 });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = two } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
+    try f.appendStore(entry, raw, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    var data: [8]u32 = @splat(0);
+    for (0..lanes) |i| data[i] = @bitCast(@as(f32, @floatFromInt(i)));
+    try runOnce(words, &data, 0, 1);
+    for (0..lanes) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(n + 2.0)), data[i]);
+    }
+}
+
+test "a constant an f16 cannot hold exactly is refused as a factor" {
+    // Two ways a constant fails. 0.1 has no exact f16, so the core would multiply by a different
+    // number than the IR named. 2^-15 has one, but only as a subnormal, and the lane flushes those
+    // to zero, so the constant would behave as a zero.
+    const allocator = std.testing.allocator;
+    for ([_]f64{ 0.1, 3.0517578125e-05 }) |value| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const f16_t = try f.types.intern(.{ .float = .f16 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+        const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+        const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+        const k = try f.appendInst(entry, f32_t, .{ .fconst = value });
+        const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = k } });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = product } });
+        try f.appendStore(entry, raw, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    }
+}

@@ -490,21 +490,31 @@ fn isBitPreservingConvert(func: *const Function, inst: Inst, cv: ir.function.Con
 // ===========================================================================
 // The widening multiply-accumulate.
 
-/// A `vfwmacc.vv` found in the IR: `result = acc + a * b`, where `a` and `b` are f16 and `acc` and
-/// the result are f32. Either end can be missing, because the core has no float add and no float
-/// multiply on its own and this instruction stands in for both. See `findMacs`.
+/// One factor of a MAC. The core multiplies f16 lanes, so a factor is an f16 value in a vector
+/// register or a constant an f16 holds exactly.
+///
+/// A constant factor is not a corner case. `@as(f32, a) * @as(f32, b)` with a comptime `b` reaches
+/// the IR as a multiply by an f32 CONSTANT, because the widening of a constant folds in the
+/// frontend, so only one side arrives as a convert.
+const Factor = union(enum) {
+    value: Value,
+    /// An f16 bit pattern, which the emitter splats into a scratch register.
+    constant: u16,
+};
+
+/// A `vfwmacc.vv` found in the IR: `result = acc + a * b`, where the factors are f16 and `acc` and
+/// the result are f32. The accumulator can be missing, because the core has no float multiply on
+/// its own and this instruction stands in for one. See `findMacs`.
 const Mac = struct {
     /// What the product adds to. Null when the IR asked for the product alone, and the destination
     /// is zeroed first.
     acc: ?Value,
-    a: Value,
-    /// The second factor. Null when the IR asked for an addition with no multiply, and the factor
-    /// is the constant 1.0.
-    b: ?Value,
+    a: Factor,
+    b: Factor,
 };
 
 /// An f16 1.0, which is the second factor of a MAC that stands in for an addition.
-const half_one: i32 = 0x3C00;
+const half_one: u16 = 0x3C00;
 
 /// Where the MACs are. `mac` is indexed by instruction and holds the operands of the `add` that
 /// becomes the instruction; `folded` marks the multiply and the two widening converts that the
@@ -601,8 +611,8 @@ const Matcher = struct {
     divergent: []const bool,
     block_of: []const u32,
 
-    /// An `add` read as a MAC: either a full one, or an addition of a widened f16 whose second
-    /// factor is an implicit 1.0.
+    /// An `add` read as a MAC: either a full one, or an addition of a single factor whose partner
+    /// is an implicit 1.0.
     fn matchAdd(self: *const Matcher, inst: Inst) ?Match {
         const a = switch (self.func.opcode(inst)) {
             .arith => |x| x,
@@ -616,59 +626,86 @@ const Matcher = struct {
             const term = pair[0];
             const acc = pair[1];
             if (!self.divergent[@backingInt(acc)]) continue;
-            const defining = self.soleUseInBlock(inst, term) orelse continue;
 
             // `acc + f32(a) * f32(b)`.
-            if (self.product(inst, defining)) |factors| {
-                return .{
-                    .mac = .{ .acc = acc, .a = factors.a, .b = factors.b },
-                    .folded = .{ defining, factors.wide_a, factors.wide_b },
-                };
+            if (self.soleUseInBlock(inst, term)) |defining| {
+                if (self.product(inst, defining)) |p| {
+                    return .{
+                        .mac = .{ .acc = acc, .a = p.a, .b = p.b },
+                        .folded = .{ defining, p.folded[0], p.folded[1] },
+                    };
+                }
             }
 
-            // `acc + f32(a)`. When the other side is a widening convert too there is no accumulator
-            // at all, and nothing folds it, so the convert rule refuses the kernel.
-            if (self.widened(defining)) |ha| {
-                if (!self.divergent[@backingInt(ha)]) continue;
-                return .{ .mac = .{ .acc = acc, .a = ha, .b = null }, .folded = .{ defining, null, null } };
+            // `acc + f32(a)`. When the other side is a factor too there is no accumulator at all,
+            // and nothing folds it, so the convert rule refuses the kernel.
+            if (self.factor(inst, term)) |f| {
+                return .{
+                    .mac = .{ .acc = acc, .a = f.factor, .b = .{ .constant = half_one } },
+                    .folded = .{ f.folded, null, null },
+                };
             }
         }
         return null;
     }
 
-    /// A `mul` of two widened f16 with nothing to accumulate into, which zeroes its destination
-    /// and then accumulates.
+    /// A product with nothing to accumulate into, which zeroes its destination and then
+    /// accumulates.
     fn matchProduct(self: *const Matcher, inst: Inst) ?Match {
         if (!self.resultIsPerLaneF32(inst)) return null;
-        const factors = self.product(inst, inst) orelse return null;
+        const p = self.product(inst, inst) orelse return null;
         return .{
-            .mac = .{ .acc = null, .a = factors.a, .b = factors.b },
-            .folded = .{ factors.wide_a, factors.wide_b, null },
+            .mac = .{ .acc = null, .a = p.a, .b = p.b },
+            .folded = .{ p.folded[0], p.folded[1], null },
         };
     }
 
-    /// `mul` read as a product of two widened f16, with both converts absorbable at `at`.
-    fn product(self: *const Matcher, at: Inst, mul: Inst) ?struct { a: Value, b: Value, wide_a: Inst, wide_b: Inst } {
+    /// `mul` read as a product of two f16 factors, with any convert absorbable at `at`.
+    fn product(self: *const Matcher, at: Inst, mul: Inst) ?struct { a: Factor, b: Factor, folded: [2]?Inst } {
         const m = switch (self.func.opcode(mul)) {
             .arith => |x| x,
             else => return null,
         };
         if (m.op != .mul or !isF32(self.func, self.func.valueType(m.lhs))) return null;
-        const wide_a = self.foldableConvert(at, m.lhs) orelse return null;
-        const wide_b = self.foldableConvert(at, m.rhs) orelse return null;
-        const ha = self.widened(wide_a).?;
-        const hb = self.widened(wide_b).?;
-        if (!self.divergent[@backingInt(ha)] or !self.divergent[@backingInt(hb)]) return null;
-        return .{ .a = ha, .b = hb, .wide_a = wide_a, .wide_b = wide_b };
+        const fa = self.factor(at, m.lhs) orelse return null;
+        const fb = self.factor(at, m.rhs) orelse return null;
+        return .{ .a = fa.factor, .b = fb.factor, .folded = .{ fa.folded, fb.folded } };
     }
 
-    /// The widening convert defining `v`, when it can be absorbed by the instruction at `at`.
-    fn foldableConvert(self: *const Matcher, at: Inst, v: Value) ?Inst {
-        const inst = self.soleUseInBlock(at, v) orelse return null;
-        _ = self.widened(inst) orelse return null;
-        return inst;
+    /// `v` as one factor of a MAC: a widening convert the instruction at `at` can absorb, or a
+    /// float constant an f16 holds exactly.
+    fn factor(self: *const Matcher, at: Inst, v: Value) ?struct { factor: Factor, folded: ?Inst } {
+        if (self.soleUseInBlock(at, v)) |inst| {
+            if (self.widened(inst)) |ha| {
+                // A warp-uniform factor lives in a SCALAR register, and the two register files are
+                // indexed by the same number, so reading one here would read whatever that scalar
+                // register holds.
+                if (!self.divergent[@backingInt(ha)]) return null;
+                return .{ .factor = .{ .value = ha }, .folded = inst };
+            }
+        }
+        if (self.halfConstant(v)) |bits| return .{ .factor = .{ .constant = bits }, .folded = null };
+        return null;
     }
 
+    /// The f16 bit pattern of the float constant `v`, when an f16 holds its value exactly.
+    ///
+    /// A value the round trip changes is refused, because the core would multiply by a different
+    /// number than the IR named. So is one an f16 holds only as a subnormal, since the lane
+    /// flushes those and the constant would behave as a zero.
+    fn halfConstant(self: *const Matcher, v: Value) ?u16 {
+        const inst = self.func.definingInst(v) orelse return null;
+        const c = switch (self.func.opcode(inst)) {
+            .fconst => |x| x,
+            else => return null,
+        };
+        if (!isWord(self.func, self.func.valueType(v))) return null;
+        const wide: f32 = @floatCast(c);
+        const narrow: f16 = @floatCast(wide);
+        if (@as(f32, narrow) != wide) return null;
+        if (flushToZero(f16, narrow) != narrow) return null;
+        return @bitCast(narrow);
+    }
     /// Whether the result of `inst` is a per-lane f32. Everything a MAC produces is, so this is
     /// also what keeps the emitter on its vector path.
     fn resultIsPerLaneF32(self: *const Matcher, inst: Inst) bool {
@@ -1229,14 +1266,12 @@ const Emitter = struct {
     /// bare product gets `vfwmacc.vv v2, v1, v2` and would read a zeroed destination as its own
     /// factor.
     fn emitMac(self: *Emitter, m: Mac, dst: VReg, pos: u32) Error!void {
-        var a = try self.vreg(m.a, pos);
-        // A missing second factor means the MAC is standing in for an addition, so the factor is
-        // 1.0 and the product is the widened operand itself.
-        var b = if (m.b) |v| try self.vreg(v, pos) else blk: {
-            try self.constant(scratch, half_one);
-            try self.put(rv.vmv_v_x(vscratch, scratch));
-            break :blk vscratch;
-        };
+        // A constant factor is splatted into a scratch, and two of them take both scratches. That
+        // is safe: staging below only has work when a factor is a VALUE sitting in `dst`, and two
+        // constants leave no value factor at all.
+        var next: VReg = vscratch;
+        var a = try self.factorReg(m.a, pos, &next);
+        var b = try self.factorReg(m.b, pos, &next);
         if (a == dst or b == dst) {
             try self.put(rv.vmv_v_v(vscratch2, dst));
             if (a == dst) a = vscratch2;
@@ -1253,6 +1288,21 @@ const Emitter = struct {
             try self.put(rv.vmv_v_x(dst, .x0));
         }
         try self.put(rv.vfwmacc_vv(dst, a, b));
+    }
+
+    /// The vector register holding one MAC factor. A constant goes into the scratch `next` names,
+    /// which then moves on so a second constant gets the other one.
+    fn factorReg(self: *Emitter, f: Factor, pos: u32, next: *VReg) Error!VReg {
+        switch (f) {
+            .value => |v| return self.vreg(v, pos),
+            .constant => |bits| {
+                const into = next.*;
+                next.* = vscratch2;
+                try self.constant(scratch, bits);
+                try self.put(rv.vmv_v_x(into, scratch));
+                return into;
+            },
+        }
     }
 
     fn emitVectorArithImm(self: *Emitter, a: ir.function.ArithImm, inst: Inst, pos: u32) Error!void {
