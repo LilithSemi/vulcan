@@ -1072,6 +1072,13 @@ fn vectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const f
     // There is no per-lane float arithmetic. The widening MAC is the only vector float operation
     // and it is not a binary op, because it accumulates into its own destination. A per-lane
     // divide would have to feed the single scalar divider one lane at a time.
+    //
+    // BEFORE SELECTING A NON-WIDENING FLOAT MULTIPLY HERE, CHECK THE BITSTREAM. The lane sizes its
+    // significand product from the multiply formats and the narrow side of the widening pair, and
+    // Glacier leaves the multiply formats empty on purpose, for the MAC. A multiply whose format
+    // does not fit that width returns the canonical NaN and raises the invalid flag. So a kernel
+    // built against today's core would compile, run, and produce NaN. The core has to set its
+    // multiply format to f32 and a bitstream has to be built from it first.
     if (isFloat(func, ty)) return null;
     const signed = isSigned(func, ty);
     return switch (op) {
