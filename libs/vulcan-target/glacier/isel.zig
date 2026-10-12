@@ -917,16 +917,16 @@ fn checkInst(
             if (isFloat(func, func.valueType(a.lhs))) return error.Unsupported;
             _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
         },
-        // A per-lane compare writes a MASK, and a per-lane select reads one. Masks are the
-        // next slice of this lowering, so refuse rather than compare lane 0 and call it the
-        // answer for the whole warp.
+        // A per-lane compare writes a MASK, one bit per lane, and a per-lane select reads one.
         .icmp => |c| {
-            // Glacier has no float compare in any form. An integer compare over float bits
+            // Glacier has no float compare in any form yet. An integer compare over float bits
             // answers a different relation, and it is wrong for a negative value and for NaN.
             if (isFloat(func, func.valueType(c.lhs))) return error.Unsupported;
-            if (divergent[@backingInt(c.lhs)] or divergent[@backingInt(c.rhs)]) return error.Unsupported;
+            if (resultDivergent(func, inst, divergent)) {
+                _ = vectorCmpOp(func, c.op, func.valueType(c.lhs)) orelse return error.Unsupported;
+            }
         },
-        .select => |s| if (divergent[@backingInt(s.cond)]) return error.Unsupported,
+        .select => {},
         .load => |l| {
             if (!isWord(func, func.valueType(l.ptr))) return error.Unsupported;
             const r = func.instResult(inst) orelse return error.Unsupported;
@@ -1094,6 +1094,29 @@ fn floatVectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*co
         .sub => rv.vfsub_vv,
         .mul => rv.vfmul_vv,
         else => null,
+    };
+}
+
+/// The per-lane compare that answers `op`, and whether its operands must be swapped to get it.
+///
+/// A compare writes one BIT per lane into a mask register. RVV has no vector-vector greater-than,
+/// and needs none: greater-than is less-than with the operands the other way round.
+///
+/// Float compares are absent because the core does not decode them yet. They are the next hardware
+/// step, not a gap in RVV: `vmflt.vv` and `vmfle.vv` exist and `riscv64/encode.zig` has them.
+fn vectorCmpOp(func: *const Function, op: ir.function.CmpOp, ty: Type) ?struct {
+    encode: *const fn (VReg, VReg, VReg) u32,
+    swap: bool,
+} {
+    if (isFloat(func, ty)) return null;
+    const signed = isSigned(func, ty);
+    return switch (op) {
+        .eq => .{ .encode = rv.vmseq_vv, .swap = false },
+        .ne => .{ .encode = rv.vmsne_vv, .swap = false },
+        .lt => .{ .encode = if (signed) rv.vmslt_vv else rv.vmsltu_vv, .swap = false },
+        .le => .{ .encode = if (signed) rv.vmsle_vv else rv.vmsleu_vv, .swap = false },
+        .gt => .{ .encode = if (signed) rv.vmslt_vv else rv.vmsltu_vv, .swap = true },
+        .ge => .{ .encode = if (signed) rv.vmsle_vv else rv.vmsleu_vv, .swap = true },
     };
 }
 
@@ -1417,6 +1440,19 @@ const Emitter = struct {
                 try self.put(f(dst, lhs, rhs));
             },
             .arith_imm => |a| try self.emitVectorArithImm(a, inst, pos),
+            // A per-lane compare writes a MASK into its destination: one bit per lane, not a word
+            // per lane. Nothing else may read it as a value.
+            .icmp => |c| {
+                var pool: Pool = .{};
+                const dst = try self.vreg(self.func.instResult(inst).?, pos);
+                const cmp = vectorCmpOp(self.func, c.op, self.func.valueType(c.lhs)) orelse return error.Unsupported;
+                const lhs = try self.maskOperand(c.lhs, &pool, pos);
+                const rhs = try self.maskOperand(c.rhs, &pool, pos);
+                // Greater-than is less-than the other way round, which is why there is no encoder
+                // for it.
+                try self.put(if (cmp.swap) cmp.encode(dst, rhs, lhs) else cmp.encode(dst, lhs, rhs));
+            },
+            .select => |s| try self.emitVectorSelect(s, inst, pos),
             else => return error.Unsupported,
         }
     }
@@ -1434,6 +1470,44 @@ const Emitter = struct {
     fn emitVectorMac(self: *Emitter, m: Mac, inst: Inst, pos: u32) Error!void {
         var pool: Pool = .{};
         try self.mac(m, try self.vreg(self.func.instResult(inst).?, pos), &pool, pos);
+    }
+
+    /// An operand of a per-lane instruction, broadcast from a scalar register when it is
+    /// warp-uniform. Unlike `vectorOperand` this draws from the pool, so several operands of one
+    /// instruction can each need one.
+    fn maskOperand(self: *Emitter, v: Value, pool: *Pool, pos: u32) Error!VReg {
+        if (self.isDivergent(v)) return self.vreg(v, pos);
+        const into = try pool.take();
+        try self.put(rv.vmv_v_x(into, try self.reg(v, pos)));
+        return into;
+    }
+
+    /// A per-lane select: `vmerge.vvm`, which reads its mask from v0 and nowhere else.
+    ///
+    /// The mask is moved into v0 with a mask AND against itself. `vmv.v.v` would also work on this
+    /// core, because sixteen lanes of mask fit inside the first 32-bit element and it copies that
+    /// element, but it is a move of ELEMENTS and this is a move of BITS; the mask op says what is
+    /// meant and stays right at any lane count. v0 is never allocatable, so writing it displaces
+    /// nothing. NOTE the warp model cannot tell the two apart, for the same reason.
+    fn emitVectorSelect(self: *Emitter, s: ir.function.Select, inst: Inst, pos: u32) Error!void {
+        var pool: Pool = .{};
+        const dst = try self.vreg(self.func.instResult(inst).?, pos);
+        const then_v = try self.maskOperand(s.then, &pool, pos);
+        const else_v = try self.maskOperand(s.@"else", &pool, pos);
+        if (!self.isDivergent(s.cond)) {
+            // A warp-uniform condition picks the same side in every lane, but the sides are
+            // per-lane, so it still goes through the merge. The mask is built by comparing the
+            // broadcast condition against zero, which gives all ones exactly where it is FALSE, so
+            // the two sides go in the other order below.
+            const tmp = try pool.take();
+            try self.put(rv.vmv_v_x(tmp, try self.reg(s.cond, pos)));
+            try self.put(rv.vmseq_vx(.v0, tmp, .x0));
+            try self.put(rv.vmerge_vvm(dst, then_v, else_v));
+            return;
+        }
+        const mask = try self.vreg(s.cond, pos);
+        try self.put(rv.vmand_mm(.v0, mask, mask));
+        try self.put(rv.vmerge_vvm(dst, else_v, then_v));
     }
 
     /// A warp-uniform float binary operation. There is no scalar form of any of these, so both

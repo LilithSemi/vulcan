@@ -2172,3 +2172,160 @@ test "a float add rounds to nearest even and the MAC truncates" {
         try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.0))), data[0]);
     }
 }
+
+/// How many words in `code` are an integer vector compare into a mask: OP-V, OPIVV or OPIVX, with
+/// a funct6 in the compare block.
+fn countCompares(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        const f3 = (w >> 12) & 0x7;
+        if (f3 != 0b000 and f3 != 0b100) continue;
+        if (w >> 26 < 0b011000 or w >> 26 > 0b011111) continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// How many words in `code` are `vmerge`, the one masked instruction emitted: funct6 010111 with
+/// `vm` clear.
+fn countMerges(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if (w >> 26 != 0b010111 or (w >> 25) & 1 != 0) continue;
+        n += 1;
+    }
+    return n;
+}
+
+test "a per-lane compare and select pick a different answer in each lane" {
+    // `out[lane] = cmp(lane, 2) ? 100 : 200`, which is the shape a rasteriser's span test has and
+    // which used to be refused outright: a per-lane compare writes a MASK, and reading lane zero's
+    // answer for the whole warp would have been a wrong frame rather than a slow one.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { op: ir.function.CmpOp, taken: [4]bool }{
+        .{ .op = .lt, .taken = .{ true, true, false, false } },
+        .{ .op = .le, .taken = .{ true, true, true, false } },
+        .{ .op = .gt, .taken = .{ false, false, false, true } },
+        .{ .op = .ge, .taken = .{ false, false, true, true } },
+        .{ .op = .eq, .taken = .{ false, false, true, false } },
+        .{ .op = .ne, .taken = .{ true, true, false, true } },
+    };
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+        const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = c.op, .lhs = tid, .rhs = two } });
+        const hit = try f.appendInst(entry, u32_t, .{ .iconst = 100 });
+        const miss = try f.appendInst(entry, u32_t, .{ .iconst = 200 });
+        const pick = try f.appendInst(entry, u32_t, .{ .select = .{ .cond = cond, .then = hit, .@"else" = miss } });
+        try f.appendStore(entry, pick, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        // One compare into a mask and one merge under it. Greater-than has no vector-vector
+        // encoding, so it is the less-than with the operands swapped and still one instruction.
+        try std.testing.expectEqual(@as(usize, 1), countCompares(words));
+        try std.testing.expectEqual(@as(usize, 1), countMerges(words));
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            try std.testing.expectEqual(@as(u32, if (c.taken[i]) 100 else 200), data[i]);
+        }
+    }
+}
+
+test "a warp-uniform condition still merges when the sides are per-lane" {
+    // The condition is the same in every lane but the two sides are not, so the answer is per-lane
+    // and the merge is still how it is built. The mask comes from comparing the broadcast condition
+    // against zero, which is all ones where it is FALSE, so the sides go in the other order.
+    const allocator = std.testing.allocator;
+    for ([_]i64{ 0, 1 }) |flag| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        const cond = try f.appendInst(entry, bool_t, .{ .iconst = flag });
+        const ten = try f.appendArithImm(entry, u32_t, .mul, tid, 10);
+        const hundred = try f.appendArithImm(entry, u32_t, .mul, tid, 100);
+        const pick = try f.appendInst(entry, u32_t, .{ .select = .{ .cond = cond, .then = ten, .@"else" = hundred } });
+        try f.appendStore(entry, pick, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 1), countMerges(words));
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            const want: u32 = @intCast(i * (if (flag != 0) @as(usize, 10) else 100));
+            try std.testing.expectEqual(want, data[i]);
+        }
+    }
+}
+
+test "a per-lane compare takes its signedness from the operand type" {
+    // The lane index is small, so signed and unsigned compares agree on it and a test against a
+    // small bound cannot tell them apart. These bounds are chosen so they disagree on every lane:
+    // 0x80000000 is half the unsigned range and the most negative signed value.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { signedness: std.builtin.Signedness, bound: i64, taken: bool }{
+        // Unsigned: every lane is below half the range.
+        .{ .signedness = .unsigned, .bound = 0x8000_0000, .taken = true },
+        // Signed: the same bits are the most negative value, so no lane is below it.
+        .{ .signedness = .signed, .bound = -0x8000_0000, .taken = false },
+    };
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ty = try f.types.intern(.{ .int = .{ .signedness = c.signedness, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        const lane = try f.appendInst(entry, ty, .{ .convert = .{ .value = tid } });
+        const bound = try f.appendInst(entry, ty, .{ .iconst = c.bound });
+        const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = lane, .rhs = bound } });
+        const hit = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+        const miss = try f.appendInst(entry, u32_t, .{ .iconst = 9 });
+        const pick = try f.appendInst(entry, u32_t, .{ .select = .{ .cond = cond, .then = hit, .@"else" = miss } });
+        try f.appendStore(entry, pick, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            try std.testing.expectEqual(@as(u32, if (c.taken) 7 else 9), data[i]);
+        }
+    }
+}

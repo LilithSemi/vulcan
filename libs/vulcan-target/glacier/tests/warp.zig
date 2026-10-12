@@ -112,6 +112,19 @@ pub const Warp = struct {
     fn set(self: *Warp, rd: u5, value: u32) void {
         if (rd != 0) self.x[rd] = value;
     }
+
+    /// A mask register, as THIS MODEL keeps one: the bits in element ZERO, rather than packed
+    /// across the register the way the hardware lays them out. Nothing reads a mask as elements, so
+    /// the difference is invisible, and the rest of the register is left recognisably stale so a
+    /// misuse shows up as an obviously wrong answer.
+    fn mask(self: *const Warp, reg: u5) u32 {
+        return self.v[reg][0];
+    }
+
+    fn setMask(self: *Warp, reg: u5, bits: u32) void {
+        self.v[reg] = @splat(stale_lane);
+        self.v[reg][0] = bits;
+    }
 };
 
 fn signExtend(value: u32, bits: u5) i32 {
@@ -310,7 +323,11 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
     const src: u5 = @intCast((word >> 15) & 0x1F); // vs1, rs1, or a 5-bit immediate
     const vs2: u5 = @intCast((word >> 20) & 0x1F);
     const funct6 = word >> 26;
-    if ((word >> 25) & 1 != 1) return error.Illegal; // unmasked only
+    // `vmerge` is the ONE masked instruction the lowering emits, and it is handled below. Anything
+    // else with `vm` clear is predicated, which nothing emits yet, so it is an error rather than a
+    // quietly unpredicated write.
+    const masked = (word >> 25) & 1 == 0;
+    if (masked and funct6 != 0b010111) return error.Illegal;
 
     // vid.v and vmv.v.x write a value that does not come from vs2, so they are taken first.
     if (funct3 == 0b010 and funct6 == 0b010100) {
@@ -318,11 +335,13 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
         for (0..warp.lanes) |i| warp.v[vd][i] = @intCast(i);
         return;
     }
-    if (funct3 == 0b100 and funct6 == 0b010111) {
+    // The two moves share their funct6 with `vmerge`, which is told apart ONLY by the mask bit. A
+    // merge reaching here would copy one side over every lane and lose the mask entirely.
+    if (funct3 == 0b100 and funct6 == 0b010111 and !masked) {
         for (0..warp.lanes) |i| warp.v[vd][i] = warp.x[src];
         return;
     }
-    if (funct3 == 0b000 and funct6 == 0b010111) {
+    if (funct3 == 0b000 and funct6 == 0b010111 and !masked) {
         for (0..warp.lanes) |i| warp.v[vd][i] = warp.v[src][i];
         return;
     }
@@ -392,6 +411,56 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
                 0b01100 => @bitCast(ftz(f32, @as(f32, asHalf(x)))),
                 else => return error.Illegal,
             };
+        }
+        return;
+    }
+
+    // The integer compares and the mask ops. A MASK is one bit per lane in the low bits of a
+    // register, not a word per lane, so these are modelled on bits and the element path below
+    // would read the wrong thing entirely.
+    if ((funct3 == 0b000 or funct3 == 0b100) and funct6 >= 0b011000 and funct6 <= 0b011111) {
+        var bits: u32 = 0;
+        for (0..warp.lanes) |i| {
+            const x = warp.v[vs2][i];
+            const y = if (funct3 == 0b000) warp.v[src][i] else warp.x[src];
+            const take = switch (funct6) {
+                0b011000 => x == y,
+                0b011001 => x != y,
+                0b011010 => x < y,
+                0b011011 => @as(i32, @bitCast(x)) < @as(i32, @bitCast(y)),
+                0b011100 => x <= y,
+                0b011101 => @as(i32, @bitCast(x)) <= @as(i32, @bitCast(y)),
+                0b011110 => x > y,
+                0b011111 => @as(i32, @bitCast(x)) > @as(i32, @bitCast(y)),
+                else => return error.Illegal,
+            };
+            if (take) bits |= @as(u32, 1) << @intCast(i);
+        }
+        warp.setMask(vd, bits);
+        return;
+    }
+    // Mask logic, also bit-wise. These share their funct6 with the compares and are told apart by
+    // OPMVV, which is why they are checked after.
+    if (funct3 == 0b010 and funct6 >= 0b011000 and funct6 <= 0b011111) {
+        const a = warp.mask(vs2);
+        const b = warp.mask(src);
+        warp.setMask(vd, switch (funct6) {
+            0b011000 => a & ~b, // vmandn
+            0b011001 => a & b, // vmand
+            0b011010 => a | b, // vmor
+            0b011011 => a ^ b, // vmxor
+            0b011101 => ~(a & b), // vmnand
+            else => return error.Illegal,
+        });
+        return;
+    }
+    // vmerge: the one masked instruction here, so `vm` is clear and v0 is implicit.
+    if (funct6 == 0b010111 and masked) {
+        const m = warp.mask(0);
+        for (0..warp.lanes) |i| {
+            const take = (m >> @intCast(i)) & 1 == 1;
+            const t: u32 = if (funct3 == 0b000) warp.v[src][i] else warp.x[src];
+            warp.v[vd][i] = if (take) t else warp.v[vs2][i];
         }
         return;
     }
