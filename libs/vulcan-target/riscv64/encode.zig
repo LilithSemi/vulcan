@@ -334,6 +334,34 @@ pub fn vsuxei32(vs3: VReg, rs1: Reg, vs2: VReg) u32 {
     return 0b0100111 | (vnum(vs3) << 7) | (0b110 << 12) | (num(rs1) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b01) << 26);
 }
 
+// The A extension, word width. An AMO reads the word at `addr`, combines it with `value`, writes
+// the answer back and gives the ORIGINAL back in `rd`, with the read and the write held together
+// on the bus. That makes it work against an MMIO register as well as against memory.
+//
+// The assembler writes these `amoadd.w rd, rs2, (rs1)`, value before address. The arguments here
+// are in the order the operation reads: destination, address, value.
+
+/// The `funct5` that selects an AMO, in bits 31 to 27.
+pub const AmoOp = enum(u5) {
+    add = 0b00000,
+    swap = 0b00001,
+    xor = 0b00100,
+    @"and" = 0b01100,
+    @"or" = 0b01000,
+    min = 0b10000,
+    max = 0b10100,
+    minu = 0b11000,
+    maxu = 0b11100,
+};
+
+/// `amo<op>.w rd, value, (addr)`. `aq` orders later accesses after this one, `rl` orders earlier
+/// accesses before it; both clear is the relaxed form.
+pub fn amo(op: AmoOp, rd: Reg, addr: Reg, value: Reg, aq: bool, rl: bool) u32 {
+    return 0b0101111 | (num(rd) << 7) | (0b010 << 12) | (num(addr) << 15) | (num(value) << 20) |
+        (@as(u32, @intFromBool(rl)) << 25) | (@as(u32, @intFromBool(aq)) << 26) |
+        (@as(u32, @backingInt(op)) << 27);
+}
+
 // Vector compares and masks. A compare writes one BIT per lane into a mask register, and a
 // predicated operation reads the mask in `v0` and leaves an inactive lane alone. These are what
 // per-lane control flow is built from: the two sides of a divergent branch both run, each under a
@@ -2304,4 +2332,22 @@ test "the vector compares and mask ops match LLVM's assembler" {
     // The same reference run pins the move this file already had, so the parse of the dump above
     // is checked against an encoder that was verified separately.
     try std.testing.expectEqual(@as(u32, 0x5e048457), vmv_v_v(.v8, .v9));
+}
+
+test "the A extension word atomics match LLVM's assembler" {
+    // `amo<op>.w a0, a1, (a2)` from `zig cc -target riscv64-linux-musl -mcpu=generic_rv64+a`.
+    // a0 is x10 (the old value), a1 is x11 (the operand) and a2 is x12 (the address).
+    try std.testing.expectEqual(@as(u32, 0x00b6252f), amo(.add, .x10, .x12, .x11, false, false));
+    try std.testing.expectEqual(@as(u32, 0x08b6252f), amo(.swap, .x10, .x12, .x11, false, false));
+    try std.testing.expectEqual(@as(u32, 0x20b6252f), amo(.xor, .x10, .x12, .x11, false, false));
+    try std.testing.expectEqual(@as(u32, 0x60b6252f), amo(.@"and", .x10, .x12, .x11, false, false));
+    try std.testing.expectEqual(@as(u32, 0x40b6252f), amo(.@"or", .x10, .x12, .x11, false, false));
+    try std.testing.expectEqual(@as(u32, 0x80b6252f), amo(.min, .x10, .x12, .x11, false, false));
+    try std.testing.expectEqual(@as(u32, 0xa0b6252f), amo(.max, .x10, .x12, .x11, false, false));
+    try std.testing.expectEqual(@as(u32, 0xc0b6252f), amo(.minu, .x10, .x12, .x11, false, false));
+    try std.testing.expectEqual(@as(u32, 0xe0b6252f), amo(.maxu, .x10, .x12, .x11, false, false));
+    // The ordering bits are separate from the operation, so they are pinned on one of them.
+    try std.testing.expectEqual(@as(u32, 0x04b6252f), amo(.add, .x10, .x12, .x11, true, false));
+    try std.testing.expectEqual(@as(u32, 0x02b6252f), amo(.add, .x10, .x12, .x11, false, true));
+    try std.testing.expectEqual(@as(u32, 0x06b6252f), amo(.add, .x10, .x12, .x11, true, true));
 }

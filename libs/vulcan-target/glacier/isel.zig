@@ -268,6 +268,11 @@ fn forEachOperand(func: *const Function, inst: Inst, ctx: anytype, comptime f: f
             f(ctx, s.@"else");
         },
         .load => |l| f(ctx, l.ptr),
+        .atomic_rmw => |a| {
+            f(ctx, a.ptr);
+            f(ctx, a.value);
+            if (a.compare) |c| f(ctx, c);
+        },
         .store => |st| {
             f(ctx, st.value);
             f(ctx, st.ptr);
@@ -954,6 +959,14 @@ fn checkInst(
             if (!isWord(func, func.valueType(st.value))) return error.Unsupported;
             if (isHalf(func, func.valueType(st.value))) return error.Unsupported;
         },
+        .atomic_rmw => |a| {
+            _ = amoOp(func, a.op, func.valueType(a.value)) orelse return error.Unsupported;
+            // Every lane would need its own read-modify-write, and the core has one bus. A per-lane
+            // atomic is a loop over the lanes, which is not this. The vector emitter would refuse
+            // it too; this is here because admission is where a refusal belongs.
+            if (divergent[@backingInt(a.ptr)] or divergent[@backingInt(a.value)]) return error.Unsupported;
+            if (!isWord(func, func.valueType(a.value))) return error.Unsupported;
+        },
         .global_addr => |g| _ = addressOf(opts, func.symbolName(g.symbol)) orelse return error.Unsupported,
         .unary => |u| if (u.op != .reinterpret) return error.Unsupported,
         // A widening convert has no instruction of its own; the recognizer turns one into a MAC.
@@ -996,6 +1009,25 @@ fn builtinSource(b: gpu.builtin.Builtin) ?union(enum) { csr: u12, lanes } {
 /// above the signed range and the negative value with the same bits are one register value.
 fn lowWord(c: i64) i32 {
     return @bitCast(@as(u32, @truncate(@as(u64, @bitCast(c)))));
+}
+
+/// The AMO that performs an IR atomic, or null when the core has none for it.
+///
+/// `compare_exchange` is the absence that matters: it is the one operation that needs LR and SC,
+/// and Glacier decodes the AMOs without the load-reserved pair. See `encode.zig`.
+fn amoOp(func: *const Function, op: ir.function.AtomicOp, ty: Type) ?rv.AmoOp {
+    // The compare is against the OPERAND type, so an unsigned value takes the unsigned form.
+    const signed = isSigned(func, ty);
+    return switch (op) {
+        .add => .add,
+        .exchange => .swap,
+        .bit_and => .@"and",
+        .bit_or => .@"or",
+        .bit_xor => .xor,
+        .min => if (signed) .min else .minu,
+        .max => if (signed) .max else .maxu,
+        .compare_exchange => null,
+    };
 }
 
 fn addressOf(opts: Options, name: []const u8) ?u32 {
@@ -1535,6 +1567,17 @@ const Emitter = struct {
             .select => |s| try self.emitSelect(s, dst, pos),
             .load => |l| try self.put(rv.lw(dst, try self.reg(l.ptr, pos), 0)),
             .store => |st| try self.put(rv.sw(try self.reg(st.value, pos), try self.reg(st.ptr, pos), 0)),
+            // The old value goes to `dst`, or to the lowering's scratch when nobody reads it: the
+            // core has no reduction form that writes no register, so the read-modify-write happens
+            // either way and the answer is thrown away.
+            .atomic_rmw => |a| try self.put(rv.amo(
+                amoOp(self.func, a.op, self.func.valueType(a.value)) orelse return error.Unsupported,
+                dst,
+                try self.reg(a.ptr, pos),
+                try self.reg(a.value, pos),
+                a.ordering == .acquire or a.ordering == .acq_rel or a.ordering == .seq_cst,
+                a.ordering == .release or a.ordering == .acq_rel or a.ordering == .seq_cst,
+            )),
             // A barrier over a workgroup or a subgroup emits NOTHING, and that is the answer
             // rather than a shortcut. A workgroup here is one warp, and the lanes of a warp are
             // elements of one instruction stream, so they cannot reach different points in the

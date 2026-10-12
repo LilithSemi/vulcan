@@ -6,10 +6,10 @@
 //! The FPGA is the real answer, and this is what makes a disagreement visible before a kernel ever
 //! reaches it.
 //!
-//! It models only what a Glacier core decodes and only what a kernel uses: RV32I, RV32M, a CSR
-//! read, the RVV integer subset the lowering emits, and the float converts and scalar divide. An
-//! unknown word is an error, never a no-op, so a lowering that emits something this model does not
-//! know about is caught rather than silently skipped.
+//! It models only what a Glacier core decodes and only what a kernel uses: RV32I, RV32M, the A
+//! extension word atomics, a CSR read, the RVV integer subset the lowering emits, and the float
+//! converts and scalar divide. An unknown word is an error, never a no-op, so a lowering that
+//! emits something this model does not know about is caught rather than silently skipped.
 //!
 //! The float rules are the ones the core implements, which are NOT the ones the mnemonics imply:
 //! the scalar divide always truncates, the integer-to-float and the narrowing converts round to
@@ -257,6 +257,28 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
         },
         // Register-register arithmetic, including the M extension.
         0x33 => warp.set(rd, try arith(funct3, funct7, a, b)),
+        // The A extension, word width. Read, combine, write back, give back the ORIGINAL. One warp
+        // runs at a time here, so the model cannot show whether the pair is really indivisible;
+        // what it does check is the VALUE and that the old one comes back rather than the new.
+        0x2F => {
+            if (funct3 != 2) return error.Illegal;
+            if (mem.crossesHart(a, warp.hart_id)) return error.CrossHart;
+            const at = try mem.index(a);
+            const old = mem.words[at];
+            mem.words[at] = switch (@as(u5, @intCast(funct7 >> 2))) {
+                0b00000 => old +% b,
+                0b00001 => b,
+                0b00100 => old ^ b,
+                0b01100 => old & b,
+                0b01000 => old | b,
+                0b10000 => if (@as(i32, @bitCast(old)) < @as(i32, @bitCast(b))) old else b,
+                0b10100 => if (@as(i32, @bitCast(old)) > @as(i32, @bitCast(b))) old else b,
+                0b11000 => @min(old, b),
+                0b11100 => @max(old, b),
+                else => return error.Illegal,
+            };
+            warp.set(rd, old);
+        },
         // OP-V: every vector arithmetic form.
         0x57 => try vectorOp(word, warp),
         // OP-FP. Glacier decodes exactly one of these, FDIV.S, and its register fields name X

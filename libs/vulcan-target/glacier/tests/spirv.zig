@@ -956,3 +956,96 @@ test "a volatile load and store keep their flag through the lowering" {
         try std.testing.expect(words.len > 0);
     }
 }
+
+/// Every warp does `out.results[warp] = atomicAdd(&out.counter, 1)`, which is the arrival counter a
+/// software barrier across warps is built from: each warp learns how many arrived before it.
+fn atomicCounterModule(allocator: std.mem.Allocator, opcode: u16) !spirv.binary.Builder {
+    // ids: void=1 uint=2 v3uint=3 pInV3=4 pInU=5 arr=6 struct=7 pSbStruct=8 pSbU32=9 voidfn=10
+    //      c0=11 c1=12 scope=13 semantics=14 wid=15 out=16 main=17 entry=18 widptr=19 w=20
+    //      pCounter=21 old=22 pElem=23.
+    var b = try spirv.binary.Builder.init(allocator, 24);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 17, 0x6E69616D, 0, 15, 16 });
+    try b.emit(allocator, op.Name, &.{ 16, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 15, op.Decoration.builtin, op.BuiltIn.workgroup_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 7, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.MemberDecorate, &.{ 7, 1, op.Decoration.offset, 4 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 3, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.input, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 6, 2 });
+    try b.emit(allocator, op.TypeStruct, &.{ 7, 2, 6 });
+    try b.emit(allocator, op.TypePointer, &.{ 8, op.StorageClass.storage_buffer, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 10, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 11, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 12, 1 });
+    // The scope and the semantics are constants, not literals: device scope, relaxed.
+    try b.emit(allocator, op.Constant, &.{ 2, 13, op.Scope.device });
+    try b.emit(allocator, op.Constant, &.{ 2, 14, 0 });
+    try b.emit(allocator, op.Variable, &.{ 4, 15, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 8, 16, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 17, 0, 10 });
+    try b.emit(allocator, op.Label, &.{18});
+    try b.emit(allocator, op.AccessChain, &.{ 5, 19, 15, 11 });
+    try b.emit(allocator, op.Load, &.{ 2, 20, 19 });
+    try b.emit(allocator, op.AccessChain, &.{ 9, 21, 16, 11 }); // &out.counter
+    try b.emit(allocator, opcode, &.{ 2, 22, 21, 13, 14, 12 });
+    try b.emit(allocator, op.AccessChain, &.{ 9, 23, 16, 12, 20 }); // &out.results[warp]
+    try b.emit(allocator, op.Store, &.{ 23, 22 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "an atomic add gives every warp a different arrival number" {
+    const allocator = std.testing.allocator;
+    var b = try atomicCounterModule(allocator, op.AtomicIAdd);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.mi",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    const warps: u32 = 5;
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    data[0] = 0;
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    for (0..warps) |w| {
+        var one: warp.Warp = .{ .hart_id = @intCast(w), .hart_count = warps };
+        _ = try warp.run(words, &mem, &one, 10_000);
+    }
+    // Each warp took the OLD value, so they are 0, 1, 2, ... and the counter ends at the count.
+    try std.testing.expectEqual(warps, data[0]);
+    for (0..warps) |w| try std.testing.expectEqual(@as(u32, @intCast(w)), data[1 + w]);
+}
+
+test "an atomic exchange claims a word and hands back what it replaced" {
+    const allocator = std.testing.allocator;
+    var b = try atomicCounterModule(allocator, op.AtomicExchange);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.mi",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    data[0] = 77;
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    for (0..2) |w| {
+        var one: warp.Warp = .{ .hart_id = @intCast(w), .hart_count = 2 };
+        _ = try warp.run(words, &mem, &one, 10_000);
+    }
+    // The first warp swapped 1 in and took 77 out; the second took the 1 the first left.
+    try std.testing.expectEqual(@as(u32, 1), data[0]);
+    try std.testing.expectEqual(@as(u32, 77), data[1]);
+    try std.testing.expectEqual(@as(u32, 1), data[2]);
+}

@@ -292,3 +292,36 @@ pub const InBoundsAccessChain = 66;
 pub const MemoryOperand = struct {
     pub const @"volatile": u32 = 0x0001;
 };
+
+// Atomic read-modify-write. Each takes a pointer, a memory SCOPE id and a memory-semantics id,
+// then the operand. The scope and semantics are ids of constants, not literals.
+pub const AtomicExchange = 229;
+pub const AtomicIIncrement = 232;
+pub const AtomicIDecrement = 233;
+pub const AtomicIAdd = 234;
+pub const AtomicISub = 235;
+pub const AtomicSMin = 236;
+pub const AtomicUMin = 237;
+pub const AtomicSMax = 238;
+pub const AtomicUMax = 239;
+pub const AtomicAnd = 240;
+pub const AtomicOr = 241;
+pub const AtomicXor = 242;
+
+/// The memory-semantics bits that say how strongly an atomic orders what is around it. The rest of
+/// the mask names which storage class is ordered, which a Glacier core does not distinguish.
+pub const MemorySemantics = struct {
+    pub const acquire: u32 = 0x0002;
+    pub const release: u32 = 0x0004;
+    pub const acquire_release: u32 = 0x0008;
+    pub const sequentially_consistent: u32 = 0x0010;
+};
+
+/// SPIR-V execution scopes, as `OpAtomic*` takes them.
+pub const Scope = struct {
+    pub const cross_device: u32 = 0;
+    pub const device: u32 = 1;
+    pub const workgroup: u32 = 2;
+    pub const subgroup: u32 = 3;
+    pub const invocation: u32 = 4;
+};

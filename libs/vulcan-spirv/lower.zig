@@ -1479,6 +1479,58 @@ fn appendArith(func: *Function, block: Block, ty: Type, bop: ir.function.BinOp, 
 }
 
 /// Lower a non-terminator body instruction, recording its result Value.
+/// The integer value of the constant `id` names, or null when it is not an integer constant.
+///
+/// An `OpAtomic*` takes its scope and its semantics as ids of CONSTANTS rather than as literals,
+/// and both have already been materialized into the entry block by the time a body instruction is
+/// lowered, so the value is read back from the instruction that defines them.
+fn constantOperand(func: *const Function, module: *Module, id: u32) ?i64 {
+    if (id >= module.value_of.len) return null;
+    const v = module.value_of[id] orelse return null;
+    const inst = func.definingInst(v) orelse return null;
+    return switch (func.opcode(inst)) {
+        .iconst => |c| c,
+        else => null,
+    };
+}
+
+/// The IR atomic an `OpAtomic*` performs.
+fn atomicOpOf(opcode: u16) ?ir.function.AtomicOp {
+    return switch (opcode) {
+        op.AtomicExchange => .exchange,
+        // A subtract is an add of the negated operand; the caller negates.
+        op.AtomicIAdd, op.AtomicISub => .add,
+        op.AtomicSMin, op.AtomicUMin => .min,
+        op.AtomicSMax, op.AtomicUMax => .max,
+        op.AtomicAnd => .bit_and,
+        op.AtomicOr => .bit_or,
+        op.AtomicXor => .bit_xor,
+        else => null,
+    };
+}
+
+/// How strongly the memory-semantics mask orders the atomic. The storage-class bits are ignored,
+/// because this is read by targets that do not order one class separately from another.
+fn orderingOf(semantics: i64) ir.function.AtomicOrdering {
+    const bits: u32 = @truncate(@as(u64, @bitCast(semantics)));
+    if (bits & op.MemorySemantics.sequentially_consistent != 0) return .seq_cst;
+    if (bits & op.MemorySemantics.acquire_release != 0) return .acq_rel;
+    if (bits & op.MemorySemantics.release != 0) return .release;
+    if (bits & op.MemorySemantics.acquire != 0) return .acquire;
+    return .relaxed;
+}
+
+/// The IR scope a SPIR-V execution scope names. `invocation` has no IR spelling: an atomic that is
+/// atomic only against its own invocation is not an atomic, and refusing it beats widening it.
+fn scopeOf(scope: i64) ?ir.function.AtomicScope {
+    return switch (scope) {
+        op.Scope.cross_device => .system,
+        op.Scope.device => .device,
+        op.Scope.workgroup, op.Scope.subgroup => .workgroup,
+        else => null,
+    };
+}
+
 /// Whether the optional Memory Operands at `at` mark the access volatile.
 ///
 /// A volatile access must happen exactly as written, which is what keeps a poll inside a spin loop
@@ -1561,6 +1613,29 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 }
             }
             value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .convert = .{ .value = source } });
+        },
+        op.AtomicExchange, op.AtomicIAdd, op.AtomicISub, op.AtomicSMin, op.AtomicUMin, op.AtomicSMax, op.AtomicUMax, op.AtomicAnd, op.AtomicOr, op.AtomicXor => {
+            // [result type, result, pointer, scope, semantics, operand]. The scope and the
+            // semantics are ids of CONSTANTS rather than literals, so both are read back through
+            // the constant table and a non-constant one is refused rather than guessed at.
+            const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            const ptr = try valueOf(module, try operandAt(inst.operands, 2));
+            const scope = constantOperand(func, module, try operandAt(inst.operands, 3)) orelse return error.Unsupported;
+            const semantics = constantOperand(func, module, try operandAt(inst.operands, 4)) orelse return error.Unsupported;
+            var operand = try valueOf(module, try operandAt(inst.operands, 5));
+            // There is no subtracting atomic: it is an add of the negated operand, which is what
+            // every target does with it.
+            if (inst.opcode == op.AtomicISub) {
+                const zero = try func.appendInst(block, ty, .{ .iconst = 0 });
+                operand = try appendArith(func, block, ty, .sub, zero, operand);
+            }
+            value_of[inst.operands[1]] = try func.appendAtomicRmw(block, .{
+                .op = atomicOpOf(inst.opcode).?,
+                .ptr = ptr,
+                .value = operand,
+                .ordering = orderingOf(semantics),
+                .scope = scopeOf(scope) orelse return error.Unsupported,
+            });
         },
         op.Bitcast => {
             // Reinterpret the operand's bits as the result type (e.g. int <-> uint). Lowers

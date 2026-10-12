@@ -1805,3 +1805,164 @@ test "a table of constants written once spills nothing" {
     try runOnce(words, &data, 0, 1);
     for (0..entries) |i| try std.testing.expectEqual(@as(u32, @intCast(0x1234_0000 + i)), data[i]);
 }
+
+test "an atomic add is one instruction and gives back the old value" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const old = try f.appendAtomicRmw(entry, .{
+        .op = .add,
+        .ptr = base,
+        .value = one,
+        .ordering = .relaxed,
+        .scope = .device,
+    });
+    const at = try f.appendArithImm(entry, ptr_t, .add, base, 4);
+    try f.appendStore(entry, old, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var amos: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b0101111) amos += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), amos);
+
+    var data: [4]u32 = @splat(0);
+    data[0] = 40;
+    try runOnce(words, &data, 0, 1);
+    // Memory advanced, and what came back is what was there before.
+    try std.testing.expectEqual(@as(u32, 41), data[0]);
+    try std.testing.expectEqual(@as(u32, 40), data[1]);
+}
+
+test "the atomics Glacier cannot do are refused" {
+    const allocator = std.testing.allocator;
+    const Shape = enum { compare_exchange, per_lane };
+    for ([_]Shape{ .compare_exchange, .per_lane }) |shape| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+        const old = switch (shape) {
+            // Compare-and-swap needs the load-reserved pair, and Glacier decodes the AMOs without
+            // it. See `encode.zig`.
+            .compare_exchange => try f.appendAtomicRmw(entry, .{
+                .op = .compare_exchange,
+                .ptr = base,
+                .value = one,
+                .compare = one,
+                .ordering = .relaxed,
+                .scope = .device,
+            }),
+            // One bus, one read-modify-write. A per-lane atomic is a loop over the lanes.
+            .per_lane => blk: {
+                const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+                const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+                break :blk try f.appendAtomicRmw(entry, .{
+                    .op = .add,
+                    .ptr = at,
+                    .value = one,
+                    .ordering = .relaxed,
+                    .scope = .device,
+                });
+            },
+        };
+        try f.appendStore(entry, old, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    }
+}
+
+test "an atomic minimum compares as the operand type, not always as signed" {
+    // 0xFFFFFFFF is the largest unsigned value and minus one as a signed one, so the two forms of
+    // the instruction disagree about it. The IR says the compare is against the OPERAND type.
+    const allocator = std.testing.allocator;
+    for ([_]std.builtin.Signedness{ .unsigned, .signed }) |signedness| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const ty = try f.types.intern(.{ .int = .{ .signedness = signedness, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const one = try f.appendInst(entry, ty, .{ .iconst = 1 });
+        const old = try f.appendAtomicRmw(entry, .{
+            .op = .min,
+            .ptr = base,
+            .value = one,
+            .ordering = .relaxed,
+            .scope = .device,
+        });
+        const at = try f.appendArithImm(entry, ptr_t, .add, base, 4);
+        try f.appendStore(entry, old, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var data: [4]u32 = @splat(0);
+        data[0] = 0xFFFF_FFFF;
+        try runOnce(words, &data, 0, 1);
+        // Unsigned keeps the 1; signed keeps the minus one that was already there.
+        const want: u32 = if (signedness == .unsigned) 1 else 0xFFFF_FFFF;
+        try std.testing.expectEqual(want, data[0]);
+        try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), data[1]);
+    }
+}
+
+test "the ordering an atomic asks for reaches its aq and rl bits" {
+    // A warp model that runs one warp to completion cannot observe ordering at all, so this is
+    // checked where it is decided: in the emitted word.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { ordering: ir.function.AtomicOrdering, aq: bool, rl: bool }{
+        .{ .ordering = .relaxed, .aq = false, .rl = false },
+        .{ .ordering = .acquire, .aq = true, .rl = false },
+        .{ .ordering = .release, .aq = false, .rl = true },
+        .{ .ordering = .acq_rel, .aq = true, .rl = true },
+        .{ .ordering = .seq_cst, .aq = true, .rl = true },
+    };
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+        try f.appendAtomicRmwStmt(entry, .{
+            .op = .add,
+            .ptr = base,
+            .value = one,
+            .ordering = c.ordering,
+            .scope = .device,
+        });
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var found = false;
+        for (words) |w| {
+            if (w & 0x7F != 0b0101111) continue;
+            try std.testing.expectEqual(c.aq, (w >> 26) & 1 == 1);
+            try std.testing.expectEqual(c.rl, (w >> 25) & 1 == 1);
+            found = true;
+        }
+        // The old value goes nowhere, and the read-modify-write still has to happen.
+        try std.testing.expect(found);
+    }
+}
