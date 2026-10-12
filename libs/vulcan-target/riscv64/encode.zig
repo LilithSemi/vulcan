@@ -139,6 +139,17 @@ pub fn vle32(vd: VReg, rs1: Reg) u32 {
 pub fn vse32(vs3: VReg, rs1: Reg) u32 {
     return 0b0100111 | (vnum(vs3) << 7) | (0b110 << 12) | (num(rs1) << 15) | (@as(u32, 1) << 25);
 }
+
+/// `vse32.v vs3, (rs1), v0.t`: the unit-stride store predicated by v0. A lane whose mask bit is
+/// clear makes no access, so a contiguous run writes only the lanes the mask names.
+pub fn vse32_m(vs3: VReg, rs1: Reg) u32 {
+    return vse32(vs3, rs1) & vm_clear;
+}
+
+/// `vle32.v vd, (rs1), v0.t`: the unit-stride load predicated by v0.
+pub fn vle32_m(vd: VReg, rs1: Reg) u32 {
+    return vle32(vd, rs1) & vm_clear;
+}
 /// An OPFVV op (vector-vector float, funct3=001): `vd = vs2 <op> vs1`, unmasked.
 fn opfvv(funct6: u6, vd: VReg, vs2: VReg, vs1: VReg) u32 {
     return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (vnum(vs1) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, funct6) << 26);
@@ -2431,4 +2442,12 @@ test "the masked indexed accesses clear the vm bit and nothing else" {
     try std.testing.expectEqual(@as(u32, 0x0420e1a7), vsuxei32_m(.v3, .x1, .v2));
     try std.testing.expectEqual(@as(u32, 0x0620e187), vluxei32(.v3, .x1, .v2));
     try std.testing.expectEqual(@as(u32, 0x0420e187), vluxei32_m(.v3, .x1, .v2));
+}
+
+test "the masked unit-stride accesses clear the vm bit and nothing else" {
+    // Pinned against LLVM's `vse32.v v15, (x13), v0.t` and the load beside it.
+    try std.testing.expectEqual(@as(u32, 0x0206e7a7), vse32(.v15, .x13));
+    try std.testing.expectEqual(@as(u32, 0x0006e7a7), vse32_m(.v15, .x13));
+    try std.testing.expectEqual(@as(u32, 0x0206e707), vle32(.v14, .x13));
+    try std.testing.expectEqual(@as(u32, 0x0006e707), vle32_m(.v14, .x13));
 }

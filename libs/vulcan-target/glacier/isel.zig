@@ -170,7 +170,10 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     var macs = try findMacs(allocator, &work, uses, divergent);
     defer macs.deinit(allocator);
 
-    var ctx: Ctx = .{ .divergent = divergent, .macs = &macs };
+    var strides = try findStrides(allocator, &work, uses, divergent);
+    defer strides.deinit(allocator);
+
+    var ctx: Ctx = .{ .divergent = divergent, .macs = &macs, .strides = &strides };
 
     try checkSupported(&work, opts, divergent, &macs);
 
@@ -222,6 +225,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
         .divergent = divergent,
         .uses = uses,
         .macs = &macs,
+        .strides = &strides,
         .spills = slots != 0,
     };
     defer e.deinit();
@@ -241,7 +245,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
 // value came from, not of its type, and `thread_id_x` already says a thread is a lane.
 
 /// What the analysis and the emitter share. `desc.ctx` points at it.
-const Ctx = struct { divergent: []const bool, macs: *const Macs };
+const Ctx = struct { divergent: []const bool, macs: *const Macs, strides: *const Strides };
 
 /// Whether a builtin differs between the lanes of one warp. A warp index is the same in every
 /// lane; a lane or thread index is the point of the exercise.
@@ -416,13 +420,32 @@ fn copySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
 /// multiplies whatever landed there. There is no diagnostic for that; it is a wrong frame.
 fn fusedOperands(ctx: *const anyopaque, func: *const Function, inst: Inst, out: *[wimmer.max_fused_operands]Value) ?u8 {
     const c: *const Ctx = @ptrCast(@alignCast(ctx));
+    // A unit-stride access reads a SCALAR base and not the per-lane address the IR names, and the
+    // arithmetic that built that address is not emitted at all. Both halves have to be reported:
+    // the base so it is live at the access, and nothing for the absorbed arithmetic.
+    if (c.strides.isFolded(inst)) return 0;
+    if (c.strides.at(inst)) |base| {
+        out[0] = base;
+        var n: u8 = 1;
+        switch (func.opcode(inst)) {
+            .store => |st| {
+                out[n] = st.value;
+                n += 1;
+                if (st.mask) |m| {
+                    out[n] = m;
+                    n += 1;
+                }
+            },
+            else => {},
+        }
+        return n;
+    }
     // An absorbed instruction reads nothing, because it is not emitted. Reporting that is worth
     // real code: a vertex pass of 1840 words came out at 1582 once the suppressed multiplies and
     // converts stopped being counted as readers. It is not a register-pressure win, since the
     // factors now live LONGER by as much as the products live less.
     if (c.macs.isFolded(inst)) return 0;
     const m = c.macs.at(inst) orelse return null;
-    _ = func;
     var n: u8 = 0;
     if (m.acc) |acc| {
         out[n] = acc;
@@ -808,6 +831,127 @@ fn convert(allocator: std.mem.Allocator, func: *Function, a: Block, d: Diamond) 
         func.setTerminator(dead, .{ .ret = ir.function.Ret.none() });
     }
 }
+// ===========================================================================
+// Unit-stride accesses.
+
+/// Which per-lane accesses read or write a CONTIGUOUS run of words, and the scalar address the run
+/// starts at.
+///
+/// Every per-lane access is a gather or a scatter otherwise: an address per lane, which costs the
+/// address vector to build and makes the load-store unit visit one word at a time. A run of
+/// consecutive words is the common case and the hardware has one instruction for it, so this is
+/// where that case is recognized.
+///
+/// `folded` marks the arithmetic the access absorbs. The emitter writes nothing for it and
+/// `fusedOperands` tells the allocator it reads nothing, exactly as for an absorbed multiply.
+const Strides = struct {
+    base: []const ?Value,
+    folded: []const bool,
+
+    fn deinit(self: *Strides, allocator: std.mem.Allocator) void {
+        allocator.free(self.base);
+        allocator.free(self.folded);
+    }
+
+    fn at(self: *const Strides, inst: Inst) ?Value {
+        return self.base[@backingInt(inst)];
+    }
+
+    fn isFolded(self: *const Strides, inst: Inst) bool {
+        return self.folded[@backingInt(inst)];
+    }
+};
+
+/// Find every unit-stride access. The caller owns the result.
+fn findStrides(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    uses: []const u32,
+    divergent: []const bool,
+) Error!Strides {
+    const base = try allocator.alloc(?Value, func.instCount());
+    errdefer allocator.free(base);
+    @memset(base, null);
+    const folded = try allocator.alloc(bool, func.instCount());
+    errdefer allocator.free(folded);
+    @memset(folded, false);
+
+    // How many unit-stride accesses read each address. The arithmetic can only be absorbed when
+    // that accounts for EVERY reader: an absorbed instruction is not emitted, so a reader left
+    // over would find the register holding nothing.
+    const recognized = try allocator.alloc(u32, func.valueCount());
+    defer allocator.free(recognized);
+    @memset(recognized, 0);
+
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const ptr = switch (func.opcode(inst)) {
+                .load => |l| l.ptr,
+                .store => |st| st.ptr,
+                else => continue,
+            };
+            if (!divergent[@backingInt(ptr)]) continue;
+            const run = laneRun(func, ptr) orelse continue;
+            base[@backingInt(inst)] = run.base;
+            recognized[@backingInt(ptr)] += 1;
+        }
+    }
+
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const result = func.instResult(inst) orelse continue;
+            if (recognized[@backingInt(result)] != uses[@backingInt(result)]) continue;
+            const run = laneRun(func, result) orelse continue;
+            folded[@backingInt(inst)] = true;
+            // The scale can only go with it when the add above was its one reader.
+            if (uses[@backingInt(run.offset)] != 1) continue;
+            folded[@backingInt(func.definingInst(run.offset).?)] = true;
+        }
+    }
+    return .{ .base = base, .folded = folded };
+}
+
+/// `base + lane * 4` taken apart, which is the address an index by lane id makes.
+const LaneRun = struct {
+    /// The warp-uniform start of the run, which the access names as a scalar register.
+    base: Value,
+    /// The per-lane byte offset, `lane * 4`. Absorbed with the add above it.
+    offset: Value,
+};
+
+/// Whether `ptr` addresses consecutive words, one per lane.
+///
+/// `global_id_x` is deliberately NOT accepted even though its lanes are consecutive too. Its value
+/// is `mhartid * lanes + vid`, so the run would start at the address PLUS this warp's own offset,
+/// and that sum is not a value the function holds: naming it would mean emitting arithmetic from
+/// here rather than recognizing something already there.
+fn laneRun(func: *const Function, ptr: Value) ?LaneRun {
+    const inst = func.definingInst(ptr) orelse return null;
+    const a = switch (func.opcode(inst)) {
+        .arith => |x| x,
+        else => return null,
+    };
+    if (a.op != .add) return null;
+    for ([_][2]Value{ .{ a.lhs, a.rhs }, .{ a.rhs, a.lhs } }) |pair| {
+        if (!isLaneWordOffset(func, pair[1])) continue;
+        return .{ .base = pair[0], .offset = pair[1] };
+    }
+    return null;
+}
+
+/// Whether `v` is the lane index scaled to a word offset, as a shift by two or a multiply by four.
+fn isLaneWordOffset(func: *const Function, v: Value) bool {
+    const inst = func.definingInst(v) orelse return false;
+    const a = switch (func.opcode(inst)) {
+        .arith_imm => |x| x,
+        else => return false,
+    };
+    const scaled = (a.op == .shl and a.imm == 2) or (a.op == .mul and a.imm == 4);
+    if (!scaled) return false;
+    const b = gpu.attrs.builtinOf(func, a.lhs) orelse return false;
+    return b == .thread_id_x or b == .lane_id;
+}
+
 // ===========================================================================
 // The widening multiply-accumulate.
 
@@ -1466,6 +1610,8 @@ const Emitter = struct {
     divergent: []const bool,
     /// Which `add` instructions are a widening MAC, and which instructions one absorbs.
     macs: *const Macs,
+    /// Which accesses are unit-stride, and which address arithmetic one absorbs.
+    strides: *const Strides,
     /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
     spills: bool,
     words: std.ArrayList(u32) = .empty,
@@ -1712,16 +1858,29 @@ const Emitter = struct {
             // vector carries the whole address and the base is x0, so no analysis has to prove
             // the lanes are contiguous. A unit-stride access is the faster form when they are,
             // and recognizing that is the next optimization rather than a correctness matter.
-            .load => |l| try self.put(rv.vluxei32(
-                try self.vreg(self.func.instResult(inst).?, pos),
-                .x0,
-                try self.vectorOperand(l.ptr, pos),
-            )),
+            .load => |l| {
+                const dst = try self.vreg(self.func.instResult(inst).?, pos);
+                // A contiguous run is one instruction and one bus run. See `Strides`.
+                if (self.strides.at(inst)) |b| {
+                    return self.put(rv.vle32(dst, try self.reg(b, pos)));
+                }
+                try self.put(rv.vluxei32(dst, .x0, try self.vectorOperand(l.ptr, pos)));
+            },
             .store => |st| {
                 // A masked store can have a uniform address AND a uniform value, since the mask
                 // alone makes it per-lane, so both go through the pool and each gets its own
                 // scratch register rather than sharing one.
                 var pool: Pool = .{};
+                // A contiguous run takes a scalar start address, so the per-lane address is not
+                // read at all and the arithmetic that built it is not emitted. See `Strides`.
+                if (self.strides.at(inst)) |b| {
+                    const start = try self.reg(b, pos);
+                    const words = try self.maskOperand(st.value, &pool, pos);
+                    const mask = st.mask orelse return self.put(rv.vse32(words, start));
+                    const bits = try self.vreg(mask, pos);
+                    try self.put(rv.vmand_mm(.v0, bits, bits));
+                    return self.put(rv.vse32_m(words, start));
+                }
                 const addr = try self.maskOperand(st.ptr, &pool, pos);
                 const val = try self.maskOperand(st.value, &pool, pos);
                 const mask = st.mask orelse {
@@ -1953,6 +2112,9 @@ const Emitter = struct {
         // The multiply and the converts a MAC absorbed. Their registers stay allocated and hold
         // nothing, because a three-operand instruction cannot be spelled as one `arith`.
         if (self.macs.isFolded(inst)) return;
+        // The address arithmetic a unit-stride access absorbed. Same reasoning as a MAC's folded
+        // multiply: the instruction is not emitted and its register holds nothing.
+        if (self.strides.isFolded(inst)) return;
         // A pure instruction nothing reads is dropped. The allocator still places its result, so
         // the home lookup below would not catch it: a frontend that emits a constant whose only
         // consumer was removed (an eliminated bounds check leaves the array length behind) would

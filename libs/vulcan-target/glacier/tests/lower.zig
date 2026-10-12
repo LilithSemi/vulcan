@@ -2488,6 +2488,8 @@ test "a store under a divergent branch becomes a masked scatter" {
         masked_stores += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), masked_stores);
+    // The run is contiguous as well as masked, so it is the unit-stride form.
+    try std.testing.expectEqual(@as(usize, 1), countAccesses(words, 0b00));
     for (words) |w| {
         try std.testing.expect(w & 0x7F != 0b1100011);
         try std.testing.expect(w & 0x7F != 0b1101111);
@@ -2953,4 +2955,161 @@ test "a mask combined with a warp-uniform bool is refused" {
     f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
     try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+/// How many vector accesses in `code` use the addressing mode `mop`: 00 unit-stride, 01 indexed.
+fn countAccesses(code: []const u32, mop: u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        const op = w & 0x7F;
+        if (op != 0b0000111 and op != 0b0100111) continue;
+        if ((w >> 12) & 0b111 != 0b110) continue;
+        if ((w >> 26) & 0b11 != mop) continue;
+        n += 1;
+    }
+    return n;
+}
+
+test "an index by lane id becomes one contiguous access" {
+    // `data[lane] += 7`. The lanes address consecutive words, so the load and the store each take
+    // one unit-stride instruction from a scalar start address, and the per-lane address vector is
+    // never built: the shift and the add that made it are absorbed.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const old = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at } });
+    const bumped = try f.appendArithImm(entry, u32_t, .add, old, 7);
+    try f.appendStore(entry, bumped, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 2), countAccesses(words, 0b00));
+    try std.testing.expectEqual(@as(usize, 0), countAccesses(words, 0b01));
+    // The address arithmetic is gone with it. `vsll.vi` is funct6 100101 in the OPIVI form, and
+    // the shift by two that scaled the lane index is the only one this kernel could emit.
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        try std.testing.expect(w >> 26 != 0b100101);
+    }
+
+    var data: [8]u32 = @splat(0);
+    for (0..8) |i| data[i] = @intCast(i * 10);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i * 10 + 7)), data[i]);
+    }
+}
+
+test "an index the lowering cannot prove contiguous stays a scatter" {
+    // `data[lane ^ 1] = lane`. The lanes swap in pairs, so the words are not a run and the access
+    // keeps its address per lane. A miss costs speed and never an answer.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const swapped = try f.appendArithImm(entry, u32_t, .bit_xor, tid, 1);
+    const offset = try f.appendArithImm(entry, u32_t, .shl, swapped, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, tid, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countAccesses(words, 0b00));
+    try std.testing.expectEqual(@as(usize, 1), countAccesses(words, 0b01));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i ^ 1)), data[i]);
+    }
+}
+
+test "a lane index scaled by anything but one word stays a scatter" {
+    // `data[lane * 2] = lane + 1`, so the byte offset is the lane shifted by THREE. The words are
+    // every other one, not a run, and reading the shift amount is the only thing that tells the
+    // two apart. Treating this as contiguous writes the first four words instead of every second
+    // one, which the values below catch.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 3);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const value = try f.appendArithImm(entry, u32_t, .add, tid, 1);
+    try f.appendStore(entry, value, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countAccesses(words, 0b00));
+    try std.testing.expectEqual(@as(usize, 1), countAccesses(words, 0b01));
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [16]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), data[i * 2]);
+        try std.testing.expectEqual(sentinel, data[i * 2 + 1]);
+    }
+}
+
+test "an address a second reader wants is still built" {
+    // `data[lane] = 0x55; table[lane] = &data[lane]`. The address feeds a contiguous store AND
+    // goes into memory as a VALUE, so the arithmetic that built it cannot be absorbed: the second
+    // store would write a register holding nothing. The addresses in the table are the assertion.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const fill = try f.appendInst(entry, u32_t, .{ .iconst = 0x55 });
+    try f.appendStore(entry, fill, at);
+
+    // The table sits one warp width along, so its own address is unit-stride from there.
+    const table = try f.appendArithImm(entry, ptr_t, .add, base, @intCast(lanes * 4));
+    const table_at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = table, .rhs = offset } });
+    try f.appendStore(entry, at, table_at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 2), countAccesses(words, 0b00));
+
+    var data: [16]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    for (0..lanes) |i| {
+        try std.testing.expectEqual(@as(u32, 0x55), data[i]);
+        try std.testing.expectEqual(data_base + @as(u32, @intCast(i * 4)), data[lanes + i]);
+    }
 }

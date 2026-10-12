@@ -223,7 +223,12 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
         // emits: lane i accesses `rs1 + vs2[i]`, and only for a lane the launch mask names.
         0x07, 0x27 => {
             if (funct3 != 0b110) return error.Illegal; // width must be 32-bit
-            if ((word >> 26) & 0b11 != 0b01) return error.Illegal; // mop must be indexed-unordered
+            // mop 00 is unit stride, where lane i takes the i'th word from `rs1` and the offset
+            // register is not read at all. mop 01 is indexed-unordered, where lane i takes its own
+            // offset from `vs2`. Nothing else is decoded.
+            const mop = (word >> 26) & 0b11;
+            if (mop != 0b00 and mop != 0b01) return error.Illegal;
+            const unit = mop == 0b00;
             // A clear `vm` predicates the access on v0. A lane whose bit is clear makes NO access:
             // it does not read, it does not write, and the hardware skips it on the bus rather
             // than driving a harmless cycle. That is what a store under divergent control flow
@@ -232,7 +237,7 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
             const bits = warp.mask(0);
             for (0..warp.lanes) |i| {
                 if (masked and (bits >> @intCast(i)) & 1 == 0) continue;
-                const addr = a +% warp.v[rs2][i];
+                const addr = if (unit) a +% @as(u32, @intCast(i * 4)) else a +% warp.v[rs2][i];
                 if (mem.crossesHart(addr, warp.hart_id)) return error.CrossHart;
                 const at = try mem.index(addr);
                 if (opcode == 0x07) warp.v[rd][i] = mem.words[at] else mem.words[at] = warp.v[rd][i];
