@@ -1049,3 +1049,116 @@ test "an atomic exchange claims a word and hands back what it replaced" {
     try std.testing.expectEqual(@as(u32, 77), data[1]);
     try std.testing.expectEqual(@as(u32, 1), data[2]);
 }
+
+/// How many words are `vfwmacc.vv`, and how many are a plain float add, subtract or multiply.
+fn countKind(code: []const u32, mac: bool) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111 or (w >> 12) & 0x7 != 0b001) continue;
+        const f6 = w >> 26;
+        if (mac) {
+            if (f6 == 0x3C) n += 1;
+        } else switch (f6) {
+            0x00, 0x02, 0x24 => n += 1,
+            else => {},
+        }
+    }
+    return n;
+}
+
+/// The selection half of the fp32 acceptance test. The execution half lives in Glacier's own
+/// harness, driving hand-assembled words into the RTL: it proves the lane computes correctly given
+/// the instructions. This proves the path from a module to those instructions PICKS them, which the
+/// other half cannot see, and it is what would catch a selector regression.
+///
+/// Every operand is kept live by a runtime load, because an operation between two float constants
+/// is folded by any real frontend long before a selector sees it.
+fn fp32AcceptanceModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 50);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 26, 0x6E69616D, 0, 25 });
+    try b.emit(allocator, op.Name, &.{ 25, 0x0074756F });
+    try b.emit(allocator, op.MemberDecorate, &.{ 8, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeFloat, &.{ 4, 16 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 7, 3 });
+    try b.emit(allocator, op.TypeStruct, &.{ 8, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 3 });
+    try b.emit(allocator, op.TypeFunction, &.{ 11, 1 });
+    for (0..7) |i| try b.emit(allocator, op.Constant, &.{ 2, @intCast(12 + i), @intCast(i) });
+    // 3 * 2^-25: three quarters of an f32 ulp at 1.0, and NOT representable in f16, so it cannot
+    // become a MAC factor and the addition stays a plain float add.
+    try b.emit(allocator, op.Constant, &.{ 3, 19, @as(u32, @bitCast(@as(f32, @floatCast(@as(f64, 3.0) / 33554432.0)))) });
+    // 3 * 2^-13 and 2^-12, normal halves whose product is exactly the quantity above.
+    try b.emit(allocator, op.Constant, &.{ 4, 20, @as(u16, @bitCast(@as(f16, @floatCast(@as(f64, 3.0) / 8192.0)))) });
+    try b.emit(allocator, op.Constant, &.{ 4, 21, @as(u16, @bitCast(@as(f16, @floatCast(@as(f64, 1.0) / 4096.0)))) });
+    try b.emit(allocator, op.Constant, &.{ 3, 22, @as(u32, @bitCast(@as(f32, 0.1))) });
+    try b.emit(allocator, op.Constant, &.{ 3, 23, @as(u32, @bitCast(@as(f32, 2.0))) });
+    // 2^20+1: exact in f32 and no f16 holds it, so the MAC cannot claim the multiply below and it
+    // stays a widening convert followed by a plain one. A constant that IS an exact half, 4.0 say,
+    // turns the whole thing back into a MAC and the slot stops testing the convert.
+    try b.emit(allocator, op.Constant, &.{ 3, 24, @as(u32, @bitCast(@as(f32, 1048577.0))) });
+    try b.emit(allocator, op.Variable, &.{ 9, 25, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 26, 0, 11 });
+    try b.emit(allocator, op.Label, &.{27});
+    try b.emit(allocator, op.AccessChain, &.{ 10, 28, 25, 12, 12 }); // &out[0]
+    try b.emit(allocator, op.Load, &.{ 3, 29, 28 }); // x, the only runtime value
+    try b.emit(allocator, op.FConvert, &.{ 3, 30, 20 }); // f32(3 * 2^-13)
+    try b.emit(allocator, op.FConvert, &.{ 3, 31, 21 }); // f32(2^-12)
+    try b.emit(allocator, op.FMul, &.{ 3, 32, 30, 31 });
+    try b.emit(allocator, op.FAdd, &.{ 3, 33, 29, 19 }); // x + 3*2^-25, nearest even
+    try b.emit(allocator, op.FAdd, &.{ 3, 34, 29, 32 }); // x + the same quantity as a MAC, truncated
+    try b.emit(allocator, op.FMul, &.{ 3, 35, 29, 22 }); // x * 0.1, full fp32
+    try b.emit(allocator, op.FSub, &.{ 3, 36, 29, 23 }); // x - 2
+    try b.emit(allocator, op.FSub, &.{ 3, 37, 23, 29 }); // 2 - x
+    try b.emit(allocator, op.FConvert, &.{ 4, 38, 29 }); // narrow to f16
+    try b.emit(allocator, op.FConvert, &.{ 3, 39, 38 }); // and widen back
+    try b.emit(allocator, op.FMul, &.{ 3, 40, 39, 24 });
+    for ([_]u32{ 33, 34, 35, 36, 37, 40 }, 0..) |v, i| {
+        try b.emit(allocator, op.AccessChain, &.{ 10, @intCast(41 + i), 25, 12, @intCast(13 + i) });
+        try b.emit(allocator, op.Store, &.{ @intCast(41 + i), v });
+    }
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "the fp32 acceptance kernel selects the right instructions from a module" {
+    const allocator = std.testing.allocator;
+    var b = try fp32AcceptanceModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.mi",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    // The selection claim, made explicit: ONE MAC, which claimed the widening converts and the
+    // multiply feeding the second addition, and five plain float ops for everything else.
+    try std.testing.expectEqual(@as(usize, 1), countKind(words, true));
+    try std.testing.expectEqual(@as(usize, 5), countKind(words, false));
+
+    var data: [8]u32 = @splat(0xDEAD_BEEF);
+    data[0] = @bitCast(@as(f32, 1.0));
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    _ = try warp.run(words, &mem, &one, 10_000);
+
+    // The two rounding modes on ONE quantity: the add carries three quarters of an ulp up, the MAC
+    // truncates it away. Equal answers would mean one mux feeds both, which no single-value check
+    // can see. The hardware gave these same two words from the instruction stream directly.
+    try std.testing.expectEqual(@as(u32, 0x3f800001), data[1]);
+    try std.testing.expectEqual(@as(u32, 0x3f800000), data[2]);
+    // Full fp32, not the 0x3dccc000 that narrowing 0.1 to an f16 would give.
+    try std.testing.expectEqual(@as(u32, 0x3dcccccd), data[3]);
+    // Subtract is not commutative, so the order reaches the instruction.
+    try std.testing.expectEqual(@as(u32, 0xbf800000), data[4]);
+    try std.testing.expectEqual(@as(u32, 0x3f800000), data[5]);
+    // Narrowed to f16 and widened back, then multiplied: both converts and a plain multiply.
+    try std.testing.expectEqual(@as(u32, 0x49800008), data[6]);
+}
