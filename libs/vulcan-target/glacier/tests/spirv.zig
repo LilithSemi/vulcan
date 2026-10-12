@@ -798,3 +798,83 @@ test "a float divide and a float to integer convert run on Glacier" {
     _ = try warp.run(words, &mem, &one, 10_000);
     try std.testing.expectEqual(@as(u32, 33), data[1]);
 }
+
+/// `out.results[warp] = u32(f16(signed(out.denominator_slot)) * 2.0)`, where the integer comes from
+/// a LOAD and so keeps the module's signless integer type. The point is `OpConvertSToF`: a SPIR-V
+/// integer type carries no signedness, so the opcode is the only place that says signed, and a
+/// selector that reads the operand type sees unsigned and has no instruction for it.
+fn signlessConvertModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 uint=2 float=3 half=4 v3uint=5 pInV3=6 pInU=7 arr=8 struct=9 pSbStruct=10
+    //      pSbU32=11 voidfn=12 c0=13 c1=14 wid=15 out=16 main=17 entry=18 widptr=19 w=20
+    //      pSrc=21 src=22 asfloat=23 scaled=24 narrowed=25 n=26 pElem=27 c2=28.
+    var b = try spirv.binary.Builder.init(allocator, 29);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 17, 0x6E69616D, 0, 15, 16 });
+    try b.emit(allocator, op.Name, &.{ 16, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 15, op.Decoration.builtin, op.BuiltIn.workgroup_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 9, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.MemberDecorate, &.{ 9, 1, op.Decoration.offset, 4 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    // SIGNLESS, which is the only integer type Zig's SPIR-V backend ever emits.
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeFloat, &.{ 4, 16 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 5 });
+    try b.emit(allocator, op.TypePointer, &.{ 7, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 8, 2 });
+    try b.emit(allocator, op.TypeStruct, &.{ 9, 2, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 9 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 12, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 13, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 14, 1 });
+    try b.emit(allocator, op.Constant, &.{ 3, 28, @as(u32, @bitCast(@as(f32, 2.0))) });
+    try b.emit(allocator, op.Variable, &.{ 6, 15, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 10, 16, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 17, 0, 12 });
+    try b.emit(allocator, op.Label, &.{18});
+    try b.emit(allocator, op.AccessChain, &.{ 7, 19, 15, 13 }); // &gl_WorkGroupID.x
+    try b.emit(allocator, op.Load, &.{ 2, 20, 19 });
+    try b.emit(allocator, op.AccessChain, &.{ 11, 21, 16, 13 }); // &out.source
+    try b.emit(allocator, op.Load, &.{ 2, 22, 21 });
+    try b.emit(allocator, op.ConvertSToF, &.{ 4, 23, 22 }); // f16(signed(source))
+    try b.emit(allocator, op.FConvert, &.{ 3, 24, 23 }); // widen to f32
+    try b.emit(allocator, op.FMul, &.{ 3, 25, 24, 28 }); // times 2.0
+    try b.emit(allocator, op.ConvertFToU, &.{ 2, 26, 25 });
+    try b.emit(allocator, op.AccessChain, &.{ 11, 27, 16, 14, 20 }); // &out.results[warp]
+    try b.emit(allocator, op.Store, &.{ 27, 26 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "an integer to float convert reaches the hardware from a signless module" {
+    const allocator = std.testing.allocator;
+    var b = try signlessConvertModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.mi",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    // `vfcvt.f.x.v` is the only instruction that converts an integer to a float on this core.
+    var converts: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0x7 != 0b001) continue;
+        if (w >> 26 != 0b010010 or (w >> 15) & 0x1F != 0b00011) continue;
+        converts += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), converts);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    data[0] = 21;
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1 };
+    _ = try warp.run(words, &mem, &one, 10_000);
+    try std.testing.expectEqual(@as(u32, 42), data[1]);
+}

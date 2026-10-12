@@ -1479,6 +1479,17 @@ fn appendArith(func: *Function, block: Block, ty: Type, bop: ir.function.BinOp, 
 }
 
 /// Lower a non-terminator body instruction, recording its result Value.
+/// `v` with its integer signedness restated, which moves no bits.
+///
+/// A SPIR-V integer type says nothing about signedness, so a conversion opcode is the only place
+/// that information exists. A backend reads an operand type, so it has to be written down.
+fn restated(func: *Function, block: Block, v: Value, signedness: std.builtin.Signedness) Error!Value {
+    const kind = func.types.type_kind(func.valueType(v));
+    if (kind != .int or kind.int.signedness == signedness) return v;
+    const ty = try func.types.intern(.{ .int = .{ .signedness = signedness, .bits = kind.int.bits } });
+    return func.appendInst(block, ty, .{ .convert = .{ .value = v } });
+}
+
 fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
     const value_of = module.value_of;
     const bound = value_of.len; // == the id bound; every per-id array is this length
@@ -1510,7 +1521,35 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         op.ConvertFToU, op.ConvertFToS, op.ConvertSToF, op.ConvertUToF, op.UConvert, op.SConvert, op.FConvert => {
             const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
             const v = try valueOf(module, try operandAt(inst.operands, 2));
-            value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .convert = .{ .value = v } });
+            // A SPIR-V integer type is SIGNLESS, and Zig's backend emits exactly one of them for a
+            // whole module: `OpTypeInt 32 0` serves signed and unsigned alike and the signedness
+            // rides on the OPCODE. A backend that reads the operand type therefore reads the wrong
+            // thing, and the information exists nowhere else, so write it into the IR here with a
+            // signedness-only convert. That moves no bits and a backend coalesces it away.
+            const source = if (inst.opcode == op.ConvertSToF)
+                try restated(func, block, v, .signed)
+            else if (inst.opcode == op.ConvertUToF)
+                try restated(func, block, v, .unsigned)
+            else
+                v;
+            const want: ?std.builtin.Signedness = switch (inst.opcode) {
+                op.ConvertFToS => .signed,
+                op.ConvertFToU => .unsigned,
+                else => null,
+            };
+            if (want) |signedness| {
+                // The RESULT carries the signedness for a float to integer convert, so the
+                // conversion is made against a type that states it and then restated to the type
+                // the module declared, which is what later instructions expect to read.
+                const kind = func.types.type_kind(ty);
+                if (kind == .int and kind.int.signedness != signedness) {
+                    const as_asked = try func.types.intern(.{ .int = .{ .signedness = signedness, .bits = kind.int.bits } });
+                    const n = try func.appendInst(block, as_asked, .{ .convert = .{ .value = source } });
+                    value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .convert = .{ .value = n } });
+                    return;
+                }
+            }
+            value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .convert = .{ .value = source } });
         },
         op.Bitcast => {
             // Reinterpret the operand's bits as the result type (e.g. int <-> uint). Lowers
