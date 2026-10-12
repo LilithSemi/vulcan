@@ -502,6 +502,24 @@ test "gl_LocalInvocationID is the lane index" {
     // pattern repeats per warp. A lowering that confused the lane with the warp would write a
     // rising sequence instead.
     for (data, 0..) |got, i| try std.testing.expectEqual(@as(u32, @intCast(i % lanes)) * 10, got);
+
+    // The warp writes a CONTIGUOUS run, so the store is the unit-stride form and not a scatter.
+    // This is the shape every Zig kernel reaches memory through, an access chain into a storage
+    // buffer, and it is the one that has to be recognized: an address built from pointer
+    // arithmetic by hand proves nothing about what a frontend emits.
+    var unit: usize = 0;
+    var indexed: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b0100111) continue;
+        if ((w >> 12) & 0b111 != 0b110) continue;
+        switch ((w >> 26) & 0b11) {
+            0b00 => unit += 1,
+            0b01 => indexed += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), unit);
+    try std.testing.expectEqual(@as(usize, 0), indexed);
 }
 
 /// A kernel that keeps a value in a FUNCTION-storage local across a branch, which is the shape

@@ -877,7 +877,14 @@ const Affine = struct {
 /// Arithmetic here WRAPS, like the address arithmetic it describes. A term scaled past 32 bits
 /// addresses the same word either way, so wrapping is the answer rather than a refusal.
 fn peelAffine(func: *const Function, divergent: []const bool, v: Value, scale: i64, out: *Affine) bool {
-    if (!divergent[@backingInt(v)]) return out.push(v, scale);
+    if (!divergent[@backingInt(v)]) {
+        // A constant goes into the constant rather than becoming a term to multiply at run time.
+        if (constantOf(func, v)) |c| {
+            out.constant +%= c *% scale;
+            return true;
+        }
+        return out.push(v, scale);
+    }
     if (gpu.attrs.builtinOf(func, v)) |b| {
         if (b != .thread_id_x and b != .lane_id) return false;
         if (out.lane) |already| {
@@ -889,10 +896,37 @@ fn peelAffine(func: *const Function, divergent: []const bool, v: Value, scale: i
     }
     const inst = func.definingInst(v) orelse return false;
     switch (func.opcode(inst)) {
-        .arith => |a| {
-            if (a.op != .add) return false;
-            if (!peelAffine(func, divergent, a.lhs, scale, out)) return false;
-            return peelAffine(func, divergent, a.rhs, scale, out);
+        // The scale arrives as a CONSTANT OPERAND and not as an immediate. `OpAccessChain` emits
+        // `mul(index, iconst)` for the element size, so reading only the immediate form meant no
+        // kernel that reached the IR through SPIR-V was ever recognized, which is every kernel
+        // written in Zig.
+        .arith => |a| switch (a.op) {
+            .add => {
+                if (!peelAffine(func, divergent, a.lhs, scale, out)) return false;
+                return peelAffine(func, divergent, a.rhs, scale, out);
+            },
+            .mul => {
+                if (constantOf(func, a.rhs)) |k| return peelAffine(func, divergent, a.lhs, scale *% k, out);
+                if (constantOf(func, a.lhs)) |k| return peelAffine(func, divergent, a.rhs, scale *% k, out);
+                return false;
+            },
+            .shl => {
+                const k = constantOf(func, a.rhs) orelse return false;
+                if (k < 0 or k > 31) return false;
+                return peelAffine(func, divergent, a.lhs, scale *% (@as(i64, 1) << @intCast(k)), out);
+            },
+            else => return false,
+        },
+        // An index is coerced to the offset type on its way into an access chain, and neither
+        // spelling of that coercion moves a bit of the address. `reinterpret` is the one a SPIR-V
+        // module actually produces, for the unsigned index of a signed offset.
+        .unary => |u| {
+            if (u.op != .reinterpret) return false;
+            return peelAffine(func, divergent, u.value, scale, out);
+        },
+        .convert => |cv| {
+            if (!isBitPreservingConvert(func, inst, cv)) return false;
+            return peelAffine(func, divergent, cv.value, scale, out);
         },
         .arith_imm => |a| switch (a.op) {
             .add => {
@@ -1114,6 +1148,15 @@ fn laneRun(func: *const Function, ptr: Value) ?LaneRun {
         return .{ .base = pair[0], .offset = pair[1] };
     }
     return null;
+}
+
+/// The constant behind `v`, when it is one.
+fn constantOf(func: *const Function, v: Value) ?i64 {
+    const inst = func.definingInst(v) orelse return null;
+    return switch (func.opcode(inst)) {
+        .iconst => |c| c,
+        else => null,
+    };
 }
 
 /// Whether `v` is the lane index scaled to a word offset, as a shift by two or a multiply by four.
