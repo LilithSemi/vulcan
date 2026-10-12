@@ -359,6 +359,27 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
     // float-to-integer convert truncate toward zero while these and the other converts round to
     // nearest. Getting one of them wrong moves a low bit with no error anywhere, so the two modes
     // are pinned against each other by test rather than left to a comment.
+    // The float compares, which write a MASK exactly as the integer ones do. Three instructions,
+    // not six: there is no greater-than, which is less-than with the operands swapped, and no
+    // `vmfne`, which the lowering builds by inverting the equality.
+    //
+    // Ordered semantics: a NaN compares FALSE against everything, including itself.
+    if (funct3 == 0b001 and (funct6 == 0b011000 or funct6 == 0b011001 or funct6 == 0b011011)) {
+        var bits: u32 = 0;
+        for (0..warp.lanes) |i| {
+            const x = asFloat(warp.v[vs2][i]);
+            const y = asFloat(warp.v[src][i]);
+            const take = switch (funct6) {
+                0b011000 => x == y,
+                0b011001 => x <= y,
+                0b011011 => x < y,
+                else => unreachable,
+            };
+            if (take) bits |= @as(u32, 1) << @intCast(i);
+        }
+        warp.setMask(vd, bits);
+        return;
+    }
     if (funct3 == 0b001) switch (funct6) {
         0b000000, 0b000010, 0b100100, 0b000100, 0b000110 => {
             for (0..warp.lanes) |i| {

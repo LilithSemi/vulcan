@@ -2329,3 +2329,64 @@ test "a per-lane compare takes its signedness from the operand type" {
         }
     }
 }
+
+test "a per-lane float compare answers false where it should" {
+    // Checking only the TRUE cases cannot see a compare that always says true, which is exactly
+    // how a mis-wired one fails: the peer's lane read the fp32 operands as fp16 in their low bits,
+    // both zero there, so every compare returned an all-ones mask and looked plausible. So every
+    // relation here is driven with operands that differ, and each one is checked in BOTH
+    // directions. `5 < 3` being false is what pins the left operand as the left operand.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { op: ir.function.CmpOp, lhs: f64, rhs: f64, taken: bool }{
+        .{ .op = .eq, .lhs = 3.0, .rhs = 5.0, .taken = false },
+        .{ .op = .eq, .lhs = 3.0, .rhs = 3.0, .taken = true },
+        .{ .op = .ne, .lhs = 3.0, .rhs = 5.0, .taken = true },
+        .{ .op = .ne, .lhs = 3.0, .rhs = 3.0, .taken = false },
+        .{ .op = .lt, .lhs = 3.0, .rhs = 5.0, .taken = true },
+        .{ .op = .lt, .lhs = 5.0, .rhs = 3.0, .taken = false },
+        .{ .op = .lt, .lhs = 3.0, .rhs = 3.0, .taken = false },
+        .{ .op = .le, .lhs = 3.0, .rhs = 5.0, .taken = true },
+        .{ .op = .le, .lhs = 5.0, .rhs = 3.0, .taken = false },
+        .{ .op = .le, .lhs = 3.0, .rhs = 3.0, .taken = true },
+        .{ .op = .gt, .lhs = 5.0, .rhs = 3.0, .taken = true },
+        .{ .op = .gt, .lhs = 3.0, .rhs = 5.0, .taken = false },
+        .{ .op = .ge, .lhs = 3.0, .rhs = 3.0, .taken = true },
+        .{ .op = .ge, .lhs = 3.0, .rhs = 5.0, .taken = false },
+    };
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        // Made per-lane by adding a zeroed lane index, so the compare is a vector one rather than
+        // something a uniform path could answer.
+        const zero = try f.appendArithImm(entry, u32_t, .mul, tid, 0);
+        const bias = try f.appendInst(entry, f32_t, .{ .unary = .{ .op = .reinterpret, .value = zero } });
+        const kl = try f.appendInst(entry, f32_t, .{ .fconst = c.lhs });
+        const kr = try f.appendInst(entry, f32_t, .{ .fconst = c.rhs });
+        const lhs = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = kl, .rhs = bias } });
+        const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = c.op, .lhs = lhs, .rhs = kr } });
+        const hit = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+        const miss = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+        const pick = try f.appendInst(entry, u32_t, .{ .select = .{ .cond = cond, .then = hit, .@"else" = miss } });
+        try f.appendStore(entry, pick, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            try std.testing.expectEqual(@as(u32, if (c.taken) 1 else 0), data[i]);
+        }
+    }
+}

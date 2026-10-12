@@ -919,11 +919,15 @@ fn checkInst(
         },
         // A per-lane compare writes a MASK, one bit per lane, and a per-lane select reads one.
         .icmp => |c| {
-            // Glacier has no float compare in any form yet. An integer compare over float bits
-            // answers a different relation, and it is wrong for a negative value and for NaN.
-            if (isFloat(func, func.valueType(c.lhs))) return error.Unsupported;
+            const ty = func.valueType(c.lhs);
+            // A WARP-UNIFORM float compare has nothing to do it: the compares write a mask, so
+            // they are vector instructions, and the scalar path has no float compare at all. An
+            // integer compare over float bits answers a different relation and is wrong for a
+            // negative value and for NaN, so it is a refusal rather than a substitution.
             if (resultDivergent(func, inst, divergent)) {
-                _ = vectorCmpOp(func, c.op, func.valueType(c.lhs)) orelse return error.Unsupported;
+                _ = vectorCmpOp(func, c.op, ty) orelse return error.Unsupported;
+            } else if (isFloat(func, ty)) {
+                return error.Unsupported;
             }
         },
         .select => {},
@@ -1102,19 +1106,37 @@ fn floatVectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*co
 /// A compare writes one BIT per lane into a mask register. RVV has no vector-vector greater-than,
 /// and needs none: greater-than is less-than with the operands the other way round.
 ///
-/// Float compares are absent because the core does not decode them yet. They are the next hardware
-/// step, not a gap in RVV: `vmflt.vv` and `vmfle.vv` exist and `riscv64/encode.zig` has them.
+/// The float set is three instructions, not six. There is no `vmfne`, and it needs none either:
+/// `not (a == b)` and `a != b` agree on EVERY input including NaN, because a NaN equals nothing and
+/// differs from everything, so the negation is exact rather than an approximation. The compares are
+/// ordered, which is all the lowering can ask for: `vulcan-spirv` maps only the `FOrd` predicates
+/// and refuses the unordered ones.
+///
+/// f16 has no compare for the same reason it has no arithmetic: the element width is 32 bits, so
+/// these read whole lanes.
 fn vectorCmpOp(func: *const Function, op: ir.function.CmpOp, ty: Type) ?struct {
     encode: *const fn (VReg, VReg, VReg) u32,
-    swap: bool,
+    swap: bool = false,
+    /// Whether the mask has to be inverted afterwards, which only `ne` on a float needs.
+    negate: bool = false,
 } {
-    if (isFloat(func, ty)) return null;
+    if (isFloat(func, ty)) {
+        if (!isF32(func, ty)) return null;
+        return switch (op) {
+            .eq => .{ .encode = rv.vmfeq_vv },
+            .ne => .{ .encode = rv.vmfeq_vv, .negate = true },
+            .lt => .{ .encode = rv.vmflt_vv },
+            .le => .{ .encode = rv.vmfle_vv },
+            .gt => .{ .encode = rv.vmflt_vv, .swap = true },
+            .ge => .{ .encode = rv.vmfle_vv, .swap = true },
+        };
+    }
     const signed = isSigned(func, ty);
     return switch (op) {
-        .eq => .{ .encode = rv.vmseq_vv, .swap = false },
-        .ne => .{ .encode = rv.vmsne_vv, .swap = false },
-        .lt => .{ .encode = if (signed) rv.vmslt_vv else rv.vmsltu_vv, .swap = false },
-        .le => .{ .encode = if (signed) rv.vmsle_vv else rv.vmsleu_vv, .swap = false },
+        .eq => .{ .encode = rv.vmseq_vv },
+        .ne => .{ .encode = rv.vmsne_vv },
+        .lt => .{ .encode = if (signed) rv.vmslt_vv else rv.vmsltu_vv },
+        .le => .{ .encode = if (signed) rv.vmsle_vv else rv.vmsleu_vv },
         .gt => .{ .encode = if (signed) rv.vmslt_vv else rv.vmsltu_vv, .swap = true },
         .ge => .{ .encode = if (signed) rv.vmsle_vv else rv.vmsleu_vv, .swap = true },
     };
@@ -1451,6 +1473,9 @@ const Emitter = struct {
                 // Greater-than is less-than the other way round, which is why there is no encoder
                 // for it.
                 try self.put(if (cmp.swap) cmp.encode(dst, rhs, lhs) else cmp.encode(dst, lhs, rhs));
+                // A float `ne` is the equality inverted, which is exact: a NaN equals nothing and
+                // differs from everything, so the two agree on every input.
+                if (cmp.negate) try self.put(rv.vmnand_mm(dst, dst, dst));
             },
             .select => |s| try self.emitVectorSelect(s, inst, pos),
             else => return error.Unsupported,
