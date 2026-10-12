@@ -334,6 +334,90 @@ pub fn vsuxei32(vs3: VReg, rs1: Reg, vs2: VReg) u32 {
     return 0b0100111 | (vnum(vs3) << 7) | (0b110 << 12) | (num(rs1) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b01) << 26);
 }
 
+// Vector compares and masks. A compare writes one BIT per lane into a mask register, and a
+// predicated operation reads the mask in `v0` and leaves an inactive lane alone. These are what
+// per-lane control flow is built from: the two sides of a divergent branch both run, each under a
+// mask, instead of the warp taking one side for every lane.
+
+/// `vmseq.vv vd, vs2, vs1`: per-lane equality into the mask register `vd`.
+pub fn vmseq_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b011000, vd, vs2, vs1);
+}
+pub fn vmsne_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b011001, vd, vs2, vs1);
+}
+pub fn vmsltu_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b011010, vd, vs2, vs1);
+}
+pub fn vmslt_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b011011, vd, vs2, vs1);
+}
+pub fn vmsleu_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b011100, vd, vs2, vs1);
+}
+pub fn vmsle_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opivv(0b011101, vd, vs2, vs1);
+}
+
+/// The scalar-operand compares. There is no `vmslt.vi` family in RVV, so a compare against a
+/// constant goes through a register, and `vmsgt` exists ONLY in the scalar and immediate forms:
+/// the vector-vector greater-than is the same relation with the operands swapped.
+pub fn vmseq_vx(vd: VReg, vs2: VReg, rs1: Reg) u32 {
+    return opivx(0b011000, vd, vs2, rs1);
+}
+pub fn vmsltu_vx(vd: VReg, vs2: VReg, rs1: Reg) u32 {
+    return opivx(0b011010, vd, vs2, rs1);
+}
+pub fn vmslt_vx(vd: VReg, vs2: VReg, rs1: Reg) u32 {
+    return opivx(0b011011, vd, vs2, rs1);
+}
+pub fn vmsle_vx(vd: VReg, vs2: VReg, rs1: Reg) u32 {
+    return opivx(0b011101, vd, vs2, rs1);
+}
+pub fn vmsgt_vx(vd: VReg, vs2: VReg, rs1: Reg) u32 {
+    return opivx(0b011111, vd, vs2, rs1);
+}
+
+/// `vmerge.vvm vd, vs2, vs1, v0`: `vd[i] = v0[i] ? vs1[i] : vs2[i]`. The ONE instruction here that
+/// is masked, so `vm` is zero; `v0` is implicit and names no field.
+pub fn vmerge_vvm(vd: VReg, false_src: VReg, true_src: VReg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b000 << 12) | (vnum(true_src) << 15) | (vnum(false_src) << 20) | (@as(u32, 0b010111) << 26);
+}
+
+/// `vmerge.vxm vd, vs2, rs1, v0`: the same with the true side broadcast from a scalar.
+pub fn vmerge_vxm(vd: VReg, false_src: VReg, true_src: Reg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b100 << 12) | (num(true_src) << 15) | (vnum(false_src) << 20) | (@as(u32, 0b010111) << 26);
+}
+
+/// Mask logic, one bit per lane. `vmandn` is the "and not" that turns a branch's mask into its
+/// complement within an enclosing mask, which is how a nested divergent `else` is built.
+pub fn vmand_mm(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b011001, vd, vs2, vs1);
+}
+pub fn vmor_mm(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b011010, vd, vs2, vs1);
+}
+pub fn vmxor_mm(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b011011, vd, vs2, vs1);
+}
+pub fn vmnand_mm(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b011101, vd, vs2, vs1);
+}
+pub fn vmandn_mm(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b011000, vd, vs2, vs1);
+}
+
+/// `vcpop.m rd, vs2`: how many lanes the mask names. Zero means no lane takes this side, which is
+/// what lets a lowering skip a branch arm entirely.
+pub fn vcpop_m(rd: Reg, vs2: VReg) u32 {
+    return 0b1010111 | (num(rd) << 7) | (0b010 << 12) | (@as(u32, 16) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010000) << 26);
+}
+
+/// `vfirst.m rd, vs2`: the lowest lane the mask names, or -1 when it names none.
+pub fn vfirst_m(rd: Reg, vs2: VReg) u32 {
+    return 0b1010111 | (num(rd) << 7) | (0b010 << 12) | (@as(u32, 17) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010000) << 26);
+}
+
 /// Encode an OP-FP (floating-point R-type) instruction. `rm` is the rounding
 /// mode (0b111 = dynamic).
 fn fpRType(funct7: u7, rm: u3, rd: FReg, rs1: FReg, rs2: FReg) u32 {
@@ -2189,4 +2273,35 @@ test "packTensorQuant field placement" {
     last_slot[9] = .pack_128b;
     const slot9 = packTensorQuant(0, 0, 0, 0, last_slot);
     try std.testing.expectEqual(@as(u64, 0xA), (slot9 >> 36) & 0xF); // transforms[9] at bit 36
+}
+
+test "the vector compares and mask ops match LLVM's assembler" {
+    // Reference words from `zig cc -target riscv64-linux-musl -mcpu=generic_rv64+v`, assembling
+    // the same mnemonics and reading back .text. Nothing selects these yet; they are what per-lane
+    // control flow will be built from.
+    try std.testing.expectEqual(@as(u32, 0x62950457), vmseq_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x66950457), vmsne_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x6a950457), vmsltu_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x6e950457), vmslt_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x72950457), vmsleu_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x76950457), vmsle_vv(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x62954457), vmseq_vx(.v8, .v9, .x10));
+    try std.testing.expectEqual(@as(u32, 0x6a954457), vmsltu_vx(.v8, .v9, .x10));
+    try std.testing.expectEqual(@as(u32, 0x6e954457), vmslt_vx(.v8, .v9, .x10));
+    try std.testing.expectEqual(@as(u32, 0x76954457), vmsle_vx(.v8, .v9, .x10));
+    try std.testing.expectEqual(@as(u32, 0x7e954457), vmsgt_vx(.v8, .v9, .x10));
+    // `vmerge.vvm v8, v9, v10, v0`: the mask register is implicit, and this is the one encoder here
+    // with `vm` clear.
+    try std.testing.expectEqual(@as(u32, 0x5c950457), vmerge_vvm(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x5c954457), vmerge_vxm(.v8, .v9, .x10));
+    try std.testing.expectEqual(@as(u32, 0x66952457), vmand_mm(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x6a952457), vmor_mm(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x6e952457), vmxor_mm(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x76952457), vmnand_mm(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x62952457), vmandn_mm(.v8, .v9, .v10));
+    try std.testing.expectEqual(@as(u32, 0x42982557), vcpop_m(.x10, .v9));
+    try std.testing.expectEqual(@as(u32, 0x4298a557), vfirst_m(.x10, .v9));
+    // The same reference run pins the move this file already had, so the parse of the dump above
+    // is checked against an encoder that was verified separately.
+    try std.testing.expectEqual(@as(u32, 0x5e048457), vmv_v_v(.v8, .v9));
 }
