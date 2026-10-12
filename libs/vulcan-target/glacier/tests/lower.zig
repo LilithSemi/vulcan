@@ -3424,3 +3424,51 @@ test "a divergent loop whose back edge computes something is refused" {
 
     try std.testing.expectError(error.Unsupported, compile(allocator, &f));
 }
+
+test "a uniform term multiplied by three keeps its own multiply and the lane still runs contiguous" {
+    // `w[a * 3 + lane] = lane`, where `a` is warp uniform. The lane steps one word, so the access
+    // is a run, and the rebuild scales the uniform part by the ELEMENT SIZE only: `a * 3` is
+    // already a value, so nothing has to multiply by twelve. Every scale the rebuild emits is a
+    // shift, which is what lets a core leave a wide multiply out and still address memory.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const a = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const three = try f.appendInst(entry, u32_t, .{ .iconst = 3 });
+    const row = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = three } });
+    const index = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .add, .lhs = row, .rhs = tid } });
+    const four = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const offset = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = index, .rhs = four } });
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, tid, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countAccesses(words, 0b00));
+    // One multiply, the kernel's own `a * 3`. The rebuild adds none.
+    var multiplies: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b0110011) continue;
+        if (w >> 25 != 0b0000001) continue;
+        if ((w >> 12) & 0b111 != 0) continue;
+        multiplies += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), multiplies);
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [16]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..data.len) |i| {
+        const lane = @as(i64, @intCast(i)) - 3;
+        const inside = lane >= 0 and lane < glacier.encode.Profile.@"gc1.n".lanes();
+        try std.testing.expectEqual(if (inside) @as(u32, @intCast(lane)) else sentinel, data[i]);
+    }
+}

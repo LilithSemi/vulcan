@@ -1487,10 +1487,21 @@ fn hoistOne(func: *Function, block: Block, divergent: []const bool, inst: Inst) 
     var sum = aff.terms[ci].value;
     for (aff.terms[0..aff.count], 0..) |t, i| {
         if (i == ci) continue;
-        const scaled = if (t.scale == 1) t.value else try func.appendInst(
+        // Every scale a real index produces is a POWER OF TWO, so the rebuild uses a SHIFT and
+        // never a multiply. The scale of a term is the product of the constants between the
+        // address and the term, and the only ones this peels through are on the path to the lane,
+        // whose total has to come out at one element. So a term's scale divides the element size.
+        //
+        // That is an argument about the shapes an index takes and not a proof, and a contrived one
+        // (`lane + 3 * (u + lane)`) reaches a scale of three with a stride of four. Refusing that
+        // is what makes the shift GUARANTEED rather than usual, and it matters past the lowering:
+        // a 64-bit multiply is expensive on an FPGA and a 64-bit shift by a constant is not, so
+        // the core need not decode one for an address.
+        const shift = powerOfTwoShift(t.scale) orelse return null;
+        const scaled = if (shift == 0) t.value else try func.appendInst(
             block,
             func.valueType(t.value),
-            .{ .arith_imm = .{ .op = .mul, .lhs = t.value, .imm = t.scale } },
+            .{ .arith_imm = .{ .op = .shl, .lhs = t.value, .imm = shift } },
         );
         sum = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = scaled } });
     }
@@ -1611,6 +1622,13 @@ fn laneRun(func: *const Function, ptr: Value) ?LaneRun {
         return .{ .base = pair[0], .offset = pair[1] };
     }
     return null;
+}
+
+/// The shift that multiplies by `scale`, or null when `scale` is not a positive power of two.
+fn powerOfTwoShift(scale: i64) ?i64 {
+    if (scale <= 0) return null;
+    if (scale & (scale - 1) != 0) return null;
+    return std.math.log2_int(u64, @intCast(scale));
 }
 
 /// The constant behind `v`, when it is one.
