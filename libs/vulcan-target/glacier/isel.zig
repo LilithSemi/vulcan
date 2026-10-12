@@ -50,6 +50,45 @@ const Type = ir.types.Type;
 
 pub const Error = std.mem.Allocator.Error || error{Unsupported};
 
+/// Why a kernel was refused, for a caller that asks for it.
+///
+/// `error.Unsupported` on its own sends a reader bisecting the COMPILER for a construct that is in
+/// their own kernel. That happened: a refusal with no detail cost one session four compiles and
+/// another an hour, and a one-line print of this information settled it in three runs.
+///
+/// `block` indexes the function the caller passed, for every block it had: the passes that run
+/// before admission APPEND blocks (critical-edge splitting) rather than renumbering, so an
+/// original block keeps its index. `index` is the instruction's position within that block in the
+/// LOWERING'S OWN order, which if-conversion and the address rewrite both change, so it is for
+/// reading beside an IR dump rather than for mapping back to source.
+pub const Refusal = struct {
+    /// A fixed phrase naming what was refused. Empty when nothing filled it in.
+    reason: []const u8 = "",
+    /// The opcode it was on, by name, or empty for a refusal about the whole function.
+    opcode: []const u8 = "",
+    block: u32 = unknown,
+    index: u32 = unknown,
+
+    pub const unknown: u32 = std.math.maxInt(u32);
+
+    /// Record `reason` and refuse. Returns the error so a caller writes one statement.
+    fn at(self: ?*Refusal, func: *const Function, block: Block, index: usize, inst: Inst, reason: []const u8) error{Unsupported} {
+        if (self) |r| r.* = .{
+            .reason = reason,
+            .opcode = @tagName(func.opcode(inst)),
+            .block = @backingInt(block),
+            .index = @intCast(index),
+        };
+        return error.Unsupported;
+    }
+
+    /// Record a refusal about the function rather than about one instruction.
+    fn whole(self: ?*Refusal, reason: []const u8) error{Unsupported} {
+        if (self) |r| r.* = .{ .reason = reason };
+        return error.Unsupported;
+    }
+};
+
 /// The register this lowering keeps for itself. It holds a constant too wide for an immediate
 /// field, and the Wimmer resolver routes a parallel-copy cycle through it. It is never
 /// allocatable, so no value ever lives here across an instruction boundary.
@@ -123,8 +162,29 @@ pub const Options = struct {
 
 /// Lower `func` to a Glacier word stream. The caller owns the result.
 pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: Options) Error![]u32 {
-    if (func.blockCount() == 0) return error.Unsupported;
-    if (func.is_variadic or func.sret) return error.Unsupported;
+    return compileKernelInternal(allocator, func, opts, null);
+}
+
+/// `compileKernel`, and on a refusal it says what it refused. See `Refusal`.
+pub fn compileKernelExplained(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    opts: Options,
+    why: *Refusal,
+) Error![]u32 {
+    why.* = .{};
+    return compileKernelInternal(allocator, func, opts, why);
+}
+
+fn compileKernelInternal(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    opts: Options,
+    why: ?*Refusal,
+) Error![]u32 {
+    if (func.blockCount() == 0) return Refusal.whole(why, "a kernel with no blocks");
+    if (func.is_variadic) return Refusal.whole(why, "a variadic kernel");
+    if (func.sret) return Refusal.whole(why, "a kernel that returns a value through a pointer");
 
     // The Wimmer resolver needs a block on every critical edge to put its shuffle moves on, and
     // splitting mutates the function, so split a clone and leave the caller's input alone.
@@ -213,7 +273,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
 
     var ctx: Ctx = .{ .divergent = divergent, .macs = &macs, .strides = &strides };
 
-    try checkSupported(&work, opts, divergent, &macs, &any_lane);
+    try checkSupported(&work, opts, divergent, &macs, &any_lane, why);
 
     const classes = [_]wimmer.RegClass{
         .{
@@ -247,18 +307,24 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     // A spill goes into the hart's own scratch region, so the kernel must fit there. The region
     // belongs to one hart, which is why no other hart's slots are counted against it.
     const slots = walloc.slot_count_per_class[0];
-    if (slots > opts.profile.scratchBytes() / 4) return error.Unsupported;
+    if (slots > opts.profile.scratchBytes() / 4) {
+        return Refusal.whole(why, "more spill slots than the hart's scratch region holds");
+    }
     // The deepest slot is reached by one signed 12-bit displacement from `sp`, and the stack grows
     // down, so 2048 bytes is all one displacement can name.
     //
     // At a 2048-byte region the two ceilings now MEET: 512 slots either way, so the check above
     // never fires on its own. Raising the region again buys nothing until a deep slot is addressed
     // with more than one instruction, which is the thing to change first rather than the number.
-    if (slots * 4 > 2048) return error.Unsupported;
+    if (slots * 4 > 2048) {
+        return Refusal.whole(why, "a spill slot past the one displacement that reaches it");
+    }
 
     // A spilled VECTOR would need a vector store to the scratch region and a reload from it.
     // Nothing emits those yet, so refuse rather than drop the spill and miscompile.
-    if (walloc.slot_count_per_class[1] != 0) return error.Unsupported;
+    if (walloc.slot_count_per_class[1] != 0) {
+        return Refusal.whole(why, "a per-lane value that had to spill, which has no store yet");
+    }
 
     var e: Emitter = .{
         .allocator = allocator,
@@ -270,6 +336,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
         .macs = &macs,
         .strides = &strides,
         .any_lane = &any_lane,
+        .why = why,
         .spills = slots != 0,
     };
     defer e.deinit();
@@ -1977,10 +2044,13 @@ fn checkSupported(
     divergent: []const bool,
     macs: *const Macs,
     any_lane: *const AnyLane,
+    why: ?*Refusal,
 ) Error!void {
     for (0..func.valueCount()) |vi| {
         const v: Value = @fromBackingInt(@intCast(vi));
-        if (!isWord(func, func.valueType(v))) return error.Unsupported;
+        if (!isWord(func, func.valueType(v))) {
+            return Refusal.whole(why, "a value wider than the 32-bit word a register holds");
+        }
     }
     var args: usize = 0;
     for (func.blockParams(@fromBackingInt(0))) |p| {
@@ -1990,13 +2060,16 @@ fn checkSupported(
             //
             // Its TYPE needs no check here: the loop above refuses any value this core cannot
             // hold in a register, so a parameter wider than a word is already gone.
-            if (launchArgOf(args) == null) return error.Unsupported;
+            if (launchArgOf(args) == null) {
+                return Refusal.whole(why, "more kernel parameters than the core has launch arguments");
+            }
             args += 1;
             continue;
         };
         // A lane-varying builtin comes from `vid.v` rather than from a CSR, so it has no
         // `builtinSource`. See `lanewiseBuiltin`.
-        if (!laneVarying(b)) _ = builtinSource(b) orelse return error.Unsupported;
+        if (!laneVarying(b)) _ = builtinSource(b) orelse
+            return Refusal.whole(why, "a builtin the core cannot answer");
     }
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
@@ -2005,10 +2078,12 @@ fn checkSupported(
             // The multiply and the two converts a MAC absorbs are emitted by the `add`, so the
             // rules below do not apply to them: on their own the core has neither instruction.
             if (macs.isFolded(inst)) continue;
-            try checkInst(func, opts, divergent, macs, any_lane, block, insts, inst, i);
+            try checkInst(func, opts, divergent, macs, any_lane, block, insts, inst, i, why);
         }
         if (func.terminator(block)) |term| switch (term) {
-            .ret => |r| if (r.count != 0) return error.Unsupported,
+            .ret => |r| if (r.count != 0) {
+                return Refusal.whole(why, "a kernel that returns a value, which has no caller to return it to");
+            },
             .jump => {},
         };
     }
@@ -2024,13 +2099,14 @@ fn checkInst(
     insts: []const Inst,
     inst: Inst,
     i: usize,
+    why: ?*Refusal,
 ) Error!void {
     switch (func.opcode(inst)) {
         // A constant must fit a 32-bit register. An unsigned type reaches 0xFFFFFFFF and a
         // signed one reaches the most negative value, so the window spans both.
-        .iconst => |c| if (c < std.math.minInt(i32) or c > std.math.maxInt(u32)) return error.Unsupported,
+        .iconst => |c| if (c < std.math.minInt(i32) or c > std.math.maxInt(u32)) return Refusal.at(why, func, block, i, inst, "a constant too wide for a 32-bit register"),
         // The result type is swept above, so it is already an f32 or an f16 here.
-        .fconst => |c| _ = floatBits(func, inst, c) orelse return error.Unsupported,
+        .fconst => |c| _ = floatBits(func, inst, c) orelse return Refusal.at(why, func, block, i, inst, "a float constant in a format the core has no value for"),
         // The emitter picks the scalar or the vector table from the result's divergence, so
         // admission has to ask the same table it will use. The integer tables are both
         // complete, but the float ones are not: a divide is scalar only.
@@ -2043,9 +2119,9 @@ fn checkInst(
             // gives one value per element rather than one bit per lane, so it is refused rather
             // than quietly read as a mask.
             if (isBool(func, ty) and resultDivergent(func, inst, divergent)) {
-                _ = maskBinOp(a.op) orelse return error.Unsupported;
+                _ = maskBinOp(a.op) orelse return Refusal.at(why, func, block, i, inst, "a bitwise operation between per-lane bools that has no mask op");
                 if (!divergent[@backingInt(a.lhs)] or !divergent[@backingInt(a.rhs)]) {
-                    return error.Unsupported;
+                    return Refusal.at(why, func, block, i, inst, "a mask combined with a warp-uniform bool");
                 }
                 return;
             }
@@ -2053,16 +2129,21 @@ fn checkInst(
             // whether or not the operands vary per lane; only the plumbing around it differs.
             if (floatVectorBinOp(func, a.op, ty) == null) {
                 if (resultDivergent(func, inst, divergent)) {
-                    _ = vectorBinOp(func, a.op, ty) orelse return error.Unsupported;
+                    _ = vectorBinOp(func, a.op, ty) orelse
+                        return Refusal.at(why, func, block, i, inst, "a per-lane arithmetic operation the core has no instruction for");
                 } else {
-                    _ = binOp(func, a.op, ty) orelse return error.Unsupported;
+                    _ = binOp(func, a.op, ty) orelse
+                        return Refusal.at(why, func, block, i, inst, "a warp-uniform arithmetic operation the core has no instruction for");
                 }
             }
         },
         .arith_imm => |a| {
             // The immediate is an integer, so this opcode never carries a float operand.
-            if (isFloat(func, func.valueType(a.lhs))) return error.Unsupported;
-            _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
+            if (isFloat(func, func.valueType(a.lhs))) {
+                return Refusal.at(why, func, block, i, inst, "float arithmetic against an immediate");
+            }
+            _ = binOp(func, a.op, func.valueType(a.lhs)) orelse
+                return Refusal.at(why, func, block, i, inst, "an operation against an immediate the core has no instruction for");
         },
         // A per-lane compare writes a MASK, one bit per lane, and a per-lane select reads one.
         .icmp => |c| {
@@ -2072,54 +2153,82 @@ fn checkInst(
             // integer compare over float bits answers a different relation and is wrong for a
             // negative value and for NaN, so it is a refusal rather than a substitution.
             if (resultDivergent(func, inst, divergent)) {
-                _ = vectorCmpOp(func, c.op, ty) orelse return error.Unsupported;
+                _ = vectorCmpOp(func, c.op, ty) orelse
+                    return Refusal.at(why, func, block, i, inst, "a per-lane compare the core has no instruction for");
             } else if (isFloat(func, ty)) {
-                return error.Unsupported;
+                return Refusal.at(why, func, block, i, inst, "a warp-uniform float compare, which the core has only per lane");
             }
         },
         .select => {},
         .load => |l| {
-            if (!isWord(func, func.valueType(l.ptr))) return error.Unsupported;
-            const r = func.instResult(inst) orelse return error.Unsupported;
+            if (!isWord(func, func.valueType(l.ptr))) {
+                return Refusal.at(why, func, block, i, inst, "a load through an address a register cannot hold");
+            }
+            const r = func.instResult(inst) orelse
+                return Refusal.at(why, func, block, i, inst, "a load whose result nothing names");
             // An f16 is the low half of a lane, not a word in memory. See `isHalf`.
-            if (isHalf(func, func.valueType(r))) return error.Unsupported;
+            if (isHalf(func, func.valueType(r))) {
+                return Refusal.at(why, func, block, i, inst, "an f16 load, which is half a lane and never a word in memory");
+            }
             // A mask has to be a real per-lane predicate, the same rule as a masked store: a
             // warp-uniform one says every lane agrees, and the answer for that is a branch over
             // the load rather than a predicate on it.
             if (l.mask) |m| {
-                if (!isWord(func, func.valueType(m))) return error.Unsupported;
-                if (!divergent[@backingInt(m)]) return error.Unsupported;
+                if (!isWord(func, func.valueType(m))) {
+                    return Refusal.at(why, func, block, i, inst, "a load mask a register cannot hold");
+                }
+                if (!divergent[@backingInt(m)]) {
+                    return Refusal.at(why, func, block, i, inst, "a load under a warp-uniform mask, which is a branch and not a predicate");
+                }
                 // A masked load leaves the lanes its mask excludes holding whatever the
                 // destination held, so the result is only defined where the mask is set. That is
                 // true of every per-lane op in a masked region, and the per-lane path is the only
                 // one that can express it.
-                if (!resultDivergent(func, inst, divergent)) return error.Unsupported;
+                if (!resultDivergent(func, inst, divergent)) {
+                    return Refusal.at(why, func, block, i, inst, "a masked load whose result is not per-lane");
+                }
             }
         },
         .store => |st| {
-            if (!isWord(func, func.valueType(st.value))) return error.Unsupported;
-            if (isHalf(func, func.valueType(st.value))) return error.Unsupported;
+            if (!isWord(func, func.valueType(st.value))) {
+                return Refusal.at(why, func, block, i, inst, "a store of a value wider than a word");
+            }
+            if (isHalf(func, func.valueType(st.value))) {
+                return Refusal.at(why, func, block, i, inst, "an f16 store, which is half a lane and never a word in memory");
+            }
             // A mask has to be a real per-lane predicate. A WARP-UNIFORM one says every lane
             // agrees, and the answer for that is a branch over the store rather than a predicate
             // on it, so it is refused rather than widened into a mask of all ones or all zeros.
             if (st.mask) |m| {
-                if (!isWord(func, func.valueType(m))) return error.Unsupported;
-                if (!divergent[@backingInt(m)]) return error.Unsupported;
+                if (!isWord(func, func.valueType(m))) {
+                    return Refusal.at(why, func, block, i, inst, "a store mask a register cannot hold");
+                }
+                if (!divergent[@backingInt(m)]) {
+                    return Refusal.at(why, func, block, i, inst, "a store under a warp-uniform mask, which is a branch and not a predicate");
+                }
             }
         },
         .atomic_rmw => |a| {
-            _ = amoOp(func, a.op, func.valueType(a.value)) orelse return error.Unsupported;
+            _ = amoOp(func, a.op, func.valueType(a.value)) orelse
+                return Refusal.at(why, func, block, i, inst, "an atomic the core has no AMO for, compare-and-swap among them");
             // Every lane would need its own read-modify-write, and the core has one bus. A per-lane
             // atomic is a loop over the lanes, which is not this. The vector emitter would refuse
             // it too; this is here because admission is where a refusal belongs.
-            if (divergent[@backingInt(a.ptr)] or divergent[@backingInt(a.value)]) return error.Unsupported;
-            if (!isWord(func, func.valueType(a.value))) return error.Unsupported;
+            if (divergent[@backingInt(a.ptr)] or divergent[@backingInt(a.value)]) {
+                return Refusal.at(why, func, block, i, inst, "a per-lane atomic, which would be a loop over the lanes");
+            }
+            if (!isWord(func, func.valueType(a.value))) {
+                return Refusal.at(why, func, block, i, inst, "an atomic on a value wider than a word");
+            }
         },
-        .global_addr => |g| _ = addressOf(opts, func.symbolName(g.symbol)) orelse return error.Unsupported,
-        .unary => |u| if (u.op != .reinterpret) return error.Unsupported,
+        .global_addr => |g| _ = addressOf(opts, func.symbolName(g.symbol)) orelse
+            return Refusal.at(why, func, block, i, inst, "a global the host did not place at an address"),
+        .unary => |u| if (u.op != .reinterpret)
+            return Refusal.at(why, func, block, i, inst, "a unary operation that is not a reinterpret"),
         // A widening convert has no instruction of its own; the recognizer turns one into a MAC.
         .convert => |cv| if (macs.at(inst) == null) {
-            _ = convertKind(func, inst, cv) orelse return error.Unsupported;
+            _ = convertKind(func, inst, cv) orelse
+                return Refusal.at(why, func, block, i, inst, "a convert between two types the core has no instruction for");
         },
         .barrier => |b| switch (b.scope) {
             .workgroup, .subgroup => {},
@@ -2128,16 +2237,20 @@ fn checkInst(
         // block must have no terminator: a terminator there is an edge the allocator would
         // resolve and this emits nothing for.
         .@"if" => |cf| {
-            if (i + 1 != insts.len or func.terminator(block) != null) return error.Unsupported;
+            if (i + 1 != insts.len or func.terminator(block) != null) {
+                return Refusal.at(why, func, block, i, inst, "a branch that is not the last thing its block does");
+            }
             // A branch on a per-lane condition is DIVERGENCE: the lanes would need to take
             // both arms under masks. A scalar branch here would send the whole warp whichever
             // way lane 0 went, which is a wrong answer and not a slow one.
             //
             // The ONE exception is a loop latch this lowering rewrote itself, where the condition
             // is the active mask and the branch is a reduction of it. See `AnyLane`.
-            if (divergent[@backingInt(cf.cond)] and !any_lane.has(inst)) return error.Unsupported;
+            if (divergent[@backingInt(cf.cond)] and !any_lane.has(inst)) {
+                return Refusal.at(why, func, block, i, inst, "a branch on a per-lane condition that if-conversion could not flatten");
+            }
         },
-        else => return error.Unsupported,
+        else => return Refusal.at(why, func, block, i, inst, "an opcode this lowering has no rule for"),
     }
 }
 
@@ -2384,6 +2497,8 @@ const Emitter = struct {
     strides: *const Strides,
     /// Which branches ask whether any lane is still active. See `AnyLane`.
     any_lane: *const AnyLane,
+    /// Where a refusal is recorded, when the caller asked for one. See `Refusal`.
+    why: ?*Refusal,
     /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
     spills: bool,
     words: std.ArrayList(u32) = .empty,
@@ -2465,6 +2580,19 @@ const Emitter = struct {
         if (dst != src) try self.put(rv.vmv_v_v(dst, src));
     }
 
+    /// Attach a position to a refusal the emitter raised, and pass anything else through.
+    fn explain(self: *Emitter, e: Error, block: Block, idx: usize, inst: Inst) Error {
+        if (e != error.Unsupported) return e;
+        return Refusal.at(
+            self.why,
+            self.func,
+            block,
+            idx,
+            inst,
+            "an instruction admission accepted and emission could not express",
+        );
+    }
+
     fn run(self: *Emitter) Error!void {
         const nblocks = self.func.blockCount();
         try self.block_start.appendNTimes(self.allocator, 0, nblocks);
@@ -2479,13 +2607,16 @@ const Emitter = struct {
             pos += 1;
             const insts = self.func.blockInsts(block);
             var ended = false;
-            for (insts) |inst| {
+            for (insts, 0..) |inst, idx| {
                 try self.actionsAt(pos);
+                // Admission accepted this instruction and emission could not express it, which is
+                // the lowering disagreeing with itself rather than a kernel asking for too much.
+                // Naming it here covers every refusal in the emitter from one place.
                 if (self.func.opcode(inst) == .@"if") {
-                    try self.emitIf(inst, pos, bi);
+                    self.emitIf(inst, pos, bi) catch |e| return self.explain(e, block, idx, inst);
                     ended = true;
                 } else {
-                    try self.emitInst(inst, pos);
+                    self.emitInst(inst, pos) catch |e| return self.explain(e, block, idx, inst);
                 }
                 pos += 1;
             }

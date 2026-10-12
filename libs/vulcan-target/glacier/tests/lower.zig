@@ -3785,3 +3785,102 @@ test "an unused kernel parameter does not shift the ones after it" {
         try std.testing.expectEqual(@as(u32, 22), data[i]);
     }
 }
+
+test "a refusal names the construct and where it is" {
+    // The shape that cost a session four compiles: a divergent branch whose arms the lowering
+    // cannot flatten. `error.Unsupported` on its own says nothing about whose fault it is, so the
+    // refusal carries the phrase, the opcode and the position.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    // An atomic in the arm: not in the pure set, so if-conversion leaves the branch alone.
+    try f.appendAtomicRmwStmt(then_b, .{
+        .op = .add,
+        .ptr = base,
+        .value = two,
+        .ordering = .relaxed,
+        .scope = .device,
+    });
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = join });
+    try f.setJump(then_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{};
+    try std.testing.expectError(
+        error.Unsupported,
+        glacier.isel.compileKernelExplained(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+        }, &why),
+    );
+    try std.testing.expectEqualStrings(
+        "a branch on a per-lane condition that if-conversion could not flatten",
+        why.reason,
+    );
+    try std.testing.expectEqualStrings("if", why.opcode);
+    // The branch is in the entry block, which the caller numbered 0 and the passes before
+    // admission do not renumber.
+    try std.testing.expectEqual(@as(u32, 0), why.block);
+}
+
+test "a refusal about the whole function carries no position" {
+    // A kernel that returns a value is wrong before any instruction is looked at, so there is no
+    // block to point at and the fields say so rather than naming block zero.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const entry = try f.appendBlock();
+    const n = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.one(n) });
+
+    var why: glacier.isel.Refusal = .{};
+    try std.testing.expectError(
+        error.Unsupported,
+        glacier.isel.compileKernelExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+    );
+    try std.testing.expectEqualStrings(
+        "a kernel that returns a value, which has no caller to return it to",
+        why.reason,
+    );
+    try std.testing.expectEqual(glacier.isel.Refusal.unknown, why.block);
+}
+
+test "a kernel that compiles leaves the refusal empty" {
+    // The struct is only written on a refusal, so a caller that prints it unconditionally prints
+    // nothing rather than a stale reason from a kernel that was fine.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, tid, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{ .reason = "stale" };
+    const words = try glacier.isel.compileKernelExplained(allocator, &f, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "data", .address = data_base }},
+    }, &why);
+    defer allocator.free(words);
+    try std.testing.expectEqualStrings("", why.reason);
+}
