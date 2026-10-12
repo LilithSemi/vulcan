@@ -2451,3 +2451,11 @@ test "the masked unit-stride accesses clear the vm bit and nothing else" {
     try std.testing.expectEqual(@as(u32, 0x0206e707), vle32(.v14, .x13));
     try std.testing.expectEqual(@as(u32, 0x0006e707), vle32_m(.v14, .x13));
 }
+
+test "the mask reductions differ from vmv.x.s only in vs1" {
+    // Pinned against LLVM's `vcpop.m x31, v5`, `vfirst.m x31, v5` and `vmv.x.s x31, v5`. All
+    // three share funct6 010000 in the OPMVV form, so vs1 is the whole difference: 0, 16 and 17.
+    try std.testing.expectEqual(@as(u32, 0x42582fd7), vcpop_m(.x31, .v5));
+    try std.testing.expectEqual(@as(u32, 0x4258afd7), vfirst_m(.x31, .v5));
+    try std.testing.expectEqual(@as(u32, 0x42502fd7), vmv_x_s(.x31, .v5));
+}

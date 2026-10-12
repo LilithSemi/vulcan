@@ -3266,3 +3266,161 @@ test "a buried address read and written takes the contiguous form both ways" {
         try std.testing.expectEqual(want, data[i]);
     }
 }
+
+test "a loop the lanes leave at different times runs until the last one is done" {
+    // `acc = 0; i = 0; do { acc += lane + 1; i += 1 } while (acc < 10); out[lane] = i`
+    //
+    // Lane 0 steps by one and needs ten iterations, lane 3 steps by four and needs three. The
+    // warp has ONE program counter, so it runs ten iterations and carries the finished lanes
+    // along inactive: their counters must stop where they stopped. A lowering that let the body
+    // keep updating them would give every lane the same answer.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const step = try f.appendArithImm(entry, u32_t, .add, tid, 1);
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const ten = try f.appendInst(entry, u32_t, .{ .iconst = 10 });
+    try f.setJump(entry, loop, &.{ zero, zero });
+
+    const acc = try f.appendBlockParam(loop, u32_t);
+    const count = try f.appendBlockParam(loop, u32_t);
+    const acc_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = step } });
+    const count_next = try f.appendArithImm(loop, u32_t, .add, count, 1);
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = acc_next, .rhs = ten } });
+    try f.appendIf(
+        loop,
+        more,
+        .{ .target = loop, .args = &.{ acc_next, count_next } },
+        .{ .target = exit, .args = &.{count_next} },
+    );
+
+    const total = try f.appendBlockParam(exit, u32_t);
+    const offset = try f.appendArithImm(exit, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(exit, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(exit, total, at);
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // The loop condition is a mask reduced to a lane count: `vcpop.m`, funct6 010000 in the OPMVV
+    // form with vs1 = 16, which is what tells it from `vmv.x.s` sharing that funct6.
+    var reductions: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0b111 != 0b010) continue;
+        if (w >> 26 != 0b010000) continue;
+        if ((w >> 15) & 0x1F != 16) continue;
+        reductions += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), reductions);
+
+    // Eight words is enough only because the kernel does not spill: a spilled value would land in
+    // the scratch region, which sits past the end of a buffer this small.
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    const want = [_]u32{ 10, 5, 4, 3 };
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(want[i], data[i]);
+    }
+}
+
+test "a per-lane parameter fed a warp-uniform value on one edge gets it in every lane" {
+    // `out[lane] = flag ? lane * 10 : 7`, as a BRANCH on a warp-uniform flag. The join parameter
+    // is per-lane because one side is, and the other side hands it a constant: parameter and
+    // argument sit in different register files, and the allocator's move carries the parameter's
+    // class with the argument's location. When the two indices happen to agree it emits NOTHING,
+    // so the lanes read whatever the vector register held. The constant arm is the assertion.
+    const allocator = std.testing.allocator;
+    for ([_]i64{ 0, 1 }) |flag| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const then_b = try f.appendBlock();
+        const else_b = try f.appendBlock();
+        const join = try f.appendBlock();
+
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const cond = try f.appendInst(entry, bool_t, .{ .iconst = flag });
+        const scaled = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+        const seven = try f.appendInst(else_b, u32_t, .{ .iconst = 7 });
+        const result = try f.appendBlockParam(join, u32_t);
+
+        try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+        try f.setJump(then_b, join, &.{scaled});
+        try f.setJump(else_b, join, &.{seven});
+
+        const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        try f.appendStore(join, result, at);
+        f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            const want: u32 = if (flag == 1) @intCast(i * 10) else 7;
+            try std.testing.expectEqual(want, data[i]);
+        }
+    }
+}
+
+test "a divergent loop whose back edge computes something is refused" {
+    // The block on the back edge holds an instruction, so the values that go round are defined
+    // THERE and not in the header. Freezing them means selecting on them from the header, where
+    // they do not dominate, and nothing in the body would be masked either. The shape is refused
+    // and the divergent branch refusal catches it.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const header = try f.appendBlock();
+    const mid = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const step = try f.appendArithImm(entry, u32_t, .add, tid, 1);
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const ten = try f.appendInst(entry, u32_t, .{ .iconst = 10 });
+    try f.setJump(entry, header, &.{zero});
+
+    const acc = try f.appendBlockParam(header, u32_t);
+    const more = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = acc, .rhs = ten } });
+    try f.appendIf(header, more, .{ .target = mid }, .{ .target = exit, .args = &.{acc} });
+
+    // The step happens on the back edge, which is what makes this shape different.
+    const bumped = try f.appendInst(mid, u32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = step } });
+    try f.setJump(mid, header, &.{bumped});
+
+    const total = try f.appendBlockParam(exit, u32_t);
+    const offset = try f.appendArithImm(exit, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(exit, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(exit, total, at);
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}

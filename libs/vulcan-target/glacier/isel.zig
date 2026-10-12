@@ -160,6 +160,31 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     const reachable_after = try ir.reachable.neutralizeUnreachable(allocator, &work);
     allocator.free(reachable_after);
 
+    // A loop whose lanes disagree about when to stop: carry an active mask round it, mask the
+    // stores with it, and freeze the carried values of a lane that has finished. This runs AFTER
+    // if-conversion, which is what flattens an inner diamond into the straight-line body this
+    // needs, and before the analysis below, because it adds values of its own.
+    var latches: std.ArrayList(Inst) = .empty;
+    defer latches.deinit(allocator);
+    {
+        const d = try analyzeDivergence(allocator, &work);
+        defer allocator.free(d);
+        _ = try convertDivergentLoops(allocator, &work, d, &latches);
+    }
+    const any_lane_at = try allocator.alloc(bool, work.instCount());
+    defer allocator.free(any_lane_at);
+    @memset(any_lane_at, false);
+    for (latches.items) |l| any_lane_at[@backingInt(l)] = true;
+    const any_lane: AnyLane = .{ .at = any_lane_at };
+
+    // No per-lane parameter may be fed a warp-uniform argument: see `broadcastUniformArgs` for
+    // what the shared allocator does with a move that crosses the two register files.
+    {
+        const d = try analyzeDivergence(allocator, &work);
+        defer allocator.free(d);
+        _ = try broadcastUniformArgs(allocator, &work, d);
+    }
+
     // Put every one-word-per-lane address into the shape `findStrides` reads, then clear out the
     // arithmetic that is left over. The divergence analysis runs again below, because the rewrite
     // adds values and moves work from the vector side to the scalar side.
@@ -188,7 +213,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
 
     var ctx: Ctx = .{ .divergent = divergent, .macs = &macs, .strides = &strides };
 
-    try checkSupported(&work, opts, divergent, &macs);
+    try checkSupported(&work, opts, divergent, &macs, &any_lane);
 
     const classes = [_]wimmer.RegClass{
         .{
@@ -239,6 +264,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
         .uses = uses,
         .macs = &macs,
         .strides = &strides,
+        .any_lane = &any_lane,
         .spills = slots != 0,
     };
     defer e.deinit();
@@ -393,9 +419,13 @@ fn spreadToParams(func: *const Function, div: []bool, j: ir.function.Jump) bool 
 // ===========================================================================
 // What this backend accepts.
 
+/// The two register files, as the allocator indexes them: scalar first, per-lane second.
+const scalar_class: u16 = 0;
+const vector_class: u16 = 1;
+
 fn classOf(ctx: *const anyopaque, _: *const Function, v: Value) u16 {
     const c: *const Ctx = @ptrCast(@alignCast(ctx));
-    return if (c.divergent[@backingInt(v)]) 1 else 0;
+    return if (c.divergent[@backingInt(v)]) vector_class else scalar_class;
 }
 
 fn useKind(_: *const anyopaque, _: *const Function, _: Inst, _: Value) wimmer.UseKind {
@@ -844,6 +874,439 @@ fn convert(allocator: std.mem.Allocator, func: *Function, a: Block, d: Diamond) 
         func.setTerminator(dead, .{ .ret = ir.function.Ret.none() });
     }
 }
+// ===========================================================================
+// Broadcasting a warp-uniform argument into a per-lane parameter.
+
+/// Give every PER-LANE block parameter a per-lane argument, and report whether anything changed.
+///
+/// A parameter and the argument that feeds it can sit in different register files here: the
+/// parameter is per-lane and the argument is the same in every lane, a loop's initial accumulator
+/// for instance. The shared allocator builds that move with the PARAMETER's class and the
+/// ARGUMENT's location, and `locEql` compares the two by index without their file, so the move is
+/// emitted into the wrong register file or DROPPED ENTIRELY when the two indices coincide. Neither
+/// has a diagnostic.
+///
+/// So the crossing is removed instead of being handled: the argument is broadcast into lanes in
+/// the predecessor, and the parameter then receives a per-lane value like any other. Adding the
+/// lane-wise zero is what makes it per-lane, and it costs one instruction once plus one per
+/// argument fixed.
+fn broadcastUniformArgs(allocator: std.mem.Allocator, func: *Function, divergent: []const bool) Error!bool {
+    const lane = laneValue(func) orelse return false;
+    var zero: ?Value = null;
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const pred: Block = @fromBackingInt(@intCast(bi));
+        var edge: usize = 0;
+        while (edge < 3) : (edge += 1) {
+            const target = edgeTarget(func, pred, edge) orelse continue;
+            const params = func.blockParams(target);
+            const args = edgeArgsOf(func, pred, edge);
+            if (args.len != params.len) continue;
+            var fixed: std.ArrayList(Value) = .empty;
+            defer fixed.deinit(allocator);
+            var any = false;
+            for (params, args) |p, a| {
+                if (!divergent[@backingInt(p)] or divergent[@backingInt(a)]) {
+                    try fixed.append(allocator, a);
+                    continue;
+                }
+                if (zero == null) {
+                    zero = try appendBeforeBranch(allocator, func, @fromBackingInt(0), func.valueType(lane), .{
+                        .arith_imm = .{ .op = .bit_and, .lhs = lane, .imm = 0 },
+                    });
+                }
+                try fixed.append(allocator, try appendBeforeBranch(allocator, func, pred, func.valueType(a), .{
+                    .arith = .{ .op = .add, .lhs = a, .rhs = zero.? },
+                }));
+                any = true;
+            }
+            if (!any) continue;
+            try setEdgeArgs(func, pred, edge, try func.internValueList(fixed.items));
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+/// The target of edge `n` leaving `block`: 0 and 1 are an `if`'s then and else, 2 is a jump.
+fn edgeTarget(func: *const Function, block: Block, n: usize) ?Block {
+    if (endsInIf(func, block)) {
+        const insts = func.blockInsts(block);
+        const cf = func.opcode(insts[insts.len - 1]).@"if";
+        return switch (n) {
+            0 => cf.then.target,
+            1 => cf.@"else".target,
+            else => null,
+        };
+    }
+    if (n != 2) return null;
+    return switch (func.terminator(block) orelse return null) {
+        .jump => |j| j.target,
+        .ret => null,
+    };
+}
+
+fn edgeArgsOf(func: *const Function, block: Block, n: usize) []const Value {
+    if (endsInIf(func, block)) {
+        const insts = func.blockInsts(block);
+        const cf = func.opcode(insts[insts.len - 1]).@"if";
+        return func.blockArgs(if (n == 0) cf.then else cf.@"else");
+    }
+    return switch (func.terminator(block).?) {
+        .jump => |j| func.blockArgs(j),
+        .ret => &.{},
+    };
+}
+
+fn setEdgeArgs(func: *Function, block: Block, n: usize, list: ir.function.ValueList) Error!void {
+    if (endsInIf(func, block)) {
+        const insts = func.blockInsts(block);
+        const cf = &func.opcodeMut(insts[insts.len - 1]).@"if";
+        if (n == 0) cf.then.args = list else cf.@"else".args = list;
+        return;
+    }
+    func.terminatorPtr(block).*.?.jump.args = list;
+}
+
+/// Append an instruction to `block` so that it lands BEFORE the conditional that ends it, which is
+/// where a value the branch's arguments read has to be.
+fn appendBeforeBranch(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    block: Block,
+    ty: Type,
+    op: ir.function.Opcode,
+) Error!Value {
+    if (!endsInIf(func, block)) return func.appendInst(block, ty, op);
+    const insts = func.blockInstsMut(block);
+    const branch = insts.pop().?;
+    const v = try func.appendInst(block, ty, op);
+    try func.blockInstsMut(block).append(allocator, branch);
+    return v;
+}
+
+// ===========================================================================
+// Divergent loops.
+
+/// Which `if` instructions branch on whether ANY LANE is still active, rather than on a boolean.
+///
+/// A warp has one program counter, so a loop whose lanes disagree about when to stop runs until
+/// the last of them is done, with the finished ones carried along inactive. The condition of such
+/// a branch is a MASK and the branch is a reduction of it, which is not what an `if` means
+/// anywhere else. `checkSupported` still refuses every other divergent branch, so this set is the
+/// whole of the exception and `convertDivergentLoops` is its only producer.
+const AnyLane = struct {
+    at: []const bool,
+
+    fn deinit(self: *AnyLane, allocator: std.mem.Allocator) void {
+        allocator.free(self.at);
+    }
+
+    fn has(self: *const AnyLane, inst: Inst) bool {
+        return self.at[@backingInt(inst)];
+    }
+};
+
+/// A loop this can convert: a header left by a per-lane condition, with the back edge going
+/// through the empty block critical-edge splitting put on it.
+///
+/// A self-loop is NOT the shape that arrives. The latch has two successors and the header has two
+/// predecessors, so the back edge is critical and `splitCriticalEdges` always puts a block on it
+/// before this runs. That block holds nothing, takes no parameters and jumps straight back, so it
+/// is where the values that go round are named.
+const DivergentLoop = struct {
+    header: Block,
+    /// The empty block on the back edge, which carries the arguments round.
+    latch: Block,
+    /// The one predecessor of the header that is not the latch.
+    preheader: Block,
+    cond: Value,
+    /// Whether the TRUE edge continues the loop.
+    continue_on_true: bool,
+    exit: Block,
+};
+
+/// Whether `block` is a loop this converts. Every condition is a reason it would otherwise be
+/// wrong rather than a simplification of convenience.
+fn divergentLoop(func: *const Function, block: Block, divergent: []const bool) ?DivergentLoop {
+    const insts = func.blockInsts(block);
+    if (insts.len == 0) return null;
+    const cf = switch (func.opcode(insts[insts.len - 1])) {
+        .@"if" => |x| x,
+        else => return null,
+    };
+    if (!divergent[@backingInt(cf.cond)]) return null;
+    const then_latch = isLatchOf(func, cf.then.target, block);
+    const else_latch = isLatchOf(func, cf.@"else".target, block);
+    // One edge round and the other out. Both or neither is not a loop this reads.
+    if (then_latch == else_latch) return null;
+    const latch = if (then_latch) cf.then.target else cf.@"else".target;
+    const exit = if (then_latch) cf.@"else".target else cf.then.target;
+    if (exit == block or exit == latch) return null;
+    // The branch passes nothing to the latch: the latch is empty and takes no parameters, so the
+    // values that go round are the ones IT names.
+    if (func.blockArgs(if (then_latch) cf.then else cf.@"else").len != 0) return null;
+    const round = switch (func.terminator(latch).?) {
+        .jump => |j| j,
+        .ret => return null,
+    };
+    // The carried values arrive as parameters and go round from the latch, so the two line up.
+    if (func.blockArgs(round).len != func.blockParams(block).len) return null;
+    if (predCount(func, block) != 2) return null;
+    var preheader: ?Block = null;
+    for (0..func.blockCount()) |bi| {
+        const p: Block = @fromBackingInt(@intCast(bi));
+        if (p == block or p == latch) continue;
+        if (!jumpsTo(func, p, block)) continue;
+        if (preheader != null) return null;
+        preheader = p;
+    }
+    const pre = preheader orelse return null;
+    // The mask for the first iteration is appended to the preheader, which only lands before the
+    // jump when the preheader LEAVES by a jump. A branch there would take the arrival with it.
+    if (func.terminator(pre) == null) return null;
+    for (func.blockInsts(pre)) |inst| {
+        if (func.opcode(inst) == .@"if") return null;
+    }
+    // Every instruction in the body runs for a lane that has already finished, so the body must
+    // be instructions that cost nothing when their answer is thrown away. A STORE is admitted
+    // because it takes the mask. A LOAD is not: an inactive lane would read an address it never
+    // meant to compute, and the answer for that is a masked load, which the IR cannot say yet.
+    for (insts[0 .. insts.len - 1]) |inst| {
+        if (!convertible(func.opcode(inst))) return null;
+    }
+    return .{
+        .header = block,
+        .latch = latch,
+        .preheader = pre,
+        .cond = cf.cond,
+        .continue_on_true = then_latch,
+        .exit = exit,
+    };
+}
+
+/// Whether `candidate` is the block critical-edge splitting put on the back edge to `header`:
+/// empty, parameterless, reached only from the header, and leaving straight back to it.
+fn isLatchOf(func: *const Function, maybe: Block, header: Block) bool {
+    if (maybe == header) return false;
+    if (func.blockInsts(maybe).len != 0) return false;
+    if (func.blockParams(maybe).len != 0) return false;
+    if (predCount(func, maybe) != 1) return false;
+    return switch (func.terminator(maybe) orelse return false) {
+        .jump => |j| j.target == header,
+        .ret => false,
+    };
+}
+
+/// Convert every divergent loop, recording each rewritten latch in `latches`.
+///
+/// A warp has ONE program counter, so the lanes cannot leave a loop at different times. They leave
+/// together, at the last iteration any of them needs, and a lane that is finished is carried along
+/// INACTIVE: an active mask says which lanes are still going, the body's stores take that mask, and
+/// every carried value is frozen for a lane the mask has dropped. The branch then asks whether any
+/// lane is left rather than what one lane thinks.
+///
+/// The mask is a loop-carried value like any other, which is what makes the rest fall out: it
+/// arrives as a block parameter, so the divergence analysis sees it as an operand and nothing here
+/// depends on a control-dependence rule.
+fn convertDivergentLoops(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    divergent: []const bool,
+    latches: *std.ArrayList(Inst),
+) Error!bool {
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const loop = divergentLoop(func, block, divergent) orelse continue;
+        if (try convertLoop(allocator, func, loop, latches)) changed = true;
+    }
+    return changed;
+}
+
+/// Rewrite one loop, or report false when a condition only the rewrite can see refuses it.
+fn convertLoop(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    loop: DivergentLoop,
+    latches: *std.ArrayList(Inst),
+) Error!bool {
+    const bool_ty = try func.types.intern(.bool);
+    const lane = laneValue(func) orelse return false;
+    // A loop the lanes leave on the FALSE edge needs the complement of its condition, and the
+    // only exact complement is an inverted integer compare. See `invertedCompare`.
+    if (!loop.continue_on_true and invertedCompare(func, loop.cond) == null) return false;
+    const header = loop.header;
+
+    // The mask the first iteration runs under: every lane that reached the loop. Comparing the
+    // lane index against itself is true in every lane, and it is a per-lane value by its
+    // operands, so it reaches the hardware as a real mask rather than a broadcast 1.
+    const all = try func.appendInst(loop.preheader, bool_ty, .{ .icmp = .{
+        .op = .eq,
+        .lhs = lane,
+        .rhs = lane,
+    } });
+    const carried = func.blockParams(header).len;
+    const active = try func.appendBlockParam(header, bool_ty);
+    try appendJumpArg(allocator, func, loop.preheader, all);
+
+    // The body, with every store put under the mask of the iteration it runs in. A lane that is
+    // finished takes no part: an inactive lane makes no bus access at all.
+    const body = func.blockInstsMut(header);
+    const original = try allocator.dupe(Inst, body.items);
+    defer allocator.free(original);
+    const branch = original[original.len - 1];
+    body.clearRetainingCapacity();
+    const cf = func.opcode(branch).@"if";
+    const exit_edge = if (loop.continue_on_true) cf.@"else" else cf.then;
+    // What goes round is named by the LATCH, which is where the back edge's arguments live.
+    const back_args = try allocator.dupe(Value, func.valueList(func.terminator(loop.latch).?.jump.args));
+    defer allocator.free(back_args);
+    const exit_args = try allocator.dupe(Value, func.valueList(exit_edge.args));
+    defer allocator.free(exit_args);
+
+    for (original[0 .. original.len - 1]) |inst| {
+        const carried_mask: ?Value = switch (func.opcode(inst)) {
+            .store => |st| st.mask,
+            else => null,
+        };
+        if (carried_mask) |inner| {
+            const both = try func.appendInst(header, bool_ty, .{ .arith = .{
+                .op = .bit_and,
+                .lhs = inner,
+                .rhs = active,
+            } });
+            try func.blockInstsMut(header).append(allocator, inst);
+            func.opcodeMut(inst).store.mask = both;
+            continue;
+        }
+        try func.blockInstsMut(header).append(allocator, inst);
+        switch (func.opcodeMut(inst).*) {
+            .store => |*st| st.mask = active,
+            else => {},
+        }
+    }
+
+    // Which lanes go round again: the ones still active that also want another iteration.
+    //
+    // The AND with `active` cannot be observed TODAY and is still right to keep. A finished lane
+    // has its values frozen, so the body recomputes the same condition for it and it stays out
+    // with or without the AND. That holds only while the body reads no memory: once a masked load
+    // is admitted, another lane's store could change what a frozen lane loads and bring it back
+    // to life. The AND is what makes that impossible rather than unlikely.
+    const again = if (loop.continue_on_true) loop.cond else try func.appendInst(
+        header,
+        bool_ty,
+        .{ .icmp = invertedCompare(func, loop.cond).? },
+    );
+    const next = try func.appendInst(header, bool_ty, .{ .arith = .{
+        .op = .bit_and,
+        .lhs = active,
+        .rhs = again,
+    } });
+
+    // A lane the mask has dropped keeps the value it had when it was dropped, which is this
+    // iteration's for the lane that is leaving now and the frozen one for a lane that left
+    // earlier. The select on the mask AT THE TOP of the iteration says exactly that.
+    var frozen: std.ArrayList(Value) = .empty;
+    defer frozen.deinit(allocator);
+    for (0..carried) |i| {
+        const param = func.blockParams(header)[i];
+        try frozen.append(allocator, try func.appendInst(header, func.valueType(param), .{ .select = .{
+            .cond = active,
+            .then = back_args[i],
+            .@"else" = param,
+        } }));
+    }
+
+    // The exit carries the frozen values too: the loop is left when NO lane is active, so this
+    // iteration's results belong to no one.
+    var out: std.ArrayList(Value) = .empty;
+    defer out.deinit(allocator);
+    for (exit_args) |v| {
+        try out.append(allocator, exitValue(func, header, v, back_args, frozen.items) orelse return false);
+    }
+
+    // The mask goes round with the rest, and it needs no select of its own: a lane the AND has
+    // dropped stays dropped, so the mask freezes itself.
+    var round: std.ArrayList(Value) = .empty;
+    defer round.deinit(allocator);
+    try round.appendSlice(allocator, frozen.items);
+    try round.append(allocator, next);
+
+    // What goes round is written on the LATCH's jump, and the mask goes with it.
+    func.terminatorPtr(loop.latch).*.?.jump.args = try func.internValueList(round.items);
+
+    // The back edge is put on the THEN side whatever the original polarity was. The condition is
+    // now a MASK and the branch is a reduction of it, so which way the lanes used to go has no
+    // meaning here: the loop runs again while any lane is left.
+    func.opcodeMut(branch).* = .{ .@"if" = .{
+        .cond = next,
+        .then = .{ .target = loop.latch, .args = try func.internValueList(&.{}) },
+        .@"else" = .{ .target = loop.exit, .args = try func.internValueList(out.items) },
+    } };
+    try func.blockInstsMut(header).append(allocator, branch);
+    try latches.append(allocator, branch);
+    return true;
+}
+
+/// What the exit edge passes in place of `v`: the frozen value when it is one the loop carries,
+/// and `v` itself when it comes from outside. Null when it is neither, which is a value computed
+/// in the body that only the exit reads, and that would need its own carried slot.
+fn exitValue(
+    func: *const Function,
+    block: Block,
+    v: Value,
+    back_args: []const Value,
+    frozen: []const Value,
+) ?Value {
+    for (back_args, 0..) |arg, i| {
+        if (arg == v) return frozen[i];
+    }
+    for (func.blockParams(block), 0..) |p, i| {
+        if (p != v) continue;
+        if (i >= frozen.len) return null; // the mask parameter itself
+        return frozen[i];
+    }
+    const inst = func.definingInst(v) orelse return v; // a parameter of another block
+    for (func.blockInsts(block)) |in_body| {
+        if (in_body == inst) return null;
+    }
+    return v;
+}
+
+/// The lane index a kernel reads, whichever builtin it asked for.
+fn laneValue(func: *const Function) ?Value {
+    for (func.blockParams(@fromBackingInt(0))) |p| {
+        const b = gpu.attrs.builtinOf(func, p) orelse continue;
+        if (laneVarying(b)) return p;
+    }
+    return null;
+}
+
+/// Append `v` to the argument list of the jump leaving `block`.
+fn appendJumpArg(allocator: std.mem.Allocator, func: *Function, block: Block, v: Value) Error!void {
+    const term = func.terminatorPtr(block);
+    const old = term.*.?.jump;
+    var args: std.ArrayList(Value) = .empty;
+    defer args.deinit(allocator);
+    try args.appendSlice(allocator, func.valueList(old.args));
+    try args.append(allocator, v);
+    term.*.?.jump.args = try func.internValueList(args.items);
+}
+
+/// Whether `block` leaves by a jump to `target`.
+fn jumpsTo(func: *const Function, block: Block, target: Block) bool {
+    for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+        .@"if" => |cf| return cf.then.target == target or cf.@"else".target == target,
+        else => {},
+    };
+    return switch (func.terminator(block) orelse return false) {
+        .jump => |j| j.target == target,
+        .ret => false,
+    };
+}
+
 // ===========================================================================
 // Hoisting the lane term out of an address.
 
@@ -1468,7 +1931,13 @@ fn resultDivergent(func: *const Function, inst: Inst, divergent: []const bool) b
 
 /// Reject every shape this lowering does not handle, before anything is emitted. A refusal here
 /// is a clear error; a refusal halfway through emission is a truncated program.
-fn checkSupported(func: *const Function, opts: Options, divergent: []const bool, macs: *const Macs) Error!void {
+fn checkSupported(
+    func: *const Function,
+    opts: Options,
+    divergent: []const bool,
+    macs: *const Macs,
+    any_lane: *const AnyLane,
+) Error!void {
     for (0..func.valueCount()) |vi| {
         const v: Value = @fromBackingInt(@intCast(vi));
         if (!isWord(func, func.valueType(v))) return error.Unsupported;
@@ -1486,7 +1955,7 @@ fn checkSupported(func: *const Function, opts: Options, divergent: []const bool,
             // The multiply and the two converts a MAC absorbs are emitted by the `add`, so the
             // rules below do not apply to them: on their own the core has neither instruction.
             if (macs.isFolded(inst)) continue;
-            try checkInst(func, opts, divergent, macs, block, insts, inst, i);
+            try checkInst(func, opts, divergent, macs, any_lane, block, insts, inst, i);
         }
         if (func.terminator(block)) |term| switch (term) {
             .ret => |r| if (r.count != 0) return error.Unsupported,
@@ -1500,6 +1969,7 @@ fn checkInst(
     opts: Options,
     divergent: []const bool,
     macs: *const Macs,
+    any_lane: *const AnyLane,
     block: Block,
     insts: []const Inst,
     inst: Inst,
@@ -1600,7 +2070,10 @@ fn checkInst(
             // A branch on a per-lane condition is DIVERGENCE: the lanes would need to take
             // both arms under masks. A scalar branch here would send the whole warp whichever
             // way lane 0 went, which is a wrong answer and not a slow one.
-            if (divergent[@backingInt(cf.cond)]) return error.Unsupported;
+            //
+            // The ONE exception is a loop latch this lowering rewrote itself, where the condition
+            // is the active mask and the branch is a reduction of it. See `AnyLane`.
+            if (divergent[@backingInt(cf.cond)] and !any_lane.has(inst)) return error.Unsupported;
         },
         else => return error.Unsupported,
     }
@@ -1832,6 +2305,8 @@ const Emitter = struct {
     macs: *const Macs,
     /// Which accesses are unit-stride, and which address arithmetic one absorbs.
     strides: *const Strides,
+    /// Which branches ask whether any lane is still active. See `AnyLane`.
+    any_lane: *const AnyLane,
     /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
     spills: bool,
     words: std.ArrayList(u32) = .empty,
@@ -2001,7 +2476,7 @@ const Emitter = struct {
             if (set.succ != block or set.moves.len == 0) continue;
             if (!endsInIf(self.func, set.pred)) continue;
             if (predCount(self.func, block) != 1) return error.Unsupported;
-            try self.emitMoves(set.moves);
+            try self.emitMoves(set.moves, set.pred, set.succ);
         }
     }
 
@@ -2015,25 +2490,96 @@ const Emitter = struct {
     fn edgeMovesOutOf(self: *Emitter, block: Block) Error!void {
         for (self.alloc.edge_moves) |set| {
             if (set.pred != block or set.moves.len == 0) continue;
-            try self.emitMoves(set.moves);
+            try self.emitMoves(set.moves, set.pred, set.succ);
         }
     }
 
     /// Realize one parallel-move set: register moves, spills, reloads, and the slot-to-slot step
     /// the Wimmer resolver already routes through the class scratch.
-    fn emitMoves(self: *Emitter, moves: []const wimmer.Move) Error!void {
-        for (moves) |m| switch (m.src) {
-            .reg => |s| switch (m.dst) {
-                .reg => |d| try self.move(regOf(d), regOf(s)),
-                .slot => |d| try self.put(rv.sw(regOf(s), sp, try self.slotOffset(d))),
-            },
-            .slot => |s| switch (m.dst) {
-                .reg => |d| try self.put(rv.lw(regOf(d), sp, try self.slotOffset(s))),
-                .slot => |d| {
-                    try self.put(rv.lw(scratch, sp, try self.slotOffset(s)));
-                    try self.put(rv.sw(scratch, sp, try self.slotOffset(d)));
+    /// The parallel copies the resolver asked for, in the register file each one belongs to.
+    ///
+    /// A PER-LANE value is moved with a vector instruction, and a per-lane BOOL with a mask one: a
+    /// mask is bits and not elements, and `vmv.v.v` is only right for one while the whole mask fits
+    /// inside the first element. A scalar `addi` on a vector register pair writes neither, which is
+    /// what this used to do for every class: the moves are the one place a class is not implied by
+    /// the opcode, and ignoring `m.class` was a wrong answer waiting for a per-lane block
+    /// parameter to cross an edge.
+    fn emitMoves(self: *Emitter, moves: []const wimmer.Move, pred: ?Block, succ: ?Block) Error!void {
+        for (moves) |m| {
+            if (m.class == vector_class) {
+                const uniform_source = if (pred) |p| self.argIsUniform(p, succ.?, m.value) else false;
+                // A spilled vector is refused before emission, so neither end is ever a slot.
+                const s = switch (m.src) {
+                    .reg => |r| vregOf(r),
+                    .slot => return error.Unsupported,
+                };
+                const d = switch (m.dst) {
+                    .reg => |r| vregOf(r),
+                    .slot => return error.Unsupported,
+                };
+                // A WARP-UNIFORM value feeding a per-lane parameter would cross the register
+                // files: the source index names a SCALAR register and the destination a vector
+                // one. `broadcastUniformArgs` removes every such edge before this runs, so
+                // reaching here means it missed one, and the answer is a refusal rather than a
+                // move that reads the wrong file. Note the allocator can also DROP such a move
+                // before emission, which nothing here can catch; that is what the test pins.
+                if (uniform_source) return error.Unsupported;
+                if (s == d) continue;
+                if (isBool(self.func, self.func.valueType(m.value))) {
+                    try self.put(rv.vmand_mm(d, s, s));
+                } else {
+                    try self.put(rv.vmv_v_v(d, s));
+                }
+                continue;
+            }
+            switch (m.src) {
+                .reg => |s| switch (m.dst) {
+                    .reg => |d| try self.move(regOf(d), regOf(s)),
+                    .slot => |d| try self.put(rv.sw(regOf(s), sp, try self.slotOffset(d))),
                 },
-            },
+                .slot => |s| switch (m.dst) {
+                    .reg => |d| try self.put(rv.lw(regOf(d), sp, try self.slotOffset(s))),
+                    .slot => |d| {
+                        try self.put(rv.lw(scratch, sp, try self.slotOffset(s)));
+                        try self.put(rv.sw(scratch, sp, try self.slotOffset(d)));
+                    },
+                },
+            }
+        }
+    }
+
+    /// Whether the value a per-lane parameter receives on the edge `pred` to `succ` is warp
+    /// UNIFORM, which makes the move a broadcast across the register files.
+    ///
+    /// The allocator builds a parameter move with the PARAMETER's class and the ARGUMENT's
+    /// location, because it assumes the two share a register file. Here they need not: a loop's
+    /// initial accumulator arrives as a constant and goes round as a lane value. `m.value` names
+    /// the parameter, so the argument is the one at the same index on this edge.
+    fn argIsUniform(self: *const Emitter, pred: Block, succ: Block, param: Value) bool {
+        const args = self.edgeArgs(pred, succ) orelse return false;
+        const params = self.func.blockParams(succ);
+        if (args.len != params.len) return false;
+        for (params, args) |p, a| {
+            if (p != param) continue;
+            return !self.isDivergent(a);
+        }
+        return false;
+    }
+
+    /// The arguments `pred` passes on its edge to `succ`, or null when it has two edges there and
+    /// the one this move belongs to cannot be told apart.
+    fn edgeArgs(self: *const Emitter, pred: Block, succ: Block) ?[]const Value {
+        const insts = self.func.blockInsts(pred);
+        if (endsInIf(self.func, pred)) {
+            const cf = self.func.opcode(insts[insts.len - 1]).@"if";
+            if (cf.then.target == succ and cf.@"else".target == succ) return null;
+            if (cf.then.target == succ) return self.func.blockArgs(cf.then);
+            if (cf.@"else".target == succ) return self.func.blockArgs(cf.@"else");
+            return null;
+        }
+        return switch (self.func.terminator(pred) orelse return null) {
+            .jump => |j| if (j.target == succ) self.func.blockArgs(j) else null,
+            .ret => null,
         };
     }
 
@@ -2054,7 +2600,9 @@ const Emitter = struct {
     fn actionsAt(self: *Emitter, pos: u32) Error!void {
         for (self.alloc.actions) |a| {
             if (a.at != pos) continue;
-            try self.emitMoves(&[_]wimmer.Move{.{ .src = a.src, .dst = a.dst, .class = a.class, .value = a.value }});
+            // An intra-block action moves one value to itself, so there is no edge and no
+            // parameter: source and destination are always the same register file.
+            try self.emitMoves(&[_]wimmer.Move{.{ .src = a.src, .dst = a.dst, .class = a.class, .value = a.value }}, null, null);
         }
     }
 
@@ -2517,6 +3065,15 @@ const Emitter = struct {
 
     fn emitIf(self: *Emitter, inst: Inst, pos: u32, bi: usize) Error!void {
         const cf = self.func.opcode(inst).@"if";
+        // A loop latch branches on whether ANY LANE is still active. The condition is a mask, so
+        // it is reduced to a lane count in a scalar register first, and the warp goes round again
+        // while that count is not zero. See `AnyLane`.
+        if (self.any_lane.has(inst)) {
+            try self.put(rv.vcpop_m(scratch, try self.vreg(cf.cond, pos)));
+            try self.put(rv.beq(scratch, .x0, 8));
+            try self.jumpAlways(cf.then.target);
+            return self.jumpTo(cf.@"else".target, bi);
+        }
         const cond = try self.reg(cf.cond, pos);
         // The boolean is 0 or 1, so testing it against x0 is the whole condition. A false
         // condition skips the then jump, so that jump is always emitted even when its target
@@ -2566,6 +3123,11 @@ const Emitter = struct {
 /// The register a Wimmer class-relative index names. The numbering is the register's own, so
 /// index n is x_n.
 fn regOf(index: u16) Reg {
+    return @fromBackingInt(@as(u5, @intCast(index)));
+}
+
+/// The same for the per-lane file: index n is v_n.
+fn vregOf(index: u16) VReg {
     return @fromBackingInt(@as(u5, @intCast(index)));
 }
 

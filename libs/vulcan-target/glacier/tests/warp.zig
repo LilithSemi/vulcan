@@ -356,9 +356,35 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
         for (0..warp.lanes) |i| warp.v[vd][i] = warp.v[src][i];
         return;
     }
-    // vmv.x.s moves lane 0 to a scalar register, so it writes no vector lane.
+    // The three OPMVV instructions that write a SCALAR register, told apart by `vs1` and not by
+    // funct6, which they share. Reading only funct6 ran a mask reduction as `vmv.x.s` and gave
+    // back the mask word instead of a count.
     if (funct3 == 0b010 and funct6 == 0b010000) {
-        warp.set(vd, warp.v[vs2][0]);
+        switch (src) {
+            // vmv.x.s moves lane 0 to a scalar register, so it writes no vector lane.
+            0 => warp.set(vd, warp.v[vs2][0]),
+            // vcpop.m counts the lanes the mask names. Only the launched lanes count: a bit above
+            // them belongs to no lane and a warp that polled it would never finish.
+            16 => {
+                const bits = warp.mask(vs2);
+                var n: u32 = 0;
+                for (0..warp.lanes) |i| n += (bits >> @intCast(i)) & 1;
+                warp.set(vd, n);
+            },
+            // vfirst.m gives the lowest lane the mask names, or -1 when it names none.
+            17 => {
+                const bits = warp.mask(vs2);
+                var found: i32 = -1;
+                for (0..warp.lanes) |i| {
+                    if ((bits >> @intCast(i)) & 1 == 1) {
+                        found = @intCast(i);
+                        break;
+                    }
+                }
+                warp.set(vd, @bitCast(found));
+            },
+            else => return error.Illegal,
+        }
         return;
     }
 
