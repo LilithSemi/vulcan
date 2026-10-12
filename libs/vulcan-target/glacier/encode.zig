@@ -124,11 +124,16 @@ pub const Profile = enum {
     /// COMPILER does read it, because it must know when a spill would walk out of the region and
     /// into the hart below, and the generation is in the profile name so a later core cannot
     /// quietly move it.
+    /// One kilobyte on every GC1 profile. The region is carved from the top of the largest memory
+    /// device, SDRAM or DDR3 and not on-chip SRAM, so the size costs address space and no logic:
+    /// eight resident warps on gc1.mi reserve 8 KiB out of 32 MiB.
+    ///
+    /// THIS NUMBER MUST MATCH `GlacierConfig.scratchBytesPerHart` IN THE CORE. A compiler that
+    /// believes the region is larger than the hardware gives it spills into the hart below and
+    /// corrupts a neighbour, which surfaces as that hart's wrong answer somewhere else.
     pub fn scratchBytes(self: Profile) u32 {
         return switch (self) {
-            .@"gc1.n", .@"gc1.mi" => 256,
-            .@"gc1.s" => 512,
-            .@"gc1.f", .@"gc1.ma" => 1024,
+            .@"gc1.n", .@"gc1.mi", .@"gc1.s", .@"gc1.f", .@"gc1.ma" => 1024,
         };
     }
 };
