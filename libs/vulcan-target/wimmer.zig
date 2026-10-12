@@ -401,7 +401,10 @@ fn visitOperands(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn
             f(ctx, cv.global_scale, false);
         },
         .unary => |u| f(ctx, u.value, false),
-        .load => |l| f(ctx, l.ptr, false),
+        .load => |l| {
+            f(ctx, l.ptr, false);
+            if (l.mask) |m| f(ctx, m, false);
+        },
         .store => |st| {
             f(ctx, st.value, false);
             f(ctx, st.ptr, false);

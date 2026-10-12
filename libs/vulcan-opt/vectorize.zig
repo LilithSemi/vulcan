@@ -494,6 +494,9 @@ fn analyzeLoadRun(func: *const Function, block: Block, scalars: []const Value, g
         // from the survivor. Refuse the whole run; the caller packs the scalars instead, which keeps
         // every load, in order, with its flag.
         if (func.opcode(inst).load.@"volatile") return null;
+        // A MASKED load cannot join a run either: one wide load reads every element of it, and a
+        // lane the mask excludes reads none. There is no per-element predicate to carry into it.
+        if (func.opcode(inst).load.mask != null) return null;
         // An `endian`-tagged load moves its element's bytes in reverse (see `Attribute.endian`).
         // One wide load over `lanes` of them reverses the WHOLE vector, which puts the elements
         // themselves in the wrong lanes, and the survivor keeps at most lane 0's tag. Refuse the
@@ -1040,7 +1043,10 @@ fn countUses(func: *const Function, uses: []u32) void {
                     uses[@backingInt(x.global_scale)] += 1;
                 },
                 .unary => |x| uses[@backingInt(x.value)] += 1,
-                .load => |x| uses[@backingInt(x.ptr)] += 1,
+                .load => |x| {
+                    uses[@backingInt(x.ptr)] += 1;
+                    if (x.mask) |m| uses[@backingInt(m)] += 1;
+                },
                 .store => |x| {
                     uses[@backingInt(x.value)] += 1;
                     uses[@backingInt(x.ptr)] += 1;

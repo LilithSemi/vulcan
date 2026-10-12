@@ -222,7 +222,11 @@ fn mapOpcode(caller: *Function, callee: *const Function, vmap: std.AutoHashMapUn
         .unary => |u| .{ .unary = .{ .op = u.op, .value = m(vmap, u.value) } },
         // `volatile` is an observable side effect, not a hint. A callee that reads an MMIO
         // register keeps that read observable after it is inlined, so carry the flag.
-        .load => |l| .{ .load = .{ .ptr = m(vmap, l.ptr), .@"volatile" = l.@"volatile" } },
+        .load => |l| .{ .load = .{
+            .ptr = m(vmap, l.ptr),
+            .@"volatile" = l.@"volatile",
+            .mask = if (l.mask) |k| m(vmap, k) else null,
+        } },
         .alloca => |al| .{ .alloca = .{ .elem = try mapType(caller, callee, tmap, al.elem) } },
         .global_addr => |ga| .{ .global_addr = .{ .symbol = try caller.internSymbol(callee.symbolName(ga.symbol)), .via_got = ga.via_got } },
         // dot is pure, like arith: remap its 3 operands. (Its vector operand types
@@ -296,7 +300,10 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
                 cv.global_scale = r(from, to, cv.global_scale);
             },
             .unary => |*u| u.value = r(from, to, u.value),
-            .load => |*l| l.ptr = r(from, to, l.ptr),
+            .load => |*l| {
+                l.ptr = r(from, to, l.ptr);
+                if (l.mask) |m| l.mask = r(from, to, m);
+            },
             .store => |*st| {
                 st.value = r(from, to, st.value);
                 st.ptr = r(from, to, st.ptr);

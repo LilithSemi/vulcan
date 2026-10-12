@@ -1043,7 +1043,10 @@ fn appendOperands(allocator: std.mem.Allocator, func: *const Function, inst: Ins
             try out.appendSlice(allocator, func.valueList(c.args));
             if (c.ret_dest) |rd| try out.append(allocator, rd);
         },
-        .load => |l| try out.append(allocator, l.ptr),
+        .load => |l| {
+            try out.append(allocator, l.ptr);
+            if (l.mask) |m| try out.append(allocator, m);
+        },
         .store => |s| {
             try out.appendSlice(allocator, &.{ s.value, s.ptr });
             if (s.mask) |m| try out.append(allocator, m);

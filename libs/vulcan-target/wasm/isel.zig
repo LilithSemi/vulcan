@@ -1185,6 +1185,9 @@ fn emitInst(
             }
         },
         .load => |ld| {
+            // A masked load is per-lane predication (see `Load.mask`), and wasm has no masked
+            // load. Reading every lane is a wrong answer, so refuse.
+            if (ld.mask != null) return error.Unsupported;
             const ptr_local = value_local[@backingInt(ld.ptr)];
             const ty = if (result) |r| func.valueType(r) else func.valueType(ld.ptr);
             try code.append(allocator, encode.LocalOp.local_get);

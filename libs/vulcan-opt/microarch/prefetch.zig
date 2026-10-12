@@ -284,7 +284,9 @@ fn collectLoadsOn(
     if (distance == 0) return;
     for (func.blockInsts(block)) |inst| {
         const ptr = switch (func.opcode(inst)) {
-            .load => |l| l.ptr,
+            // A MASKED load is left alone. A prefetch for it would warm an address the lanes its
+            // mask excludes never meant to compute, which is the hazard the mask exists to avoid.
+            .load => |l| if (l.mask == null) l.ptr else continue,
             else => continue,
         };
         if (!isAffine(func, block, biv, ptr)) continue;

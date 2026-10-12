@@ -3472,3 +3472,204 @@ test "a uniform term multiplied by three keeps its own multiply and the lane sti
         try std.testing.expectEqual(if (inside) @as(u32, @intCast(lane)) else sentinel, data[i]);
     }
 }
+
+test "a load under a divergent branch reads nothing in the lanes that did not choose it" {
+    // `out[lane] = (lane < 2) ? data[lane * 1024] : 0`. The address for lanes 2 and 3 is far
+    // outside the buffer, so an unmasked read FAULTS in the model rather than returning a value
+    // nobody looks at. That is the only way to see the mask on a read: the value an inactive lane
+    // loads is thrown away by the select either way, so a value test cannot tell.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+
+    // Lane 0 reads word 0 and lane 1 word 1024, which is past the eight words the run is given.
+    const far = try f.appendArithImm(then_b, u32_t, .shl, tid, 12);
+    const at = try f.appendInst(then_b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = far } });
+    const got = try f.appendInst(then_b, u32_t, .{ .load = .{ .ptr = at } });
+    const picked = try f.appendBlockParam(join, u32_t);
+
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = join, .args = &.{zero} });
+    try f.setJump(then_b, join, &.{got});
+
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const out = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, picked, out);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One predicated gather, vm clear, and no branch left.
+    var masked_loads: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b0000111) continue;
+        try std.testing.expectEqual(@as(u32, 0), (w >> 25) & 1);
+        masked_loads += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), masked_loads);
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011);
+        try std.testing.expect(w & 0x7F != 0b1101111);
+    }
+
+    // 2048 words covers lane 1's read at word 1024 and leaves lanes 2 and 3 pointing past the end.
+    var data: [2048]u32 = @splat(0);
+    data[0] = 11;
+    data[1024] = 22;
+    try runOnce(words, &data, 0, 1);
+    const want = [_]u32{ 11, 22, 0, 0 };
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(want[i], data[i]);
+    }
+}
+
+test "a divergent loop whose body reads memory sums a different run in each lane" {
+    // `acc = 0; i = 0; do { acc += data[i]; i += 1 } while (i <= lane); out[lane] = acc`
+    //
+    // Lane 0 reads one word and lane 3 reads four, so the lanes leave at different times with a
+    // LOAD in the body, which was refused before masked loads existed.
+    //
+    // The mask on that load has no observable effect HERE, and it is worth saying why rather than
+    // implying the test covers it. A finished lane has its index frozen, so it re-reads an address
+    // next to where it stopped, which is in range and whose value the freeze throws away. The mask
+    // matters when the frozen address comes from memory ANOTHER LANE WRITES, which needs a store
+    // in the same loop and is not this test.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    try f.setJump(entry, loop, &.{ zero, zero });
+
+    const acc = try f.appendBlockParam(loop, u32_t);
+    const index = try f.appendBlockParam(loop, u32_t);
+    const offset = try f.appendArithImm(loop, u32_t, .shl, index, 2);
+    const at = try f.appendInst(loop, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const word = try f.appendInst(loop, u32_t, .{ .load = .{ .ptr = at } });
+    const acc_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = word } });
+    const index_next = try f.appendArithImm(loop, u32_t, .add, index, 1);
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .le, .lhs = index_next, .rhs = tid } });
+    try f.appendIf(
+        loop,
+        more,
+        .{ .target = loop, .args = &.{ acc_next, index_next } },
+        .{ .target = exit, .args = &.{acc_next} },
+    );
+
+    const total = try f.appendBlockParam(exit, u32_t);
+    const out_off = try f.appendArithImm(exit, u32_t, .shl, tid, 2);
+    const out_at = try f.appendInst(exit, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = out_off } });
+    try f.appendStore(exit, total, out_at);
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var masked_loads: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b0000111) continue;
+        try std.testing.expectEqual(@as(u32, 0), (w >> 25) & 1);
+        masked_loads += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), masked_loads);
+
+    // The input words are read before the output overwrites them, lane by lane: lane 3 reads
+    // words 0 to 3 and every lane writes its own word, so the inputs have to be read first.
+    var data: [8]u32 = @splat(0);
+    for (0..8) |i| data[i] = @intCast(i + 1);
+    try runOnce(words, &data, 0, 1);
+    const want = [_]u32{ 1, 3, 6, 10 };
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(want[i], data[i]);
+    }
+}
+
+test "a masked load whose mask is the same in every lane is refused" {
+    // The mirror of the masked store rule: every lane agreeing means the answer is a branch over
+    // the load, not a predicate on it. Only hand-written IR says this.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const always = try f.appendInst(entry, bool_t, .{ .iconst = 1 });
+    // The ADDRESS is per-lane, so the result is per-lane and the only thing wrong with this load
+    // is its mask. A uniform address would be refused for its result instead, which would leave
+    // this rule untested.
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const got = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at, .mask = always } });
+    try f.appendStore(entry, got, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a mask nothing else reads is still kept alive for its load" {
+    // A masked load whose mask has NO OTHER READER. In everything the compiler builds itself the
+    // mask is shared: if-conversion gives the same condition to the arm's selects, and a loop
+    // gives the same active mask to every access and freeze. So a use count or a live range that
+    // forgot a load's mask would go unnoticed, and this is the shape that notices.
+    //
+    // Lanes 2 and 3 address far outside the buffer, so the mask is what keeps the run from
+    // faulting, and lanes 0 and 1 holding the right words is what says the mask was the condition
+    // rather than whatever the register happened to contain.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const far = try f.appendArithImm(entry, u32_t, .shl, tid, 12);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = far } });
+    const got = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at, .mask = cond } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const out = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, got, out);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    var data: [2048]u32 = @splat(0);
+    data[0] = 11;
+    data[1024] = 22;
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 11), data[0]);
+    try std.testing.expectEqual(@as(u32, 22), data[1]);
+}

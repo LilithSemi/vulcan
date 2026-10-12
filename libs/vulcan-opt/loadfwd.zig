@@ -47,7 +47,11 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     // not hold the value a plain store put there, and a later plain load must not
                     // be answered from it either. Forwarding across the tag silently deletes the
                     // byte swap the backend would have emitted.
-                    if (!ld.@"volatile" and !func.isByteOrderTagged(inst)) {
+                    //
+                    // A MASKED load is kept out of it in both directions: its result holds the
+                    // memory only for the lanes its mask names, so it may not be answered from an
+                    // earlier store and no later load may be answered from it.
+                    if (!ld.@"volatile" and ld.mask == null and !func.isByteOrderTagged(inst)) {
                         const result = func.instResult(inst).?;
                         if (find(avail.items, func, ld.ptr, func.valueType(result))) |v| {
                             func.replaceAllUses(result, v);

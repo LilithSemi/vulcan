@@ -871,6 +871,9 @@ pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
                 e.mask |= @as(u4, 1) << @intCast(out.comp);
             },
             .load => |ld| {
+                // A masked load is per-lane predication (see `Load.mask`). A TGSI fetch has no
+                // per-lane predicate here, so refuse rather than read every lane.
+                if (ld.mask != null) return error.Unsupported;
                 const r = result orelse continue;
                 // A reload of a texture-sample result -> that component of the TEX temp.
                 if (tex_addr.get(ld.ptr)) |te| {

@@ -201,8 +201,21 @@ pub const GlobalAddr = struct { symbol: u32, via_got: bool = false };
 /// hint for a volatile address, which is a question about what `prefetch` may name
 /// rather than a violation of the three rules above. `vulcan-spirv/widen`'s sampler
 /// gather path would drop the flag, and is unreachable from any current frontend.
-pub const Load = struct { ptr: Value, @"volatile": bool = false };
+pub const Load = struct { ptr: Value, @"volatile": bool = false, mask: ?Value = null };
 
+/// `Load.mask` predicates the load PER LANE, the mirror of `Store.mask`: where a lane's mask bit
+/// is clear the lane makes no access at all, and its share of the result holds whatever the
+/// destination held before. So the result is only defined for the lanes the mask names, which is
+/// the same contract every other per-lane operation has in a masked region, and a reader outside
+/// the mask was going to be reading an undefined lane either way.
+///
+/// It exists so a load can survive if-conversion. An UNMASKED load in a converted arm reads an
+/// address the lane never meant to compute, which can fault or touch a device register, so without
+/// this a branch whose arm reads memory cannot be flattened at all.
+///
+/// A pass that reasons about what a load RETURNED must treat a masked one as holding nothing it
+/// can rely on, which is why store-to-load forwarding and `alloca` promotion refuse it.
+///
 /// A store to memory. Produces no result. `volatile` mirrors `Load.volatile` (see its doc).
 ///
 /// `mask` predicates the store PER LANE on a vector target: where a lane's mask bit is clear the
@@ -1486,7 +1499,10 @@ pub const Function = struct {
                     cv.global_scale = r(from, to, cv.global_scale);
                 },
                 .unary => |*u| u.value = r(from, to, u.value),
-                .load => |*l| l.ptr = r(from, to, l.ptr),
+                .load => |*l| {
+                    l.ptr = r(from, to, l.ptr);
+                    if (l.mask) |m| l.mask = r(from, to, m);
+                },
                 .store => |*st| {
                     st.value = r(from, to, st.value);
                     st.ptr = r(from, to, st.ptr);
@@ -1782,7 +1798,11 @@ pub const Function = struct {
                 .ret_pieces = c.ret_pieces,
                 .sret = c.sret,
             } },
-            .load => |ld| .{ .load = .{ .ptr = remapValue(map, ld.ptr), .@"volatile" = ld.@"volatile" } },
+            .load => |ld| .{ .load = .{
+                .ptr = remapValue(map, ld.ptr),
+                .@"volatile" = ld.@"volatile",
+                .mask = if (ld.mask) |m| remapValue(map, m) else null,
+            } },
             .store => |st| .{ .store = .{
                 .value = remapValue(map, st.value),
                 .ptr = remapValue(map, st.ptr),
@@ -2272,12 +2292,15 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
         // `volatile` prints as a word after the mnemonic, the same shape as `global_addr
         // got`. It marks an access the optimizer must not remove, move or merge, so the
         // text form must carry it.
-        .load => |ld| try w.print("let v{d} = load{s} {f}, v{d}", .{
-            self.valueName(data.result.?),
-            if (ld.@"volatile") " volatile" else "",
-            self.types.fmt(self.valueType(data.result.?)),
-            self.valueName(ld.ptr),
-        }),
+        .load => |ld| {
+            try w.print("let v{d} = load{s} {f}, v{d}", .{
+                self.valueName(data.result.?),
+                if (ld.@"volatile") " volatile" else "",
+                self.types.fmt(self.valueType(data.result.?)),
+                self.valueName(ld.ptr),
+            });
+            if (ld.mask) |m| try w.print(" if v{d}", .{self.valueName(m)});
+        },
         .store => |st| {
             try w.print("store{s} v{d}, v{d}", .{
                 if (st.@"volatile") " volatile" else "",

@@ -90,7 +90,10 @@ fn collectOperands(
             try buf.append(allocator, c.target);
             for (func.valueList(c.args)) |a| try buf.append(allocator, a);
         },
-        .load => |l| try buf.append(allocator, l.ptr),
+        .load => |l| {
+            try buf.append(allocator, l.ptr);
+            if (l.mask) |m| try buf.append(allocator, m);
+        },
         .store => |st| {
             try buf.append(allocator, st.value);
             try buf.append(allocator, st.ptr);

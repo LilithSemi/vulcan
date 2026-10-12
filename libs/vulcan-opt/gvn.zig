@@ -202,7 +202,10 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
                 cv.global_scale = sub(canon, cv.global_scale);
             },
             .unary => |*u| u.value = sub(canon, u.value),
-            .load => |*l| l.ptr = sub(canon, l.ptr),
+            .load => |*l| {
+                l.ptr = sub(canon, l.ptr);
+                if (l.mask) |m| l.mask = sub(canon, m);
+            },
             .store => |*st| {
                 st.value = sub(canon, st.value);
                 st.ptr = sub(canon, st.ptr);

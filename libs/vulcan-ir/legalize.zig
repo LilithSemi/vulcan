@@ -412,7 +412,10 @@ fn applySubst(func: *Function, subst: *const Subst) void {
                 cv.global_scale = sub(subst, cv.global_scale);
             },
             .unary => |*u| u.value = sub(subst, u.value),
-            .load => |*ld| ld.ptr = sub(subst, ld.ptr),
+            .load => |*ld| {
+                ld.ptr = sub(subst, ld.ptr);
+                if (ld.mask) |m| ld.mask = sub(subst, m);
+            },
             .store => |*st| {
                 st.value = sub(subst, st.value);
                 st.ptr = sub(subst, st.ptr);
@@ -533,7 +536,10 @@ fn countUses(func: *const Function, uses: []u32) void {
                     uses[@backingInt(cv.global_scale)] += 1;
                 },
                 .unary => |u| uses[@backingInt(u.value)] += 1,
-                .load => |ld| uses[@backingInt(ld.ptr)] += 1,
+                .load => |ld| {
+                    uses[@backingInt(ld.ptr)] += 1;
+                    if (ld.mask) |m| uses[@backingInt(m)] += 1;
+                },
                 .store => |st| {
                     uses[@backingInt(st.value)] += 1;
                     uses[@backingInt(st.ptr)] += 1;

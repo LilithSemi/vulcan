@@ -237,12 +237,14 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
     // The same wide load refuses an `endian`-tagged element load (see `Attribute.endian`). This is
     // a WIDENING: one `<16 x i8>` load cannot express a per-element byte order, and the tag would
     // be dropped from the survivor. Refuse the loop; it stays scalar and keeps every tag.
+    // A MASKED load is refused for the same reason: one wide load reads every element, and a
+    // masked lane reads none.
     const bp_x = switch (func.opcode(la_inst)) {
-        .load => |l| if (l.@"volatile") return null else l.ptr,
+        .load => |l| if (l.@"volatile" or l.mask != null) return null else l.ptr,
         else => return null,
     };
     const bp_y = switch (func.opcode(lb_inst)) {
-        .load => |l| if (l.@"volatile") return null else l.ptr,
+        .load => |l| if (l.@"volatile" or l.mask != null) return null else l.ptr,
         else => return null,
     };
     if (func.isByteOrderTagged(la_inst) or func.isByteOrderTagged(lb_inst)) return null;

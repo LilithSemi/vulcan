@@ -141,7 +141,11 @@ fn rebuildOpcode(
             break :blk .{ .call_indirect = out };
         },
         .global_addr => |g| .{ .global_addr = .{ .symbol = g.symbol, .via_got = g.via_got } },
-        .load => |l| .{ .load = .{ .ptr = remapValue(value_map, l.ptr), .@"volatile" = l.@"volatile" } },
+        .load => |l| .{ .load = .{
+            .ptr = remapValue(value_map, l.ptr),
+            .@"volatile" = l.@"volatile",
+            .mask = if (l.mask) |m| remapValue(value_map, m) else null,
+        } },
         .store => |st| .{ .store = .{
             .value = remapValue(value_map, st.value),
             .ptr = remapValue(value_map, st.ptr),

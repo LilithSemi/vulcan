@@ -2437,6 +2437,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             try ctx.store(allocator, result, rd);
         },
         .load => {
+            // A masked load is per-lane predication (see `Load.mask`), which this backend has no
+            // form for. Reading every lane is a wrong answer, so refuse.
+            if (func.opcode(inst).load.mask != null) return error.Unsupported;
             // A folded load addresses `[base + disp32]`. `baseOf` yields the
             // fold base, the add's lhs, and `offOf` yields the displacement.
             // Both are the raw ptr and 0 when unfolded, so the non-folding

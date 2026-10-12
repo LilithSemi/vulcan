@@ -326,7 +326,10 @@ fn forEachOperand(func: *const Function, inst: Inst, ctx: anytype, comptime f: f
             f(ctx, s.then);
             f(ctx, s.@"else");
         },
-        .load => |l| f(ctx, l.ptr),
+        .load => |l| {
+            f(ctx, l.ptr);
+            if (l.mask) |m| f(ctx, m);
+        },
         .atomic_rmw => |a| {
             f(ctx, a.ptr);
             f(ctx, a.value);
@@ -752,10 +755,12 @@ fn soleJump(func: *const Function, block: Block) ?ir.function.Jump {
     };
 }
 
+/// Whether `block` holds an access that would need the complement of a condition to run under.
 fn hasStore(func: *const Function, block: Block) bool {
-    for (func.blockInsts(block)) |inst| {
-        if (func.opcode(inst) == .store) return true;
-    }
+    for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+        .store, .load => return true,
+        else => {},
+    };
     return false;
 }
 
@@ -788,11 +793,12 @@ fn invertedCompare(func: *const Function, cond: Value) ?ir.function.Compare {
 fn convertible(code: ir.function.Opcode) bool {
     return switch (code) {
         .iconst, .fconst, .global_addr, .arith, .arith_imm, .icmp, .select, .convert, .unary => true,
-        // A store converts because the core can predicate one. An inactive lane makes no bus
-        // access at all, so a store spliced out of an arm writes exactly the lanes that chose it.
-        // A store that already carries a mask converts too: the two masks are ANDed, which is a
-        // mask op and exact at any lane count. See `maskBinOp`.
-        .store => true,
+        // A store or a load converts because the core can predicate either. An inactive lane makes
+        // no bus access at all, so an access spliced out of an arm touches exactly the lanes that
+        // chose it, and a lane that did not read gets a destination lane it was never going to
+        // look at. An access that already carries a mask converts too: the two masks are ANDed,
+        // which is a mask op and exact at any lane count. See `maskBinOp`.
+        .store, .load => true,
         else => false,
     };
 }
@@ -825,6 +831,7 @@ fn convert(allocator: std.mem.Allocator, func: *Function, a: Block, d: Diamond) 
         for (moved) |inst| {
             const carried: ?Value = switch (func.opcode(inst)) {
                 .store => |st| st.mask,
+                .load => |l| l.mask,
                 else => null,
             };
             if (carried) |inner| {
@@ -834,12 +841,17 @@ fn convert(allocator: std.mem.Allocator, func: *Function, a: Block, d: Diamond) 
                     .rhs = mask.?,
                 } });
                 try func.blockInstsMut(a).append(allocator, inst);
-                func.opcodeMut(inst).store.mask = both;
+                switch (func.opcodeMut(inst).*) {
+                    .store => |*st| st.mask = both,
+                    .load => |*l| l.mask = both,
+                    else => unreachable,
+                }
                 continue;
             }
             try func.blockInstsMut(a).append(allocator, inst);
             switch (func.opcodeMut(inst).*) {
                 .store => |*st| st.mask = mask,
+                .load => |*l| l.mask = mask,
                 else => {},
             }
         }
@@ -1073,10 +1085,9 @@ fn divergentLoop(func: *const Function, block: Block, divergent: []const bool) ?
     for (func.blockInsts(pre)) |inst| {
         if (func.opcode(inst) == .@"if") return null;
     }
-    // Every instruction in the body runs for a lane that has already finished, so the body must
-    // be instructions that cost nothing when their answer is thrown away. A STORE is admitted
-    // because it takes the mask. A LOAD is not: an inactive lane would read an address it never
-    // meant to compute, and the answer for that is a masked load, which the IR cannot say yet.
+    // Every instruction in the body runs for a lane that has already finished, so the body must be
+    // instructions that cost nothing when their answer is thrown away. A store and a load both
+    // qualify because both take the mask: a finished lane makes no access at all.
     for (insts[0 .. insts.len - 1]) |inst| {
         if (!convertible(func.opcode(inst))) return null;
     }
@@ -1173,6 +1184,7 @@ fn convertLoop(
     for (original[0 .. original.len - 1]) |inst| {
         const carried_mask: ?Value = switch (func.opcode(inst)) {
             .store => |st| st.mask,
+            .load => |l| l.mask,
             else => null,
         };
         if (carried_mask) |inner| {
@@ -1182,12 +1194,17 @@ fn convertLoop(
                 .rhs = active,
             } });
             try func.blockInstsMut(header).append(allocator, inst);
-            func.opcodeMut(inst).store.mask = both;
+            switch (func.opcodeMut(inst).*) {
+                .store => |*st| st.mask = both,
+                .load => |*l| l.mask = both,
+                else => unreachable,
+            }
             continue;
         }
         try func.blockInstsMut(header).append(allocator, inst);
         switch (func.opcodeMut(inst).*) {
             .store => |*st| st.mask = active,
+            .load => |*l| l.mask = active,
             else => {},
         }
     }
@@ -2056,6 +2073,18 @@ fn checkInst(
             const r = func.instResult(inst) orelse return error.Unsupported;
             // An f16 is the low half of a lane, not a word in memory. See `isHalf`.
             if (isHalf(func, func.valueType(r))) return error.Unsupported;
+            // A mask has to be a real per-lane predicate, the same rule as a masked store: a
+            // warp-uniform one says every lane agrees, and the answer for that is a branch over
+            // the load rather than a predicate on it.
+            if (l.mask) |m| {
+                if (!isWord(func, func.valueType(m))) return error.Unsupported;
+                if (!divergent[@backingInt(m)]) return error.Unsupported;
+                // A masked load leaves the lanes its mask excludes holding whatever the
+                // destination held, so the result is only defined where the mask is set. That is
+                // true of every per-lane op in a masked region, and the per-lane path is the only
+                // one that can express it.
+                if (!resultDivergent(func, inst, divergent)) return error.Unsupported;
+            }
         },
         .store => |st| {
             if (!isWord(func, func.valueType(st.value))) return error.Unsupported;
@@ -2651,11 +2680,20 @@ const Emitter = struct {
             // and recognizing that is the next optimization rather than a correctness matter.
             .load => |l| {
                 const dst = try self.vreg(self.func.instResult(inst).?, pos);
+                const mask = l.mask;
+                if (mask) |m| {
+                    const bits = try self.vreg(m, pos);
+                    try self.put(rv.vmand_mm(.v0, bits, bits));
+                }
                 // A contiguous run is one instruction and one bus run. See `Strides`.
                 if (self.strides.at(inst)) |b| {
-                    return self.put(rv.vle32(dst, try self.reg(b, pos)));
+                    const start = try self.reg(b, pos);
+                    if (mask != null) return self.put(rv.vle32_m(dst, start));
+                    return self.put(rv.vle32(dst, start));
                 }
-                try self.put(rv.vluxei32(dst, .x0, try self.vectorOperand(l.ptr, pos)));
+                const addr = try self.vectorOperand(l.ptr, pos);
+                if (mask != null) return self.put(rv.vluxei32_m(dst, .x0, addr));
+                try self.put(rv.vluxei32(dst, .x0, addr));
             },
             .store => |st| {
                 // A masked store can have a uniform address AND a uniform value, since the mask
@@ -2952,7 +2990,13 @@ const Emitter = struct {
             .arith_imm => |a| try self.emitArithImm(a, dst, pos),
             .icmp => |c| try self.emitCompare(c, dst, pos),
             .select => |s| try self.emitSelect(s, dst, pos),
-            .load => |l| try self.put(rv.lw(dst, try self.reg(l.ptr, pos), 0)),
+            // A masked load is never scalar: admission requires its result to be per-lane. The
+            // refusal is here because a scalar load cannot predicate, so a change that routed one
+            // here would read every lane.
+            .load => |l| if (l.mask != null)
+                return error.Unsupported
+            else
+                try self.put(rv.lw(dst, try self.reg(l.ptr, pos), 0)),
             // A masked store is never scalar: `isVector` reports one as per-lane whatever its
             // operands are. The refusal is here because a scalar store cannot predicate, so a
             // change that routed one here would write every lane.

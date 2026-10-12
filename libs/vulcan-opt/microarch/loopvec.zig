@@ -185,7 +185,11 @@ fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Va
         .convert => |c| .{ .convert = .{ .value = rv(vmap, c.value) } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = rv(vmap, u.value) } },
         .extract => |e| .{ .extract = .{ .aggregate = rv(vmap, e.aggregate), .index = e.index } },
-        .load => |l| .{ .load = .{ .ptr = rv(vmap, l.ptr), .@"volatile" = l.@"volatile" } },
+        .load => |l| .{ .load = .{
+            .ptr = rv(vmap, l.ptr),
+            .@"volatile" = l.@"volatile",
+            .mask = if (l.mask) |m| rv(vmap, m) else null,
+        } },
         .store => |s| .{ .store = .{
             .value = rv(vmap, s.value),
             .ptr = rv(vmap, s.ptr),

@@ -507,7 +507,9 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
             // deletes the load and hands the stored SSA value straight to its readers, and the
             // byte swap the backend would have emitted for the tag goes with it. The slot must
             // keep its real storage so the tagged access survives to codegen.
-            .load => |ld| if (ld.@"volatile" or func.isByteOrderTagged(inst)) esc(promotable, ld.ptr),
+            // A MASKED load pins the slot too. Promotion answers it with the value a store put
+            // there, and a masked load reads nothing for the lanes its mask excludes.
+            .load => |ld| if (ld.@"volatile" or ld.mask != null or func.isByteOrderTagged(inst)) esc(promotable, ld.ptr),
             // ptr is fine, value escapes; a `volatile` or `endian`-tagged store likewise pins its
             // alloca unpromotable.
             .store => |st| {

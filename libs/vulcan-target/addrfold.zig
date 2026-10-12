@@ -187,7 +187,10 @@ fn countUses(func: *const Function, uses: []u32) void {
                     uses[@backingInt(cv.global_scale)] += 1;
                 },
                 .unary => |u| uses[@backingInt(u.value)] += 1,
-                .load => |l| uses[@backingInt(l.ptr)] += 1,
+                .load => |l| {
+                    uses[@backingInt(l.ptr)] += 1;
+                    if (l.mask) |m| uses[@backingInt(m)] += 1;
+                },
                 .store => |st| {
                     uses[@backingInt(st.value)] += 1;
                     uses[@backingInt(st.ptr)] += 1;

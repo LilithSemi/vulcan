@@ -602,7 +602,17 @@ const FunctionParser = struct {
             try self.eat(',');
             self.skipWs();
             const ptr = try self.parseValueRef();
-            const result = try self.func.appendInst(block, ty, .{ .load = .{ .ptr = ptr, .@"volatile" = is_volatile } });
+            // `if v3` predicates the load per lane. See `Load.mask`.
+            self.skipWs();
+            const mask: ?Value = if (self.tryWord("if")) blk: {
+                self.skipWs();
+                break :blk try self.parseValueRef();
+            } else null;
+            const result = try self.func.appendInst(block, ty, .{ .load = .{
+                .ptr = ptr,
+                .@"volatile" = is_volatile,
+                .mask = mask,
+            } });
             try self.recordValue(result);
             return result;
         }

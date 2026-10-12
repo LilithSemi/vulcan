@@ -4153,6 +4153,10 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, stage: Stage, 
             }
         },
         .load => |l| {
+            // A masked load is per-lane predication (see `Load.mask`). This backend predicates
+            // with its own guard registers and nothing builds that from an IR mask yet, so refuse
+            // rather than read every lane.
+            if (l.mask != null) return error.Unsupported;
             const rd = gprOf(loc.*, func.instResult(inst).?);
             // A reload of a sampled-texture result: the four loads of the
             // host-sampler out-pointer resolve to the TEX result block

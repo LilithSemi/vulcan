@@ -560,7 +560,11 @@ fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Va
         .quantize_nvfp4 => |c| .{ .quantize_nvfp4 = .{ .value = rv(vmap, c.value), .block_scale = rv(vmap, c.block_scale), .global_scale = rv(vmap, c.global_scale), .block_application = c.block_application, .global_application = c.global_application } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = rv(vmap, u.value) } },
         .extract => |e| .{ .extract = .{ .aggregate = rv(vmap, e.aggregate), .index = e.index } },
-        .load => |l| .{ .load = .{ .ptr = rv(vmap, l.ptr), .@"volatile" = l.@"volatile" } },
+        .load => |l| .{ .load = .{
+            .ptr = rv(vmap, l.ptr),
+            .@"volatile" = l.@"volatile",
+            .mask = if (l.mask) |m| rv(vmap, m) else null,
+        } },
         .store => |s| .{ .store = .{
             .value = rv(vmap, s.value),
             .ptr = rv(vmap, s.ptr),

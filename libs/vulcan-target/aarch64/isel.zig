@@ -1635,6 +1635,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .load => {
+                    // A masked load is per-lane predication (see `Load.mask`), which this backend
+                    // has no form for. Reading every lane is a wrong answer, so refuse.
+                    if (func.opcode(inst).load.mask != null) return error.Unsupported;
                     // A folded load addresses `[base, #off]` directly: `baseOf` yields the fold base
                     // (the add's lhs) and `offOf` the displacement. Both are the raw ptr and 0 when
                     // unfolded, so the non-folding case is byte-identical.

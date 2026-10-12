@@ -651,6 +651,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             try ctx.store(allocator, result, rd);
         },
         .load => {
+            // A masked load is per-lane predication (see `Load.mask`), which this backend has no
+            // form for. Reading every lane is a wrong answer, so refuse.
+            if (func.opcode(inst).load.mask != null) return error.Unsupported;
             // x86-32 is integer-only: reject a float, vector, bool, or pointer load result
             // cleanly rather than misread its bytes.
             if (func.types.type_kind(func.valueType(result)) != .int) return error.Unsupported;

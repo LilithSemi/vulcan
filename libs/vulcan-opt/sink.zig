@@ -139,7 +139,10 @@ fn noteReads(func: *const Function, inst: Inst, candidate: []const bool, reader:
         .convert => |cv| note(candidate, reader, inst, cv.value),
         .decode_low_float, .encode_low_float => |cv| note(candidate, reader, inst, cv.value),
         .unary => |u| note(candidate, reader, inst, u.value),
-        .load => |l| note(candidate, reader, inst, l.ptr),
+        .load => |l| {
+            note(candidate, reader, inst, l.ptr);
+            if (l.mask) |m| note(candidate, reader, inst, m);
+        },
         .store => |st| {
             note(candidate, reader, inst, st.value);
             note(candidate, reader, inst, st.ptr);

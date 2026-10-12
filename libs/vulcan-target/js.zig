@@ -280,7 +280,9 @@ const Emitter = struct {
             .convert => |cv| try self.emitConvert(res.?, cv.value, indent),
             .unary => |u| try self.emitUnary(res.?, u, indent),
             .alloca => |al| try self.print("{s}v{d} = __alloca({d});\n", .{ indent, self.name(res.?), self.typeSize(al.elem) }),
-            .load => |ld| try self.emitLoad(res.?, ld.ptr, indent),
+            // A masked load is per-lane predication (see `Load.mask`), which this backend has no
+            // form for. Reading every lane is a wrong answer, so refuse.
+            .load => |ld| if (ld.mask != null) return error.Unsupported else try self.emitLoad(res.?, ld.ptr, indent),
             // A masked store is per-lane predication (see `Store.mask`), which this backend has
             // no form for. Writing every lane is a wrong answer, so refuse.
             .store => |st| if (st.mask != null) return error.Unsupported else try self.emitStore(st.value, st.ptr, indent),
