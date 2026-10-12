@@ -945,8 +945,8 @@ test "a warp-uniform float divide becomes the one scalar divide" {
 
 test "the backend refuses the float work Glacier cannot do" {
     const allocator = std.testing.allocator;
-    const Shape = enum { add, compare, half_store, per_lane_divide };
-    for ([_]Shape{ .add, .compare, .half_store, .per_lane_divide }) |shape| {
+    const Shape = enum { add, mul, compare, half_store, per_lane_divide };
+    for ([_]Shape{ .add, .mul, .compare, .half_store, .per_lane_divide }) |shape| {
         var f = Function.init(allocator);
         defer f.deinit();
         const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
@@ -970,6 +970,16 @@ test "the backend refuses the float work Glacier cannot do" {
                 const y = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = base } });
                 const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
                 break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
+            },
+            // A multiply of two f32 VALUES has no lowering either. A MAC factor must be an f16, and
+            // narrowing an operand to make it fit would throw away precision the IR asked to
+            // keep, silently. Building a non-widening vector multiply is the other answer, and
+            // which of the three happens is not the compiler's to pick.
+            .mul => blk: {
+                const x = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = base } });
+                const y = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = base } });
+                const p = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+                break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = p } });
             },
             // There is no float compare, and an integer compare over the bits is a different
             // relation.
