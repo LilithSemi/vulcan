@@ -1665,3 +1665,55 @@ test "a positive zero accumulator becomes a zeroed destination, a negative one d
         }
     }
 }
+
+test "a MAC keeps its factors alive past the converts it absorbed" {
+    // An absorbed convert emits nothing, but the IR still says the f16 dies there, so the
+    // allocator is free to hand that register to a value defined between the convert and the MAC.
+    // The MAC would then multiply whatever landed in it. `fusedOperands` is what tells the
+    // allocator that the MAC, not the convert, is the real reader.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const other = try f.appendArithImm(entry, i32_t, .add, lane, 1);
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+    const hb = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = other } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+    // Per-lane values born after the absorbed converts, each live past the MAC, so the allocator
+    // has every reason to reuse the registers the two f16 appear to have vacated.
+    var junk: [6]Value = undefined;
+    for (&junk, 1..) |*j, k| j.* = try f.appendArithImm(entry, u32_t, .mul, tid, @intCast(k + 1));
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wb } });
+
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, product, at);
+    for (junk, 0..) |j, n| {
+        const slot = try f.appendArithImm(entry, u32_t, .add, offset, @intCast((n + 1) * 32));
+        const where = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = slot } });
+        try f.appendStore(entry, j, where);
+    }
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+
+    var data: [64]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(n * (n + 1.0))), data[i]);
+    }
+}

@@ -155,7 +155,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     var macs = try findMacs(allocator, &work, uses, divergent);
     defer macs.deinit(allocator);
 
-    var ctx: Ctx = .{ .divergent = divergent, .mac = macs.mac };
+    var ctx: Ctx = .{ .divergent = divergent, .macs = &macs };
 
     try checkSupported(&work, opts, divergent, &macs);
 
@@ -182,6 +182,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
         .scratch = &scratch_set,
         .ctx = &ctx,
         .copySource = copySource,
+        .fusedOperands = fusedOperands,
         .coalesce_block_params = true,
     };
     var walloc = try wimmer.allocate(allocator, &work, &desc);
@@ -225,7 +226,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
 // value came from, not of its type, and `thread_id_x` already says a thread is a lane.
 
 /// What the analysis and the emitter share. `desc.ctx` points at it.
-const Ctx = struct { divergent: []const bool, mac: []const ?Mac };
+const Ctx = struct { divergent: []const bool, macs: *const Macs };
 
 /// Whether a builtin differs between the lanes of one warp. A warp index is the same in every
 /// lane; a lane or thread index is the point of the exercise.
@@ -374,7 +375,7 @@ fn copySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
     const inst = func.definingInst(v) orelse return null;
     // A MAC reports its accumulator, or nothing when it has none and zeroes its destination
     // instead. Either way the switch below must not read the instruction as a plain arithmetic op.
-    const src = if (c.mac[@backingInt(inst)]) |m| (m.acc orelse return null) else switch (func.opcode(inst)) {
+    const src = if (c.macs.at(inst)) |m| (m.acc orelse return null) else switch (func.opcode(inst)) {
         .unary => |u| if (u.op == .reinterpret) u.value else return null,
         .convert => |cv| if (isBitPreservingConvert(func, inst, cv)) cv.value else return null,
         else => return null,
@@ -383,6 +384,38 @@ fn copySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
     // is per-lane and the accumulator is not. That needs no guard here: `wimmer.buildIntervals`
     // drops a hint whose source is in another class, because the two share no register pool.
     return src;
+}
+
+/// What a MAC's machine instruction really reads, which is not what the IR says.
+///
+/// An absorbed multiply or convert emits nothing, so the IR's operand walk is wrong in both
+/// directions: the f16 factors appear to die at the converts that no longer exist, and the
+/// products appear to be read by a multiply that no longer exists. Left unreported, the allocator
+/// hands a factor's register to a value born between the convert and the MAC, and the MAC
+/// multiplies whatever landed there. There is no diagnostic for that; it is a wrong frame.
+fn fusedOperands(ctx: *const anyopaque, func: *const Function, inst: Inst, out: *[wimmer.max_fused_operands]Value) ?u8 {
+    const c: *const Ctx = @ptrCast(@alignCast(ctx));
+    // An absorbed instruction reads nothing, because it is not emitted. Reporting that is worth
+    // real code: a vertex pass of 1840 words came out at 1582 once the suppressed multiplies and
+    // converts stopped being counted as readers. It is not a register-pressure win, since the
+    // factors now live LONGER by as much as the products live less.
+    if (c.macs.isFolded(inst)) return 0;
+    const m = c.macs.at(inst) orelse return null;
+    _ = func;
+    var n: u8 = 0;
+    if (m.acc) |acc| {
+        out[n] = acc;
+        n += 1;
+    }
+    for ([_]Factor{ m.a, m.b }) |f| switch (f) {
+        // A constant is materialized at the MAC and is no one's value.
+        .constant => {},
+        .value => |v| {
+            out[n] = v;
+            n += 1;
+        },
+    };
+    return n;
 }
 
 /// Whether `ty` is a value a Glacier register holds. One 32-bit word, nothing narrower.
