@@ -371,6 +371,22 @@ pub fn vsuxei32(vs3: VReg, rs1: Reg, vs2: VReg) u32 {
     return 0b0100111 | (vnum(vs3) << 7) | (0b110 << 12) | (num(rs1) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b01) << 26);
 }
 
+/// `vsuxei32.v vs3, (rs1), vs2, v0.t`: the scatter above, predicated by v0. A lane whose mask bit
+/// is clear makes NO access, so a masked scatter is how a store inside divergent control flow
+/// reaches memory. Clearing bit 25, the `vm` bit, is the whole difference.
+pub fn vsuxei32_m(vs3: VReg, rs1: Reg, vs2: VReg) u32 {
+    return vsuxei32(vs3, rs1, vs2) & vm_clear;
+}
+
+/// `vluxei32.v vd, (rs1), vs2, v0.t`: the gather predicated by v0. A lane whose mask bit is clear
+/// makes no access and keeps what `vd` held.
+pub fn vluxei32_m(vd: VReg, rs1: Reg, vs2: VReg) u32 {
+    return vluxei32(vd, rs1, vs2) & vm_clear;
+}
+
+/// Every bit but `vm`. ANDing turns an unmasked vector access into the v0-predicated form.
+const vm_clear: u32 = ~(@as(u32, 1) << 25);
+
 // The A extension, word width. An AMO reads the word at `addr`, combines it with `value`, writes
 // the answer back and gives the ORIGINAL back in `rd`, with the read and the write held together
 // on the bus. That makes it work against an MMIO register as well as against memory.
@@ -2407,4 +2423,12 @@ test "the RVV float arithmetic, compares and widening convert match LLVM's assem
     // The same reference run pins the add this file already had, which checks the parse of the
     // dump the other words came from.
     try std.testing.expectEqual(@as(u32, 0x021111d7), vfadd_vv(.v3, .v1, .v2));
+}
+
+test "the masked indexed accesses clear the vm bit and nothing else" {
+    // Pinned against LLVM's `vsuxei32.v v3, (x1), v2, v0.t` and the gather beside it.
+    try std.testing.expectEqual(@as(u32, 0x0620e1a7), vsuxei32(.v3, .x1, .v2));
+    try std.testing.expectEqual(@as(u32, 0x0420e1a7), vsuxei32_m(.v3, .x1, .v2));
+    try std.testing.expectEqual(@as(u32, 0x0620e187), vluxei32(.v3, .x1, .v2));
+    try std.testing.expectEqual(@as(u32, 0x0420e187), vluxei32_m(.v3, .x1, .v2));
 }

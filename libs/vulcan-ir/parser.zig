@@ -869,6 +869,13 @@ const FunctionParser = struct {
         try self.eat(',');
         self.skipWs();
         const ptr = try self.parseValueRef();
+        // `if v3` predicates the store per lane. See `Store.mask`.
+        self.skipWs();
+        if (self.tryWord("if")) {
+            self.skipWs();
+            const mask = try self.parseValueRef();
+            return self.func.appendStoreMaskedVol(block, value, ptr, mask, is_volatile);
+        }
         try self.func.appendStoreVol(block, value, ptr, is_volatile);
     }
 

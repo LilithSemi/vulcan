@@ -1535,6 +1535,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         // `store` produces no result, so the code handles it before the result
         // unwrap below.
         const st = func.opcode(inst).store;
+        // A masked store is per-lane predication (see `Store.mask`), which this backend has no
+        // form for. Writing every lane is a wrong answer, so refuse.
+        if (st.mask != null) return error.Unsupported;
         // A folded store addresses `[base + disp32]`. `baseOf` yields the fold
         // base, the add's lhs, and `offOf` yields the displacement. Both are
         // the raw ptr and 0 when unfolded, so the non-folding case stays

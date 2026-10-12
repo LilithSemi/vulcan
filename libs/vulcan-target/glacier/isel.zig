@@ -287,6 +287,7 @@ fn forEachOperand(func: *const Function, inst: Inst, ctx: anytype, comptime f: f
         .store => |st| {
             f(ctx, st.value);
             f(ctx, st.ptr);
+            if (st.mask) |m| f(ctx, m);
         },
         .@"if" => |cf| f(ctx, cf.cond),
         else => {},
@@ -654,6 +655,11 @@ fn candidate(func: *const Function, a: Block, divergent: []const bool) ?Diamond 
     for ([_]Block{ t, e }) |arm| {
         for (func.blockInsts(arm)) |inst| if (!convertible(func.opcode(inst))) return null;
     }
+    // A store in the ELSE arm runs where the condition is FALSE, so it needs the complement as a
+    // real value. The only exact complement here is an inverted integer compare: `!(a < b)` is
+    // `a >= b` over a total order, and is NOT over floats, where a NaN leaves both false. A
+    // condition this cannot invert means the else arm keeps its store and the diamond is refused.
+    if (hasStore(func, e) and invertedCompare(func, cf.cond) == null) return null;
     return .{
         .cond = cf.cond,
         .then_block = t,
@@ -675,11 +681,47 @@ fn soleJump(func: *const Function, block: Block) ?ir.function.Jump {
     };
 }
 
+fn hasStore(func: *const Function, block: Block) bool {
+    for (func.blockInsts(block)) |inst| {
+        if (func.opcode(inst) == .store) return true;
+    }
+    return false;
+}
+
+/// The compare that answers the opposite of `cond`, when `cond` is an integer compare. Null for
+/// anything else, including a FLOAT compare: an unordered pair leaves `lt` and `ge` both false, so
+/// flipping the operator there changes the answer rather than negating it.
+fn invertedCompare(func: *const Function, cond: Value) ?ir.function.Compare {
+    const inst = func.definingInst(cond) orelse return null;
+    const c = switch (func.opcode(inst)) {
+        .icmp => |x| x,
+        else => return null,
+    };
+    if (isFloat(func, func.valueType(c.lhs))) return null;
+    return .{
+        .op = switch (c.op) {
+            .eq => .ne,
+            .ne => .eq,
+            .lt => .ge,
+            .le => .gt,
+            .gt => .le,
+            .ge => .lt,
+        },
+        .lhs = c.lhs,
+        .rhs = c.rhs,
+    };
+}
+
 /// Whether an instruction may run for lanes that did not choose its arm. Anything that writes
 /// memory, or reads an address a lane never meant to compute, may not.
 fn convertible(code: ir.function.Opcode) bool {
     return switch (code) {
         .iconst, .fconst, .global_addr, .arith, .arith_imm, .icmp, .select, .convert, .unary => true,
+        // A store converts because the core can predicate one. An inactive lane makes no bus
+        // access at all, so a store spliced out of an arm writes exactly the lanes that chose it.
+        // A store that already carries a mask does NOT convert: combining two masks is a bitwise
+        // AND of mask registers, and this does not lean on that.
+        .store => |st| st.mask == null,
         else => false,
     };
 }
@@ -688,10 +730,28 @@ fn convert(allocator: std.mem.Allocator, func: *Function, a: Block, d: Diamond) 
     // Drop the branch first, so the arms' instructions land where it was.
     const a_insts = func.blockInstsMut(a);
     _ = a_insts.pop();
+
+    // The complement of the condition, materialized ONLY when the else arm stores. It goes in
+    // before either body so it dominates every store it masks.
+    const else_mask: ?Value = if (hasStore(func, d.else_block)) blk: {
+        const inverted = invertedCompare(func, d.cond).?;
+        break :blk try func.appendInst(a, func.valueType(d.cond), .{ .icmp = inverted });
+    } else null;
+
     for ([_]Block{ d.then_block, d.else_block }) |arm| {
+        const mask = if (arm == d.else_block) else_mask else d.cond;
         const body = func.blockInstsMut(arm);
+        const from = func.blockInsts(a).len;
         try func.blockInstsMut(a).appendSlice(allocator, body.items);
         body.clearRetainingCapacity();
+        // Both arms run for every lane now, so a store that was under the branch becomes a store
+        // under the mask. The lanes the mask excludes make no access at all.
+        for (func.blockInsts(a)[from..]) |inst| {
+            switch (func.opcodeMut(inst).*) {
+                .store => |*st| st.mask = mask,
+                else => {},
+            }
+        }
     }
 
     // Each join parameter becomes a select between what the two arms would have passed it.
@@ -1112,6 +1172,13 @@ fn checkInst(
         .store => |st| {
             if (!isWord(func, func.valueType(st.value))) return error.Unsupported;
             if (isHalf(func, func.valueType(st.value))) return error.Unsupported;
+            // A mask has to be a real per-lane predicate. A WARP-UNIFORM one says every lane
+            // agrees, and the answer for that is a branch over the store rather than a predicate
+            // on it, so it is refused rather than widened into a mask of all ones or all zeros.
+            if (st.mask) |m| {
+                if (!isWord(func, func.valueType(m))) return error.Unsupported;
+                if (!divergent[@backingInt(m)]) return error.Unsupported;
+            }
         },
         .atomic_rmw => |a| {
             _ = amoOp(func, a.op, func.valueType(a.value)) orelse return error.Unsupported;
@@ -1576,7 +1643,9 @@ const Emitter = struct {
     fn isVector(self: *const Emitter, inst: Inst) bool {
         if (self.func.instResult(inst)) |r| return self.isDivergent(r);
         return switch (self.func.opcode(inst)) {
-            .store => |st| self.isDivergent(st.ptr) or self.isDivergent(st.value),
+            // A masked store is per-lane by definition: the mask decides which lanes write, so it
+            // goes out as a predicated scatter even when the address and the value are uniform.
+            .store => |st| st.mask != null or self.isDivergent(st.ptr) or self.isDivergent(st.value),
             else => false,
         };
     }
@@ -1595,16 +1664,21 @@ const Emitter = struct {
                 try self.vectorOperand(l.ptr, pos),
             )),
             .store => |st| {
-                const addr = try self.vectorOperand(st.ptr, pos);
-                // Both operands cannot need the scratch: the address is per-lane here whenever
-                // the value is not, because a uniform store to a uniform address is not a vector
-                // instruction at all.
-                const val = if (self.isDivergent(st.value)) try self.vreg(st.value, pos) else blk: {
-                    if (addr == vscratch) return error.Unsupported;
-                    try self.put(rv.vmv_v_x(vscratch, try self.reg(st.value, pos)));
-                    break :blk vscratch;
+                // A masked store can have a uniform address AND a uniform value, since the mask
+                // alone makes it per-lane, so both go through the pool and each gets its own
+                // scratch register rather than sharing one.
+                var pool: Pool = .{};
+                const addr = try self.maskOperand(st.ptr, &pool, pos);
+                const val = try self.maskOperand(st.value, &pool, pos);
+                const mask = st.mask orelse {
+                    try self.put(rv.vsuxei32(val, .x0, addr));
+                    return;
                 };
-                try self.put(rv.vsuxei32(val, .x0, addr));
+                // The predicate reads from v0 and nowhere else. A lane whose bit is clear makes no
+                // bus access at all, which is what lets a store survive if-conversion.
+                const bits = try self.vreg(mask, pos);
+                try self.put(rv.vmand_mm(.v0, bits, bits));
+                try self.put(rv.vsuxei32_m(val, .x0, addr));
             },
             .unary => |u| try self.vmove(
                 try self.vreg(self.func.instResult(inst).?, pos),
@@ -1868,7 +1942,13 @@ const Emitter = struct {
             .icmp => |c| try self.emitCompare(c, dst, pos),
             .select => |s| try self.emitSelect(s, dst, pos),
             .load => |l| try self.put(rv.lw(dst, try self.reg(l.ptr, pos), 0)),
-            .store => |st| try self.put(rv.sw(try self.reg(st.value, pos), try self.reg(st.ptr, pos), 0)),
+            // A masked store is never scalar: `isVector` reports one as per-lane whatever its
+            // operands are. The refusal is here because a scalar store cannot predicate, so a
+            // change that routed one here would write every lane.
+            .store => |st| if (st.mask != null)
+                return error.Unsupported
+            else
+                try self.put(rv.sw(try self.reg(st.value, pos), try self.reg(st.ptr, pos), 0)),
             // The old value goes to `dst`, or to the lowering's scratch when nobody reads it: the
             // core has no reduction form that writes no register, so the read-modify-write happens
             // either way and the answer is thrown away.

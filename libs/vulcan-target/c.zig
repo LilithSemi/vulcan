@@ -410,6 +410,9 @@ const Emitter = struct {
                 try self.print("*)v{d};\n", .{self.name(ld.ptr)});
             },
             .store => |st| {
+                // A masked store is per-lane predication (see `Store.mask`), which C has no
+                // spelling for here. Writing every lane is a wrong answer, so refuse.
+                if (st.mask != null) return error.Unsupported;
                 try self.w("    *(");
                 try self.emitType(func.valueType(st.value));
                 try self.print("*)v{d} = v{d};\n", .{ self.name(st.ptr), self.name(st.value) });

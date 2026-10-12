@@ -281,7 +281,9 @@ const Emitter = struct {
             .unary => |u| try self.emitUnary(res.?, u, indent),
             .alloca => |al| try self.print("{s}v{d} = __alloca({d});\n", .{ indent, self.name(res.?), self.typeSize(al.elem) }),
             .load => |ld| try self.emitLoad(res.?, ld.ptr, indent),
-            .store => |st| try self.emitStore(st.value, st.ptr, indent),
+            // A masked store is per-lane predication (see `Store.mask`), which this backend has
+            // no form for. Writing every lane is a wrong answer, so refuse.
+            .store => |st| if (st.mask != null) return error.Unsupported else try self.emitStore(st.value, st.ptr, indent),
             .prefetch => {}, // a hint, JS has no prefetch, dropped
             // dot is aarch64+dotprod-only in practice. The JS backend has no lowering for it.
             .dot => return error.Unsupported,

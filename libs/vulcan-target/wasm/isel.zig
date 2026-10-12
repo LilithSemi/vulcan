@@ -1205,6 +1205,9 @@ fn emitInst(
             }
         },
         .store => |st| {
+            // A masked store is per-lane predication (see `Store.mask`), and wasm has no masked
+            // store. Writing every lane is a wrong answer, so refuse.
+            if (st.mask != null) return error.Unsupported;
             const val_local = value_local[@backingInt(st.value)];
             const ptr_local = value_local[@backingInt(st.ptr)];
             const val_ty = func.valueType(st.value);

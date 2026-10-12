@@ -384,6 +384,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
     if (func.opcode(inst) == .store) {
         // `store` produces no result, so handle it before the result-unwrap below.
         const st = func.opcode(inst).store;
+        // A masked store is per-lane predication (see `Store.mask`), which this backend has no
+        // form for. Writing every lane is a wrong answer, so refuse.
+        if (st.mask != null) return error.Unsupported;
         if (func.types.type_kind(func.valueType(st.value)) != .int) return error.Unsupported; // x86-32 is integer-only
         const bits = intBits(func, st.value);
         if (bits > 32) return error.Unsupported; // no multi-register wide-int support here

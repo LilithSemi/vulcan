@@ -224,8 +224,14 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
         0x07, 0x27 => {
             if (funct3 != 0b110) return error.Illegal; // width must be 32-bit
             if ((word >> 26) & 0b11 != 0b01) return error.Illegal; // mop must be indexed-unordered
-            if ((word >> 25) & 1 != 1) return error.Illegal; // unmasked only
+            // A clear `vm` predicates the access on v0. A lane whose bit is clear makes NO access:
+            // it does not read, it does not write, and the hardware skips it on the bus rather
+            // than driving a harmless cycle. That is what a store under divergent control flow
+            // relies on, so the model has to skip it here too and not merely discard the result.
+            const masked = (word >> 25) & 1 == 0;
+            const bits = warp.mask(0);
             for (0..warp.lanes) |i| {
+                if (masked and (bits >> @intCast(i)) & 1 == 0) continue;
                 const addr = a +% warp.v[rs2][i];
                 if (mem.crossesHart(addr, warp.hart_id)) return error.CrossHart;
                 const at = try mem.index(addr);

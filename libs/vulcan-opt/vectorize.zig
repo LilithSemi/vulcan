@@ -568,7 +568,7 @@ fn resultsAreCoalesceableStores(func: *const Function, block: Block, results: []
             // cost model in step with the rewrite that follows. It is a PREDICTOR, not a guard:
             // `coalesceStoreRun` refuses both on its own.
             .store => |st| {
-                if (st.@"volatile" or func.isByteOrderTagged(insts[i])) return false;
+                if (st.@"volatile" or st.mask != null or func.isByteOrderTagged(insts[i])) return false;
                 store_count += 1;
             },
             // Touches memory, or orders it, so the window is not safe to coalesce. See
@@ -675,6 +675,7 @@ fn valueUseCount(func: *const Function, v: Value) usize {
                 .store => |x| {
                     if (x.value == v) n += 1;
                     if (x.ptr == v) n += 1;
+                    if (x.mask == v) n += 1;
                 },
                 .prefetch => |x| if (x.ptr == v) {
                     n += 1;
@@ -840,7 +841,12 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
                     // An `endian`-tagged store ends the window for the byte-order reason (see
                     // `Attribute.endian`): the wide store would reverse the whole vector rather
                     // than each element, and it would keep at most lane 0's tag.
-                    if (st.@"volatile" or func.isByteOrderTagged(insts[i])) {
+                    //
+                    // A MASKED store ends the window as well. One wide store writes every byte of
+                    // the run, and a masked lane writes nothing, so the merge would write memory
+                    // the program told it to leave alone. There is no per-element predicate in a
+                    // wide store to carry the mask into.
+                    if (st.@"volatile" or st.mask != null or func.isByteOrderTagged(insts[i])) {
                         broke = true;
                         break;
                     }

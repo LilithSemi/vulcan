@@ -143,6 +143,7 @@ fn noteReads(func: *const Function, inst: Inst, candidate: []const bool, reader:
         .store => |st| {
             note(candidate, reader, inst, st.value);
             note(candidate, reader, inst, st.ptr);
+            if (st.mask) |m| note(candidate, reader, inst, m);
         },
         .prefetch => |pf| note(candidate, reader, inst, pf.ptr),
         .dot => |d| {

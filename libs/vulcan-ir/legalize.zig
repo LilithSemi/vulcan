@@ -416,6 +416,7 @@ fn applySubst(func: *Function, subst: *const Subst) void {
             .store => |*st| {
                 st.value = sub(subst, st.value);
                 st.ptr = sub(subst, st.ptr);
+                if (st.mask) |m| st.mask = sub(subst, m);
             },
             .prefetch => |*pf| pf.ptr = sub(subst, pf.ptr),
             .va_start => |*vs| vs.list = sub(subst, vs.list),
@@ -536,6 +537,7 @@ fn countUses(func: *const Function, uses: []u32) void {
                 .store => |st| {
                     uses[@backingInt(st.value)] += 1;
                     uses[@backingInt(st.ptr)] += 1;
+                    if (st.mask) |m| uses[@backingInt(m)] += 1;
                 },
                 .prefetch => |pf| uses[@backingInt(pf.ptr)] += 1,
                 .va_start => |vs| uses[@backingInt(vs.list)] += 1,

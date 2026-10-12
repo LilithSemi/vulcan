@@ -2448,10 +2448,10 @@ test "a divergent branch becomes straight-line code with a select" {
     }
 }
 
-test "a divergent branch whose arm writes memory is still refused" {
-    // Both arms run for every lane once converted, so a store in one would reach lanes that did
-    // not choose it. That needs a MASKED store, which the core does not offer yet, and inventing
-    // a read-modify-write to fake one would add a load the program never had.
+test "a store under a divergent branch becomes a masked scatter" {
+    // The span fill: `if (lane < 2) data[lane] = 0xAA`. Both arms run for every lane after
+    // if-conversion, so the store carries the condition as a MASK and the lanes that did not
+    // choose it make no bus access at all. The words they would have written are the proof.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -2468,12 +2468,114 @@ test "a divergent branch whose arm writes memory is still refused" {
     const base = try f.appendGlobalAddr(entry, ptr_t, "data");
     const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
     const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const fill = try f.appendInst(then_b, u32_t, .{ .iconst = 0xAA });
     const offset = try f.appendArithImm(then_b, u32_t, .shl, tid, 2);
     const at = try f.appendInst(then_b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
-    try f.appendStore(then_b, two, at);
+    try f.appendStore(then_b, fill, at);
 
     try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = join });
     try f.setJump(then_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One predicated scatter and no branch. `vm` clear is what makes it predicated, so the test
+    // reads that bit rather than trusting the opcode.
+    var masked_stores: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b0100111) continue;
+        try std.testing.expectEqual(@as(u32, 0), (w >> 25) & 1);
+        masked_stores += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), masked_stores);
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011);
+        try std.testing.expect(w & 0x7F != 0b1101111);
+    }
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(if (i < 2) @as(u32, 0xAA) else sentinel, data[i]);
+    }
+}
+
+test "a store in the else arm takes the complement of the condition" {
+    // `if (lane < 2) {} else data[lane] = 0xBB`. The else arm runs where the condition is FALSE,
+    // so its mask is the inverted compare, and a wrong polarity shows up as the other two words.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+
+    const fill = try f.appendInst(else_b, u32_t, .{ .iconst = 0xBB });
+    const offset = try f.appendArithImm(else_b, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(else_b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(else_b, fill, at);
+
+    try f.appendIf(entry, cond, .{ .target = join }, .{ .target = else_b });
+    try f.setJump(else_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // ONE compare. The complement is a real instruction, because a mask cannot be negated where
+    // it is used, and the original condition is then dead: the then arm is empty and no join
+    // parameter reads it, so dead-code elimination takes it out.
+    try std.testing.expectEqual(@as(usize, 1), countCompares(words));
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(if (i < 2) sentinel else @as(u32, 0xBB), data[i]);
+    }
+}
+
+test "a store in the else arm of a float compare is refused" {
+    // `!(a < b)` is not `a >= b` when either is a NaN, so the complement this needs does not
+    // exist for a float compare and the diamond stays a branch.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const lane_off = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const lane_at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = lane_off } });
+    const lane_f = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = lane_at } });
+    const limit = try f.appendInst(entry, f32_t, .{ .fconst = 2.0 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = lane_f, .rhs = limit } });
+
+    const fill = try f.appendInst(else_b, u32_t, .{ .iconst = 0xCC });
+    const offset = try f.appendArithImm(else_b, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(else_b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(else_b, fill, at);
+
+    try f.appendIf(entry, cond, .{ .target = join }, .{ .target = else_b });
+    try f.setJump(else_b, join, &.{});
     f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
 
     try std.testing.expectError(error.Unsupported, compile(allocator, &f));
@@ -2691,6 +2793,101 @@ test "a divergent branch whose arms go to different places is refused" {
     f.setTerminator(then_end, .{ .ret = ir.function.Ret.none() });
     try f.appendStore(else_end, hundred, at);
     f.setTerminator(else_end, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a masked store whose address and value are the same in every lane writes nothing when no lane is active" {
+    // `if (lane > 100) data[0] = 0xAA`. Nothing about the address or the value is per-lane, so
+    // only the mask makes this a vector instruction, and no lane of this warp is in it. The
+    // sentinel surviving is the whole assertion: an unmasked scatter would write the word.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const limit = try f.appendInst(entry, u32_t, .{ .iconst = 100 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = tid, .rhs = limit } });
+    const fill = try f.appendInst(then_b, u32_t, .{ .iconst = 0xAA });
+    try f.appendStore(then_b, fill, base);
+
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = join });
+    try f.setJump(then_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(sentinel, data[0]);
+}
+
+test "a store already under one mask is not converted a second time" {
+    // `if (lane < 3) { if (lane > 0) data[lane] = 0xDD }`. The inner diamond converts first and
+    // leaves the store carrying the inner condition. Combining that with the outer condition is a
+    // bitwise AND of two mask registers, which this does not do, so the outer diamond stays a
+    // branch and the refusal catches it. Overwriting the inner mask would write lane 0.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const outer = try f.appendBlock();
+    const inner = try f.appendBlock();
+    const inner_join = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const three = try f.appendInst(entry, u32_t, .{ .iconst = 3 });
+    const outer_cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = three } });
+    try f.appendIf(entry, outer_cond, .{ .target = outer }, .{ .target = join });
+
+    const zero = try f.appendInst(outer, u32_t, .{ .iconst = 0 });
+    const inner_cond = try f.appendInst(outer, bool_t, .{ .icmp = .{ .op = .gt, .lhs = tid, .rhs = zero } });
+    try f.appendIf(outer, inner_cond, .{ .target = inner }, .{ .target = inner_join });
+
+    const fill = try f.appendInst(inner, u32_t, .{ .iconst = 0xDD });
+    const offset = try f.appendArithImm(inner, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(inner, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(inner, fill, at);
+    try f.setJump(inner, inner_join, &.{});
+    try f.setJump(inner_join, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a masked store whose mask is the same in every lane is refused" {
+    // Every lane agrees, so the answer is a branch over the store and not a predicate on it.
+    // Nothing the compiler writes has this shape, and hand-written IR says it in one line.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const fill = try f.appendInst(entry, u32_t, .{ .iconst = 0xEE });
+    const always = try f.appendInst(entry, bool_t, .{ .iconst = 1 });
+    try f.appendStoreMasked(entry, fill, base, always);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
     try std.testing.expectError(error.Unsupported, compile(allocator, &f));
 }

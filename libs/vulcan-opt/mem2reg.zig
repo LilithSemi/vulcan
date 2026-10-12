@@ -512,7 +512,10 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
             // alloca unpromotable.
             .store => |st| {
                 esc(promotable, st.value);
-                if (st.@"volatile" or func.isByteOrderTagged(inst)) esc(promotable, st.ptr);
+                // A MASKED store pins the slot too. Promotion would hand the stored value to every
+                // later reader of the slot, and a masked store writes only the lanes its mask
+                // selects, so the slot does not hold that value for the rest of them.
+                if (st.@"volatile" or st.mask != null or func.isByteOrderTagged(inst)) esc(promotable, st.ptr);
             },
             // An atomic pins its slot. `ptr` escapes because a read-modify-write is not the
             // sanctioned load-or-store use this pass promotes: turning the slot into an SSA
@@ -1162,5 +1165,43 @@ test "a slot an atomic touches is left in memory" {
         for (func.blockInsts(b)) |inst| {
             try testing.expect(func.opcode(inst) != .load);
         }
+    }
+}
+
+/// `int s; s = x if m; return s;` over one alloca in one block, with the store masked when
+/// `mask` is set. Returns the stored value, the loaded value and the block.
+fn buildMaskedSlotRoundTrip(func: *Function, mask: bool) !struct { stored: Value, loaded: Value, block: Block } {
+    const t = try intTy(func, 32, .signed);
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const m = try func.appendBlockParam(b, bool_t);
+    const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
+    if (mask) try func.appendStoreMasked(b, x, slot, m) else try func.appendStore(b, x, slot);
+    const y = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+    return .{ .stored = x, .loaded = y, .block = b };
+}
+
+test "a slot written by a masked store is left in memory" {
+    const allocator = testing.allocator;
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildMaskedSlotRoundTrip(&func, true);
+        // Promotion would hand `x` to the reader, and the lanes the mask excluded never wrote it.
+        try testing.expect(!try runOnce(allocator, &func));
+        try testing.expectEqual(@as(usize, 3), func.blockInsts(s.block).len);
+        try testing.expectEqual(s.loaded, func.terminator(s.block).?.ret.values[0]);
+        try testing.expect(func.opcode(func.blockInsts(s.block)[1]).store.mask != null);
+    }
+    // The identical shape with no mask still promotes, so the refusal is about the mask.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildMaskedSlotRoundTrip(&func, false);
+        try testing.expect(try runOnce(allocator, &func));
+        try testing.expectEqual(s.stored, func.terminator(s.block).?.ret.values[0]);
     }
 }

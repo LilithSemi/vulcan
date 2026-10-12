@@ -191,6 +191,7 @@ fn countUses(func: *const Function, uses: []u32) void {
                 .store => |st| {
                     uses[@backingInt(st.value)] += 1;
                     uses[@backingInt(st.ptr)] += 1;
+                    if (st.mask) |m| uses[@backingInt(m)] += 1;
                 },
                 .prefetch => |pf| uses[@backingInt(pf.ptr)] += 1,
                 .va_start => |vs| uses[@backingInt(vs.list)] += 1,

@@ -561,7 +561,12 @@ fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Va
         .unary => |u| .{ .unary = .{ .op = u.op, .value = rv(vmap, u.value) } },
         .extract => |e| .{ .extract = .{ .aggregate = rv(vmap, e.aggregate), .index = e.index } },
         .load => |l| .{ .load = .{ .ptr = rv(vmap, l.ptr), .@"volatile" = l.@"volatile" } },
-        .store => |s| .{ .store = .{ .value = rv(vmap, s.value), .ptr = rv(vmap, s.ptr), .@"volatile" = s.@"volatile" } },
+        .store => |s| .{ .store = .{
+            .value = rv(vmap, s.value),
+            .ptr = rv(vmap, s.ptr),
+            .@"volatile" = s.@"volatile",
+            .mask = if (s.mask) |m| rv(vmap, m) else null,
+        } },
         .prefetch => |p| .{ .prefetch = .{ .ptr = rv(vmap, p.ptr) } },
         .dot => |d| .{ .dot = .{ .acc = rv(vmap, d.acc), .a = rv(vmap, d.a), .b = rv(vmap, d.b) } },
         .reduce => |red| .{ .reduce = .{ .vector = rv(vmap, red.vector), .op = red.op } },
@@ -647,6 +652,7 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
             .store => |x| {
                 bump(counts, x.value);
                 bump(counts, x.ptr);
+                if (x.mask) |m| bump(counts, m);
             },
             .prefetch => |x| bump(counts, x.ptr),
             .va_start => |x| bump(counts, x.list),

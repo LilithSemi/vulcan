@@ -856,6 +856,9 @@ pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
                 line += 1;
             },
             .store => |st| {
+                // A masked store is per-lane predication (see `Store.mask`). A TGSI output write
+                // has no per-lane predicate here, so refuse rather than write every lane.
+                if (st.mask != null) return error.Unsupported;
                 const out = outputSlot(func, st.ptr) orelse return error.Unsupported;
                 const reg = outReg(out);
                 if (reg >= out_regs.len) return error.Unsupported;

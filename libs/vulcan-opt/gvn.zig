@@ -206,6 +206,7 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
             .store => |*st| {
                 st.value = sub(canon, st.value);
                 st.ptr = sub(canon, st.ptr);
+                if (st.mask) |m| st.mask = sub(canon, m);
             },
             .prefetch => |*pf| pf.ptr = sub(canon, pf.ptr),
             .va_start => |*vs| vs.list = sub(canon, vs.list),

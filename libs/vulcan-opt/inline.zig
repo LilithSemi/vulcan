@@ -300,6 +300,7 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
             .store => |*st| {
                 st.value = r(from, to, st.value);
                 st.ptr = r(from, to, st.ptr);
+                if (st.mask) |m| st.mask = r(from, to, m);
             },
             .prefetch => |*pf| pf.ptr = r(from, to, pf.ptr),
             .va_start => |*vs| vs.list = r(from, to, vs.list),

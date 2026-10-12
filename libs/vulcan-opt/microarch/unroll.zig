@@ -146,6 +146,7 @@ fn rebuildOpcode(
             .value = remapValue(value_map, st.value),
             .ptr = remapValue(value_map, st.ptr),
             .@"volatile" = st.@"volatile",
+            .mask = if (st.mask) |m| remapValue(value_map, m) else null,
         } },
         .prefetch => |pf| .{ .prefetch = .{
             .ptr = remapValue(value_map, pf.ptr),
@@ -1412,7 +1413,7 @@ fn instUsesValue(func: *const Function, inst: Inst, value: Value) bool {
         .dequantize_nvfp4, .quantize_nvfp4 => |x| x.value == value or x.block_scale == value or x.global_scale == value,
         .unary => |x| x.value == value,
         .load => |x| x.ptr == value,
-        .store => |x| x.value == value or x.ptr == value,
+        .store => |x| x.value == value or x.ptr == value or x.mask == value,
         .atomic_rmw => |x| x.ptr == value or x.value == value or (x.compare != null and x.compare.? == value),
         .prefetch => |x| x.ptr == value,
         .va_start => |x| x.list == value,
@@ -1599,6 +1600,7 @@ fn collectOperands(
             .store => |x| {
                 try set.put(a, x.value, {});
                 try set.put(a, x.ptr, {});
+                if (x.mask) |m| try set.put(a, m, {});
             },
             .prefetch => |x| try set.put(a, x.ptr, {}),
             .va_start => |x| try set.put(a, x.list, {}),
@@ -1680,6 +1682,7 @@ fn replaceInBlock(func: *Function, block: Block, from: Value, to: Value) void {
             .store => |*x| {
                 x.value = rep(from, to, x.value);
                 x.ptr = rep(from, to, x.ptr);
+                if (x.mask) |m| x.mask = rep(from, to, m);
             },
             .prefetch => |*x| x.ptr = rep(from, to, x.ptr),
             .va_start => |*x| x.list = rep(from, to, x.list),

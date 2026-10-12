@@ -1044,7 +1044,10 @@ fn appendOperands(allocator: std.mem.Allocator, func: *const Function, inst: Ins
             if (c.ret_dest) |rd| try out.append(allocator, rd);
         },
         .load => |l| try out.append(allocator, l.ptr),
-        .store => |s| try out.appendSlice(allocator, &.{ s.value, s.ptr }),
+        .store => |s| {
+            try out.appendSlice(allocator, &.{ s.value, s.ptr });
+            if (s.mask) |m| try out.append(allocator, m);
+        },
         .prefetch => |p| try out.append(allocator, p.ptr),
         .va_start => |v| try out.append(allocator, v.list),
         .va_arg => |v| try out.append(allocator, v.list),

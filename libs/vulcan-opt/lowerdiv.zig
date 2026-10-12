@@ -200,6 +200,7 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
             .store => |*st| {
                 st.value = sub(subst, st.value);
                 st.ptr = sub(subst, st.ptr);
+                if (st.mask) |m| st.mask = sub(subst, m);
             },
             .prefetch => |*pf| pf.ptr = sub(subst, pf.ptr),
             .va_start => |*vs| vs.list = sub(subst, vs.list),

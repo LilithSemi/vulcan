@@ -4866,6 +4866,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
                 },
                 .store => |st| {
+                    // A masked store is per-lane predication (see `Store.mask`), which this backend
+                    // has no form for. Writing every lane is a wrong answer, so refuse.
+                    if (st.mask != null) return error.Unsupported;
                     // A folded store addresses `disp(base)` directly (see the `.load` arm). `baseOf`/
                     // `offOf` are the raw ptr and 0 when unfolded, and never fold a vector, so both the
                     // non-folding case and every vector store are byte-identical.

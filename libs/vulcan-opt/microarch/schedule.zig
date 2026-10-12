@@ -94,6 +94,7 @@ fn collectOperands(
         .store => |st| {
             try buf.append(allocator, st.value);
             try buf.append(allocator, st.ptr);
+            if (st.mask) |m| try buf.append(allocator, m);
         },
         .prefetch => |pf| try buf.append(allocator, pf.ptr),
         .va_start => |vs| try buf.append(allocator, vs.list),

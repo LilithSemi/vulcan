@@ -4238,6 +4238,10 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, stage: Stage, 
             }
         },
         .store => |st| {
+            // A masked store is per-lane predication (see `Store.mask`). This backend predicates
+            // with its own guard registers and nothing builds that from an IR mask yet, so refuse
+            // rather than write every lane.
+            if (st.mask != null) return error.Unsupported;
             // A store whose pointer is tagged with a graphics output
             // attribute goes to that attribute (AST). A fragment color
             // output is moved into the ROP color register (R0..R3), and

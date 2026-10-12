@@ -405,6 +405,7 @@ fn visitOperands(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn
         .store => |st| {
             f(ctx, st.value, false);
             f(ctx, st.ptr, false);
+            if (st.mask) |m| f(ctx, m, false);
         },
         .prefetch => |pf| f(ctx, pf.ptr, false),
         .va_start => |vs| f(ctx, vs.list, false),

@@ -101,6 +101,9 @@ const op_dequantize_nvfp4: u8 = 28;
 const op_quantize_nvfp4: u8 = 29;
 const op_reduce: u8 = 30;
 const op_splat: u8 = 31;
+// A masked store takes a record of its own rather than a flag inside `op_store`, so a stream
+// holding only ordinary stores stays byte for byte what an older build wrote. See `Store.mask`.
+const op_store_masked: u8 = 32;
 
 // An `atomic_rmw` record flag bit: the compare operand follows the two ordinary operand
 // slots. Written from the field and read back into it, so a record round-trips whatever the
@@ -478,9 +481,10 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
             try w.u8v(@intFromBool(l.@"volatile"));
         },
         .store => |st| {
-            try w.u8v(op_store);
+            try w.u8v(if (st.mask == null) op_store else op_store_masked);
             try w.u32v(sv(serial, st.value));
             try w.u32v(sv(serial, st.ptr));
+            if (st.mask) |m| try w.u32v(sv(serial, m));
             try w.u8v(@intFromBool(st.@"volatile"));
         },
         .prefetch => |pf| {
@@ -952,6 +956,7 @@ const Fixup = struct {
                     .store => |*st| {
                         st.value = next(&i, self.slots, serial);
                         st.ptr = next(&i, self.slots, serial);
+                        if (st.mask != null) st.mask = next(&i, self.slots, serial);
                     },
                     // Slot order matches the write order above: address, operand, then the
                     // compare operand when the record carried one.
@@ -1183,11 +1188,20 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
             const is_volatile = (try r.take(u8)) != 0;
             break :blk try appendRes(func, block, serial, rty, .{ .load = .{ .ptr = dummy, .@"volatile" = is_volatile } });
         },
-        op_store => blk: {
+        op_store, op_store_masked => blk: {
             try slots.append(allocator, try r.take(u32));
             try slots.append(allocator, try r.take(u32));
+            // The mask slot is read as a third operand, and `dummy` stands in until the slot
+            // pass resolves it. It has to be non-null here for that pass to know it is there.
+            const masked = tag == op_store_masked;
+            if (masked) try slots.append(allocator, try r.take(u32));
             const is_volatile = (try r.take(u8)) != 0;
-            break :blk try appendStmtOp(func, block, .{ .store = .{ .value = dummy, .ptr = dummy, .@"volatile" = is_volatile } });
+            break :blk try appendStmtOp(func, block, .{ .store = .{
+                .value = dummy,
+                .ptr = dummy,
+                .@"volatile" = is_volatile,
+                .mask = if (masked) dummy else null,
+            } });
         },
         op_prefetch => blk: {
             try slots.append(allocator, try r.take(u32));

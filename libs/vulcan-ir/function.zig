@@ -204,7 +204,16 @@ pub const GlobalAddr = struct { symbol: u32, via_got: bool = false };
 pub const Load = struct { ptr: Value, @"volatile": bool = false };
 
 /// A store to memory. Produces no result. `volatile` mirrors `Load.volatile` (see its doc).
-pub const Store = struct { value: Value, ptr: Value, @"volatile": bool = false };
+///
+/// `mask` predicates the store PER LANE on a vector target: where a lane's mask bit is clear the
+/// lane does not write, and it makes no access at all rather than a harmless one. Null is the
+/// ordinary store every lane takes. A target that cannot express the predicate must REFUSE a
+/// masked store, because writing every lane is a wrong answer and not a slow one.
+///
+/// A pass that reasons about what a store put in memory has to treat a masked one as writing
+/// NOTHING it can rely on, which is why store-to-load forwarding and `alloca` promotion refuse
+/// it. A pass that replicates a store (unrolling) carries the mask with the copy.
+pub const Store = struct { value: Value, ptr: Value, @"volatile": bool = false, mask: ?Value = null };
 
 /// A software prefetch hint for the address at `ptr`. Produces no result and has
 /// no observable effect on the function's result, it only hints the backend to
@@ -1109,6 +1118,28 @@ pub const Function = struct {
         try self.appendStmt(block, .{ .store = .{ .value = value, .ptr = ptr, .@"volatile" = is_volatile } });
     }
 
+    /// Append a store that only the lanes where `mask` is true take. See `Store.mask`.
+    pub fn appendStoreMasked(self: *Function, block: Block, value: Value, ptr: Value, mask: Value) std.mem.Allocator.Error!void {
+        try self.appendStoreMaskedVol(block, value, ptr, mask, false);
+    }
+
+    /// `appendStoreMasked` with the `volatile` flag, which the two properties can both carry.
+    pub fn appendStoreMaskedVol(
+        self: *Function,
+        block: Block,
+        value: Value,
+        ptr: Value,
+        mask: Value,
+        is_volatile: bool,
+    ) std.mem.Allocator.Error!void {
+        try self.appendStmt(block, .{ .store = .{
+            .value = value,
+            .ptr = ptr,
+            .@"volatile" = is_volatile,
+            .mask = mask,
+        } });
+    }
+
     /// Append a software prefetch hint for `ptr` to a block. No observable effect.
     pub fn appendPrefetch(self: *Function, block: Block, ptr: Value) std.mem.Allocator.Error!void {
         try self.appendStmt(block, .{ .prefetch = .{ .ptr = ptr } });
@@ -1459,6 +1490,7 @@ pub const Function = struct {
                 .store => |*st| {
                     st.value = r(from, to, st.value);
                     st.ptr = r(from, to, st.ptr);
+                    if (st.mask) |m| st.mask = r(from, to, m);
                 },
                 .prefetch => |*pf| pf.ptr = r(from, to, pf.ptr),
                 .va_start => |*vs| vs.list = r(from, to, vs.list),
@@ -1751,7 +1783,12 @@ pub const Function = struct {
                 .sret = c.sret,
             } },
             .load => |ld| .{ .load = .{ .ptr = remapValue(map, ld.ptr), .@"volatile" = ld.@"volatile" } },
-            .store => |st| .{ .store = .{ .value = remapValue(map, st.value), .ptr = remapValue(map, st.ptr), .@"volatile" = st.@"volatile" } },
+            .store => |st| .{ .store = .{
+                .value = remapValue(map, st.value),
+                .ptr = remapValue(map, st.ptr),
+                .@"volatile" = st.@"volatile",
+                .mask = if (st.mask) |m| remapValue(map, m) else null,
+            } },
             .prefetch => |pf| .{ .prefetch = .{ .ptr = remapValue(map, pf.ptr) } },
             .va_start => |vs| .{ .va_start = .{ .list = remapValue(map, vs.list) } },
             .va_arg => |va| .{ .va_arg = .{ .list = remapValue(map, va.list), .ty = va.ty } },
@@ -2241,11 +2278,14 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
             self.types.fmt(self.valueType(data.result.?)),
             self.valueName(ld.ptr),
         }),
-        .store => |st| try w.print("store{s} v{d}, v{d}", .{
-            if (st.@"volatile") " volatile" else "",
-            self.valueName(st.value),
-            self.valueName(st.ptr),
-        }),
+        .store => |st| {
+            try w.print("store{s} v{d}, v{d}", .{
+                if (st.@"volatile") " volatile" else "",
+                self.valueName(st.value),
+                self.valueName(st.ptr),
+            });
+            if (st.mask) |m| try w.print(" if v{d}", .{self.valueName(m)});
+        },
         .prefetch => |pf| try w.print("prefetch v{d}", .{self.valueName(pf.ptr)}),
         .va_start => |vs| try w.print("va_start v{d}", .{self.valueName(vs.list)}),
         .va_arg => |va| try w.print("let v{d} = va_arg {f}, v{d}", .{
