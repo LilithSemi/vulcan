@@ -16,6 +16,13 @@
 //! nearest even, and every lane flushes a subnormal result to a signed zero. A model that rounded
 //! the way the names suggest would disagree with the hardware in the last bit.
 //!
+//! ONE WARP AT A TIME, TO COMPLETION. `run` returns when its warp hits EBREAK, so a caller that
+//! wants several warps runs them one after another and they never interleave. Real warps issue
+//! round-robin, and a kernel cannot order two of them: both IR barrier scopes are one warp here,
+//! so both emit nothing. This model therefore cannot show a cross-warp race whatever the hardware
+//! does, so give every address one owning warp rather than reading a passing test as proof there
+//! is no race.
+//!
 //! Lane behaviour is modelled faithfully because it cannot be checked any other way here: every
 //! vector write is gated by the launch mask, and a lane outside it keeps `stale_lane`. A kernel
 //! that reads an inactive lane therefore gets an obviously wrong answer instead of a plausible one.
