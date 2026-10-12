@@ -505,6 +505,9 @@ const ConvertKind = enum {
     /// `vfncvt.f.f.w`: an f32 to an f16, rounding to nearest even, so an overflow gives infinity
     /// rather than the largest finite value.
     narrow_half,
+    /// `vfwcvt.f.f.v`: an f16 to an f32. Exact in every case, including a subnormal, so there is
+    /// no rounding to describe.
+    widen_half,
 };
 
 fn convertKind(func: *const Function, inst: Inst, cv: ir.function.Convert) ?ConvertKind {
@@ -528,7 +531,9 @@ fn convertKind(func: *const Function, inst: Inst, cv: ir.function.Convert) ?Conv
         return .float_to_uint;
     }
     if (from == .float and to == .float) {
-        return if (from.float == .f32 and to.float == .f16) .narrow_half else null;
+        if (from.float == .f32 and to.float == .f16) return .narrow_half;
+        if (from.float == .f16 and to.float == .f32) return .widen_half;
+        return null;
     }
     return null;
 }
@@ -541,6 +546,7 @@ fn convertEncoder(kind: ConvertKind) *const fn (VReg, VReg) u32 {
         .int_to_half => rv.vfcvt_f_x_v,
         .float_to_uint => rv.vfcvt_rtz_xu_f_v,
         .narrow_half => rv.vfncvt_f_f_w,
+        .widen_half => rv.vfwcvt_f_f_v,
     };
 }
 
@@ -575,9 +581,6 @@ const Mac = struct {
     a: Factor,
     b: Factor,
 };
-
-/// An f16 1.0, which is the second factor of a MAC that stands in for an addition.
-const half_one: u16 = 0x3C00;
 
 /// Where the MACs are. `mac` is indexed by instruction and holds the operands of the `add` that
 /// becomes the instruction; `folded` marks the multiply and the two widening converts that the
@@ -672,20 +675,8 @@ fn findMacs(
         if (absorbed[ii] == uses[@backingInt(result)]) folded[ii] = true;
     }
 
-    // Last, a widening convert nothing suppressed. The core has no `vfwcvt`, so the MAC is the
-    // only instruction that reads an f16 as an f32, and multiplying by 1.0 into a zeroed
-    // destination widens one on its own. This is what lets an f16 reach a divide, which no MAC can
-    // absorb, and what lets a PARTLY absorbed convert still produce its f32.
-    //
-    // The skip keeps `mac` and `folded` disjoint, which is the invariant `Macs` carries: an
-    // instruction is either a MAC of its own or part of one, never both.
-    for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
-            if (folded[@backingInt(inst)] or mac[@backingInt(inst)] != null) continue;
-            const found = m.matchWiden(inst) orelse continue;
-            record(mac, absorbed, inst, found);
-        }
-    }
+    // A widening convert nothing suppressed needs no MAC: `vfwcvt.f.f.v` does it in one
+    // instruction, so `convertKind` handles it and this pass has nothing to add.
     return .{ .mac = mac, .folded = folded };
 }
 
@@ -705,8 +696,9 @@ const Matcher = struct {
     divergent: []const bool,
     block_of: []const u32,
 
-    /// An `add` read as a MAC: either a full one, or an addition of a single factor whose partner
-    /// is an implicit 1.0.
+    /// An `add` read as a full MAC. An addition of a single widened f16 is NOT one: with a native
+    /// float add it is a widening convert and an add, two instructions, where a MAC against a
+    /// constant 1.0 would be four once the constant is materialized and broadcast.
     fn matchAdd(self: *const Matcher, inst: Inst) ?Match {
         const a = switch (self.func.opcode(inst)) {
             .arith => |x| x,
@@ -734,15 +726,6 @@ const Matcher = struct {
                     };
                 }
             }
-
-            // `acc + f32(a)`. When the other side is a factor too there is no accumulator at all,
-            // and nothing folds it, so the convert rule refuses the kernel.
-            if (self.factor(inst, term)) |f| {
-                return .{
-                    .mac = .{ .acc = acc, .a = f.factor, .b = .{ .constant = half_one } },
-                    .folded = .{ f.folded, null, null },
-                };
-            }
         }
         return null;
     }
@@ -765,16 +748,6 @@ const Matcher = struct {
         return .{
             .mac = .{ .acc = null, .a = p.a, .b = p.b },
             .folded = .{ p.folded[0], p.folded[1], null },
-        };
-    }
-
-    /// A widening convert on its own, as a MAC of the f16 against 1.0 into a zeroed destination.
-    /// Nothing is absorbed: this instruction IS the MAC, and its operand stays a real value.
-    fn matchWiden(self: *const Matcher, inst: Inst) ?Match {
-        const ha = self.widened(inst) orelse return null;
-        return .{
-            .mac = .{ .acc = null, .a = .{ .value = ha }, .b = .{ .constant = half_one } },
-            .folded = .{ null, null, null },
         };
     }
 
@@ -925,13 +898,18 @@ fn checkInst(
         // The emitter picks the scalar or the vector table from the result's divergence, so
         // admission has to ask the same table it will use. The integer tables are both
         // complete, but the float ones are not: a divide is scalar only.
-        // An `add` the recognizer claimed becomes the widening MAC, which is the only float
-        // arithmetic the vector unit has.
+        // An `add` the recognizer claimed becomes the widening MAC, which is one instruction where
+        // the plain float ops are two or more.
         .arith => |a| if (macs.at(inst) == null) {
-            if (resultDivergent(func, inst, divergent)) {
-                _ = vectorBinOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
-            } else {
-                _ = binOp(func, a.op, func.valueType(a.lhs)) orelse return error.Unsupported;
+            const ty = func.valueType(a.lhs);
+            // Float arithmetic runs on the vector unit either way, so its table is the same one
+            // whether or not the operands vary per lane; only the plumbing around it differs.
+            if (floatVectorBinOp(func, a.op, ty) == null) {
+                if (resultDivergent(func, inst, divergent)) {
+                    _ = vectorBinOp(func, a.op, ty) orelse return error.Unsupported;
+                } else {
+                    _ = binOp(func, a.op, ty) orelse return error.Unsupported;
+                }
             }
         },
         .arith_imm => |a| {
@@ -1073,17 +1051,7 @@ fn vectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const f
     // and it is not a binary op, because it accumulates into its own destination. A per-lane
     // divide would have to feed the single scalar divider one lane at a time.
     //
-    // BEFORE SELECTING ANY OF THESE, THREE THINGS HAVE TO BE TRUE OF THE CORE, and they are
-    // separate. A LANE that can perform the operation. A DECODER that decodes the instruction and
-    // routes it to that lane, with the element width, the format select and the rounding mode
-    // wired. A BITSTREAM built from both. A lane that can add is not a core that can be told to.
-    //
-    // Each one fails differently and none of them fails as a compile error. Without the lane, a
-    // multiply whose format does not fit the significand product width returns the canonical NaN
-    // and raises the invalid flag, because the width is sized from the multiply formats and the
-    // narrow side of the widening pair. Without the decode, the instruction is never executed at
-    // all. Without the bitstream, neither of the first two is in the hardware anyone loads.
-    if (isFloat(func, ty)) return null;
+    if (isFloat(func, ty)) return floatVectorBinOp(func, op, ty);
     const signed = isSigned(func, ty);
     return switch (op) {
         .add => rv.vadd_vv,
@@ -1097,6 +1065,35 @@ fn vectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const f
         .bit_xor => rv.vxor_vv,
         .shl => rv.vsll_vv,
         .shr => if (signed) rv.vsra_vv else rv.vsrl_vv,
+    };
+}
+
+/// The per-lane float arithmetic the core decodes, or null when it has none for this shape.
+///
+/// BEFORE ADDING TO THIS, THREE THINGS HAVE TO BE TRUE OF THE CORE, and they are separate. A LANE
+/// that can perform the operation. A DECODER that decodes the instruction and routes it to that
+/// lane, with the element width, the format select and the rounding mode wired. A BITSTREAM built
+/// from both. A lane that can add is not a core that can be told to.
+///
+/// Each fails differently and none of them fails as a compile error. Without the lane, a multiply
+/// whose format does not fit the significand product width returns the canonical NaN and raises the
+/// invalid flag. Without the decode, the instruction is never executed at all. Without the
+/// bitstream, neither of the first two is in the hardware anyone loads.
+///
+/// So this list is NOT the lane's op list. The divide is the one that will look missing: the lane
+/// reaches its divider through a separate port set with its own handshake, because it iterates, so
+/// `vfdiv.vv` is not an arm on the lane's op input and does not decode. `FDIV.S` stays the only
+/// float divide, and it is warp-uniform; see `binOp`.
+///
+/// f16 arithmetic is absent for a different reason: the element width is fixed at 32 bits, so these
+/// read whole lanes. An f16 lives in the low half of one, which is the MAC's shape and not this.
+fn floatVectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const fn (VReg, VReg, VReg) u32 {
+    if (!isF32(func, ty)) return null;
+    return switch (op) {
+        .add => rv.vfadd_vv,
+        .sub => rv.vfsub_vv,
+        .mul => rv.vfmul_vv,
+        else => null,
     };
 }
 
@@ -1439,6 +1436,26 @@ const Emitter = struct {
         try self.mac(m, try self.vreg(self.func.instResult(inst).?, pos), &pool, pos);
     }
 
+    /// A warp-uniform float binary operation. There is no scalar form of any of these, so both
+    /// operands are broadcast, the vector unit does the work and lane zero carries the answer back.
+    /// Four words where a scalar float unit would take one.
+    fn emitScalarFloatBinOp(
+        self: *Emitter,
+        encode: *const fn (VReg, VReg, VReg) u32,
+        a: ir.function.Arith,
+        dst: Reg,
+        pos: u32,
+    ) Error!void {
+        var pool: Pool = .{};
+        const into = try pool.take();
+        const lhs = try pool.take();
+        const rhs = try pool.take();
+        try self.put(rv.vmv_v_x(lhs, try self.reg(a.lhs, pos)));
+        try self.put(rv.vmv_v_x(rhs, try self.reg(a.rhs, pos)));
+        try self.put(encode(into, lhs, rhs));
+        try self.put(rv.vmv_x_s(dst, into));
+    }
+
     /// A warp-uniform MAC. It still runs on the vector unit, because that is the only float
     /// multiplier the core has, so it accumulates in a scratch and the answer comes back out of
     /// lane zero. Around six words where a scalar float unit would take one, which is the price of
@@ -1566,10 +1583,13 @@ const Emitter = struct {
             else
                 try self.emitConvert(cv, inst, dst, pos),
             .arith => |a| {
+                const ty = self.func.valueType(a.lhs);
                 if (self.macs.at(inst)) |m| {
                     try self.emitScalarMac(m, dst, pos);
+                } else if (floatVectorBinOp(self.func, a.op, ty)) |encode| {
+                    try self.emitScalarFloatBinOp(encode, a, dst, pos);
                 } else {
-                    const f = binOp(self.func, a.op, self.func.valueType(a.lhs)) orelse return error.Unsupported;
+                    const f = binOp(self.func, a.op, ty) orelse return error.Unsupported;
                     try self.put(f(dst, try self.reg(a.lhs, pos), try self.reg(a.rhs, pos)));
                 }
             },

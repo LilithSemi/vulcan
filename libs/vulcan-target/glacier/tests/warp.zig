@@ -332,6 +332,33 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
         return;
     }
 
+    // The plain float arithmetic. These read WHOLE lanes as f32: the element width is fixed at 32
+    // bits, so there is no f16 form of any of them.
+    //
+    // THE ROUNDING MODE OF THESE IS NOT RECORDED. The MAC truncates and two of the converts round
+    // to nearest even, so the lane is not uniform about it and it cannot be inferred. Nearest even
+    // is assumed here because it is the IEEE default, and every test of them uses operands whose
+    // result is EXACT, so no test depends on the assumption.
+    if (funct3 == 0b001) switch (funct6) {
+        0b000000, 0b000010, 0b100100, 0b000100, 0b000110 => {
+            for (0..warp.lanes) |i| {
+                const x = asFloat(warp.v[vs2][i]);
+                const y = asFloat(warp.v[src][i]);
+                warp.v[vd][i] = @bitCast(ftz(f32, switch (funct6) {
+                    0b000000 => x + y,
+                    0b000010 => x - y,
+                    0b100100 => x * y,
+                    0b000100 => @min(x, y),
+                    0b000110 => @max(x, y),
+                    else => unreachable,
+                }));
+            }
+            return;
+        },
+        // The converts and the widening MAC are handled below.
+        else => {},
+    };
+
     // The float converts. One funct6 holds all three and the vs1 field picks which, so the field
     // that names a source register everywhere else is a selector here. An f32 fills a lane and an
     // f16 is its LOW HALF, because the core has no f register file.
@@ -360,6 +387,8 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
                 // vfncvt.f.f.w: an f32 narrowed to f16, nearest even, so an overflow gives
                 // INFINITY rather than the largest finite value.
                 0b10100 => halfBits(ftz(f16, @floatCast(asFloat(x)))),
+                // vfwcvt.f.f.v: an f16 widened to f32, which is exact in every case.
+                0b01100 => @bitCast(ftz(f32, @as(f32, asHalf(x)))),
                 else => return error.Illegal,
             };
         }

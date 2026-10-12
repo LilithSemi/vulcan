@@ -945,8 +945,8 @@ test "a warp-uniform float divide becomes the one scalar divide" {
 
 test "the backend refuses the float work Glacier cannot do" {
     const allocator = std.testing.allocator;
-    const Shape = enum { add, mul, compare, half_store, per_lane_divide };
-    for ([_]Shape{ .add, .mul, .compare, .half_store, .per_lane_divide }) |shape| {
+    const Shape = enum { half_arith, compare, half_store, per_lane_divide };
+    for ([_]Shape{ .half_arith, .compare, .half_store, .per_lane_divide }) |shape| {
         var f = Function.init(allocator);
         defer f.deinit();
         const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
@@ -962,24 +962,15 @@ test "the backend refuses the float work Glacier cannot do" {
         const a = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
         const b = try f.appendInst(entry, f32_t, .{ .fconst = 5.0 });
         const stored = switch (shape) {
-            // An addition of two f32 VALUES has no lowering. The MAC covers an addition only when one
-            // side is an f16 factor or a constant an f16 holds, because the hardware adds nothing
-            // that is not a widening product.
-            .add => blk: {
-                const x = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = base } });
-                const y = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = base } });
-                const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+            // f32 arithmetic works; f16 arithmetic does not. The element width is fixed at 32 bits,
+            // so a plain float op reads whole lanes, and an f16 is the low half of one. Arithmetic
+            // on a pair of them is the MAC's shape and nothing else.
+            .half_arith => blk: {
+                const signed_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+                const s = try f.appendInst(entry, signed_t, .{ .convert = .{ .value = tid } });
+                const h = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = s } });
+                const sum = try f.appendInst(entry, f16_t, .{ .arith = .{ .op = .add, .lhs = h, .rhs = h } });
                 break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
-            },
-            // A multiply of two f32 VALUES has no lowering either. A MAC factor must be an f16, and
-            // narrowing an operand to make it fit would throw away precision the IR asked to
-            // keep, silently. Building a non-widening vector multiply is the other answer, and
-            // which of the three happens is not the compiler's to pick.
-            .mul => blk: {
-                const x = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = base } });
-                const y = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = base } });
-                const p = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
-                break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = p } });
             },
             // There is no float compare, and an integer compare over the bits is a different
             // relation.
@@ -1031,6 +1022,32 @@ fn countVectorMoves(code: []const u32) usize {
         if ((w >> 12) & 0x7 != 0b000) continue;
         if (w >> 26 != 0b010111) continue;
         n += 1;
+    }
+    return n;
+}
+
+/// How many words in `code` are `vfwcvt.f.f.v`: OP-V, OPFVV, funct6 0x12, vs1 field 0x0C.
+fn countWidens(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0x7 != 0b001) continue;
+        if (w >> 26 != 0x12 or (w >> 15) & 0x1F != 0x0C) continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// How many words in `code` are a plain float add, subtract or multiply.
+fn countFloatArith(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0x7 != 0b001) continue;
+        switch (w >> 26) {
+            0x00, 0x02, 0x24 => n += 1,
+            else => {},
+        }
     }
     return n;
 }
@@ -1146,7 +1163,7 @@ test "one widened f16 feeds two products" {
 
 test "a partly absorbed widening convert still produces its f32" {
     // One reader is a MAC and the other is a store, so the convert cannot be suppressed: it is
-    // widened on its own for the store, and the MAC reads the f16 beside it.
+    // widened on its own for the store with `vfwcvt.f.f.v`, and the MAC reads the f16 beside it.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -1176,8 +1193,9 @@ test "a partly absorbed widening convert still produces its f32" {
 
     const words = try compile(allocator, &f);
     defer allocator.free(words);
-    // One MAC for the product, one for the convert the store still needs.
-    try std.testing.expectEqual(@as(usize, 2), countMacs(words));
+    // One MAC for the product, and the convert the store needs is one widening instruction.
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 1), countWidens(words));
 
     var data: [32]u32 = @splat(0xFFFF_FFFF);
     try runOnce(words, &data, 0, 1);
@@ -1319,10 +1337,9 @@ test "a bare widening product zeroes the destination and accumulates into it" {
     }
 }
 
-test "an addition of a widened f16 becomes a MAC against one" {
-    // The core has no float add, so `acc + f32(a)` is a MAC whose second factor is 1.0. Writing
-    // the multiply by hand does not work: the optimiser folds `a * 1.0` back to `a` before the
-    // module arrives, which is how this shape reaches the selector in the first place.
+test "an addition of a widened f16 is a widening convert and an add" {
+    // Two instructions. A MAC against a constant 1.0 would be four once the constant is
+    // materialized and broadcast, so the native pair wins now that the core has a float add.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -1349,7 +1366,9 @@ test "an addition of a widened f16 becomes a MAC against one" {
 
     const words = try compile(allocator, &f);
     defer allocator.free(words);
-    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 1), countWidens(words));
+    try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
 
     const lanes = glacier.encode.Profile.@"gc1.n".lanes();
     var data: [8]u32 = @splat(0);
@@ -1362,8 +1381,9 @@ test "an addition of a widened f16 becomes a MAC against one" {
 }
 
 test "a chain of MACs keeps one accumulator register" {
-    // `out[lane] += a * b + c` over three MACs: a full one, a bare product and an addition. The
-    // accumulator hint is what keeps them on one register, so the chain costs no copies.
+    // `out[lane] += a * b + c * d + e`: a full MAC, a bare product the addition accumulates, and a
+    // final widened term that is now a convert and an add rather than a third MAC. The accumulator
+    // hint is what keeps the chain on one register, so it costs no copies.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -1406,8 +1426,9 @@ test "a chain of MACs keeps one accumulator register" {
 
     const words = try compile(allocator, &f);
     defer allocator.free(words);
-    try std.testing.expectEqual(@as(usize, 3), countMacs(words));
-    // One accumulator register means no `vmv.v.v` between the three.
+    try std.testing.expectEqual(@as(usize, 2), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 1), countWidens(words));
+    // One accumulator register means no `vmv.v.v` between them.
     try std.testing.expectEqual(@as(usize, 0), countVectorMoves(words));
 
     const lanes = glacier.encode.Profile.@"gc1.n".lanes();
@@ -1453,10 +1474,9 @@ test "a per-lane same-width convert costs no instruction either" {
     }
 }
 
-test "an addition of two widened f16 becomes two MACs" {
-    // Neither side is an accumulator, so one convert widens on its own into a zeroed destination
-    // and the addition accumulates the other against 1.0. No intermediate has to be invented: the
-    // standalone widening convert IS the first MAC.
+test "an addition of two widened f16 is two converts and an add" {
+    // Neither side is an accumulator and neither needs to be: each f16 widens with one
+    // instruction and the addition is one more. No MAC is involved at all.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -1484,7 +1504,9 @@ test "an addition of two widened f16 becomes two MACs" {
 
     const words = try compile(allocator, &f);
     defer allocator.free(words);
-    try std.testing.expectEqual(@as(usize, 2), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 2), countWidens(words));
+    try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
 
     var data: [8]u32 = @splat(0xFFFF_FFFF);
     try runOnce(words, &data, 0, 1);
@@ -1494,10 +1516,9 @@ test "an addition of two widened f16 becomes two MACs" {
     }
 }
 
-test "a widening convert on its own is a MAC against one" {
-    // The core has no `vfwcvt`, so reading an f16 as an f32 outside any arithmetic still goes
-    // through the MAC: zero the destination, multiply by 1.0. That is what lets an f16 reach an
-    // operation no MAC can absorb, a divide being the one that matters.
+test "a widening convert on its own is one instruction" {
+    // `vfwcvt.f.f.v`. It used to be a MAC against a constant 1.0, which cost a zeroed destination,
+    // a materialized constant and a broadcast: five words where this is one.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -1522,7 +1543,8 @@ test "a widening convert on its own is a MAC against one" {
 
     const words = try compile(allocator, &f);
     defer allocator.free(words);
-    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 1), countWidens(words));
 
     var data: [8]u32 = @splat(0xFFFF_FFFF);
     try runOnce(words, &data, 0, 1);
@@ -1572,7 +1594,7 @@ test "a constant factor reaches the MAC already widened by the frontend" {
     }
 }
 
-test "an addition of a constant is a MAC with both factors constant" {
+test "an addition of a float constant is one add" {
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -1595,7 +1617,8 @@ test "an addition of a constant is a MAC with both factors constant" {
 
     const words = try compile(allocator, &f);
     defer allocator.free(words);
-    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
 
     const lanes = glacier.encode.Profile.@"gc1.n".lanes();
     var data: [8]u32 = @splat(0);
@@ -1607,10 +1630,11 @@ test "an addition of a constant is a MAC with both factors constant" {
     }
 }
 
-test "a constant an f16 cannot hold exactly is refused as a factor" {
-    // Two ways a constant fails. 0.1 has no exact f16, so the core would multiply by a different
-    // number than the IR named. 2^-15 has one, but only as a subnormal, and the lane flushes those
-    // to zero, so the constant would behave as a zero.
+test "a constant no f16 holds exactly keeps its full precision" {
+    // Neither can be a MAC factor: 0.1 has no exact f16, and 2^-15 has one only as a SUBNORMAL,
+    // which the lane flushes to zero. That used to be a refusal, because the MAC was the only
+    // float multiply. With a native one the constant stays an f32 and the f16 widens, so the
+    // answer is the one the source asked for rather than a narrowed approximation of it.
     const allocator = std.testing.allocator;
     for ([_]f64{ 0.1, 3.0517578125e-05 }) |value| {
         var f = Function.init(allocator);
@@ -1628,7 +1652,8 @@ test "a constant an f16 cannot hold exactly is refused as a factor" {
         const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
         const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
         const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
-        const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+        const plus = try f.appendArithImm(entry, i32_t, .add, lane, 3);
+        const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = plus } });
         const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
         const k = try f.appendInst(entry, f32_t, .{ .fconst = value });
         const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = k } });
@@ -1636,7 +1661,23 @@ test "a constant an f16 cannot hold exactly is refused as a factor" {
         try f.appendStore(entry, raw, at);
         f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
-        try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+        try std.testing.expectEqual(@as(usize, 1), countWidens(words));
+        try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        // The exact f32 product is the discriminator on its own: the MAC path could not produce it
+        // for either constant. 0.1 would have been rounded to an f16 first, and 2^-15 IS an exact
+        // f16 but only a subnormal one, which the lane flushes, so that path would give zero.
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            const n: f32 = @floatFromInt(i + 3);
+            const want = n * @as(f32, @floatCast(value));
+            try std.testing.expectEqual(@as(u32, @bitCast(want)), data[i]);
+            try std.testing.expect(want != 0.0);
+        }
     }
 }
 
@@ -1974,5 +2015,88 @@ test "the ordering an atomic asks for reaches its aq and rl bits" {
         }
         // The old value goes nowhere, and the read-modify-write still has to happen.
         try std.testing.expect(found);
+    }
+}
+
+test "warp-uniform float arithmetic goes out to the vector unit and comes back" {
+    // There is no scalar form of any of these, so both operands are broadcast, the vector unit
+    // does the work and lane zero carries the answer back.
+    //
+    // 2^20 plus 1 is deliberate on both counts. It is EXACT in f32, needing 21 of the 24 bits, so
+    // no result here depends on the rounding mode, which is not recorded anywhere for these three.
+    // And no f16 holds it, so the MAC cannot claim the multiply: a product of two constants that
+    // ARE exact halves is still lowered as a MAC, correctly and in fewer words, which means a test
+    // using small integers would never reach `vfmul` at all.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { op: ir.function.BinOp, want: f32 }{
+        .{ .op = .add, .want = 1048579.0 },
+        .{ .op = .sub, .want = 1048575.0 },
+        .{ .op = .mul, .want = 2097154.0 },
+    };
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const big = try f.appendInst(entry, f32_t, .{ .fconst = 1048577.0 });
+        const two = try f.appendInst(entry, f32_t, .{ .fconst = 2.0 });
+        const r = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = c.op, .lhs = big, .rhs = two } });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = r } });
+        try f.appendStore(entry, raw, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
+
+        var data: [4]u32 = @splat(0);
+        try runOnce(words, &data, 0, 1);
+        try std.testing.expectEqual(@as(u32, @bitCast(c.want)), data[0]);
+    }
+}
+
+test "per-lane float arithmetic over widened f16" {
+    // `out[lane] = f32(lane + 5) - f32(lane + 3)`, which is 2 in every lane. Written as a subtract
+    // so an encoder that reached for the add would answer differently in every lane.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const a5 = try f.appendArithImm(entry, i32_t, .add, lane, 5);
+    const a3 = try f.appendArithImm(entry, i32_t, .add, lane, 3);
+    const h5 = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = a5 } });
+    const h3 = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = a3 } });
+    const w5 = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = h5 } });
+    const w3 = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = h3 } });
+    const diff = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .sub, .lhs = w5, .rhs = w3 } });
+    try f.appendStore(entry, diff, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 2), countWidens(words));
+    try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 2.0))), data[i]);
     }
 }
