@@ -343,9 +343,16 @@ fn compileKernelInternal(
         return Refusal.whole(why, "a per-lane value that had to spill, which has no store yet");
     }
 
+    // Recomputed here rather than reused from above: the passes between have emptied blocks and
+    // rewired edges, so what was reachable then is not what is reachable now. Emission skips the
+    // rest, which is worth a word each: a dead block otherwise leaves an `ebreak` behind.
+    const live = try ir.reachable.neutralizeUnreachable(allocator, &work);
+    defer allocator.free(live);
+
     var e: Emitter = .{
         .allocator = allocator,
         .func = &work,
+        .live = live,
         .opts = opts,
         .alloc = &walloc,
         .divergent = divergent,
@@ -2892,6 +2899,9 @@ const Emitter = struct {
     strides: *const Strides,
     /// Which branches ask whether any lane is still active. See `AnyLane`.
     any_lane: *const AnyLane,
+    /// Which blocks the entry can still reach. The passes above leave emptied blocks behind and
+    /// nothing branches to them, so emitting anything for one is a word wasted per block.
+    live: []const bool,
     /// Where a refusal is recorded, when the caller asked for one. See `Refusal`.
     why: ?*Refusal,
     /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
@@ -2996,6 +3006,13 @@ const Emitter = struct {
         for (0..nblocks) |bi| {
             const block: Block = @fromBackingInt(@intCast(bi));
             self.block_start.items[bi] = @intCast(self.words.items.len);
+            // Nothing reaches this block, so nothing needs a word here. Its POSITIONS still
+            // advance below, because the allocator numbered them whether or not they are emitted,
+            // and an action it placed at one of them belongs to a value no longer read here.
+            if (!self.live[bi]) {
+                pos += 2 + @as(u32, @intCast(self.func.blockInsts(block).len));
+                continue;
+            }
             if (bi == 0) try self.prologue(block) else try self.edgeMovesInto(block);
 
             try self.actionsAt(pos); // the block-parameter position
