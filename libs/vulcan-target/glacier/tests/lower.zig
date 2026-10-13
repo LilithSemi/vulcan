@@ -4099,14 +4099,15 @@ test "a per-lane guard around a loop becomes the mask the loop starts with" {
     }
 }
 
-test "a guard whose other side carries a value of its own is refused" {
-    // `if (x <= 2) { do { ... } while (...) } else { done(7) }`, where the two ways out of the
-    // guard reach the same block with DIFFERENT arguments. The guard cannot become the loop's
-    // mask then: a lane that failed it would arrive carrying the loop's value instead of its own.
+test "a guard whose other side carries a value of its own selects it at the exit" {
+    // `if (x <= 2) { do { x += 4 } while (x <= 2) } else { x = 7 }`, then `out[lane] = x`. The two
+    // ways out of the guard reach the same block with DIFFERENT values. The guard still becomes
+    // the loop's mask, and a lane that failed it leaves the loop carrying the value ITS side of
+    // the guard had: it ran no iteration, so the loop's value belongs to another lane.
     //
     // The two arrivals look alike after critical-edge splitting, which puts an empty block on each
-    // edge, and the only thing that tells them apart is that one of those blocks passes an
-    // argument. Reading past it without checking is a wrong answer and not a refusal.
+    // edge, and what tells them apart is the argument those blocks pass. Reading past it without
+    // the select is a wrong answer for every lane the guard turned away.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -4138,9 +4139,74 @@ test "a guard whose other side carries a value of its own is refused" {
     try f.appendStore(done, arrived, at);
     f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 
-    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // The guard's branch is gone, so the loop's own reduction is the only conditional left.
+    var branches: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1100011) branches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), branches);
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    // Lanes 0 to 2 enter and leave after one pass with `lane + 4`. Lane 3 failed the guard and
+    // keeps the 7 its own edge carried.
+    try std.testing.expectEqual(@as(u32, 4), data[0]);
+    try std.testing.expectEqual(@as(u32, 5), data[1]);
+    try std.testing.expectEqual(@as(u32, 6), data[2]);
+    try std.testing.expectEqual(@as(u32, 7), data[3]);
+    for (4..data.len) |i| try std.testing.expectEqual(sentinel, data[i]);
 }
 
+test "a guard stays when the block the loop leaves by writes memory" {
+    // The same shape, with a STORE in the block the loop leaves by. Dropping the guard sends a
+    // lane that failed it through that block, and the store is an access that lane must not make,
+    // so the guard cannot become the mask and the per-lane branch has nowhere to go.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const mid = try f.appendBlock();
+    const done = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const limit = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const seven = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    const step = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const guard = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .le, .lhs = tid, .rhs = limit } });
+    try f.appendIf(entry, guard, .{ .target = loop, .args = &.{tid} }, .{ .target = done, .args = &.{seven} });
+
+    const x = try f.appendBlockParam(loop, u32_t);
+    const x_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = step } });
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .le, .lhs = x_next, .rhs = limit } });
+    try f.appendIf(loop, more, .{ .target = loop, .args = &.{x_next} }, .{ .target = mid, .args = &.{x_next} });
+
+    const left = try f.appendBlockParam(mid, u32_t);
+    const mid_at = try f.appendInst(mid, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(mid, u32_t, .shl, left, 2),
+    } });
+    try f.appendStore(mid, left, mid_at);
+    try f.setJump(mid, done, &.{left});
+
+    const arrived = try f.appendBlockParam(done, u32_t);
+    const offset = try f.appendArithImm(done, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(done, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(done, arrived, at);
+    f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
 
 test "a per-lane float divide runs on the lanes and rounds to nearest even" {
     // `out[lane] = (lane + 1) / 3`, in f32, per lane. The quotient of 1/3 and 2/3 is not exact in

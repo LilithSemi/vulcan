@@ -242,6 +242,13 @@ fn compileKernelInternal(
         defer allocator.free(d);
         _ = try convertDivergentLoops(allocator, &work, d, &latches);
     }
+    // A loop that absorbed its guard leaves the guard's failing side unreachable. Emptying it now
+    // keeps the passes below off a block nothing reaches, and the allocator off a live range in
+    // one: a value there is live nowhere and the allocation verifier reads that as unsound.
+    {
+        const rest = try ir.reachable.neutralizeUnreachable(allocator, &work);
+        allocator.free(rest);
+    }
     const any_lane_at = try allocator.alloc(bool, work.instCount());
     defer allocator.free(any_lane_at);
     @memset(any_lane_at, false);
@@ -1278,6 +1285,47 @@ fn forwardsTo(func: *const Function, b: Block) Block {
     };
 }
 
+/// Whether the guard's failing side `out` arrives where the loop's `exit` block arrives, with
+/// values of its own, and record those values in `fail` when it does.
+///
+/// This is `if (c) { while (...) } else { x }`: both sides give the merge a value. Dropping the
+/// guard sends a failing lane through the loop and out of `exit`, so that lane needs the value its
+/// own side carried, which `convertLoop` selects on the guard. The exit block runs for a failing
+/// lane now, so it must hold nothing that lane may not do: its values came from an iteration that
+/// never ran, and an address built from them points anywhere.
+fn guardFailArgs(func: *const Function, out: Block, exit: Block, fail: *?ir.function.ValueList) bool {
+    if (func.blockInsts(out).len != 0) return false;
+    if (func.blockParams(out).len != 0) return false;
+    // The values are read where the EXIT is, so they must reach it. Only the guard reaches `out`
+    // and only the loop reaches `exit`, which puts both below the guard.
+    if (predCount(func, out) != 1) return false;
+    if (predCount(func, exit) != 1) return false;
+    const missed = switch (func.terminator(out) orelse return false) {
+        .jump => |j| j,
+        .ret => return false,
+    };
+    const taken = switch (func.terminator(exit) orelse return false) {
+        .jump => |j| j,
+        .ret => return false,
+    };
+    if (missed.target != taken.target) return false;
+    const n = func.blockArgs(missed).len;
+    if (n == 0 or n != func.blockArgs(taken).len) return false;
+    for (func.blockInsts(exit)) |inst| {
+        if (!sideEffectFree(func.opcode(inst))) return false;
+    }
+    fail.* = missed.args;
+    return true;
+}
+
+/// Whether `code` is safe to run for a lane that takes no part.
+fn sideEffectFree(code: ir.function.Opcode) bool {
+    return switch (code) {
+        .iconst, .fconst, .global_addr, .arith, .arith_imm, .icmp, .select, .convert, .unary => true,
+        else => false,
+    };
+}
+
 /// The one block that reaches `b`, when exactly one does.
 fn solePredecessor(func: *const Function, b: Block) ?Block {
     var found: ?Block = null;
@@ -1443,6 +1491,9 @@ const DivergentLoop = struct {
     /// The condition of a per-lane GUARD around the loop, which becomes the mask the first
     /// iteration runs under. Null when every lane that reached the preheader enters.
     guard: ?Value = null,
+    /// What the guard's failing side carries to the block the loop leaves by, when it carries
+    /// anything. The exit selects between its own values and these on the guard.
+    guard_fail: ?ir.function.ValueList = null,
     /// Whether the guard's TRUE side is the one that enters the loop.
     guard_on_true: bool = true,
     /// The block the guard branches in, which is one above the preheader when critical-edge
@@ -1504,6 +1555,7 @@ fn divergentLoop(func: *const Function, block: Block, divergent: []const bool) ?
     // a branch and a loop header, so the guard is one level above the preheader rather than being
     // the preheader. Looking only at the immediate predecessor finds nothing.
     var guard: ?Value = null;
+    var guard_fail: ?ir.function.ValueList = null;
     var guard_on_true = true;
     var guard_block = pre;
     if (func.blockInsts(pre).len == 0 and func.blockParams(pre).len == 0) {
@@ -1516,15 +1568,19 @@ fn divergentLoop(func: *const Function, block: Block, divergent: []const bool) ?
                 // One way in and the other OUT, to the block the loop itself exits to. A guard
                 // that sends the failing lanes anywhere else is a different shape.
                 const out = if (into_then) g.@"else".target else g.then.target;
+                var fail: ?ir.function.ValueList = null;
                 // Both edges leave for the same place, but critical-edge splitting puts a
                 // DIFFERENT empty block on each, so comparing the immediate targets finds two
                 // blocks where the source had one. Compare where they end up.
+                const to_the_exit = forwardsTo(func, out) == forwardsTo(func, exit) or
+                    guardFailArgs(func, out, exit, &fail);
                 if (into_then != into_else and
-                    forwardsTo(func, out) == forwardsTo(func, exit) and
+                    to_the_exit and
                     divergent[@backingInt(g.cond)] and
                     (into_then or invertedCompare(func, g.cond) != null))
                 {
                     guard = g.cond;
+                    guard_fail = fail;
                     guard_on_true = into_then;
                     guard_block = up;
                 }
@@ -1545,6 +1601,7 @@ fn divergentLoop(func: *const Function, block: Block, divergent: []const bool) ?
         .continue_on_true = then_latch,
         .exit = exit,
         .guard = guard,
+        .guard_fail = guard_fail,
         .guard_on_true = guard_on_true,
         .guard_block = guard_block,
     };
@@ -1633,6 +1690,24 @@ fn convertLoop(
             .target = loop.preheader,
             .args = enter.args,
         } };
+        if (loop.guard_fail) |missed| {
+            // A lane that failed the guard leaves with the values the guard's own side carried.
+            // It runs the exit block now, so the choice between the two belongs there.
+            const theirs = try allocator.dupe(Value, func.valueList(missed));
+            defer allocator.free(theirs);
+            const ours = try allocator.dupe(Value, func.blockArgs(func.terminator(loop.exit).?.jump));
+            defer allocator.free(ours);
+            var merged: std.ArrayList(Value) = .empty;
+            defer merged.deinit(allocator);
+            for (ours, theirs) |took, missed_val| {
+                try merged.append(allocator, try func.appendInst(loop.exit, func.valueType(took), .{ .select = .{
+                    .cond = g.cond,
+                    .then = if (loop.guard_on_true) took else missed_val,
+                    .@"else" = if (loop.guard_on_true) missed_val else took,
+                } }));
+            }
+            func.terminatorPtr(loop.exit).*.?.jump.args = try func.internValueList(merged.items);
+        }
     }
 
     // The body, with every store put under the mask of the iteration it runs in. A lane that is
