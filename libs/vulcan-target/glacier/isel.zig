@@ -215,7 +215,12 @@ fn compileKernelInternal(
     while (true) {
         const d = try analyzeDivergence(allocator, &work);
         defer allocator.free(d);
-        if (!try ifConvert(allocator, &work, d)) break;
+        // Merging first, because a block boundary with nothing on either side of it hides both a
+        // region and a loop latch. Flattening then makes new boundaries, so the two iterate
+        // together rather than one after the other.
+        const merged = try mergeStraightLine(allocator, &work);
+        const flattened = try ifConvert(allocator, &work, d);
+        if (!merged and !flattened) break;
     }
     const reachable_after = try ir.reachable.neutralizeUnreachable(allocator, &work);
     allocator.free(reachable_after);
@@ -1205,6 +1210,80 @@ fn convertible(code: ir.function.Opcode) bool {
 }
 
 // ===========================================================================
+// Merging a block into the predecessor that only jumps to it.
+
+/// Merge every block whose one predecessor reaches it by an unconditional jump, and report whether
+/// anything changed.
+///
+/// A frontend leaves these everywhere. A `while` loop arrives as a header that holds the
+/// loop-carried parameters and does nothing else, jumping to a second block that holds the test,
+/// so the test is not in the header and `divergentLoop` does not see a latch. Merging the two puts
+/// the test where the header is, which is the shape the rest of this reads.
+///
+/// It is also what lets region if-conversion see a whole region: a block boundary with nothing on
+/// either side of it is a block the region has to account for.
+fn mergeStraightLine(allocator: std.mem.Allocator, func: *Function) Error!bool {
+    var changed = false;
+    for (1..func.blockCount()) |bi| {
+        const b: Block = @fromBackingInt(@intCast(bi));
+        if (predCount(func, b) != 1) continue;
+        const pred = solePredecessor(func, b) orelse continue;
+        if (pred == b) continue;
+        // The predecessor must LEAVE by a jump. A block ending in a branch keeps its two edges,
+        // and critical-edge splitting put some of those blocks there on purpose.
+        if (endsInIf(func, pred)) continue;
+        const jump = switch (func.terminator(pred) orelse continue) {
+            .jump => |j| j,
+            .ret => continue,
+        };
+        if (jump.target != b) continue;
+
+        // The parameters take the one set of arguments that reaches them.
+        const params = try allocator.dupe(Value, func.blockParams(b));
+        defer allocator.free(params);
+        const args = try allocator.dupe(Value, func.blockArgs(jump));
+        defer allocator.free(args);
+        if (args.len != params.len) continue;
+        for (params, args) |p, a| func.replaceAllUses(p, a);
+        try func.setBlockParams(b, &.{});
+
+        const body = try allocator.dupe(Inst, func.blockInsts(b));
+        defer allocator.free(body);
+        func.blockInstsMut(b).clearRetainingCapacity();
+        try func.blockInstsMut(pred).appendSlice(allocator, body);
+        func.terminatorPtr(pred).* = func.terminatorPtr(b).*;
+        func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+        changed = true;
+    }
+    return changed;
+}
+
+/// Where `b` really goes: through an empty forwarding block that passes nothing, or `b` itself.
+///
+/// A block that carries ARGUMENTS is not forwarding, because the values it passes belong to the
+/// path that reaches it and cannot be read as the same arrival.
+fn forwardsTo(func: *const Function, b: Block) Block {
+    if (func.blockInsts(b).len != 0) return b;
+    if (func.blockParams(b).len != 0) return b;
+    return switch (func.terminator(b) orelse return b) {
+        .jump => |j| if (func.blockArgs(j).len == 0) j.target else b,
+        .ret => b,
+    };
+}
+
+/// The one block that reaches `b`, when exactly one does.
+fn solePredecessor(func: *const Function, b: Block) ?Block {
+    var found: ?Block = null;
+    for (0..func.blockCount()) |pi| {
+        const p: Block = @fromBackingInt(@intCast(pi));
+        if (!jumpsTo(func, p, b)) continue;
+        if (found != null) return null;
+        found = p;
+    }
+    return found;
+}
+
+// ===========================================================================
 // Broadcasting a warp-uniform argument into a per-lane parameter.
 
 /// Give every PER-LANE block parameter a per-lane argument, and report whether anything changed.
@@ -1354,6 +1433,14 @@ const DivergentLoop = struct {
     /// Whether the TRUE edge continues the loop.
     continue_on_true: bool,
     exit: Block,
+    /// The condition of a per-lane GUARD around the loop, which becomes the mask the first
+    /// iteration runs under. Null when every lane that reached the preheader enters.
+    guard: ?Value = null,
+    /// Whether the guard's TRUE side is the one that enters the loop.
+    guard_on_true: bool = true,
+    /// The block the guard branches in, which is one above the preheader when critical-edge
+    /// splitting put a block between them. Equal to the preheader when there is no guard.
+    guard_block: Block,
 };
 
 /// Whether `block` is a loop this converts. Every condition is a reason it would otherwise be
@@ -1392,11 +1479,50 @@ fn divergentLoop(func: *const Function, block: Block, divergent: []const bool) ?
         preheader = p;
     }
     const pre = preheader orelse return null;
+    // A GUARDED loop: the preheader leaves by a per-lane branch, one way into the loop and the
+    // other to the block the loop exits to. That is `if (c) while (...)`, and it means the loop
+    // starts with only the lanes `c` names. The guard's condition becomes the loop's first mask
+    // and the branch goes away: a lane that fails it enters inactive, runs nothing, and leaves by
+    // the loop's own exit edge, which is where the guard would have sent it.
+    //
+    // The guard must send the failing lanes to THE LOOP'S EXIT. One that sends them anywhere else
+    // is a different shape and stays refused.
     // The mask for the first iteration is appended to the preheader, which only lands before the
-    // jump when the preheader LEAVES by a jump. A branch there would take the arrival with it.
+    // jump when the preheader LEAVES by a jump.
     if (func.terminator(pre) == null) return null;
     for (func.blockInsts(pre)) |inst| {
         if (func.opcode(inst) == .@"if") return null;
+    }
+    // Where the guard sits, if there is one. Critical-edge splitting puts an EMPTY block between
+    // a branch and a loop header, so the guard is one level above the preheader rather than being
+    // the preheader. Looking only at the immediate predecessor finds nothing.
+    var guard: ?Value = null;
+    var guard_on_true = true;
+    var guard_block = pre;
+    if (func.blockInsts(pre).len == 0 and func.blockParams(pre).len == 0) {
+        if (solePredecessor(func, pre)) |up| {
+            if (endsInIf(func, up)) {
+                const up_insts = func.blockInsts(up);
+                const g = func.opcode(up_insts[up_insts.len - 1]).@"if";
+                const into_then = g.then.target == pre;
+                const into_else = g.@"else".target == pre;
+                // One way in and the other OUT, to the block the loop itself exits to. A guard
+                // that sends the failing lanes anywhere else is a different shape.
+                const out = if (into_then) g.@"else".target else g.then.target;
+                // Both edges leave for the same place, but critical-edge splitting puts a
+                // DIFFERENT empty block on each, so comparing the immediate targets finds two
+                // blocks where the source had one. Compare where they end up.
+                if (into_then != into_else and
+                    forwardsTo(func, out) == forwardsTo(func, exit) and
+                    divergent[@backingInt(g.cond)] and
+                    (into_then or invertedCompare(func, g.cond) != null))
+                {
+                    guard = g.cond;
+                    guard_on_true = into_then;
+                    guard_block = up;
+                }
+            }
+        }
     }
     // Every instruction in the body runs for a lane that has already finished, so the body must be
     // instructions that cost nothing when their answer is thrown away. A store and a load both
@@ -1411,6 +1537,9 @@ fn divergentLoop(func: *const Function, block: Block, divergent: []const bool) ?
         .cond = cf.cond,
         .continue_on_true = then_latch,
         .exit = exit,
+        .guard = guard,
+        .guard_on_true = guard_on_true,
+        .guard_block = guard_block,
     };
 }
 
@@ -1467,10 +1596,18 @@ fn convertLoop(
     if (!loop.continue_on_true and invertedCompare(func, loop.cond) == null) return false;
     const header = loop.header;
 
-    // The mask the first iteration runs under: every lane that reached the loop. Comparing the
-    // lane index against itself is true in every lane, and it is a per-lane value by its
-    // operands, so it reaches the hardware as a real mask rather than a broadcast 1.
-    const all = try func.appendInst(loop.preheader, bool_ty, .{ .icmp = .{
+    // The mask the first iteration runs under. Without a guard that is every lane which reached
+    // the loop, and comparing the lane index against itself says so: true in every lane, and a
+    // per-lane value by its operands, so it reaches the hardware as a real mask rather than a
+    // broadcast 1. With a guard it is the guard's condition, or the complement of it when the
+    // loop is entered on the false side.
+    const all = if (loop.guard) |g| blk: {
+        if (loop.guard_on_true) break :blk g;
+        // Before the guard's branch, which is still there until below.
+        break :blk try appendBeforeBranch(allocator, func, loop.guard_block, bool_ty, .{
+            .icmp = invertedCompare(func, g).?,
+        });
+    } else try func.appendInst(loop.preheader, bool_ty, .{ .icmp = .{
         .op = .eq,
         .lhs = lane,
         .rhs = lane,
@@ -1478,6 +1615,18 @@ fn convertLoop(
     const carried = func.blockParams(header).len;
     const active = try func.appendBlockParam(header, bool_ty);
     try appendJumpArg(allocator, func, loop.preheader, all);
+    if (loop.guard != null) {
+        // The guard is the mask now, so the branch it was goes away and control simply enters the
+        // loop. The lanes it would have turned away enter INACTIVE instead, run no iteration of
+        // the body, and leave by the loop's own exit edge, which is where the guard sent them.
+        const g_inst = func.blockInstsMut(loop.guard_block).pop().?;
+        const g = func.opcode(g_inst).@"if";
+        const enter = if (loop.guard_on_true) g.then else g.@"else";
+        func.terminatorPtr(loop.guard_block).* = .{ .jump = .{
+            .target = loop.preheader,
+            .args = enter.args,
+        } };
+    }
 
     // The body, with every store put under the mask of the iteration it runs in. A lane that is
     // finished takes no part: an inactive lane makes no bus access at all.

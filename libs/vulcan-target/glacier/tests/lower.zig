@@ -4045,3 +4045,104 @@ test "a loop whose body branches leaves at different times in each lane" {
         try std.testing.expectEqual(want[i], data[i]);
     }
 }
+
+test "a per-lane guard around a loop becomes the mask the loop starts with" {
+    // `x = lane; if (x <= 2) { do { data[x] = 0x77; x += 4 } while (x <= 2) }`
+    //
+    // This is a span fill written as a guarded do-while, which is the shape a rasteriser wants: a
+    // run can be SHORTER than the warp is wide, so a lane past the end must not store even once.
+    // The guard is a per-lane branch whose arm holds a LOOP, which if-conversion must not flatten,
+    // so instead the guard's condition becomes the mask the loop's first iteration runs under and
+    // the branch goes away. A lane that fails it enters inactive and stores nothing.
+    //
+    // Lane 3 fails the guard. Word 3 staying untouched is the whole assertion: a lowering that
+    // entered every lane would write it on the first iteration.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const done = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const limit = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const colour = try f.appendInst(entry, u32_t, .{ .iconst = 0x77 });
+    const step = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const guard = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .le, .lhs = tid, .rhs = limit } });
+    try f.appendIf(entry, guard, .{ .target = loop, .args = &.{tid} }, .{ .target = done });
+
+    const x = try f.appendBlockParam(loop, u32_t);
+    const offset = try f.appendArithImm(loop, u32_t, .shl, x, 2);
+    const at = try f.appendInst(loop, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(loop, colour, at);
+    const x_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = step } });
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .le, .lhs = x_next, .rhs = limit } });
+    try f.appendIf(loop, more, .{ .target = loop, .args = &.{x_next} }, .{ .target = done });
+    f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One reduction for the loop, and the guard's branch is gone: the only conditional left is the
+    // one the lane count feeds.
+    var branches: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1100011) branches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), branches);
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..data.len) |i| {
+        const want: u32 = if (i <= 2) 0x77 else sentinel;
+        try std.testing.expectEqual(want, data[i]);
+    }
+}
+
+test "a guard whose other side carries a value of its own is refused" {
+    // `if (x <= 2) { do { ... } while (...) } else { done(7) }`, where the two ways out of the
+    // guard reach the same block with DIFFERENT arguments. The guard cannot become the loop's
+    // mask then: a lane that failed it would arrive carrying the loop's value instead of its own.
+    //
+    // The two arrivals look alike after critical-edge splitting, which puts an empty block on each
+    // edge, and the only thing that tells them apart is that one of those blocks passes an
+    // argument. Reading past it without checking is a wrong answer and not a refusal.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const done = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const limit = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const seven = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    const step = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const guard = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .le, .lhs = tid, .rhs = limit } });
+    try f.appendIf(entry, guard, .{ .target = loop, .args = &.{tid} }, .{ .target = done, .args = &.{seven} });
+
+    const x = try f.appendBlockParam(loop, u32_t);
+    const x_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = step } });
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .le, .lhs = x_next, .rhs = limit } });
+    try f.appendIf(loop, more, .{ .target = loop, .args = &.{x_next} }, .{ .target = done, .args = &.{x_next} });
+
+    const arrived = try f.appendBlockParam(done, u32_t);
+    const offset = try f.appendArithImm(done, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(done, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(done, arrived, at);
+    f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
