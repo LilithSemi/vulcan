@@ -20,8 +20,8 @@
 //!     which has independent read and write channels and more than one transaction in flight. At
 //!     that point every clause of the justification goes at once and the bits become a promise the
 //!     core has to keep.
-//!   - No FP square root, and FP32 truncates toward zero with subnormals flushed rather than
-//!     rounding to nearest. Anything that assumes IEEE default rounding differs in the last bit.
+//!   - No FP square root, and every FP32 result has its subnormals flushed to a signed zero. The
+//!     rounding is IEEE nearest even except in the widening MAC, which truncates its accumulate.
 //!
 //! Sub-word access is NOT one of the absences. Both halves work: LB, LBU, LH and LHU extend from
 //! the addressed byte or halfword, and SB and SH drive the bus byte select for the lane they
@@ -106,9 +106,13 @@ pub const warp_barrier: u32 = 0x1000000F;
 /// `fdiv.s f8, f9, f10`: the same word, read as a different register file.
 ///
 /// It is the ONLY scalar FP operation the core decodes, and the only FP operation of any kind that
-/// is not per-lane. A per-lane divide therefore costs one of these per lane with a `vmv.x.s` and a
-/// `vmv.v.x` around it, which is why a renderer divides per vertex or per scanline and not per
-/// pixel. It always truncates: the rounding mode in `funct3` is accepted and ignored.
+/// is not per-lane. The rounding mode in `funct3` is accepted and ignored, because the core ties
+/// the divider's mode to nearest even.
+///
+/// A divide whose operands are the same in every lane belongs here rather than on `vfdiv_vv`: both
+/// give the same quotient, and this one does the work once where the vector divider would walk
+/// every lane and park the warp for all of them. A renderer still divides per vertex or per
+/// scanline and not per pixel, because the walk is what a per-lane divide costs.
 pub fn fdiv(rd: Reg, rs1: Reg, rs2: Reg) u32 {
     return 0b1010011 | (@as(u32, @backingInt(rd)) << 7) | (0b111 << 12) |
         (@as(u32, @backingInt(rs1)) << 15) | (@as(u32, @backingInt(rs2)) << 20) |

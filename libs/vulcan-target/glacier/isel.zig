@@ -2858,17 +2858,17 @@ fn vectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const f
 /// So this list is NOT the lane's op list.
 ///
 /// THE DIVIDE IS PER-LANE ONLY, and that is not an oversight of the table. The core has TWO float
-/// dividers, deliberately unshared so a vector divide never waits on a scalar one, and THEY ROUND
-/// DIFFERENTLY: `vfdiv.vv` rounds to nearest even and `FDIV.S` truncates toward zero. So a
-/// warp-uniform divide has to stay on the scalar one rather than be computed per lane and read
-/// back out, because the two answers differ in the last bit and the scalar one is what a kernel
-/// that does not vary per lane has always got. `per_lane` is what keeps them apart.
+/// dividers, deliberately unshared so a vector divide never waits on a scalar one, and both have
+/// their mode tied to nearest even. So the quotient cannot say which one ran and the choice is
+/// cost alone: `vfdiv.vv` walks the lanes, about 31 beats of recurrence for each active one, and
+/// the warp parks for the whole walk, where `FDIV.S` divides once and leaves the vector write port
+/// alone. A warp-uniform divide therefore stays scalar rather than compute the same quotient in
+/// every lane, and `per_lane` is what keeps the two apart. The wider the core, the further apart
+/// they are.
 ///
-/// `vfdiv.vv` iterates, one lane a beat, and the warp parks for the walk while the other resident
-/// warps keep issuing. So a divide per span and a multiply per pixel is the shape to write, and a
-/// divide in an inner loop costs the warp width in beats each time round. A lane the mask excludes
-/// is SKIPPED rather than divided and discarded, measured by cycle count on the core, so a divide
-/// under a narrow mask is cheaper in proportion.
+/// A lane the mask excludes is SKIPPED rather than divided and discarded, so a divide under a
+/// narrow mask costs in proportion. A divide per span and a multiply per pixel is still the shape
+/// to write: in an inner loop the walk is paid every time round.
 ///
 /// f16 arithmetic is absent for a different reason: the element width is fixed at 32 bits, so these
 /// read whole lanes. An f16 lives in the low half of one, which is the MAC's shape and not this.

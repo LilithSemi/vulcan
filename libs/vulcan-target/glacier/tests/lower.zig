@@ -931,7 +931,8 @@ test "a float to unsigned convert truncates toward zero" {
 
 test "a warp-uniform float divide becomes the one scalar divide" {
     // The perspective divide is what this exists for: one divide per vertex or per scanline, not
-    // per pixel. It truncates, which 1.0 / 3.0 shows.
+    // per pixel. It rounds to nearest even, which 1.0 / 3.0 shows, because that quotient is
+    // inexact and the two roundings name different words.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -952,8 +953,9 @@ test "a warp-uniform float divide becomes the one scalar divide" {
     defer allocator.free(words);
     var data: [1]u32 = .{0};
     try runOnce(words, &data, 0, 1);
-    // 1.0 / 3.0 rounds to nearest UP, so truncating gives one unit in the last place less.
-    try std.testing.expectEqual(@as(u32, @as(u32, @bitCast(@as(f32, 1.0) / @as(f32, 3.0))) - 1), data[0]);
+    // 1.0 / 3.0 rounds to nearest UP, so a truncating divider would give one unit in the last
+    // place less and this would fail.
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.0) / @as(f32, 3.0))), data[0]);
 }
 
 test "the backend refuses the float work Glacier cannot do" {
@@ -4209,10 +4211,10 @@ test "a guard stays when the block the loop leaves by writes memory" {
 }
 
 test "a per-lane float divide runs on the lanes and rounds to nearest even" {
-    // `out[lane] = (lane + 1) / 3`, in f32, per lane. The quotient of 1/3 and 2/3 is not exact in
-    // binary, so this is also where the TWO DIVIDERS part company: `vfdiv.vv` rounds to nearest
-    // even and the scalar `FDIV.S` truncates toward zero. The expected words are the nearest-even
-    // ones, and a lowering that sent this to the scalar divider would be one bit low.
+    // `out[lane] = (lane + 1) / 3`, in f32, per lane. The opcode check is what says the lanes did
+    // the work, because the two dividers give the same quotient and no value can tell them apart.
+    // The bits are checked as well, against the exact IEEE words: 1/3 and 2/3 are both inexact, so
+    // they catch a divider that rounded any other way.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -4258,8 +4260,71 @@ test "a per-lane float divide runs on the lanes and rounds to nearest even" {
         const want: f32 = @as(f32, @floatFromInt(i + 1)) / 3.0;
         try std.testing.expectEqual(@as(u32, @bitCast(want)), data[i]);
     }
-    // 1/3 and 2/3 both round UP to nearest even, so the truncating divider would differ. That is
-    // what makes this test say which divider ran rather than only that a divide happened.
+    // Written out, so a change of rounding anywhere under this has to be read rather than
+    // recomputed by the same expression that produced it.
     try std.testing.expectEqual(@as(u32, 0x3EAAAAAB), data[0]);
     try std.testing.expectEqual(@as(u32, 0x3F2AAAAB), data[1]);
+}
+
+test "one kernel can hold both dividers" {
+    // `out[lane] = (lane + 1) / 3` per lane and `out[4] = 1 / 3` once for the warp, so the lowering
+    // selects BOTH dividers in one function. The two give the same quotient, so only the opcodes
+    // say which ran, and both quotients are checked because a kernel that mixes them is where a
+    // wrong selection would be easiest to miss.
+    //
+    // The core has these on separate issue gates and each blocks all issue while it holds a
+    // result. Whether they interact is an OPEN question on the hardware side, so the stream this
+    // emits is the one to run there before a kernel relies on the pair.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const three = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+
+    const numerator = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const per_lane = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = numerator, .rhs = three } });
+    try f.appendStore(entry, try f.appendInst(entry, u32_t, .{
+        .unary = .{ .op = .reinterpret, .value = per_lane },
+    }), at);
+
+    const one = try f.appendInst(entry, f32_t, .{ .fconst = 1.0 });
+    const uniform = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = one, .rhs = three } });
+    const tail = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendInst(entry, u32_t, .{ .iconst = 16 }),
+    } });
+    try f.appendStore(entry, try f.appendInst(entry, u32_t, .{
+        .unary = .{ .op = .reinterpret, .value = uniform },
+    }), tail);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var scalar: usize = 0;
+    var vector: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1010011) scalar += 1;
+        if (w & 0x7F == 0b1010111 and (w >> 12) & 0b111 == 0b001 and w >> 26 == 0b100000) vector += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), scalar);
+    try std.testing.expectEqual(@as(usize, 1), vector);
+
+    var data: [8]u32 = @splat(0);
+    for (0..8) |i| data[i] = @bitCast(@as(f32, @floatFromInt(i + 1)));
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const want: f32 = @as(f32, @floatFromInt(i + 1)) / 3.0;
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), data[i]);
+    }
+    try std.testing.expectEqual(@as(u32, 0x3EAAAAAB), data[4]);
 }

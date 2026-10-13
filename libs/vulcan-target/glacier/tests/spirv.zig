@@ -820,11 +820,12 @@ test "a float divide and a float to integer convert run on Glacier" {
         var one: warp.Warp = .{ .hart_id = @intCast(w), .hart_count = warps };
         _ = try warp.run(words, &mem, &one, 10_000);
     }
-    // 100.0 / 8.0 is exact, so the truncation has nothing to remove.
+    // 100.0 / 8.0 is exact, so the rounding has nothing to decide.
     for (0..warps) |w| try std.testing.expectEqual(@as(u32, 12), data[1 + w]);
 
-    // 100.0 / 3.0 is not exact, and the divider truncates rather than rounding, so the integer
-    // result is 33 either way. The float quotient is what shows the truncation; see `lower.zig`.
+    // 100.0 / 3.0 is not exact, and 33.333 floors to 33 whichever way the last bit went, so this
+    // says nothing about the divider's rounding. The float quotient is what shows it; see
+    // `lower.zig`.
     data = @splat(0xFFFF_FFFF);
     data[0] = @bitCast(@as(f32, 3.0));
     var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1 };

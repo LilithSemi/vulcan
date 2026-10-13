@@ -12,9 +12,10 @@
 //! emits something this model does not know about is caught rather than silently skipped.
 //!
 //! The float rules are the ones the core implements, which are NOT the ones the mnemonics imply:
-//! the scalar divide always truncates, the integer-to-float and the narrowing converts round to
-//! nearest even, and every lane flushes a subnormal result to a signed zero. A model that rounded
-//! the way the names suggest would disagree with the hardware in the last bit.
+//! the widening MAC truncates its accumulate, the float-to-integer converts truncate toward zero,
+//! the adds, the multiplies, both divides and the other converts round to nearest even, and every
+//! lane flushes a subnormal result to a signed zero. A model that rounded the way the names
+//! suggest would disagree with the hardware in the last bit.
 //!
 //! ONE WARP AT A TIME, TO COMPLETION. `run` returns when its warp hits EBREAK, so a caller that
 //! wants several warps runs them one after another and they never interleave. Real warps issue
@@ -314,11 +315,11 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
         // OP-V: every vector arithmetic form.
         0x57 => try vectorOp(word, warp),
         // OP-FP. Glacier decodes exactly one of these, FDIV.S, and its register fields name X
-        // registers because the core has no f register file. It always truncates: the rounding
-        // mode in funct3 is accepted and ignored.
+        // registers because the core has no f register file. The rounding mode in funct3 is
+        // accepted and ignored: the core ties the divider's mode to nearest even.
         0x53 => {
             if (funct7 != 0b0001100) return error.Illegal;
-            warp.set(rd, @bitCast(ftz(f32, divTowardZero(asFloat(a), asFloat(b)))));
+            warp.set(rd, @bitCast(ftz(f32, asFloat(a) / asFloat(b))));
         },
         // CSR read. CSRRS with x0 as the set mask is the only CSR access a Glacier core decodes.
         0x73 => {
@@ -441,9 +442,9 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
                     0b100100 => x * y,
                     0b000100 => @min(x, y),
                     0b000110 => @max(x, y),
-                    // vfdiv.vv rounds to NEAREST EVEN, where the scalar `fdiv.s` below truncates.
-                    // Two dividers, two rounding modes, and the same operands can differ in the
-                    // last bit depending on which path a kernel took.
+                    // vfdiv.vv is a second divider, not the scalar one reused, and it is the same
+                    // unit with the same mode tied to nearest even. So the two agree bit for bit
+                    // and which one a kernel took is a question of cost alone.
                     0b100000 => x / y,
                     else => unreachable,
                 }));
@@ -596,14 +597,6 @@ fn unsignedFromFloat(v: f32) u32 {
     if (v <= 0) return 0;
     if (v >= 4294967296.0) return std.math.maxInt(u32);
     return @intFromFloat(v);
-}
-
-/// An f32 divide that truncates toward zero, which is the only rounding Glacier's divider does.
-/// The quotient is formed in f64 first, so the one case left wrong is the double rounding where
-/// the exact quotient sits just under a value f32 can name and the f64 step lifts it onto that
-/// value. No test here is near such a quotient.
-fn divTowardZero(x: f32, y: f32) f32 {
-    return truncToF32(@as(f64, x) / @as(f64, y));
 }
 
 /// `v` as the nearest f32 toward zero.
