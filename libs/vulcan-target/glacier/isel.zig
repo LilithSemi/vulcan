@@ -1,4 +1,4 @@
-//! Glacier instruction selection: a Vulcan IR kernel to a Glacier word stream.
+//! Glacier ruction selection: a Vulcan IR kernel to a Glacier word stream.
 //!
 //! A Glacier kernel is not a function. It has no caller, no arguments and no stack, so this
 //! lowering is narrower than a CPU backend on purpose:
@@ -220,6 +220,12 @@ fn compileKernelInternal(
     const reachable_after = try ir.reachable.neutralizeUnreachable(allocator, &work);
     allocator.free(reachable_after);
 
+    // Flattening a region makes new edges, and a loop whose body it collapsed comes out as a
+    // SELF-LOOP with its back edge critical again. Splitting once before if-conversion is
+    // therefore not enough: the allocator needs a block on every critical edge to put its shuffle
+    // moves on, and the loop recognizer below reads the split block as the latch.
+    try ir.critical_edge.splitCriticalEdges(allocator, &work);
+
     // A loop whose lanes disagree about when to stop: carry an active mask round it, mask the
     // stores with it, and freeze the carried values of a lane that has finished. This runs AFTER
     // if-conversion, which is what flattens an inner diamond into the straight-line body this
@@ -251,11 +257,17 @@ fn compileKernelInternal(
     {
         const d = try analyzeDivergence(allocator, &work);
         defer allocator.free(d);
-        if (try hoistLaneAddresses(allocator, &work, d)) {
-            var analyses: opt.pass.Analyses = .{ .allocator = allocator, .func = &work };
-            defer analyses.deinit();
-            _ = try opt.dce.run(allocator, &work, &analyses);
-        }
+        _ = try hoistLaneAddresses(allocator, &work, d);
+    }
+
+    // Unconditionally, because the passes above all leave dead values behind: a condition whose
+    // branch is gone, a predicate for a block that turned out to hold nothing, the arithmetic of
+    // an address that was rebuilt. The emitter drops an instruction nothing reads, but a dead
+    // value still holds a register until then, and a dead MASK is a vector register.
+    {
+        var analyses: opt.pass.Analyses = .{ .allocator = allocator, .func = &work };
+        defer analyses.deinit();
+        _ = try opt.dce.run(allocator, &work, &analyses);
     }
 
     const divergent = try analyzeDivergence(allocator, &work);
@@ -738,77 +750,399 @@ fn ifConvert(allocator: std.mem.Allocator, func: *Function, divergent: []const b
     var changed = false;
     for (0..func.blockCount()) |bi| {
         const a: Block = @fromBackingInt(@intCast(bi));
-        const found = candidate(func, a, divergent) orelse continue;
-        try convert(allocator, func, a, found);
-        changed = true;
+        const found = region(func, a, divergent) orelse continue;
+        if (try flatten(allocator, func, found)) changed = true;
     }
     return changed;
 }
 
-/// One convertible diamond: the branch, its two arms and the join they share.
-const Diamond = struct {
-    cond: Value,
-    then_block: Block,
-    else_block: Block,
-    join: Block,
-    then_args: ir.function.ValueList,
-    else_args: ir.function.ValueList,
+/// The most blocks one region may hold. The bound keeps the compile bounded rather than the code
+/// fast: a divergent branch has no branchy alternative, so there is no faster version to protect.
+const max_region_blocks = 64;
+
+/// A region one divergent branch opens and one block closes: single entry, single exit, acyclic,
+/// and every path from the head leaves only through the exit.
+///
+/// A diamond is the two-block case of this. A chain of `else if`s is not, which is why the
+/// diamond-only version refused the shape a real rasteriser writes: the arms of the first branch
+/// do not rejoin immediately, and the block they all end at has more than two predecessors.
+const Region = struct {
+    head: Block,
+    exit: Block,
+    /// The blocks strictly inside, ordered so a block comes after every predecessor of it.
+    inside: [max_region_blocks]Block = undefined,
+    count: usize = 0,
+
+    fn holds(self: *const Region, b: Block) bool {
+        for (self.inside[0..self.count]) |x| {
+            if (x == b) return true;
+        }
+        return false;
+    }
 };
 
-/// Whether the `if` ending `a` is a diamond this can convert. Every condition here is a reason it
-/// would otherwise be wrong, not a simplification of convenience.
-fn candidate(func: *const Function, a: Block, divergent: []const bool) ?Diamond {
-    const insts = func.blockInsts(a);
+/// The region the `if` ending `head` opens, or null when this cannot flatten it.
+fn region(func: *const Function, head: Block, divergent: []const bool) ?Region {
+    const insts = func.blockInsts(head);
     if (insts.len == 0) return null;
     const cf = switch (func.opcode(insts[insts.len - 1])) {
         .@"if" => |x| x,
         else => return null,
     };
-    // A uniform branch is left alone: it costs one jump and runs one side, where converting it
-    // would run both.
+    // A uniform branch is left alone: it costs one jump and runs one side, where flattening would
+    // run every block of the region.
     if (!divergent[@backingInt(cf.cond)]) return null;
-    const t = cf.then.target;
-    const e = cf.@"else".target;
-    if (t == e) return null;
-    // An arm with another predecessor is reached from somewhere this branch does not control, so
-    // its instructions cannot move into `a`. Critical-edge splitting runs first and gives every arm
-    // its own predecessor, so this holds structurally today and stands against a change of order.
-    if (predCount(func, t) != 1 or predCount(func, e) != 1) return null;
-    // An arm taking parameters receives them from the branch, and moving its body out would leave
-    // them undefined.
-    if (func.blockParams(t).len != 0 or func.blockParams(e).len != 0) return null;
-    // Both arms must leave by a plain jump to one join, and nothing may follow the branch.
-    if (func.blockArgs(cf.then).len != 0 or func.blockArgs(cf.@"else").len != 0) return null;
-    const t_jump = soleJump(func, t) orelse return null;
-    const e_jump = soleJump(func, e) orelse return null;
-    if (t_jump.target != e_jump.target) return null;
-    const join = t_jump.target;
-    if (join == t or join == e or join == a) return null;
-    // The entry block is reachable without a predecessor, so it cannot be absorbed into another.
-    if (@backingInt(join) == 0) return null;
-    // A join reached from anywhere else takes parameters from a path this does not control, so
-    // they cannot all become selects.
-    if (predCount(func, join) != 2) return null;
-    if (func.blockArgs(t_jump).len != func.blockParams(join).len) return null;
-    if (func.blockArgs(e_jump).len != func.blockParams(join).len) return null;
-    // Both arms run for every lane after this, so a side effect in one would reach lanes that did
-    // not choose it.
-    for ([_]Block{ t, e }) |arm| {
-        for (func.blockInsts(arm)) |inst| if (!convertible(func.opcode(inst))) return null;
+    if (cf.then.target == head or cf.@"else".target == head) return null;
+
+    var r: Region = .{ .head = head, .exit = head };
+    // Candidates are the blocks an edge out of the region's known part reaches. One of them ends
+    // up being the exit and the rest end up inside.
+    var seen: [max_region_blocks * 2]Block = undefined;
+    var seen_count: usize = 0;
+    const push = struct {
+        fn f(list: []Block, n: *usize, b: Block) bool {
+            for (list[0..n.*]) |x| {
+                if (x == b) return true;
+            }
+            if (n.* == list.len) return false;
+            list[n.*] = b;
+            n.* += 1;
+            return true;
+        }
+    }.f;
+    if (!push(&seen, &seen_count, cf.then.target)) return null;
+    if (!push(&seen, &seen_count, cf.@"else".target)) return null;
+
+    // Take blocks into the region while more than one is still outstanding, always one whose
+    // predecessors are all accounted for, which builds a topological order. The region CLOSES
+    // when exactly one is left: that block is where every path meets again, so it is the exit.
+    // Absorbing it instead would swallow the rest of the function.
+    while (outstanding(&r, seen[0..seen_count]) > 1) {
+        var took = false;
+        for (seen[0..seen_count]) |b| {
+            if (r.holds(b)) continue;
+            if (!readyIn(func, &r, b)) continue;
+            // A block that leaves by `ret` takes a path out that the exit does not cover, so it
+            // cannot go INSIDE. It may still be the exit, which is the ordinary end of a kernel.
+            if (func.terminator(b)) |t| {
+                if (t == .ret) continue;
+            }
+            // Everything inside runs for every lane, so it has to be something a lane that did
+            // not choose it may run. A store and a load qualify: both take the mask.
+            var pure = true;
+            for (func.blockInsts(b)) |in_b| {
+                if (func.opcode(in_b) == .@"if") continue; // dropped: the predicates carry it
+                if (!convertible(func.opcode(in_b))) pure = false;
+            }
+            if (!pure) continue;
+            if (r.count == max_region_blocks) return null;
+            r.inside[r.count] = b;
+            r.count += 1;
+            for (successorsOf(func, b)) |s| {
+                const t = s orelse continue;
+                if (t == head) return null; // a cycle: this is a loop and not a region
+                if (r.holds(t)) return null; // a cycle inside the region
+                if (!push(&seen, &seen_count, t)) return null;
+            }
+            took = true;
+            break;
+        }
+        if (!took) return null; // nothing was ready, so the shape is not single-exit
     }
-    // A store in the ELSE arm runs where the condition is FALSE, so it needs the complement as a
-    // real value. The only exact complement here is an inverted integer compare: `!(a < b)` is
-    // `a >= b` over a total order, and is NOT over floats, where a NaN leaves both false. A
-    // condition this cannot invert means the else arm keeps its store and the diamond is refused.
-    if (hasStore(func, e) and invertedCompare(func, cf.cond) == null) return null;
-    return .{
-        .cond = cf.cond,
-        .then_block = t,
-        .else_block = e,
-        .join = join,
-        .then_args = t_jump.args,
-        .else_args = e_jump.args,
+    var exit: ?Block = null;
+    for (seen[0..seen_count]) |b| {
+        if (r.holds(b)) continue;
+        exit = b;
+    }
+    r.exit = exit orelse return null;
+    if (r.count == 0) return null;
+    if (r.exit == head) return null;
+    if (@backingInt(r.exit) == 0) return null;
+    // Every way into the region is the head's branch, and every way out is the exit. A block with
+    // an outside predecessor would be reached on a path this does not control.
+    if (!readyIn(func, &r, r.exit)) return null;
+    return r;
+}
+
+/// How many candidate blocks are not inside the region yet.
+fn outstanding(r: *const Region, seen: []const Block) usize {
+    var n: usize = 0;
+    for (seen) |b| {
+        if (!r.holds(b)) n += 1;
+    }
+    return n;
+}
+
+/// Whether every predecessor of `b` is the head or already inside the region.
+fn readyIn(func: *const Function, r: *const Region, b: Block) bool {
+    for (0..func.blockCount()) |pi| {
+        const p: Block = @fromBackingInt(@intCast(pi));
+        if (!jumpsTo(func, p, b)) continue;
+        if (p == r.head or r.holds(p)) continue;
+        return false;
+    }
+    return true;
+}
+
+/// The blocks `b` can go to, as two optional slots: an `if`'s two targets or a jump's one.
+fn successorsOf(func: *const Function, b: Block) [2]?Block {
+    const insts = func.blockInsts(b);
+    if (insts.len != 0) {
+        if (func.opcode(insts[insts.len - 1]) == .@"if") {
+            const cf = func.opcode(insts[insts.len - 1]).@"if";
+            return .{ cf.then.target, cf.@"else".target };
+        }
+    }
+    return switch (func.terminator(b) orelse return .{ null, null }) {
+        .jump => |j| .{ j.target, null },
+        .ret => .{ null, null },
     };
+}
+
+/// What a block did by way of control flow, captured BEFORE anything moves. Flattening empties
+/// the blocks it would otherwise read this from, and a predicate built later needs the condition
+/// of a branch whose block is already gone.
+const Flow = struct {
+    block: Block,
+    /// Null for a block that leaves by a jump.
+    cond: ?Value = null,
+    /// The then edge and the else edge, or just the first for a jump.
+    edges: [2]?ir.function.Jump = .{ null, null },
+
+    fn edgeTo(self: Flow, b: Block) ?ir.function.Jump {
+        for (self.edges) |e| {
+            const j = e orelse continue;
+            if (j.target == b) return j;
+        }
+        return null;
+    }
+
+    /// Which side of a branch goes to `b`: 0 the then edge, 1 the else edge, null neither.
+    fn sideTo(self: Flow, b: Block) ?usize {
+        for (self.edges, 0..) |e, i| {
+            const j = e orelse continue;
+            if (j.target == b) return i;
+        }
+        return null;
+    }
+};
+
+/// The control flow of the head and of every block inside a region.
+const Flows = struct {
+    items: [max_region_blocks + 1]Flow = undefined,
+    count: usize = 0,
+
+    fn add(self: *Flows, func: *const Function, b: Block) void {
+        var f: Flow = .{ .block = b };
+        const insts = func.blockInsts(b);
+        if (insts.len != 0 and func.opcode(insts[insts.len - 1]) == .@"if") {
+            const cf = func.opcode(insts[insts.len - 1]).@"if";
+            f.cond = cf.cond;
+            f.edges = .{ cf.then, cf.@"else" };
+        } else if (func.terminator(b)) |t| switch (t) {
+            .jump => |j| f.edges[0] = j,
+            .ret => {},
+        };
+        self.items[self.count] = f;
+        self.count += 1;
+    }
+
+    fn of(self: *const Flows, b: Block) ?Flow {
+        for (self.items[0..self.count]) |f| {
+            if (f.block == b) return f;
+        }
+        return null;
+    }
+};
+
+/// Flatten `r` into its head: every block's instructions move in under the predicate of the block
+/// they came from, every block parameter becomes a select over the paths that reach it, and the
+/// branches disappear. Reports false when a predicate it would need cannot be built, leaving the
+/// function as it was.
+///
+/// The cost is the SUM of the region's blocks rather than the longest path through it, because
+/// every block now runs for every lane. That is the price of a warp having one program counter,
+/// and the alternative is refusing the kernel.
+///
+/// A block is predicated and moved in one step, in topological order. The two cannot be separated:
+/// a predicate reads the branch conditions of the blocks above it, and those are values that only
+/// reach the head when their block moves.
+fn flatten(allocator: std.mem.Allocator, func: *Function, r: Region) Error!bool {
+    const bool_ty = try func.types.intern(.bool);
+    const head = r.head;
+
+    // Captured first, because moving a block destroys what it says about its own edges.
+    var flows: Flows = .{};
+    flows.add(func, head);
+    for (r.inside[0..r.count]) |b| flows.add(func, b);
+
+    // Nothing is touched until every predicate is known to be buildable, so a refusal leaves the
+    // function alone. The only one that can fail is a complement, and only an integer compare has
+    // one, so the check is the same question asked without emitting anything.
+    for (r.inside[0..r.count]) |b| {
+        for (flows.items[0..flows.count]) |src| {
+            if (src.sideTo(b)) |side| {
+                if (side == 1 and src.cond != null and invertedCompare(func, src.cond.?) == null) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    _ = func.blockInstsMut(head).pop().?;
+
+    var preds: [max_region_blocks]?Value = @splat(null);
+    var negated: [max_region_blocks + 1]?Value = @splat(null);
+
+    for (0..r.count) |i| {
+        const b = r.inside[i];
+        preds[i] = try predicateOf(func, head, r, &flows, &preds, &negated, b, bool_ty);
+        try moveBlock(allocator, func, head, r, &flows, &preds, b, preds[i], bool_ty, .drop_branch);
+    }
+    // The exit runs for every lane that entered the region, so it needs no predicate of its own.
+    // Its own branch STAYS: the region ends there, so whatever it does next is not this region's
+    // business. For a loop that branch is the latch, and dropping it would lose the loop.
+    try moveBlock(allocator, func, head, r, &flows, &preds, r.exit, null, bool_ty, .keep_branch);
+
+    // The head takes the exit's terminator, so nothing branches anywhere inside. Everything else
+    // is unreachable and `neutralizeUnreachable` takes it out.
+    func.terminatorPtr(head).* = func.terminatorPtr(r.exit).*;
+    for (r.inside[0..r.count]) |b| func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    func.setTerminator(r.exit, .{ .ret = ir.function.Ret.none() });
+    return true;
+}
+
+/// The predicate for `b`: the paths into it, each the predicate of its source ANDed with what the
+/// edge tests, ORed together. Null means every lane that reached the region.
+fn predicateOf(
+    func: *Function,
+    head: Block,
+    r: Region,
+    flows: *const Flows,
+    preds: *const [max_region_blocks]?Value,
+    negated: *[max_region_blocks + 1]?Value,
+    b: Block,
+    bool_ty: Type,
+) Error!?Value {
+    var total: ?Value = null;
+    var any = false;
+    for (flows.items[0..flows.count], 0..) |src, si| {
+        const side = src.sideTo(b) orelse continue;
+        const from: ?Value = if (src.block == head) null else preds[indexIn(r, src.block).?];
+        // What the edge itself tests. A jump tests nothing, a branch its condition one way and the
+        // complement of it the other, and a branch whose two edges both land here tests nothing.
+        const edge: ?Value = blk: {
+            const cond = src.cond orelse break :blk null;
+            if (src.edges[0] != null and src.edges[1] != null and
+                src.edges[0].?.target == src.edges[1].?.target) break :blk null;
+            if (side == 0) break :blk cond;
+            if (negated[si] == null) {
+                negated[si] = try func.appendInst(head, bool_ty, .{
+                    .icmp = invertedCompare(func, cond).?,
+                });
+            }
+            break :blk negated[si];
+        };
+        const path: ?Value = if (from) |f|
+            (if (edge) |e| try maskAnd(func, head, f, e, bool_ty) else f)
+        else
+            edge;
+        if (!any) {
+            total = path;
+        } else if (total) |a_mask| {
+            // A path with no predicate of its own covers every lane, so the OR is everything.
+            const b_mask = path orelse break;
+            total = try maskOr(func, head, a_mask, b_mask, bool_ty);
+        }
+        any = true;
+    }
+    return total;
+}
+
+fn maskAnd(func: *Function, at: Block, x: Value, y: Value, bool_ty: Type) Error!Value {
+    return func.appendInst(at, bool_ty, .{ .arith = .{ .op = .bit_and, .lhs = x, .rhs = y } });
+}
+
+fn maskOr(func: *Function, at: Block, x: Value, y: Value, bool_ty: Type) Error!Value {
+    return func.appendInst(at, bool_ty, .{ .arith = .{ .op = .bit_or, .lhs = x, .rhs = y } });
+}
+
+/// Where `b` sits in the region's order, or null when it is not inside.
+fn indexIn(r: Region, b: Block) ?usize {
+    for (r.inside[0..r.count], 0..) |x, i| {
+        if (x == b) return i;
+    }
+    return null;
+}
+
+/// Move `b`'s parameters and instructions into `head`, under `mask`.
+fn moveBlock(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    head: Block,
+    r: Region,
+    flows: *const Flows,
+    preds: *const [max_region_blocks]?Value,
+    b: Block,
+    mask: ?Value,
+    bool_ty: Type,
+    branch: enum { drop_branch, keep_branch },
+) Error!void {
+    // A parameter becomes a select down the paths that reach it. The paths are mutually exclusive,
+    // because a lane takes one way out of a branch, so the last one stands as the default and the
+    // order between them does not matter.
+    const params = try allocator.dupe(Value, func.blockParams(b));
+    defer allocator.free(params);
+    for (params, 0..) |p, pi| {
+        var value: ?Value = null;
+        for (flows.items[0..flows.count]) |src| {
+            const edge = src.edgeTo(b) orelse continue;
+            const args = func.blockArgs(edge);
+            if (pi >= args.len) continue;
+            const arg = args[pi];
+            if (value == null) {
+                value = arg;
+                continue;
+            }
+            const gate = if (src.block == head) null else preds[indexIn(r, src.block).?];
+            const g = gate orelse {
+                value = arg; // a path that covers every lane wins outright
+                continue;
+            };
+            value = try func.appendInst(head, func.valueType(p), .{ .select = .{
+                .cond = g,
+                .then = arg,
+                .@"else" = value.?,
+            } });
+        }
+        if (value) |v| func.replaceAllUses(p, v);
+    }
+    try func.setBlockParams(b, &.{});
+
+    const body = try allocator.dupe(Inst, func.blockInsts(b));
+    defer allocator.free(body);
+    func.blockInstsMut(b).clearRetainingCapacity();
+    for (body) |inst| {
+        // A branch INSIDE the region is gone: its condition is already inside every predicate
+        // that depended on it. The exit keeps its own branch, because the region ends before it,
+        // and for a loop that branch is the latch.
+        if (func.opcode(inst) == .@"if" and branch == .drop_branch) continue;
+        const carried: ?Value = switch (func.opcode(inst)) {
+            .store => |st| st.mask,
+            .load => |l| l.mask,
+            else => null,
+        };
+        const combined: ?Value = if (mask) |m| blk: {
+            if (carried) |inner| break :blk try maskAnd(func, head, inner, m, bool_ty);
+            break :blk m;
+        } else carried;
+        try func.blockInstsMut(head).append(allocator, inst);
+        switch (func.opcodeMut(inst).*) {
+            .store => |*st| st.mask = combined,
+            .load => |*l| l.mask = combined,
+            else => {},
+        }
+    }
 }
 
 /// The jump leaving `block`, when that is all it does by way of control flow.
@@ -870,94 +1204,6 @@ fn convertible(code: ir.function.Opcode) bool {
     };
 }
 
-fn convert(allocator: std.mem.Allocator, func: *Function, a: Block, d: Diamond) Error!void {
-    // Drop the branch first, so the arms' instructions land where it was.
-    const a_insts = func.blockInstsMut(a);
-    _ = a_insts.pop();
-
-    // The complement of the condition, materialized ONLY when the else arm stores. It goes in
-    // before either body so it dominates every store it masks.
-    const else_mask: ?Value = if (hasStore(func, d.else_block)) blk: {
-        const inverted = invertedCompare(func, d.cond).?;
-        break :blk try func.appendInst(a, func.valueType(d.cond), .{ .icmp = inverted });
-    } else null;
-
-    for ([_]Block{ d.then_block, d.else_block }) |arm| {
-        const mask = if (arm == d.else_block) else_mask else d.cond;
-        const body = func.blockInstsMut(arm);
-        const moved = try allocator.dupe(Inst, body.items);
-        defer allocator.free(moved);
-        body.clearRetainingCapacity();
-        // Both arms run for every lane now, so a store that was under the branch becomes a store
-        // under the mask. The lanes the mask excludes make no access at all.
-        //
-        // A store that arrives already masked came from a diamond this converted earlier, and it
-        // has to run where BOTH conditions hold, so the two masks are ANDed. The AND is appended
-        // before the store it feeds, which is why the body moves one instruction at a time rather
-        // than in one slice.
-        for (moved) |inst| {
-            const carried: ?Value = switch (func.opcode(inst)) {
-                .store => |st| st.mask,
-                .load => |l| l.mask,
-                else => null,
-            };
-            if (carried) |inner| {
-                const both = try func.appendInst(a, func.valueType(inner), .{ .arith = .{
-                    .op = .bit_and,
-                    .lhs = inner,
-                    .rhs = mask.?,
-                } });
-                try func.blockInstsMut(a).append(allocator, inst);
-                switch (func.opcodeMut(inst).*) {
-                    .store => |*st| st.mask = both,
-                    .load => |*l| l.mask = both,
-                    else => unreachable,
-                }
-                continue;
-            }
-            try func.blockInstsMut(a).append(allocator, inst);
-            switch (func.opcodeMut(inst).*) {
-                .store => |*st| st.mask = mask,
-                .load => |*l| l.mask = mask,
-                else => {},
-            }
-        }
-    }
-
-    // Each join parameter becomes a select between what the two arms would have passed it.
-    const count = func.blockParams(d.join).len;
-    var args: std.ArrayList(Value) = .empty;
-    defer args.deinit(allocator);
-    for (0..count) |i| {
-        const then_v = func.valueList(d.then_args)[i];
-        const else_v = func.valueList(d.else_args)[i];
-        const ty = func.valueType(func.blockParams(d.join)[i]);
-        try args.append(allocator, try func.appendInst(a, ty, .{ .select = .{
-            .cond = d.cond,
-            .then = then_v,
-            .@"else" = else_v,
-        } }));
-    }
-    for (0..count) |i| {
-        func.replaceAllUses(func.blockParams(d.join)[i], args.items[i]);
-    }
-    try func.setBlockParams(d.join, &.{});
-
-    // Absorb the join as well. Both arms came from `a` and nothing else reaches the join, so `a`
-    // dominates it and taking its body leaves no jump anywhere in the diamond. Its terminator
-    // comes over as it is, which is null when the join itself ends in an `if`: that branch moves
-    // across with the body and the next round of this pass sees it.
-    const join_body = func.blockInstsMut(d.join);
-    try func.blockInstsMut(a).appendSlice(allocator, join_body.items);
-    join_body.clearRetainingCapacity();
-    func.terminatorPtr(a).* = func.terminatorPtr(d.join).*;
-
-    // The arms and the join are now unreachable; `neutralizeUnreachable` takes them out of the
-    // picture.
-    for ([_]Block{ d.then_block, d.else_block, d.join }) |dead| {
-        func.setTerminator(dead, .{ .ret = ir.function.Ret.none() });
-    }
-}
 // ===========================================================================
 // Broadcasting a warp-uniform argument into a per-lane parameter.
 

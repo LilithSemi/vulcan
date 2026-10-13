@@ -2734,10 +2734,10 @@ test "a join reached from outside the branch keeps its parameters" {
     try std.testing.expectError(error.Unsupported, compile(allocator, &f));
 }
 
-test "a divergent branch that passes an argument to its arm is refused" {
-    // The arm reads a parameter the branch edge supplies, which if-conversion has nowhere to put:
-    // splicing the body into the branch would leave that parameter with no value. So the shape is
-    // one of those the refusal has to catch, and this pins that it does.
+test "a divergent branch that passes an argument to its arm becomes a select" {
+    // The arm reads a parameter the branch edge supplies. Flattening a REGION turns any block's
+    // parameters into selects over the paths that reach it, not just the exit's, so the argument
+    // arrives the same way a join value does. The diamond-only version refused this.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -2771,7 +2771,20 @@ test "a divergent branch that passes an argument to its arm is refused" {
     try f.appendStore(join, result, at);
     f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
 
-    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011);
+        try std.testing.expect(w & 0x7F != 0b1101111);
+    }
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        // The then arm reads its argument, `lane * 10`, and adds one. The else arm does not.
+        const want: u32 = if (i < 2) @intCast(i * 10 + 1) else @intCast(i + 100);
+        try std.testing.expectEqual(want, data[i]);
+    }
 }
 
 test "a divergent branch whose arms go to different places is refused" {
@@ -3883,4 +3896,152 @@ test "a kernel that compiles leaves the refusal empty" {
     }, &why);
     defer allocator.free(words);
     try std.testing.expectEqualStrings("", why.reason);
+}
+
+test "a chain of divergent else ifs flattens into one block" {
+    // `out[lane] = lane < 1 ? 10 : lane < 2 ? 20 : lane < 3 ? 30 : 40`, written as a CHAIN: the
+    // else arm of each test holds the next test. No two arms rejoin immediately and the block
+    // they all end at has four predecessors, which is why a diamond-only if-conversion refused
+    // the shape a real rasteriser writes.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const t1 = try f.appendBlock();
+    const test2 = try f.appendBlock();
+    const t2 = try f.appendBlock();
+    const test3 = try f.appendBlock();
+    const t3 = try f.appendBlock();
+    const t4 = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const three = try f.appendInst(entry, u32_t, .{ .iconst = 3 });
+    const c1 = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = one } });
+    try f.appendIf(entry, c1, .{ .target = t1 }, .{ .target = test2 });
+
+    const v10 = try f.appendInst(t1, u32_t, .{ .iconst = 10 });
+    try f.setJump(t1, join, &.{v10});
+
+    const c2 = try f.appendInst(test2, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(test2, c2, .{ .target = t2 }, .{ .target = test3 });
+    const v20 = try f.appendInst(t2, u32_t, .{ .iconst = 20 });
+    try f.setJump(t2, join, &.{v20});
+
+    const c3 = try f.appendInst(test3, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = three } });
+    try f.appendIf(test3, c3, .{ .target = t3 }, .{ .target = t4 });
+    const v30 = try f.appendInst(t3, u32_t, .{ .iconst = 30 });
+    try f.setJump(t3, join, &.{v30});
+    const v40 = try f.appendInst(t4, u32_t, .{ .iconst = 40 });
+    try f.setJump(t4, join, &.{v40});
+
+    const picked = try f.appendBlockParam(join, u32_t);
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, picked, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // Eight blocks became one: nothing branches and nothing jumps.
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011);
+        try std.testing.expect(w & 0x7F != 0b1101111);
+    }
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    const want = [_]u32{ 10, 20, 30, 40 };
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(want[i], data[i]);
+    }
+}
+
+test "a loop whose body branches leaves at different times in each lane" {
+    // `acc = 0; i = 0; do { acc += ((i + lane) & 1) == 0 ? 1 : 100; i += 1 } while (i <= lane)`
+    //
+    // The body holds a branch and the branch is PER LANE, so the loop has a multi-block body that
+    // if-conversion has to flatten before the per-lane exit can apply. That chain is what the
+    // rasteriser's span loop needs.
+    //
+    // The condition has to involve the lane. A branch on the loop index alone is warp-uniform, so
+    // if-conversion leaves it as a branch, correctly, and the body stays several blocks.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const header = try f.appendBlock();
+    const even = try f.appendBlock();
+    const odd = try f.appendBlock();
+    const tail = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    try f.setJump(entry, header, &.{ zero, zero });
+
+    const acc = try f.appendBlockParam(header, u32_t);
+    const index = try f.appendBlockParam(header, u32_t);
+    const sum = try f.appendInst(header, u32_t, .{ .arith = .{ .op = .add, .lhs = index, .rhs = tid } });
+    const low = try f.appendArithImm(header, u32_t, .bit_and, sum, 1);
+    const is_even = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .eq, .lhs = low, .rhs = zero } });
+    try f.appendIf(header, is_even, .{ .target = even }, .{ .target = odd });
+
+    const small = try f.appendInst(even, u32_t, .{ .iconst = 1 });
+    try f.setJump(even, tail, &.{small});
+    const big = try f.appendInst(odd, u32_t, .{ .iconst = 100 });
+    try f.setJump(odd, tail, &.{big});
+
+    const step = try f.appendBlockParam(tail, u32_t);
+    const acc_next = try f.appendInst(tail, u32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = step } });
+    const index_next = try f.appendArithImm(tail, u32_t, .add, index, 1);
+    const more = try f.appendInst(tail, bool_t, .{ .icmp = .{ .op = .le, .lhs = index_next, .rhs = tid } });
+    try f.appendIf(
+        tail,
+        more,
+        .{ .target = header, .args = &.{ acc_next, index_next } },
+        .{ .target = exit, .args = &.{acc_next} },
+    );
+
+    const total = try f.appendBlockParam(exit, u32_t);
+    const out_off = try f.appendArithImm(exit, u32_t, .shl, tid, 2);
+    const out_at = try f.appendInst(exit, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = out_off } });
+    try f.appendStore(exit, total, out_at);
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // The loop is still a loop, so one backward jump stays, and the lane count reduction is what
+    // it branches on.
+    var reductions: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0b111 != 0b010) continue;
+        if (w >> 26 != 0b010000) continue;
+        if ((w >> 15) & 0x1F != 16) continue;
+        reductions += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), reductions);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    // Lane j runs j+1 iterations, adding 1 on even indices and 100 on odd ones.
+    const want = [_]u32{ 1, 101, 102, 202 };
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(want[i], data[i]);
+    }
 }
