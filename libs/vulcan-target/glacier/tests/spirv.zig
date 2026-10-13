@@ -1196,3 +1196,113 @@ test "the fp32 acceptance kernel selects the right instructions from a module" {
     // Narrowed to f16 and widened back, then multiplied: both converts and a plain multiply.
     try std.testing.expectEqual(@as(u32, 0x49800008), data[6]);
 }
+
+/// `i = 0; sum = 0; while (i < lane) { out[lane * 8 + i] = i + 100; sum += i; i += 1 }`, then
+/// `out[lane * 8 + 7] = sum`.
+///
+/// A `while` loop in the STRUCTURED form a SPIR-V producer emits: the test in the header, the body
+/// in a block of its own, a continue block behind it. The trip count is the lane index, so the
+/// lanes disagree about when to stop, and the body WRITES, which is what says the test reached the
+/// hardware as a mask. Reading the sums alone would not: a body that stored for every lane on every
+/// pass would still add up to the same totals.
+fn whileLoopModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 u32=2 bool=3 v3u32=4 pInV3=5 pInU=6 c4096=7 arr=8 struct=9 pSbStruct=10
+    //      pSbArr=11 pSbU32=12 voidfn=13 c0=14 c1=15 c8=16 c100=17 c7=18 lid=19 out=20 main=21
+    //      entry=22 lanePtr=23 lane=24 header=25 body=26 cont=27 merge=28 i=29 sum=30 test=31
+    //      span=32 idx=33 elems=34 elem=35 val=36 sum_next=37 i_next=38 elems2=39 tail=40 elem2=41.
+    var b = try spirv.binary.Builder.init(allocator, 42);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 21, 0x6E69616D, 0, 19, 20 });
+    try b.emit(allocator, op.Name, &.{ 20, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 19, op.Decoration.builtin, op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 9, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeBool, &.{3});
+    try b.emit(allocator, op.TypeVector, &.{ 4, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.Constant, &.{ 2, 7, 4096 });
+    try b.emit(allocator, op.TypeArray, &.{ 8, 2, 7 });
+    try b.emit(allocator, op.TypeStruct, &.{ 9, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 9 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 12, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 13, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 14, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 15, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 16, 8 });
+    try b.emit(allocator, op.Constant, &.{ 2, 17, 100 });
+    try b.emit(allocator, op.Constant, &.{ 2, 18, 7 });
+    try b.emit(allocator, op.Variable, &.{ 5, 19, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 10, 20, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 21, 0, 13 });
+    try b.emit(allocator, op.Label, &.{22});
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 6, 23, 19, 14 });
+    try b.emit(allocator, op.Load, &.{ 2, 24, 23 });
+    try b.emit(allocator, op.IMul, &.{ 2, 32, 24, 16 });
+    try b.emit(allocator, op.Branch, &.{25});
+    try b.emit(allocator, op.Label, &.{25});
+    try b.emit(allocator, op.Phi, &.{ 2, 29, 14, 22, 38, 27 });
+    try b.emit(allocator, op.Phi, &.{ 2, 30, 14, 22, 37, 27 });
+    try b.emit(allocator, op.LoopMerge, &.{ 28, 27, 0 });
+    try b.emit(allocator, op.ULessThan, &.{ 3, 31, 29, 24 });
+    try b.emit(allocator, op.BranchConditional, &.{ 31, 26, 28 });
+    try b.emit(allocator, op.Label, &.{26});
+    try b.emit(allocator, op.IAdd, &.{ 2, 33, 32, 29 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 34, 20, 14 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 12, 35, 34, 33 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 36, 29, 17 });
+    try b.emit(allocator, op.Store, &.{ 35, 36 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 37, 30, 29 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 38, 29, 15 });
+    try b.emit(allocator, op.Branch, &.{27});
+    try b.emit(allocator, op.Label, &.{27});
+    try b.emit(allocator, op.Branch, &.{25});
+    try b.emit(allocator, op.Label, &.{28});
+    try b.emit(allocator, op.IAdd, &.{ 2, 40, 32, 18 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 39, 20, 14 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 12, 41, 39, 40 });
+    try b.emit(allocator, op.Store, &.{ 41, 30 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "a while loop with the test at the top runs a different count in each lane" {
+    const allocator = std.testing.allocator;
+    var b = try whileLoopModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    // The rotation leaves ONE conditional, the reduction of the active mask. A branch per lane
+    // would mean the lanes disagreed about where to go, which they cannot.
+    var branches: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1100011) branches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), branches);
+
+    const sentinel: u32 = 0xDEAD_BEEF;
+    var data: [32]u32 = @splat(sentinel);
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    _ = try warp.run(words, &mem, &one, 10_000);
+
+    // Lane `l` writes `100 + i` at `l * 8 + i` for i below l, and its sum at `l * 8 + 7`. Every
+    // other word is UNTOUCHED, which is the claim: the lanes the test excluded made no access, so
+    // lane 0 wrote one word and lane 3 wrote four.
+    const want = [32]u32{
+        sentinel, sentinel, sentinel, sentinel, sentinel, sentinel, sentinel, 0,
+        100,      sentinel, sentinel, sentinel, sentinel, sentinel, sentinel, 0,
+        100,      101,      sentinel, sentinel, sentinel, sentinel, sentinel, 1,
+        100,      101,      102,      sentinel, sentinel, sentinel, sentinel, 3,
+    };
+    for (want, 0..) |w, i| try std.testing.expectEqual(w, data[i]);
+}

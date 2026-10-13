@@ -3405,11 +3405,11 @@ test "a per-lane parameter fed a warp-uniform value on one edge gets it in every
     }
 }
 
-test "a divergent loop whose back edge computes something is refused" {
-    // The block on the back edge holds an instruction, so the values that go round are defined
-    // THERE and not in the header. Freezing them means selecting on them from the header, where
-    // they do not dominate, and nothing in the body would be masked either. The shape is refused
-    // and the divergent branch refusal catches it.
+test "a divergent loop whose step is on the back edge counts up by a different stride per lane" {
+    // `acc = 0; while (acc < 10) acc += lane + 1;`, then `out[lane] = acc`. The step is in the
+    // block the back edge goes through, so the values that go round are defined THERE and not in
+    // the header. That is the `while` shape, and the rotation moves the step up into the header
+    // under the test, which is where it has to be for the freezing select to see it.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -3444,7 +3444,17 @@ test "a divergent loop whose back edge computes something is refused" {
     try f.appendStore(exit, total, at);
     f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
 
-    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [8]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    // Lane `l` steps by `l + 1` and stops at or above ten, so it stops at the first multiple of
+    // its stride that reaches ten. Lanes 0 and 1 land ON ten, lanes 2 and 3 overshoot to twelve,
+    // and each keeps the value it had when it stopped rather than the last lane's.
+    try std.testing.expectEqual(@as(u32, 10), data[0]);
+    try std.testing.expectEqual(@as(u32, 10), data[1]);
+    try std.testing.expectEqual(@as(u32, 12), data[2]);
+    try std.testing.expectEqual(@as(u32, 12), data[3]);
 }
 
 test "a uniform term multiplied by three keeps its own multiply and the lane still runs contiguous" {
@@ -4327,4 +4337,60 @@ test "one kernel can hold both dividers" {
         try std.testing.expectEqual(@as(u32, @bitCast(want)), data[i]);
     }
     try std.testing.expectEqual(@as(u32, 0x3EAAAAAB), data[4]);
+}
+
+test "a while loop whose body holds an atomic keeps its branch" {
+    // `while (i < lane) { atomic_add(data, 1); i += 1 }`, in the test-at-the-top shape a SPIR-V
+    // producer emits. The rotation would move the body into the header, where it runs for every
+    // lane on every pass, and an atomic takes no mask to stop that. So the branch stays, and a
+    // per-lane branch is a refusal.
+    //
+    // Hoisting it would not fail anywhere later: the counter would simply come out too high.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const header = try f.appendBlock();
+    const body = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    try f.setJump(entry, header, &.{zero});
+
+    const i = try f.appendBlockParam(header, u32_t);
+    const more = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = tid } });
+    try f.appendIf(header, more, .{ .target = body }, .{ .target = exit });
+
+    try f.appendAtomicRmwStmt(body, .{
+        .op = .add,
+        .ptr = base,
+        .value = one,
+        .ordering = .relaxed,
+        .scope = .device,
+    });
+    const next = try f.appendInst(body, u32_t, .{ .arith = .{ .op = .add, .lhs = i, .rhs = one } });
+    try f.setJump(body, header, &.{next});
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{};
+    try std.testing.expectError(
+        error.Unsupported,
+        glacier.isel.compileKernelExplained(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+        }, &why),
+    );
+    try std.testing.expectEqualStrings(
+        "a branch on a per-lane condition that if-conversion could not flatten",
+        why.reason,
+    );
+    try std.testing.expectEqualStrings("if", why.opcode);
 }

@@ -237,6 +237,13 @@ fn compileKernelInternal(
     // needs, and before the analysis below, because it adds values of its own.
     var latches: std.ArrayList(Inst) = .empty;
     defer latches.deinit(allocator);
+    // A loop whose test sits at the TOP becomes the do-while the conversion below reads. Analysed
+    // again after it, because the rotation adds values of its own.
+    {
+        const d = try analyzeDivergence(allocator, &work);
+        defer allocator.free(d);
+        _ = try rotateWhileLoops(allocator, &work, d);
+    }
     {
         const d = try analyzeDivergence(allocator, &work);
         defer allocator.free(d);
@@ -1631,6 +1638,158 @@ fn isLatchOf(func: *const Function, maybe: Block, header: Block) bool {
 /// The mask is a loop-carried value like any other, which is what makes the rest fall out: it
 /// arrives as a block parameter, so the divergence analysis sees it as an operand and nothing here
 /// depends on a control-dependence rule.
+// ===========================================================================
+// A loop whose test is at the TOP.
+
+/// Turn every `while` loop into the do-while shape `divergentLoop` reads, and report whether
+/// anything changed.
+///
+/// A SPIR-V producer puts the test in the HEADER and the body in a block of its own, so the
+/// header's branch goes to the body one way and out of the loop the other. `divergentLoop` reads
+/// the other shape, where the body IS the header and the branch at the end of it either goes round
+/// or leaves. The two are the same loop once the body runs UNDER THE TEST: a lane the test excludes
+/// does nothing and carries its values unchanged, which is what a mask and a select say. So the
+/// body moves into the header under the test and the body's block, now empty, becomes the latch.
+///
+/// Only a divergent loop needs this. A warp-uniform one branches and costs nothing.
+fn rotateWhileLoops(allocator: std.mem.Allocator, func: *Function, divergent: []const bool) Error!bool {
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        if (try rotateWhileLoop(allocator, func, block, divergent)) changed = true;
+    }
+    return changed;
+}
+
+/// Whether `maybe` is the body of a `while` loop whose header is `header`: reached only from the
+/// header, holding no parameters of its own, and leaving straight back to the header with the
+/// values that go round.
+fn whileBodyOf(func: *const Function, maybe: Block, header: Block) bool {
+    if (maybe == header) return false;
+    // An EMPTY block here is the latch of a loop that is already a do-while, where the body sits
+    // in the header and ran before the test. Rotating that would put this iteration's work behind
+    // the test that ends the loop, and a lane leaving now would carry the value it had BEFORE the
+    // iteration it just ran.
+    if (func.blockInsts(maybe).len == 0) return false;
+    if (func.blockParams(maybe).len != 0) return false;
+    if (predCount(func, maybe) != 1) return false;
+    return switch (func.terminator(maybe) orelse return false) {
+        .jump => |j| j.target == header,
+        .ret => false,
+    };
+}
+
+/// Rotate the loop `header` heads, or report false when it is not a `while` loop this reads. Every
+/// condition is a reason it would otherwise be wrong rather than a simplification of convenience.
+fn rotateWhileLoop(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    header: Block,
+    divergent: []const bool,
+) Error!bool {
+    const insts = func.blockInsts(header);
+    if (insts.len == 0) return false;
+    const cf = switch (func.opcode(insts[insts.len - 1])) {
+        .@"if" => |x| x,
+        else => return false,
+    };
+    if (!divergent[@backingInt(cf.cond)]) return false;
+    // One edge into the body and the other out. Both or neither is not a loop this reads.
+    const then_body = whileBodyOf(func, cf.then.target, header);
+    const else_body = whileBodyOf(func, cf.@"else".target, header);
+    if (then_body == else_body) return false;
+    const body = if (then_body) cf.then.target else cf.@"else".target;
+    const exit = if (then_body) cf.@"else".target else cf.then.target;
+    if (exit == header or exit == body) return false;
+    if (predCount(func, header) != 2) return false;
+    // The body takes no parameters, so the branch passes it nothing and the values that go round
+    // are the ones the back edge names. They line up with the header's parameters.
+    if (func.blockArgs(if (then_body) cf.then else cf.@"else").len != 0) return false;
+    const round = func.terminator(body).?.jump;
+    if (func.blockArgs(round).len != func.blockParams(header).len) return false;
+    // Every instruction in the body runs for every lane once it moves up, so each has to cost
+    // nothing when its answer is thrown away. An access qualifies because it takes the test as a
+    // mask: a lane the test excludes makes no access at all.
+    for (func.blockInsts(body)) |inst| {
+        if (!convertible(func.opcode(inst))) return false;
+    }
+    // The body on the FALSE side needs the complement of the test, and the only exact complement
+    // is an inverted integer compare. See `invertedCompare`.
+    if (!then_body and invertedCompare(func, cf.cond) == null) return false;
+
+    const bool_ty = try func.types.intern(.bool);
+    const pred = if (then_body) cf.cond else try appendBeforeBranch(allocator, func, header, bool_ty, .{
+        .icmp = invertedCompare(func, cf.cond).?,
+    });
+
+    const moved = try allocator.dupe(Inst, func.blockInsts(body));
+    defer allocator.free(moved);
+    const back = try allocator.dupe(Value, func.blockArgs(round));
+    defer allocator.free(back);
+    // The edge out, kept before the branch is rewritten, arguments and all.
+    const leaving = if (then_body) cf.@"else" else cf.then;
+
+    // The branch comes off while the body goes under it, and goes back on at the end.
+    const branch = func.blockInstsMut(header).pop().?;
+    for (moved) |inst| try appendMasked(allocator, func, header, inst, pred);
+
+    // What goes round: the body's value for a lane the test admitted, and the parameter it already
+    // had for a lane the test excluded. Without this a lane that stopped early would carry a value
+    // computed from an iteration it took no part in.
+    var carried: std.ArrayList(Value) = .empty;
+    defer carried.deinit(allocator);
+    for (func.blockParams(header), back) |param, arg| {
+        try carried.append(allocator, try func.appendInst(header, func.valueType(param), .{ .select = .{
+            .cond = pred,
+            .then = arg,
+            .@"else" = param,
+        } }));
+    }
+    try func.blockInstsMut(header).append(allocator, branch);
+
+    // The body is the latch now: empty, taking nothing, carrying the selected values round.
+    func.blockInstsMut(body).clearRetainingCapacity();
+    func.terminatorPtr(body).* = .{ .jump = .{
+        .target = header,
+        .args = try func.internValueList(carried.items),
+    } };
+    // The test enters the latch on the TRUE side whatever its polarity was, which is the shape
+    // `divergentLoop` reads.
+    func.opcodeMut(branch).* = .{ .@"if" = .{
+        .cond = pred,
+        .then = .{ .target = body, .args = try func.internValueList(&.{}) },
+        .@"else" = leaving,
+    } };
+    return true;
+}
+
+/// Put `inst` in `block` with `mask` over the access it makes, ANDed with a mask it already
+/// carries. An instruction that makes no access goes in unchanged.
+fn appendMasked(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    block: Block,
+    inst: Inst,
+    mask: Value,
+) Error!void {
+    const carried: ?Value = switch (func.opcode(inst)) {
+        .store => |st| st.mask,
+        .load => |l| l.mask,
+        else => null,
+    };
+    const both = if (carried) |inner| try func.appendInst(block, try func.types.intern(.bool), .{ .arith = .{
+        .op = .bit_and,
+        .lhs = inner,
+        .rhs = mask,
+    } }) else mask;
+    try func.blockInstsMut(block).append(allocator, inst);
+    switch (func.opcodeMut(inst).*) {
+        .store => |*st| st.mask = both,
+        .load => |*l| l.mask = both,
+        else => {},
+    }
+}
+
 fn convertDivergentLoops(
     allocator: std.mem.Allocator,
     func: *Function,
@@ -1725,33 +1884,7 @@ fn convertLoop(
     const exit_args = try allocator.dupe(Value, func.valueList(exit_edge.args));
     defer allocator.free(exit_args);
 
-    for (original[0 .. original.len - 1]) |inst| {
-        const carried_mask: ?Value = switch (func.opcode(inst)) {
-            .store => |st| st.mask,
-            .load => |l| l.mask,
-            else => null,
-        };
-        if (carried_mask) |inner| {
-            const both = try func.appendInst(header, bool_ty, .{ .arith = .{
-                .op = .bit_and,
-                .lhs = inner,
-                .rhs = active,
-            } });
-            try func.blockInstsMut(header).append(allocator, inst);
-            switch (func.opcodeMut(inst).*) {
-                .store => |*st| st.mask = both,
-                .load => |*l| l.mask = both,
-                else => unreachable,
-            }
-            continue;
-        }
-        try func.blockInstsMut(header).append(allocator, inst);
-        switch (func.opcodeMut(inst).*) {
-            .store => |*st| st.mask = active,
-            .load => |*l| l.mask = active,
-            else => {},
-        }
-    }
+    for (original[0 .. original.len - 1]) |inst| try appendMasked(allocator, func, header, inst, active);
 
     // Which lanes go round again: the ones still active that also want another iteration.
     //
