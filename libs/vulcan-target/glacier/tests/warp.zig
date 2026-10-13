@@ -431,7 +431,7 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
         return;
     }
     if (funct3 == 0b001) switch (funct6) {
-        0b000000, 0b000010, 0b100100, 0b000100, 0b000110 => {
+        0b000000, 0b000010, 0b100100, 0b000100, 0b000110, 0b100000 => {
             for (0..warp.lanes) |i| {
                 const x = asFloat(warp.v[vs2][i]);
                 const y = asFloat(warp.v[src][i]);
@@ -441,6 +441,10 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
                     0b100100 => x * y,
                     0b000100 => @min(x, y),
                     0b000110 => @max(x, y),
+                    // vfdiv.vv rounds to NEAREST EVEN, where the scalar `fdiv.s` below truncates.
+                    // Two dividers, two rounding modes, and the same operands can differ in the
+                    // last bit depending on which path a kernel took.
+                    0b100000 => x / y,
                     else => unreachable,
                 }));
             }

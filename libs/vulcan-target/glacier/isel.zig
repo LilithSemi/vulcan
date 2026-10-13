@@ -2527,9 +2527,10 @@ fn checkInst(
                 }
                 return;
             }
-            // Float arithmetic runs on the vector unit either way, so its table is the same one
-            // whether or not the operands vary per lane; only the plumbing around it differs.
-            if (floatVectorBinOp(func, a.op, ty) == null) {
+            // Float arithmetic runs on the vector unit either way, so the table is nearly the same
+            // whether or not the operands vary per lane. The divide is the exception: see
+            // `floatVectorBinOp`.
+            if (floatVectorBinOp(func, a.op, ty, resultDivergent(func, inst, divergent)) == null) {
                 if (resultDivergent(func, inst, divergent)) {
                     _ = vectorBinOp(func, a.op, ty) orelse
                         return Refusal.at(why, func, block, i, inst, "a per-lane arithmetic operation the core has no instruction for");
@@ -2750,11 +2751,7 @@ fn binOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const fn (Reg
 /// lanes share and it walks them one at a time, so a vector divide costs what the scalar ones
 /// would. It is still correct, and emitting it keeps a kernel that divides from being refused.
 fn vectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const fn (VReg, VReg, VReg) u32 {
-    // There is no per-lane float arithmetic. The widening MAC is the only vector float operation
-    // and it is not a binary op, because it accumulates into its own destination. A per-lane
-    // divide would have to feed the single scalar divider one lane at a time.
-    //
-    if (isFloat(func, ty)) return floatVectorBinOp(func, op, ty);
+    if (isFloat(func, ty)) return floatVectorBinOp(func, op, ty, true);
     const signed = isSigned(func, ty);
     return switch (op) {
         .add => rv.vadd_vv,
@@ -2783,19 +2780,35 @@ fn vectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const f
 /// invalid flag. Without the decode, the instruction is never executed at all. Without the
 /// bitstream, neither of the first two is in the hardware anyone loads.
 ///
-/// So this list is NOT the lane's op list. The divide is the one that will look missing: the lane
-/// reaches its divider through a separate port set with its own handshake, because it iterates, so
-/// `vfdiv.vv` is not an arm on the lane's op input and does not decode. `FDIV.S` stays the only
-/// float divide, and it is warp-uniform; see `binOp`.
+/// So this list is NOT the lane's op list.
+///
+/// THE DIVIDE IS PER-LANE ONLY, and that is not an oversight of the table. The core has TWO float
+/// dividers, deliberately unshared so a vector divide never waits on a scalar one, and THEY ROUND
+/// DIFFERENTLY: `vfdiv.vv` rounds to nearest even and `FDIV.S` truncates toward zero. So a
+/// warp-uniform divide has to stay on the scalar one rather than be computed per lane and read
+/// back out, because the two answers differ in the last bit and the scalar one is what a kernel
+/// that does not vary per lane has always got. `per_lane` is what keeps them apart.
+///
+/// `vfdiv.vv` iterates, one lane a beat, and the warp parks for the walk while the other resident
+/// warps keep issuing. So a divide per span and a multiply per pixel is the shape to write, and a
+/// divide in an inner loop costs the warp width in beats each time round. A lane the mask excludes
+/// is SKIPPED rather than divided and discarded, measured by cycle count on the core, so a divide
+/// under a narrow mask is cheaper in proportion.
 ///
 /// f16 arithmetic is absent for a different reason: the element width is fixed at 32 bits, so these
 /// read whole lanes. An f16 lives in the low half of one, which is the MAC's shape and not this.
-fn floatVectorBinOp(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const fn (VReg, VReg, VReg) u32 {
+fn floatVectorBinOp(
+    func: *const Function,
+    op: ir.function.BinOp,
+    ty: Type,
+    per_lane: bool,
+) ?*const fn (VReg, VReg, VReg) u32 {
     if (!isF32(func, ty)) return null;
     return switch (op) {
         .add => rv.vfadd_vv,
         .sub => rv.vfsub_vv,
         .mul => rv.vfmul_vv,
+        .div => if (per_lane) rv.vfdiv_vv else null,
         else => null,
     };
 }
@@ -3562,7 +3575,7 @@ const Emitter = struct {
                 const ty = self.func.valueType(a.lhs);
                 if (self.macs.at(inst)) |m| {
                     try self.emitScalarMac(m, dst, pos);
-                } else if (floatVectorBinOp(self.func, a.op, ty)) |encode| {
+                } else if (floatVectorBinOp(self.func, a.op, ty, false)) |encode| {
                     try self.emitScalarFloatBinOp(encode, a, dst, pos);
                 } else {
                     const f = binOp(self.func, a.op, ty) orelse return error.Unsupported;

@@ -958,8 +958,8 @@ test "a warp-uniform float divide becomes the one scalar divide" {
 
 test "the backend refuses the float work Glacier cannot do" {
     const allocator = std.testing.allocator;
-    const Shape = enum { half_arith, compare, half_store, per_lane_divide };
-    for ([_]Shape{ .half_arith, .compare, .half_store, .per_lane_divide }) |shape| {
+    const Shape = enum { half_arith, compare, half_store };
+    for ([_]Shape{ .half_arith, .compare, .half_store }) |shape| {
         var f = Function.init(allocator);
         defer f.deinit();
         const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
@@ -999,12 +999,6 @@ test "the backend refuses the float work Glacier cannot do" {
                 const signed_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
                 const s = try f.appendInst(entry, signed_t, .{ .convert = .{ .value = tid } });
                 break :blk try f.appendInst(entry, f16_t, .{ .convert = .{ .value = s } });
-            },
-            // A per-lane divide would have to feed the single scalar divider a lane at a time.
-            .per_lane_divide => blk: {
-                const lane = try f.appendInst(entry, f32_t, .{ .unary = .{ .op = .reinterpret, .value = tid } });
-                const q = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = lane, .rhs = b } });
-                break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = q } });
             },
         };
         try f.appendStore(entry, stored, base);
@@ -4145,4 +4139,61 @@ test "a guard whose other side carries a value of its own is refused" {
     f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 
     try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+
+test "a per-lane float divide runs on the lanes and rounds to nearest even" {
+    // `out[lane] = (lane + 1) / 3`, in f32, per lane. The quotient of 1/3 and 2/3 is not exact in
+    // binary, so this is also where the TWO DIVIDERS part company: `vfdiv.vv` rounds to nearest
+    // even and the scalar `FDIV.S` truncates toward zero. The expected words are the nearest-even
+    // ones, and a lowering that sent this to the scalar divider would be one bit low.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    // The numerator is LOADED rather than converted from the lane index: an integer to f32
+    // convert is not something this core does, so building one here would refuse for a reason
+    // that has nothing to do with the divide.
+    const numerator = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const three = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+    const quotient = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = numerator, .rhs = three } });
+    const as_word = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = quotient } });
+    try f.appendStore(entry, as_word, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One `vfdiv.vv`, funct6 100000 in the OPFVV form, and no scalar `fdiv.s` anywhere.
+    var lane_divides: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0b111 != 0b001) continue;
+        if (w >> 26 != 0b100000) continue;
+        lane_divides += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), lane_divides);
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1010011); // no OP-FP, so no scalar divide
+    }
+
+    var data: [8]u32 = @splat(0);
+    for (0..8) |i| data[i] = @bitCast(@as(f32, @floatFromInt(i + 1)));
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const want: f32 = @as(f32, @floatFromInt(i + 1)) / 3.0;
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), data[i]);
+    }
+    // 1/3 and 2/3 both round UP to nearest even, so the truncating divider would differ. That is
+    // what makes this test say which divider ran rather than only that a divide happened.
+    try std.testing.expectEqual(@as(u32, 0x3EAAAAAB), data[0]);
+    try std.testing.expectEqual(@as(u32, 0x3F2AAAAB), data[1]);
 }
