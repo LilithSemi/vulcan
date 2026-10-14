@@ -4683,6 +4683,24 @@ test "a per-lane branch on a NOT takes both sides" {
 
     const words = try compile(allocator, &f);
     defer allocator.free(words);
+
+    // ONE `vmnand.mm` and no `vmxor.mm`: a NOT of a mask is that one instruction against the same
+    // source twice, where xoring against an all-ones mask would be two instructions and would need
+    // the all-ones mask to live in a register of its own.
+    var nands: usize = 0;
+    var xors: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0b111 != 0b010) continue;
+        switch (w >> 26) {
+            0b011101 => nands += 1,
+            0b011011 => xors += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), nands);
+    try std.testing.expectEqual(@as(usize, 0), xors);
+
     var data: [8]u32 = @splat(0);
     try runOnce(words, &data, 0, 1);
     try std.testing.expectEqual(@as(u32, 20), data[0]);
