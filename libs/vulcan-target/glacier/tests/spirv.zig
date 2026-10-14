@@ -1306,3 +1306,387 @@ test "a while loop with the test at the top runs a different count in each lane"
     };
     for (want, 0..) |w, i| try std.testing.expectEqual(w, data[i]);
 }
+
+/// `if (lane < 2) { i = 0; s = 0; while (i <= lane) { out[lane * 4 + i] = 100 + i; s += i; i += 1 }
+/// out[lane * 4 + 3] = s }`
+///
+/// A loop inside a per-lane `if`, with a STORE after the loop and still inside the `if`. The guard
+/// becomes the loop's first mask, so every lane enters the loop and every lane reaches the block
+/// the loop leaves by. The store in that block belongs to the lanes the guard admitted, so it takes
+/// the guard as its mask: lanes 2 and 3 run both stores and write nothing.
+fn guardedTailModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 u32=2 bool=3 v3u32=4 pInV3=5 pInU=6 c4096=7 arr=8 struct=9 pSbStruct=10
+    //      pSbArr=11 pSbU32=12 voidfn=13 c0=14 c1=15 c4=16 c100=17 c3=18 c2=19 lid=20 out=21
+    //      main=22 entry=23 arm=24 header=25 body=26 cont=27 after=28 join=29 lanePtr=30 lane=31
+    //      base=32 guard=33 i=34 s=35 test=36 idx=37 elems=38 elem=39 val=40 s_next=41 i_next=42
+    //      tail=43 elems2=44 elem2=45.
+    var b = try spirv.binary.Builder.init(allocator, 46);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 22, 0x6E69616D, 0, 20, 21 });
+    try b.emit(allocator, op.Name, &.{ 21, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 20, op.Decoration.builtin, op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 9, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeBool, &.{3});
+    try b.emit(allocator, op.TypeVector, &.{ 4, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.Constant, &.{ 2, 7, 4096 });
+    try b.emit(allocator, op.TypeArray, &.{ 8, 2, 7 });
+    try b.emit(allocator, op.TypeStruct, &.{ 9, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 9 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 12, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 13, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 14, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 15, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 16, 4 });
+    try b.emit(allocator, op.Constant, &.{ 2, 17, 100 });
+    try b.emit(allocator, op.Constant, &.{ 2, 18, 3 });
+    try b.emit(allocator, op.Constant, &.{ 2, 19, 2 });
+    try b.emit(allocator, op.Variable, &.{ 5, 20, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 10, 21, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 22, 0, 13 });
+    try b.emit(allocator, op.Label, &.{23});
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 6, 30, 20, 14 });
+    try b.emit(allocator, op.Load, &.{ 2, 31, 30 });
+    try b.emit(allocator, op.IMul, &.{ 2, 32, 31, 16 });
+    try b.emit(allocator, op.ULessThan, &.{ 3, 33, 31, 19 });
+    try b.emit(allocator, op.SelectionMerge, &.{ 29, 0 });
+    try b.emit(allocator, op.BranchConditional, &.{ 33, 24, 29 });
+    try b.emit(allocator, op.Label, &.{24});
+    try b.emit(allocator, op.Branch, &.{25});
+    try b.emit(allocator, op.Label, &.{25});
+    try b.emit(allocator, op.Phi, &.{ 2, 34, 14, 24, 42, 27 });
+    try b.emit(allocator, op.Phi, &.{ 2, 35, 14, 24, 41, 27 });
+    try b.emit(allocator, op.LoopMerge, &.{ 28, 27, 0 });
+    try b.emit(allocator, op.ULessThanEqual, &.{ 3, 36, 34, 31 });
+    try b.emit(allocator, op.BranchConditional, &.{ 36, 26, 28 });
+    try b.emit(allocator, op.Label, &.{26});
+    try b.emit(allocator, op.IAdd, &.{ 2, 37, 32, 34 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 38, 21, 14 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 12, 39, 38, 37 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 40, 34, 17 });
+    try b.emit(allocator, op.Store, &.{ 39, 40 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 41, 35, 34 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 42, 34, 15 });
+    try b.emit(allocator, op.Branch, &.{27});
+    try b.emit(allocator, op.Label, &.{27});
+    try b.emit(allocator, op.Branch, &.{25});
+    try b.emit(allocator, op.Label, &.{28});
+    try b.emit(allocator, op.IAdd, &.{ 2, 43, 32, 18 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 44, 21, 14 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 12, 45, 44, 43 });
+    try b.emit(allocator, op.Store, &.{ 45, 35 });
+    try b.emit(allocator, op.Branch, &.{29});
+    try b.emit(allocator, op.Label, &.{29});
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "a loop inside a per-lane if keeps the store after it under the same mask" {
+    const allocator = std.testing.allocator;
+    var b = try guardedTailModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    // The guard's branch is gone and so is the loop's, so the reduction of the active mask is the
+    // only conditional left.
+    var branches: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1100011) branches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), branches);
+
+    const sentinel: u32 = 0xDEAD_BEEF;
+    var data: [16]u32 = @splat(sentinel);
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    _ = try warp.run(words, &mem, &one, 10_000);
+
+    // Lane 0 runs one pass and lane 1 two, each writing `100 + i` and then its sum at word 3 of its
+    // own four. Lanes 2 and 3 failed the guard: they run every instruction of the loop and of the
+    // block after it, and write NOTHING, which the untouched second half says.
+    const want = [16]u32{
+        100,      sentinel, sentinel, 0,
+        100,      101,      sentinel, 1,
+        sentinel, sentinel, sentinel, sentinel,
+        sentinel, sentinel, sentinel, sentinel,
+    };
+    for (want, 0..) |w, i| try std.testing.expectEqual(w, data[i]);
+}
+
+/// `if (lane < 2) { a = lane * 10; out[lane * 4] = a; i = 0; s = 0;
+/// do { s += i; out[lane * 4 + i + 1] = 100 + i; i += 1 } while (i <= lane);
+/// out[lane * 4 + 3] = s + a }`
+///
+/// A loop in the arm of a per-lane `if`, with a STORE before it and a STORE after it, both still
+/// inside the arm. The arm cannot be flattened into one block, because the warp has to go round
+/// the loop. So the region is flattened in two parts: what runs before the loop goes into the
+/// head, what runs after it goes into the block the loop leaves by, and the loop keeps its own
+/// shape with the arm's predicate as the mask its first iteration runs under.
+///
+/// The suffix reads a value from the prefix (`a`) and one the loop carried (`s`), so a destination
+/// that put either out of reach would fail here rather than somewhere subtle.
+fn armLoopModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 u32=2 bool=3 v3u32=4 pInV3=5 pInU=6 c4096=7 arr=8 struct=9 pSbStruct=10
+    //      pSbArr=11 pSbU32=12 voidfn=13 c0=14 c1=15 c4=16 c100=17 c3=18 c2=19 c10=20 lid=21
+    //      out=22 main=23 entry=24 arm=25 header=26 body=27 cont=28 after=29 join=30 lanePtr=31
+    //      lane=32 base=33 guard=34 a=35 elemsP=36 elemP=37 i=38 s=39 s_next=40 idx=41 elemsB=42
+    //      elemB=43 val=44 i_next=45 test=46 tailIdx=47 elemsA=48 elemA=49 sum=50 idx1=51.
+    var b = try spirv.binary.Builder.init(allocator, 52);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 23, 0x6E69616D, 0, 21, 22 });
+    try b.emit(allocator, op.Name, &.{ 22, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 21, op.Decoration.builtin, op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 9, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeBool, &.{3});
+    try b.emit(allocator, op.TypeVector, &.{ 4, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.Constant, &.{ 2, 7, 4096 });
+    try b.emit(allocator, op.TypeArray, &.{ 8, 2, 7 });
+    try b.emit(allocator, op.TypeStruct, &.{ 9, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 9 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 12, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 13, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 14, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 15, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 16, 4 });
+    try b.emit(allocator, op.Constant, &.{ 2, 17, 100 });
+    try b.emit(allocator, op.Constant, &.{ 2, 18, 3 });
+    try b.emit(allocator, op.Constant, &.{ 2, 19, 2 });
+    try b.emit(allocator, op.Constant, &.{ 2, 20, 10 });
+    try b.emit(allocator, op.Variable, &.{ 5, 21, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 10, 22, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 23, 0, 13 });
+    try b.emit(allocator, op.Label, &.{24});
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 6, 31, 21, 14 });
+    try b.emit(allocator, op.Load, &.{ 2, 32, 31 });
+    try b.emit(allocator, op.IMul, &.{ 2, 33, 32, 16 });
+    try b.emit(allocator, op.ULessThan, &.{ 3, 34, 32, 19 });
+    try b.emit(allocator, op.SelectionMerge, &.{ 30, 0 });
+    try b.emit(allocator, op.BranchConditional, &.{ 34, 25, 30 });
+    try b.emit(allocator, op.Label, &.{25});
+    try b.emit(allocator, op.IMul, &.{ 2, 35, 32, 20 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 36, 22, 14 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 12, 37, 36, 33 });
+    try b.emit(allocator, op.Store, &.{ 37, 35 });
+    try b.emit(allocator, op.Branch, &.{26});
+    try b.emit(allocator, op.Label, &.{26});
+    try b.emit(allocator, op.Phi, &.{ 2, 38, 14, 25, 45, 28 });
+    try b.emit(allocator, op.Phi, &.{ 2, 39, 14, 25, 40, 28 });
+    try b.emit(allocator, op.LoopMerge, &.{ 29, 28, 0 });
+    try b.emit(allocator, op.Branch, &.{27});
+    try b.emit(allocator, op.Label, &.{27});
+    try b.emit(allocator, op.IAdd, &.{ 2, 40, 39, 38 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 41, 33, 38 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 51, 41, 15 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 42, 22, 14 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 12, 43, 42, 51 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 44, 38, 17 });
+    try b.emit(allocator, op.Store, &.{ 43, 44 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 45, 38, 15 });
+    try b.emit(allocator, op.ULessThanEqual, &.{ 3, 46, 45, 32 });
+    try b.emit(allocator, op.BranchConditional, &.{ 46, 28, 29 });
+    try b.emit(allocator, op.Label, &.{28});
+    try b.emit(allocator, op.Branch, &.{26});
+    try b.emit(allocator, op.Label, &.{29});
+    try b.emit(allocator, op.IAdd, &.{ 2, 50, 40, 35 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 47, 33, 18 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 48, 22, 14 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 12, 49, 48, 47 });
+    try b.emit(allocator, op.Store, &.{ 49, 50 });
+    try b.emit(allocator, op.Branch, &.{30});
+    try b.emit(allocator, op.Label, &.{30});
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "a loop in an arm keeps the work before and after it under the arm's mask" {
+    const allocator = std.testing.allocator;
+    var b = try armLoopModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    // The `if` is gone and so is the loop's own branch, so the reduction of the active mask is the
+    // only conditional left in the kernel.
+    var branches: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1100011) branches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), branches);
+
+    const sentinel: u32 = 0xDEAD_BEEF;
+    var data: [16]u32 = @splat(sentinel);
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    _ = try warp.run(words, &mem, &one, 10_000);
+
+    // Lane 0 runs the body once and lane 1 twice. Lane 1's sum is 1 and its `a` is 10, so the word
+    // after it is 11, which is the one word in this kernel that is wrong if the suffix reads the
+    // prefix or the loop through the wrong destination. Lanes 2 and 3 failed the `if` and run every
+    // instruction of all three parts, writing NOTHING.
+    const want = [16]u32{
+        0,        100,      sentinel, 0,
+        10,       100,      101,      11,
+        sentinel, sentinel, sentinel, sentinel,
+        sentinel, sentinel, sentinel, sentinel,
+    };
+    for (want, 0..) |w, i| try std.testing.expectEqual(w, data[i]);
+}
+
+/// `s = 0; r = 0; while (r <= lane) { c = 0; while (c <= r) { s += 1; c += 1 } out[lane*8+r] = s;
+/// r += 1 }`
+///
+/// A divergent loop INSIDE a divergent loop. The outer body cannot be flattened into the header,
+/// because the warp has to go round the inner loop, so the body spans blocks and the iteration
+/// ends in the block that goes round: that is where the freezing and the reduction of the mask go.
+///
+/// The inner bound is the OUTER loop's counter, so the inner test looks the same in every lane
+/// until the outer conversion freezes that counter per lane. The conversion iterates for that
+/// reason, and this kernel is the one that says so: without the second round the inner loop would
+/// run a warp-uniform number of times.
+///
+/// Each lane writes one word per outer pass, holding the total inner passes so far, so the words
+/// are the triangular numbers and their COUNT is the lane's own trip count.
+// s = 0; r = 0;
+// while (r <= lane) { c = 0; while (c <= r) { s += 1; c += 1 } out[lane*8 + r] = s; r += 1 }
+fn nestedLoopModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 50);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 21, 0x6E69616D, 0, 19, 20 });
+    try b.emit(allocator, op.Name, &.{ 20, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 19, op.Decoration.builtin, op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.MemberDecorate, &.{ 9, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeBool, &.{3});
+    try b.emit(allocator, op.TypeVector, &.{ 4, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.Constant, &.{ 2, 7, 4096 });
+    try b.emit(allocator, op.TypeArray, &.{ 8, 2, 7 });
+    try b.emit(allocator, op.TypeStruct, &.{ 9, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 9 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 12, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 13, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 14, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 15, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 16, 8 });
+    try b.emit(allocator, op.Constant, &.{ 2, 17, 32 });
+    try b.emit(allocator, op.Constant, &.{ 2, 18, 100 });
+    try b.emit(allocator, op.Variable, &.{ 5, 19, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 10, 20, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 21, 0, 13 });
+    // entry
+    try b.emit(allocator, op.Label, &.{22});
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 6, 23, 19, 14 });
+    try b.emit(allocator, op.Load, &.{ 2, 24, 23 });
+    try b.emit(allocator, op.IMul, &.{ 2, 25, 24, 16 });
+    try b.emit(allocator, op.Branch, &.{26});
+    // outer header
+    try b.emit(allocator, op.Label, &.{26});
+    try b.emit(allocator, op.Phi, &.{ 2, 32, 14, 22, 46, 30 });
+    try b.emit(allocator, op.Phi, &.{ 2, 33, 14, 22, 40, 30 });
+    try b.emit(allocator, op.LoopMerge, &.{ 31, 30, 0 });
+    try b.emit(allocator, op.ULessThanEqual, &.{ 3, 34, 32, 24 });
+    try b.emit(allocator, op.BranchConditional, &.{ 34, 27, 31 });
+    // outer body: straight into the inner loop
+    try b.emit(allocator, op.Label, &.{27});
+    try b.emit(allocator, op.Branch, &.{35});
+    // inner header
+    try b.emit(allocator, op.Label, &.{35});
+    try b.emit(allocator, op.Phi, &.{ 2, 39, 14, 27, 41, 38 });
+    try b.emit(allocator, op.Phi, &.{ 2, 40, 33, 27, 42, 38 });
+    try b.emit(allocator, op.LoopMerge, &.{ 43, 38, 0 });
+    try b.emit(allocator, op.ULessThanEqual, &.{ 3, 44, 39, 32 });
+    try b.emit(allocator, op.BranchConditional, &.{ 44, 37, 43 });
+    // inner body, which writes which OUTER pass it is running in: a lane that has finished the
+    // outer loop and takes part in the inner one anyway leaves its own frozen pass number behind.
+    try b.emit(allocator, op.Label, &.{37});
+    try b.emit(allocator, op.IAdd, &.{ 2, 42, 40, 15 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 41, 39, 15 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 28, 24, 17 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 29, 20, 14 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 12, 36, 29, 28 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 49, 32, 18 });
+    try b.emit(allocator, op.Store, &.{ 36, 49 });
+    try b.emit(allocator, op.Branch, &.{38});
+    // inner continue
+    try b.emit(allocator, op.Label, &.{38});
+    try b.emit(allocator, op.Branch, &.{35});
+    // inner merge: the outer body's tail, with the store and the outer step
+    try b.emit(allocator, op.Label, &.{43});
+    try b.emit(allocator, op.IAdd, &.{ 2, 45, 25, 32 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 11, 47, 20, 14 });
+    try b.emit(allocator, op.InBoundsAccessChain, &.{ 12, 48, 47, 45 });
+    try b.emit(allocator, op.Store, &.{ 48, 40 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 46, 32, 15 });
+    try b.emit(allocator, op.Branch, &.{30});
+    // outer continue
+    try b.emit(allocator, op.Label, &.{30});
+    try b.emit(allocator, op.Branch, &.{26});
+    // outer merge
+    try b.emit(allocator, op.Label, &.{31});
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "a divergent loop inside a divergent loop runs each lane's own count of each" {
+    const allocator = std.testing.allocator;
+    var b = try nestedLoopModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    // Two reductions, one per loop, and nothing else conditional.
+    var branches: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1100011) branches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), branches);
+
+    const sentinel: u32 = 0xDEAD_BEEF;
+    var data: [36]u32 = @splat(sentinel);
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    _ = try warp.run(words, &mem, &one, 100_000);
+
+    const want = [36]u32{
+        1,        sentinel, sentinel, sentinel, sentinel, sentinel, sentinel, sentinel,
+        1,        3,        sentinel, sentinel, sentinel, sentinel, sentinel, sentinel,
+        1,        3,        6,        sentinel, sentinel, sentinel, sentinel, sentinel,
+        1,        3,        6,        10,       sentinel, sentinel, sentinel, sentinel,
+        // The last outer pass each lane took part in, written from inside the INNER loop. A lane
+        // that kept running the inner loop after its own outer test failed would leave the pass
+        // number it was frozen at, which is one too high.
+        100,      101,      102,      103,
+    };
+    for (want, 0..) |w, i| try std.testing.expectEqual(w, data[i]);
+}

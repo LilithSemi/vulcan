@@ -212,6 +212,9 @@ fn compileKernelInternal(
     // If-convert the divergent diamonds, then analyse again: converting one turns a join parameter
     // into a select, which can make an enclosing condition per-lane that operand propagation had
     // called uniform, and that can expose another diamond. So it iterates to a fixpoint.
+    // A loop a flattened region decided the mask for, rather than a branch above it.
+    var loop_masks: std.ArrayList(LoopMask) = .empty;
+    defer loop_masks.deinit(allocator);
     while (true) {
         const d = try analyzeDivergence(allocator, &work);
         defer allocator.free(d);
@@ -219,7 +222,7 @@ fn compileKernelInternal(
         // region and a loop latch. Flattening then makes new boundaries, so the two iterate
         // together rather than one after the other.
         const merged = try mergeStraightLine(allocator, &work);
-        const flattened = try ifConvert(allocator, &work, d);
+        const flattened = try ifConvert(allocator, &work, d, &loop_masks);
         if (!merged and !flattened) break;
     }
     const reachable_after = try ir.reachable.neutralizeUnreachable(allocator, &work);
@@ -237,18 +240,29 @@ fn compileKernelInternal(
     // needs, and before the analysis below, because it adds values of its own.
     var latches: std.ArrayList(Inst) = .empty;
     defer latches.deinit(allocator);
-    // A loop whose test sits at the TOP becomes the do-while the conversion below reads. Analysed
-    // again after it, because the rotation adds values of its own.
-    {
-        const d = try analyzeDivergence(allocator, &work);
-        defer allocator.free(d);
-        _ = try rotateWhileLoops(allocator, &work, d);
+    // A loop whose test sits at the TOP becomes the do-while the conversion reads, and then the
+    // conversion runs. Both are analysed again each round, because each adds values of its own and
+    // because A LOOP INSIDE ANOTHER ONE only looks divergent after the outer one is converted: an
+    // inner bound that comes from an outer parameter is the same in every lane until that
+    // parameter is frozen per lane.
+    while (true) {
+        var moved = false;
+        {
+            const d = try analyzeDivergence(allocator, &work);
+            defer allocator.free(d);
+            if (try rotateWhileLoops(allocator, &work, d)) moved = true;
+        }
+        {
+            const d = try analyzeDivergence(allocator, &work);
+            defer allocator.free(d);
+            if (try convertDivergentLoops(allocator, &work, d, &loop_masks, &latches)) moved = true;
+        }
+        if (!moved) break;
     }
-    {
-        const d = try analyzeDivergence(allocator, &work);
-        defer allocator.free(d);
-        _ = try convertDivergentLoops(allocator, &work, d, &latches);
-    }
+    // A loop whose body spans blocks puts a branch where a jump was, and the back edge is critical
+    // again. The allocator needs a block on it to put its shuffle moves on.
+    try ir.critical_edge.splitCriticalEdges(allocator, &work);
+
     // A loop that absorbed its guard leaves the guard's failing side unreachable. Emptying it now
     // keeps the passes below off a block nothing reaches, and the allocator off a live range in
     // one: a value there is live nowhere and the allocation verifier reads that as unsound.
@@ -772,12 +786,17 @@ fn isBitPreservingConvert(func: *const Function, inst: Inst, cv: ir.function.Con
 /// Both arms then execute for every lane, which is why only PURE arms convert. An instruction with
 /// a side effect would take effect in lanes that did not choose it, and the answer for that is a
 /// masked form of the instruction rather than this.
-fn ifConvert(allocator: std.mem.Allocator, func: *Function, divergent: []const bool) Error!bool {
+fn ifConvert(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    divergent: []const bool,
+    masks: *std.ArrayList(LoopMask),
+) Error!bool {
     var changed = false;
     for (0..func.blockCount()) |bi| {
         const a: Block = @fromBackingInt(@intCast(bi));
         const found = region(func, a, divergent) orelse continue;
-        if (try flatten(allocator, func, found)) changed = true;
+        if (try flatten(allocator, func, found, divergent, masks)) changed = true;
     }
     return changed;
 }
@@ -792,18 +811,48 @@ const max_region_blocks = 64;
 /// A diamond is the two-block case of this. A chain of `else if`s is not, which is why the
 /// diamond-only version refused the shape a real rasteriser writes: the arms of the first branch
 /// do not rejoin immediately, and the block they all end at has more than two predecessors.
+/// A loop a region holds, which stays a loop. See `Region.loop`.
+const LoopNode = struct {
+    header: Block,
+    latch: Block,
+    exit: Block,
+    pre: Block,
+};
+
+/// The mask a loop runs its first iteration under, decided by the region flattened around it
+/// rather than by a branch above it. `divergentLoop` reads it.
+const LoopMask = struct { header: Block, mask: Value };
+
 const Region = struct {
     head: Block,
     exit: Block,
     /// The blocks strictly inside, ordered so a block comes after every predecessor of it.
     inside: [max_region_blocks]Block = undefined,
+    /// Whether `inside[i]` runs after the loop, which decides where it is flattened to.
+    after: [max_region_blocks]bool = @splat(false),
     count: usize = 0,
+    /// The one loop inside, left as a loop. Its blocks are not in `inside`: nothing moves them,
+    /// and what the flattening gives it is the mask its first iteration runs under.
+    loop: ?LoopNode = null,
 
     fn holds(self: *const Region, b: Block) bool {
+        if (self.loop) |l| {
+            if (b == l.header or b == l.latch) return true;
+        }
         for (self.inside[0..self.count]) |x| {
             if (x == b) return true;
         }
         return false;
+    }
+
+    /// Where `b`'s instructions go: the head, or the block the loop leaves by for everything that
+    /// runs after the loop.
+    fn destOf(self: *const Region, b: Block) Block {
+        const l = self.loop orelse return self.head;
+        for (self.inside[0..self.count], 0..) |x, i| {
+            if (x == b) return if (self.after[i]) l.exit else self.head;
+        }
+        return self.head;
     }
 };
 
@@ -817,7 +866,7 @@ fn region(func: *const Function, head: Block, divergent: []const bool) ?Region {
     };
     // A uniform branch is left alone: it costs one jump and runs one side, where flattening would
     // run every block of the region.
-    if (!divergent[@backingInt(cf.cond)]) return null;
+    if (!varies(divergent, cf.cond)) return null;
     if (cf.then.target == head or cf.@"else".target == head) return null;
 
     var r: Region = .{ .head = head, .exit = head };
@@ -847,6 +896,18 @@ fn region(func: *const Function, head: Block, divergent: []const bool) ?Region {
         var took = false;
         for (seen[0..seen_count]) |b| {
             if (r.holds(b)) continue;
+            // A LOOP inside the region stays a loop: nothing can move its blocks, because the
+            // warp has to go round them. It is taken as one node, and what the flattening gives
+            // it is the mask its first iteration runs under, which is the predicate of the block
+            // that enters it. The walk carries on from the block the loop leaves by.
+            if (r.loop == null) {
+                if (loopNodeAt(func, &r, b, divergent)) |l| {
+                    r.loop = l;
+                    if (!push(&seen, &seen_count, l.exit)) return null;
+                    took = true;
+                    break;
+                }
+            }
             if (!readyIn(func, &r, b)) continue;
             // A block that leaves by `ret` takes a path out that the exit does not cover, so it
             // cannot go INSIDE. It may still be the exit, which is the ordinary end of a kernel.
@@ -887,7 +948,41 @@ fn region(func: *const Function, head: Block, divergent: []const bool) ?Region {
     // Every way into the region is the head's branch, and every way out is the exit. A block with
     // an outside predecessor would be reached on a path this does not control.
     if (!readyIn(func, &r, r.exit)) return null;
+    // What runs after the loop: the block it leaves by, and everything inside that block reaches.
+    // Those are flattened into it rather than into the head, because the head runs BEFORE the
+    // loop and they run after it.
+    if (r.loop) |l| {
+        var growing = true;
+        while (growing) {
+            growing = false;
+            for (r.inside[0..r.count], 0..) |b, i| {
+                if (r.after[i]) continue;
+                var reached = b == l.exit;
+                for (r.inside[0..r.count], 0..) |src, j| {
+                    if (!r.after[j]) continue;
+                    for (successorsOf(func, src)) |s| {
+                        if (s == b) reached = true;
+                    }
+                }
+                if (!reached) continue;
+                r.after[i] = true;
+                growing = true;
+            }
+        }
+    }
     return r;
+}
+
+/// The loop `b` heads, when `b` heads one this region can hold, and null otherwise.
+fn loopNodeAt(func: *const Function, r: *const Region, b: Block, divergent: []const bool) ?LoopNode {
+    const dl = divergentLoop(func, b, divergent, &.{}) orelse return null;
+    // The block that enters the loop has to be accounted for already, because the mask the loop
+    // runs under is that block's predicate. The latch is the other way in and belongs to the loop.
+    if (dl.preheader != r.head and !r.holds(dl.preheader)) return null;
+    // Only the loop reaches the block it leaves by, so the predicate there is the loop's own.
+    if (predCount(func, dl.exit) != 1) return null;
+    if (dl.exit == r.head or dl.exit == dl.header) return null;
+    return .{ .header = b, .latch = dl.latch, .exit = dl.exit, .pre = dl.preheader };
 }
 
 /// How many candidate blocks are not inside the region yet.
@@ -993,7 +1088,13 @@ const Flows = struct {
 /// A block is predicated and moved in one step, in topological order. The two cannot be separated:
 /// a predicate reads the branch conditions of the blocks above it, and those are values that only
 /// reach the head when their block moves.
-fn flatten(allocator: std.mem.Allocator, func: *Function, r: Region) Error!bool {
+fn flatten(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    r: Region,
+    divergent: []const bool,
+    masks: *std.ArrayList(LoopMask),
+) Error!bool {
     const bool_ty = try func.types.intern(.bool);
     const head = r.head;
 
@@ -1002,13 +1103,29 @@ fn flatten(allocator: std.mem.Allocator, func: *Function, r: Region) Error!bool 
     flows.add(func, head);
     for (r.inside[0..r.count]) |b| flows.add(func, b);
 
+    // How the loop is entered, read before the branch above it goes away.
+    const enter: ?ir.function.Jump = if (r.loop) |l| blk: {
+        if (l.pre != head) break :blk switch (func.terminator(l.pre) orelse return false) {
+            .jump => |j| j,
+            .ret => return false,
+        };
+        const insts = func.blockInsts(head);
+        const cf = func.opcode(insts[insts.len - 1]).@"if";
+        const edge = if (cf.then.target == l.header) cf.then else cf.@"else";
+        break :blk .{ .target = l.header, .args = edge.args };
+    } else null;
+
     // Nothing is touched until every predicate is known to be buildable, so a refusal leaves the
     // function alone. The only one that can fail is a complement, and only an integer compare has
     // one, so the check is the same question asked without emitting anything.
     for (r.inside[0..r.count]) |b| {
         for (flows.items[0..flows.count]) |src| {
             if (src.sideTo(b)) |side| {
-                if (side == 1 and src.cond != null and invertedCompare(func, src.cond.?) == null) {
+                const cond = (src.cond orelse continue);
+                // Every test in the region has to reach the predicates as a MASK, and the ones on
+                // the far side of a branch need their complement as well.
+                if (!maskable(func, cond, divergent)) return false;
+                if (side == 1 and varies(divergent, cond) and complementOf(func, cond) == null) {
                     return false;
                 }
             }
@@ -1019,23 +1136,104 @@ fn flatten(allocator: std.mem.Allocator, func: *Function, r: Region) Error!bool 
 
     var preds: [max_region_blocks]?Value = @splat(null);
     var negated: [max_region_blocks + 1]?Value = @splat(null);
+    var masked: [max_region_blocks + 1]?Value = @splat(null);
+
+    // The mask the loop's first iteration runs under: the predicate of the block that enters it.
+    // `predicateOf` gives exactly that, because the latch is not one of the flows, so the only
+    // path it finds into the header is the one from above.
+    var entry: ?Value = null;
+    if (r.loop) |l| {
+        if (l.pre == head) {
+            entry = try predicateOf(func, head, head, r, &flows, &preds, &negated, &masked, divergent, l.header, bool_ty);
+        }
+    }
 
     for (0..r.count) |i| {
         const b = r.inside[i];
-        preds[i] = try predicateOf(func, head, r, &flows, &preds, &negated, b, bool_ty);
-        try moveBlock(allocator, func, head, r, &flows, &preds, b, preds[i], bool_ty, .drop_branch);
+        const dest = r.destOf(b);
+        if (r.loop) |l| {
+            if (b == l.exit) {
+                // The loop still jumps here with the values it carries, so the parameters stay and
+                // only the instructions take the predicate. This block is where everything after
+                // the loop is flattened to.
+                preds[i] = entry;
+                try maskInPlace(allocator, func, b, entry, true);
+                continue;
+            }
+        }
+        preds[i] = try predicateOf(func, head, dest, r, &flows, &preds, &negated, &masked, divergent, b, bool_ty);
+        try moveBlock(allocator, func, head, dest, r, &flows, &preds, b, preds[i], bool_ty, .drop_branch);
+        if (r.loop) |l| {
+            if (b == l.pre) {
+                entry = try predicateOf(func, head, head, r, &flows, &preds, &negated, &masked, divergent, l.header, bool_ty);
+            }
+        }
     }
+
+    // Everything after the loop was flattened into the block the loop leaves by, so that is where
+    // the region ends and where the exit is absorbed.
+    const last = if (r.loop) |l| l.exit else head;
     // The exit runs for every lane that entered the region, so it needs no predicate of its own.
     // Its own branch STAYS: the region ends there, so whatever it does next is not this region's
     // business. For a loop that branch is the latch, and dropping it would lose the loop.
-    try moveBlock(allocator, func, head, r, &flows, &preds, r.exit, null, bool_ty, .keep_branch);
+    try moveBlock(allocator, func, head, last, r, &flows, &preds, r.exit, null, bool_ty, .keep_branch);
 
-    // The head takes the exit's terminator, so nothing branches anywhere inside. Everything else
-    // is unreachable and `neutralizeUnreachable` takes it out.
-    func.terminatorPtr(head).* = func.terminatorPtr(r.exit).*;
-    for (r.inside[0..r.count]) |b| func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
-    func.setTerminator(r.exit, .{ .ret = ir.function.Ret.none() });
+    // The last destination takes the exit's terminator, so nothing branches anywhere inside.
+    // Everything else is unreachable and `neutralizeUnreachable` takes it out.
+    func.terminatorPtr(last).* = func.terminatorPtr(r.exit).*;
+    // With a loop in the region the head no longer branches: it enters the loop, and the lanes the
+    // predicate excludes enter it inactive.
+    if (enter) |j| {
+        func.terminatorPtr(head).* = .{ .jump = j };
+        if (entry) |m| try recordLoopMask(func, head, masks, r.loop.?.header, m, bool_ty);
+    }
+    for (r.inside[0..r.count]) |b| {
+        if (b == last) continue;
+        func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    }
+    if (r.exit != last) func.setTerminator(r.exit, .{ .ret = ir.function.Ret.none() });
     return true;
+}
+
+/// Record the mask `header`'s loop runs its first iteration under, ANDing with a mask an inner
+/// region already decided: a lane has to pass both to take part.
+fn recordLoopMask(
+    func: *Function,
+    at: Block,
+    masks: *std.ArrayList(LoopMask),
+    header: Block,
+    mask: Value,
+    bool_ty: Type,
+) Error!void {
+    for (masks.items) |*m| {
+        if (m.header != header) continue;
+        m.mask = try maskAnd(func, at, m.mask, mask, bool_ty);
+        return;
+    }
+    try masks.append(func.allocator, .{ .header = header, .mask = mask });
+}
+
+/// Put `mask` over every access `b` holds, in place. With `drop_branch` a branch it ends with goes,
+/// which is what a flattened region wants: its branches are gone and their conditions are inside
+/// the predicates already. A loop's blocks keep theirs.
+fn maskInPlace(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    b: Block,
+    mask: ?Value,
+    drop_branch: bool,
+) Error!void {
+    const body = try allocator.dupe(Inst, func.blockInsts(b));
+    defer allocator.free(body);
+    func.blockInstsMut(b).clearRetainingCapacity();
+    for (body) |inst| {
+        if (drop_branch and func.opcode(inst) == .@"if") continue;
+        if (mask) |m| {
+            try appendMasked(allocator, func, b, inst, m);
+        } else {
+            try func.blockInstsMut(b).append(allocator, inst);
+        }
+    }
 }
 
 /// The predicate for `b`: the paths into it, each the predicate of its source ANDed with what the
@@ -1043,10 +1241,13 @@ fn flatten(allocator: std.mem.Allocator, func: *Function, r: Region) Error!bool 
 fn predicateOf(
     func: *Function,
     head: Block,
+    dest: Block,
     r: Region,
     flows: *const Flows,
     preds: *const [max_region_blocks]?Value,
     negated: *[max_region_blocks + 1]?Value,
+    masked: *[max_region_blocks + 1]?Value,
+    divergent: []const bool,
     b: Block,
     bool_ty: Type,
 ) Error!?Value {
@@ -1061,16 +1262,17 @@ fn predicateOf(
             const cond = src.cond orelse break :blk null;
             if (src.edges[0] != null and src.edges[1] != null and
                 src.edges[0].?.target == src.edges[1].?.target) break :blk null;
-            if (side == 0) break :blk cond;
+            // Where the CONDITION is, which is where its block was flattened to.
+            const at = r.destOf(src.block);
+            if (masked[si] == null) masked[si] = (try asMask(func, at, cond, divergent, bool_ty)).?;
+            if (side == 0) break :blk masked[si];
             if (negated[si] == null) {
-                negated[si] = try func.appendInst(head, bool_ty, .{
-                    .icmp = invertedCompare(func, cond).?,
-                });
+                negated[si] = (try appendComplement(func, at, masked[si].?, bool_ty)).?;
             }
             break :blk negated[si];
         };
         const path: ?Value = if (from) |f|
-            (if (edge) |e| try maskAnd(func, head, f, e, bool_ty) else f)
+            (if (edge) |e| try maskAnd(func, dest, f, e, bool_ty) else f)
         else
             edge;
         if (!any) {
@@ -1078,7 +1280,7 @@ fn predicateOf(
         } else if (total) |a_mask| {
             // A path with no predicate of its own covers every lane, so the OR is everything.
             const b_mask = path orelse break;
-            total = try maskOr(func, head, a_mask, b_mask, bool_ty);
+            total = try maskOr(func, dest, a_mask, b_mask, bool_ty);
         }
         any = true;
     }
@@ -1106,6 +1308,7 @@ fn moveBlock(
     allocator: std.mem.Allocator,
     func: *Function,
     head: Block,
+    dest: Block,
     r: Region,
     flows: *const Flows,
     preds: *const [max_region_blocks]?Value,
@@ -1135,7 +1338,7 @@ fn moveBlock(
                 value = arg; // a path that covers every lane wins outright
                 continue;
             };
-            value = try func.appendInst(head, func.valueType(p), .{ .select = .{
+            value = try func.appendInst(dest, func.valueType(p), .{ .select = .{
                 .cond = g,
                 .then = arg,
                 .@"else" = value.?,
@@ -1159,10 +1362,10 @@ fn moveBlock(
             else => null,
         };
         const combined: ?Value = if (mask) |m| blk: {
-            if (carried) |inner| break :blk try maskAnd(func, head, inner, m, bool_ty);
+            if (carried) |inner| break :blk try maskAnd(func, dest, inner, m, bool_ty);
             break :blk m;
         } else carried;
-        try func.blockInstsMut(head).append(allocator, inst);
+        try func.blockInstsMut(dest).append(allocator, inst);
         switch (func.opcodeMut(inst).*) {
             .store => |*st| st.mask = combined,
             .load => |*l| l.mask = combined,
@@ -1194,6 +1397,121 @@ fn hasStore(func: *const Function, block: Block) bool {
 /// The compare that answers the opposite of `cond`, when `cond` is an integer compare. Null for
 /// anything else, including a FLOAT compare: an unordered pair leaves `lt` and `ge` both false, so
 /// flipping the operator there changes the answer rather than negating it.
+/// Whether `v` varies per lane, for a value that may have been MADE since the analysis ran.
+///
+/// The passes that flatten and convert create values of their own, and the analysis they were
+/// handed is as long as the function was when it started. A value past the end is one of those, so
+/// it is read as per-lane: every one of them is a mask, a predicate or a select over masks, and
+/// reading it the other way would hand a mask op a scalar bool.
+fn varies(divergent: []const bool, v: Value) bool {
+    const i = @backingInt(v);
+    return i >= divergent.len or divergent[i];
+}
+
+/// Whether `cond` can be used as a mask in a predicate: it already varies per lane, or it is a
+/// compare this can rebuild per lane. See `asMask`.
+fn maskable(func: *const Function, cond: Value, divergent: []const bool) bool {
+    if (varies(divergent, cond)) return true;
+    const inst = func.definingInst(cond) orelse return false;
+    switch (func.opcode(inst)) {
+        .icmp => |c| return !isFloat(func, func.valueType(c.lhs)),
+        // A NOT of something maskable: mask that and flip it.
+        .arith, .arith_imm => switch (complementOf(func, cond) orelse return false) {
+            .have => |v| return maskable(func, v, divergent),
+            .compare => return false,
+        },
+        else => return false,
+    }
+}
+
+/// `cond` as a MASK, one bit per lane, rebuilt when it is the same in every lane.
+///
+/// A warp-uniform bool sits in a scalar register as a 0 or a 1, and a mask op reads one BIT per
+/// lane, so the two cannot be combined as they stand. A region mixes the two whenever a test that
+/// does not vary per lane sits inside a branch that does, which a rasteriser writes every time it
+/// asks something about the triangle rather than about the pixel.
+///
+/// Rebuilding the compare with one operand made per-lane gives the same answer in every lane and
+/// arrives as a real mask. Adding a per-lane zero is what makes the operand per-lane: the value is
+/// unchanged and the divergence analysis reads it off the operands.
+fn asMask(func: *Function, at: Block, cond: Value, divergent: []const bool, bool_ty: Type) Error!?Value {
+    if (varies(divergent, cond)) return cond;
+    const inst = func.definingInst(cond) orelse return null;
+    const c = switch (func.opcode(inst)) {
+        .icmp => |x| x,
+        // A NOT: the mask of what it negates, flipped.
+        .arith, .arith_imm => switch (complementOf(func, cond) orelse return null) {
+            .have => |v| {
+                const inner = (try asMask(func, at, v, divergent, bool_ty)) orelse return null;
+                return try appendComplement(func, at, inner, bool_ty);
+            },
+            .compare => return null,
+        },
+        else => return null,
+    };
+    const ty = func.valueType(c.lhs);
+    if (isFloat(func, ty)) return null;
+    const lane = laneValue(func) orelse return null;
+    const zero = try func.appendInst(at, func.valueType(lane), .{ .arith_imm = .{
+        .op = .bit_and,
+        .lhs = lane,
+        .imm = 0,
+    } });
+    const spread = try func.appendInst(at, ty, .{ .arith = .{ .op = .add, .lhs = c.lhs, .rhs = zero } });
+    return try func.appendInst(at, bool_ty, .{ .icmp = .{ .op = c.op, .lhs = spread, .rhs = c.rhs } });
+}
+
+/// How the complement of a bool can be had, when it can.
+const Complement = union(enum) {
+    /// A value that already IS the complement, so it costs nothing.
+    have: Value,
+    /// An integer compare to emit, which answers the opposite of the one given.
+    compare: ir.function.Compare,
+};
+
+/// The complement of `cond`, or null when there is none to be had.
+///
+/// An integer compare has one: flip the operator. A NOT has one for FREE, and a frontend writes a
+/// NOT as `b ^ 1`, in either the immediate form or with a constant of its own, so the complement
+/// of that is `b`. A FLOAT compare has none: see `invertedCompare`.
+fn complementOf(func: *const Function, cond: Value) ?Complement {
+    if (invertedCompare(func, cond)) |c| return .{ .compare = c };
+    const inst = func.definingInst(cond) orelse return null;
+    switch (func.opcode(inst)) {
+        .arith_imm => |a| {
+            if (a.op != .bit_xor or a.imm != 1) return null;
+            if (!isBool(func, func.valueType(a.lhs))) return null;
+            return .{ .have = a.lhs };
+        },
+        .arith => |a| {
+            if (a.op != .bit_xor) return null;
+            if (!isBool(func, func.valueType(a.lhs))) return null;
+            // One side is the constant one, and the other is what this negates.
+            if (isOne(func, a.rhs)) return .{ .have = a.lhs };
+            if (isOne(func, a.lhs)) return .{ .have = a.rhs };
+            return null;
+        },
+        else => return null,
+    }
+}
+
+/// Whether `v` is the constant one.
+fn isOne(func: *const Function, v: Value) bool {
+    const inst = func.definingInst(v) orelse return false;
+    return switch (func.opcode(inst)) {
+        .iconst => |c| c == 1,
+        else => false,
+    };
+}
+
+/// The complement of `cond` as a value, emitted in `at` when it has to be. Null when there is none.
+fn appendComplement(func: *Function, at: Block, cond: Value, bool_ty: Type) Error!?Value {
+    return switch (complementOf(func, cond) orelse return null) {
+        .have => |v| v,
+        .compare => |c| try func.appendInst(at, bool_ty, .{ .icmp = c }),
+    };
+}
+
 fn invertedCompare(func: *const Function, cond: Value) ?ir.function.Compare {
     const inst = func.definingInst(cond) orelse return null;
     const c = switch (func.opcode(inst)) {
@@ -1292,45 +1610,57 @@ fn forwardsTo(func: *const Function, b: Block) Block {
     };
 }
 
-/// Whether the guard's failing side `out` arrives where the loop's `exit` block arrives, with
-/// values of its own, and record those values in `fail` when it does.
+/// Whether the guard's failing side rejoins the loop's path AFTER the block the loop leaves by,
+/// and what that side carries. Setting `fail` says so, and the values may be none.
 ///
-/// This is `if (c) { while (...) } else { x }`: both sides give the merge a value. Dropping the
-/// guard sends a failing lane through the loop and out of `exit`, so that lane needs the value its
-/// own side carried, which `convertLoop` selects on the guard. The exit block runs for a failing
-/// lane now, so it must hold nothing that lane may not do: its values came from an iteration that
-/// never ran, and an address built from them points anywhere.
-fn guardFailArgs(func: *const Function, out: Block, exit: Block, fail: *?ir.function.ValueList) bool {
-    if (func.blockInsts(out).len != 0) return false;
-    if (func.blockParams(out).len != 0) return false;
-    // The values are read where the EXIT is, so they must reach it. Only the guard reaches `out`
-    // and only the loop reaches `exit`, which puts both below the guard.
-    if (predCount(func, out) != 1) return false;
+/// Two shapes, and both mean a lane that failed the guard does NOT run the exit block in the
+/// program as written:
+///
+///   `if (c) { while (...) } else { x }` where both sides give a merge block a value, so the
+///   failing side arrives WHERE the exit arrives;
+///
+///   `if (c) { while (...); tail }` where the tail IS the exit block, so the failing side arrives
+///   where the exit GOES.
+///
+/// Once the guard is a mask every lane runs the exit block, so each access there takes the guard
+/// as its mask and the values the failing side carried are selected over the loop's at the exit.
+/// An instruction there that cannot take a mask keeps the branch: see `convertible`.
+fn guardRejoins(
+    func: *const Function,
+    missed_edge: ir.function.Jump,
+    exit: Block,
+    fail: *?ir.function.ValueList,
+) bool {
+    // Only the loop reaches the exit, which puts the exit below the guard and the guard's own
+    // values within reach of it.
     if (predCount(func, exit) != 1) return false;
-    const missed = switch (func.terminator(out) orelse return false) {
-        .jump => |j| j,
-        .ret => return false,
-    };
     const taken = switch (func.terminator(exit) orelse return false) {
         .jump => |j| j,
         .ret => return false,
     };
-    if (missed.target != taken.target) return false;
-    const n = func.blockArgs(missed).len;
-    if (n == 0 or n != func.blockArgs(taken).len) return false;
     for (func.blockInsts(exit)) |inst| {
-        if (!sideEffectFree(func.opcode(inst))) return false;
+        if (!convertible(func.opcode(inst))) return false;
     }
+    const out = forwardsTo(func, missed_edge.target);
+    if (out == taken.target) {
+        // The failing side IS where the exit goes, so what it carries is on the guard's own edge.
+        if (func.blockArgs(missed_edge).len != func.blockArgs(taken).len) return false;
+        fail.* = missed_edge.args;
+        return true;
+    }
+    // The failing side is a block of its own that arrives where the exit arrives. It must hold
+    // nothing, so the values it passes are defined above the guard and reach the exit.
+    if (func.blockInsts(out).len != 0) return false;
+    if (func.blockParams(out).len != 0) return false;
+    if (predCount(func, out) != 1) return false;
+    const missed = switch (func.terminator(out) orelse return false) {
+        .jump => |j| j,
+        .ret => return false,
+    };
+    if (missed.target != taken.target) return false;
+    if (func.blockArgs(missed).len != func.blockArgs(taken).len) return false;
     fail.* = missed.args;
     return true;
-}
-
-/// Whether `code` is safe to run for a lane that takes no part.
-fn sideEffectFree(code: ir.function.Opcode) bool {
-    return switch (code) {
-        .iconst, .fconst, .global_addr, .arith, .arith_imm, .icmp, .select, .convert, .unary => true,
-        else => false,
-    };
 }
 
 /// The one block that reaches `b`, when exactly one does.
@@ -1498,26 +1828,35 @@ const DivergentLoop = struct {
     /// The condition of a per-lane GUARD around the loop, which becomes the mask the first
     /// iteration runs under. Null when every lane that reached the preheader enters.
     guard: ?Value = null,
-    /// What the guard's failing side carries to the block the loop leaves by, when it carries
-    /// anything. The exit selects between its own values and these on the guard.
+    /// Set when the lanes the guard turns away rejoin AFTER the block the loop leaves by, holding
+    /// what that side carries, which may be nothing. Then the exit block runs only for the lanes
+    /// the guard admitted: its accesses take the guard as a mask and its outgoing values are
+    /// selected against these. Null when the failing lanes land on the exit block itself, which
+    /// they run as they always did. See `guardRejoins`.
     guard_fail: ?ir.function.ValueList = null,
     /// Whether the guard's TRUE side is the one that enters the loop.
     guard_on_true: bool = true,
     /// The block the guard branches in, which is one above the preheader when critical-edge
-    /// splitting put a block between them. Equal to the preheader when there is no guard.
-    guard_block: Block,
+    /// splitting put a block between them. Null when the mask came from a region flattened around
+    /// the loop, where there is no branch left to absorb.
+    guard_block: ?Block = null,
 };
 
 /// Whether `block` is a loop this converts. Every condition is a reason it would otherwise be
 /// wrong rather than a simplification of convenience.
-fn divergentLoop(func: *const Function, block: Block, divergent: []const bool) ?DivergentLoop {
+fn divergentLoop(
+    func: *const Function,
+    block: Block,
+    divergent: []const bool,
+    masks: []const LoopMask,
+) ?DivergentLoop {
     const insts = func.blockInsts(block);
     if (insts.len == 0) return null;
     const cf = switch (func.opcode(insts[insts.len - 1])) {
         .@"if" => |x| x,
         else => return null,
     };
-    if (!divergent[@backingInt(cf.cond)]) return null;
+    if (!varies(divergent, cf.cond)) return null;
     const then_latch = isLatchOf(func, cf.then.target, block);
     const else_latch = isLatchOf(func, cf.@"else".target, block);
     // One edge round and the other out. Both or neither is not a loop this reads.
@@ -1564,8 +1903,13 @@ fn divergentLoop(func: *const Function, block: Block, divergent: []const bool) ?
     var guard: ?Value = null;
     var guard_fail: ?ir.function.ValueList = null;
     var guard_on_true = true;
-    var guard_block = pre;
-    if (func.blockInsts(pre).len == 0 and func.blockParams(pre).len == 0) {
+    var guard_block: ?Block = null;
+    // A region flattened around this loop already decided which lanes enter it, and left no
+    // branch: the mask is a value in a block above. See `flatten`.
+    for (masks) |m| {
+        if (m.header == block) guard = m.mask;
+    }
+    if (guard == null and func.blockInsts(pre).len == 0 and func.blockParams(pre).len == 0) {
         if (solePredecessor(func, pre)) |up| {
             if (endsInIf(func, up)) {
                 const up_insts = func.blockInsts(up);
@@ -1580,11 +1924,11 @@ fn divergentLoop(func: *const Function, block: Block, divergent: []const bool) ?
                 // DIFFERENT empty block on each, so comparing the immediate targets finds two
                 // blocks where the source had one. Compare where they end up.
                 const to_the_exit = forwardsTo(func, out) == forwardsTo(func, exit) or
-                    guardFailArgs(func, out, exit, &fail);
+                    guardRejoins(func, if (into_then) g.@"else" else g.then, exit, &fail);
                 if (into_then != into_else and
                     to_the_exit and
-                    divergent[@backingInt(g.cond)] and
-                    (into_then or invertedCompare(func, g.cond) != null))
+                    varies(divergent, g.cond) and
+                    (into_then or complementOf(func, g.cond) != null))
                 {
                     guard = g.cond;
                     guard_fail = fail;
@@ -1693,7 +2037,7 @@ fn rotateWhileLoop(
         .@"if" => |x| x,
         else => return false,
     };
-    if (!divergent[@backingInt(cf.cond)]) return false;
+    if (!varies(divergent, cf.cond)) return false;
     // One edge into the body and the other out. Both or neither is not a loop this reads.
     const then_body = whileBodyOf(func, cf.then.target, header);
     const else_body = whileBodyOf(func, cf.@"else".target, header);
@@ -1713,14 +2057,14 @@ fn rotateWhileLoop(
     for (func.blockInsts(body)) |inst| {
         if (!convertible(func.opcode(inst))) return false;
     }
-    // The body on the FALSE side needs the complement of the test, and the only exact complement
-    // is an inverted integer compare. See `invertedCompare`.
-    if (!then_body and invertedCompare(func, cf.cond) == null) return false;
+    // The body on the FALSE side needs the complement of the test. See `complementOf`.
+    if (!then_body and complementOf(func, cf.cond) == null) return false;
 
     const bool_ty = try func.types.intern(.bool);
-    const pred = if (then_body) cf.cond else try appendBeforeBranch(allocator, func, header, bool_ty, .{
-        .icmp = invertedCompare(func, cf.cond).?,
-    });
+    const pred = if (then_body) cf.cond else switch (complementOf(func, cf.cond).?) {
+        .have => |v| v,
+        .compare => |c| try appendBeforeBranch(allocator, func, header, bool_ty, .{ .icmp = c }),
+    };
 
     const moved = try allocator.dupe(Inst, func.blockInsts(body));
     defer allocator.free(moved);
@@ -1790,19 +2134,528 @@ fn appendMasked(
     }
 }
 
+// ===========================================================================
+// A loop whose body is more than one block.
+
+/// The most blocks one loop body may hold. A body is a chain here, so this bounds the compile
+/// rather than the code.
+const max_body_blocks = 64;
+
+/// A divergent loop whose body spans blocks, which is what a loop INSIDE the body makes: the warp
+/// has to go round the inner one, so nothing can flatten the body into the header.
+///
+/// The test sits at the top, so the mask the body runs under is the mask of the lanes still going
+/// ANDed with the test. The iteration ends in the tail, which is where the freezing and the
+/// reduction of that mask go.
+const MultiLoop = struct {
+    header: Block,
+    preheader: Block,
+    /// The body in order, from the block the test enters to the one that goes round. An inner
+    /// loop's own blocks are NOT here: its own conversion masks those.
+    body: [max_body_blocks]Block = undefined,
+    count: usize = 0,
+    /// The inner loop headers, and the block that enters each.
+    inner: [max_body_blocks]Block = undefined,
+    inner_pre: [max_body_blocks]Block = undefined,
+    inner_count: usize = 0,
+    /// Every block the inner loops own. They keep their own shape, and they take the body's mask
+    /// like the rest of the body: an inner loop that is warp-uniform gets no conversion of its
+    /// own, and its accesses still belong to the lanes the test admitted.
+    owned: [max_body_blocks]Block = undefined,
+    owned_count: usize = 0,
+    /// The body block the iteration ends in. With the test at the top it goes round by a jump this
+    /// turns into the reduction branch; with the test at the bottom it already branches.
+    tail: Block,
+    /// The empty block on the back edge, when the test is at the bottom and there is one.
+    latch: Block,
+    exit: Block,
+    cond: Value,
+    /// Whether the test is in the HEADER. A `while` loop reads that way and a `do`-`while` does
+    /// not, and the difference is which mask the body runs under: with the test at the top a lane
+    /// the test turns away runs no body, so the body's mask is the test ANDed in, and with the test
+    /// at the bottom every lane that entered the iteration ran the body already.
+    test_at_top: bool,
+    /// With the test at the top, whether its TRUE side enters the body. With it at the bottom,
+    /// whether its TRUE side goes round.
+    enter_on_true: bool,
+    /// The two edges of the test's branch, kept before it is rewritten.
+    entering: ir.function.Jump,
+    leaving: ir.function.Jump,
+};
+
+/// Whether `header` heads a loop whose body spans blocks. Every condition is a reason it would
+/// otherwise be wrong rather than a simplification of convenience.
+fn multiBlockLoop(
+    func: *const Function,
+    header: Block,
+    divergent: []const bool,
+    masks: []const LoopMask,
+) ?MultiLoop {
+    if (predCount(func, header) != 2) return null;
+    for (func.blockInsts(header)) |inst| {
+        if (func.opcode(inst) == .@"if") continue; // the test, read below
+        if (!convertible(func.opcode(inst))) return null;
+    }
+    const m = if (endsInIf(func, header))
+        topTestLoop(func, header, divergent, masks) orelse return null
+    else
+        bottomTestLoop(func, header, divergent, masks) orelse return null;
+    // Where the loop is entered from: the other way into the header.
+    var found = m;
+    var pre: ?Block = null;
+    for (0..func.blockCount()) |pi| {
+        const p: Block = @fromBackingInt(@intCast(pi));
+        if (p == found.tail or p == header or p == found.latch) continue;
+        if (!jumpsTo(func, p, header)) continue;
+        if (pre != null) return null;
+        pre = p;
+    }
+    found.preheader = pre orelse return null;
+    if (func.terminator(found.preheader) == null) return null;
+    for (func.blockInsts(found.preheader)) |inst| {
+        if (func.opcode(inst) == .@"if") return null;
+    }
+    if (found.exit == header or found.exit == found.tail) return null;
+    return found;
+}
+
+/// The loop `header` heads when the test is in the header, which is a `while` loop.
+fn topTestLoop(
+    func: *const Function,
+    header: Block,
+    divergent: []const bool,
+    masks: []const LoopMask,
+) ?MultiLoop {
+    const insts = func.blockInsts(header);
+    const cf = func.opcode(insts[insts.len - 1]).@"if";
+    if (!varies(divergent, cf.cond)) return null;
+    // One side enters the body and the other leaves. The body is the side that comes back.
+    for ([_]bool{ true, false }) |on_true| {
+        const entering = if (on_true) cf.then else cf.@"else";
+        const leaving = if (on_true) cf.@"else" else cf.then;
+        var m: MultiLoop = .{
+            .header = header,
+            .preheader = header,
+            .tail = header,
+            .latch = header,
+            .exit = leaving.target,
+            .cond = cf.cond,
+            .test_at_top = true,
+            .enter_on_true = on_true,
+            .entering = entering,
+            .leaving = leaving,
+        };
+        if (!walkBody(func, &m, entering.target, divergent, masks)) continue;
+        // The values that go round are named by the tail, so they line up with the parameters.
+        const round = switch (func.terminator(m.tail) orelse continue) {
+            .jump => |j| j,
+            .ret => continue,
+        };
+        if (func.blockArgs(round).len != func.blockParams(header).len) continue;
+        // The branch passes the body nothing, so the body names what it reads.
+        if (func.blockArgs(entering).len != func.blockParams(entering.target).len) continue;
+        return m;
+    }
+    return null;
+}
+
+/// The loop `header` heads when the test is in the block the iteration ends in, which is a
+/// `do`-`while`. The header only carries the values round, so the body starts where it jumps.
+fn bottomTestLoop(
+    func: *const Function,
+    header: Block,
+    divergent: []const bool,
+    masks: []const LoopMask,
+) ?MultiLoop {
+    const first = switch (func.terminator(header) orelse return null) {
+        .jump => |j| j,
+        .ret => return null,
+    };
+    var w: MultiLoop = .{
+        .header = header,
+        .preheader = header,
+        .tail = header,
+        .latch = header,
+        .exit = header,
+        .cond = undefined,
+        .test_at_top = false,
+        .enter_on_true = true,
+        .entering = first,
+        .leaving = first,
+    };
+    if (!walkBody(func, &w, first.target, divergent, masks)) return null;
+    // The tail is where the iteration ends, so that is where the test is.
+    const insts = func.blockInsts(w.tail);
+    if (insts.len == 0) return null;
+    const cf = switch (func.opcode(insts[insts.len - 1])) {
+        .@"if" => |x| x,
+        else => return null,
+    };
+    if (!varies(divergent, cf.cond)) return null;
+    // One side goes round, through the empty block the edge split put there, and the other leaves.
+    const then_round = isLatchOf(func, cf.then.target, header);
+    const else_round = isLatchOf(func, cf.@"else".target, header);
+    if (then_round == else_round) return null;
+    w.cond = cf.cond;
+    w.enter_on_true = then_round;
+    w.latch = if (then_round) cf.then.target else cf.@"else".target;
+    w.leaving = if (then_round) cf.@"else" else cf.then;
+    w.exit = w.leaving.target;
+    // The branch passes the latch nothing, so what goes round is what the latch names.
+    if (func.blockArgs(if (then_round) cf.then else cf.@"else").len != 0) return null;
+    const round = switch (func.terminator(w.latch).?) {
+        .jump => |j| j,
+        .ret => return null,
+    };
+    if (func.blockArgs(round).len != func.blockParams(header).len) return null;
+    if (func.blockArgs(first).len != func.blockParams(first.target).len) return null;
+    return w;
+}
+
+/// A loop inside another loop's body, read from its shape alone. The blocks are the header and the
+/// chain that comes back to it, which is one block before the `while` rotation and two after.
+const InnerLoop = struct {
+    pre: Block,
+    exit: Block,
+    blocks: [max_inner_blocks]Block = undefined,
+    count: usize = 0,
+};
+
+/// The most blocks one inner loop may own. A deeper nest than this is refused.
+const max_inner_blocks = 8;
+
+/// The loop `header` heads, read without reference to divergence, or null when it heads none.
+fn innerLoop(func: *const Function, header: Block) ?InnerLoop {
+    const insts = func.blockInsts(header);
+    if (insts.len == 0) return null;
+    const cf = switch (func.opcode(insts[insts.len - 1])) {
+        .@"if" => |x| x,
+        else => return null,
+    };
+    if (predCount(func, header) != 2) return null;
+    var m: InnerLoop = .{ .pre = header, .exit = header };
+    m.blocks[0] = header;
+    m.count = 1;
+    // One side comes back and the other leaves.
+    const then_back = chainReaches(func, cf.then.target, header, &m);
+    const back_count = m.count;
+    const else_back = chainReaches(func, cf.@"else".target, header, &m);
+    if (then_back == else_back) return null;
+    if (then_back) m.count = back_count;
+    m.exit = if (then_back) cf.@"else".target else cf.then.target;
+    if (m.exit == header) return null;
+    // Where it is entered from: the way in that is not the way round.
+    var pre: ?Block = null;
+    for (0..func.blockCount()) |pi| {
+        const p: Block = @fromBackingInt(@intCast(pi));
+        var own = false;
+        for (m.blocks[0..m.count]) |b| {
+            if (b == p) own = true;
+        }
+        if (own) continue;
+        if (!jumpsTo(func, p, header)) continue;
+        if (pre != null) return null;
+        pre = p;
+    }
+    m.pre = pre orelse return null;
+    return m;
+}
+
+/// Whether the chain from `from` comes back to `header`, recording the blocks it passes on the way.
+fn chainReaches(func: *const Function, from: Block, header: Block, m: *InnerLoop) bool {
+    var cur = from;
+    while (true) {
+        if (cur == header) return true;
+        if (m.count == max_inner_blocks) return false;
+        if (predCount(func, cur) != 1) return false;
+        if (endsInIf(func, cur)) return false;
+        m.blocks[m.count] = cur;
+        m.count += 1;
+        switch (func.terminator(cur) orelse return false) {
+            .jump => |j| cur = j.target,
+            .ret => return false,
+        }
+    }
+}
+
+/// Follow the body from `first` to the block that goes round. False when the body is not a chain
+/// this reads.
+fn walkBody(
+    func: *const Function,
+    m: *MultiLoop,
+    first: Block,
+    divergent: []const bool,
+    masks: []const LoopMask,
+) bool {
+    _ = divergent;
+    _ = masks;
+    var cur = first;
+    while (true) {
+        if (cur == m.header) return false;
+        if (m.count == max_body_blocks) return false;
+        // A block that branches inside the body can only be an inner LOOP. The warp has one
+        // program counter, so anything else was flattened already or is refused.
+        //
+        // Read WITHOUT asking whether the inner test varies per lane, because it does not yet: an
+        // inner bound that comes from the outer loop's parameter looks the same in every lane
+        // until the outer conversion freezes that parameter per lane. The conversion iterates for
+        // the same reason.
+        if (endsInIf(func, cur)) {
+            // The block the iteration ends in when the test is at the BOTTOM: one of its edges
+            // goes round, through the block the edge split left there. Its own code belongs to the
+            // body like the rest.
+            const cf = func.opcode(func.blockInsts(cur)[func.blockInsts(cur).len - 1]).@"if";
+            if (isLatchOf(func, cf.then.target, m.header) or isLatchOf(func, cf.@"else".target, m.header)) {
+                if (predCount(func, cur) != 1) return false;
+                m.tail = cur;
+                m.body[m.count] = cur;
+                m.count += 1;
+                return m.inner_count != 0;
+            }
+            const inner = innerLoop(func, cur) orelse return false;
+            if (m.inner_count == max_body_blocks) return false;
+            if (m.owned_count + inner.count > max_body_blocks) return false;
+            m.inner[m.inner_count] = cur;
+            m.inner_pre[m.inner_count] = inner.pre;
+            m.inner_count += 1;
+            for (inner.blocks[0..inner.count]) |b| {
+                m.owned[m.owned_count] = b;
+                m.owned_count += 1;
+            }
+            cur = inner.exit;
+            continue;
+        }
+        // One way in, so the body is a chain and the mask of a block is the mask of the body.
+        if (predCount(func, cur) != 1) return false;
+        for (func.blockInsts(cur)) |inst| {
+            if (!convertible(func.opcode(inst))) return false;
+        }
+        m.body[m.count] = cur;
+        m.count += 1;
+        switch (func.terminator(cur) orelse return false) {
+            .jump => |j| {
+                if (j.target == m.header) {
+                    m.tail = cur;
+                    // Without an inner loop the body would have been flattened into the header,
+                    // and `divergentLoop` reads that shape. This path is for the one it cannot.
+                    return m.inner_count != 0;
+                }
+                cur = j.target;
+            },
+            .ret => return false,
+        }
+    }
+}
+
+/// Rewrite a loop whose body spans blocks, or report false when a condition only the rewrite can
+/// see refuses it.
+fn convertMultiBlockLoop(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    m: MultiLoop,
+    masks: *std.ArrayList(LoopMask),
+    latches: *std.ArrayList(Inst),
+) Error!bool {
+    const bool_ty = try func.types.intern(.bool);
+    const lane = laneValue(func) orelse return false;
+    // A loop the lanes leave on the FALSE edge needs the complement of its condition. See
+    // `complementOf`.
+    if (!m.enter_on_true and complementOf(func, m.cond) == null) return false;
+    const header = m.header;
+    const carried = func.blockParams(header).len;
+
+    // The mask the first iteration runs under: a region flattened around this loop may have
+    // decided it, and otherwise it is every lane that reached the loop.
+    const all = blk: {
+        for (masks.items) |mm| {
+            if (mm.header == header) break :blk mm.mask;
+        }
+        break :blk try func.appendInst(m.preheader, bool_ty, .{ .icmp = .{
+            .op = .eq,
+            .lhs = lane,
+            .rhs = lane,
+        } });
+    };
+    const active = try func.appendBlockParam(header, bool_ty);
+    try appendJumpArg(allocator, func, m.preheader, all);
+
+    // The header's own code runs for every lane still going. With the test there its branch comes
+    // off, so the body follows unconditionally and the lanes the test turns away run it with the
+    // mask shut.
+    var next: Value = active;
+    if (m.test_at_top) {
+        const head_insts = try allocator.dupe(Inst, func.blockInsts(header));
+        defer allocator.free(head_insts);
+        func.blockInstsMut(header).clearRetainingCapacity();
+        for (head_insts[0 .. head_insts.len - 1]) |inst| {
+            try appendMasked(allocator, func, header, inst, active);
+        }
+        const again = if (m.enter_on_true)
+            m.cond
+        else
+            (try appendComplement(func, header, m.cond, bool_ty)).?;
+        next = try maskAnd(func, header, active, again, bool_ty);
+        func.terminatorPtr(header).* = .{ .jump = m.entering };
+    } else {
+        try maskInPlace(allocator, func, header, active, false);
+    }
+
+    // The body, under the mask of the iteration it runs in: with the test at the bottom every lane
+    // that entered the iteration ran the body, so that is the mask the loop arrived with. An inner
+    // loop's own blocks take it too: a uniform inner loop gets no mask of its own, and a divergent
+    // one ANDs what it adds with this.
+    const body_mask = next;
+    for (m.body[0..m.count]) |b| try maskInPlace(allocator, func, b, body_mask, false);
+    for (m.owned[0..m.owned_count]) |b| try maskInPlace(allocator, func, b, body_mask, false);
+
+    // An inner loop takes the body's mask ON TOP of the one it already had, which is what says a
+    // lane the test turned away takes no part in that loop either. The AND goes where the inner
+    // loop is entered, because that is the one place both masks are in reach.
+    for (m.inner[0..m.inner_count], m.inner_pre[0..m.inner_count]) |h, pre| {
+        var had = false;
+        for (masks.items) |*mm| {
+            if (mm.header != h) continue;
+            mm.mask = try maskAnd(func, pre, mm.mask, body_mask, bool_ty);
+            had = true;
+            break;
+        }
+        if (!had) try masks.append(allocator, .{ .header = h, .mask = body_mask });
+    }
+
+    // With the test at the bottom the mask that goes round is only known once the body has run,
+    // and the tail is where that is. The branch comes off while everything else goes in, because
+    // a branch is the last thing its block does.
+    const held: ?Inst = if (m.test_at_top) null else func.blockInstsMut(m.tail).pop().?;
+    if (!m.test_at_top) {
+        const again = if (m.enter_on_true)
+            m.cond
+        else
+            (try appendComplement(func, m.tail, m.cond, bool_ty)).?;
+        next = try maskAnd(func, m.tail, active, again, bool_ty);
+    }
+
+    // What goes round is named by the block the back edge leaves from.
+    const goes_round = if (m.test_at_top) m.tail else m.latch;
+    const back_args = try allocator.dupe(Value, func.valueList(func.terminator(goes_round).?.jump.args));
+    defer allocator.free(back_args);
+    const exit_args = try allocator.dupe(Value, func.valueList(m.leaving.args));
+    defer allocator.free(exit_args);
+
+    // A lane the mask has dropped keeps the value it had when it was dropped. A lane leaving now
+    // ran the HEADER but not the body, so what it keeps is the parameter and not this pass.
+    var frozen: std.ArrayList(Value) = .empty;
+    defer frozen.deinit(allocator);
+    // With the test at the bottom the lane ran the whole body, so what it keeps is this pass.
+    const freeze_mask = if (m.test_at_top) next else active;
+    for (0..carried) |i| {
+        const param = func.blockParams(header)[i];
+        try frozen.append(allocator, try func.appendInst(m.tail, func.valueType(param), .{ .select = .{
+            .cond = freeze_mask,
+            .then = back_args[i],
+            .@"else" = param,
+        } }));
+    }
+
+    // A value the loop computes that something outside reads needs a frozen copy, the same as for
+    // a one-block body. The header's code runs under `active` and the body's under `next`, so the
+    // two are asked separately.
+    var slots: std.ArrayList(CarriedValue) = .empty;
+    defer slots.deinit(allocator);
+    var inside: std.ArrayList(Block) = .empty;
+    defer inside.deinit(allocator);
+    try inside.append(allocator, header);
+    try inside.appendSlice(allocator, m.body[0..m.count]);
+    try inside.appendSlice(allocator, m.owned[0..m.owned_count]);
+    if (!m.test_at_top) try inside.append(allocator, m.latch);
+    if (!try carrySlots(allocator, func, inside.items, &.{header}, header, m.preheader, m.tail, active, &slots)) return false;
+    if (!try carrySlots(allocator, func, inside.items, m.body[0..m.count], header, m.preheader, m.tail, body_mask, &slots)) return false;
+
+    var out: std.ArrayList(Value) = .empty;
+    defer out.deinit(allocator);
+    for (exit_args) |v| {
+        const slotted = blk: {
+            for (slots.items) |s| {
+                if (s.value == v) break :blk s.frozen;
+            }
+            break :blk exitValue(func, header, v, back_args, frozen.items) orelse return false;
+        };
+        try out.append(allocator, slotted);
+    }
+
+    var round: std.ArrayList(Value) = .empty;
+    defer round.deinit(allocator);
+    try round.appendSlice(allocator, frozen.items);
+    try round.append(allocator, next);
+    for (slots.items) |s| try round.append(allocator, s.frozen);
+
+    // The loop runs again while ANY lane is left, which is a reduction of the mask and not a
+    // per-lane branch.
+    if (m.test_at_top) {
+        // The jump round becomes that branch, which makes the back edge critical: the edges are
+        // split again after this pass.
+        try func.appendIf(m.tail, next, .{
+            .target = header,
+            .args = round.items,
+        }, .{
+            .target = m.exit,
+            .args = out.items,
+        });
+        // A block that ends in a branch has NO terminator: the branch is the edge, and a
+        // terminator beside it is one the allocator would resolve and the emitter would drop.
+        func.terminatorPtr(m.tail).* = null;
+    } else {
+        // The branch goes back on, and the back edge already has its block, so what goes round is
+        // written on that block's jump.
+        const branch = held.?;
+        try func.blockInstsMut(m.tail).append(allocator, branch);
+        func.opcodeMut(branch).* = .{ .@"if" = .{
+            .cond = next,
+            .then = .{ .target = m.latch, .args = try func.internValueList(&.{}) },
+            .@"else" = .{ .target = m.exit, .args = try func.internValueList(out.items) },
+        } };
+        func.terminatorPtr(m.latch).*.?.jump.args = try func.internValueList(round.items);
+    }
+    const tail_insts = func.blockInsts(m.tail);
+    try latches.append(allocator, tail_insts[tail_insts.len - 1]);
+    return true;
+}
+
 fn convertDivergentLoops(
     allocator: std.mem.Allocator,
     func: *Function,
     divergent: []const bool,
+    masks: *std.ArrayList(LoopMask),
     latches: *std.ArrayList(Inst),
 ) Error!bool {
     var changed = false;
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
-        const loop = divergentLoop(func, block, divergent) orelse continue;
-        if (try convertLoop(allocator, func, loop, latches)) changed = true;
+        // A loop this already converted, which the rounds would otherwise convert again: the
+        // reduction branch is both the marker and the thing that would be rewritten.
+        if (alreadyConverted(func, block, latches.items)) continue;
+        if (divergentLoop(func, block, divergent, masks.items)) |loop| {
+            if (try convertLoop(allocator, func, loop, latches)) changed = true;
+            continue;
+        }
+        // A body that spans blocks, which an inner loop makes. The outer one goes first, so the
+        // mask it hands the inner one is in place before the inner one is rewritten.
+        const wide = multiBlockLoop(func, block, divergent, masks.items) orelse continue;
+        // With the test at the bottom the marker sits on the TAIL, so the check above looked at
+        // the wrong block. Without this the rounds convert the same loop again and again.
+        if (alreadyConverted(func, wide.tail, latches.items)) continue;
+        if (try convertMultiBlockLoop(allocator, func, wide, masks, latches)) changed = true;
     }
     return changed;
+}
+
+/// Whether the branch `block` ends with is one a conversion already made.
+fn alreadyConverted(func: *const Function, block: Block, latches: []const Inst) bool {
+    const insts = func.blockInsts(block);
+    if (insts.len == 0) return false;
+    for (latches) |l| {
+        if (l == insts[insts.len - 1]) return true;
+    }
+    return false;
 }
 
 /// Rewrite one loop, or report false when a condition only the rewrite can see refuses it.
@@ -1814,9 +2667,9 @@ fn convertLoop(
 ) Error!bool {
     const bool_ty = try func.types.intern(.bool);
     const lane = laneValue(func) orelse return false;
-    // A loop the lanes leave on the FALSE edge needs the complement of its condition, and the
-    // only exact complement is an inverted integer compare. See `invertedCompare`.
-    if (!loop.continue_on_true and invertedCompare(func, loop.cond) == null) return false;
+    // A loop the lanes leave on the FALSE edge needs the complement of its condition. See
+    // `complementOf`.
+    if (!loop.continue_on_true and complementOf(func, loop.cond) == null) return false;
     const header = loop.header;
 
     // The mask the first iteration runs under. Without a guard that is every lane which reached
@@ -1827,9 +2680,10 @@ fn convertLoop(
     const all = if (loop.guard) |g| blk: {
         if (loop.guard_on_true) break :blk g;
         // Before the guard's branch, which is still there until below.
-        break :blk try appendBeforeBranch(allocator, func, loop.guard_block, bool_ty, .{
-            .icmp = invertedCompare(func, g).?,
-        });
+        break :blk switch (complementOf(func, g).?) {
+            .have => |v| v,
+            .compare => |c| try appendBeforeBranch(allocator, func, loop.guard_block.?, bool_ty, .{ .icmp = c }),
+        };
     } else try func.appendInst(loop.preheader, bool_ty, .{ .icmp = .{
         .op = .eq,
         .lhs = lane,
@@ -1838,18 +2692,27 @@ fn convertLoop(
     const carried = func.blockParams(header).len;
     const active = try func.appendBlockParam(header, bool_ty);
     try appendJumpArg(allocator, func, loop.preheader, all);
-    if (loop.guard != null) {
+    if (loop.guard_block) |guard_block| {
         // The guard is the mask now, so the branch it was goes away and control simply enters the
         // loop. The lanes it would have turned away enter INACTIVE instead, run no iteration of
         // the body, and leave by the loop's own exit edge, which is where the guard sent them.
-        const g_inst = func.blockInstsMut(loop.guard_block).pop().?;
+        const g_inst = func.blockInstsMut(guard_block).pop().?;
         const g = func.opcode(g_inst).@"if";
         const enter = if (loop.guard_on_true) g.then else g.@"else";
-        func.terminatorPtr(loop.guard_block).* = .{ .jump = .{
+        func.terminatorPtr(guard_block).* = .{ .jump = .{
             .target = loop.preheader,
             .args = enter.args,
         } };
         if (loop.guard_fail) |missed| {
+            // The lanes the guard turned away did not run the exit block and now they reach it, so
+            // every access there takes the guard as its mask. The arithmetic around them is left
+            // alone: it reads values from an iteration those lanes never ran, and the selects
+            // below throw the answers away.
+            const tail = try allocator.dupe(Inst, func.blockInsts(loop.exit));
+            defer allocator.free(tail);
+            func.blockInstsMut(loop.exit).clearRetainingCapacity();
+            for (tail) |inst| try appendMasked(allocator, func, loop.exit, inst, all);
+
             // A lane that failed the guard leaves with the values the guard's own side carried.
             // It runs the exit block now, so the choice between the two belongs there.
             const theirs = try allocator.dupe(Value, func.valueList(missed));
@@ -1893,11 +2756,10 @@ fn convertLoop(
     // with or without the AND. That holds only while the body reads no memory: once a masked load
     // is admitted, another lane's store could change what a frozen lane loads and bring it back
     // to life. The AND is what makes that impossible rather than unlikely.
-    const again = if (loop.continue_on_true) loop.cond else try func.appendInst(
-        header,
-        bool_ty,
-        .{ .icmp = invertedCompare(func, loop.cond).? },
-    );
+    const again = if (loop.continue_on_true)
+        loop.cond
+    else
+        (try appendComplement(func, header, loop.cond, bool_ty)).?;
     const next = try func.appendInst(header, bool_ty, .{ .arith = .{
         .op = .bit_and,
         .lhs = active,
@@ -1923,7 +2785,17 @@ fn convertLoop(
     // the reads it answers for.
     var slots: std.ArrayList(CarriedValue) = .empty;
     defer slots.deinit(allocator);
-    if (!try carrySlots(allocator, func, loop, active, &slots)) return false;
+    if (!try carrySlots(
+        allocator,
+        func,
+        &.{ header, loop.latch },
+        &.{header},
+        header,
+        loop.preheader,
+        header,
+        active,
+        &slots,
+    )) return false;
 
     // The exit carries the frozen values too: the loop is left when NO lane is active, so this
     // iteration's results belong to no one.
@@ -1987,41 +2859,67 @@ const CarriedValue = struct { value: Value, frozen: Value };
 fn carrySlots(
     allocator: std.mem.Allocator,
     func: *Function,
-    loop: DivergentLoop,
-    active: Value,
+    inside: []const Block,
+    produce: []const Block,
+    header: Block,
+    preheader: Block,
+    dest: Block,
+    took_part: Value,
     slots: *std.ArrayList(CarriedValue),
 ) Error!bool {
-    const header = loop.header;
     var computed: std.ArrayList(Value) = .empty;
     defer computed.deinit(allocator);
-    for (func.blockInsts(header)) |inst| {
-        if (func.instResult(inst)) |v| try computed.append(allocator, v);
+    for (produce) |b| {
+        for (func.blockInsts(b)) |inst| {
+            if (func.instResult(inst)) |v| try computed.append(allocator, v);
+        }
     }
     if (computed.items.len == 0) return true;
 
     // Counted with the loop's own code OUT OF SIGHT, so what is left is the reads from outside.
-    // The branch is not in the block at this point, so the exit edge's arguments are not counted
-    // either: `exitValue` answers for those.
+    // The header's branch is not in the block at this point, so the exit edge's arguments are not
+    // counted either: `exitValue` answers for those.
     const uses = try allocator.alloc(u32, func.valueCount());
     defer allocator.free(uses);
-    const body = try allocator.dupe(Inst, func.blockInsts(header));
-    defer allocator.free(body);
-    const round = func.terminatorPtr(loop.latch).*.?.jump.args;
-    func.blockInstsMut(header).clearRetainingCapacity();
-    func.terminatorPtr(loop.latch).*.?.jump.args = try func.internValueList(&.{});
+    var hidden_insts: std.ArrayList([]Inst) = .empty;
+    defer {
+        for (hidden_insts.items) |h| allocator.free(h);
+        hidden_insts.deinit(allocator);
+    }
+    var hidden_args: std.ArrayList(ir.function.ValueList) = .empty;
+    defer hidden_args.deinit(allocator);
+    const none = try func.internValueList(&.{});
+    for (inside) |b| {
+        try hidden_insts.append(allocator, try allocator.dupe(Inst, func.blockInsts(b)));
+        func.blockInstsMut(b).clearRetainingCapacity();
+        // A block whose last instruction is a branch has no terminator of its own, and the branch
+        // went out of sight with the instructions.
+        if (func.terminatorPtr(b).*) |*t| switch (t.*) {
+            .jump => |*j| {
+                try hidden_args.append(allocator, j.args);
+                j.args = none;
+            },
+            .ret => try hidden_args.append(allocator, none),
+        } else try hidden_args.append(allocator, none);
+    }
     opt.dce.countUses(func, uses);
-    try func.blockInstsMut(header).appendSlice(allocator, body);
-    func.terminatorPtr(loop.latch).*.?.jump.args = round;
+    for (inside, 0..) |b, i| {
+        try func.blockInstsMut(b).appendSlice(allocator, hidden_insts.items[i]);
+        if (func.terminatorPtr(b).*) |*t| switch (t.*) {
+            .jump => |*j| j.args = hidden_args.items[i],
+            .ret => {},
+        };
+    }
 
     for (computed.items) |v| {
         if (uses[@backingInt(v)] == 0) continue;
         const ty = func.valueType(v);
         const zero = switch (func.types.type_kind(ty)) {
-            .int => try func.appendInst(loop.preheader, ty, .{ .iconst = 0 }),
-            .float => try func.appendInst(loop.preheader, ty, .{ .fconst = 0 }),
+            .int => try func.appendInst(preheader, ty, .{ .iconst = 0 }),
+            .float => try func.appendInst(preheader, ty, .{ .fconst = 0 }),
             .bool => blk: {
                 const lane = laneValue(func) orelse return false;
-                break :blk try func.appendInst(loop.preheader, ty, .{ .icmp = .{
+                break :blk try func.appendInst(preheader, ty, .{ .icmp = .{
                     .op = .ne,
                     .lhs = lane,
                     .rhs = lane,
@@ -2030,18 +2928,22 @@ fn carrySlots(
             else => return false,
         };
         const slot = try func.appendBlockParam(header, ty);
-        const frozen = try func.appendInst(header, ty, .{ .select = .{
-            .cond = active,
+        const frozen = try func.appendInst(dest, ty, .{ .select = .{
+            .cond = took_part,
             .then = v,
             .@"else" = slot,
         } });
-        // Every block but the loop's own two: inside, the body reads this iteration's value.
+        // Every block but the loop's own: inside, the body reads this iteration's value.
         for (0..func.blockCount()) |bi| {
             const b: Block = @fromBackingInt(@intCast(bi));
-            if (b == header or b == loop.latch) continue;
+            var own = false;
+            for (inside) |x| {
+                if (x == b) own = true;
+            }
+            if (own) continue;
             func.replaceUsesIn(b, v, frozen);
         }
-        try appendJumpArg(allocator, func, loop.preheader, zero);
+        try appendJumpArg(allocator, func, preheader, zero);
         try slots.append(allocator, .{ .value = v, .frozen = frozen });
     }
     return true;
@@ -3923,13 +4825,18 @@ const Emitter = struct {
             // stream, one bus, and in-order completion already order the accesses.
             //
             // Glacier's own `warp_barrier` is deliberately NOT emitted here. It synchronizes every
-            // warp of one core, which is wider than this opcode asks for, and a wider barrier is
-            // NOT the safe choice: a warp parks until its siblings arrive, so a warp that took a
-            // different amount of work waits for warps that had no reason to meet it. The core can
-            // time that out and raise a sticky error instead of waiting, but the watchdog budget
-            // defaults to zero, which disables it, so a build as generated today waits forever.
-            // Either way the barrier does not do what the IR asked. The IR has no scope for one
-            // core's warps, so there is nothing to spell it with.
+            // warp of one core, which is wider than this opcode asks for: a warp parks until its
+            // siblings arrive, so a warp would wait for warps that had no reason to meet it. Only
+            // LIVE warps hold it, so the wait ends when the last sibling exits and a kernel cannot
+            // deadlock on it, and a watchdog releases it with a sticky error when one is budgeted.
+            // It still does not do what the IR asked, and the IR has no scope for one core's warps
+            // to spell the wider thing with.
+            //
+            // When there is a scope for it, the barrier needs NO fence beside it. A memory
+            // operation parks its own warp until the bus completes it, so there is no store buffer
+            // to drain, and the barrier releases only once every live warp has arrived: the two
+            // together are release and acquire. THAT EXPIRES WITH AXI4, where a write is accepted
+            // on one channel long before its response, so completion has to mean the response.
             .barrier => {},
             else => return error.Unsupported,
         }
@@ -4053,8 +4960,12 @@ const Emitter = struct {
 
     fn emitTerminator(self: *Emitter, block: Block, bi: usize) Error!void {
         const term = self.func.terminator(block) orelse {
-            // A neutralized unreachable block has no terminator. Retiring is the safe word to
-            // leave behind: nothing branches here, and EBREAK cannot run on into the next block.
+            // A LIVE block with no terminator, which is a compiler bug and not a kernel one: a
+            // block nothing reaches is skipped entirely and emits no word at all, so reaching this
+            // means an analysis called a block live and left it no way out.
+            //
+            // Retiring is the safe word to leave behind: nothing branches here, and EBREAK cannot
+            // run on into the next block.
             return self.put(glacier.ebreak);
         };
         switch (term) {

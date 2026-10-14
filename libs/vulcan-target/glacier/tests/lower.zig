@@ -4172,10 +4172,11 @@ test "a guard whose other side carries a value of its own selects it at the exit
     for (4..data.len) |i| try std.testing.expectEqual(sentinel, data[i]);
 }
 
-test "a guard stays when the block the loop leaves by writes memory" {
-    // The same shape, with a STORE in the block the loop leaves by. Dropping the guard sends a
-    // lane that failed it through that block, and the store is an access that lane must not make,
-    // so the guard cannot become the mask and the per-lane branch has nowhere to go.
+test "a store in the block the loop leaves by runs for the lanes the guard admitted" {
+    // The same shape with a STORE in the block the loop leaves by. Dropping the guard sends a lane
+    // that failed it through that block, so the store takes the guard as its mask and that lane
+    // makes no access. The arithmetic around it is left alone: it reads a value from an iteration
+    // the lane never ran, and the select on the way out throws the answer away.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -4203,12 +4204,80 @@ test "a guard stays when the block the loop leaves by writes memory" {
     try f.appendIf(loop, more, .{ .target = loop, .args = &.{x_next} }, .{ .target = mid, .args = &.{x_next} });
 
     const left = try f.appendBlockParam(mid, u32_t);
+    // EIGHT WORDS UP, so this store has words of its own. At the lane's own index it would land
+    // where the merge store lands and be overwritten, and the absence this test is about would be
+    // invisible.
+    const slot = try f.appendArithImm(mid, u32_t, .add, left, 8);
     const mid_at = try f.appendInst(mid, ptr_t, .{ .arith = .{
         .op = .add,
         .lhs = base,
-        .rhs = try f.appendArithImm(mid, u32_t, .shl, left, 2),
+        .rhs = try f.appendArithImm(mid, u32_t, .shl, slot, 2),
     } });
     try f.appendStore(mid, left, mid_at);
+    try f.setJump(mid, done, &.{left});
+
+    const arrived = try f.appendBlockParam(done, u32_t);
+    const offset = try f.appendArithImm(done, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(done, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(done, arrived, at);
+    f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    const sentinel: u32 = 0x1234_5678;
+    var data: [16]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    // Lanes 0 to 2 leave the loop with `lane + 4`, which the merge writes at the lane's own index
+    // and the block the loop leaves by writes eight words up. Lane 3 failed the guard: it carries
+    // the 7 its own edge gave it, and its FROZEN loop value is the 3 it entered with, so an
+    // unmasked store in that block would put a 3 at word 11. That word is the claim.
+    const want = [16]u32{
+        4,        5,        6,        7,
+        sentinel, sentinel, sentinel, sentinel,
+        sentinel, sentinel, sentinel, sentinel,
+        4,        5,        6,        sentinel,
+    };
+    for (want, 0..) |w, i| try std.testing.expectEqual(w, data[i]);
+}
+
+test "a guard stays when the block the loop leaves by holds an atomic" {
+    // The same shape again, with an ATOMIC in the block the loop leaves by. A lane that failed the
+    // guard reaches that block once the guard is a mask, and an atomic takes no mask to stop it, so
+    // the guard cannot be absorbed and the per-lane branch has nowhere to go.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const mid = try f.appendBlock();
+    const done = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const limit = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const seven = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    const step = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const guard = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .le, .lhs = tid, .rhs = limit } });
+    try f.appendIf(entry, guard, .{ .target = loop, .args = &.{tid} }, .{ .target = done, .args = &.{seven} });
+
+    const x = try f.appendBlockParam(loop, u32_t);
+    const x_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = step } });
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .le, .lhs = x_next, .rhs = limit } });
+    try f.appendIf(loop, more, .{ .target = loop, .args = &.{x_next} }, .{ .target = mid, .args = &.{x_next} });
+
+    const left = try f.appendBlockParam(mid, u32_t);
+    try f.appendAtomicRmwStmt(mid, .{
+        .op = .add,
+        .ptr = base,
+        .value = left,
+        .ordering = .relaxed,
+        .scope = .device,
+    });
     try f.setJump(mid, done, &.{left});
 
     const arrived = try f.appendBlockParam(done, u32_t);
@@ -4446,4 +4515,130 @@ test "a value the body computes and the exit reads keeps the iteration the lane 
     try std.testing.expectEqual(@as(u32, 16), data[1]);
     try std.testing.expectEqual(@as(u32, 18), data[2]);
     try std.testing.expectEqual(@as(u32, 16), data[3]);
+}
+
+test "a warp-uniform loop inside a divergent one still writes only for the lanes that are going" {
+    // `r = 0; while (r <= lane) { c = 0; do { out[lane * 8 + c] = r; c += 1 } while (c < 2); r += 1 }`
+    //
+    // The inner loop's bound is a CONSTANT, so it runs the same count in every lane and gets no
+    // mask of its own: it keeps its branch and nothing converts it. Its store still belongs to the
+    // lanes the outer test admitted, so the outer conversion masks the inner loop's blocks along
+    // with the rest of its body. Without that, a lane that has finished the outer loop keeps
+    // storing with the counter it was frozen at, one pass too high.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const outer = try f.appendBlock();
+    const pre = try f.appendBlock();
+    const inner = try f.appendBlock();
+    const ilatch = try f.appendBlock();
+    const tail = try f.appendBlock();
+    const done = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const lane_base = try f.appendArithImm(entry, u32_t, .shl, tid, 3);
+    try f.setJump(entry, outer, &.{zero});
+
+    const r = try f.appendBlockParam(outer, u32_t);
+    const going = try f.appendInst(outer, bool_t, .{ .icmp = .{ .op = .le, .lhs = r, .rhs = tid } });
+    try f.appendIf(outer, going, .{ .target = pre }, .{ .target = done });
+    try f.setJump(pre, inner, &.{zero});
+
+    const c = try f.appendBlockParam(inner, u32_t);
+    const slot = try f.appendInst(inner, u32_t, .{ .arith = .{ .op = .add, .lhs = lane_base, .rhs = c } });
+    const at = try f.appendInst(inner, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(inner, u32_t, .shl, slot, 2),
+    } });
+    try f.appendStore(inner, r, at);
+    const c_next = try f.appendInst(inner, u32_t, .{ .arith = .{ .op = .add, .lhs = c, .rhs = one } });
+    const more = try f.appendInst(inner, bool_t, .{ .icmp = .{ .op = .lt, .lhs = c_next, .rhs = two } });
+    try f.appendIf(inner, more, .{ .target = ilatch }, .{ .target = tail });
+    try f.setJump(ilatch, inner, &.{c_next});
+
+    const r_next = try f.appendInst(tail, u32_t, .{ .arith = .{ .op = .add, .lhs = r, .rhs = one } });
+    try f.setJump(tail, outer, &.{r_next});
+    f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    const sentinel: u32 = 0x1234_5678;
+    var data: [32]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    // Each lane's two words hold the LAST outer pass it took part in, which is its own lane index.
+    for (0..4) |l| {
+        try std.testing.expectEqual(@as(u32, @intCast(l)), data[l * 8]);
+        try std.testing.expectEqual(@as(u32, @intCast(l)), data[l * 8 + 1]);
+        for (2..8) |k| try std.testing.expectEqual(sentinel, data[l * 8 + k]);
+    }
+}
+
+test "a warp-uniform test inside a per-lane branch reaches the mask" {
+    // `if (lane < 2) { out[lane] = (flag == 7) ? 1 : 2 }`, where `flag` is loaded from one address
+    // and is therefore the same in every lane. The predicate for each arm is the per-lane mask
+    // ANDed with that test, and a mask op reads one BIT per lane where a warp-uniform bool is a 0
+    // or a 1 in a scalar register. So the test is rebuilt per lane, which is the same answer in
+    // every lane and arrives as a real mask.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const arm = try f.appendBlock();
+    const one_b = try f.appendBlock();
+    const two_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const seven = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const flag_at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendInst(entry, u32_t, .{ .iconst = 32 }),
+    } });
+    const flag = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = flag_at } });
+    const uniform = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = flag, .rhs = seven } });
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+    const mine = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(entry, mine, .{ .target = arm }, .{ .target = join });
+    try f.appendIf(arm, uniform, .{ .target = one_b }, .{ .target = two_b });
+    try f.appendStore(one_b, one, at);
+    try f.setJump(one_b, join, &.{});
+    try f.appendStore(two_b, two, at);
+    try f.setJump(two_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    const sentinel: u32 = 0x1234_5678;
+    var data: [9]u32 = @splat(sentinel);
+    data[8] = 7;
+    try runOnce(words, &data, 0, 1);
+    // Lanes 0 and 1 take the arm and the uniform test sends both to the same side. Lanes 2 and 3
+    // run every instruction of both sides and write nothing.
+    try std.testing.expectEqual(@as(u32, 1), data[0]);
+    try std.testing.expectEqual(@as(u32, 1), data[1]);
+    for (2..8) |i| try std.testing.expectEqual(sentinel, data[i]);
 }
