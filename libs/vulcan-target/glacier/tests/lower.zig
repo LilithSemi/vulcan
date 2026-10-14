@@ -4690,4 +4690,3 @@ test "a per-lane branch on a NOT takes both sides" {
     try std.testing.expectEqual(@as(u32, 10), data[2]);
     try std.testing.expectEqual(@as(u32, 10), data[3]);
 }
-
