@@ -4642,3 +4642,52 @@ test "a warp-uniform test inside a per-lane branch reaches the mask" {
     try std.testing.expectEqual(@as(u32, 1), data[1]);
     for (2..8) |i| try std.testing.expectEqual(sentinel, data[i]);
 }
+
+test "a per-lane branch on a NOT takes both sides" {
+    // `if (!(lane < 2)) out[lane] = 10 else out[lane] = 20`, with the NOT as the `b ^ 1` a frontend
+    // writes. Flattening needs the complement of the branch's condition for the far side, and the
+    // complement of a NOT is free: it is what the NOT negates. Without that the condition has no
+    // complement to find and the branch is refused.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const high = try f.appendBlock();
+    const low = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const ten = try f.appendInst(entry, u32_t, .{ .iconst = 10 });
+    const twenty = try f.appendInst(entry, u32_t, .{ .iconst = 20 });
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+    const small = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const not_small = try f.appendArithImm(entry, bool_t, .bit_xor, small, 1);
+    try f.appendIf(entry, not_small, .{ .target = high }, .{ .target = low });
+
+    try f.appendStore(high, ten, at);
+    try f.setJump(high, join, &.{});
+    try f.appendStore(low, twenty, at);
+    try f.setJump(low, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [8]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 20), data[0]);
+    try std.testing.expectEqual(@as(u32, 20), data[1]);
+    try std.testing.expectEqual(@as(u32, 10), data[2]);
+    try std.testing.expectEqual(@as(u32, 10), data[3]);
+}
+

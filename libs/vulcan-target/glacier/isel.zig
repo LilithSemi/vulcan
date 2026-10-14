@@ -263,6 +263,14 @@ fn compileKernelInternal(
     // again. The allocator needs a block on it to put its shuffle moves on.
     try ir.critical_edge.splitCriticalEdges(allocator, &work);
 
+    // A per-lane NOT has to reach the hardware as a mask op. Last, because what varies per lane is
+    // only settled once the loops above are converted.
+    {
+        const d = try analyzeDivergence(allocator, &work);
+        defer allocator.free(d);
+        _ = try maskNots(allocator, &work, d);
+    }
+
     // A loop that absorbed its guard leaves the guard's failing side unreachable. Emptying it now
     // keeps the passes below off a block nothing reaches, and the allocator off a live range in
     // one: a value there is live nowhere and the allocation verifier reads that as unsound.
@@ -2644,6 +2652,51 @@ fn convertDivergentLoops(
         // the wrong block. Without this the rounds convert the same loop again and again.
         if (alreadyConverted(func, wide.tail, latches.items)) continue;
         if (try convertMultiBlockLoop(allocator, func, wide, masks, latches)) changed = true;
+    }
+    return changed;
+}
+
+/// Rewrite a per-lane NOT against an immediate into a mask op, and report whether anything changed.
+///
+/// `b ^ 1` is the NOT a frontend writes, and against an IMMEDIATE it reaches the vector unit as an
+/// integer xor on the register the mask lives in. A mask is one bit per lane packed into the first
+/// element, so that flips lane zero and leaves every other lane alone, which is a wrong answer
+/// rather than a refusal. XORing against an all-true mask is the same thing said with a mask op,
+/// and a mask op is exact at any lane count.
+fn maskNots(allocator: std.mem.Allocator, func: *Function, divergent: []const bool) Error!bool {
+    const bool_ty = try func.types.intern(.bool);
+    const lane = laneValue(func) orelse return false;
+    var all: ?Value = null;
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const b: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(b)) |inst| {
+            const a = switch (func.opcode(inst)) {
+                .arith_imm => |x| x,
+                else => continue,
+            };
+            if (a.op != .bit_xor or a.imm != 1) continue;
+            if (!isBool(func, func.valueType(a.lhs))) continue;
+            const res = func.instResult(inst) orelse continue;
+            // A warp-uniform NOT stays a scalar xor, which is right for a 0 or a 1 in a register.
+            if (!varies(divergent, res)) continue;
+            if (all == null) {
+                // At the FRONT of the entry block: the NOT this feeds can be anywhere, including
+                // above where an append would put it, and the lane index is a parameter so it is
+                // in reach from the first instruction on.
+                const entry: Block = @fromBackingInt(0);
+                all = try func.appendInst(entry, bool_ty, .{ .icmp = .{
+                    .op = .eq,
+                    .lhs = lane,
+                    .rhs = lane,
+                } });
+                const list = func.blockInstsMut(entry);
+                const made = list.pop().?;
+                try list.insert(allocator, 0, made);
+            }
+            func.opcodeMut(inst).* = .{ .arith = .{ .op = .bit_xor, .lhs = a.lhs, .rhs = all.? } };
+            changed = true;
+        }
     }
     return changed;
 }
