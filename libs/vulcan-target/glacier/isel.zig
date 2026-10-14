@@ -1918,12 +1918,25 @@ fn convertLoop(
         } }));
     }
 
+    // A value the body computes that something outside the loop reads needs a frozen copy of its
+    // own. This runs before the exit edge is rebuilt, because an argument on that edge is one of
+    // the reads it answers for.
+    var slots: std.ArrayList(CarriedValue) = .empty;
+    defer slots.deinit(allocator);
+    if (!try carrySlots(allocator, func, loop, active, &slots)) return false;
+
     // The exit carries the frozen values too: the loop is left when NO lane is active, so this
     // iteration's results belong to no one.
     var out: std.ArrayList(Value) = .empty;
     defer out.deinit(allocator);
     for (exit_args) |v| {
-        try out.append(allocator, exitValue(func, header, v, back_args, frozen.items) orelse return false);
+        const slotted = blk: {
+            for (slots.items) |s| {
+                if (s.value == v) break :blk s.frozen;
+            }
+            break :blk exitValue(func, header, v, back_args, frozen.items) orelse return false;
+        };
+        try out.append(allocator, slotted);
     }
 
     // The mask goes round with the rest, and it needs no select of its own: a lane the AND has
@@ -1932,6 +1945,8 @@ fn convertLoop(
     defer round.deinit(allocator);
     try round.appendSlice(allocator, frozen.items);
     try round.append(allocator, next);
+    // In the order the slots were given their parameters.
+    for (slots.items) |s| try round.append(allocator, s.frozen);
 
     // What goes round is written on the LATCH's jump, and the mask goes with it.
     func.terminatorPtr(loop.latch).*.?.jump.args = try func.internValueList(round.items);
@@ -1946,6 +1961,89 @@ fn convertLoop(
     } };
     try func.blockInstsMut(header).append(allocator, branch);
     try latches.append(allocator, branch);
+    return true;
+}
+
+/// A value the body computes that something outside the loop reads, and the frozen copy of it the
+/// outside reads instead. See `carrySlots`.
+const CarriedValue = struct { value: Value, frozen: Value };
+
+/// Give every value the body computes that something OUTSIDE the loop reads a frozen copy, and
+/// report false when one of them cannot have it.
+///
+/// A lane that stops early keeps its parameters frozen, so the body goes on recomputing from them
+/// and lands ONE ITERATION PAST the one that lane last took part in. Inside the loop that is
+/// harmless, because nothing reads the result of an iteration a lane sat out. Outside it is a
+/// wrong answer: the block the loop leaves by would read the value as though that iteration had
+/// happened. The frozen copy is the same select the carried values get, so the lane leaving now
+/// contributes this iteration and a lane that left earlier keeps what it had.
+///
+/// The slot starts at zero from the preheader. Only a lane that runs no iteration at all reads
+/// that, and such a lane took no part in anything the value feeds. A BOOL slot starts at a per-lane
+/// false rather than a zero: it is a mask, and the broadcast that gives a warp-uniform value to a
+/// per-lane parameter adds a per-lane zero, which is one value per element where a mask is one BIT
+/// per lane. Comparing the lane index against itself is false in every lane and per-lane by its
+/// operands, so it arrives as a real mask.
+fn carrySlots(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    loop: DivergentLoop,
+    active: Value,
+    slots: *std.ArrayList(CarriedValue),
+) Error!bool {
+    const header = loop.header;
+    var computed: std.ArrayList(Value) = .empty;
+    defer computed.deinit(allocator);
+    for (func.blockInsts(header)) |inst| {
+        if (func.instResult(inst)) |v| try computed.append(allocator, v);
+    }
+    if (computed.items.len == 0) return true;
+
+    // Counted with the loop's own code OUT OF SIGHT, so what is left is the reads from outside.
+    // The branch is not in the block at this point, so the exit edge's arguments are not counted
+    // either: `exitValue` answers for those.
+    const uses = try allocator.alloc(u32, func.valueCount());
+    defer allocator.free(uses);
+    const body = try allocator.dupe(Inst, func.blockInsts(header));
+    defer allocator.free(body);
+    const round = func.terminatorPtr(loop.latch).*.?.jump.args;
+    func.blockInstsMut(header).clearRetainingCapacity();
+    func.terminatorPtr(loop.latch).*.?.jump.args = try func.internValueList(&.{});
+    opt.dce.countUses(func, uses);
+    try func.blockInstsMut(header).appendSlice(allocator, body);
+    func.terminatorPtr(loop.latch).*.?.jump.args = round;
+
+    for (computed.items) |v| {
+        if (uses[@backingInt(v)] == 0) continue;
+        const ty = func.valueType(v);
+        const zero = switch (func.types.type_kind(ty)) {
+            .int => try func.appendInst(loop.preheader, ty, .{ .iconst = 0 }),
+            .float => try func.appendInst(loop.preheader, ty, .{ .fconst = 0 }),
+            .bool => blk: {
+                const lane = laneValue(func) orelse return false;
+                break :blk try func.appendInst(loop.preheader, ty, .{ .icmp = .{
+                    .op = .ne,
+                    .lhs = lane,
+                    .rhs = lane,
+                } });
+            },
+            else => return false,
+        };
+        const slot = try func.appendBlockParam(header, ty);
+        const frozen = try func.appendInst(header, ty, .{ .select = .{
+            .cond = active,
+            .then = v,
+            .@"else" = slot,
+        } });
+        // Every block but the loop's own two: inside, the body reads this iteration's value.
+        for (0..func.blockCount()) |bi| {
+            const b: Block = @fromBackingInt(@intCast(bi));
+            if (b == header or b == loop.latch) continue;
+            func.replaceUsesIn(b, v, frozen);
+        }
+        try appendJumpArg(allocator, func, loop.preheader, zero);
+        try slots.append(allocator, .{ .value = v, .frozen = frozen });
+    }
     return true;
 }
 

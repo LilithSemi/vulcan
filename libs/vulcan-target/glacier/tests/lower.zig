@@ -4394,3 +4394,56 @@ test "a while loop whose body holds an atomic keeps its branch" {
     );
     try std.testing.expectEqualStrings("if", why.opcode);
 }
+
+test "a value the body computes and the exit reads keeps the iteration the lane finished on" {
+    // `x = 0; do { y = x + x; x += lane + 1 } while (x < 10); out[lane] = y`
+    //
+    // `y` is computed in the BODY and read after the loop, which is the shape a frontend emits
+    // whenever a loop's working value outlives it. The loop runs until the last lane is done, and
+    // a lane that finished earlier has its parameters frozen, so the body goes on recomputing `y`
+    // from them and lands one iteration past the one that lane ran. Reading `y` directly would
+    // give that. The conversion gives it a slot of its own instead.
+    //
+    // Each lane steps by `lane + 1` and stops at or above ten, so `y` is twice the `x` it had on
+    // its last pass: lanes 0 and 2 stop with x = 9, lanes 1 and 3 with x = 8.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const latch = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const step = try f.appendArithImm(entry, u32_t, .add, tid, 1);
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const ten = try f.appendInst(entry, u32_t, .{ .iconst = 10 });
+    try f.setJump(entry, loop, &.{zero});
+
+    const x = try f.appendBlockParam(loop, u32_t);
+    const y = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
+    const x_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = step } });
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x_next, .rhs = ten } });
+    try f.appendIf(loop, more, .{ .target = latch }, .{ .target = exit });
+    try f.setJump(latch, loop, &.{x_next});
+
+    const offset = try f.appendArithImm(exit, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(exit, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(exit, y, at);
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [8]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 18), data[0]);
+    try std.testing.expectEqual(@as(u32, 16), data[1]);
+    try std.testing.expectEqual(@as(u32, 18), data[2]);
+    try std.testing.expectEqual(@as(u32, 16), data[3]);
+}

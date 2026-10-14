@@ -1465,102 +1465,122 @@ pub const Function = struct {
     /// edge arguments, and terminators (an SSA "replace all uses with").
     /// Definitions are untouched. The caller handles any now-dead `from`.
     pub fn replaceAllUses(self: *Function, from: Value, to: Value) void {
+        for (0..self.instCount()) |i| self.replaceUsesInInst(@fromBackingInt(@intCast(i)), from, to);
+        for (0..self.blockCount()) |bi| self.replaceUsesInTerm(@fromBackingInt(@intCast(bi)), from, to);
+    }
+
+    /// Replace uses of `from` with `to` in ONE block: its instructions, the edge arguments of a
+    /// branch it holds, and its terminator. For a rewrite that must not reach the rest of the
+    /// function, where `replaceAllUses` would be wrong.
+    pub fn replaceUsesIn(self: *Function, block: Block, from: Value, to: Value) void {
+        var i: usize = 0;
+        while (i < self.blockInsts(block).len) : (i += 1) {
+            self.replaceUsesInInst(self.blockInsts(block)[i], from, to);
+        }
+        self.replaceUsesInTerm(block, from, to);
+    }
+
+    fn replaceUsesInInst(self: *Function, inst: Inst, from: Value, to: Value) void {
         const r = struct {
             fn repl(f: Value, t: Value, v: Value) Value {
                 return if (v == f) t else v;
             }
         }.repl;
-        for (0..self.instCount()) |i| {
-            const op = self.opcodeMut(@fromBackingInt(@intCast(i)));
-            switch (op.*) {
-                // A barrier carries a scope and no Value operand, so it has nothing to
-                // replace. It joins the constants here for that reason only.
-                .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
-                .arith => |*a| {
-                    a.lhs = r(from, to, a.lhs);
-                    a.rhs = r(from, to, a.rhs);
-                },
-                .arith_imm => |*a| a.lhs = r(from, to, a.lhs),
-                .icmp => |*c| {
-                    c.lhs = r(from, to, c.lhs);
-                    c.rhs = r(from, to, c.rhs);
-                },
-                .select => |*s| {
-                    s.cond = r(from, to, s.cond);
-                    s.then = r(from, to, s.then);
-                    s.@"else" = r(from, to, s.@"else");
-                },
-                .extract => |*e| e.aggregate = r(from, to, e.aggregate),
-                .convert => |*cv| cv.value = r(from, to, cv.value),
-                .decode_low_float, .encode_low_float => |*cv| cv.value = r(from, to, cv.value),
-                .dequantize_nvfp4, .quantize_nvfp4 => |*cv| {
-                    cv.value = r(from, to, cv.value);
-                    cv.block_scale = r(from, to, cv.block_scale);
-                    cv.global_scale = r(from, to, cv.global_scale);
-                },
-                .unary => |*u| u.value = r(from, to, u.value),
-                .load => |*l| {
-                    l.ptr = r(from, to, l.ptr);
-                    if (l.mask) |m| l.mask = r(from, to, m);
-                },
-                .store => |*st| {
-                    st.value = r(from, to, st.value);
-                    st.ptr = r(from, to, st.ptr);
-                    if (st.mask) |m| st.mask = r(from, to, m);
-                },
-                .prefetch => |*pf| pf.ptr = r(from, to, pf.ptr),
-                .va_start => |*vs| vs.list = r(from, to, vs.list),
-                .va_arg => |*va| va.list = r(from, to, va.list),
-                .va_end => |*ve| ve.list = r(from, to, ve.list),
-                .dot => |*d| {
-                    d.acc = r(from, to, d.acc);
-                    d.a = r(from, to, d.a);
-                    d.b = r(from, to, d.b);
-                },
-                .reduce => |*red| red.vector = r(from, to, red.vector),
-                .splat => |*sp| sp.scalar = r(from, to, sp.scalar),
-                .matmul => |*mm| {
-                    mm.a = r(from, to, mm.a);
-                    mm.b = r(from, to, mm.b);
-                    mm.c = r(from, to, mm.c);
-                },
-                .atomic_rmw => |*a| {
-                    a.ptr = r(from, to, a.ptr);
-                    a.value = r(from, to, a.value);
-                    // The compare operand exists only in the compare-exchange form, and it is
-                    // a Value like the other two when it does exist.
-                    if (a.compare) |*c| c.* = r(from, to, c.*);
-                },
-                .struct_new => |sn| for (self.valueListMut(sn.fields)) |*f| {
-                    f.* = r(from, to, f.*);
-                },
-                .call => |*c| {
-                    if (c.ret_dest) |*rd| rd.* = r(from, to, rd.*); // The register-return dest is a use.
-                    for (self.valueListMut(c.args)) |*arg| arg.* = r(from, to, arg.*);
-                },
-                .call_indirect => |*c| {
-                    c.target = r(from, to, c.target);
-                    if (c.ret_dest) |*rd| rd.* = r(from, to, rd.*); // The register-return dest is a use.
-                    for (self.valueListMut(c.args)) |*arg| arg.* = r(from, to, arg.*);
-                },
-                .@"if" => |*cf| {
-                    cf.cond = r(from, to, cf.cond);
-                    for (self.valueListMut(cf.then.args)) |*arg| arg.* = r(from, to, arg.*);
-                    for (self.valueListMut(cf.@"else".args)) |*arg| arg.* = r(from, to, arg.*);
-                },
+        const op = self.opcodeMut(inst);
+        switch (op.*) {
+            // A barrier carries a scope and no Value operand, so it has nothing to
+            // replace. It joins the constants here for that reason only.
+            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
+            .arith => |*a| {
+                a.lhs = r(from, to, a.lhs);
+                a.rhs = r(from, to, a.rhs);
+            },
+            .arith_imm => |*a| a.lhs = r(from, to, a.lhs),
+            .icmp => |*c| {
+                c.lhs = r(from, to, c.lhs);
+                c.rhs = r(from, to, c.rhs);
+            },
+            .select => |*s| {
+                s.cond = r(from, to, s.cond);
+                s.then = r(from, to, s.then);
+                s.@"else" = r(from, to, s.@"else");
+            },
+            .extract => |*e| e.aggregate = r(from, to, e.aggregate),
+            .convert => |*cv| cv.value = r(from, to, cv.value),
+            .decode_low_float, .encode_low_float => |*cv| cv.value = r(from, to, cv.value),
+            .dequantize_nvfp4, .quantize_nvfp4 => |*cv| {
+                cv.value = r(from, to, cv.value);
+                cv.block_scale = r(from, to, cv.block_scale);
+                cv.global_scale = r(from, to, cv.global_scale);
+            },
+            .unary => |*u| u.value = r(from, to, u.value),
+            .load => |*l| {
+                l.ptr = r(from, to, l.ptr);
+                if (l.mask) |m| l.mask = r(from, to, m);
+            },
+            .store => |*st| {
+                st.value = r(from, to, st.value);
+                st.ptr = r(from, to, st.ptr);
+                if (st.mask) |m| st.mask = r(from, to, m);
+            },
+            .prefetch => |*pf| pf.ptr = r(from, to, pf.ptr),
+            .va_start => |*vs| vs.list = r(from, to, vs.list),
+            .va_arg => |*va| va.list = r(from, to, va.list),
+            .va_end => |*ve| ve.list = r(from, to, ve.list),
+            .dot => |*d| {
+                d.acc = r(from, to, d.acc);
+                d.a = r(from, to, d.a);
+                d.b = r(from, to, d.b);
+            },
+            .reduce => |*red| red.vector = r(from, to, red.vector),
+            .splat => |*sp| sp.scalar = r(from, to, sp.scalar),
+            .matmul => |*mm| {
+                mm.a = r(from, to, mm.a);
+                mm.b = r(from, to, mm.b);
+                mm.c = r(from, to, mm.c);
+            },
+            .atomic_rmw => |*a| {
+                a.ptr = r(from, to, a.ptr);
+                a.value = r(from, to, a.value);
+                // The compare operand exists only in the compare-exchange form, and it is
+                // a Value like the other two when it does exist.
+                if (a.compare) |*c| c.* = r(from, to, c.*);
+            },
+            .struct_new => |sn| for (self.valueListMut(sn.fields)) |*f| {
+                f.* = r(from, to, f.*);
+            },
+            .call => |*c| {
+                if (c.ret_dest) |*rd| rd.* = r(from, to, rd.*); // The register-return dest is a use.
+                for (self.valueListMut(c.args)) |*arg| arg.* = r(from, to, arg.*);
+            },
+            .call_indirect => |*c| {
+                c.target = r(from, to, c.target);
+                if (c.ret_dest) |*rd| rd.* = r(from, to, rd.*); // The register-return dest is a use.
+                for (self.valueListMut(c.args)) |*arg| arg.* = r(from, to, arg.*);
+            },
+            .@"if" => |*cf| {
+                cf.cond = r(from, to, cf.cond);
+                for (self.valueListMut(cf.then.args)) |*arg| arg.* = r(from, to, arg.*);
+                for (self.valueListMut(cf.@"else".args)) |*arg| arg.* = r(from, to, arg.*);
+            },
+        }
+    }
+
+    fn replaceUsesInTerm(self: *Function, block: Block, from: Value, to: Value) void {
+        const r = struct {
+            fn repl(f: Value, t: Value, v: Value) Value {
+                return if (v == f) t else v;
             }
-        }
-        for (0..self.blockCount()) |bi| {
-            const term = self.terminatorPtr(@fromBackingInt(@intCast(bi)));
-            if (term.*) |*t| switch (t.*) {
-                .ret => |*ret| for (ret.values[0..ret.count]) |*vv| {
-                    vv.* = r(from, to, vv.*);
-                },
-                .jump => |*j| for (self.valueListMut(j.args)) |*arg| {
-                    arg.* = r(from, to, arg.*);
-                },
-            };
-        }
+        }.repl;
+        const term = self.terminatorPtr(block);
+        if (term.*) |*t| switch (t.*) {
+            .ret => |*ret| for (ret.values[0..ret.count]) |*vv| {
+                vv.* = r(from, to, vv.*);
+            },
+            .jump => |*j| for (self.valueListMut(j.args)) |*arg| {
+                arg.* = r(from, to, arg.*);
+            },
+        };
     }
 
     /// A mutable pointer to a block's instruction list (to drop instructions).
