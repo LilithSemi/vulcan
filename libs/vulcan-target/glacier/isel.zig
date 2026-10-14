@@ -4265,6 +4265,9 @@ const Emitter = struct {
 
     /// Put the mask bits of `cond` in `v0`, which is the only register that predicates. A masked
     /// operation reads them from there and nowhere else.
+    ///
+    /// The install is spelled `vmand.mm v0, b, b`, so a reader counting mask operations in the
+    /// stream sees an AND. A destination of `v0` makes it an install.
     fn predicate(self: *Emitter, cond: Value, pos: u32) Error!void {
         if (self.v0_mask) |have| {
             if (have == cond) return;
