@@ -5017,9 +5017,17 @@ const Emitter = struct {
             // block nothing reaches is skipped entirely and emits no word at all, so reaching this
             // means an analysis called a block live and left it no way out.
             //
-            // Retiring is the safe word to leave behind: nothing branches here, and EBREAK cannot
-            // run on into the next block.
-            return self.put(glacier.ebreak);
+            // It FAULTS rather than retires. Retiring is indistinguishable from finishing, so the
+            // host would read a successful launch that did part of the work, and the only evidence
+            // would be a wrong frame. See `encode.fault_compiler_bug`.
+            //
+            // The code is a VALUE the core reads out of a register, so it is materialised first.
+            // `scratch` is never allocatable, so writing it here disturbs nothing, and nothing runs
+            // after a fault in any case. That it is x31 while the code is 31 is a coincidence of
+            // two unrelated numbers: the register is the one this lowering reserves, and the code
+            // is the top of the range the toolchain reserved.
+            try self.put(rv.addi(scratch, .x0, glacier.fault_compiler_bug));
+            return self.put(glacier.ecall(scratch));
         };
         switch (term) {
             .ret => try self.put(glacier.ebreak),

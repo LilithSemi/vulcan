@@ -37,9 +37,52 @@ pub const rv = @import("../riscv64/encode.zig");
 
 pub const Reg = rv.Reg;
 
-/// EBREAK. Retires the warp: a Glacier kernel ends with this rather than returning, because a
-/// warp has no caller to return to.
+/// EBREAK. Retires the warp as FINISHED: a Glacier kernel ends with this rather than returning,
+/// because a warp has no caller to return to. The core requires rs1 = 0 here, deliberately, so the
+/// rest of the encoding stays free to be given meaning later.
 pub const ebreak: u32 = 0x00100073;
+
+/// ECALL. Retires the warp as FAULTED, with the code taken from THE VALUE `rs1` HOLDS AT RUN TIME.
+///
+/// NOT from the register number. The core reads the register, so a constant code has to be
+/// materialised into one first and a code is never an immediate. This takes a `Reg` rather than an
+/// integer for exactly that reason: the two readings of this word, "the rs1 field IS the code" and
+/// "the rs1 register holds the code", produce the same instruction and differ in what the hardware
+/// reports, and nothing but the type can tell them apart. A register-valued code is also what makes
+/// the fault useful to a KERNEL rather than only to the compiler, because the interesting thing to
+/// report is usually a computed value and not an enum.
+///
+/// The host reads the code at FAULT (CSR offset 0x1C) and the valid bit at STATUS bit 4, and it
+/// needs both: code zero is a legal report and says nothing on its own. The FIRST fault wins, so
+/// with several warps failing the code that explains the run is not overwritten by whichever
+/// failed last.
+///
+/// This is how a kernel says something went wrong AT ALL. Retiring with EBREAK is indistinguishable
+/// from finishing, so without this a kernel that discovers its own bad state reports success.
+///
+/// It is separate from STATUS bit 3, which the FABRIC raises when an address no slave decodes is
+/// accessed. Bit 3 means the bus objected, bit 4 means the kernel did.
+pub fn ecall(rs1: Reg) u32 {
+    return 0x73 | (@as(u32, @backingInt(rs1)) << 15);
+}
+
+/// The fault code for a state the compiler proved impossible, as a VALUE to materialise. Nothing
+/// emits it on a path a kernel can take: it marks the places where a wrong answer from a compiler
+/// analysis would otherwise retire the warp and read as success. A host seeing this has found a
+/// compiler bug, not a kernel bug, which is why it is reserved rather than left to a kernel.
+///
+/// The top of the range on purpose, so a kernel numbering its own codes from one never meets it.
+/// 28 through 31 are reserved for the toolchain by agreement; 1 through 27 belong to the kernel.
+pub const fault_compiler_bug: i12 = 31;
+
+test "the fault retire is an ECALL naming the register its code is in" {
+    // `x0` reads zero, so the architectural ECALL word is already the zero-code fault and needs no
+    // special case. The second one names x31, which is the register this lowering keeps for itself.
+    try std.testing.expectEqual(@as(u32, 0x00000073), ecall(.x0));
+    try std.testing.expectEqual(@as(u32, 0x000F8073), ecall(.x31));
+    // A fault and a finish differ, which is the whole point of the pair.
+    try std.testing.expect(ecall(.x0) != ebreak);
+}
 
 /// The CSRs a Glacier core decodes. Reading one is the only CSR access it implements, and it is
 /// how a kernel asks the hardware which warp is running it.
