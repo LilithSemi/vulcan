@@ -1679,14 +1679,14 @@ test "a divergent loop inside a divergent loop runs each lane's own count of eac
     _ = try warp.run(words, &mem, &one, 100_000);
 
     const want = [36]u32{
-        1,        sentinel, sentinel, sentinel, sentinel, sentinel, sentinel, sentinel,
-        1,        3,        sentinel, sentinel, sentinel, sentinel, sentinel, sentinel,
-        1,        3,        6,        sentinel, sentinel, sentinel, sentinel, sentinel,
-        1,        3,        6,        10,       sentinel, sentinel, sentinel, sentinel,
+        1,   sentinel, sentinel, sentinel, sentinel, sentinel, sentinel, sentinel,
+        1,   3,        sentinel, sentinel, sentinel, sentinel, sentinel, sentinel,
+        1,   3,        6,        sentinel, sentinel, sentinel, sentinel, sentinel,
+        1,   3,        6,        10,       sentinel, sentinel, sentinel, sentinel,
         // The last outer pass each lane took part in, written from inside the INNER loop. A lane
         // that kept running the inner loop after its own outer test failed would leave the pass
         // number it was frozen at, which is one too high.
-        100,      101,      102,      103,
+        100, 101,      102,      103,
     };
     for (want, 0..) |w, i| try std.testing.expectEqual(w, data[i]);
 }
