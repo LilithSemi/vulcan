@@ -222,8 +222,11 @@ fn compileKernelInternal(
         // region and a loop latch. Flattening then makes new boundaries, so the two iterate
         // together rather than one after the other.
         const merged = try mergeStraightLine(allocator, &work);
+        // A branch that chooses between two identical arrivals goes first: it is not a region to
+        // flatten, it is a branch that should not be there.
+        const dropped = dropPointlessBranches(&work);
         const flattened = try ifConvert(allocator, &work, d, &loop_masks);
-        if (!merged and !flattened) break;
+        if (!merged and !dropped and !flattened) break;
     }
     const reachable_after = try ir.reachable.neutralizeUnreachable(allocator, &work);
     allocator.free(reachable_after);
@@ -1550,6 +1553,56 @@ fn convertible(code: ir.function.Opcode) bool {
 
 // ===========================================================================
 // Merging a block into the predecessor that only jumps to it.
+
+/// Where control really ends up when a block only passes values on: through a chain of empty
+/// parameterless blocks, to the first block that holds something, with the arguments that arrive
+/// there.
+fn arrivalOf(func: *const Function, edge: ir.function.Jump) ir.function.Jump {
+    var cur = edge;
+    var hops: usize = 0;
+    while (hops < max_forward_hops) : (hops += 1) {
+        const b = cur.target;
+        if (func.blockInsts(b).len != 0) return cur;
+        if (func.blockParams(b).len != 0) return cur;
+        if (func.blockArgs(cur).len != 0) return cur;
+        cur = switch (func.terminator(b) orelse return cur) {
+            .jump => |j| j,
+            .ret => return cur,
+        };
+    }
+    return cur;
+}
+
+/// How far a chain of empty forwarding blocks is followed. A bound, not a limit on anything real.
+const max_forward_hops = 8;
+
+/// Replace a branch whose two sides end up at the same block with the same values by a jump, and
+/// report whether anything changed.
+///
+/// A structurizer leaves these behind: `if (code == X) {} else {}` with both arms emptied by the
+/// optimizer, so the branch chooses between two identical arrivals. It is still a BRANCH, so a
+/// per-lane condition on it would be refused for a choice that makes no difference, and the arms
+/// cannot be flattened when the block they meet at is reached from elsewhere as well.
+fn dropPointlessBranches(func: *Function) bool {
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const insts = func.blockInsts(block);
+        if (insts.len == 0) continue;
+        const cf = switch (func.opcode(insts[insts.len - 1])) {
+            .@"if" => |x| x,
+            else => continue,
+        };
+        const a = arrivalOf(func, cf.then);
+        const b = arrivalOf(func, cf.@"else");
+        if (a.target != b.target) continue;
+        if (!std.mem.eql(Value, func.blockArgs(a), func.blockArgs(b))) continue;
+        _ = func.blockInstsMut(block).pop().?;
+        func.terminatorPtr(block).* = .{ .jump = a };
+        changed = true;
+    }
+    return changed;
+}
 
 /// Merge every block whose one predecessor reaches it by an unconditional jump, and report whether
 /// anything changed.

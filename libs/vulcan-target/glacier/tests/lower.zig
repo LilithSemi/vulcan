@@ -4708,3 +4708,60 @@ test "a per-lane branch on a NOT takes both sides" {
     try std.testing.expectEqual(@as(u32, 10), data[2]);
     try std.testing.expectEqual(@as(u32, 10), data[3]);
 }
+
+test "a per-lane branch between two identical arrivals becomes a jump" {
+    // Both arms of the per-lane branch are empty and reach the same block with the same values, so
+    // the branch decides nothing. An optimizer leaves this shape behind after it empties the arms.
+    // The block they meet at has a third predecessor, so there is no region to flatten and the
+    // branch has to go instead.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const pre = try f.appendBlock();
+    const arm_a = try f.appendBlock();
+    const arm_b = try f.appendBlock();
+    const other = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const seven = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    const flag_at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendInst(entry, u32_t, .{ .iconst = 32 }),
+    } });
+    const flag = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = flag_at } });
+    const uniform = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = flag, .rhs = seven } });
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+    const mine = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(entry, uniform, .{ .target = pre }, .{ .target = other });
+
+    try f.appendIf(pre, mine, .{ .target = arm_a }, .{ .target = arm_b });
+    try f.setJump(arm_a, join, &.{});
+    try f.setJump(arm_b, join, &.{});
+    try f.setJump(other, join, &.{});
+
+    const ten = try f.appendInst(join, u32_t, .{ .iconst = 10 });
+    const out = try f.appendInst(join, u32_t, .{ .arith = .{ .op = .mul, .lhs = tid, .rhs = ten } });
+    try f.appendStore(join, out, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [9]u32 = @splat(0);
+    data[8] = 7;
+    try runOnce(words, &data, 0, 1);
+    for (0..4) |i| try std.testing.expectEqual(@as(u32, @intCast(i * 10)), data[i]);
+}
