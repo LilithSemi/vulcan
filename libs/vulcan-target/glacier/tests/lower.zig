@@ -4825,3 +4825,61 @@ test "a per-lane value that waits in the scratch region comes back per lane" {
         try std.testing.expectEqual(want, data[i]);
     }
 }
+
+test "two masked stores under one predicate install the mask once" {
+    // `if (lane < 2) { out[lane] = 1; out[lane + 4] = 2; }`. Both stores read the predicate from
+    // v0, which only the install writes, and a mask never changes after it is computed. So the
+    // second install is dead.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const arm = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const off = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = off } });
+    const far = try f.appendArithImm(entry, ptr_t, .add, at, 16);
+    const mine = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(entry, mine, .{ .target = arm }, .{ .target = join });
+
+    try f.appendStore(arm, one, at);
+    try f.appendStore(arm, two, far);
+    try f.setJump(arm, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    var installs: usize = 0;
+    var masked_stores: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1010111 and (w >> 12) & 7 == 2 and w >> 26 == 0b011001 and (w >> 7) & 0x1F == 0) {
+            installs += 1;
+        }
+        if (w & 0x7F == 0b0100111 and (w >> 25) & 1 == 0) masked_stores += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), masked_stores);
+    try std.testing.expectEqual(@as(usize, 1), installs);
+
+    const sentinel: u32 = 0x5555_5555;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 1), data[0]);
+    try std.testing.expectEqual(@as(u32, 1), data[1]);
+    try std.testing.expectEqual(sentinel, data[2]);
+    try std.testing.expectEqual(sentinel, data[3]);
+    try std.testing.expectEqual(@as(u32, 2), data[4]);
+    try std.testing.expectEqual(@as(u32, 2), data[5]);
+    try std.testing.expectEqual(sentinel, data[6]);
+    try std.testing.expectEqual(sentinel, data[7]);
+}

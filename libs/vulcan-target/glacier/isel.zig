@@ -4197,6 +4197,10 @@ const Emitter = struct {
     why: ?*Refusal,
     /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
     spills: bool,
+    /// The value whose mask bits are in `v0`, or null when the contents are unknown. `v0` is
+    /// never allocatable, so the predicate installs are the only writes to it, and a value never
+    /// changes after it is computed: a second install of the same mask in one block is dead.
+    v0_mask: ?Value = null,
     /// Where the per-lane spill slots start, in bytes below `sp`. The scalar slots take the top of
     /// the region one word each, so the vector slots sit under them, one whole register each.
     vector_slot_base: u32,
@@ -4259,6 +4263,17 @@ const Emitter = struct {
         };
     }
 
+    /// Put the mask bits of `cond` in `v0`, which is the only register that predicates. A masked
+    /// operation reads them from there and nowhere else.
+    fn predicate(self: *Emitter, cond: Value, pos: u32) Error!void {
+        if (self.v0_mask) |have| {
+            if (have == cond) return;
+        }
+        const bits = try self.vreg(cond, pos);
+        try self.put(rv.vmand_mm(.v0, bits, bits));
+        self.v0_mask = cond;
+    }
+
     /// `v` as a vector operand. A warp-uniform value is broadcast into the vector scratch first,
     /// since one operand of a per-lane operation may well be the same in every lane.
     ///
@@ -4305,6 +4320,8 @@ const Emitter = struct {
         for (0..nblocks) |bi| {
             const block: Block = @fromBackingInt(@intCast(bi));
             self.block_start.items[bi] = @intCast(self.words.items.len);
+            // A block can be entered from several predecessors, each leaving its own mask behind.
+            self.v0_mask = null;
             // Nothing reaches this block, so nothing needs a word here. Its POSITIONS still
             // advance below, because the allocator numbered them whether or not they are emitted,
             // and an action it placed at one of them belongs to a value no longer read here.
@@ -4608,10 +4625,7 @@ const Emitter = struct {
             .load => |l| {
                 const dst = try self.vreg(self.func.instResult(inst).?, pos);
                 const mask = l.mask;
-                if (mask) |m| {
-                    const bits = try self.vreg(m, pos);
-                    try self.put(rv.vmand_mm(.v0, bits, bits));
-                }
+                if (mask) |m| try self.predicate(m, pos);
                 // A contiguous run is one instruction and one bus run. See `Strides`.
                 if (self.strides.at(inst)) |b| {
                     const start = try self.reg(b, pos);
@@ -4633,8 +4647,7 @@ const Emitter = struct {
                     const start = try self.reg(b, pos);
                     const words = try self.maskOperand(st.value, &pool, pos);
                     const mask = st.mask orelse return self.put(rv.vse32(words, start));
-                    const bits = try self.vreg(mask, pos);
-                    try self.put(rv.vmand_mm(.v0, bits, bits));
+                    try self.predicate(mask, pos);
                     return self.put(rv.vse32_m(words, start));
                 }
                 const addr = try self.maskOperand(st.ptr, &pool, pos);
@@ -4645,8 +4658,7 @@ const Emitter = struct {
                 };
                 // The predicate reads from v0 and nowhere else. A lane whose bit is clear makes no
                 // bus access at all, which is what lets a store survive if-conversion.
-                const bits = try self.vreg(mask, pos);
-                try self.put(rv.vmand_mm(.v0, bits, bits));
+                try self.predicate(mask, pos);
                 try self.put(rv.vsuxei32_m(val, .x0, addr));
             },
             .unary => |u| try self.vmove(
@@ -4746,11 +4758,12 @@ const Emitter = struct {
             const tmp = try pool.take();
             try self.put(rv.vmv_v_x(tmp, try self.reg(s.cond, pos)));
             try self.put(rv.vmseq_vx(.v0, tmp, .x0));
+            // A mask built by comparing, not installed from a value, so nothing can match it.
+            self.v0_mask = null;
             try self.put(rv.vmerge_vvm(dst, then_v, else_v));
             return;
         }
-        const mask = try self.vreg(s.cond, pos);
-        try self.put(rv.vmand_mm(.v0, mask, mask));
+        try self.predicate(s.cond, pos);
         try self.put(rv.vmerge_vvm(dst, else_v, then_v));
     }
 
