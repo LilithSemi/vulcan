@@ -368,10 +368,17 @@ fn compileKernelInternal(
         return Refusal.whole(why, "a spill slot past the one displacement that reaches it");
     }
 
-    // A spilled VECTOR would need a vector store to the scratch region and a reload from it.
-    // Nothing emits those yet, so refuse rather than drop the spill and miscompile.
-    if (walloc.slot_count_per_class[1] != 0) {
-        return Refusal.whole(why, "a per-lane value that had to spill, which has no store yet");
+    // A spilled per-lane value goes under the scalar slots, one whole vector register each, and
+    // both regions have to fit the hart's scratch. A mask spends a register's worth of space on
+    // one bit per lane, which is the price of not having a narrower store.
+    const vector_bytes = walloc.slot_count_per_class[1] * @as(u32, opts.profile.lanes()) * 4;
+    if (slots * 4 + vector_bytes > opts.profile.scratchBytes()) {
+        return Refusal.whole(why, "more spill space than the hart's scratch region holds");
+    }
+    // The deepest per-lane slot is addressed by one signed 12-bit displacement from `sp`, the same
+    // ceiling the scalar slots have.
+    if (slots * 4 + vector_bytes > 2048) {
+        return Refusal.whole(why, "a spill slot past the one displacement that reaches it");
     }
 
     // Recomputed here rather than reused from above: the passes between have emptied blocks and
@@ -392,7 +399,8 @@ fn compileKernelInternal(
         .strides = &strides,
         .any_lane = &any_lane,
         .why = why,
-        .spills = slots != 0,
+        .spills = slots != 0 or walloc.slot_count_per_class[1] != 0,
+        .vector_slot_base = slots * 4,
     };
     defer e.deinit();
     try e.run();
@@ -4189,6 +4197,9 @@ const Emitter = struct {
     why: ?*Refusal,
     /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
     spills: bool,
+    /// Where the per-lane spill slots start, in bytes below `sp`. The scalar slots take the top of
+    /// the region one word each, so the vector slots sit under them, one whole register each.
+    vector_slot_base: u32,
     words: std.ArrayList(u32) = .empty,
     block_start: std.ArrayList(u32) = .empty,
     fixups: std.ArrayList(Fixup) = .empty,
@@ -4239,7 +4250,12 @@ const Emitter = struct {
     fn vreg(self: *const Emitter, v: Value, pos: u32) Error!VReg {
         return switch (self.locAt(v, pos) orelse return error.Unsupported) {
             .reg => |r| @as(VReg, @fromBackingInt(@as(u5, @intCast(r)))),
-            .slot => error.Unsupported, // a spilled vector; refused before emission
+            // A per-lane value the allocator put in a slot at its own definition. The scalar path
+            // computes such a result in the scratch register and stores it after, which this
+            // cannot copy: the vector scratch already carries a broadcast warp-uniform operand on
+            // several paths here. A move to or from a slot between two instructions is handled,
+            // and that is what the allocator emits for a value that spills after it is defined.
+            .slot => error.Unsupported,
         };
     }
 
@@ -4425,22 +4441,51 @@ const Emitter = struct {
         for (moves) |m| {
             if (m.class == vector_class) {
                 const uniform_source = if (pred) |p| self.argIsUniform(p, succ.?, m.value) else false;
-                // A spilled vector is refused before emission, so neither end is ever a slot.
+                if (uniform_source) return error.Unsupported;
+                // A per-lane value that had to spill. The access takes its address from a register,
+                // so the slot's address goes in the scalar scratch first. Nothing else is using the
+                // scratch between the two words.
+                switch (m.src) {
+                    .reg => |r| switch (m.dst) {
+                        .reg => {},
+                        .slot => |n| {
+                            try self.vectorSlotAddress(n);
+                            try self.put(rv.vse32(vregOf(r), scratch));
+                            continue;
+                        },
+                    },
+                    .slot => |n| switch (m.dst) {
+                        .reg => |d| {
+                            try self.vectorSlotAddress(n);
+                            try self.put(rv.vle32(vregOf(d), scratch));
+                            continue;
+                        },
+                        // Slot to slot goes through the vector scratch, which no value occupies
+                        // across an instruction boundary.
+                        .slot => |d| {
+                            try self.vectorSlotAddress(n);
+                            try self.put(rv.vle32(vscratch, scratch));
+                            try self.vectorSlotAddress(d);
+                            try self.put(rv.vse32(vscratch, scratch));
+                            continue;
+                        },
+                    },
+                }
                 const s = switch (m.src) {
                     .reg => |r| vregOf(r),
-                    .slot => return error.Unsupported,
+                    .slot => unreachable,
                 };
                 const d = switch (m.dst) {
                     .reg => |r| vregOf(r),
-                    .slot => return error.Unsupported,
+                    .slot => unreachable,
                 };
                 // A WARP-UNIFORM value feeding a per-lane parameter would cross the register
                 // files: the source index names a SCALAR register and the destination a vector
                 // one. `broadcastUniformArgs` removes every such edge before this runs, so
                 // reaching here means it missed one, and the answer is a refusal rather than a
-                // move that reads the wrong file. Note the allocator can also DROP such a move
-                // before emission, which nothing here can catch; that is what the test pins.
-                if (uniform_source) return error.Unsupported;
+                // move that reads the wrong file (refused above). Note the allocator can also DROP
+                // such a move before emission, which nothing here can catch; that is what the test
+                // pins.
                 if (s == d) continue;
                 if (isBool(self.func, self.func.valueType(m.value))) {
                     try self.put(rv.vmand_mm(d, s, s));
@@ -4511,6 +4556,23 @@ const Emitter = struct {
         const off: i64 = -(@as(i64, n) + 1) * 4;
         if (off < std.math.minInt(i12)) return error.Unsupported;
         return @intCast(off);
+    }
+
+    /// The offset of PER-LANE spill slot `n` from `sp`, below the scalar slots. A whole vector
+    /// register wide, because a spill of one stores every lane: a MASK only uses the first element,
+    /// and storing the rest costs nothing but the space.
+    fn vectorSlotOffset(self: *const Emitter, n: u32) Error!i12 {
+        if (!self.spills) return error.Unsupported;
+        const width: i64 = @as(i64, self.opts.profile.lanes()) * 4;
+        const off: i64 = -(@as(i64, self.vector_slot_base) + (@as(i64, n) + 1) * width);
+        if (off < std.math.minInt(i12)) return error.Unsupported;
+        return @intCast(off);
+    }
+
+    /// Put the address of per-lane slot `n` in the scalar scratch, because a vector access takes
+    /// its address from a register and has no displacement field of its own.
+    fn vectorSlotAddress(self: *Emitter, n: u32) Error!void {
+        try self.put(rv.addi(scratch, sp, try self.vectorSlotOffset(n)));
     }
 
     /// The allocator's own spills, reloads and moves at `pos`.

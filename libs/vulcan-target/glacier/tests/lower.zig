@@ -4765,3 +4765,63 @@ test "a per-lane branch between two identical arrivals becomes a jump" {
     try runOnce(words, &data, 0, 1);
     for (0..4) |i| try std.testing.expectEqual(@as(u32, @intCast(i * 10)), data[i]);
 }
+
+test "a per-lane value that waits in the scratch region comes back per lane" {
+    // Twenty-eight live per-lane values and the lane index and the address make more than the core
+    // has vector registers, so the allocator puts one in the scratch region and reads it back. The
+    // sum consumes them in reverse, which makes the first value the one with the farthest use. A
+    // reload that kept only the first element would give every lane lane zero's answer.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+
+    var vals: [28]ir.function.Value = undefined;
+    for (&vals, 1..) |*v, k| v.* = try f.appendArithImm(entry, u32_t, .add, tid, @intCast(k));
+    var sum = vals[vals.len - 1];
+    for (1..vals.len) |i| {
+        sum = try f.appendInst(entry, u32_t, .{ .arith = .{
+            .op = .add,
+            .lhs = sum,
+            .rhs = vals[vals.len - 1 - i],
+        } });
+    }
+    try f.appendStore(entry, sum, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    // A whole vector register goes out and comes back, addressed from the scalar scratch, which is
+    // what tells these apart from the kernel's own store.
+    var spill_stores: usize = 0;
+    var reloads: usize = 0;
+    for (words) |w| {
+        if ((w >> 15) & 0x1F != 31) continue;
+        if (w & 0x7F == 0b0100111) spill_stores += 1;
+        if (w & 0x7F == 0b0000111) reloads += 1;
+    }
+    try std.testing.expect(spill_stores > 0);
+    try std.testing.expect(reloads > 0);
+
+    // The words past the output stand in for the hart scratch region, so a spill that walked out
+    // of its slice would land in the output rather than pass unseen.
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [8 + scratch_words]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    for (0..4) |i| {
+        const want: u32 = @intCast(28 * i + 406);
+        try std.testing.expectEqual(want, data[i]);
+    }
+}
