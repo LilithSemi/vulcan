@@ -400,6 +400,7 @@ fn compileKernelInternal(
         .any_lane = &any_lane,
         .why = why,
         .spills = slots != 0 or walloc.slot_count_per_class[1] != 0,
+        .remat = try rematTable(allocator, &work),
         .vector_slot_base = slots * 4,
     };
     defer e.deinit();
@@ -4175,6 +4176,33 @@ fn vectorBinOpVx(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const
 /// out of range inside one legal kernel while a jump cannot.
 const Fixup = struct { at: usize, target: Block };
 
+/// The one-word constant each value rematerialises to, or null where it has to go through a spill
+/// slot.
+///
+/// A constant that spills costs a store at its definition and a load at every reload. One that
+/// fits ADDI's immediate takes ONE word to re-emit, which is what the load costs, so re-emitting
+/// is never the worse trade and the store goes away with the slot. A wider constant takes two
+/// words and keeps its slot. The single-use case is already gone by here: `opt.sink` moved those
+/// next to their reader, so what is left is a constant several instructions read.
+fn rematTable(allocator: std.mem.Allocator, func: *const Function) Error![]const ?i32 {
+    const table = try allocator.alloc(?i32, func.valueCount());
+    @memset(table, null);
+    for (0..func.blockCount()) |bi| {
+        const b: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(b)) |inst| {
+            const res = func.instResult(inst) orelse continue;
+            const value: i32 = switch (func.opcode(inst)) {
+                .iconst => |c| lowWord(c),
+                .fconst => |c| @bitCast(floatBits(func, inst, c) orelse continue),
+                else => continue,
+            };
+            if (value < -2048 or value > 2047) continue;
+            table[@backingInt(res)] = value;
+        }
+    }
+    return table;
+}
+
 const Emitter = struct {
     allocator: std.mem.Allocator,
     func: *const Function,
@@ -4197,6 +4225,8 @@ const Emitter = struct {
     why: ?*Refusal,
     /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
     spills: bool,
+    /// What each value rematerialises to. See `rematTable`.
+    remat: []const ?i32,
     /// The value whose mask bits are in `v0`, or null when the contents are unknown. `v0` is
     /// never allocatable, so the predicate installs are the only writes to it, and a value never
     /// changes after it is computed: a second install of the same mask in one block is dead.
@@ -4209,6 +4239,7 @@ const Emitter = struct {
     fixups: std.ArrayList(Fixup) = .empty,
 
     fn deinit(self: *Emitter) void {
+        self.allocator.free(self.remat);
         self.words.deinit(self.allocator);
         self.block_start.deinit(self.allocator);
         self.fixups.deinit(self.allocator);
@@ -4514,14 +4545,24 @@ const Emitter = struct {
                 }
                 continue;
             }
+            // A constant this can re-emit never reaches its slot, so a move that would write the
+            // slot is dropped and a move that would read it re-emits instead. Every scalar read
+            // of a slot goes through here, which is what makes dropping the write sound.
+            const rematerialises = self.remat[@backingInt(m.value)];
             switch (m.src) {
                 .reg => |s| switch (m.dst) {
                     .reg => |d| try self.move(regOf(d), regOf(s)),
-                    .slot => |d| try self.put(rv.sw(regOf(s), sp, try self.slotOffset(d))),
+                    .slot => |d| if (rematerialises == null) {
+                        try self.put(rv.sw(regOf(s), sp, try self.slotOffset(d)));
+                    },
                 },
                 .slot => |s| switch (m.dst) {
-                    .reg => |d| try self.put(rv.lw(regOf(d), sp, try self.slotOffset(s))),
-                    .slot => |d| {
+                    .reg => |d| if (rematerialises) |c| {
+                        try self.constant(regOf(d), c);
+                    } else {
+                        try self.put(rv.lw(regOf(d), sp, try self.slotOffset(s)));
+                    },
+                    .slot => |d| if (rematerialises == null) {
                         try self.put(rv.lw(scratch, sp, try self.slotOffset(s)));
                         try self.put(rv.sw(scratch, sp, try self.slotOffset(d)));
                     },
@@ -4911,6 +4952,14 @@ const Emitter = struct {
             null;
         // A result that lives in a spill slot is computed in the scratch register and stored
         // afterwards, so the opcode below never has to know where its result goes.
+        // A constant whose home is a slot is neither computed nor stored, because every read of
+        // that slot re-emits it instead. See `rematTable`.
+        if (home) |h| switch (h) {
+            .slot => if (self.func.instResult(inst)) |r| {
+                if (self.remat[@backingInt(r)] != null) return;
+            },
+            .reg => {},
+        };
         const dst: Reg = switch (home orelse wimmer.Location{ .reg = @backingInt(scratch) }) {
             .reg => |r| regOf(r),
             .slot => scratch,

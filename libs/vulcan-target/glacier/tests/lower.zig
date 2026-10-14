@@ -4883,3 +4883,68 @@ test "two masked stores under one predicate install the mask once" {
     try std.testing.expectEqual(sentinel, data[6]);
     try std.testing.expectEqual(sentinel, data[7]);
 }
+
+test "constants that spill are re-emitted and still add up" {
+    // Forty constants, each read twice, with the first pass reading them in reverse so the one
+    // defined first lives longest. Far more than the core has registers, so most of them spill.
+    // A narrow constant is re-emitted at the read instead of stored and loaded back, and three
+    // wide ones keep their slots, so both paths run in one kernel.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, i32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .block_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+
+    var nums: [40]i64 = undefined;
+    for (&nums, 0..) |*n, k| n.* = @as(i64, @intCast(k)) * 7 + 1;
+    nums[37] = 0x12345;
+    nums[38] = 0x7FFFF;
+    nums[39] = -70000;
+
+    var vals: [nums.len]ir.function.Value = undefined;
+    for (&vals, nums) |*v, n| v.* = try f.appendInst(entry, i32_t, .{ .iconst = n });
+
+    var sum = try f.appendInst(entry, i32_t, .{ .iconst = 0 });
+    var want: i64 = 0;
+    for (0..vals.len) |i| {
+        const k = vals.len - 1 - i;
+        sum = try f.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = vals[k] } });
+        want += nums[k];
+    }
+    for (vals, nums) |v, n| {
+        sum = try f.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = v } });
+        want += n;
+    }
+    try f.appendStore(entry, sum, base);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    // The kernel spills, and a narrow constant is no longer part of that traffic: what is left
+    // belongs to the three wide ones and to the running sum.
+    var spill_stores: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b0100011 and (w >> 15) & 0x1F == 2) spill_stores += 1;
+    }
+    // `addi rd, x0, imm` is a narrow constant. More of them than there are constants means they
+    // are re-emitted at the read rather than materialised once and spilled.
+    var narrow: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b0010011 and (w >> 12) & 7 == 0 and (w >> 15) & 0x1F == 0) narrow += 1;
+    }
+    try std.testing.expect(narrow > vals.len);
+    // What spilling is left belongs to the three wide constants and the running sum.
+    try std.testing.expect(spill_stores > 0);
+    try std.testing.expect(spill_stores < 10);
+
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [8 + scratch_words]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(i32, @intCast(want)))), data[0]);
+}
