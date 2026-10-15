@@ -41,7 +41,9 @@ const TypeInfo = union(enum) {
     void,
     function: struct { ret: u32 },
     pointer: struct { pointee: u32 }, // a pointer to another type id
-    array: struct { elem: u32 }, // a (runtime) array of another type id
+    /// An array of another type id. `len_id` names the constant holding its length, and is zero
+    /// for an `OpTypeRuntimeArray`, whose length only the host knows.
+    array: struct { elem: u32, len_id: u32 = 0 },
     vector: VecType, // a SIMD vector of a scalar component type
     matrix: MatType, // a matrix: `cols` column vectors of type `col_vec`
     image, // an OpTypeImage (the opaque image resource of a sampler)
@@ -130,7 +132,7 @@ pub const GradDesc = struct { slot: u32, axis: enum { x, y } };
 /// `vertex_index` / `instance_index` are vertex-shader BuiltIn INPUTs (gl_VertexIndex /
 /// gl_InstanceIndex): each becomes a synthesized i32 entry param the dispatch supplies
 /// per vertex, exactly like the compute `global_id`.
-const VarKind = enum { buffer, sampler, global_id, workgroup_id, num_workgroups, local_id, workgroup_size, vertex_index, instance_index, input, output, other };
+const VarKind = enum { buffer, sampler, shared, global_id, workgroup_id, num_workgroups, local_id, workgroup_size, vertex_index, instance_index, input, output, other };
 
 /// The shader stage an `OpEntryPoint` selects. Lowering produces the attribute interface
 /// for graphics stages, the kernel ABI for compute.
@@ -172,6 +174,9 @@ const Module = struct {
     // for anything that is not a tracked struct local.
     local_struct: []?[]Value,
     buffers: std.ArrayList(u32) = .empty, // storage-buffer var ids, declaration order
+    /// Workgroup-storage var ids in declaration order. Each becomes a shared `alloca` in the
+    /// entry block, which is what `gpu.abi.layoutSharedFrame` places.
+    shared_vars: std.ArrayList(u32) = .empty,
     has_global_id: bool = false,
     // A compute kernel that divides work by WARP rather than by thread reads WorkgroupId and
     // NumWorkgroups instead of GlobalInvocationID. Glacier is that shape: one warp is the
@@ -294,6 +299,9 @@ const Module = struct {
     grad_buf_param: ?Value = null, // the synthesized grad_buf pointer param (lazy)
     grad_entry: Block = undefined, // the entry block, for appending the grad_buf param
     ptr_t: Type,
+    /// A pointer into the workgroup window. The address space is in the TYPE, so it survives the
+    /// pointer arithmetic an access chain builds.
+    shared_ptr_t: Type,
     i32_t: Type,
     global_id_value: ?Value = null,
     workgroup_id_value: ?Value = null,
@@ -579,6 +587,7 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         .input_comp_of = undefined,
         .pos_chain_var = undefined,
         .ptr_t = try func.types.ptrGlobal(),
+        .shared_ptr_t = try func.types.intern(.{ .ptr = .shared }),
         .i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }),
         .array_stride = array_stride,
         .const_val = const_val,
@@ -596,6 +605,7 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         .opts = opts,
     };
     defer module.buffers.deinit(allocator);
+    defer module.shared_vars.deinit(allocator);
     defer module.members.deinit(allocator);
     defer module.attr_slot_of.deinit(allocator);
     defer module.grad_index_x.deinit(allocator);
@@ -656,7 +666,11 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
             },
             op.TypeArray, op.TypeRuntimeArray => {
                 const id = try idOperandAt(inst.operands, 0, bound);
-                types[id] = .{ .array = .{ .elem = try idOperandAt(inst.operands, 1, bound) } };
+                const elem = try idOperandAt(inst.operands, 1, bound);
+                // `OpTypeArray` carries its length as the id of a constant, which only a later
+                // pass can read. Keeping the id is what lets a workgroup object be SIZED.
+                const len_id: u32 = if (inst.opcode == op.TypeArray) try idOperandAt(inst.operands, 2, bound) else 0;
+                types[id] = .{ .array = .{ .elem = elem, .len_id = len_id } };
             },
             op.TypeVector => {
                 const id = try idOperandAt(inst.operands, 0, bound);
@@ -877,6 +891,12 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         } else if (builtin_decor[id] == op.BuiltIn.local_invocation_id) {
             var_kind[id] = .local_id;
             module.has_local_id = true;
+        } else if (class == op.StorageClass.workgroup) {
+            // Per-workgroup shared memory. It becomes a shared `alloca` in the entry block, so the
+            // placement rule in `gpu.abi.layoutSharedFrame` serves every target, and a backend
+            // decides where the window lives: LDS on NVIDIA, the warp'"'"'s own scratch on Glacier.
+            var_kind[id] = .shared;
+            try module.shared_vars.append(allocator, id);
         } else if (class == op.StorageClass.function) {
             // A module-scope variable in the function class becomes a stack slot further down,
             // where `mem2reg` then promotes it.
@@ -1152,6 +1172,14 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
             const block_binding: i64 = if (module.stage == .vertex) 0 else 1;
             try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "binding", .value = .{ .int = block_binding } } });
         }
+    }
+    // Workgroup objects. Each becomes a shared `alloca` in the entry block, AFTER the parameters
+    // so a backend reading the entry params by position is unaffected. Its address is the same in
+    // every invocation of the workgroup, which is what makes the object shared.
+    for (module.shared_vars.items) |id| {
+        const pointee = module.var_pointee(id) orelse return error.Unsupported;
+        const elem = sharedElemType(func, module, consts, pointee) orelse return error.Unsupported;
+        value_of[id] = try func.appendInst(entry, module.shared_ptr_t, .{ .alloca = .{ .elem = elem } });
     }
     for (insts) |inst| {
         if (inst.opcode == op.FunctionParameter) {
@@ -2566,8 +2594,14 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
         const c = try func.appendInst(block, module.i32_t, .{ .iconst = const_off });
         offset_val = if (offset_val) |o| try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .add, .lhs = o, .rhs = c } }) else c;
     }
+    // The result keeps the BASE pointer's address space. A chain into a workgroup object stays a
+    // workgroup pointer, because a backend reads the space off the TYPE to pick the instruction:
+    // NVIDIA chooses between an LDS and a global access on exactly this. Typing every chain as a
+    // global pointer would send a shared address to a global load, which reads the wrong memory
+    // and reports nothing.
+    const ptr_ty = func.valueType(base_ptr);
     const result_ptr = if (offset_val) |o|
-        try func.appendInst(block, module.ptr_t, .{ .arith = .{ .op = .add, .lhs = base_ptr, .rhs = o } })
+        try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base_ptr, .rhs = o } })
     else
         base_ptr;
     module.value_of[result] = result_ptr;
@@ -3228,6 +3262,32 @@ fn phiOperandsOf(insts: []const binary.Instruction, phi_id: u32) ?[]const u32 {
 fn blockIndex(blocks: []const BlockInfo, label: u32) usize {
     for (blocks, 0..) |b, i| if (b.label == label) return i;
     return std.math.maxInt(usize);
+}
+
+/// The Vulcan type of a workgroup object: a scalar, or an array of scalars with its length read
+/// from the constant `OpTypeArray` names.
+///
+/// Anything else is refused rather than guessed at. A struct would need its member offsets to
+/// agree with whatever the backend places, and an array of arrays needs a length per level; both
+/// are real shapes and both want their own decision, which a silent mis-size would hide.
+fn sharedElemType(
+    func: *Function,
+    module: *const Module,
+    consts: *const std.AutoHashMapUnmanaged(u32, Const),
+    type_id: u32,
+) ?Type {
+    if (type_id >= module.types.len) return null;
+    return switch (module.types[type_id] orelse return null) {
+        .scalar => |t| t,
+        .array => |arr| {
+            if (arr.len_id == 0) return null; // a runtime array has no compile-time size
+            const elem = scalarType(module.types, arr.elem) orelse return null;
+            const len = consts.get(arr.len_id) orelse return null;
+            if (len.bits == 0) return null;
+            return func.types.intern(.{ .array = .{ .len = len.bits, .elem = elem } }) catch null;
+        },
+        else => null,
+    };
 }
 
 fn scalarType(types: []const ?TypeInfo, type_id: u32) ?Type {
@@ -4199,11 +4259,11 @@ test "rejects an oversized vector length (would overflow the scalarized Vec)" {
     try testing.expectError(error.MalformedModule, lowerModule(allocator, b.words.items));
 }
 
-test "a Workgroup storage class variable is unsupported, not malformed" {
+test "a Workgroup storage class variable becomes a shared alloca" {
     const allocator = testing.allocator;
-    // void main() { tile[0] = 7; } with `tile` a Workgroup array of one uint. The module is
-    // correct SPIR-V: what is missing is anywhere to put per-workgroup memory. Reporting it as
-    // malformed sent the author to a shader that had nothing wrong with it.
+    // void main() { tile[0] = 7; } with `tile` a Workgroup array of seven uints. Per-workgroup
+    // shared memory: it becomes a shared `alloca`, which is what `gpu.abi.layoutSharedFrame`
+    // places, and the chain into it keeps the workgroup address space.
     // ids: void=1 uint=2 arr=3 pWgArr=4 pWgU=5 voidfn=6 c0=7 c7=8 tile=9 main=10 label=11 at=12
     var b = try binary.Builder.init(allocator, 13);
     defer b.deinit(allocator);
@@ -4223,5 +4283,11 @@ test "a Workgroup storage class variable is unsupported, not malformed" {
     try b.emit(allocator, op.Return, &.{});
     try b.emit(allocator, op.FunctionEnd, &.{});
 
-    try testing.expectError(error.Unsupported, lowerModule(allocator, b.words.items));
+    var func = try lowerModule(allocator, b.words.items);
+    defer func.deinit();
+    var buf: [2048]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{f}", .{func});
+    // The whole object, sized from the constant `OpTypeArray` names.
+    try testing.expect(std.mem.indexOf(u8, text, "alloca [7 x u32]") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "store ") != null);
 }

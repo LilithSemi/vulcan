@@ -1690,3 +1690,90 @@ test "a divergent loop inside a divergent loop runs each lane's own count of eac
     };
     for (want, 0..) |w, i| try std.testing.expectEqual(w, data[i]);
 }
+
+/// `void main() { tile[lane] = lane + 1; out[lane] = tile[0]; }` with `tile` a Workgroup array.
+///
+/// Every lane writes its own slot and then every lane reads SLOT ZERO, so each one ends with what
+/// lane zero wrote. That is only true if the lanes of the workgroup share the window.
+fn sharedModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    // ids: void=1 int=2 uint=3 v3uint=4 pInV3=5 pInU=6 arr=7 struct=8 pSbStruct=9 pSbInt=10
+    //      voidfn=11 c0=12 c1=13 c4=14 lid=15 out=16 tile=17 pWgArr=18 pWgU=19 main=20
+    //      entry=21 lptr=22 l=23 mine=24 plus=25 slot0=26 seen=27 outp=28 wgArr=29.
+    var b = try spirv.binary.Builder.init(allocator, 31);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 20, 0x6E69616D, 0, 15, 16, 17 });
+    try b.emit(allocator, op.Name, &.{ 16, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 15, op.Decoration.builtin, op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 1 });
+    try b.emit(allocator, op.TypeInt, &.{ 3, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 3, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 3 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 7, 2 });
+    try b.emit(allocator, op.TypeStruct, &.{ 8, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 11, 1 });
+    try b.emit(allocator, op.Constant, &.{ 3, 12, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 13, 1 });
+    try b.emit(allocator, op.Constant, &.{ 3, 14, 4 });
+    // The workgroup array: four words, one per lane of the narrow profile.
+    try b.emit(allocator, op.TypeArray, &.{ 29, 2, 14 });
+    try b.emit(allocator, op.TypePointer, &.{ 18, op.StorageClass.workgroup, 29 });
+    try b.emit(allocator, op.TypePointer, &.{ 19, op.StorageClass.workgroup, 2 });
+    try b.emit(allocator, op.Variable, &.{ 5, 15, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 9, 16, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Variable, &.{ 18, 17, op.StorageClass.workgroup });
+    try b.emit(allocator, op.Function, &.{ 1, 20, 0, 11 });
+    try b.emit(allocator, op.Label, &.{21});
+    try b.emit(allocator, op.AccessChain, &.{ 6, 22, 15, 12 }); // &lane.x
+    try b.emit(allocator, op.Load, &.{ 3, 23, 22 }); // l = lane.x
+    try b.emit(allocator, op.AccessChain, &.{ 19, 24, 17, 23 }); // &tile[l]
+    try b.emit(allocator, op.IAdd, &.{ 2, 25, 23, 13 }); // l + 1
+    try b.emit(allocator, op.Store, &.{ 24, 25 }); // tile[l] = l + 1
+    try b.emit(allocator, op.AccessChain, &.{ 19, 26, 17, 12 }); // &tile[0]
+    try b.emit(allocator, op.Load, &.{ 2, 27, 26 }); // seen = tile[0]
+    try b.emit(allocator, op.AccessChain, &.{ 10, 28, 16, 12, 23 }); // &out[l]
+    try b.emit(allocator, op.Store, &.{ 28, 27 }); // out[l] = seen
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "the lanes of a workgroup share one window in the hart's scratch" {
+    const allocator = std.testing.allocator;
+    var b = try sharedModule(allocator);
+    defer b.deinit(allocator);
+
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+
+    // The window is the top of the hart's own slice, so the words after the output stand in for
+    // the scratch region exactly as they do for a spill.
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [8 + scratch_words]u32 = @splat(0);
+    const scratch_base = data_base + 8 * 4;
+    var mem: warp.Memory = .{
+        .base = data_base,
+        .words = &data,
+        .scratch = .{ .base = scratch_base, .stride = glacier.encode.Profile.@"gc1.n".scratchBytes(), .harts = 1 },
+    };
+    var one: warp.Warp = .{
+        .hart_id = 0,
+        .hart_count = 1,
+        .lanes = glacier.encode.Profile.@"gc1.n".lanes(),
+        .stack_top = scratch_base + glacier.encode.Profile.@"gc1.n".scratchBytes(),
+    };
+    _ = try warp.run(words, &mem, &one, 10_000);
+
+    // Every lane read what lane zero wrote.
+    for (0..4) |i| try std.testing.expectEqual(@as(u32, 1), data[i]);
+    // And each slot of the window holds its own lane's value, at the top of the slice.
+    for (0..4) |i| try std.testing.expectEqual(@as(u32, @intCast(i + 1)), data[data.len - 4 + i]);
+}
