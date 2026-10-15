@@ -877,6 +877,15 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         } else if (builtin_decor[id] == op.BuiltIn.local_invocation_id) {
             var_kind[id] = .local_id;
             module.has_local_id = true;
+        } else if (class == op.StorageClass.function) {
+            // A module-scope variable in the function class becomes a stack slot further down,
+            // where `mem2reg` then promotes it.
+        } else {
+            // A storage class this frontend does not route anywhere. `Workgroup` is the one a real
+            // kernel reaches for, and no target here has a region to put it in yet. Saying so is
+            // the point: falling through left the variable with no value, and the first reader of
+            // it reported a MALFORMED MODULE, which sends the author to a shader that is correct.
+            return error.Unsupported;
         }
     }
 
@@ -4188,4 +4197,31 @@ test "rejects an oversized vector length (would overflow the scalarized Vec)" {
     // A vec9 cannot be held in Vec.comps ([4]Value): reject rather than overflow it later.
     try b.emit(allocator, op.TypeVector, &.{ 2, 1, 9 });
     try testing.expectError(error.MalformedModule, lowerModule(allocator, b.words.items));
+}
+
+test "a Workgroup storage class variable is unsupported, not malformed" {
+    const allocator = testing.allocator;
+    // void main() { tile[0] = 7; } with `tile` a Workgroup array of one uint. The module is
+    // correct SPIR-V: what is missing is anywhere to put per-workgroup memory. Reporting it as
+    // malformed sent the author to a shader that had nothing wrong with it.
+    // ids: void=1 uint=2 arr=3 pWgArr=4 pWgU=5 voidfn=6 c0=7 c7=8 tile=9 main=10 label=11 at=12
+    var b = try binary.Builder.init(allocator, 13);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 7, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 8, 7 });
+    try b.emit(allocator, op.TypeArray, &.{ 3, 2, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.workgroup, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.workgroup, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 6, 1 });
+    try b.emit(allocator, op.Variable, &.{ 4, 9, op.StorageClass.workgroup });
+    try b.emit(allocator, op.Function, &.{ 1, 10, 0, 6 });
+    try b.emit(allocator, op.Label, &.{11});
+    try b.emit(allocator, op.AccessChain, &.{ 5, 12, 9, 7 });
+    try b.emit(allocator, op.Store, &.{ 12, 8 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+
+    try testing.expectError(error.Unsupported, lowerModule(allocator, b.words.items));
 }

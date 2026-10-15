@@ -120,6 +120,9 @@ pub const StorageClass = struct {
     pub const input = 1;
     pub const uniform = 2;
     pub const output = 3;
+    /// Per-workgroup shared memory. No target here has a region for it, so a variable in this
+    /// class is refused rather than lowered. See the variable classification in `lower.zig`.
+    pub const workgroup = 4;
     pub const function = 7;
     pub const push_constant = 9;
     pub const storage_buffer = 12;
