@@ -75,6 +75,15 @@ pub fn ecall(rs1: Reg) u32 {
 /// 28 through 31 are reserved for the toolchain by agreement; 1 through 27 belong to the kernel.
 pub const fault_compiler_bug: i12 = 31;
 
+/// The fault code for a scratch region smaller than the kernel was built for, as a VALUE to
+/// materialise.
+///
+/// The spill slots and the workgroup window are placed against the PROFILE's region size, which
+/// this compiler mirrors from the SoC's configuration. A core whose slice is smaller would have
+/// the kernel writing into the hart underneath it, which corrupts a neighbour and reports nothing.
+/// So a kernel that uses the region checks it first and faults with this.
+pub const fault_scratch_too_small: i12 = 30;
+
 test "the fault retire is an ECALL naming the register its code is in" {
     // `x0` reads zero, so the architectural ECALL word is already the zero-code fault and needs no
     // special case. The second one names x31, which is the register this lowering keeps for itself.
@@ -126,6 +135,16 @@ pub const Csr = struct {
     /// downward stack never needs the region size, which lets the size change with the core
     /// generation without a kernel changing. Reads zero on a core built with no scratch.
     pub const mscratch: u12 = 0x340;
+
+    /// Custom read-only CSR: how many bytes the reading hart's own scratch slice holds. Unlike
+    /// `mscratch` it does not depend on which warp reads it, and it reads zero on a core built
+    /// with no scratch, so the floor of a slice is `mscratch - scratchsize`.
+    ///
+    /// Every profile reserves 2048 bytes today, which is why a kernel built for one runs on all of
+    /// them. That is a per-profile CONFIGURATION FIELD and not an architectural constant, so a
+    /// kernel that bakes the number mis-sizes itself the day a profile changes. Reading it is how
+    /// generated code checks that the region it was built for is the region it got.
+    pub const scratchsize: u12 = 0xFD2;
 };
 
 /// The cross-warp barrier: FENCE with fm = 0001, which has no operands, so it is one constant.

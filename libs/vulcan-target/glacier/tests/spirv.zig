@@ -1769,6 +1769,7 @@ test "the lanes of a workgroup share one window in the hart's scratch" {
         .hart_count = 1,
         .lanes = glacier.encode.Profile.@"gc1.n".lanes(),
         .stack_top = scratch_base + glacier.encode.Profile.@"gc1.n".scratchBytes(),
+        .scratch_bytes = glacier.encode.Profile.@"gc1.n".scratchBytes(),
     };
     _ = try warp.run(words, &mem, &one, 10_000);
 

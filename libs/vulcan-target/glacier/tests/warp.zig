@@ -41,6 +41,9 @@ pub const Error = error{
     /// A warp reached into another hart's scratch slice. On hardware this corrupts that hart and
     /// shows up as its wrong answer somewhere else, so it is caught here instead.
     CrossHart,
+    /// The kernel retired with a FAULT rather than finishing: an `ecall`, whose code the hardware
+    /// reads out of the named register. `Warp.fault_code` carries it.
+    Fault,
 };
 
 /// The CSRs a Glacier core answers. Anything else is an illegal word here, because a kernel that
@@ -49,6 +52,7 @@ const csr_mhartid: u12 = 0xF14;
 const csr_hart_count: u12 = 0xFC0;
 
 const csr_mscratch: u12 = 0x340;
+const csr_scratchsize: u12 = 0xFD2;
 
 /// The launch arguments, 0xFC1 through 0xFC8. The strobe latches them, so every warp of one
 /// dispatch reads the same values and a read is constant for the whole of it.
@@ -114,6 +118,11 @@ pub const Warp = struct {
     /// What `mscratch` reads: one past the top of this hart's own scratch slice. Zero on a core
     /// built with no scratch, same as the hardware.
     stack_top: u32 = 0,
+    /// The code of the fault the kernel retired with, when it did. Set by the model.
+    fault_code: u32 = 0,
+    /// What `scratchsize` reads: the bytes in this hart's own slice. A test sets it SMALLER than
+    /// the profile to stand in for a core whose region does not fit the kernel.
+    scratch_bytes: u32 = 0,
     /// What the launch argument CSRs read. A dispatch gives every warp the same values, so a test
     /// that runs several warps sets these once.
     launch_args: [8]u32 = @splat(0),
@@ -323,6 +332,13 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
         },
         // CSR read. CSRRS with x0 as the set mask is the only CSR access a Glacier core decodes.
         0x73 => {
+            // A FAULT retire: `ecall`, with the code in the register `rs1` names. The whole word is
+            // `0x73` plus that register, so it differs from `ebreak` only in the immediate, which
+            // is why `run` checks for `ebreak` by the whole word and not by the opcode.
+            if (funct3 == 0 and word >> 20 == 0) {
+                warp.fault_code = warp.x[rs1];
+                return error.Fault;
+            }
             if (funct3 != 2 or rs1 != 0) return error.Illegal;
             const csr: u12 = @intCast(word >> 20);
             if (csr >= csr_launch_arg_first and csr <= csr_launch_arg_last) {
@@ -333,6 +349,7 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
                 csr_mhartid => warp.hart_id,
                 csr_hart_count => warp.hart_count,
                 csr_mscratch => warp.stack_top,
+                csr_scratchsize => warp.scratch_bytes,
                 else => return error.Illegal,
             });
         },

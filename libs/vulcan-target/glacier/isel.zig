@@ -4533,7 +4533,10 @@ const Emitter = struct {
     /// reads it, because this target has no calls, and a core built with no scratch region reads
     /// zero from `mscratch` anyway.
     fn prologue(self: *Emitter, block: Block) Error!void {
-        if (self.spills) try self.put(glacier.csrr(sp, glacier.Csr.mscratch));
+        if (self.spills) {
+            try self.put(glacier.csrr(sp, glacier.Csr.mscratch));
+            try self.checkScratch();
+        }
         // Counted over EVERY non-builtin parameter, including one the allocator gave no home,
         // because the position is the host's argument number and not a register index.
         var args: usize = 0;
@@ -4758,6 +4761,34 @@ const Emitter = struct {
         const off: i64 = -(@as(i64, self.shared_bytes) + (@as(i64, n) + 1) * 4);
         if (off < std.math.minInt(i12)) return error.Unsupported;
         return @intCast(off);
+    }
+
+    /// Fault unless the hart's scratch slice is as large as this kernel was built for.
+    ///
+    /// The spill slots and the workgroup window are placed against the PROFILE's region size,
+    /// which this compiler mirrors from the SoC's configuration rather than reading from the
+    /// hardware. A core whose slice is smaller would have the kernel writing into the hart
+    /// underneath it, which corrupts a neighbour and reports nothing. Five words at launch buy a
+    /// loud failure instead, and only a kernel that uses the region pays them.
+    ///
+    /// `scratch` is the only register this needs: the subtraction turns the comparison into a
+    /// sign test, and the whole sequence runs before any value is live.
+    fn checkScratch(self: *Emitter) Error!void {
+        const need = self.scratchNeeded();
+        if (need == 0) return;
+        try self.put(glacier.csrr(scratch, glacier.Csr.scratchsize));
+        try self.put(rv.addi(scratch, scratch, -@as(i12, @intCast(need))));
+        // Two words ahead: past the code and past the fault itself.
+        try self.put(rv.bge(scratch, .x0, 12));
+        try self.put(rv.addi(scratch, .x0, glacier.fault_scratch_too_small));
+        try self.put(glacier.ecall(scratch));
+    }
+
+    /// The bytes of the hart's scratch region this kernel uses: the workgroup window plus both
+    /// classes of spill slot.
+    fn scratchNeeded(self: *const Emitter) u32 {
+        const vector_bytes = self.alloc.slot_count_per_class[1] * @as(u32, self.opts.profile.lanes()) * 4;
+        return self.shared_bytes + self.alloc.slot_count_per_class[0] * 4 + vector_bytes;
     }
 
     /// The window offset of the workgroup slot `value` names, or null when it names none, which

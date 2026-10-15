@@ -431,6 +431,9 @@ fn runOnceWithArgs(
         // this at its default ran ONE lane, which made a per-lane test pass on lane zero alone.
         .lanes = glacier.encode.Profile.@"gc1.n".lanes(),
         .stack_top = scratch_base + (hart_id + 1) * stride,
+        // The slice this model gives a hart is the profile's own region, so a kernel built for it
+        // passes the check its prologue makes.
+        .scratch_bytes = stride,
         .launch_args = launch_args,
     };
     _ = try warp.run(code, &mem, &one, budget);
@@ -5096,4 +5099,55 @@ test "a workgroup object larger than the scratch region is refused by the number
     try std.testing.expectError(error.Unsupported, out);
     try std.testing.expectEqual(@as(u32, 4096), why.wanted);
     try std.testing.expectEqual(@as(u32, 2048), why.limit);
+}
+
+test "a kernel faults when the hart's scratch slice is smaller than it was built for" {
+    // The slots and the window are placed against the PROFILE's region size, which this compiler
+    // mirrors from the SoC's configuration. A core whose slice is smaller would have the kernel
+    // writing into the hart underneath it, so the prologue reads `scratchsize` and faults instead.
+    const allocator = std.testing.allocator;
+    const count = 40; // above the 29 allocatable registers, so it spills
+
+    var f = try buildSumKernel(allocator, count);
+    defer f.deinit();
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [count + 1 + scratch_words]u32 = @splat(0);
+    for (0..count) |i| data[i] = @intCast(i * 7 + 1);
+
+    const stride = glacier.encode.Profile.@"gc1.n".scratchBytes();
+    const scratch_base = data_base + (count + 1) * 4;
+    var mem: warp.Memory = .{
+        .base = data_base,
+        .words = &data,
+        .scratch = .{ .base = scratch_base, .stride = stride, .harts = 1 },
+    };
+    var one: warp.Warp = .{
+        .hart_id = 0,
+        .hart_count = 1,
+        .lanes = glacier.encode.Profile.@"gc1.n".lanes(),
+        .stack_top = scratch_base + stride,
+        // A core that reserved sixteen bytes a hart, which is nothing like enough for forty slots.
+        .scratch_bytes = 16,
+    };
+    try std.testing.expectError(error.Fault, warp.run(words, &mem, &one, budget));
+    try std.testing.expectEqual(@as(u32, glacier.encode.fault_scratch_too_small), one.fault_code);
+
+    // The output is untouched: the kernel faulted before it stored anything.
+    try std.testing.expectEqual(@as(u32, 0), data[count]);
+
+    // And the same kernel on a core with the region it was built for runs to the right answer.
+    var want: u32 = 0;
+    for (0..count) |i| want +%= data[i];
+    one = .{
+        .hart_id = 0,
+        .hart_count = 1,
+        .lanes = glacier.encode.Profile.@"gc1.n".lanes(),
+        .stack_top = scratch_base + stride,
+        .scratch_bytes = stride,
+    };
+    _ = try warp.run(words, &mem, &one, budget);
+    try std.testing.expectEqual(want, data[count]);
 }
