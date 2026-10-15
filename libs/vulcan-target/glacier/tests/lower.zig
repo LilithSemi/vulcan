@@ -5349,3 +5349,105 @@ test "a core-wide barrier a pass dropped is refused by the count the kernel decl
     try std.testing.expectEqual(@as(u32, 1), why.wanted);
     try std.testing.expectEqual(@as(u32, 2), why.limit);
 }
+
+test "nothing a kernel emits addresses at or above the stack pointer" {
+    // `mscratch` is ONE PAST the top of the hart's slice, so every address a kernel forms from it
+    // must be strictly below it. The top warp of a core has nothing above its slice: an access at
+    // or above its stack pointer leaves the scratch region entirely, and for every other warp the
+    // same access lands in the NEXT WARP'S SLICE and corrupts it with nothing to report. A frame
+    // that grew upward, or an offset that reached the window size rather than stopping short of
+    // it, would do it, so the invariant is pinned here rather than left to reading.
+    const allocator = std.testing.allocator;
+
+    // Three kernels that use the region three ways: scalar slots, per-lane slots, and a workgroup
+    // window above the slots.
+    var scalar = try buildSumKernel(allocator, 40);
+    defer scalar.deinit();
+
+    var lanes = Function.init(allocator);
+    defer lanes.deinit();
+    {
+        const u32_t = try lanes.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try lanes.types.ptrGlobal();
+        const entry = try lanes.appendBlock();
+        const tid = try lanes.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&lanes, tid, .thread_id_x);
+        const base = try lanes.appendGlobalAddr(entry, ptr_t, "data");
+        const at = try lanes.appendInst(entry, ptr_t, .{ .arith = .{
+            .op = .add,
+            .lhs = base,
+            .rhs = try lanes.appendArithImm(entry, u32_t, .shl, tid, 2),
+        } });
+        var vals: [28]ir.function.Value = undefined;
+        for (&vals, 1..) |*v, k| v.* = try lanes.appendArithImm(entry, u32_t, .add, tid, @intCast(k));
+        var sum = vals[vals.len - 1];
+        for (1..vals.len) |i| {
+            sum = try lanes.appendInst(entry, u32_t, .{ .arith = .{
+                .op = .add,
+                .lhs = sum,
+                .rhs = vals[vals.len - 1 - i],
+            } });
+        }
+        try lanes.appendStore(entry, sum, at);
+        lanes.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    }
+
+    var window = Function.init(allocator);
+    defer window.deinit();
+    {
+        const u32_t = try window.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try window.types.ptrGlobal();
+        const shared_t = try window.types.intern(.{ .ptr = .shared });
+        const tile_t = try window.types.intern(.{ .array = .{ .len = 64, .elem = u32_t } });
+        const entry = try window.appendBlock();
+        const tid = try window.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&window, tid, .thread_id_x);
+        const base = try window.appendGlobalAddr(entry, ptr_t, "data");
+        const tile = try window.appendInst(entry, shared_t, .{ .alloca = .{ .elem = tile_t } });
+        // The LAST word of the window, which is the one closest to the stack pointer.
+        const last = try window.appendArithImm(entry, shared_t, .add, tile, 63 * 4);
+        try window.appendStore(entry, tid, last);
+        try window.appendStore(entry, try window.appendInst(entry, u32_t, .{ .load = .{ .ptr = last } }), base);
+        window.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    }
+
+    for ([_]*Function{ &scalar, &lanes, &window }) |f| {
+        const words = try compile(allocator, f);
+        defer allocator.free(words);
+        var touched: usize = 0;
+        var deepest: i32 = 0;
+        for (words) |w| {
+            const op = w & 0x7F;
+            const rs1 = (w >> 15) & 0x1F;
+            const rs2 = (w >> 20) & 0x1F;
+            const f3 = (w >> 12) & 0x7;
+            const sp_reg = @as(u32, @backingInt(glacier.encode.Reg.x2));
+            // An immediate form reads its base from rs1: a load, a store, or the `addi` that forms
+            // a per-lane slot or a workgroup address.
+            const imm: ?i32 = switch (op) {
+                0b0000011 => @as(i32, @bitCast(w)) >> 20,
+                0b0100011 => (@as(i32, @bitCast(w & 0xFE00_0000)) >> 20) | @as(i32, @intCast((w >> 7) & 0x1F)),
+                0b0010011 => if (f3 == 0) @as(i32, @bitCast(w)) >> 20 else null,
+                else => null,
+            };
+            if (imm) |off| {
+                if (rs1 != sp_reg) continue;
+                touched += 1;
+                try std.testing.expect(off < 0);
+                if (off < deepest) deepest = off;
+                continue;
+            }
+            // Anything else that reads the stack pointer would form an address this cannot bound,
+            // so the kernel must not do it at all: a register-plus-register address, an atomic, a
+            // per-lane access based on it directly.
+            const reads_sp = switch (op) {
+                0b0110011, 0b0101111, 0b0100111, 0b0000111 => rs1 == sp_reg or rs2 == sp_reg,
+                else => false,
+            };
+            try std.testing.expect(!reads_sp);
+        }
+        // The kernel really does use the region, or the test proves nothing.
+        try std.testing.expect(touched > 0);
+        try std.testing.expect(deepest >= -@as(i32, @intCast(glacier.encode.Profile.@"gc1.n".scratchBytes())));
+    }
+}
