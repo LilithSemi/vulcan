@@ -68,6 +68,11 @@ pub const Refusal = struct {
     opcode: []const u8 = "",
     block: u32 = unknown,
     index: u32 = unknown,
+    /// For a refusal about a SIZE, what the kernel asked for and what it may have, in bytes.
+    /// Both `unknown` otherwise. A size refusal that does not name the size leaves the reader
+    /// guessing how much to cut.
+    wanted: u32 = unknown,
+    limit: u32 = unknown,
 
     pub const unknown: u32 = std.math.maxInt(u32);
 
@@ -85,6 +90,16 @@ pub const Refusal = struct {
     /// Record a refusal about the function rather than about one instruction.
     fn whole(self: ?*Refusal, reason: []const u8) error{Unsupported} {
         if (self) |r| r.* = .{ .reason = reason };
+        return error.Unsupported;
+    }
+
+    /// Record a refusal about a size, naming what was asked for and what fits.
+    fn tooBig(self: ?*Refusal, reason: []const u8, wanted: u64, limit: u32) error{Unsupported} {
+        if (self) |r| r.* = .{
+            .reason = reason,
+            .wanted = std.math.cast(u32, wanted) orelse unknown,
+            .limit = limit,
+        };
         return error.Unsupported;
     }
 };
@@ -323,6 +338,38 @@ fn compileKernelInternal(
 
     try checkSupported(&work, opts, divergent, &macs, &any_lane, why);
 
+    // Workgroup shared memory lives in the hart's own scratch region, directly below `mscratch`,
+    // with the spill slots under it. A workgroup is ONE WARP on this core and a hart owns its
+    // slice of the region, so each workgroup gets its own window with nothing to arrange: the
+    // per-core `shmaddr` region would hand every warp of the core the SAME base, which is right
+    // for a wider scope and wrong for a workgroup.
+    var frame = gpu.abi.layoutSharedFrame(allocator, &work, .{
+        .param_base = 0,
+        .pointer_bytes = 4,
+        .param_align = 4,
+        // Placed against no limit, then checked against the real one below, so the refusal can
+        // name what the kernel ASKED FOR. The placement rule is the shared one either way.
+        .max_shared_bytes = std.math.maxInt(u32),
+        .linear_thread_id = true,
+    }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SharedMemoryTooLarge => return Refusal.tooBig(why, "more workgroup memory than a 32-bit offset can name", 0, opts.profile.scratchBytes()),
+        error.UnsupportedSharedType => return Refusal.whole(why, "a workgroup object this lowering cannot place"),
+        error.SharedFrameMismatch => return Refusal.whole(why, "a declared workgroup size that disagrees with the slots"),
+        error.SharedFrameAliasesParameter => return Refusal.whole(why, "both a workgroup slot and a workgroup pointer parameter"),
+        error.UnsupportedParamType => return Refusal.whole(why, "a parameter type this lowering cannot place"),
+    };
+    defer frame.deinit(allocator);
+    const shared_bytes = frame.bytes;
+    if (shared_bytes > opts.profile.scratchBytes()) {
+        return Refusal.tooBig(
+            why,
+            "more workgroup memory than the hart's scratch region holds",
+            shared_bytes,
+            opts.profile.scratchBytes(),
+        );
+    }
+
     const classes = [_]wimmer.RegClass{
         .{
             .name = "gpr",
@@ -355,8 +402,13 @@ fn compileKernelInternal(
     // A spill goes into the hart's own scratch region, so the kernel must fit there. The region
     // belongs to one hart, which is why no other hart's slots are counted against it.
     const slots = walloc.slot_count_per_class[0];
-    if (slots > opts.profile.scratchBytes() / 4) {
-        return Refusal.whole(why, "more spill slots than the hart's scratch region holds");
+    if (shared_bytes + slots * 4 > opts.profile.scratchBytes()) {
+        return Refusal.tooBig(
+            why,
+            "more spill slots and workgroup memory than the hart's scratch region holds",
+            shared_bytes + @as(u64, slots) * 4,
+            opts.profile.scratchBytes(),
+        );
     }
     // The deepest slot is reached by one signed 12-bit displacement from `sp`, and the stack grows
     // down, so 2048 bytes is all one displacement can name.
@@ -364,21 +416,26 @@ fn compileKernelInternal(
     // At a 2048-byte region the two ceilings now MEET: 512 slots either way, so the check above
     // never fires on its own. Raising the region again buys nothing until a deep slot is addressed
     // with more than one instruction, which is the thing to change first rather than the number.
-    if (slots * 4 > 2048) {
-        return Refusal.whole(why, "a spill slot past the one displacement that reaches it");
+    if (shared_bytes + slots * 4 > 2048) {
+        return Refusal.tooBig(why, "a spill slot past the one displacement that reaches it", shared_bytes + @as(u64, slots) * 4, 2048);
     }
 
     // A spilled per-lane value goes under the scalar slots, one whole vector register each, and
     // both regions have to fit the hart's scratch. A mask spends a register's worth of space on
     // one bit per lane, which is the price of not having a narrower store.
     const vector_bytes = walloc.slot_count_per_class[1] * @as(u32, opts.profile.lanes()) * 4;
-    if (slots * 4 + vector_bytes > opts.profile.scratchBytes()) {
-        return Refusal.whole(why, "more spill space than the hart's scratch region holds");
+    if (shared_bytes + slots * 4 + vector_bytes > opts.profile.scratchBytes()) {
+        return Refusal.tooBig(
+            why,
+            "more spill space and workgroup memory than the hart's scratch region holds",
+            @as(u64, shared_bytes) + slots * 4 + vector_bytes,
+            opts.profile.scratchBytes(),
+        );
     }
     // The deepest per-lane slot is addressed by one signed 12-bit displacement from `sp`, the same
     // ceiling the scalar slots have.
-    if (slots * 4 + vector_bytes > 2048) {
-        return Refusal.whole(why, "a spill slot past the one displacement that reaches it");
+    if (shared_bytes + slots * 4 + vector_bytes > 2048) {
+        return Refusal.tooBig(why, "a spill slot past the one displacement that reaches it", @as(u64, shared_bytes) + slots * 4 + vector_bytes, 2048);
     }
 
     // Recomputed here rather than reused from above: the passes between have emptied blocks and
@@ -400,7 +457,9 @@ fn compileKernelInternal(
         .strides = &strides,
         .any_lane = &any_lane,
         .why = why,
-        .spills = slots != 0 or walloc.slot_count_per_class[1] != 0,
+        .spills = slots != 0 or walloc.slot_count_per_class[1] != 0 or shared_bytes != 0,
+        .shared = frame.slots,
+        .shared_bytes = shared_bytes,
         .remat = remat,
         .elide = try elidableSlots(allocator, &walloc, remat, slots),
         .vector_slot_base = slots * 4,
@@ -3917,6 +3976,23 @@ fn checkInst(
         .barrier => |b| switch (b.scope) {
             .workgroup, .subgroup => {},
         },
+        // A workgroup object: a window in the hart's scratch region, which a warp owns. A warp has
+        // no stack, so every OTHER address space is refused here, and `private` is the one a
+        // frontend reaches for by mistake.
+        .alloca => {
+            const res = func.instResult(inst) orelse
+                return Refusal.at(why, func, block, i, inst, "an allocation whose address nothing reads");
+            switch (func.types.type_kind(func.valueType(res))) {
+                .ptr => |space| switch (space) {
+                    .shared => {},
+                    .global, .constant, .private => return Refusal.at(why, func, block, i, inst, "an allocation outside workgroup memory, which a warp has no stack for"),
+                },
+                else => return Refusal.at(why, func, block, i, inst, "an allocation that is not a pointer"),
+            }
+            if (divergent[@backingInt(res)]) {
+                return Refusal.at(why, func, block, i, inst, "a per-lane workgroup address, which every lane of a workgroup shares");
+            }
+        },
         // A conditional transfers control, so nothing may follow it in its block, and its
         // block must have no terminator: a terminator there is an edge the allocator would
         // resolve and this emits nothing for.
@@ -4276,6 +4352,10 @@ const Emitter = struct {
     /// never allocatable, so the predicate installs are the only writes to it, and a value never
     /// changes after it is computed: a second install of the same mask in one block is dead.
     v0_mask: ?Value = null,
+    /// The placed workgroup slots, each an `alloca` and its offset in the window.
+    shared: []const gpu.abi.SharedSlot,
+    /// The bytes the workgroup window takes directly below `sp`. The spill slots start under it.
+    shared_bytes: u32,
     /// Where the per-lane spill slots start, in bytes below `sp`. The scalar slots take the top of
     /// the region one word each, so the vector slots sit under them, one whole register each.
     vector_slot_base: u32,
@@ -4675,9 +4755,18 @@ const Emitter = struct {
     /// register, and that is a silent wrong answer rather than a refusal.
     fn slotOffset(self: *const Emitter, n: u32) Error!i12 {
         if (!self.spills) return error.Unsupported;
-        const off: i64 = -(@as(i64, n) + 1) * 4;
+        const off: i64 = -(@as(i64, self.shared_bytes) + (@as(i64, n) + 1) * 4);
         if (off < std.math.minInt(i12)) return error.Unsupported;
         return @intCast(off);
+    }
+
+    /// The window offset of the workgroup slot `value` names, or null when it names none, which
+    /// is this lowering disagreeing with the placement it asked for.
+    fn sharedOffset(self: *const Emitter, value: Value) ?u32 {
+        for (self.shared) |slot| {
+            if (slot.value == value) return slot.offset;
+        }
+        return null;
     }
 
     /// The offset of PER-LANE spill slot `n` from `sp`, below the scalar slots. A whole vector
@@ -4686,7 +4775,7 @@ const Emitter = struct {
     fn vectorSlotOffset(self: *const Emitter, n: u32) Error!i12 {
         if (!self.spills) return error.Unsupported;
         const width: i64 = @as(i64, self.opts.profile.lanes()) * 4;
-        const off: i64 = -(@as(i64, self.vector_slot_base) + (@as(i64, n) + 1) * width);
+        const off: i64 = -(@as(i64, self.shared_bytes) + @as(i64, self.vector_slot_base) + (@as(i64, n) + 1) * width);
         if (off < std.math.minInt(i12)) return error.Unsupported;
         return @intCast(off);
     }
@@ -5094,6 +5183,17 @@ const Emitter = struct {
             // together are release and acquire. THAT EXPIRES WITH AXI4, where a write is accepted
             // on one channel long before its response, so completion has to mean the response.
             .barrier => {},
+            // A workgroup object is an ADDRESS in the hart's scratch region. The window sits
+            // directly below `mscratch`, so a slot at window offset `off` is `sp - bytes + off`,
+            // and that is one instruction with no load behind it. The lanes of the warp all
+            // compute the same address, which is what makes the object shared between them.
+            .alloca => {
+                const res = self.func.instResult(inst).?;
+                const off = self.sharedOffset(res) orelse return error.Unsupported;
+                const from_sp: i64 = @as(i64, off) - @as(i64, self.shared_bytes);
+                if (from_sp < std.math.minInt(i12)) return error.Unsupported;
+                try self.put(rv.addi(dst, sp, @intCast(from_sp)));
+            },
             else => return error.Unsupported,
         }
         if (home) |h| switch (h) {

@@ -5012,3 +5012,88 @@ test "constants arriving on one edge of a wide join keep the parameters' slots" 
     try runOnce(words, &data, 0, 1);
     try std.testing.expectEqual(want, data[32]);
 }
+
+test "lanes of a workgroup share one window in the hart's scratch" {
+    // Every lane writes its own slot of a four-word workgroup array, then every lane reads SLOT
+    // ZERO, which is the same address in every lane. So each lane ends with what lane zero wrote,
+    // which is only true if the window is shared between them.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+    const shared_t = try f.types.intern(.{ .ptr = .shared });
+    const tile_t = try f.types.intern(.{ .array = .{ .len = 4, .elem = u32_t } });
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const tile = try f.appendInst(entry, shared_t, .{ .alloca = .{ .elem = tile_t } });
+
+    // tile[lane] = lane * 10 + 1
+    const mine = try f.appendInst(entry, shared_t, .{ .arith = .{
+        .op = .add,
+        .lhs = tile,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+    const ten = try f.appendInst(entry, u32_t, .{ .iconst = 10 });
+    const scaled = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = tid, .rhs = ten } });
+    try f.appendStore(entry, try f.appendArithImm(entry, u32_t, .add, scaled, 1), mine);
+
+    // data[lane] = tile[0], the same address in every lane.
+    const seen = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = tile } });
+    const out = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+    try f.appendStore(entry, seen, out);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [8 + scratch_words]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    // Every lane read what lane zero wrote.
+    for (0..4) |i| try std.testing.expectEqual(@as(u32, 1), data[i]);
+    // The window is the TOP of the hart's slice, so the four slots are the last four words of it,
+    // and each holds its own lane's value.
+    const top = data.len;
+    for (0..4) |i| {
+        const want: u32 = @intCast(i * 10 + 1);
+        try std.testing.expectEqual(want, data[top - 4 + i]);
+    }
+}
+
+test "a workgroup object larger than the scratch region is refused by the number" {
+    // Four kilobytes of workgroup memory on a hart that owns two. The refusal names both numbers,
+    // because "too large" without them leaves the author guessing how much to cut.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+    const shared_t = try f.types.intern(.{ .ptr = .shared });
+    const tile_t = try f.types.intern(.{ .array = .{ .len = 1024, .elem = u32_t } });
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const tile = try f.appendInst(entry, shared_t, .{ .alloca = .{ .elem = tile_t } });
+    try f.appendStore(entry, tid, tile);
+    try f.appendStore(entry, try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = tile } }), base);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{};
+    const out = glacier.isel.compileKernelExplained(allocator, &f, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "data", .address = data_base }},
+    }, &why);
+    try std.testing.expectError(error.Unsupported, out);
+    try std.testing.expectEqual(@as(u32, 4096), why.wanted);
+    try std.testing.expectEqual(@as(u32, 2048), why.limit);
+}
