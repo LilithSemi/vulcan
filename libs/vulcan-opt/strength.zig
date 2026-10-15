@@ -42,7 +42,29 @@ fn log2Pow2(c: i64, bits: u16) ?u6 {
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
+    var changed = try shiftPhase(allocator, func);
 
+    // Second phase: replace division or remainder by a non-power-of-two constant with a
+    // magic-number multiply (Granlund-Montgomery). A narrower type WIDENS TO 64 BITS to do it,
+    // because the `mulh` this emits is defined only on 64-bit operands, so a target with 32-bit
+    // registers cannot take this phase at all and calls `shiftPhase` by itself.
+    var consts2 = try allocator.alloc(?i64, func.valueCount());
+    defer allocator.free(consts2);
+    @memset(consts2, null);
+    for (0..func.instCount()) |i| {
+        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
+        if (func.opcode(inst) == .iconst) {
+            if (func.instResult(inst)) |r| consts2[@backingInt(r)] = func.opcode(inst).iconst;
+        }
+    }
+    if (try magicPhase(allocator, func, consts2)) changed = true;
+    return changed;
+}
+
+/// Replace a multiply, divide or remainder by a constant POWER OF TWO with a shift or a mask, and
+/// report whether anything changed. Rewrites opcodes in place, so it adds no value and no type: a
+/// 32-bit target can run this where it cannot run the magic-number phase in `run`.
+pub fn shiftPhase(allocator: std.mem.Allocator, func: *Function) pass.Error!bool {
     // Constant values (to spot a power-of-two operand of an `arith`).
     var consts = try allocator.alloc(?i64, func.valueCount());
     defer allocator.free(consts);
@@ -100,12 +122,6 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         }
     }
 
-    // Second phase: replace 64-bit division/remainder by a non-power-of-two constant with a
-    // magic-number multiply (Granlund-Montgomery). This needs a multi-instruction sequence, so it
-    // rebuilds the instruction list of any block that holds an eligible div/rem. Width is limited to
-    // 64 because the `mulh` high-multiply this emits is defined only on 64-bit operands; 32-bit and
-    // below want a widening multiply, which waits on int->int widening `convert` in the backends.
-    if (try magicPhase(allocator, func, consts)) changed = true;
     return changed;
 }
 
