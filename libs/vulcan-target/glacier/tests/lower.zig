@@ -4948,3 +4948,67 @@ test "constants that spill are re-emitted and still add up" {
     try runOnce(words, &data, 0, 1);
     try std.testing.expectEqual(@as(u32, @bitCast(@as(i32, @intCast(want)))), data[0]);
 }
+
+test "constants arriving on one edge of a wide join keep the parameters' slots" {
+    // Thirty-two parameters on one join, which is more than the core has registers, so some of
+    // them have to live in spill slots. One predecessor passes CONSTANTS and the other passes
+    // loaded values. A slot belongs to the PARAMETER and not to the constant that arrives in it,
+    // so the write has to happen: dropping it leaves the join reading a slot nothing wrote.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const from_const = try f.appendBlock();
+    const from_load = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const warp_id = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, warp_id, .block_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const out = try f.appendArithImm(entry, ptr_t, .add, base, 128);
+
+    const count = 32;
+    var loads: [count]ir.function.Value = undefined;
+    for (&loads, 0..) |*v, k| {
+        const at = try f.appendArithImm(entry, ptr_t, .add, base, @intCast(k * 4));
+        v.* = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at } });
+    }
+    const pick_at = try f.appendArithImm(entry, ptr_t, .add, base, 140);
+    const pick = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = pick_at } });
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const take = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = pick, .rhs = one } });
+    try f.appendIf(entry, take, .{ .target = from_const }, .{ .target = from_load });
+
+    var consts: [count]ir.function.Value = undefined;
+    var want: u32 = 0;
+    for (&consts, 0..) |*c, k| {
+        const n: i64 = @intCast(100 + k);
+        c.* = try f.appendInst(from_const, u32_t, .{ .iconst = n });
+        want += @intCast(n);
+    }
+    try f.setJump(from_const, join, &consts);
+    try f.setJump(from_load, join, &loads);
+
+    var params: [count]ir.function.Value = undefined;
+    for (&params) |*p| p.* = try f.appendBlockParam(join, u32_t);
+    var sum = try f.appendInst(join, u32_t, .{ .iconst = 0 });
+    for (params) |p| {
+        sum = try f.appendInst(join, u32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = p } });
+    }
+    try f.appendStore(join, sum, out);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [40 + scratch_words]u32 = @splat(0);
+    for (0..count) |k| data[k] = @intCast(1000 + k);
+    data[35] = 1; // take the constant side
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(want, data[32]);
+}

@@ -387,6 +387,7 @@ fn compileKernelInternal(
     const live = try ir.reachable.neutralizeUnreachable(allocator, &work);
     defer allocator.free(live);
 
+    const remat = try rematTable(allocator, &work);
     var e: Emitter = .{
         .allocator = allocator,
         .func = &work,
@@ -400,7 +401,8 @@ fn compileKernelInternal(
         .any_lane = &any_lane,
         .why = why,
         .spills = slots != 0 or walloc.slot_count_per_class[1] != 0,
-        .remat = try rematTable(allocator, &work),
+        .remat = remat,
+        .elide = try elidableSlots(allocator, &walloc, remat, slots),
         .vector_slot_base = slots * 4,
     };
     defer e.deinit();
@@ -4176,6 +4178,47 @@ fn vectorBinOpVx(func: *const Function, op: ir.function.BinOp, ty: Type) ?*const
 /// out of range inside one legal kernel while a jump cannot.
 const Fixup = struct { at: usize, target: Block };
 
+/// Which scalar spill slots hold nothing, because every value that reaches one rematerialises.
+///
+/// A slot belongs to an INTERVAL and not to a value, and a move names the value whose bits it
+/// carries, which are not always the same thing: the entry edge of a loop writes a CONSTANT into
+/// the slot of the loop's parameter, and the body then reads that slot under the PARAMETER's name.
+/// Eliding by value drops that write and leaves the read on a slot nothing wrote. So the question
+/// has to be asked of the slot: a slot every one of whose values rematerialises is never written
+/// and never read, and any other slot is left alone.
+fn elidableSlots(
+    allocator: std.mem.Allocator,
+    alloc: *const wimmer.Allocation,
+    remat: []const ?i32,
+    slots: u32,
+) Error![]const bool {
+    const plain = try allocator.alloc(bool, slots);
+    defer allocator.free(plain);
+    @memset(plain, false);
+    const touch = struct {
+        fn at(p: []bool, r: []const ?i32, class: u16, loc: wimmer.Location, v: Value) void {
+            if (class != scalar_class) return;
+            switch (loc) {
+                .slot => |n| if (n < p.len and r[@backingInt(v)] == null) {
+                    p[n] = true;
+                },
+                .reg => {},
+            }
+        }
+    };
+    for (alloc.actions) |a| {
+        touch.at(plain, remat, a.class, a.src, a.value);
+        touch.at(plain, remat, a.class, a.dst, a.value);
+    }
+    for (alloc.edge_moves) |set| for (set.moves) |m| {
+        touch.at(plain, remat, m.class, m.src, m.value);
+        touch.at(plain, remat, m.class, m.dst, m.value);
+    };
+    const out = try allocator.alloc(bool, slots);
+    for (out, plain) |*o, p| o.* = !p;
+    return out;
+}
+
 /// The one-word constant each value rematerialises to, or null where it has to go through a spill
 /// slot.
 ///
@@ -4227,6 +4270,8 @@ const Emitter = struct {
     spills: bool,
     /// What each value rematerialises to. See `rematTable`.
     remat: []const ?i32,
+    /// Which spill slots hold nothing. See `elidableSlots`.
+    elide: []const bool,
     /// The value whose mask bits are in `v0`, or null when the contents are unknown. `v0` is
     /// never allocatable, so the predicate installs are the only writes to it, and a value never
     /// changes after it is computed: a second install of the same mask in one block is dead.
@@ -4240,6 +4285,7 @@ const Emitter = struct {
 
     fn deinit(self: *Emitter) void {
         self.allocator.free(self.remat);
+        self.allocator.free(self.elide);
         self.words.deinit(self.allocator);
         self.block_start.deinit(self.allocator);
         self.fixups.deinit(self.allocator);
@@ -4292,6 +4338,15 @@ const Emitter = struct {
             // and that is what the allocator emits for a value that spills after it is defined.
             .slot => error.Unsupported,
         };
+    }
+
+    /// Re-emit `value` into `dst`, in place of a load from a slot that holds nothing.
+    ///
+    /// A value with no constant here means a slot was elided that something plain reads, which is
+    /// this lowering disagreeing with itself. It REFUSES rather than loading a word nobody wrote.
+    fn rematerialise(self: *Emitter, dst: Reg, value: Value) Error!void {
+        const c = self.remat[@backingInt(value)] orelse return error.Unsupported;
+        try self.constant(dst, c);
     }
 
     /// Put the mask bits of `cond` in `v0`, which is the only register that predicates. A masked
@@ -4548,22 +4603,28 @@ const Emitter = struct {
             // A constant this can re-emit never reaches its slot, so a move that would write the
             // slot is dropped and a move that would read it re-emits instead. Every scalar read
             // of a slot goes through here, which is what makes dropping the write sound.
-            const rematerialises = self.remat[@backingInt(m.value)];
+            // A write to an elided slot goes nowhere and a read of one re-emits the constant
+            // instead. Every value that reaches such a slot rematerialises, which is what makes
+            // dropping the write sound. See `elidableSlots`.
             switch (m.src) {
                 .reg => |s| switch (m.dst) {
                     .reg => |d| try self.move(regOf(d), regOf(s)),
-                    .slot => |d| if (rematerialises == null) {
+                    .slot => |d| if (!self.elide[d]) {
                         try self.put(rv.sw(regOf(s), sp, try self.slotOffset(d)));
                     },
                 },
                 .slot => |s| switch (m.dst) {
-                    .reg => |d| if (rematerialises) |c| {
-                        try self.constant(regOf(d), c);
+                    .reg => |d| if (self.elide[s]) {
+                        try self.rematerialise(regOf(d), m.value);
                     } else {
                         try self.put(rv.lw(regOf(d), sp, try self.slotOffset(s)));
                     },
-                    .slot => |d| if (rematerialises == null) {
-                        try self.put(rv.lw(scratch, sp, try self.slotOffset(s)));
+                    .slot => |d| if (!self.elide[d]) {
+                        if (self.elide[s]) {
+                            try self.rematerialise(scratch, m.value);
+                        } else {
+                            try self.put(rv.lw(scratch, sp, try self.slotOffset(s)));
+                        }
                         try self.put(rv.sw(scratch, sp, try self.slotOffset(d)));
                     },
                 },
@@ -4955,9 +5016,7 @@ const Emitter = struct {
         // A constant whose home is a slot is neither computed nor stored, because every read of
         // that slot re-emits it instead. See `rematTable`.
         if (home) |h| switch (h) {
-            .slot => if (self.func.instResult(inst)) |r| {
-                if (self.remat[@backingInt(r)] != null) return;
-            },
+            .slot => |n| if (self.elide[n]) return,
             .reg => {},
         };
         const dst: Reg = switch (home orelse wimmer.Location{ .reg = @backingInt(scratch) }) {
