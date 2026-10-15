@@ -215,6 +215,13 @@ fn compileKernelInternal(
         var analyses: opt.pass.Analyses = .{ .allocator = allocator, .func = &work };
         defer analyses.deinit();
         _ = try opt.mem2reg.run(allocator, &work, &analyses);
+        // A scale by a power of two is a SHIFT. An address computation reaches the IR as a
+        // multiply by the element size, and this core has a multiplier, so nothing downstream was
+        // obliged to notice: it emitted `mul` by four for every indexed access. A shift is cheaper
+        // on any core and it keeps an address computation out of the multiplier entirely.
+        // The SHIFT phase only: the magic-number phase widens to 64 bits for a division by a
+        // non-power-of-two, and a warp register holds 32.
+        _ = try opt.strength.shiftPhase(allocator, &work);
         // A SPIR-V module constant lands at the top of the entry block, so a kernel that writes a
         // table of them holds every one at once and spills the lot. A warp has little scratch, so
         // that is a refusal rather than slow code.

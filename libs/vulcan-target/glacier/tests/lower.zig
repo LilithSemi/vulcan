@@ -5451,3 +5451,43 @@ test "nothing a kernel emits addresses at or above the stack pointer" {
         try std.testing.expect(deepest >= -@as(i32, @intCast(glacier.encode.Profile.@"gc1.n".scratchBytes())));
     }
 }
+
+test "a scale by a power of two is a shift and not a multiply" {
+    // An indexed access reaches the IR as a multiply by the element size, and this core HAS a
+    // multiplier, so nothing downstream was obliged to notice: every address computation went
+    // through it. A shift is cheaper on any core, and it keeps address arithmetic out of a unit
+    // whose answer is wider than the register that holds it.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const warp_id = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, warp_id, .block_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    // `base[warp * 4]`, written the way a frontend writes it: a multiply by the element size with
+    // the size as a separate constant, not an immediate.
+    const four = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const scaled = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = warp_id, .rhs = four } });
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = scaled } });
+    try f.appendStore(entry, warp_id, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var multiplies: usize = 0;
+    var shifts: usize = 0;
+    for (words) |w| {
+        // RV32M MUL is funct7 1 with funct3 0 on the register-register opcode.
+        if (w & 0x7F == 0b0110011 and w >> 25 == 1 and (w >> 12) & 7 == 0) multiplies += 1;
+        if (w & 0x7F == 0b0010011 and (w >> 12) & 7 == 1) shifts += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), multiplies);
+    try std.testing.expectEqual(@as(usize, 1), shifts);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 2, 4);
+    try std.testing.expectEqual(@as(u32, 2), data[2]);
+}
