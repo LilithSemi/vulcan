@@ -196,10 +196,14 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
                 cv.global_scale = sub(subst, cv.global_scale);
             },
             .unary => |*u| u.value = sub(subst, u.value),
-            .load => |*l| l.ptr = sub(subst, l.ptr),
+            .load => |*l| {
+                l.ptr = sub(subst, l.ptr);
+                if (l.mask) |m| l.mask = sub(subst, m);
+            },
             .store => |*st| {
                 st.value = sub(subst, st.value);
                 st.ptr = sub(subst, st.ptr);
+                if (st.mask) |m| st.mask = sub(subst, m);
             },
             .prefetch => |*pf| pf.ptr = sub(subst, pf.ptr),
             .va_start => |*vs| vs.list = sub(subst, vs.list),

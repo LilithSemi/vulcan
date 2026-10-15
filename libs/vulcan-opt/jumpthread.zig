@@ -433,8 +433,14 @@ fn blockUsesValueFromBlock(func: *const Function, block: Block, def_bi: u32, def
             .decode_low_float, .encode_low_float => |cv| if (usesB(def_block, cv.value, def_bi)) return true,
             .dequantize_nvfp4, .quantize_nvfp4 => |cv| if (usesB(def_block, cv.value, def_bi) or usesB(def_block, cv.block_scale, def_bi) or usesB(def_block, cv.global_scale, def_bi)) return true,
             .unary => |u| if (usesB(def_block, u.value, def_bi)) return true,
-            .load => |ld| if (usesB(def_block, ld.ptr, def_bi)) return true,
-            .store => |st| if (usesB(def_block, st.value, def_bi) or usesB(def_block, st.ptr, def_bi)) return true,
+            .load => |ld| {
+                if (usesB(def_block, ld.ptr, def_bi)) return true;
+                if (ld.mask) |m| if (usesB(def_block, m, def_bi)) return true;
+            },
+            .store => |st| {
+                if (usesB(def_block, st.value, def_bi) or usesB(def_block, st.ptr, def_bi)) return true;
+                if (st.mask) |m| if (usesB(def_block, m, def_bi)) return true;
+            },
             .prefetch => |pf| if (usesB(def_block, pf.ptr, def_bi)) return true,
             .va_start => |vs| if (usesB(def_block, vs.list, def_bi)) return true,
             .va_arg => |va| if (usesB(def_block, va.list, def_bi)) return true,

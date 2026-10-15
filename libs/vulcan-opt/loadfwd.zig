@@ -47,7 +47,11 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     // not hold the value a plain store put there, and a later plain load must not
                     // be answered from it either. Forwarding across the tag silently deletes the
                     // byte swap the backend would have emitted.
-                    if (!ld.@"volatile" and !func.isByteOrderTagged(inst)) {
+                    //
+                    // A MASKED load is kept out of it in both directions: its result holds the
+                    // memory only for the lanes its mask names, so it may not be answered from an
+                    // earlier store and no later load may be answered from it.
+                    if (!ld.@"volatile" and ld.mask == null and !func.isByteOrderTagged(inst)) {
                         const result = func.instResult(inst).?;
                         if (find(avail.items, func, ld.ptr, func.valueType(result))) |v| {
                             func.replaceAllUses(result, v);
@@ -63,8 +67,15 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     // recorded as an availability entry. An `endian`-tagged store is barred from
                     // the table for the byte-order reason: it writes its value REVERSED, so what
                     // the address now holds is not `st.value`.
+                    //
+                    // A MASKED store is kept out of the table for a third reason: the lanes whose
+                    // mask bit is clear did not write, so the address does not hold `st.value`
+                    // afterwards. It still invalidates, because the lanes that did write changed
+                    // what is there.
                     invalidateAliasing(&avail, func, st.ptr);
-                    if (!st.@"volatile" and !func.isByteOrderTagged(inst)) try avail.append(allocator, .{ .ptr = st.ptr, .value = st.value });
+                    if (!st.@"volatile" and st.mask == null and !func.isByteOrderTagged(inst)) {
+                        try avail.append(allocator, .{ .ptr = st.ptr, .value = st.value });
+                    }
                 },
                 // An atomic is a STORE of `ptr`, so a relaxed one invalidates every entry
                 // that may alias it, exactly like the `store` arm above. It is NEVER
@@ -584,4 +595,43 @@ test "a load does not satisfy a later load across an atomic on the same address"
     const add = func.opcode(func.definingInst(sum).?).arith;
     try testing.expectEqual(y1, add.lhs);
     try testing.expectEqual(y2, add.rhs); // the second load was NOT replaced by the first
+}
+
+/// `*p = v if m; y = *p; return y;` in one block. `mask` predicates the store. Returns the stored
+/// value, the loaded value and the block.
+fn buildMaskedStoreThenLoad(func: *Function, mask: bool) !struct { stored: Value, loaded: Value, block: Block } {
+    const t = try i32Ty(func);
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendBlockParam(b, t);
+    const m = try func.appendBlockParam(b, bool_t);
+    if (mask) try func.appendStoreMasked(b, v, p, m) else try func.appendStore(b, v, p);
+    const y = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+    return .{ .stored = v, .loaded = y, .block = b };
+}
+
+test "a masked store does not forward its value to a later load" {
+    const allocator = testing.allocator;
+    // The lanes the mask excluded did not write, so the address does not hold `v` afterwards and
+    // the load has to stay.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildMaskedStoreThenLoad(&func, true);
+        try testing.expect(!try runOnce(allocator, &func));
+        try testing.expectEqual(@as(usize, 2), func.blockInsts(s.block).len);
+        try testing.expectEqual(s.loaded, func.terminator(s.block).?.ret.values[0]);
+        try testing.expect(func.opcode(func.blockInsts(s.block)[0]).store.mask != null);
+    }
+    // The identical shape with no mask still forwards, so the refusal is about the mask.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildMaskedStoreThenLoad(&func, false);
+        try testing.expect(try runOnce(allocator, &func));
+        try testing.expectEqual(s.stored, func.terminator(s.block).?.ret.values[0]);
+    }
 }

@@ -747,6 +747,21 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(glacier_lower).step);
 
+    // The `glacierctl exec kernel.spv` path: a SPIR-V compute module through the SPIR-V lowering,
+    // through the Glacier selector, executed on the warp model.
+    const glacier_spirv = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/glacier/tests/spirv.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-gpu", .module = vulcan_gpu },
+            .{ .name = "vulcan-spirv", .module = vulcan_spirv },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(glacier_spirv).step);
+
     // Scalar-expanded matmul over deliberately odd global pointers. The expansion is test-owned:
     // NVIDIA production codegen receives the ordinary scalar IR, then real hardware proves its
     // bytewise memory lowering preserves the exact footprint and fp32 bits.

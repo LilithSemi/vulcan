@@ -602,7 +602,17 @@ const FunctionParser = struct {
             try self.eat(',');
             self.skipWs();
             const ptr = try self.parseValueRef();
-            const result = try self.func.appendInst(block, ty, .{ .load = .{ .ptr = ptr, .@"volatile" = is_volatile } });
+            // `if v3` predicates the load per lane. See `Load.mask`.
+            self.skipWs();
+            const mask: ?Value = if (self.tryWord("if")) blk: {
+                self.skipWs();
+                break :blk try self.parseValueRef();
+            } else null;
+            const result = try self.func.appendInst(block, ty, .{ .load = .{
+                .ptr = ptr,
+                .@"volatile" = is_volatile,
+                .mask = mask,
+            } });
             try self.recordValue(result);
             return result;
         }
@@ -869,6 +879,13 @@ const FunctionParser = struct {
         try self.eat(',');
         self.skipWs();
         const ptr = try self.parseValueRef();
+        // `if v3` predicates the store per lane. See `Store.mask`.
+        self.skipWs();
+        if (self.tryWord("if")) {
+            self.skipWs();
+            const mask = try self.parseValueRef();
+            return self.func.appendStoreMaskedVol(block, value, ptr, mask, is_volatile);
+        }
         try self.func.appendStoreVol(block, value, ptr, is_volatile);
     }
 

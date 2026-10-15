@@ -560,10 +560,14 @@ fn checkDominance(func: *const Function, diags: *Diagnostics) std.mem.Allocator.
                     try checkUse(&dominance, def_block, diags, cv.global_scale, bi);
                 },
                 .unary => |u| try checkUse(&dominance, def_block, diags, u.value, bi),
-                .load => |ld| try checkUse(&dominance, def_block, diags, ld.ptr, bi),
+                .load => |ld| {
+                    try checkUse(&dominance, def_block, diags, ld.ptr, bi);
+                    if (ld.mask) |m| try checkUse(&dominance, def_block, diags, m, bi);
+                },
                 .store => |st| {
                     try checkUse(&dominance, def_block, diags, st.value, bi);
                     try checkUse(&dominance, def_block, diags, st.ptr, bi);
+                    if (st.mask) |m| try checkUse(&dominance, def_block, diags, m, bi);
                 },
                 // An atomic reads three Values at most: the address, the operand, and the
                 // expected value of the compare-exchange form.

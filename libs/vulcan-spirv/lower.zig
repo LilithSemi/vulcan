@@ -10,8 +10,14 @@
 //! synthesized entry parameters (dispatch supplies the buffer base address and the
 //! per-thread invocation id). `OpAccessChain` lowers to pointer arithmetic
 //! (`base + index*stride`), `OpLoad`/`OpStore` to IR load/store. Synthesized
-//! entry-parameter order: invocation id (if the builtin is present), then each storage
-//! buffer in declaration order, then explicit function parameters.
+//! entry-parameter order: invocation id (if the builtin is present), then the workgroup id
+//! and workgroup count (same), then each storage buffer in declaration order, then explicit
+//! function parameters.
+//!
+//! A kernel may divide work by WORKGROUP instead of by thread, reading `gl_WorkGroupID` and
+//! `gl_NumWorkGroups` rather than `gl_GlobalInvocationID`. That is the shape a target whose
+//! workgroup is one SIMD warp needs, since a per-thread index there is a vector and not a
+//! scalar. See `Options.buffers_as_globals` for the other half such a target needs.
 //!
 //! Assumes a storage buffer is `{ T elems[] }` (single array member at offset 0).
 //! Multi-member / nested-struct offsets are not modeled. Vectors, function calls, and
@@ -35,7 +41,9 @@ const TypeInfo = union(enum) {
     void,
     function: struct { ret: u32 },
     pointer: struct { pointee: u32 }, // a pointer to another type id
-    array: struct { elem: u32 }, // a (runtime) array of another type id
+    /// An array of another type id. `len_id` names the constant holding its length, and is zero
+    /// for an `OpTypeRuntimeArray`, whose length only the host knows.
+    array: struct { elem: u32, len_id: u32 = 0 },
     vector: VecType, // a SIMD vector of a scalar component type
     matrix: MatType, // a matrix: `cols` column vectors of type `col_vec`
     image, // an OpTypeImage (the opaque image resource of a sampler)
@@ -124,7 +132,7 @@ pub const GradDesc = struct { slot: u32, axis: enum { x, y } };
 /// `vertex_index` / `instance_index` are vertex-shader BuiltIn INPUTs (gl_VertexIndex /
 /// gl_InstanceIndex): each becomes a synthesized i32 entry param the dispatch supplies
 /// per vertex, exactly like the compute `global_id`.
-const VarKind = enum { buffer, sampler, global_id, vertex_index, instance_index, input, output, other };
+const VarKind = enum { buffer, sampler, shared, global_id, workgroup_id, num_workgroups, local_id, workgroup_size, vertex_index, instance_index, input, output, other };
 
 /// The shader stage an `OpEntryPoint` selects. Lowering produces the attribute interface
 /// for graphics stages, the kernel ABI for compute.
@@ -158,13 +166,37 @@ const Module = struct {
     local_is_vec: []bool, // id -> whether it is a tracked Function-storage vector local
     local_vec: []Vec, // local var id -> the scalarized vector last stored to it
     local_comp_of: []?LocalComp, // access-chain result id -> (local var id, component index)
+    // A Function-storage local whose pointee is a flat (all-scalar-member) struct scalarizes to
+    // one alloca per field, in member order, so mem2reg promotes each field exactly like a plain
+    // scalar local. A constant-index access chain into it resolves straight to that field's
+    // alloca (see lowerAccessChain), so loads and stores through the chain need no new code; only
+    // a whole-struct OpLoad/OpStore (operand IS the var id, not a chain result) needs one. Null
+    // for anything that is not a tracked struct local.
+    local_struct: []?[]Value,
+    /// How many barriers were widened to the core while lowering, recorded on the function so a
+    /// backend can tell a lost attribute from a kernel that never had one.
+    cluster_barriers: u32 = 0,
     buffers: std.ArrayList(u32) = .empty, // storage-buffer var ids, declaration order
+    /// Workgroup-storage var ids in declaration order. Each becomes a shared `alloca` in the
+    /// entry block, which is what `gpu.abi.layoutSharedFrame` places.
+    shared_vars: std.ArrayList(u32) = .empty,
     has_global_id: bool = false,
+    // A compute kernel that divides work by WARP rather than by thread reads WorkgroupId and
+    // NumWorkgroups instead of GlobalInvocationID. Glacier is that shape: one warp is the
+    // workgroup, so these two are how a kernel finds its own share.
+    has_workgroup_id: bool = false,
+    has_num_workgroups: bool = false,
+    has_local_id: bool = false,
+    has_workgroup_size: bool = false,
     value_of: []?Value, // id -> the Vulcan value it lowers to (scalars)
     vec_of: []Vec, // id -> a scalarized vector value's components (len 0 = not a vector)
     mat_of: []Mat, // id -> a scalarized matrix value's elements (cols 0 = not a matrix)
     mat_ptr: []?MatPtr, // access-chain result id -> matrix-in-memory layout (for OpLoad)
     vec_ptr: []?VecPtr, // access-chain result id -> vector-in-memory layout (for OpLoad)
+    // An access-chain result id -> the type its pointer points AT. Zig splits a chain in two (one
+    // step to the struct member, a second to index the array), so the second chain's base is a
+    // previous chain's result and not a variable. 0 means unknown.
+    chain_pointee: []u32,
     is_builtin_ptr: []bool, // id -> a pointer into the gl_GlobalInvocationID builtin
     // Combined-image-sampler descriptor pointer per value: an OpLoad of a sampler
     // variable, or an OpSampledImage, records here the descriptor pointer Value the
@@ -270,8 +302,15 @@ const Module = struct {
     grad_buf_param: ?Value = null, // the synthesized grad_buf pointer param (lazy)
     grad_entry: Block = undefined, // the entry block, for appending the grad_buf param
     ptr_t: Type,
+    /// A pointer into the workgroup window. The address space is in the TYPE, so it survives the
+    /// pointer arithmetic an access chain builds.
+    shared_ptr_t: Type,
     i32_t: Type,
     global_id_value: ?Value = null,
+    workgroup_id_value: ?Value = null,
+    num_workgroups_value: ?Value = null,
+    local_id_value: ?Value = null,
+    workgroup_size_value: ?Value = null,
     has_vertex_index: bool = false,
     vertex_index_value: ?Value = null,
     has_instance_index: bool = false,
@@ -293,6 +332,8 @@ const Module = struct {
     is_front_facing: []bool, // input var id -> whether it is the gl_FrontFacing builtin
     is_frag_depth: []bool, // output var id -> whether it is the gl_FragDepth builtin
     var_storage: []u32, // variable id -> its SPIR-V storage class
+    name_words: []const []const u32, // id -> the operand words of its OpName (empty if unnamed)
+    opts: Options, // the lowering choices the caller asked for
 
     fn pointee(self: *const Module, type_id: u32) ?u32 {
         if (type_id >= self.types.len) return null;
@@ -373,9 +414,62 @@ fn valueOf(module: *const Module, id: u32) Error!Value {
     return module.value_of[id] orelse error.MalformedModule;
 }
 
+/// The longest storage-buffer name `buffers_as_globals` accepts. A longer one is refused rather
+/// than truncated: a truncated symbol would quietly fail to match the address the host supplied.
+const max_symbol_len = 128;
+
+/// Decode a SPIR-V literal string from the operand words that hold it, into `out`.
+///
+/// SPIR-V packs four bytes per word, low-order byte first, and terminates with a NUL. The bytes
+/// are read with shifts rather than by reinterpreting the words, so the result does not depend on
+/// the host's byte order. Returns null when the string is unterminated or longer than `out`.
+fn literalString(words: []const u32, out: []u8) ?[]const u8 {
+    var n: usize = 0;
+    for (words) |w| {
+        for (0..4) |i| {
+            const byte: u8 = @truncate(w >> @intCast(i * 8));
+            if (byte == 0) return out[0..n];
+            if (n == out.len) return null;
+            out[n] = byte;
+            n += 1;
+        }
+    }
+    return null;
+}
+
+test "literalString decodes a SPIR-V packed name" {
+    var buf: [16]u8 = undefined;
+    // "out" plus the terminator fills exactly one word.
+    try std.testing.expectEqualStrings("out", literalString(&.{0x00_74_75_6F}, &buf).?);
+    // A name whose length is a multiple of four needs a whole word of padding for the terminator.
+    try std.testing.expectEqualStrings("data", literalString(&.{ 0x61_74_61_64, 0 }, &buf).?);
+    // Unterminated, and longer than the buffer: both refused rather than guessed.
+    try std.testing.expectEqual(@as(?[]const u8, null), literalString(&.{0x64_63_62_61}, &buf));
+    var tiny: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), literalString(&.{0x00_74_75_6F}, &tiny));
+}
+
+pub const Options = struct {
+    /// Lower each storage buffer to a `global_addr` naming the variable, instead of to a pointer
+    /// entry parameter.
+    ///
+    /// A dispatch supplies a buffer's base address at launch, which is why the default is an entry
+    /// parameter. A target with no parameter block cannot receive one: a Glacier kernel reaches
+    /// memory by absolute address and is built for the address the host already chose, so the
+    /// buffer is a symbol the backend resolves (see `vulcan-target/glacier/isel.zig`
+    /// `Options.globals`). The name comes from the variable's `OpName`, so a module that does not
+    /// name its buffers is refused under this option.
+    buffers_as_globals: bool = false,
+};
+
 /// Lower the first function of the SPIR-V module in `words` to a fresh Vulcan IR
 /// function. Caller owns and must `deinit` it.
 pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Function {
+    return lowerModuleFor(allocator, words, .{});
+}
+
+/// `lowerModule` with the lowering choices in `opts`. See `Options`.
+pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Options) Error!Function {
     var r = try binary.Reader.init(words);
     const bound = r.header.id_bound;
 
@@ -429,6 +523,12 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
     const has_binding = try allocator.alloc(bool, bound);
     defer allocator.free(has_binding);
     @memset(has_binding, false);
+    // The operand words of each id's `OpName`, which hold its source name. These are slices into
+    // the caller's `words`, not copies: a name is only read while lowering, and `internSymbol`
+    // copies the one name that outlives it. Empty means the module named nothing for that id.
+    const name_words = try allocator.alloc([]const u32, bound);
+    defer allocator.free(name_words);
+    @memset(name_words, &.{});
     const is_position = try allocator.alloc(bool, bound);
     defer allocator.free(is_position);
     @memset(is_position, false);
@@ -480,14 +580,17 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
         .mat_of = undefined,
         .mat_ptr = undefined,
         .vec_ptr = undefined,
+        .chain_pointee = undefined,
         .local_is_vec = undefined,
         .local_vec = undefined,
         .local_comp_of = undefined,
+        .local_struct = undefined,
         .is_builtin_ptr = undefined,
         .sampler_ptr_of = undefined,
         .input_comp_of = undefined,
         .pos_chain_var = undefined,
         .ptr_t = try func.types.ptrGlobal(),
+        .shared_ptr_t = try func.types.intern(.{ .ptr = .shared }),
         .i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }),
         .array_stride = array_stride,
         .const_val = const_val,
@@ -501,8 +604,11 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
         .is_front_facing = is_front_facing,
         .is_frag_depth = is_frag_depth,
         .var_storage = var_storage,
+        .name_words = name_words,
+        .opts = opts,
     };
     defer module.buffers.deinit(allocator);
+    defer module.shared_vars.deinit(allocator);
     defer module.members.deinit(allocator);
     defer module.attr_slot_of.deinit(allocator);
     defer module.grad_index_x.deinit(allocator);
@@ -563,7 +669,11 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
             },
             op.TypeArray, op.TypeRuntimeArray => {
                 const id = try idOperandAt(inst.operands, 0, bound);
-                types[id] = .{ .array = .{ .elem = try idOperandAt(inst.operands, 1, bound) } };
+                const elem = try idOperandAt(inst.operands, 1, bound);
+                // `OpTypeArray` carries its length as the id of a constant, which only a later
+                // pass can read. Keeping the id is what lets a workgroup object be SIZED.
+                const len_id: u32 = if (inst.opcode == op.TypeArray) try idOperandAt(inst.operands, 2, bound) else 0;
+                types[id] = .{ .array = .{ .elem = elem, .len_id = len_id } };
             },
             op.TypeVector => {
                 const id = try idOperandAt(inst.operands, 0, bound);
@@ -619,6 +729,11 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
                     op.ExecutionModel.fragment => .fragment,
                     else => .compute,
                 };
+            },
+            // [target, name...]. Only kept so a storage buffer can become a `global_addr` under
+            // the source name the host knows it by. See `Options.buffers_as_globals`.
+            op.Name => if (inst.operands.len >= 2) {
+                name_words[try checkId(inst.operands[0], bound)] = inst.operands[1..];
             },
             op.Decorate => if (inst.operands.len >= 3 and inst.operands[1] == op.Decoration.builtin) {
                 const target = try checkId(inst.operands[0], bound);
@@ -689,6 +804,14 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
             // The const result ids index value_of / vec_of when the constants are materialized.
             op.ConstantTrue => try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 1 }),
             op.ConstantFalse => try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 0 }),
+            // `OpUndef` is legal at MODULE scope as well as in a body, and spirv-opt hoists one
+            // there when it rewrites a dead loop-carried phi. A module-scope one is not a body
+            // instruction, so it registers as the zero constant it lowers to; nothing reads an
+            // undefined value, so any concrete value is sound and zero is the cheapest.
+            op.Undef => if (in_function)
+                try insts.append(allocator, inst)
+            else
+                try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 0 }),
             op.ConstantComposite => {
                 // [type, result, comp0, comp1, ...]: a vector constant whose components
                 // are themselves OpConstants. Record the component ids, materialized
@@ -704,6 +827,10 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
                 try pending_vars.append(allocator, .{ result, storage });
                 var_type[result] = type_id; // the variable's pointer type
                 var_storage[result] = storage;
+                // A variable declared INSIDE the function is also a body instruction: it
+                // allocates a stack slot where a module-scope one names an interface. This arm
+                // claims the opcode, so without this the body lowering would never see it.
+                if (in_function) try insts.append(allocator, inst);
             },
             op.Function => {
                 if (in_function) return error.Unsupported; // only the first function
@@ -755,6 +882,33 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
         } else if (builtin_decor[id] == op.BuiltIn.global_invocation_id) {
             var_kind[id] = .global_id;
             module.has_global_id = true;
+        } else if (builtin_decor[id] == op.BuiltIn.workgroup_id) {
+            var_kind[id] = .workgroup_id;
+            module.has_workgroup_id = true;
+        } else if (builtin_decor[id] == op.BuiltIn.num_workgroups) {
+            var_kind[id] = .num_workgroups;
+            module.has_num_workgroups = true;
+        } else if (builtin_decor[id] == op.BuiltIn.workgroup_size) {
+            var_kind[id] = .workgroup_size;
+            module.has_workgroup_size = true;
+        } else if (builtin_decor[id] == op.BuiltIn.local_invocation_id) {
+            var_kind[id] = .local_id;
+            module.has_local_id = true;
+        } else if (class == op.StorageClass.workgroup) {
+            // Per-workgroup shared memory. It becomes a shared `alloca` in the entry block, so the
+            // placement rule in `gpu.abi.layoutSharedFrame` serves every target, and a backend
+            // decides where the window lives: LDS on NVIDIA, the warp'"'"'s own scratch on Glacier.
+            var_kind[id] = .shared;
+            try module.shared_vars.append(allocator, id);
+        } else if (class == op.StorageClass.function) {
+            // A module-scope variable in the function class becomes a stack slot further down,
+            // where `mem2reg` then promotes it.
+        } else {
+            // A storage class this frontend does not route anywhere. `Workgroup` is the one a real
+            // kernel reaches for, and no target here has a region to put it in yet. Saying so is
+            // the point: falling through left the variable with no value, and the first reader of
+            // it reported a MALFORMED MODULE, which sends the author to a shader that is correct.
+            return error.Unsupported;
         }
     }
 
@@ -775,6 +929,11 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
     if (module.stage == .compute) {
         if (local_size) |size| try gpu.attrs.setLocalSize(&func, size);
     }
+
+    // Recorded BEFORE any pass runs, which is the point of it: the width rides on an instruction
+    // attribute and a pass that rebuilds the instruction can drop it, so a backend compares this
+    // with what it emitted and refuses rather than quietly narrowing the barrier.
+    if (module.cluster_barriers != 0) try gpu.attrs.setClusterBarriers(&func, module.cluster_barriers);
 
     // Emit the fragment-shader gradient-buffer layout: one func attr per grad_buf index
     // (in index order), encoding (axis | slot << 1) so the backend recovers, per buffer
@@ -815,6 +974,10 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     defer allocator.free(vec_ptr);
     @memset(vec_ptr, null);
     module.vec_ptr = vec_ptr;
+    const chain_pointee = try allocator.alloc(u32, bound);
+    defer allocator.free(chain_pointee);
+    @memset(chain_pointee, 0);
+    module.chain_pointee = chain_pointee;
     const local_is_vec = try allocator.alloc(bool, bound);
     defer allocator.free(local_is_vec);
     @memset(local_is_vec, false);
@@ -827,6 +990,13 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     defer allocator.free(local_comp_of);
     @memset(local_comp_of, null);
     module.local_comp_of = local_comp_of;
+    const local_struct = try allocator.alloc(?[]Value, bound);
+    defer {
+        for (local_struct) |maybe_fields| if (maybe_fields) |fields| allocator.free(fields);
+        allocator.free(local_struct);
+    }
+    @memset(local_struct, null);
+    module.local_struct = local_struct;
     // Classify surviving Function-storage vector OpVariables (mem2reg leaves these when a
     // component's address is taken) so the body's store/load/access-chain scalarize them.
     {
@@ -908,6 +1078,35 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         // tag and treat it as an ordinary register parameter.
         try gpu.attrs.setBuiltin(func, gid, .global_id_x);
     }
+    // A kernel that divides work by workgroup rather than by thread reads these two instead of
+    // the invocation id. They come after it so a module that reads both keeps the invocation id
+    // in the leading slot every existing consumer expects.
+    if (module.has_workgroup_id) {
+        const wid = try func.appendBlockParam(entry, module.i32_t);
+        module.workgroup_id_value = wid;
+        try gpu.attrs.setBuiltin(func, wid, .block_id_x);
+    }
+    if (module.has_num_workgroups) {
+        const n = try func.appendBlockParam(entry, module.i32_t);
+        module.num_workgroups_value = n;
+        try gpu.attrs.setBuiltin(func, n, .grid_dim_x);
+    }
+    // The thread's index INSIDE its workgroup. On a target whose workgroup is one SIMD warp this
+    // is the lane index, which is why it is the one builtin here that a backend may answer with a
+    // per-lane value rather than a scalar.
+    if (module.has_local_id) {
+        const l = try func.appendBlockParam(entry, module.i32_t);
+        module.local_id_value = l;
+        try gpu.attrs.setBuiltin(func, l, .thread_id_x);
+    }
+    // The workgroup WIDTH. A kernel reads it to stride its own inner loop, and a backend answers
+    // it from the shape it is building for, so the same kernel fits a wider or narrower one
+    // without being rebuilt. That is the point of not folding the module's own LocalSize here.
+    if (module.has_workgroup_size) {
+        const s = try func.appendBlockParam(entry, module.i32_t);
+        module.workgroup_size_value = s;
+        try gpu.attrs.setBuiltin(func, s, .block_dim_x);
+    }
     // Vertex-shader BuiltIn inputs (gl_VertexIndex / gl_InstanceIndex) become synthesized
     // i32 entry params BEFORE the f32 attribute inputs and the buffer pointers, tagged so
     // a GPU backend sources them from the hardware (vertex/instance id registers) and the
@@ -929,6 +1128,20 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     module.grad_entry = entry;
     if (module.stage != .compute) try synthInputAttribs(allocator, func, module, entry);
     for (module.buffers.items) |buf_id| {
+        // A buffer the backend resolves by symbol rather than receives at launch. A sampler is
+        // never this: it is an opaque descriptor the host binds, not memory at an address.
+        if (module.opts.buffers_as_globals) {
+            if (module.var_kind[buf_id] == .sampler) return error.Unsupported;
+            var name_buf: [max_symbol_len]u8 = undefined;
+            const name = literalString(module.name_words[buf_id], &name_buf) orelse return error.Unsupported;
+            if (name.len == 0) return error.Unsupported;
+            const g = try func.appendGlobalAddr(entry, module.ptr_t, name);
+            value_of[buf_id] = g;
+            // The same four-byte promise the parameter form carries, for the same reason: a
+            // backend that cannot assume alignment reads every scalar one byte at a time.
+            try func.addAttr(.{ .value = g }, .{ .@"align" = 4 });
+            continue;
+        }
         const p = try func.appendBlockParam(entry, module.ptr_t);
         value_of[buf_id] = p;
         // Tag a combined-image-sampler descriptor param distinctly from a plain buffer
@@ -967,6 +1180,14 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
             const block_binding: i64 = if (module.stage == .vertex) 0 else 1;
             try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "binding", .value = .{ .int = block_binding } } });
         }
+    }
+    // Workgroup objects. Each becomes a shared `alloca` in the entry block, AFTER the parameters
+    // so a backend reading the entry params by position is unaffected. Its address is the same in
+    // every invocation of the workgroup, which is what makes the object shared.
+    for (module.shared_vars.items) |id| {
+        const pointee = module.var_pointee(id) orelse return error.Unsupported;
+        const elem = sharedElemType(func, module, consts, pointee) orelse return error.Unsupported;
+        value_of[id] = try func.appendInst(entry, module.shared_ptr_t, .{ .alloca = .{ .elem = elem } });
     }
     for (insts) |inst| {
         if (inst.opcode == op.FunctionParameter) {
@@ -1249,12 +1470,134 @@ fn definesResult(opcode: u16) bool {
         op.Decorate,
         op.MemberDecorate,
         op.Nop,
+        op.Line,
+        op.NoLine,
         => false,
         else => true,
     };
 }
 
+/// The synthesized scalar parameter a builtin variable's first component resolves to, or null when
+/// `id` is not one of the scalar-sourced builtin variables.
+fn builtinScalarOf(module: *const Module, id: u32) ?Value {
+    if (id >= module.var_kind.len) return null;
+    return switch (module.var_kind[id]) {
+        .global_id => module.global_id_value,
+        .workgroup_id => module.workgroup_id_value,
+        .num_workgroups => module.num_workgroups_value,
+        .local_id => module.local_id_value,
+        .workgroup_size => module.workgroup_size_value,
+        else => null,
+    };
+}
+
+/// Whether `ty` is an integer or a pointer of the width `bits`, so two of them hold the same bits
+/// and a `reinterpret` between them moves nothing.
+fn sameWidthInt(func: *const Function, a: Type, b: Type) bool {
+    const ka = func.types.type_kind(a);
+    const kb = func.types.type_kind(b);
+    if (ka != .int or kb != .int) return false;
+    return ka.int.bits == kb.int.bits;
+}
+
+/// `v` as type `ty`, through a bit-identical `reinterpret` when it is some other integer of the
+/// same width.
+///
+/// This exists because the lowering mixes two sources of type. A value the MODULE declared carries
+/// the module's signedness, and a value the lowering SYNTHESIZES carries `i32`: the builtin entry
+/// parameters, the access-chain strides and offsets. `arith` requires its two operands to agree, so
+/// a `uint` index times an i32 stride is invalid IR, and `ir.verify` says so. A width change is not
+/// a reinterpret, so that is refused rather than silently truncated.
+fn coerceTo(func: *Function, block: Block, ty: Type, v: Value) Error!Value {
+    if (func.valueType(v) == ty) return v;
+    if (!sameWidthInt(func, func.valueType(v), ty)) return error.Unsupported;
+    return func.appendInst(block, ty, .{ .unary = .{ .op = .reinterpret, .value = v } });
+}
+
+/// An `arith` whose operands are both coerced to the result type first. Use this wherever either
+/// operand might be a synthesized value; do NOT use it for pointer arithmetic, where the two
+/// operand types differ on purpose.
+fn appendArith(func: *Function, block: Block, ty: Type, bop: ir.function.BinOp, lhs: Value, rhs: Value) Error!Value {
+    const l = try coerceTo(func, block, ty, lhs);
+    const r = try coerceTo(func, block, ty, rhs);
+    return func.appendInst(block, ty, .{ .arith = .{ .op = bop, .lhs = l, .rhs = r } });
+}
+
 /// Lower a non-terminator body instruction, recording its result Value.
+/// The integer value of the constant `id` names, or null when it is not an integer constant.
+///
+/// An `OpAtomic*` takes its scope and its semantics as ids of CONSTANTS rather than as literals,
+/// and both have already been materialized into the entry block by the time a body instruction is
+/// lowered, so the value is read back from the instruction that defines them.
+fn constantOperand(func: *const Function, module: *Module, id: u32) ?i64 {
+    if (id >= module.value_of.len) return null;
+    const v = module.value_of[id] orelse return null;
+    const inst = func.definingInst(v) orelse return null;
+    return switch (func.opcode(inst)) {
+        .iconst => |c| c,
+        else => null,
+    };
+}
+
+/// The IR atomic an `OpAtomic*` performs.
+fn atomicOpOf(opcode: u16) ?ir.function.AtomicOp {
+    return switch (opcode) {
+        op.AtomicExchange => .exchange,
+        // A subtract is an add of the negated operand; the caller negates.
+        op.AtomicIAdd, op.AtomicISub => .add,
+        op.AtomicSMin, op.AtomicUMin => .min,
+        op.AtomicSMax, op.AtomicUMax => .max,
+        op.AtomicAnd => .bit_and,
+        op.AtomicOr => .bit_or,
+        op.AtomicXor => .bit_xor,
+        else => null,
+    };
+}
+
+/// How strongly the memory-semantics mask orders the atomic. The storage-class bits are ignored,
+/// because this is read by targets that do not order one class separately from another.
+fn orderingOf(semantics: i64) ir.function.AtomicOrdering {
+    const bits: u32 = @truncate(@as(u64, @bitCast(semantics)));
+    if (bits & op.MemorySemantics.sequentially_consistent != 0) return .seq_cst;
+    if (bits & op.MemorySemantics.acquire_release != 0) return .acq_rel;
+    if (bits & op.MemorySemantics.release != 0) return .release;
+    if (bits & op.MemorySemantics.acquire != 0) return .acquire;
+    return .relaxed;
+}
+
+/// The IR scope a SPIR-V execution scope names. `invocation` has no IR spelling: an atomic that is
+/// atomic only against its own invocation is not an atomic, and refusing it beats widening it.
+fn scopeOf(scope: i64) ?ir.function.AtomicScope {
+    return switch (scope) {
+        op.Scope.cross_device => .system,
+        op.Scope.device => .device,
+        op.Scope.workgroup, op.Scope.subgroup => .workgroup,
+        else => null,
+    };
+}
+
+/// Whether the optional Memory Operands at `at` mark the access volatile.
+///
+/// A volatile access must happen exactly as written, which is what keeps a poll inside a spin loop
+/// instead of being hoisted out of it. Nothing in the Glacier pipeline moves memory today, so a
+/// spin loop survives either way; carrying the flag is what keeps that true when a pass that does
+/// move memory is added.
+fn isVolatile(operands: []const u32, at: usize) bool {
+    if (operands.len <= at) return false;
+    return operands[at] & op.MemoryOperand.@"volatile" != 0;
+}
+
+/// `v` with its integer signedness restated, which moves no bits.
+///
+/// A SPIR-V integer type says nothing about signedness, so a conversion opcode is the only place
+/// that information exists. A backend reads an operand type, so it has to be written down.
+fn restated(func: *Function, block: Block, v: Value, signedness: std.builtin.Signedness) Error!Value {
+    const kind = func.types.type_kind(func.valueType(v));
+    if (kind != .int or kind.int.signedness == signedness) return v;
+    const ty = try func.types.intern(.{ .int = .{ .signedness = signedness, .bits = kind.int.bits } });
+    return func.appendInst(block, ty, .{ .convert = .{ .value = v } });
+}
+
 fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
     const value_of = module.value_of;
     const bound = value_of.len; // == the id bound; every per-id array is this length
@@ -1265,7 +1608,7 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
         const lhs = try valueOf(module, try operandAt(inst.operands, 2));
         const rhs = try valueOf(module, try operandAt(inst.operands, 3));
-        value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .arith = .{ .op = bop, .lhs = lhs, .rhs = rhs } });
+        value_of[inst.operands[1]] = try appendArith(func, block, ty, bop, lhs, rhs);
         return;
     }
     if (cmpOpOf(inst.opcode)) |cop| {
@@ -1286,7 +1629,58 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         op.ConvertFToU, op.ConvertFToS, op.ConvertSToF, op.ConvertUToF, op.UConvert, op.SConvert, op.FConvert => {
             const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
             const v = try valueOf(module, try operandAt(inst.operands, 2));
-            value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .convert = .{ .value = v } });
+            // A SPIR-V integer type is SIGNLESS, and Zig's backend emits exactly one of them for a
+            // whole module: `OpTypeInt 32 0` serves signed and unsigned alike and the signedness
+            // rides on the OPCODE. A backend that reads the operand type therefore reads the wrong
+            // thing, and the information exists nowhere else, so write it into the IR here with a
+            // signedness-only convert. That moves no bits and a backend coalesces it away.
+            const source = if (inst.opcode == op.ConvertSToF)
+                try restated(func, block, v, .signed)
+            else if (inst.opcode == op.ConvertUToF)
+                try restated(func, block, v, .unsigned)
+            else
+                v;
+            const want: ?std.builtin.Signedness = switch (inst.opcode) {
+                op.ConvertFToS => .signed,
+                op.ConvertFToU => .unsigned,
+                else => null,
+            };
+            if (want) |signedness| {
+                // The RESULT carries the signedness for a float to integer convert, so the
+                // conversion is made against a type that states it and then restated to the type
+                // the module declared, which is what later instructions expect to read.
+                const kind = func.types.type_kind(ty);
+                if (kind == .int and kind.int.signedness != signedness) {
+                    const as_asked = try func.types.intern(.{ .int = .{ .signedness = signedness, .bits = kind.int.bits } });
+                    const n = try func.appendInst(block, as_asked, .{ .convert = .{ .value = source } });
+                    value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .convert = .{ .value = n } });
+                    return;
+                }
+            }
+            value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .convert = .{ .value = source } });
+        },
+        op.AtomicExchange, op.AtomicIAdd, op.AtomicISub, op.AtomicSMin, op.AtomicUMin, op.AtomicSMax, op.AtomicUMax, op.AtomicAnd, op.AtomicOr, op.AtomicXor => {
+            // [result type, result, pointer, scope, semantics, operand]. The scope and the
+            // semantics are ids of CONSTANTS rather than literals, so both are read back through
+            // the constant table and a non-constant one is refused rather than guessed at.
+            const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            const ptr = try valueOf(module, try operandAt(inst.operands, 2));
+            const scope = constantOperand(func, module, try operandAt(inst.operands, 3)) orelse return error.Unsupported;
+            const semantics = constantOperand(func, module, try operandAt(inst.operands, 4)) orelse return error.Unsupported;
+            var operand = try valueOf(module, try operandAt(inst.operands, 5));
+            // There is no subtracting atomic: it is an add of the negated operand, which is what
+            // every target does with it.
+            if (inst.opcode == op.AtomicISub) {
+                const zero = try func.appendInst(block, ty, .{ .iconst = 0 });
+                operand = try appendArith(func, block, ty, .sub, zero, operand);
+            }
+            value_of[inst.operands[1]] = try func.appendAtomicRmw(block, .{
+                .op = atomicOpOf(inst.opcode).?,
+                .ptr = ptr,
+                .value = operand,
+                .ordering = orderingOf(semantics),
+                .scope = scopeOf(scope) orelse return error.Unsupported,
+            });
         },
         op.Bitcast => {
             // Reinterpret the operand's bits as the result type (e.g. int <-> uint). Lowers
@@ -1304,13 +1698,33 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 try func.appendInst(block, ty, .{ .fconst = 0 })
             else
                 try func.appendInst(block, ty, .{ .iconst = 0 });
-            value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = v } });
+            value_of[inst.operands[1]] = try appendArith(func, block, ty, .sub, zero, v);
         },
         op.Not => {
             // Bitwise complement: x ^ -1 (all ones).
             const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
             const v = try valueOf(module, try operandAt(inst.operands, 2));
             value_of[inst.operands[1]] = try func.appendArithImm(block, ty, .bit_xor, v, -1);
+        },
+        op.LogicalNot => {
+            // A bool holds 0 or 1, so the complement is x ^ 1, NOT the all-ones flip above: that
+            // would turn `true` into a value no comparison produces.
+            const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            const v = try valueOf(module, try operandAt(inst.operands, 2));
+            value_of[inst.operands[1]] = try func.appendArithImm(block, ty, .bit_xor, v, 1);
+        },
+        op.CopyObject => {
+            // The result IS the operand. A vector or matrix operand is carried as the scalarized
+            // form it already has, so the copy is an alias in every case and emits nothing.
+            const src = try idOperandAt(inst.operands, 2, bound);
+            const result = inst.operands[1];
+            if (module.vec_of[src].len != 0) {
+                module.vec_of[result] = module.vec_of[src];
+            } else if (module.mat_of[src].cols != 0) {
+                module.mat_of[result] = module.mat_of[src];
+            } else {
+                value_of[result] = try valueOf(module, src);
+            }
         },
         op.ExtInst => try lowerExtInst(allocator, func, module, block, inst),
         op.DPdx, op.DPdy, op.Fwidth => {
@@ -1327,7 +1741,7 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 try func.appendInst(block, ty, .{ .iconst = 0 });
         },
         op.Nop => {},
-        op.AccessChain => try lowerAccessChain(func, module, block, inst),
+        op.AccessChain, op.InBoundsAccessChain => try lowerAccessChain(func, module, block, inst),
         op.Load => {
             const result = inst.operands[1];
             const ptr_id = try idOperandAt(inst.operands, 2, bound); // indexes many per-id arrays below
@@ -1342,6 +1756,36 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 const lv = module.local_vec[lc.local];
                 if (lc.comp >= lv.len) return error.MalformedModule;
                 value_of[result] = lv.comps[lc.comp];
+            } else if (ptr_id < module.local_struct.len and module.local_struct[ptr_id] != null) {
+                // A whole-struct load of a tracked Function-storage struct local: fetch each
+                // field's current value and scalarize them into a Vec, exactly like a whole
+                // vector load, so the following OpCompositeExtract narrows it the same way.
+                const fields = module.local_struct[ptr_id].?;
+                const struct_ty = module.var_pointee(ptr_id) orelse return error.MalformedModule;
+                var out: Vec = .{ .len = @intCast(fields.len) };
+                for (fields, 0..) |slot, i| {
+                    const m = module.members.get(memberKey(struct_ty, @intCast(i))) orelse return error.MalformedModule;
+                    const fty = scalarType(module.types, m.type_id) orelse return error.Unsupported;
+                    out.comps[i] = try func.appendInst(block, fty, .{ .load = .{ .ptr = slot } });
+                }
+                module.vec_of[result] = out;
+            } else if (builtinScalarOf(module, ptr_id) != null and vectorInfo(module.types, inst.operands[0]) != null) {
+                // A WHOLE-VECTOR load of a uvec3 builtin, which a following OpCompositeExtract
+                // then narrows. Zig's SPIR-V backend writes it this way where glslang reads `.x`
+                // through an access chain, so both spellings reach the same synthesized param.
+                //
+                // Only the x component carries anything. A workgroup index here is linear (one
+                // warp, one id), so y and z are zero rather than a second and third axis.
+                const vi = vectorInfo(module.types, inst.operands[0]).?;
+                if (vi.len > 4) return error.Unsupported;
+                const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
+                var out: Vec = .{ .len = @intCast(vi.len) };
+                // The synthesized parameter is i32 and the vector's element type is whatever the
+                // module declared, so the component is coerced rather than left to mismatch the
+                // zeros beside it the first time something does arithmetic on the vector.
+                out.comps[0] = try coerceTo(func, block, elem, builtinScalarOf(module, ptr_id).?);
+                for (1..vi.len) |i| out.comps[i] = try func.appendInst(block, elem, .{ .iconst = 0 });
+                module.vec_of[result] = out;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .sampler) {
                 // A load of a combined-image-sampler variable yields its descriptor
                 // pointer (the synthesized pointer entry param). The following
@@ -1357,6 +1801,15 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             } else if (module.is_builtin_ptr[ptr_id]) {
                 // A load of gl_GlobalInvocationID.x is the synthesized invocation id.
                 value_of[result] = module.global_id_value orelse return error.MalformedModule;
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .workgroup_id) {
+                // A load of gl_WorkGroupID.x is the synthesized workgroup index param.
+                value_of[result] = module.workgroup_id_value orelse return error.MalformedModule;
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .num_workgroups) {
+                value_of[result] = module.num_workgroups_value orelse return error.MalformedModule;
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .local_id) {
+                value_of[result] = module.local_id_value orelse return error.MalformedModule;
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .workgroup_size) {
+                value_of[result] = module.workgroup_size_value orelse return error.MalformedModule;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .vertex_index) {
                 // A load of gl_VertexIndex (directly or through a scalar access chain) is
                 // the synthesized per-vertex index param.
@@ -1394,7 +1847,31 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             } else {
                 const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
                 const ptr = value_of[ptr_id] orelse return error.MalformedModule;
-                value_of[result] = try func.appendInst(block, ty, .{ .load = .{ .ptr = ptr } });
+                value_of[result] = try func.appendInst(block, ty, .{ .load = .{
+                    .ptr = ptr,
+                    .@"volatile" = isVolatile(inst.operands, 3),
+                } });
+            }
+        },
+        // `OpControlBarrier`: every invocation in the execution scope waits here. The scope is the
+        // id of a constant, so it is read out of the constant table rather than off the word.
+        //
+        // DEVICE scope becomes a barrier WIDENED to every warp of one core, which the IR has no
+        // scope value for and `gpu.attrs` carries as an attribute. That is honest only for a
+        // launch on ONE core: a device is wider than a core on a multi-core part and nothing here
+        // knows how many cores a launch will cover, so a kernel asking for it is asserting that
+        // its grid is one core. A backend that cannot give even the core-wide guarantee refuses.
+        op.ControlBarrier => {
+            const exec = try constValOf(module, try operandAt(inst.operands, 0));
+            switch (exec) {
+                op.Scope.workgroup => try func.appendBarrier(block, .workgroup),
+                op.Scope.subgroup => try func.appendBarrier(block, .subgroup),
+                op.Scope.device => {
+                    const bar = try func.appendStmtRaw(block, .{ .barrier = .{ .scope = .workgroup } });
+                    try gpu.attrs.setClusterBarrier(func, bar);
+                    module.cluster_barriers += 1;
+                },
+                else => return error.Unsupported,
             }
         },
         op.Store => {
@@ -1421,6 +1898,15 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 module.local_vec[lc.local].comps[lc.comp] = sv;
                 return;
             }
+            // A whole-struct store to a tracked Function-storage struct local: write each
+            // scalarized component into its field's alloca.
+            if (ptr_id < module.local_struct.len and module.local_struct[ptr_id] != null) {
+                const fields = module.local_struct[ptr_id].?;
+                const comps = scalarComps(module, val_id) catch return error.MalformedModule;
+                if (comps.len != fields.len) return error.MalformedModule;
+                for (fields, comps) |slot, cv| try func.appendStore(block, cv, slot);
+                return;
+            }
             // Pattern B: a store through the gl_PerVertex Position member access chain is
             // the clip-space position output (routed to ATTR_POSITION). A store through a
             // non-position member (PointSize etc.) is dropped - we model position only.
@@ -1445,7 +1931,7 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             }
             const ptr = try valueOf(module, ptr_id);
             const val = try valueOf(module, val_id);
-            try func.appendStore(block, val, ptr);
+            try func.appendStoreVol(block, val, ptr, isVolatile(inst.operands, 2));
         },
         op.SampledImage => {
             // [type, result, image, sampler]. A combined-image-sampler is already a
@@ -1466,13 +1952,36 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         },
         op.ImageFetch => try lowerImageFetch(func, module, block, inst),
         op.Variable => {
+            const result = try idOperandAt(inst.operands, 1, bound);
             // A tracked Function-storage vector local is scalarized via local_vec (its
             // store/load/access-chain are handled below). Its declaration needs no IR.
-            if (inst.operands[1] < module.local_is_vec.len and module.local_is_vec[inst.operands[1]]) return;
-            return error.Unsupported; // other function-local variables (alloca) not yet modeled
+            if (module.local_is_vec[result]) return;
+            if (try operandAt(inst.operands, 2) != op.StorageClass.function) return error.Unsupported;
+            const pointee = module.var_pointee(result) orelse return error.Unsupported;
+            // A flat (all-scalar-member) struct local scalarizes to one alloca per field (see
+            // structFieldAllocas); an initializer would need decomposing into per-field stores,
+            // which no caller here needs, so it is refused rather than guessed at.
+            if (module.types[pointee]) |ti| if (ti == .@"struct") {
+                if (inst.operands.len >= 4) return error.Unsupported;
+                module.local_struct[result] = try structFieldAllocas(allocator, func, module, block, pointee);
+                return;
+            };
+            // A scalar Function-storage local becomes an `alloca`, and its loads and stores stay
+            // loads and stores. The shared `mem2reg` promotes it to SSA with real phis afterwards,
+            // which is where that belongs: a frontend tracking "the last value stored" cannot
+            // build a phi, and a loop counter is exactly a value that needs one.
+            const elem = scalarType(module.types, pointee) orelse return error.Unsupported;
+            const slot = try func.appendInst(block, module.ptr_t, .{ .alloca = .{ .elem = elem } });
+            value_of[result] = slot;
+            // An OpVariable may carry an initializer, which is a store at the declaration.
+            if (inst.operands.len >= 4) {
+                try func.appendStore(block, try valueOf(module, inst.operands[3]), slot);
+            }
         },
         op.Phi, op.FunctionParameter => {},
         op.SelectionMerge, op.LoopMerge, op.Name, op.MemberName, op.Decorate, op.MemberDecorate => {},
+        // Debug annotations interleaved between real instructions. They carry no value.
+        op.Line, op.NoLine => {},
         op.Branch, op.BranchConditional, op.Switch, op.Return, op.ReturnValue, op.Unreachable, op.Kill => {}, // terminators (Pass 2)
         else => return error.Unsupported,
     }
@@ -1561,7 +2070,7 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
             const vec = v_of[try idOperandAt(inst.operands, 2, bound)];
             const s = try valueOf(module, try operandAt(inst.operands, 3));
             var out: Vec = .{ .len = vi.len };
-            for (0..vi.len) |i| out.comps[i] = try func.appendInst(block, elem, .{ .arith = .{ .op = .mul, .lhs = vec.comps[i], .rhs = s } });
+            for (0..vi.len) |i| out.comps[i] = try appendArith(func, block, elem, .mul, vec.comps[i], s);
             v_of[inst.operands[1]] = out;
             return true;
         },
@@ -1623,7 +2132,7 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
                     const a = v_of[try idOperandAt(inst.operands, 2, bound)];
                     const b = v_of[try idOperandAt(inst.operands, 3, bound)];
                     var out: Vec = .{ .len = vi.len };
-                    for (0..vi.len) |i| out.comps[i] = try func.appendInst(block, elem, .{ .arith = .{ .op = bop, .lhs = a.comps[i], .rhs = b.comps[i] } });
+                    for (0..vi.len) |i| out.comps[i] = try appendArith(func, block, elem, bop, a.comps[i], b.comps[i]);
                     v_of[inst.operands[1]] = out;
                     return true;
                 }
@@ -1962,6 +2471,24 @@ fn lowerExtInst(allocator: std.mem.Allocator, func: *Function, module: *Module, 
     }
 }
 
+/// Scalarize a flat, all-scalar-member struct into one `alloca` per field, in member order, so
+/// the shared `mem2reg` promotes each field exactly like a plain scalar local would. A member
+/// that is itself a struct/array/vector is not flat, and refuses with `error.Unsupported` (only
+/// the flat case is scalarized); so does a struct with no members, or more than a `Vec` can hold
+/// a whole load into (`vec_of`'s component cap, matched below).
+fn structFieldAllocas(allocator: std.mem.Allocator, func: *Function, module: *Module, block: Block, struct_ty: u32) Error![]Value {
+    var fields: std.ArrayList(Value) = .empty;
+    errdefer fields.deinit(allocator);
+    var i: u32 = 0;
+    while (true) : (i += 1) {
+        const m = module.members.get(memberKey(struct_ty, i)) orelse break;
+        const fty = scalarType(module.types, m.type_id) orelse return error.Unsupported;
+        try fields.append(allocator, try func.appendInst(block, module.ptr_t, .{ .alloca = .{ .elem = fty } }));
+    }
+    if (fields.items.len == 0 or fields.items.len > 4) return error.Unsupported;
+    return fields.toOwnedSlice(allocator);
+}
+
 /// Lower `OpAccessChain`: produce a pointer Value by walking the index chain (a
 /// getelementpointer). A chain into the `gl_GlobalInvocationID` builtin is marked (a later
 /// load yields the invocation id). Otherwise the byte offset is accumulated: a struct
@@ -1984,11 +2511,30 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
         module.local_comp_of[result] = .{ .local = base, .comp = @intCast(comp) };
         return;
     }
+    // A constant-index chain into a tracked Function-storage struct local: the member index
+    // resolves straight to that field's alloca (struct member indices are always OpConstant per
+    // the SPIR-V spec), so the following OpLoad/OpStore is an ordinary load/store and needs no
+    // further tracking. A multi-index chain (nesting into the field) is not scalarized.
+    if (base < module.local_struct.len and module.local_struct[base] != null) {
+        const fields = module.local_struct[base].?;
+        if (indices.len != 1) return error.Unsupported;
+        const member: u32 = @intCast(try constValOf(module, indices[0]));
+        if (member >= fields.len) return error.MalformedModule;
+        module.value_of[result] = fields[member];
+        return;
+    }
     // A chain into gl_VertexIndex / gl_InstanceIndex (a scalar BuiltIn input): the result
     // pointer carries the same index "kind" as the variable, so the following OpLoad reads
     // the synthesized i32 index param. (These are scalar ints, so glslang usually loads the
     // variable directly - this handles a chain too, defensively.)
     if (base < module.var_kind.len and (module.var_kind[base] == .vertex_index or module.var_kind[base] == .instance_index)) {
+        if (result < module.var_kind.len) module.var_kind[result] = module.var_kind[base];
+        return;
+    }
+    // A chain into gl_WorkGroupID / gl_NumWorkGroups. These ARE uvec3, so a kernel reads `.x`
+    // through a chain rather than loading the variable, which makes this the normal path and not
+    // the defensive one above.
+    if (base < module.var_kind.len and (module.var_kind[base] == .workgroup_id or module.var_kind[base] == .num_workgroups or module.var_kind[base] == .local_id or module.var_kind[base] == .workgroup_size)) {
         if (result < module.var_kind.len) module.var_kind[result] = module.var_kind[base];
         return;
     }
@@ -2034,7 +2580,12 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     }
 
     const base_ptr = try valueOf(module, base);
-    var cur_type = module.var_pointee(base) orelse return error.Unsupported; // the pointee of the variable
+    // What the base points at: the pointee of a variable, or of an earlier chain when a chain is
+    // split across two instructions.
+    var cur_type = module.var_pointee(base) orelse blk: {
+        if (base < module.chain_pointee.len and module.chain_pointee[base] != 0) break :blk module.chain_pointee[base];
+        return error.Unsupported;
+    };
     var const_off: i64 = 0; // accumulated compile-time byte offset
     var offset_val: ?Value = null; // accumulated runtime byte offset (i32)
     // If the chain steps into a matrix member, remember its layout so a matrix `OpLoad`
@@ -2055,7 +2606,9 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
             },
             .array => |arr| {
                 const stride: u32 = if (module.array_stride[cur_type] != 0) module.array_stride[cur_type] else @intCast(vulcanScalarSize(func, scalarType(module.types, arr.elem) orelse return error.Unsupported));
-                const idx = try valueOf(module, idx_id);
+                // Offsets are computed in i32 throughout, so a module-typed index (a `uint` array
+                // subscript, say) is coerced into that once rather than mixed with it.
+                const idx = try coerceTo(func, block, module.i32_t, try valueOf(module, idx_id));
                 const stride_c = try func.appendInst(block, module.i32_t, .{ .iconst = stride });
                 const term = try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .mul, .lhs = idx, .rhs = stride_c } });
                 offset_val = if (offset_val) |o| try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .add, .lhs = o, .rhs = term } }) else term;
@@ -2070,11 +2623,19 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
         const c = try func.appendInst(block, module.i32_t, .{ .iconst = const_off });
         offset_val = if (offset_val) |o| try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .add, .lhs = o, .rhs = c } }) else c;
     }
+    // The result keeps the BASE pointer's address space. A chain into a workgroup object stays a
+    // workgroup pointer, because a backend reads the space off the TYPE to pick the instruction:
+    // NVIDIA chooses between an LDS and a global access on exactly this. Typing every chain as a
+    // global pointer would send a shared address to a global load, which reads the wrong memory
+    // and reports nothing.
+    const ptr_ty = func.valueType(base_ptr);
     const result_ptr = if (offset_val) |o|
-        try func.appendInst(block, module.ptr_t, .{ .arith = .{ .op = .add, .lhs = base_ptr, .rhs = o } })
+        try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base_ptr, .rhs = o } })
     else
         base_ptr;
     module.value_of[result] = result_ptr;
+    // Record what this pointer points at, so a second chain can continue from it.
+    if (result < module.chain_pointee.len) module.chain_pointee[result] = cur_type;
 
     // The chain addresses a whole matrix member: record its in-memory layout so the
     // following `OpLoad %matrix` reads each element from the buffer (a matrix is not a
@@ -2730,6 +3291,32 @@ fn phiOperandsOf(insts: []const binary.Instruction, phi_id: u32) ?[]const u32 {
 fn blockIndex(blocks: []const BlockInfo, label: u32) usize {
     for (blocks, 0..) |b, i| if (b.label == label) return i;
     return std.math.maxInt(usize);
+}
+
+/// The Vulcan type of a workgroup object: a scalar, or an array of scalars with its length read
+/// from the constant `OpTypeArray` names.
+///
+/// Anything else is refused rather than guessed at. A struct would need its member offsets to
+/// agree with whatever the backend places, and an array of arrays needs a length per level; both
+/// are real shapes and both want their own decision, which a silent mis-size would hide.
+fn sharedElemType(
+    func: *Function,
+    module: *const Module,
+    consts: *const std.AutoHashMapUnmanaged(u32, Const),
+    type_id: u32,
+) ?Type {
+    if (type_id >= module.types.len) return null;
+    return switch (module.types[type_id] orelse return null) {
+        .scalar => |t| t,
+        .array => |arr| {
+            if (arr.len_id == 0) return null; // a runtime array has no compile-time size
+            const elem = scalarType(module.types, arr.elem) orelse return null;
+            const len = consts.get(arr.len_id) orelse return null;
+            if (len.bits == 0) return null;
+            return func.types.intern(.{ .array = .{ .len = len.bits, .elem = elem } }) catch null;
+        },
+        else => null,
+    };
 }
 
 fn scalarType(types: []const ?TypeInfo, type_id: u32) ?Type {
@@ -3699,4 +4286,37 @@ test "rejects an oversized vector length (would overflow the scalarized Vec)" {
     // A vec9 cannot be held in Vec.comps ([4]Value): reject rather than overflow it later.
     try b.emit(allocator, op.TypeVector, &.{ 2, 1, 9 });
     try testing.expectError(error.MalformedModule, lowerModule(allocator, b.words.items));
+}
+
+test "a Workgroup storage class variable becomes a shared alloca" {
+    const allocator = testing.allocator;
+    // void main() { tile[0] = 7; } with `tile` a Workgroup array of seven uints. Per-workgroup
+    // shared memory: it becomes a shared `alloca`, which is what `gpu.abi.layoutSharedFrame`
+    // places, and the chain into it keeps the workgroup address space.
+    // ids: void=1 uint=2 arr=3 pWgArr=4 pWgU=5 voidfn=6 c0=7 c7=8 tile=9 main=10 label=11 at=12
+    var b = try binary.Builder.init(allocator, 13);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 7, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 8, 7 });
+    try b.emit(allocator, op.TypeArray, &.{ 3, 2, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.workgroup, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.workgroup, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 6, 1 });
+    try b.emit(allocator, op.Variable, &.{ 4, 9, op.StorageClass.workgroup });
+    try b.emit(allocator, op.Function, &.{ 1, 10, 0, 6 });
+    try b.emit(allocator, op.Label, &.{11});
+    try b.emit(allocator, op.AccessChain, &.{ 5, 12, 9, 7 });
+    try b.emit(allocator, op.Store, &.{ 12, 8 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+
+    var func = try lowerModule(allocator, b.words.items);
+    defer func.deinit();
+    var buf: [2048]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{f}", .{func});
+    // The whole object, sized from the constant `OpTypeArray` names.
+    try testing.expect(std.mem.indexOf(u8, text, "alloca [7 x u32]") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "store ") != null);
 }

@@ -21,6 +21,9 @@ pub const namespace = "vulcan.gpu";
 const key_builtin = "builtin";
 const key_local_size = [3][]const u8{ "local_size_x", "local_size_y", "local_size_z" };
 const key_shared_bytes = "shared_bytes";
+const key_barrier_scope = "scope";
+const key_cluster_barriers = "cluster_barriers";
+const scope_cluster = "cluster";
 
 /// The first `vulcan.gpu` integer attribute with `key` on `target`, or null when absent.
 fn intAttr(func: *const Function, target: ir.function.AttrTarget, key: []const u8) ?i64 {
@@ -175,4 +178,87 @@ test "a foreign namespace with the same key is ignored" {
         .value = .{ .int = 0 },
     } });
     try std.testing.expectEqual(@as(?Builtin, null), builtinOf(&func, v));
+}
+
+/// Widen a `barrier` to every warp of one core, which is a scope above a workgroup on a target
+/// whose workgroup is one warp.
+///
+/// It is an ATTRIBUTE and not a `BarrierScope` value, which is a deliberate trade and carries a
+/// cost worth stating. A scope value makes every exhaustive switch on it fail to compile until it
+/// is answered; an attribute does not, so a backend that does not read this emits the NARROWER
+/// barrier the opcode names and nothing reports it. Two things hold that down:
+///
+///   - every backend that emits a real barrier refuses one carrying this. NVIDIA is the only other
+///     one today, where `BAR.SYNC` would synchronise a CTA for a kernel that asked for more.
+///   - `setClusterBarriers` records how many the kernel had before any pass ran, and a backend
+///     compares that with how many it emitted. An attribute keyed to an INSTRUCTION is fragile in
+///     a way a flag in the opcode is not: a pass that clones or rebuilds the instruction can drop
+///     it, and the count is what turns that into a refusal rather than a narrower barrier.
+pub fn setClusterBarrier(func: *Function, inst: ir.function.Inst) Error!void {
+    try func.addAttr(.{ .inst = inst }, .{ .custom = .{
+        .namespace = namespace,
+        .key = key_barrier_scope,
+        .value = .{ .string = scope_cluster },
+    } });
+}
+
+/// Whether `inst` is a barrier widened to every warp of one core.
+pub fn isClusterBarrier(func: *const Function, inst: ir.function.Inst) bool {
+    var it = func.attributesOf(.{ .inst = inst });
+    while (it.next()) |attr| switch (attr) {
+        .custom => |c| {
+            if (!std.mem.eql(u8, c.namespace, namespace)) continue;
+            if (!std.mem.eql(u8, c.key, key_barrier_scope)) continue;
+            switch (c.value) {
+                .string => |s| if (std.mem.eql(u8, s, scope_cluster)) return true,
+                .int, .flag => {},
+            }
+        },
+        .@"inline", .noreturn, .cold, .@"align", .endian => {},
+    };
+    return false;
+}
+
+/// Record how many cluster barriers the kernel had before any pass ran. See `setClusterBarrier`
+/// for why the count exists.
+pub fn setClusterBarriers(func: *Function, n: u32) Error!void {
+    try addInt(func, .func, key_cluster_barriers, n);
+}
+
+/// How many cluster barriers the kernel had before any pass ran, or null when nothing recorded it.
+/// A backend that finds a count and emits fewer has lost one to a pass.
+pub fn clusterBarriers(func: *const Function) ?u32 {
+    const raw = intAttr(func, .func, key_cluster_barriers) orelse return null;
+    if (raw < 0 or raw > std.math.maxInt(u32)) return null;
+    return @intCast(raw);
+}
+
+/// Count the cluster barriers in `func` as it stands.
+pub fn countClusterBarriers(func: *const Function) u32 {
+    var n: u32 = 0;
+    for (0..func.blockCount()) |bi| {
+        const b: ir.function.Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(b)) |inst| {
+            if (func.opcode(inst) != .barrier) continue;
+            if (isClusterBarrier(func, inst)) n += 1;
+        }
+    }
+    return n;
+}
+
+test "a cluster barrier and its count round-trip through the attribute store" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+    const b = try func.appendBlock();
+    const plain = try func.appendStmtRaw(b, .{ .barrier = .{ .scope = .workgroup } });
+    const wide = try func.appendStmtRaw(b, .{ .barrier = .{ .scope = .workgroup } });
+    try setClusterBarrier(&func, wide);
+
+    try std.testing.expect(!isClusterBarrier(&func, plain));
+    try std.testing.expect(isClusterBarrier(&func, wide));
+    try std.testing.expectEqual(@as(u32, 1), countClusterBarriers(&func));
+
+    try std.testing.expectEqual(@as(?u32, null), clusterBarriers(&func));
+    try setClusterBarriers(&func, countClusterBarriers(&func));
+    try std.testing.expectEqual(@as(?u32, 1), clusterBarriers(&func));
 }
