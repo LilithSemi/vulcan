@@ -178,6 +178,15 @@ fn immJ(word: u32) i32 {
 
 /// Run `code` from word zero until it retires, and return how many instructions it took.
 ///
+/// The count is instructions and not cycles, and the difference is not a rounding error. A memory
+/// access costs one step here and a bus round trip on the core, where the warp parks for the whole
+/// of it and is covered only while another warp is ready. So the count is low on what removing a
+/// memory access is worth, and right on what removing arithmetic is worth.
+///
+/// On the per-lane ball, re-emitting constants instead of spilling them came to 1.08x by this
+/// count and 2.12x by frame intervals on the hardware. So of two changes with similar step counts,
+/// the one touching `sp` wins. Do not rank an optimisation by this number alone.
+///
 /// `code` sits at address zero of its own aperture, which is separate from `mem`: a Glacier core
 /// takes its program through the instruction aperture and its data over the bus, so nothing a
 /// kernel stores can rewrite the kernel.
