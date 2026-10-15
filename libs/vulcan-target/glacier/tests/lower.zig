@@ -5205,10 +5205,14 @@ test "the warp model decodes every word this backend can emit" {
         rv.vfdiv_vv(.v1, .v2, .v3),                               rv.vfwmacc_vv(.v1, .v2, .v3),                                rv.vmfeq_vv(.v1, .v2, .v3),
         rv.vmflt_vv(.v1, .v2, .v3),                               rv.vmfle_vv(.v1, .v2, .v3),                                  rv.vfcvt_f_x_v(.v1, .v2),
         rv.vfcvt_rtz_xu_f_v(.v1, .v2),                            rv.vfncvt_f_f_w(.v1, .v2),                                   rv.vfwcvt_f_f_v(.v1, .v2),
-        // Memory, per lane: unit stride and gather or scatter, masked and not.
-        rv.vle32(.v1, .x10),                                      rv.vle32_m(.v1, .x10),                                       rv.vse32(.v1, .x10),
-        rv.vse32_m(.v1, .x10),                                    rv.vluxei32(.v1, .x0, .v4),                                  rv.vluxei32_m(.v1, .x0, .v4),
-        rv.vsuxei32(.v1, .x0, .v4),                               rv.vsuxei32_m(.v1, .x0, .v4),
+        // The cross-warp barrier, which is a CONSTANT word and not an encoder call: the grep that
+        // collected this list saw `rv.` calls and missed it, and the model did not decode it. A
+        // word reachable without a function call is exactly what an audit of calls cannot see.
+        glacier.encode.warp_barrier,
+            // Memory, per lane: unit stride and gather or scatter, masked and not.
+                                     rv.vle32(.v1, .x10),                                         rv.vle32_m(.v1, .x10),
+        rv.vse32(.v1, .x10),                                      rv.vse32_m(.v1, .x10),                                       rv.vluxei32(.v1, .x0, .v4),
+        rv.vluxei32_m(.v1, .x0, .v4),                             rv.vsuxei32(.v1, .x0, .v4),                                  rv.vsuxei32_m(.v1, .x0, .v4),
     };
 
     for (words, 0..) |w, i| {
@@ -5279,4 +5283,69 @@ test "the model charges a memory access what the caller says it costs" {
     // Eight loads and the store it writes, so nine accesses at fifty-one apiece and nothing else
     // moves.
     try std.testing.expectEqual(free.cycles + 9 * 51, charged.cycles);
+}
+
+test "a barrier widened to the core emits the warp barrier and a narrower one emits nothing" {
+    // The warps of a core are separate instruction streams and do drift apart, so a barrier over
+    // them is a real instruction. The lanes of ONE warp share a stream and have nothing to wait
+    // for, so a workgroup barrier is still no instruction at all.
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |widen| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const warp_id = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, warp_id, .block_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        try f.appendStore(entry, warp_id, base);
+        const bar = try f.appendStmtRaw(entry, .{ .barrier = .{ .scope = .workgroup } });
+        if (widen) {
+            try gpu.attrs.setClusterBarrier(&f, bar);
+            try gpu.attrs.setClusterBarriers(&f, 1);
+        }
+        try f.appendStore(entry, try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = base } }), base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var bars: usize = 0;
+        for (words) |w| {
+            if (w == glacier.encode.warp_barrier) bars += 1;
+        }
+        try std.testing.expectEqual(@as(usize, if (widen) 1 else 0), bars);
+    }
+}
+
+test "a core-wide barrier a pass dropped is refused by the count the kernel declared" {
+    // The width rides on an INSTRUCTION attribute, which a pass that clones or rebuilds the
+    // instruction can drop, and the narrower barrier it would leave behind is no instruction at
+    // all here. The count stands in for the attribute surviving. Declaring two with one present
+    // is the same arithmetic a lost attribute produces.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const warp_id = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, warp_id, .block_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    try f.appendStore(entry, warp_id, base);
+    const bar = try f.appendStmtRaw(entry, .{ .barrier = .{ .scope = .workgroup } });
+    try gpu.attrs.setClusterBarrier(&f, bar);
+    try gpu.attrs.setClusterBarriers(&f, 2);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{};
+    const out = glacier.isel.compileKernelExplained(allocator, &f, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "data", .address = data_base }},
+    }, &why);
+    try std.testing.expectError(error.Unsupported, out);
+    try std.testing.expectEqual(@as(u32, 1), why.wanted);
+    try std.testing.expectEqual(@as(u32, 2), why.limit);
 }

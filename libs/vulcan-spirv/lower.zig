@@ -173,6 +173,9 @@ const Module = struct {
     // a whole-struct OpLoad/OpStore (operand IS the var id, not a chain result) needs one. Null
     // for anything that is not a tracked struct local.
     local_struct: []?[]Value,
+    /// How many barriers were widened to the core while lowering, recorded on the function so a
+    /// backend can tell a lost attribute from a kernel that never had one.
+    cluster_barriers: u32 = 0,
     buffers: std.ArrayList(u32) = .empty, // storage-buffer var ids, declaration order
     /// Workgroup-storage var ids in declaration order. Each becomes a shared `alloca` in the
     /// entry block, which is what `gpu.abi.layoutSharedFrame` places.
@@ -926,6 +929,11 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
     if (module.stage == .compute) {
         if (local_size) |size| try gpu.attrs.setLocalSize(&func, size);
     }
+
+    // Recorded BEFORE any pass runs, which is the point of it: the width rides on an instruction
+    // attribute and a pass that rebuilds the instruction can drop it, so a backend compares this
+    // with what it emitted and refuses rather than quietly narrowing the barrier.
+    if (module.cluster_barriers != 0) try gpu.attrs.setClusterBarriers(&func, module.cluster_barriers);
 
     // Emit the fragment-shader gradient-buffer layout: one func attr per grad_buf index
     // (in index order), encoding (axis | slot << 1) so the backend recovers, per buffer
@@ -1843,6 +1851,27 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                     .ptr = ptr,
                     .@"volatile" = isVolatile(inst.operands, 3),
                 } });
+            }
+        },
+        // `OpControlBarrier`: every invocation in the execution scope waits here. The scope is the
+        // id of a constant, so it is read out of the constant table rather than off the word.
+        //
+        // DEVICE scope becomes a barrier WIDENED to every warp of one core, which the IR has no
+        // scope value for and `gpu.attrs` carries as an attribute. That is honest only for a
+        // launch on ONE core: a device is wider than a core on a multi-core part and nothing here
+        // knows how many cores a launch will cover, so a kernel asking for it is asserting that
+        // its grid is one core. A backend that cannot give even the core-wide guarantee refuses.
+        op.ControlBarrier => {
+            const exec = try constValOf(module, try operandAt(inst.operands, 0));
+            switch (exec) {
+                op.Scope.workgroup => try func.appendBarrier(block, .workgroup),
+                op.Scope.subgroup => try func.appendBarrier(block, .subgroup),
+                op.Scope.device => {
+                    const bar = try func.appendStmtRaw(block, .{ .barrier = .{ .scope = .workgroup } });
+                    try gpu.attrs.setClusterBarrier(func, bar);
+                    module.cluster_barriers += 1;
+                },
+                else => return error.Unsupported,
             }
         },
         op.Store => {

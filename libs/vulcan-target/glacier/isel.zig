@@ -466,6 +466,16 @@ fn compileKernelInternal(
     };
     defer e.deinit();
     try e.run();
+
+    // A cluster barrier rides on an INSTRUCTION attribute, which a pass that clones or rebuilds
+    // the instruction can drop. Losing one would emit the narrower barrier, which on this target
+    // is no instruction at all, so a kernel would run with its handshake silently gone. The count
+    // the frontend recorded before any pass ran is what turns that into a refusal.
+    if (gpu.attrs.clusterBarriers(func)) |declared| {
+        if (e.cluster_barriers < declared) {
+            return Refusal.tooBig(why, "fewer core-wide barriers than the kernel declared, so a pass dropped one", e.cluster_barriers, declared);
+        }
+    }
     return e.words.toOwnedSlice(allocator);
 }
 
@@ -4352,6 +4362,10 @@ const Emitter = struct {
     /// never allocatable, so the predicate installs are the only writes to it, and a value never
     /// changes after it is computed: a second install of the same mask in one block is dead.
     v0_mask: ?Value = null,
+    /// How many cluster barriers were emitted, checked against the count the kernel carried
+    /// before any pass ran. See `gpu.attrs.setClusterBarrier` for why an instruction attribute
+    /// needs that check.
+    cluster_barriers: u32 = 0,
     /// The placed workgroup slots, each an `alloca` and its offset in the window.
     shared: []const gpu.abi.SharedSlot,
     /// The bytes the workgroup window takes directly below `sp`. The spill slots start under it.
@@ -5200,20 +5214,27 @@ const Emitter = struct {
             // program and have nothing to wait for. The memory half needs nothing either: one
             // stream, one bus, and in-order completion already order the accesses.
             //
-            // Glacier's own `warp_barrier` is deliberately NOT emitted here. It synchronizes every
-            // warp of one core, which is wider than this opcode asks for: a warp parks until its
-            // siblings arrive, so a warp would wait for warps that had no reason to meet it. Only
-            // LIVE warps hold it, so the wait ends when the last sibling exits and a kernel cannot
-            // deadlock on it, and a watchdog releases it with a sticky error when one is budgeted.
-            // It still does not do what the IR asked, and the IR has no scope for one core's warps
-            // to spell the wider thing with.
+            // One widened to the CORE is a different question and does emit, because the warps of
+            // a core are separate instruction streams that do drift apart. `gpu.attrs` carries
+            // that width as an attribute rather than as a scope on the opcode, so the opcode here
+            // reads `workgroup` either way and the attribute decides.
             //
-            // When there is a scope for it, the barrier needs NO fence beside it. A memory
-            // operation parks its own warp until the bus completes it, so there is no store buffer
-            // to drain, and the barrier releases only once every live warp has arrived: the two
-            // together are release and acquire. THAT EXPIRES WITH AXI4, where a write is accepted
-            // on one channel long before its response, so completion has to mean the response.
-            .barrier => {},
+            // The barrier needs NO fence beside it. A memory operation parks its own warp until
+            // the bus completes it, so there is no store buffer to drain, and the barrier releases
+            // only once every live warp has arrived: the two together are release and acquire.
+            // THAT EXPIRES WITH AXI4, where a write is accepted on one channel long before its
+            // response, so completion has to mean the response.
+            .barrier => {
+                // Widened to every warp of the core, which is what `warp_barrier` does: the warp
+                // parks until its siblings arrive and NOTHING touches the bus, where the same
+                // handshake written as a spin on a word costs one access an iteration on a bus
+                // that is already the limit. Only LIVE warps hold it, so a warp that has exited
+                // releases rather than hanging the rest.
+                if (gpu.attrs.isClusterBarrier(self.func, inst)) {
+                    self.cluster_barriers += 1;
+                    try self.put(glacier.warp_barrier);
+                }
+            },
             // A workgroup object is an ADDRESS in the hart's scratch region. The window sits
             // directly below `mscratch`, so a slot at window offset `off` is `sp - bytes + off`,
             // and that is one instruction with no load behind it. The lanes of the warp all

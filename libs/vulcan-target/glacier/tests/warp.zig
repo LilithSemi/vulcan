@@ -54,6 +54,10 @@ const csr_hart_count: u12 = 0xFC0;
 const csr_mscratch: u12 = 0x340;
 const csr_scratchsize: u12 = 0xFD2;
 
+/// The cross-warp barrier word, mirrored from `glacier/encode.zig` rather than imported, because
+/// this file is the independent side of the check.
+const glacier_warp_barrier: u32 = 0x1000000F;
+
 /// The launch arguments, 0xFC1 through 0xFC8. The strobe latches them, so every warp of one
 /// dispatch reads the same values and a read is constant for the whole of it.
 const csr_launch_arg_first: u12 = 0xFC1;
@@ -363,6 +367,10 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
             warp.set(rd, @bitCast(ftz(f32, asFloat(a) / asFloat(b))));
         },
         // CSR read. CSRRS with x0 as the set mask is the only CSR access a Glacier core decodes.
+        // The cross-warp barrier, a FENCE with fm = 0001 and no operands, so it is one constant
+        // word. This model drives ONE warp, which is always the last to arrive at a barrier over
+        // every live warp, so it continues. A model that ran several warps would have to park here.
+        0x0F => if (word != glacier_warp_barrier) return error.Illegal,
         0x73 => {
             // A FAULT retire: `ecall`, with the code in the register `rs1` names. The whole word is
             // `0x73` plus that register, so it differs from `ebreak` only in the immediate, which

@@ -285,6 +285,9 @@ pub const Select = 169;
 pub const Variable = 59;
 pub const Load = 61;
 pub const Store = 62;
+/// `OpControlBarrier execution_scope memory_scope semantics`. All three operands are ids of
+/// constants and not literals. The execution scope is what decides how wide the barrier is.
+pub const ControlBarrier = 224;
 pub const AccessChain = 65;
 /// `OpInBoundsAccessChain`. InBounds is a promise about the index, not a different operation,
 /// so it lowers exactly as `AccessChain` does. Zig's SPIR-V backend emits this one, not 65.

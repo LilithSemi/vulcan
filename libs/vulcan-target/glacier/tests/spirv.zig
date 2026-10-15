@@ -1778,3 +1778,71 @@ test "the lanes of a workgroup share one window in the hart's scratch" {
     // And each slot of the window holds its own lane's value, at the top of the slice.
     for (0..4) |i| try std.testing.expectEqual(@as(u32, @intCast(i + 1)), data[data.len - 4 + i]);
 }
+
+test "a device-scope control barrier reaches the hardware warp barrier" {
+    const allocator = std.testing.allocator;
+    // `void main() { out[wid] = nwg; controlBarrier(Device); }`, which is the shape the ball's
+    // handshake wants: every warp of the core meets here, with no word to spin on.
+    // ids as fillModule, plus scope=24 semantics=25.
+    var b = try fillModule(allocator);
+    defer b.deinit(allocator);
+    // The builder appends, so the barrier and its two constants land after the store and before
+    // the return already in the module. They have to be declared, so this rebuilds instead.
+    var m = try spirv.binary.Builder.init(allocator, 26);
+    defer m.deinit(allocator);
+    try m.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 16, 0x6E69616D, 0, 14, 15, 20 });
+    try m.emit(allocator, op.Name, &.{ 15, 0x0074756F });
+    try m.emit(allocator, op.Decorate, &.{ 14, op.Decoration.builtin, op.BuiltIn.workgroup_id });
+    try m.emit(allocator, op.Decorate, &.{ 20, op.Decoration.builtin, op.BuiltIn.num_workgroups });
+    try m.emit(allocator, op.TypeVoid, &.{1});
+    try m.emit(allocator, op.TypeInt, &.{ 2, 32, 1 });
+    try m.emit(allocator, op.TypeInt, &.{ 3, 32, 0 });
+    try m.emit(allocator, op.TypeVector, &.{ 4, 3, 3 });
+    try m.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 4 });
+    try m.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 3 });
+    try m.emit(allocator, op.TypeRuntimeArray, &.{ 7, 2 });
+    try m.emit(allocator, op.TypeStruct, &.{ 8, 7 });
+    try m.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 8 });
+    try m.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 2 });
+    try m.emit(allocator, op.TypeFunction, &.{ 11, 1 });
+    try m.emit(allocator, op.Constant, &.{ 3, 12, 0 });
+    try m.emit(allocator, op.Constant, &.{ 3, 24, op.Scope.device });
+    try m.emit(allocator, op.Constant, &.{ 3, 25, 0 });
+    try m.emit(allocator, op.Variable, &.{ 5, 14, op.StorageClass.input });
+    try m.emit(allocator, op.Variable, &.{ 9, 15, op.StorageClass.storage_buffer });
+    try m.emit(allocator, op.Variable, &.{ 6, 20, op.StorageClass.input });
+    try m.emit(allocator, op.Function, &.{ 1, 16, 0, 11 });
+    try m.emit(allocator, op.Label, &.{17});
+    try m.emit(allocator, op.AccessChain, &.{ 6, 18, 14, 12 });
+    try m.emit(allocator, op.Load, &.{ 3, 19, 18 });
+    try m.emit(allocator, op.AccessChain, &.{ 6, 21, 20, 12 });
+    try m.emit(allocator, op.Load, &.{ 3, 22, 21 });
+    try m.emit(allocator, op.AccessChain, &.{ 10, 23, 15, 12, 19 });
+    try m.emit(allocator, op.Store, &.{ 23, 22 });
+    try m.emit(allocator, op.ControlBarrier, &.{ 24, 24, 25 });
+    try m.emit(allocator, op.Return, &.{});
+    try m.emit(allocator, op.FunctionEnd, &.{});
+
+    var func = try spirv.lowerModuleFor(allocator, m.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    // The count the backend checks is recorded before any pass runs.
+    try std.testing.expectEqual(@as(?u32, 1), gpu.attrs.clusterBarriers(&func));
+
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(words);
+    var bars: usize = 0;
+    for (words) |w| {
+        if (w == glacier.encode.warp_barrier) bars += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), bars);
+
+    // And it runs: one warp meets itself at the barrier and retires.
+    var data: [8]u32 = @splat(0);
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1 };
+    _ = try warp.run(words, &mem, &one, 10_000);
+    try std.testing.expectEqual(@as(u32, 1), data[0]);
+}
