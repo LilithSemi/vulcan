@@ -118,8 +118,23 @@ pub const Warp = struct {
     /// What `mscratch` reads: one past the top of this hart's own scratch slice. Zero on a core
     /// built with no scratch, same as the hardware.
     stack_top: u32 = 0,
+    /// Cycles the run has taken: one per step, plus `stall_cycles` for each memory access. Equal
+    /// to the step count until a caller sets a stall.
+    cycles: u64 = 0,
     /// The code of the fault the kernel retired with, when it did. Set by the model.
     fault_code: u32 = 0,
+    /// EXTRA cycles a memory access costs beyond its one step, so a caller can read a cost out of
+    /// a run rather than only a count. Zero is the default, where a cycle is a step and the model
+    /// behaves as it always has.
+    ///
+    /// Nothing here knows the real figure. Solving this model's step counts against render
+    /// intervals from the eight-warp simulation puts it near 51, and that number is worth only
+    /// what its provenance says: the two sides came from DIFFERENT BINARIES, the pre-remat side is
+    /// ONE interval with no spread, and a third of each render here is the one-time table setup.
+    /// The SHAPE is the solid part, since treating every access alike fits the two solutions to 8
+    /// percent where charging spills alone leaves them 35 apart: the stall is tens of cycles and
+    /// it does not depend on which kind of access makes it.
+    stall_cycles: u32 = 0,
     /// What `scratchsize` reads: the bytes in this hart's own slice. A test sets it SMALLER than
     /// the profile to stand in for a core whose region does not fit the kernel.
     scratch_bytes: u32 = 0,
@@ -207,6 +222,14 @@ pub fn run(code: []const u32, mem: *Memory, warp: *Warp, budget: usize) Error!us
 
 fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
     const opcode = word & 0x7F;
+    // Every step is one cycle, and a memory access adds what the caller says it costs. The four
+    // opcodes here are the scalar load and store and the per-lane pair; an atomic is a load and a
+    // store at one address and is charged once.
+    warp.cycles +%= 1;
+    switch (opcode) {
+        0b0000011, 0b0100011, 0b0000111, 0b0100111, 0b0101111 => warp.cycles +%= warp.stall_cycles,
+        else => {},
+    }
     const rd: u5 = @intCast((word >> 7) & 0x1F);
     const rs1: u5 = @intCast((word >> 15) & 0x1F);
     const rs2: u5 = @intCast((word >> 20) & 0x1F);

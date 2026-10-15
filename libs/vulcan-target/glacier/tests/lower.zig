@@ -5242,3 +5242,41 @@ test "the warp model decodes every word this backend can emit" {
         try std.testing.expectEqual(@as(u32, glacier.encode.fault_compiler_bug), one.fault_code);
     }
 }
+
+test "the model charges a memory access what the caller says it costs" {
+    // The step count is instructions, which is low on what removing a memory access is worth. A
+    // caller that knows the stall can read a cost out of the same run instead.
+    const allocator = std.testing.allocator;
+    var f = try buildSumKernel(allocator, 8);
+    defer f.deinit();
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [8 + 1 + scratch_words]u32 = @splat(0);
+    for (0..8) |i| data[i] = @intCast(i + 1);
+
+    const stride = glacier.encode.Profile.@"gc1.n".scratchBytes();
+    const scratch_base = data_base + 9 * 4;
+    var mem: warp.Memory = .{
+        .base = data_base,
+        .words = &data,
+        .scratch = .{ .base = scratch_base, .stride = stride, .harts = 1 },
+    };
+    var free: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .stack_top = scratch_base + stride, .scratch_bytes = stride };
+    const steps = try warp.run(words, &mem, &free, budget);
+    // With the default of zero, a cycle IS a step.
+    try std.testing.expectEqual(@as(u64, steps), free.cycles);
+
+    var charged: warp.Warp = .{
+        .hart_id = 0,
+        .hart_count = 1,
+        .stack_top = scratch_base + stride,
+        .scratch_bytes = stride,
+        .stall_cycles = 51,
+    };
+    _ = try warp.run(words, &mem, &charged, budget);
+    // Eight loads and the store it writes, so nine accesses at fifty-one apiece and nothing else
+    // moves.
+    try std.testing.expectEqual(free.cycles + 9 * 51, charged.cycles);
+}
