@@ -5699,25 +5699,26 @@ test "the generated rasteriser packs four float colour components and reads the 
 test "the rasteriser refuses what it cannot generate, and says what" {
     const allocator = std.testing.allocator;
 
-    // A body with control flow of its own.
+    // A body whose first block is a loop header. That block becomes the span, which is already the
+    // header of the warp-step loop, and one block cannot carry two sets of loop parameters.
     {
         var f = Function.init(allocator);
         defer f.deinit();
         try markFragment(&f);
         const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
         const entry = try f.appendBlock();
-        const tail = try f.appendBlock();
+        const again = try f.appendBlock();
         const colour = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
         const out = try colourOut(&f, entry, 0);
         try f.appendStore(entry, colour, out);
-        try f.setJump(entry, tail, &.{});
-        f.setTerminator(tail, .{ .ret = ir.function.Ret.none() });
+        try f.setJump(entry, again, &.{});
+        try f.setJump(again, entry, &.{});
         var why: glacier.isel.Refusal = .{};
         try std.testing.expectError(
             error.Unsupported,
             glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
         );
-        try std.testing.expect(std.mem.indexOf(u8, why.reason, "control flow of its own") != null);
+        try std.testing.expect(std.mem.indexOf(u8, why.reason, "first block is a loop header") != null);
     }
 
     // A body that reads an interpolated attribute, which nothing interpolates yet.
@@ -5762,7 +5763,7 @@ test "the rasteriser refuses what it cannot generate, and says what" {
             error.Unsupported,
             glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
         );
-        try std.testing.expect(std.mem.indexOf(u8, why.reason, "neither one word nor four") != null);
+        try std.testing.expect(std.mem.indexOf(u8, why.reason, "a part of a colour") != null);
     }
 }
 
@@ -5916,4 +5917,81 @@ test "an integer converts to f32 and not to an f16 sitting in an f32 register" {
     // The same word as unsigned and as signed: 4294967295 against -1.
     try std.testing.expectEqual(@as(u32, 0x4F800000), data[19]);
     try std.testing.expectEqual(@as(u32, 0xBF800000), data[35]);
+}
+
+/// A fragment body that branches on the coordinate and writes a different colour in each arm. The
+/// branch varies per lane, so the pass that handles every other kernel if-converts it, and each
+/// arm's masked store carries the coverage as well as the arm's own mask.
+fn branchingBody(allocator: std.mem.Allocator, packed_word: bool) !Function {
+    var f = Function.init(allocator);
+    errdefer f.deinit();
+    try markFragment(&f);
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const bool_t = try f.types.intern(.bool);
+    const entry = try f.appendBlock();
+    const near = try f.appendBlock();
+    const far = try f.appendBlock();
+    const coord = try f.appendBlockParam(entry, f32_t);
+    try gpu.attrs.setBuiltin(&f, coord, .frag_coord);
+    try f.addAttr(.{ .value = coord }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "bicomp",
+        .value = .{ .int = 0 },
+    } });
+    const edge = try f.appendInst(entry, f32_t, .{ .fconst = 8 });
+    const left = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = coord, .rhs = edge } });
+    try f.appendIf(entry, left, .{ .target = near }, .{ .target = far });
+    if (packed_word) {
+        for ([2]ir.function.Block{ near, far }, [2]i64{ 0x00FF0000, 0x000000FF }) |block, word| {
+            const colour = try f.appendInst(block, u32_t, .{ .iconst = word });
+            const out = try colourOut(&f, block, 0);
+            try f.appendStore(block, colour, out);
+            f.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+        }
+        return f;
+    }
+    for ([2]ir.function.Block{ near, far }, [2][4]f64{ .{ 1, 0, 0, 1 }, .{ 0, 0, 1, 1 } }) |block, parts| {
+        for (parts, 0..) |part, i| {
+            const component = try f.appendInst(block, f32_t, .{ .fconst = part });
+            const out = try colourOut(&f, block, @intCast(i));
+            try f.appendStore(block, component, out);
+        }
+        f.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+    }
+    return f;
+}
+
+test "the generated rasteriser keeps a fragment body's own branch" {
+    const allocator = std.testing.allocator;
+    const area = raster_width * raster_height;
+    for ([2]bool{ true, false }) |packed_word| {
+        var f = try branchingBody(allocator, packed_word);
+        defer f.deinit();
+        var why: glacier.isel.Refusal = .{};
+        const code = glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why) catch |e| {
+            std.debug.print("REFUSED {any}: {s} on {s} block {d} index {d}\n", .{ e, why.reason, why.opcode, why.block, why.index });
+            return e;
+        };
+        defer allocator.free(code);
+
+        const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
+        defer allocator.free(data);
+        @memset(data, 0);
+        writeRasterVertices(data);
+        try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+
+        const near: u32 = if (packed_word) 0x00FF0000 else 0xFFFF0000;
+        const far: u32 = if (packed_word) 0x000000FF else 0xFF0000FF;
+        // Row 0 runs the whole width of the triangle, so it holds both arms.
+        try std.testing.expectEqual(near, data[0]);
+        try std.testing.expectEqual(near, data[7]);
+        try std.testing.expectEqual(far, data[8]);
+        try std.testing.expectEqual(far, data[30]);
+        // A row further down, where the triangle is narrower, still takes the near arm at its left.
+        try std.testing.expectEqual(near, data[11 * raster_width]);
+        // And nothing outside the triangle takes either.
+        try std.testing.expectEqual(@as(u32, 0), data[23 * raster_width + 31]);
+        try std.testing.expectEqual(@as(u32, 0), data[31]);
+    }
 }
