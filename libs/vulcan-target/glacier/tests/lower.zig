@@ -2559,9 +2559,10 @@ test "a store in the else arm takes the complement of the condition" {
     }
 }
 
-test "a store in the else arm of a float compare is refused" {
-    // `!(a < b)` is not `a >= b` when either is a NaN, so the complement this needs does not
-    // exist for a float compare and the diamond stays a branch.
+test "a float compare converts both arms, and an unordered lane takes the else one" {
+    // `!(a < b)` is not `a >= b` when either is a NaN, which is why the complement here is the MASK
+    // complement and not a flip of the operator: flipping would leave an unordered lane in neither
+    // arm. The mask complement is exactly the else arm, so lane 2 below stores like lane 1 does.
     const allocator = std.testing.allocator;
     var f = Function.init(allocator);
     defer f.deinit();
@@ -2592,7 +2593,18 @@ test "a store in the else arm of a float compare is refused" {
     try f.setJump(else_b, join, &.{});
     f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
 
-    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    const code = try compile(allocator, &f);
+    defer allocator.free(code);
+    var data: [64]u32 = @splat(0);
+    data[0] = @bitCast(@as(f32, 1.0)); // below, so the then arm, which stores nothing
+    data[1] = @bitCast(@as(f32, 3.0)); // above
+    data[2] = 0x7FC00000; // a quiet NaN, unordered against everything
+    data[3] = @bitCast(@as(f32, 2.0)); // equal, which is not below
+    try runOnce(code, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.0))), data[0]);
+    try std.testing.expectEqual(@as(u32, 0xCC), data[1]);
+    try std.testing.expectEqual(@as(u32, 0xCC), data[2]);
+    try std.testing.expectEqual(@as(u32, 0xCC), data[3]);
 }
 
 test "a warp-uniform branch keeps its branch instead of running both arms" {

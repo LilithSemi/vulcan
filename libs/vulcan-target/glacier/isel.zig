@@ -2740,16 +2740,17 @@ fn flatten(
     } else null;
 
     // Nothing is touched until every predicate is known to be usable as a mask, so a refusal
-    // leaves the function alone.
+    // leaves the function alone. What a mask cannot be built from is a WARP-UNIFORM float compare:
+    // there is no scalar FPU, and `asMask` rebuilds a uniform INTEGER compare per lane and has no
+    // way to rebuild that one. The else side needs no more than this. `appendComplement` flips the
+    // operator of an integer compare and takes the mask complement of anything else, and the mask
+    // complement is the RIGHT answer for a float: NOT (a < b) is true for an unordered pair, which
+    // is exactly the else arm, where flipping `lt` to `ge` would leave both arms unrun.
     for (r.inside[0..r.count]) |b| {
         for (flows.items[0..flows.count]) |src| {
-            if (src.sideTo(b)) |side| {
-                const cond = (src.cond orelse continue);
-                if (!maskable(func, cond, divergent)) return false;
-                if (side == 1 and varies(divergent, cond) and
-                    complementOf(func, cond) == null and !hasDiscardParam(func))
-                    return false;
-            }
+            if (src.sideTo(b) == null) continue;
+            const cond = src.cond orelse continue;
+            if (!maskable(func, cond, divergent)) return false;
         }
     }
 
