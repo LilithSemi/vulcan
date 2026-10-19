@@ -5751,3 +5751,110 @@ test "the rasteriser refuses what it cannot generate, and says what" {
         try std.testing.expect(std.mem.indexOf(u8, why.reason, "neither one word nor four") != null);
     }
 }
+
+/// The first generic varying slot, which both stages agree on: a vertex Location writes it and a
+/// fragment Location reads the same number.
+const attr_generic0: u32 = 0x80;
+
+/// A fragment body that reads one interpolated attribute and writes it as the red component.
+fn attributeBody(allocator: std.mem.Allocator) !Function {
+    var f = Function.init(allocator);
+    errdefer f.deinit();
+    try markFragment(&f);
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const entry = try f.appendBlock();
+    const shade = try f.appendBlockParam(entry, f32_t);
+    try f.addAttr(.{ .value = shade }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "attr",
+        .value = .{ .int = attr_generic0 },
+    } });
+    const none = try f.appendInst(entry, f32_t, .{ .fconst = 0 });
+    const full = try f.appendInst(entry, f32_t, .{ .fconst = 1 });
+    for ([4]Value{ shade, none, none, full }, 0..) |component, i| {
+        const out = try colourOut(&f, entry, @intCast(i));
+        try f.appendStore(entry, component, out);
+    }
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    return f;
+}
+
+fn writeRasterAttribute(data: []u32, corners: [3]f32) void {
+    const stride = glacier.isel.vertex_output_stride / 4;
+    const verts = data[raster_width * raster_height ..];
+    for (corners, 0..) |value, i| {
+        verts[i * stride + attr_generic0 / 4] = @bitCast(value);
+    }
+}
+
+test "the generated rasteriser steps an interpolated attribute across the triangle" {
+    const allocator = std.testing.allocator;
+    var f = try attributeBody(allocator);
+    defer f.deinit();
+    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    const area = raster_width * raster_height;
+    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
+    defer allocator.free(data);
+
+    // The same value at all three corners. Both gradients come out zero, so this says the solve
+    // carries the base value through rather than that it interpolates.
+    @memset(data, 0);
+    writeRasterVertices(data);
+    writeRasterAttribute(data, .{ 0.5, 0.5, 0.5 });
+    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+    try std.testing.expectEqual(@as(u32, 0xFF7F0000), data[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF7F0000), data[5 * raster_width + 3]);
+
+    // Zero at the first corner and one at the other two, so the attribute rises along the row and
+    // down the column. The ends are exact and the middle is left to the arithmetic, which is what
+    // a tolerance is for.
+    @memset(data, 0);
+    writeRasterVertices(data);
+    writeRasterAttribute(data, .{ 0, 1, 1 });
+    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), data[0]);
+    var last: u32 = 0;
+    for (0..30) |column| {
+        const red = (data[column] >> 16) & 0xFF;
+        try std.testing.expect(red >= last);
+        last = red;
+    }
+    try std.testing.expect(last >= 240);
+    // The attribute reaches red alone. Nothing bleeds into green or blue.
+    for (0..30) |column| {
+        try std.testing.expectEqual(@as(u32, 0), data[column] & 0x0000FFFF);
+    }
+}
+
+test "the rasteriser refuses more attributes than one loop carries, by the number" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    try markFragment(&f);
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const entry = try f.appendBlock();
+    var sum = try f.appendInst(entry, f32_t, .{ .fconst = 0 });
+    for (0..9) |i| {
+        const varying = try f.appendBlockParam(entry, f32_t);
+        try f.addAttr(.{ .value = varying }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "attr",
+            .value = .{ .int = @intCast(attr_generic0 + i * 4) },
+        } });
+        sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = varying } });
+    }
+    const out = try colourOut(&f, entry, 0);
+    try f.appendStore(entry, sum, out);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{};
+    try std.testing.expectError(
+        error.Unsupported,
+        glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, why.reason, "more interpolated attributes") != null);
+    try std.testing.expectEqual(@as(u32, 9), why.wanted);
+    try std.testing.expectEqual(@as(u32, 8), why.limit);
+}

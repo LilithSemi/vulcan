@@ -810,32 +810,53 @@ fn constantColourByte(func: *const Function, value: Value) ?u32 {
     return @intFromFloat(@min(1.0, @max(0.0, constant)) * 255.0);
 }
 
-/// A screen coordinate as a float, for a core that decodes no integer-to-f32 convert.
+/// A small integer as a float, for a core that decodes no integer-to-f32 convert.
 ///
-/// The value goes in the mantissa of 2 raised to the 23rd and a subtraction takes the exponent
-/// away again, which is exact for every input below that. A screen coordinate is far below it. An
-/// f16 destination takes the convert the core does have.
-fn smallIntToFloat(func: *Function, block: Block, value: Value, ty: Type, u32_t: Type) Error!Value {
+/// The value goes in the mantissa of 2 raised to the 23rd and a subtraction takes the exponent away
+/// again, which is exact for every unsigned input below that. A SIGNED source is biased by 2 to the
+/// 22nd first, which halves the range and keeps all of it exact. A screen coordinate, and a
+/// difference of two of them, is far inside either. An f16 destination takes the convert the core
+/// does have.
+///
+/// `vfwcvt.f.f.v` widens an f16 exactly and looks like a cheaper road to the same place. It is not:
+/// the integer rounds to eleven bits of mantissa on the way in, so a coordinate above 2048 comes
+/// out wrong.
+fn smallIntToFloat(func: *Function, block: Block, value: Value, ty: Type, int_t: Type) Error!Value {
     if (func.types.type_kind(ty).float != .f32) {
         const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
         const signed = try func.appendInst(block, i32_t, .{ .unary = .{ .op = .reinterpret, .value = value } });
         return func.appendInst(block, ty, .{ .convert = .{ .value = signed } });
     }
-    const biased = try func.appendArithImm(block, u32_t, .bit_or, value, 0x4B000000);
-    const mantissa = try func.appendInst(block, ty, .{ .unary = .{ .op = .reinterpret, .value = biased } });
-    const exponent = try func.appendInst(block, ty, .{ .fconst = 8388608 });
-    return func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = mantissa, .rhs = exponent } });
+    const source = func.valueType(value);
+    const bias: i64 = if (isSigned(func, source)) 0x400000 else 0;
+    const shifted = if (bias == 0)
+        value
+    else
+        try func.appendArithImm(block, source, .add, value, bias);
+    const bits = if (func.valueType(shifted) == int_t)
+        shifted
+    else
+        try func.appendInst(block, int_t, .{ .unary = .{ .op = .reinterpret, .value = shifted } });
+    const placed = try func.appendArithImm(block, int_t, .bit_or, bits, 0x4B000000);
+    const mantissa = try func.appendInst(block, ty, .{ .unary = .{ .op = .reinterpret, .value = placed } });
+    const away = try func.appendInst(block, ty, .{ .fconst = @floatFromInt(0x800000 + bias) });
+    return func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = mantissa, .rhs = away } });
 }
 
-/// Where the generated rasteriser reads a vertex, inside the vertex output record. The vertex
-/// stage writes attribute slot 0 and slot 4, which is where `lowerVertexIO` puts them, and both
-/// hold SCREEN SPACE integers: a viewport transform belongs to the vertex stage.
-pub const raster_vertex_x_offset = 0;
-pub const raster_vertex_y_offset = 4;
+/// Where the generated rasteriser reads a vertex position, inside the vertex output record. This is
+/// the slot `lowerVertexIO` writes a position to, so the two stages agree without a convention of
+/// their own. What sits there must be SCREEN SPACE integers rather than the clip space a projection
+/// gives: the viewport transform and the perspective divide belong to the vertex stage.
+pub const raster_vertex_x_offset = 0x70;
+pub const raster_vertex_y_offset = 0x74;
 
 /// Where each colour component sits in a framebuffer word. Red is the third byte and blue is the
 /// first, the way the display reads them, and alpha goes in the byte above, which it ignores.
 const raster_colour_shift: [4]i64 = .{ 16, 8, 0, 24 };
+
+/// How many interpolated attributes one generated loop carries. Each one is a loop-carried value in
+/// two blocks, and a vector register holds one per lane, so the ceiling is register pressure.
+const raster_max_attributes = 8;
 
 /// Wrap a fragment body in a generated rasteriser, so the core walks the triangle itself.
 ///
@@ -845,6 +866,11 @@ const raster_colour_shift: [4]i64 = .{ 16, 8, 0, 24 };
 /// integer edge function, the sign of a cross product, and a pixel is covered when all three are
 /// non-negative. One pixel in x adds a constant to each edge and one row adds another, so the
 /// edges are stepped rather than evaluated and the per-pixel path holds no multiply at all.
+///
+/// An interpolated attribute is affine in x and y, so it steps the same way, one add per pixel. The
+/// steps come from the three vertex values and the triangle's area, which is one divide for the
+/// whole triangle. That interpolation is AFFINE, which is exact under an orthographic projection; a
+/// perspective projection needs 1/w at every pixel and the divider is one per core.
 ///
 /// The loop takes five launch arguments after the shader's own: the framebuffer, the vertex
 /// buffer, the width and height to walk, and the framebuffer pitch in bytes. A lane owns one
@@ -875,7 +901,10 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     const bool_t = try func.types.intern(.bool);
 
     // Everything this lowering cannot do, named before the function is touched, so a refusal
-    // leaves the caller's clone the way it arrived.
+    // leaves the caller's clone the way it arrived. The attributes are gathered on the way past.
+    var attr_param: [raster_max_attributes]Value = undefined;
+    var attr_slot: [raster_max_attributes]u32 = undefined;
+    var attrs: usize = 0;
     const original_params = try allocator.dupe(Value, func.blockParams(entry));
     defer allocator.free(original_params);
     for (original_params) |param| {
@@ -886,8 +915,17 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
         if (hasGpuKey(func, param, "discard_fn")) {
             return Refusal.whole(why, "a rasteriser for a fragment body that discards");
         }
-        if (gpuIntAttr(func, param, "attr") != null) {
-            return Refusal.whole(why, "a rasteriser for a fragment body that reads an interpolated attribute");
+        if (gpuIntAttr(func, param, "attr")) |slot| {
+            if (!isF32(func, func.valueType(param))) {
+                return Refusal.whole(why, "a rasteriser for an interpolated attribute that is not f32");
+            }
+            if (attrs == raster_max_attributes) {
+                return Refusal.tooBig(why, "a rasteriser for more interpolated attributes than one loop carries", attrs + 1, raster_max_attributes);
+            }
+            attr_param[attrs] = param;
+            attr_slot[attrs] = slot;
+            attrs += 1;
+            continue;
         }
         if (gpu.attrs.builtinOf(func, param)) |builtin| switch (builtin) {
             .frag_coord => if ((gpuIntAttr(func, param, "bicomp") orelse 0) > 1) {
@@ -983,6 +1021,52 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
         first[i] = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = along, .rhs = down } });
         step_x[i] = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = lanes_signed, .rhs = dy[i] } });
     }
+
+    // The attribute steps. Solving
+    //   a1 - a0 = gx * ux + gy * uy
+    //   a2 - a0 = gx * wx + gy * wy
+    // for the two gradients is the triangle's area under both, so the reciprocal is taken once and
+    // every attribute multiplies by it.
+    var attr_first: [raster_max_attributes]Value = undefined;
+    var attr_step_x: [raster_max_attributes]Value = undefined;
+    var attr_step_y: [raster_max_attributes]Value = undefined;
+    if (attrs > 0) {
+        const wx = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = vx[2], .rhs = vx[0] } });
+        const wy = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = vy[2], .rhs = vy[0] } });
+        const fux = try smallIntToFloat(func, entry, dx[0], f32_t, u32_t);
+        const fuy = try smallIntToFloat(func, entry, dy[0], f32_t, u32_t);
+        const fwx = try smallIntToFloat(func, entry, wx, f32_t, u32_t);
+        const fwy = try smallIntToFloat(func, entry, wy, f32_t, u32_t);
+        const across = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = fux, .rhs = fwy } });
+        const back = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = fuy, .rhs = fwx } });
+        const area = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .sub, .lhs = across, .rhs = back } });
+        const unit = try func.appendInst(entry, f32_t, .{ .fconst = 1 });
+        const inverse = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = unit, .rhs = area } });
+        // Where this lane's first pixel sits relative to vertex zero.
+        const from_x = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = lane_signed, .rhs = vx[0] } });
+        const from_y = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = origin, .rhs = vy[0] } });
+        const fx = try smallIntToFloat(func, entry, from_x, f32_t, u32_t);
+        const fy = try smallIntToFloat(func, entry, from_y, f32_t, u32_t);
+        const flanes = try smallIntToFloat(func, entry, lanes, f32_t, u32_t);
+        for (0..attrs) |a| {
+            var corner: [3]Value = undefined;
+            for (0..3) |i| {
+                const at = try appendOffset(func, entry, vertices, @intCast(i * vertex_output_stride + attr_slot[a]), u32_t);
+                corner[i] = try func.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+            }
+            const d1 = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .sub, .lhs = corner[1], .rhs = corner[0] } });
+            const d2 = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .sub, .lhs = corner[2], .rhs = corner[0] } });
+            const gx = try scaledDifference(func, entry, d1, fwy, d2, fuy, inverse, f32_t);
+            const gy = try scaledDifference(func, entry, d2, fux, d1, fwx, inverse, f32_t);
+            const at_x = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = gx, .rhs = fx } });
+            const at_y = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = gy, .rhs = fy } });
+            const corner_x = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = corner[0], .rhs = at_x } });
+            attr_first[a] = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = corner_x, .rhs = at_y } });
+            attr_step_x[a] = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = gx, .rhs = flanes } });
+            attr_step_y[a] = gy;
+        }
+    }
+
     const top = try func.appendInst(entry, u32_t, .{ .iconst = 0 });
     // The span tests after it writes, so a draw with no rows has to turn back here. The width
     // needs no such test: a pixel past the end of a row drops out with the coverage.
@@ -990,21 +1074,30 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     // A conditional carries both edges itself, so the block it ends may hold no terminator, and
     // the body left a `ret` on this one.
     func.terminatorPtr(entry).* = null;
+    var into_rows: [5 + raster_max_attributes]Value = undefined;
+    into_rows[0..5].* = .{ top, first[0], first[1], first[2], frame };
+    for (0..attrs) |a| into_rows[5 + a] = attr_first[a];
     try func.appendIf(
         entry,
         rows,
-        .{ .target = row_loop, .args = &.{ top, first[0], first[1], first[2], frame } },
+        .{ .target = row_loop, .args = into_rows[0 .. 5 + attrs] },
         .{ .target = done, .args = &.{} },
     );
 
-    // One iteration per row: the row, each edge at the row's first pixel, and the row's base.
+    // One iteration per row: the row, each edge at the row's first pixel, the row's base, and each
+    // attribute at the row's first pixel.
     const y = try func.appendBlockParam(row_loop, u32_t);
     const row0 = try func.appendBlockParam(row_loop, i32_t);
     const row1 = try func.appendBlockParam(row_loop, i32_t);
     const row2 = try func.appendBlockParam(row_loop, i32_t);
     const row_base = try func.appendBlockParam(row_loop, ptr_t);
+    var attr_row: [raster_max_attributes]Value = undefined;
+    for (0..attrs) |a| attr_row[a] = try func.appendBlockParam(row_loop, f32_t);
     const row_start = try func.appendInst(row_loop, u32_t, .{ .iconst = 0 });
-    try func.setJump(row_loop, span, &.{ row_start, row0, row1, row2 });
+    var into_span: [4 + raster_max_attributes]Value = undefined;
+    into_span[0..4].* = .{ row_start, row0, row1, row2 };
+    for (0..attrs) |a| into_span[4 + a] = attr_row[a];
+    try func.setJump(row_loop, span, into_span[0 .. 4 + attrs]);
 
     // One iteration per warp step along the row. Coverage is every edge non-negative, and the
     // lowering has `lt` and not `ge`, so it is three compares, two ORs and a NOT.
@@ -1012,6 +1105,16 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     const edge0 = try func.appendBlockParam(span, i32_t);
     const edge1 = try func.appendBlockParam(span, i32_t);
     const edge2 = try func.appendBlockParam(span, i32_t);
+    for (0..attrs) |a| {
+        const here = try func.appendBlockParam(span, f32_t);
+        func.replaceAllUses(attr_param[a], here);
+        try func.addAttr(.{ .value = attr_param[a] }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "lowered_graphics_input",
+            .value = .flag,
+        } });
+        attr_param[a] = here;
+    }
     const zero = try func.appendInst(span, i32_t, .{ .iconst = 0 });
     const left0 = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = edge0, .rhs = zero } });
     const left1 = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = edge1, .rhs = zero } });
@@ -1069,8 +1172,8 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
             // A constant component folds here. The core has no scalar float unit, so the clamp
             // on a warp-uniform component would be a float compare it cannot do, and a colour
             // the shader states outright should cost nothing per pixel anyway.
-            if (constantColourByte(func, component)) |byte| {
-                constants |= byte << @intCast(raster_colour_shift[i]);
+            if (constantColourByte(func, component)) |value| {
+                constants |= value << @intCast(raster_colour_shift[i]);
                 continue;
             }
             if (range == null) {
@@ -1101,16 +1204,24 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
             try func.appendInst(span, u32_t, .{ .iconst = constants });
         try func.appendStoreMasked(span, pixel_word, pixel, covered);
     }
+
     // Step the span by one warp, and the row by one pitch.
     const next_x = try func.appendInst(span, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = lanes } });
     const next0 = try func.appendInst(span, i32_t, .{ .arith = .{ .op = .add, .lhs = edge0, .rhs = step_x[0] } });
     const next1 = try func.appendInst(span, i32_t, .{ .arith = .{ .op = .add, .lhs = edge1, .rhs = step_x[1] } });
     const next2 = try func.appendInst(span, i32_t, .{ .arith = .{ .op = .add, .lhs = edge2, .rhs = step_x[2] } });
+    var along_span: [4 + raster_max_attributes]Value = undefined;
+    along_span[0..4].* = .{ next_x, next0, next1, next2 };
+    for (0..attrs) |a| {
+        along_span[4 + a] = try func.appendInst(span, f32_t, .{
+            .arith = .{ .op = .add, .lhs = attr_param[a], .rhs = attr_step_x[a] },
+        });
+    }
     const more_x = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = next_x, .rhs = width } });
     try func.appendIf(
         span,
         more_x,
-        .{ .target = span, .args = &.{ next_x, next0, next1, next2 } },
+        .{ .target = span, .args = along_span[0 .. 4 + attrs] },
         .{ .target = next_row, .args = &.{} },
     );
 
@@ -1119,14 +1230,29 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     const down1 = try func.appendInst(next_row, i32_t, .{ .arith = .{ .op = .sub, .lhs = row1, .rhs = dx[1] } });
     const down2 = try func.appendInst(next_row, i32_t, .{ .arith = .{ .op = .sub, .lhs = row2, .rhs = dx[2] } });
     const next_base = try func.appendInst(next_row, ptr_t, .{ .arith = .{ .op = .add, .lhs = row_base, .rhs = pitch } });
+    var down_row: [5 + raster_max_attributes]Value = undefined;
+    down_row[0..5].* = .{ next_y, down0, down1, down2, next_base };
+    for (0..attrs) |a| {
+        down_row[5 + a] = try func.appendInst(next_row, f32_t, .{
+            .arith = .{ .op = .add, .lhs = attr_row[a], .rhs = attr_step_y[a] },
+        });
+    }
     const more_y = try func.appendInst(next_row, bool_t, .{ .icmp = .{ .op = .lt, .lhs = next_y, .rhs = height } });
     try func.appendIf(
         next_row,
         more_y,
-        .{ .target = row_loop, .args = &.{ next_y, down0, down1, down2, next_base } },
+        .{ .target = row_loop, .args = down_row[0 .. 5 + attrs] },
         .{ .target = done, .args = &.{} },
     );
     func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+}
+
+/// `(a * b - c * d) * scale`, which is both attribute gradients with the operands swapped around.
+fn scaledDifference(func: *Function, block: Block, a: Value, b: Value, c: Value, d: Value, scale: Value, ty: Type) Error!Value {
+    const left = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const right = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = c, .rhs = d } });
+    const whole = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = left, .rhs = right } });
+    return func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = whole, .rhs = scale } });
 }
 
 fn isSamplerFunction(func: *const Function, value: Value) bool {
