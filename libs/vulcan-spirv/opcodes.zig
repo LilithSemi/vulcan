@@ -16,6 +16,7 @@ pub const MemberDecorate = 72;
 // Module setup.
 pub const EntryPoint = 15;
 pub const ExecutionMode = 16;
+pub const ExecutionModeId = 331;
 pub const Capability = 17;
 pub const MemoryModel = 14;
 pub const Source = 3;
@@ -67,6 +68,7 @@ pub const TypeFloat = 22;
 pub const TypeVector = 23;
 pub const TypeMatrix = 24; // `cols` column vectors of a vector type
 pub const TypeImage = 25;
+pub const TypeSampler = 26;
 pub const TypeSampledImage = 27;
 pub const TypeArray = 28;
 pub const TypeRuntimeArray = 29;
@@ -106,6 +108,24 @@ pub const Image = 100;
 /// INTEGER coordinate of the given LOD - no sampler/filtering (GLSL texelFetch). The reader lowers
 /// it to a host fetch call.
 pub const ImageFetch = 95;
+
+/// `OpImageRead resultType result image coordinate [imageOperands]`: read one
+/// texel from a storage image at integer coordinates.
+pub const ImageRead = 98;
+
+/// `OpImageWrite image coordinate texel [imageOperands]`: write one texel to
+/// a storage image at integer coordinates.
+pub const ImageWrite = 99;
+
+/// `OpImageQuerySizeLod resultType result image level`: query the dimensions
+/// of one sampled-image mip level.
+pub const ImageQuerySizeLod = 103;
+
+/// `OpImageQuerySize resultType result image`: query storage-image dimensions.
+pub const ImageQuerySize = 104;
+
+/// `OpImageQueryLevels resultType result image`: query sampled-image mip levels.
+pub const ImageQueryLevels = 106;
 
 /// `OpTypeImage` Dim operand (subset the frontend emits).
 pub const Dim = struct {

@@ -50,6 +50,7 @@ fn form(opcode: u16) Form {
         op.TypeVector => .{ .name = "OpTypeVector", .result = .result, .fixed = &.{ .id, .lit } },
         op.TypeMatrix => .{ .name = "OpTypeMatrix", .result = .result, .fixed = &.{ .id, .lit } },
         op.TypeImage => .{ .name = "OpTypeImage", .result = .result, .fixed = &.{ .id, .lit, .lit, .lit, .lit, .lit, .lit }, .rest = .lit },
+        op.TypeSampler => .{ .name = "OpTypeSampler", .result = .result },
         op.TypeSampledImage => .{ .name = "OpTypeSampledImage", .result = .result, .fixed = &.{.id} },
         op.TypeArray => .{ .name = "OpTypeArray", .result = .result, .fixed = &.{ .id, .id } },
         op.TypeRuntimeArray => .{ .name = "OpTypeRuntimeArray", .result = .result, .fixed = &.{.id} },
@@ -84,6 +85,7 @@ fn form(opcode: u16) Form {
         op.Variable => .{ .name = "OpVariable", .result = .typed, .fixed = &.{.storage_class}, .rest = .id },
         op.Load => .{ .name = "OpLoad", .result = .typed, .fixed = &.{.id}, .rest = .lit },
         op.Store => .{ .name = "OpStore", .fixed = &.{ .id, .id }, .rest = .lit },
+        op.ImageWrite => .{ .name = "OpImageWrite", .fixed = &.{ .id, .id, .id }, .rest = .lit },
         op.AccessChain => .{ .name = "OpAccessChain", .result = .typed, .fixed = &.{.id}, .rest = .id },
 
         // Composites (literal component/index tails).
@@ -165,6 +167,10 @@ fn namedArithmetic(opcode: u16) Form {
         op.ImageGather => "OpImageGather",
         op.Image => "OpImage",
         op.ImageFetch => "OpImageFetch",
+        op.ImageRead => "OpImageRead",
+        op.ImageQuerySizeLod => "OpImageQuerySizeLod",
+        op.ImageQuerySize => "OpImageQuerySize",
+        op.ImageQueryLevels => "OpImageQueryLevels",
         op.DPdx => "OpDPdx",
         op.DPdy => "OpDPdy",
         op.Fwidth => "OpFwidth",

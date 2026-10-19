@@ -47,6 +47,7 @@ const TypeInfo = union(enum) {
     vector: VecType, // a SIMD vector of a scalar component type
     matrix: MatType, // a matrix: `cols` column vectors of type `col_vec`
     image, // an OpTypeImage (the opaque image resource of a sampler)
+    sampler, // an OpTypeSampler (opaque sampler state)
     sampled_image, // an OpTypeSampledImage (a combined image+sampler)
     @"struct", // members tracked via Module.members
     other, // not lowered
@@ -87,14 +88,14 @@ const Mat = struct { comps: [16]Value = undefined, cols: u8 = 0, rows: u8 = 0 };
 /// knows to fetch each element from `base + col*stride + row*4` (column-major) or
 /// `base + row*stride + col*4` (row-major), where `base` is the IR pointer Value the
 /// chain produced. `elem` is the (scalar float) element Vulcan type.
-const MatPtr = struct { base: Value, cols: u8, rows: u8, stride: u32, row_major: bool, elem: Type };
+const MatPtr = struct { base: Value, descriptor: ?Value, cols: u8, rows: u8, stride: u32, row_major: bool, elem: Type };
 
 /// A pointer to a vector laid out in a buffer (UBO / SSBO). An `OpAccessChain` ending at
 /// a vector member - including a dynamic array element like `u.pos[gl_VertexIndex]`,
 /// where the runtime index was folded into the pointer arithmetic - records this so the
 /// following `OpLoad %vecN` fetches each component from `base + comp*elemSize` into a
 /// scalarized `Vec`. `len` is the component count, `elem` the (scalar) component type.
-const VecPtr = struct { base: Value, len: u8, elem: Type };
+const VecPtr = struct { base: Value, descriptor: ?Value, len: u8, elem: Type };
 
 /// An `OpAccessChain` into a tracked Function-storage vector local addressing one component:
 /// the local variable id and the constant component index. A following `OpLoad` yields that
@@ -126,13 +127,14 @@ pub const GradDesc = struct { slot: u32, axis: enum { x, y } };
 
 /// How a module-level `OpVariable` is used. `input`/`output` are the graphics attribute
 /// interface: an Input variable feeds a vertex/fragment shader, an Output variable is its
-/// product (clip-space position, fragment color). `sampler` is a combined-image-sampler
-/// (an `OpVariable` in the UniformConstant storage class typed `OpTypeSampledImage`): it
-/// reaches the shader as a descriptor pointer param, exactly like a buffer.
+/// product (clip-space position, fragment color). `sampler` is an image resource. It can
+/// use `OpTypeSampledImage` or `OpTypeImage`, and reaches the shader as a descriptor
+/// pointer param, exactly like a buffer.
 /// `vertex_index` / `instance_index` are vertex-shader BuiltIn INPUTs (gl_VertexIndex /
 /// gl_InstanceIndex): each becomes a synthesized i32 entry param the dispatch supplies
-/// per vertex, exactly like the compute `global_id`.
-const VarKind = enum { buffer, sampler, shared, global_id, workgroup_id, num_workgroups, local_id, workgroup_size, vertex_index, instance_index, input, output, other };
+/// per vertex, exactly like the compute `global_id`. `sampler_state` is an opaque
+/// `OpTypeSampler`. The host merges its state into the image descriptor before launch.
+const VarKind = enum { buffer, sampler, sampler_state, shared, global_id, workgroup_id, num_workgroups, local_id, workgroup_size, vertex_index, instance_index, input, output, other };
 
 /// The shader stage an `OpEntryPoint` selects. Lowering produces the attribute interface
 /// for graphics stages, the kernel ABI for compute.
@@ -153,6 +155,7 @@ const BlockInfo = struct {
 
 /// Module state the lowering needs, indexed by SPIR-V id.
 const Module = struct {
+    allocator: std.mem.Allocator,
     types: []?TypeInfo,
     var_kind: []VarKind, // id -> how an OpVariable is used (.other if not a var)
     binding: []u32, // id -> the Binding decoration (a descriptor's Vulkan binding number)
@@ -193,6 +196,7 @@ const Module = struct {
     mat_of: []Mat, // id -> a scalarized matrix value's elements (cols 0 = not a matrix)
     mat_ptr: []?MatPtr, // access-chain result id -> matrix-in-memory layout (for OpLoad)
     vec_ptr: []?VecPtr, // access-chain result id -> vector-in-memory layout (for OpLoad)
+    buffer_descriptor: []?Value,
     // An access-chain result id -> the type its pointer points AT. Zig splits a chain in two (one
     // step to the struct member, a second to index the array), so the second chain's base is a
     // previous chain's result and not a variable. 0 means unknown.
@@ -264,6 +268,8 @@ const Module = struct {
     // exact texel at (x, y) of layer/slice z). ABI: `fn(desc, x:i32, y:i32, z:i32, lod:i32, out)`.
     sampler_fetch_array_fn: ?Value = null,
     sampler_fetch_3d_fn: ?Value = null,
+    storage_image_write_fn: ?Value = null,
+    image_size_fn: ?Value = null,
     // The synthesized host-math function-pointer entry param (lazily appended the first time
     // a transcendental ext-inst - pow / exp / log / sin / cos - is lowered). The CPU backend
     // calls it (`f32 math_fn(op:i32, a:f32, b:f32)`). A GPU backend ignores it and emits a
@@ -357,6 +363,15 @@ fn isSamplerVar(module: *const Module, id: u32) bool {
     if (pointee >= module.types.len) return false;
     return switch (module.types[pointee] orelse return false) {
         .sampled_image, .image => true,
+        else => false,
+    };
+}
+
+fn isSamplerStateVar(module: *const Module, id: u32) bool {
+    const pointee = module.var_pointee(id) orelse return false;
+    if (pointee >= module.types.len) return false;
+    return switch (module.types[pointee] orelse return false) {
+        .sampler => true,
         else => false,
     };
 }
@@ -460,6 +475,8 @@ pub const Options = struct {
     /// `Options.globals`). The name comes from the variable's `OpName`, so a module that does not
     /// name its buffers is refused under this option.
     buffers_as_globals: bool = false,
+    buffer_descriptors: bool = false,
+    nullable_image_descriptors: bool = false,
 };
 
 /// Lower the first function of the SPIR-V module in `words` to a fresh Vulcan IR
@@ -567,6 +584,7 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
     errdefer func.deinit();
 
     var module = Module{
+        .allocator = allocator,
         .types = types,
         .var_kind = var_kind,
         .type_image_dim = type_image_dim,
@@ -580,6 +598,7 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         .mat_of = undefined,
         .mat_ptr = undefined,
         .vec_ptr = undefined,
+        .buffer_descriptor = undefined,
         .chain_pointee = undefined,
         .local_is_vec = undefined,
         .local_vec = undefined,
@@ -620,6 +639,7 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
     // The workgroup dimensions an OpExecutionMode LocalSize declares. It stays null when the
     // module declares none, which keeps a bare scalar function free of kernel metadata.
     var local_size: ?[3]u32 = null;
+    var local_size_ids: ?[3]u32 = null;
     var pending_vars: std.ArrayList([2]u32) = .empty; // (var id, storage class)
     defer pending_vars.deinit(allocator);
 
@@ -698,6 +718,10 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
                 types[id] = .image; // [result, sampledType, Dim, Depth, Arrayed, MS, Sampled, Format, ...]
                 if (inst.operands.len >= 3) module.type_image_dim[id] = @intCast(inst.operands[2] & 0xff); // Dim
                 if (inst.operands.len >= 5) module.type_image_arrayed[id] = @intCast(inst.operands[4] & 0xff); // Arrayed
+            },
+            op.TypeSampler => {
+                const id = try idOperandAt(inst.operands, 0, bound);
+                types[id] = .sampler;
             },
             op.TypeSampledImage => {
                 const id = try idOperandAt(inst.operands, 0, bound);
@@ -794,6 +818,13 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
             op.ExecutionMode => if (inst.operands.len >= 5 and inst.operands[1] == op.ExecutionModeKind.local_size) {
                 local_size = .{ inst.operands[2], inst.operands[3], inst.operands[4] };
             },
+            op.ExecutionModeId => if (inst.operands.len >= 5 and inst.operands[1] == op.ExecutionModeKind.local_size_id) {
+                local_size_ids = .{
+                    try checkId(inst.operands[2], bound),
+                    try checkId(inst.operands[3], bound),
+                    try checkId(inst.operands[4], bound),
+                };
+            },
             op.Constant => {
                 const type_id = try operandAt(inst.operands, 0);
                 const result = try idOperandAt(inst.operands, 1, bound); // indexes const_val
@@ -842,6 +873,15 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         }
     }
     if (!in_function) return error.MalformedModule;
+    if (local_size_ids) |ids| {
+        var size: [3]u32 = undefined;
+        for (ids, &size) |id, *axis| {
+            const value = consts.get(id) orelse return error.MalformedModule;
+            if (value.bits == 0 or value.bits > std.math.maxInt(u32)) return error.MalformedModule;
+            axis.* = @intCast(value.bits);
+        }
+        local_size = size;
+    }
 
     // Classify variables now that all decorations and the stage are seen. A graphics
     // stage routes Input/Output variables to the attribute interface. A compute stage
@@ -870,6 +910,8 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
             // joins module.buffers in declaration order so it gets a pointer entry param.
             var_kind[id] = .sampler;
             try module.buffers.append(allocator, id);
+        } else if (class == op.StorageClass.uniform_constant and isSamplerStateVar(&module, id)) {
+            var_kind[id] = .sampler_state;
         } else if (class == op.StorageClass.storage_buffer or class == op.StorageClass.uniform or class == op.StorageClass.push_constant) {
             // Storage buffers, uniform blocks (UBOs), and push-constant blocks all reach
             // the shader the same way: a base pointer the shader reads at std-layout member
@@ -974,6 +1016,10 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     defer allocator.free(vec_ptr);
     @memset(vec_ptr, null);
     module.vec_ptr = vec_ptr;
+    const buffer_descriptor = try allocator.alloc(?Value, bound);
+    defer allocator.free(buffer_descriptor);
+    @memset(buffer_descriptor, null);
+    module.buffer_descriptor = buffer_descriptor;
     const chain_pointee = try allocator.alloc(u32, bound);
     defer allocator.free(chain_pointee);
     @memset(chain_pointee, 0);
@@ -1028,6 +1074,8 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     module.sampler_fetch_fn = null;
     module.sampler_fetch_array_fn = null;
     module.sampler_fetch_3d_fn = null;
+    module.storage_image_write_fn = null;
+    module.image_size_fn = null;
     module.math_fn = null;
     const input_comp_of = try allocator.alloc(?Value, bound);
     defer allocator.free(input_comp_of);
@@ -1143,7 +1191,15 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
             continue;
         }
         const p = try func.appendBlockParam(entry, module.ptr_t);
-        value_of[buf_id] = p;
+        const descriptor_backed = module.opts.buffer_descriptors and
+            module.var_kind[buf_id] == .buffer and
+            module.var_storage[buf_id] != op.StorageClass.push_constant;
+        if (descriptor_backed) {
+            value_of[buf_id] = try func.appendInst(entry, module.ptr_t, .{ .load = .{ .ptr = p } });
+            module.buffer_descriptor[buf_id] = p;
+        } else {
+            value_of[buf_id] = p;
+        }
         // Tag a combined-image-sampler descriptor param distinctly from a plain buffer
         // (UBO / SSBO / push-constant) param. Both are pointer params, but the host
         // backend must supply a TEXTURE descriptor for a sampler and the bound buffer's
@@ -1152,6 +1208,8 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         // FS that reads a UBO/push-constant would be fed the texture descriptor.
         if (module.var_kind[buf_id] == .sampler) {
             try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_desc", .value = .{ .int = 1 } } });
+            if (module.opts.nullable_image_descriptors)
+                try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "nullable_desc", .value = .flag } });
         } else {
             // A UBO, an SSBO and a push-constant block all hold standard-layout members, whose
             // offsets are multiples of four, in a buffer the API binds on at least a four-byte
@@ -1664,7 +1722,16 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             // semantics are ids of CONSTANTS rather than literals, so both are read back through
             // the constant table and a non-constant one is refused rather than guessed at.
             const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
-            const ptr = try valueOf(module, try operandAt(inst.operands, 2));
+            const ptr_id = try operandAt(inst.operands, 2);
+            const access = try checkedBufferPointer(
+                func,
+                module,
+                block,
+                try valueOf(module, ptr_id),
+                module.buffer_descriptor[ptr_id],
+                true,
+                @intCast(vulcanScalarSize(func, ty)),
+            );
             const scope = constantOperand(func, module, try operandAt(inst.operands, 3)) orelse return error.Unsupported;
             const semantics = constantOperand(func, module, try operandAt(inst.operands, 4)) orelse return error.Unsupported;
             var operand = try valueOf(module, try operandAt(inst.operands, 5));
@@ -1674,13 +1741,19 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 const zero = try func.appendInst(block, ty, .{ .iconst = 0 });
                 operand = try appendArith(func, block, ty, .sub, zero, operand);
             }
-            value_of[inst.operands[1]] = try func.appendAtomicRmw(block, .{
+            const old = try func.appendAtomicRmw(block, .{
                 .op = atomicOpOf(inst.opcode).?,
-                .ptr = ptr,
+                .ptr = access.pointer,
                 .value = operand,
                 .ordering = orderingOf(semantics),
                 .scope = scopeOf(scope) orelse return error.Unsupported,
             });
+            value_of[inst.operands[1]] = if (access.in_range) |in_range| blk: {
+                const zero = try func.appendInst(block, ty, .{ .iconst = 0 });
+                break :blk try func.appendInst(block, ty, .{
+                    .select = .{ .cond = in_range, .then = old, .@"else" = zero },
+                });
+            } else old;
         },
         op.Bitcast => {
             // Reinterpret the operand's bits as the result type (e.g. int <-> uint). Lowers
@@ -1725,6 +1798,8 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             } else {
                 value_of[result] = try valueOf(module, src);
             }
+            if (src < module.buffer_descriptor.len)
+                module.buffer_descriptor[result] = module.buffer_descriptor[src];
         },
         op.ExtInst => try lowerExtInst(allocator, func, module, block, inst),
         op.DPdx, op.DPdy, op.Fwidth => {
@@ -1798,6 +1873,8 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                     if (pt < module.type_image_dim.len) module.sampler_dim_of[result] = module.type_image_dim[pt];
                     if (pt < module.type_image_arrayed.len) module.sampler_arrayed_of[result] = module.type_image_arrayed[pt];
                 }
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .sampler_state) {
+                return;
             } else if (module.is_builtin_ptr[ptr_id]) {
                 // A load of gl_GlobalInvocationID.x is the synthesized invocation id.
                 value_of[result] = module.global_id_value orelse return error.MalformedModule;
@@ -1846,7 +1923,16 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 module.vec_of[result] = module.position_vec;
             } else {
                 const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
-                const ptr = value_of[ptr_id] orelse return error.MalformedModule;
+                var ptr = value_of[ptr_id] orelse return error.MalformedModule;
+                ptr = (try checkedBufferPointer(
+                    func,
+                    module,
+                    block,
+                    ptr,
+                    module.buffer_descriptor[ptr_id],
+                    false,
+                    @intCast(vulcanScalarSize(func, ty)),
+                )).pointer;
                 value_of[result] = try func.appendInst(block, ty, .{ .load = .{
                     .ptr = ptr,
                     .@"volatile" = isVolatile(inst.operands, 3),
@@ -1929,15 +2015,27 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 try storeOutputAttrib(func, module, block, ptr_id, val_id);
                 return;
             }
-            const ptr = try valueOf(module, ptr_id);
+            var ptr = try valueOf(module, ptr_id);
             const val = try valueOf(module, val_id);
+            ptr = (try checkedBufferPointer(
+                func,
+                module,
+                block,
+                ptr,
+                module.buffer_descriptor[ptr_id],
+                true,
+                @intCast(vulcanScalarSize(func, func.valueType(val))),
+            )).pointer;
             try func.appendStoreVol(block, val, ptr, isVolatile(inst.operands, 2));
         },
         op.SampledImage => {
             // [type, result, image, sampler]. A combined-image-sampler is already a
             // sampled image, so forward the image operand's descriptor pointer.
             const image_id = try operandAt(inst.operands, 2);
-            module.sampler_ptr_of[inst.operands[1]] = (if (image_id < module.sampler_ptr_of.len) module.sampler_ptr_of[image_id] else null) orelse return error.MalformedModule;
+            const result = try idOperandAt(inst.operands, 1, module.sampler_ptr_of.len);
+            module.sampler_ptr_of[result] = (if (image_id < module.sampler_ptr_of.len) module.sampler_ptr_of[image_id] else null) orelse return error.MalformedModule;
+            if (image_id < module.sampler_dim_of.len) module.sampler_dim_of[result] = module.sampler_dim_of[image_id];
+            if (image_id < module.sampler_arrayed_of.len) module.sampler_arrayed_of[result] = module.sampler_arrayed_of[image_id];
         },
         op.ImageSampleImplicitLod, op.ImageSampleExplicitLod => try lowerImageSample(func, module, block, inst),
         op.ImageSampleDrefImplicitLod, op.ImageSampleDrefExplicitLod => try lowerImageSampleShadow(func, module, block, inst),
@@ -1951,6 +2049,16 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             if (si < module.sampler_arrayed_of.len) module.sampler_arrayed_of[inst.operands[1]] = module.sampler_arrayed_of[si];
         },
         op.ImageFetch => try lowerImageFetch(func, module, block, inst),
+        op.ImageRead => try lowerImageFetch(func, module, block, inst),
+        op.ImageWrite => try lowerImageWrite(func, module, block, inst),
+        op.ImageQuerySizeLod, op.ImageQuerySize => try lowerImageSize(func, module, block, inst),
+        op.ImageQueryLevels => {
+            const result_type = try idOperandAt(inst.operands, 0, bound);
+            const result = try idOperandAt(inst.operands, 1, bound);
+            _ = try idOperandAt(inst.operands, 2, bound);
+            const result_scalar = scalarType(module.types, result_type) orelse return error.Unsupported;
+            module.value_of[result] = try func.appendInst(block, result_scalar, .{ .iconst = 1 });
+        },
         op.Variable => {
             const result = try idOperandAt(inst.operands, 1, bound);
             // A tracked Function-storage vector local is scalarized via local_vec (its
@@ -2634,6 +2742,7 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     else
         base_ptr;
     module.value_of[result] = result_ptr;
+    module.buffer_descriptor[result] = module.buffer_descriptor[base];
     // Record what this pointer points at, so a second chain can continue from it.
     if (result < module.chain_pointee.len) module.chain_pointee[result] = cur_type;
 
@@ -2647,6 +2756,7 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
         const stride = if (m.matrix_stride != 0) m.matrix_stride else @as(u32, col_vi.len) * 4;
         module.mat_ptr[result] = .{
             .base = result_ptr,
+            .descriptor = module.buffer_descriptor[result],
             .cols = mt.cols,
             .rows = col_vi.len,
             .stride = stride,
@@ -2662,8 +2772,67 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     // not a scalar, so it cannot be loaded as one Value).
     if (module.types[cur_type]) |ti| if (ti.asVector()) |vt| {
         const elem_ty = scalarType(module.types, vt.elem) orelse return error.Unsupported;
-        module.vec_ptr[result] = .{ .base = result_ptr, .len = vt.len, .elem = elem_ty };
+        module.vec_ptr[result] = .{
+            .base = result_ptr,
+            .descriptor = module.buffer_descriptor[result],
+            .len = vt.len,
+            .elem = elem_ty,
+        };
     };
+}
+
+const CheckedBufferPointer = struct {
+    pointer: Value,
+    in_range: ?Value,
+};
+
+fn checkedBufferPointer(func: *Function, module: *Module, block: Block, pointer: Value, descriptor: ?Value, write: bool, access_size: u32) Error!CheckedBufferPointer {
+    const desc = descriptor orelse return .{ .pointer = pointer, .in_range = null };
+    const size_ptr = try func.appendInst(block, module.ptr_t, .{
+        .arith_imm = .{ .op = .add, .lhs = desc, .imm = 4 },
+    });
+    const size = try func.appendInst(block, module.i32_t, .{ .load = .{ .ptr = size_ptr } });
+    const zero = try func.appendInst(block, module.i32_t, .{ .iconst = 0 });
+    const bool_t = try func.types.intern(.bool);
+    const present = try func.appendInst(block, bool_t, .{
+        .icmp = .{ .op = .ne, .lhs = size, .rhs = zero },
+    });
+    const base = try func.appendInst(block, module.ptr_t, .{ .load = .{ .ptr = desc } });
+    const size_minus_one = try func.appendInst(block, module.i32_t, .{
+        .arith_imm = .{ .op = .sub, .lhs = size, .imm = 1 },
+    });
+    const end = try func.appendInst(block, module.ptr_t, .{
+        .arith = .{ .op = .add, .lhs = base, .rhs = size_minus_one },
+    });
+    const last = try func.appendInst(block, module.ptr_t, .{
+        .arith_imm = .{ .op = .add, .lhs = pointer, .imm = access_size - 1 },
+    });
+    const at_or_after_base = try func.appendInst(block, bool_t, .{
+        .icmp = .{ .op = .ge, .lhs = pointer, .rhs = base },
+    });
+    const no_wrap = try func.appendInst(block, bool_t, .{
+        .icmp = .{ .op = .ge, .lhs = last, .rhs = pointer },
+    });
+    const before_end = try func.appendInst(block, bool_t, .{
+        .icmp = .{ .op = .le, .lhs = last, .rhs = end },
+    });
+    const present_and_low = try func.appendInst(block, bool_t, .{
+        .arith = .{ .op = .bit_and, .lhs = present, .rhs = at_or_after_base },
+    });
+    const no_overflow = try func.appendInst(block, bool_t, .{
+        .arith = .{ .op = .bit_and, .lhs = no_wrap, .rhs = before_end },
+    });
+    const in_range = try func.appendInst(block, bool_t, .{
+        .arith = .{ .op = .bit_and, .lhs = present_and_low, .rhs = no_overflow },
+    });
+    const fallback_ptr = try func.appendInst(block, module.ptr_t, .{
+        .arith_imm = .{ .op = .add, .lhs = desc, .imm = if (write) 12 else 8 },
+    });
+    const fallback = try func.appendInst(block, module.ptr_t, .{ .load = .{ .ptr = fallback_ptr } });
+    const selected = try func.appendInst(block, module.ptr_t, .{
+        .select = .{ .cond = in_range, .then = pointer, .@"else" = fallback },
+    });
+    return .{ .pointer = selected, .in_range = in_range };
 }
 
 /// Load a matrix stored in a buffer into a scalarized `Mat`. Each element (col j, row i)
@@ -2685,7 +2854,8 @@ fn loadMatrix(func: *Function, module: *Module, block: Block, result: u32, mp: M
                 const off_c = try func.appendInst(block, module.i32_t, .{ .iconst = @intCast(byte_off) });
                 break :blk try func.appendInst(block, module.ptr_t, .{ .arith = .{ .op = .add, .lhs = mp.base, .rhs = off_c } });
             } else mp.base;
-            out.comps[@as(usize, j) * mp.rows + i] = try func.appendInst(block, mp.elem, .{ .load = .{ .ptr = eptr } });
+            const read_ptr = (try checkedBufferPointer(func, module, block, eptr, mp.descriptor, false, elem_size)).pointer;
+            out.comps[@as(usize, j) * mp.rows + i] = try func.appendInst(block, mp.elem, .{ .load = .{ .ptr = read_ptr } });
         }
     }
     module.mat_of[result] = out;
@@ -2705,7 +2875,8 @@ fn loadVector(func: *Function, module: *Module, block: Block, result: u32, vp: V
             const off_c = try func.appendInst(block, module.i32_t, .{ .iconst = @intCast(byte_off) });
             break :blk try func.appendInst(block, module.ptr_t, .{ .arith = .{ .op = .add, .lhs = vp.base, .rhs = off_c } });
         } else vp.base;
-        out.comps[i] = try func.appendInst(block, vp.elem, .{ .load = .{ .ptr = eptr } });
+        const read_ptr = (try checkedBufferPointer(func, module, block, eptr, vp.descriptor, false, elem_size)).pointer;
+        out.comps[i] = try func.appendInst(block, vp.elem, .{ .load = .{ .ptr = read_ptr } });
     }
     module.vec_of[result] = out;
 }
@@ -2718,6 +2889,64 @@ fn loadVector(func: *Function, module: *Module, block: Block, result: u32, vp: V
 /// the gpr/fpr files do not collide. A GPU backend ignores `sampler_fn` and the call,
 /// emitting a TEX from the descriptor + coord instead.
 ///
+fn implicitImageLod(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    module: *Module,
+    block: Block,
+    desc: Value,
+    u: Value,
+    v: Value,
+) Error!Value {
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const dudx = try derivativeOf(allocator, func, module, block, u, .x, false);
+    const dudy = try derivativeOf(allocator, func, module, block, u, .y, false);
+    const dvdx = try derivativeOf(allocator, func, module, block, v, .x, false);
+    const dvdy = try derivativeOf(allocator, func, module, block, v, .y, false);
+    const width_ptr = try func.appendInst(block, module.ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = desc, .imm = 16 } });
+    const height_ptr = try func.appendInst(block, module.ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = desc, .imm = 20 } });
+    const width = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = width_ptr } });
+    const height = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = height_ptr } });
+    const ux = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = dudx, .rhs = width } });
+    const uy = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = dudy, .rhs = width } });
+    const vx = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = dvdx, .rhs = height } });
+    const vy = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = dvdy, .rhs = height } });
+    const len_x = try func.appendInst(block, f32_t, .{ .arith = .{
+        .op = .add,
+        .lhs = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = ux, .rhs = ux } }),
+        .rhs = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = vx, .rhs = vx } }),
+    } });
+    const len_y = try func.appendInst(block, f32_t, .{ .arith = .{
+        .op = .add,
+        .lhs = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = uy, .rhs = uy } }),
+        .rhs = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = vy, .rhs = vy } }),
+    } });
+    const difference = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = len_x, .rhs = len_y } });
+    const difference_bits = try func.appendInst(block, u32_t, .{ .unary = .{ .op = .reinterpret, .value = difference } });
+    const absolute_bits = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .bit_and, .lhs = difference_bits, .imm = 0x7fff_ffff } });
+    const absolute_difference = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = absolute_bits } });
+    const sum = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = len_x, .rhs = len_y } });
+    const total = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = absolute_difference } });
+    const half = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
+    const rho_squared = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = total, .rhs = half } });
+    // Pick the nearest integer mip without an integer-to-f32 conversion. GC1 only converts i32
+    // to f16, and converting the raw IEEE exponent bits through f16 would overflow. For level N,
+    // the nearest-level boundary is rho^2 = 2^(2N - 1). Descending selects keep the first matching
+    // level while naturally clamping magnification and very small gradients to level zero.
+    const bool_t = try func.types.intern(.bool);
+    var lod = try func.appendInst(block, f32_t, .{ .fconst = 0 });
+    var threshold_value: f64 = 2;
+    for (1..16) |level| {
+        const threshold = try func.appendInst(block, f32_t, .{ .fconst = threshold_value });
+        const below = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = rho_squared, .rhs = threshold } });
+        const selected = try func.appendInst(block, f32_t, .{ .fconst = @floatFromInt(level) });
+        lod = try func.appendInst(block, f32_t, .{ .select = .{ .cond = below, .then = lod, .@"else" = selected } });
+        threshold_value *= 4;
+    }
+    return lod;
+}
+
 /// Lower `OpImageSampleImplicitLod` / `OpImageSampleExplicitLod`:
 ///   [type, result, sampledImage, coord, (operands...)]
 /// The coord is a vec2 (scalarized). The result vec4 is built by calling the host
@@ -2753,10 +2982,10 @@ fn lowerImageSample(func: *Function, module: *Module, block: Block, inst: binary
     // The level-of-detail passed to the host sampler. OpImageSampleExplicitLod with the Lod image
     // operand (bit 0x2) carries an explicit LOD scalar (textureLod); everything else is implicit
     // sampling (texture()). For an implicit 2D sample the CPU sampler needs the rasterizer's
-    // derivative LOD (automatic mipmapping), so pass the IMPLICIT-LOD SENTINEL (a huge negative no
-    // real LOD uses) - the software sampler reads `desc.implicit_lod` instead. A vec3 implicit sample
-    // keeps 0.0 (the nvidia cube path uses this as an EXPLICIT LOD in its TEX.LL, and the raster
-    // computes no implicit LOD for cube/3D). The GPU 2D backends ignore the 5th arg (Auto-LOD TEX).
+    // derivative LOD (automatic mipmapping). Direct fragment attributes carry gradient metadata,
+    // so derive their nearest mip here. Other coordinate expressions pass the implicit-LOD sentinel
+    // and let the software sampler use `desc.implicit_lod`. A vec3 implicit sample keeps 0.0 because
+    // the rasterizer does not yet compute cube or 3D gradients. GPU 2D backends may ignore this arg.
     const implicit_lod_sentinel: f64 = -1.0e30;
     const lod: Value = blk: {
         if (inst.opcode == op.ImageSampleExplicitLod and inst.operands.len >= 6) {
@@ -2764,6 +2993,9 @@ fn lowerImageSample(func: *Function, module: *Module, block: Block, inst: binary
             if (image_operands & 0x2 != 0) { // ImageOperands.Lod
                 if (module.value_of[try checkId(inst.operands[5], bound)]) |lv| break :blk lv;
             }
+        }
+        if (!is_vec3 and module.attr_slot_of.get(u) != null and module.attr_slot_of.get(v) != null) {
+            break :blk try implicitImageLod(module.allocator, func, module, block, desc_ptr, u, v);
         }
         break :blk try func.appendInst(block, f32_t, .{ .fconst = if (is_vec3) 0 else implicit_lod_sentinel });
     };
@@ -2842,6 +3074,13 @@ fn lowerImageSampleShadow(func: *Function, module: *Module, block: Block, inst: 
     const cv = module.vec_of[coord];
     const dref: Value = module.value_of[dref_id] orelse return error.MalformedModule;
     const implicit_lod_sentinel: f64 = -1.0e30;
+    var explicit_lod: ?Value = null;
+    if (inst.opcode == op.ImageSampleDrefExplicitLod and inst.operands.len >= 7) {
+        const image_operands = inst.operands[5];
+        if (image_operands & 0x2 != 0) {
+            explicit_lod = module.value_of[try checkId(inst.operands[6], bound)];
+        }
+    }
 
     // A Cube-dim image (Dim=3, like lowerImageSample) is a samplerCubeShadow: the coord is a vec3
     // DIRECTION (x, y, z) and the call is `f32 sampler_cube_shadow_fn(desc, x, y, z, lod, dref)`. The
@@ -2859,7 +3098,7 @@ fn lowerImageSampleShadow(func: *Function, module: *Module, block: Block, inst: 
         const u: Value = if (cv.len >= 1) cv.comps[0] else (module.value_of[coord] orelse return error.MalformedModule);
         const v: Value = if (cv.len >= 2) cv.comps[1] else try func.appendInst(block, f32_t, .{ .fconst = 0 });
         const layer: Value = if (cv.len >= 3) cv.comps[2] else try func.appendInst(block, f32_t, .{ .fconst = 0 });
-        const lod: Value = try func.appendInst(block, f32_t, .{ .fconst = 0 });
+        const lod: Value = explicit_lod orelse try func.appendInst(block, f32_t, .{ .fconst = 0 });
         const array_shadow_fn = if (module.sampler_2darray_shadow_fn) |s| s else blk: {
             const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
             try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_2darray_shadow_fn", .value = .flag } });
@@ -2879,7 +3118,7 @@ fn lowerImageSampleShadow(func: *Function, module: *Module, block: Block, inst: 
         const y: Value = if (cv.len >= 2) cv.comps[1] else try func.appendInst(block, f32_t, .{ .fconst = 0 });
         const z: Value = if (cv.len >= 3) cv.comps[2] else try func.appendInst(block, f32_t, .{ .fconst = 0 });
         // A cube sample uses an explicit 0.0 LOD (like the vec3 non-shadow cube path).
-        const lod: Value = try func.appendInst(block, f32_t, .{ .fconst = 0 });
+        const lod: Value = explicit_lod orelse try func.appendInst(block, f32_t, .{ .fconst = 0 });
         const cube_shadow_fn = if (module.sampler_cube_shadow_fn) |s| s else blk: {
             const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
             try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_cube_shadow_fn", .value = .flag } });
@@ -2896,7 +3135,7 @@ fn lowerImageSampleShadow(func: *Function, module: *Module, block: Block, inst: 
 
     const u: Value = if (cv.len >= 1) cv.comps[0] else (module.value_of[coord] orelse return error.MalformedModule);
     const v: Value = if (cv.len >= 2) cv.comps[1] else try func.appendInst(block, f32_t, .{ .fconst = 0 });
-    const lod: Value = try func.appendInst(block, f32_t, .{ .fconst = implicit_lod_sentinel });
+    const lod: Value = explicit_lod orelse try func.appendInst(block, f32_t, .{ .fconst = implicit_lod_sentinel });
 
     const shadow_fn = if (module.sampler_shadow_fn) |s| s else blk: {
         const p = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
@@ -2925,7 +3164,10 @@ fn lowerImageFetch(func: *Function, module: *Module, block: Block, inst: binary.
     const coord = try idOperandAt(inst.operands, 3, bound); // indexes vec_of / value_of below
     const desc_ptr = (if (image < module.sampler_ptr_of.len) module.sampler_ptr_of[image] else null) orelse return error.MalformedModule;
     const cv = module.vec_of[coord];
-    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const result_type = try idOperandAt(inst.operands, 0, bound);
+    const result_vector = vectorInfo(module.types, result_type) orelse return error.Unsupported;
+    if (result_vector.len != 4) return error.Unsupported;
+    const element_type = scalarType(module.types, result_vector.elem) orelse return error.Unsupported;
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const x: Value = if (cv.len >= 1) cv.comps[0] else (module.value_of[coord] orelse return error.MalformedModule);
     const y: Value = if (cv.len >= 2) cv.comps[1] else try func.appendInst(block, i32_t, .{ .iconst = 0 });
@@ -2967,7 +3209,7 @@ fn lowerImageFetch(func: *Function, module: *Module, block: Block, inst: binary.
                 const off = try func.appendInst(block, module.i32_t, .{ .iconst = @as(i64, c3) * 4 });
                 break :blk try func.appendInst(block, module.ptr_t, .{ .arith = .{ .op = .add, .lhs = out_ptr, .rhs = off } });
             };
-            outv3.comps[c3] = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = eptr } });
+            outv3.comps[c3] = try func.appendInst(block, element_type, .{ .load = .{ .ptr = eptr } });
         }
         module.vec_of[result] = outv3;
         return;
@@ -2991,9 +3233,67 @@ fn lowerImageFetch(func: *Function, module: *Module, block: Block, inst: binary.
             const off = try func.appendInst(block, module.i32_t, .{ .iconst = @as(i64, c) * 4 });
             break :blk try func.appendInst(block, module.ptr_t, .{ .arith = .{ .op = .add, .lhs = out_ptr, .rhs = off } });
         };
-        outv.comps[c] = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = eptr } });
+        outv.comps[c] = try func.appendInst(block, element_type, .{ .load = .{ .ptr = eptr } });
     }
     module.vec_of[result] = outv;
+}
+
+fn lowerImageWrite(func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
+    const bound = module.vec_of.len;
+    const image = try idOperandAt(inst.operands, 0, bound);
+    const coord = try idOperandAt(inst.operands, 1, bound);
+    const texel = try idOperandAt(inst.operands, 2, bound);
+    const desc_ptr = (if (image < module.sampler_ptr_of.len) module.sampler_ptr_of[image] else null) orelse return error.MalformedModule;
+    const cv = module.vec_of[coord];
+    if (cv.len != 2) return error.Unsupported;
+    const values = try scalarComps(module, texel);
+    if (values.len != 4) return error.Unsupported;
+
+    const write_fn = if (module.storage_image_write_fn) |value| value else blk: {
+        const value = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
+        try func.addAttr(.{ .value = value }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "storage_image_write_fn", .value = .flag } });
+        module.storage_image_write_fn = value;
+        break :blk value;
+    };
+    _ = try func.appendStmtRaw(block, .{ .call_indirect = .{
+        .target = write_fn,
+        .args = try func.internValues(&.{ desc_ptr, cv.comps[0], cv.comps[1], values[0], values[1], values[2], values[3] }),
+    } });
+}
+
+fn lowerImageSize(func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
+    const bound = module.vec_of.len;
+    const result_type = try idOperandAt(inst.operands, 0, bound);
+    const result = try idOperandAt(inst.operands, 1, bound);
+    const image = try idOperandAt(inst.operands, 2, bound);
+    const result_vector = vectorInfo(module.types, result_type) orelse return error.Unsupported;
+    if (result_vector.len != 2) return error.Unsupported;
+    const element_type = scalarType(module.types, result_vector.elem) orelse return error.Unsupported;
+    const desc_ptr = module.sampler_ptr_of[image] orelse return error.MalformedModule;
+    const lod = if (inst.opcode == op.ImageQuerySizeLod)
+        try valueOf(module, try idOperandAt(inst.operands, 3, bound))
+    else
+        try func.appendInst(block, module.i32_t, .{ .iconst = 0 });
+    const out_ptr = try func.appendInst(block, module.ptr_t, .{ .alloca = .{ .elem = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } }) } });
+    const size_fn = if (module.image_size_fn) |value| value else blk: {
+        const value = try func.appendBlockParam(@fromBackingInt(@intCast(0)), module.ptr_t);
+        try func.addAttr(.{ .value = value }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "image_size_fn", .value = .flag } });
+        module.image_size_fn = value;
+        break :blk value;
+    };
+    _ = try func.appendStmtRaw(block, .{ .call_indirect = .{
+        .target = size_fn,
+        .args = try func.internValues(&.{ desc_ptr, lod, out_ptr }),
+    } });
+    var size: Vec = .{ .len = 2 };
+    for (0..2) |component| {
+        const ptr = if (component == 0) out_ptr else blk: {
+            const offset = try func.appendInst(block, module.i32_t, .{ .iconst = 4 });
+            break :blk try func.appendInst(block, module.ptr_t, .{ .arith = .{ .op = .add, .lhs = out_ptr, .rhs = offset } });
+        };
+        size.comps[component] = try func.appendInst(block, element_type, .{ .load = .{ .ptr = ptr } });
+    }
+    module.vec_of[result] = size;
 }
 
 /// Lower `OpImageGather resultType result sampledImage coord component` (GLSL textureGather): call
@@ -3148,8 +3448,7 @@ fn lowerTerminator(allocator: std.mem.Allocator, func: *Function, module: *const
             // discard: call the synthesized discard_fn (a CPU backend signals the kill;
             // a GPU/TGSI backend emits a KILL for the call), then end the block.
             const df = module.discard_fn orelse return error.MalformedModule;
-            const void_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 0 } });
-            _ = try func.appendCallIndirect(blocks[bi].block, void_t, df, &.{});
+            try func.appendVoidCallIndirect(blocks[bi].block, df, &.{});
             func.setTerminator(blocks[bi].block, .{ .ret = ir.function.Ret.none() });
         },
         op.ReturnValue => func.setTerminator(blocks[bi].block, .{ .ret = ir.function.Ret.one(value_of[try idOperandAt(inst.operands, 0, value_of.len)] orelse return error.MalformedModule) }),
@@ -3925,6 +4224,52 @@ test "lowers a texturing fragment shader: OpImageSampleImplicitLod -> a host sam
     try testing.expect(seen[0] and seen[1] and seen[2] and seen[3]);
 }
 
+test "lowers separate image and sampler descriptors with one resource pointer" {
+    const allocator = testing.allocator;
+    var b = try binary.Builder.init(allocator, 22);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.fragment, 15, 0, 14 });
+    try b.emit(allocator, op.Decorate, &.{ 10, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 10, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 12, op.Decoration.binding, 1 });
+    try b.emit(allocator, op.Decorate, &.{ 12, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.location, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFunction, &.{ 2, 1 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 3, 2 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 3, 4 });
+    try b.emit(allocator, op.TypeImage, &.{ 6, 3, op.Dim.dim_2d, 0, 0, 0, 1, 0 });
+    try b.emit(allocator, op.TypeSampler, &.{7});
+    try b.emit(allocator, op.TypeSampledImage, &.{ 8, 6 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.uniform_constant, 6 });
+    try b.emit(allocator, op.Variable, &.{ 9, 10, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.uniform_constant, 7 });
+    try b.emit(allocator, op.Variable, &.{ 11, 12, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.TypePointer, &.{ 13, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.Variable, &.{ 13, 14, op.StorageClass.input });
+    try b.emit(allocator, op.Function, &.{ 1, 15, 0, 2 });
+    try b.emit(allocator, op.Label, &.{16});
+    try b.emit(allocator, op.Load, &.{ 6, 17, 10 });
+    try b.emit(allocator, op.Load, &.{ 7, 18, 12 });
+    try b.emit(allocator, op.SampledImage, &.{ 8, 19, 17, 18 });
+    try b.emit(allocator, op.Load, &.{ 4, 20, 14 });
+    try b.emit(allocator, op.ImageSampleImplicitLod, &.{ 5, 21, 19, 20 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+
+    var func = try lowerModule(allocator, b.words.items);
+    defer func.deinit();
+
+    const params = func.blockParams(@fromBackingInt(@intCast(0)));
+    try testing.expectEqual(@as(usize, 5), params.len);
+    var resource_params: usize = 0;
+    for (params) |param| {
+        if (hasAttr(&func, param, "binding", 0)) resource_params += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), resource_params);
+}
+
 fn hasAttr(func: *const Function, v: Value, key: []const u8, slot: u32) bool {
     var it = func.attributesOf(.{ .value = v });
     while (it.next()) |attr| switch (attr) {
@@ -4319,4 +4664,25 @@ test "a Workgroup storage class variable becomes a shared alloca" {
     // The whole object, sized from the constant `OpTypeArray` names.
     try testing.expect(std.mem.indexOf(u8, text, "alloca [7 x u32]") != null);
     try testing.expect(std.mem.indexOf(u8, text, "store ") != null);
+}
+
+test "ExecutionModeId reads a frozen local size" {
+    const allocator = testing.allocator;
+    var b = try binary.Builder.init(allocator, 8);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 6, 0 });
+    try b.emit(allocator, op.ExecutionModeId, &.{ 6, op.ExecutionModeKind.local_size_id, 3, 4, 4 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 3, 4 });
+    try b.emit(allocator, op.Constant, &.{ 2, 4, 1 });
+    try b.emit(allocator, op.TypeFunction, &.{ 5, 1 });
+    try b.emit(allocator, op.Function, &.{ 1, 6, 0, 5 });
+    try b.emit(allocator, op.Label, &.{7});
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+
+    var func = try lowerModule(allocator, b.words.items);
+    defer func.deinit();
+    try testing.expectEqual([3]u32{ 4, 1, 1 }, gpu.attrs.localSize(&func));
 }
