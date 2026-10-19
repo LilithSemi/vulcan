@@ -50,6 +50,8 @@ pub const Error = error{
 /// reads one is relying on hardware this model cannot stand in for.
 const csr_mhartid: u12 = 0xF14;
 const csr_hart_count: u12 = 0xFC0;
+const csr_workgroup_id: u12 = 0xFC9;
+const csr_grid_dim: u12 = 0xFCA;
 
 const csr_mscratch: u12 = 0x340;
 const csr_scratchsize: u12 = 0xFD2;
@@ -116,6 +118,8 @@ pub const Warp = struct {
     pc: u32 = 0,
     hart_id: u32,
     hart_count: u32,
+    workgroup_base: u32 = 0,
+    grid_dim: u32 = 0,
     /// Lanes this warp runs. A warp may be launched NARROWER than the core is wide, and then the
     /// rest are inactive for its whole life with no instruction able to turn them on.
     lanes: u8 = 1,
@@ -388,6 +392,8 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
             warp.set(rd, switch (csr) {
                 csr_mhartid => warp.hart_id,
                 csr_hart_count => warp.hart_count,
+                csr_workgroup_id => warp.hart_id +% warp.workgroup_base,
+                csr_grid_dim => if (warp.grid_dim == 0) warp.hart_count else warp.grid_dim,
                 csr_mscratch => warp.stack_top,
                 csr_scratchsize => warp.scratch_bytes,
                 else => return error.Illegal,

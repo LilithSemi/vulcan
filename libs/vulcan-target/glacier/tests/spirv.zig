@@ -6,7 +6,7 @@
 //! has no parameter block to receive a pointer in. And the kernel divides work by WORKGROUP, not
 //! by thread: one warp is the workgroup, so a per-thread index would be a vector while a warp
 //! index is a scalar. `gl_WorkGroupID` and `gl_NumWorkGroups` are the scalar pair that carries it,
-//! and they land on `mhartid` and the hart count.
+//! and they land on the dispatch workgroup and grid CSRs.
 
 const std = @import("std");
 const spirv = @import("vulcan-spirv");
@@ -95,6 +95,28 @@ test "a SPIR-V compute kernel runs on Glacier" {
     }
 }
 
+test "a SPIR-V compute kernel uses a virtual dispatch batch" {
+    const allocator = std.testing.allocator;
+    const words = try compileFill(allocator);
+    defer allocator.free(words);
+
+    var data: [12]u32 = @splat(0xFFFF_FFFF);
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    for (0..4) |w| {
+        var one: warp.Warp = .{
+            .hart_id = @intCast(w),
+            .hart_count = 4,
+            .workgroup_base = 4,
+            .grid_dim = 10,
+        };
+        _ = try warp.run(words, &mem, &one, 10_000);
+    }
+    for (data, 0..) |got, i| {
+        const want: u32 = if (i >= 4 and i < 8) 10 else 0xFFFF_FFFF;
+        try std.testing.expectEqual(want, got);
+    }
+}
+
 test "a storage buffer arrives either as an address or as a launch argument" {
     const allocator = std.testing.allocator;
     var b = try fillModule(allocator);
@@ -132,6 +154,1345 @@ test "a storage buffer arrives either as an address or as a launch argument" {
     _ = try warp.run(words, &mem, &one, 10_000);
     try std.testing.expectEqual(@as(u32, 1), data[0]);
     for (data[1..]) |got| try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), got);
+}
+
+test "a sampler fetch reads one RGBA32F texel per lane" {
+    const allocator = std.testing.allocator;
+    var func = ir.function.Function.init(allocator);
+    defer func.deinit();
+
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const u128_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 128 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const desc = try func.appendBlockParam(entry, ptr_t);
+    const output = try func.appendBlockParam(entry, ptr_t);
+    const lane = try func.appendBlockParam(entry, i32_t);
+    const fetch = try func.appendBlockParam(entry, ptr_t);
+    try func.addAttr(.{ .value = desc }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_desc", .value = .{ .int = 1 } } });
+    try gpu.attrs.setBuiltin(&func, lane, .thread_id_x);
+    try func.addAttr(.{ .value = fetch }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "sampler_fetch_fn", .value = .flag } });
+
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const slot = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = u128_t } });
+    _ = try func.appendStmtRaw(entry, .{ .call_indirect = .{
+        .target = fetch,
+        .args = try func.internValues(&.{ desc, lane, zero, zero, slot }),
+    } });
+    const red = try func.appendInst(entry, f32_t, .{ .load = .{ .ptr = slot } });
+    const bits = try func.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = red } });
+    const byte_offset = try func.appendInst(entry, i32_t, .{ .arith_imm = .{ .op = .shl, .lhs = lane, .imm = 2 } });
+    const destination = try func.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = output, .rhs = byte_offset } });
+    try func.appendStore(entry, bits, destination);
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var launch_reads: [8]u8 = @splat(0);
+    for (code) |word| {
+        if (word & 0x7f != 0b1110011 or (word >> 12) & 0b111 != 2) continue;
+        const csr = word >> 20;
+        if (csr >= 0xfc1 and csr <= 0xfc8) launch_reads[csr - 0xfc1] += 1;
+    }
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1, 0, 0, 0, 0, 0, 0 }, &launch_reads);
+
+    var memory: [40]u32 = @splat(0);
+    memory[0] = data_base + 8 * 4;
+    memory[1] = 4 * 16;
+    memory[8] = 0x3f800000;
+    memory[12] = 0x40000000;
+    memory[16] = 0x40400000;
+    memory[20] = 0x40800000;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + 24 * 4;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    try std.testing.expectEqualSlices(u32, &.{ 0x3f800000, 0x40000000, 0x40400000, 0x40800000 }, memory[24..28]);
+}
+
+fn imageFetchModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 34);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 22, 0x6e69616d, 0, 19, 20, 21 });
+    try b.emit(allocator, op.ExecutionMode, &.{ 22, op.ExecutionModeKind.local_size, 4, 1, 1 });
+    try b.emit(allocator, op.Decorate, &.{ 19, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 19, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 20, op.Decoration.builtin, op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.Decorate, &.{ 21, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 21, op.Decoration.binding, 1 });
+    try b.emit(allocator, op.MemberDecorate, &.{ 13, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFloat, &.{ 2, 32 });
+    try b.emit(allocator, op.TypeInt, &.{ 3, 32, 1 });
+    try b.emit(allocator, op.TypeInt, &.{ 4, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 3, 2 });
+    try b.emit(allocator, op.TypeVector, &.{ 6, 4, 3 });
+    try b.emit(allocator, op.TypeVector, &.{ 7, 2, 4 });
+    try b.emit(allocator, op.TypeImage, &.{ 8, 2, op.Dim.dim_2d, 0, 0, 0, 1, 0 });
+    try b.emit(allocator, op.TypeSampledImage, &.{ 9, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.uniform_constant, 9 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.input, 6 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 12, 4 });
+    try b.emit(allocator, op.TypeStruct, &.{ 13, 12 });
+    try b.emit(allocator, op.TypePointer, &.{ 14, op.StorageClass.storage_buffer, 13 });
+    try b.emit(allocator, op.TypePointer, &.{ 15, op.StorageClass.storage_buffer, 4 });
+    try b.emit(allocator, op.TypeFunction, &.{ 16, 1 });
+    try b.emit(allocator, op.Constant, &.{ 3, 17, 0 });
+    try b.emit(allocator, op.Constant, &.{ 4, 18, 0 });
+    try b.emit(allocator, op.Variable, &.{ 10, 19, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.Variable, &.{ 11, 20, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 14, 21, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 22, 0, 16 });
+    try b.emit(allocator, op.Label, &.{23});
+    try b.emit(allocator, op.Load, &.{ 9, 24, 19 });
+    try b.emit(allocator, op.Image, &.{ 8, 25, 24 });
+    try b.emit(allocator, op.Load, &.{ 6, 26, 20 });
+    try b.emit(allocator, op.CompositeExtract, &.{ 4, 27, 26, 0 });
+    try b.emit(allocator, op.Bitcast, &.{ 3, 28, 27 });
+    try b.emit(allocator, op.CompositeConstruct, &.{ 5, 29, 28, 17 });
+    try b.emit(allocator, op.ImageFetch, &.{ 7, 30, 25, 29 });
+    try b.emit(allocator, op.CompositeExtract, &.{ 2, 31, 30, 0 });
+    try b.emit(allocator, op.Bitcast, &.{ 4, 32, 31 });
+    try b.emit(allocator, op.AccessChain, &.{ 15, 33, 21, 18, 27 });
+    try b.emit(allocator, op.Store, &.{ 33, 32 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "SPIR-V image fetch runs on Glacier" {
+    const allocator = std.testing.allocator;
+    var module = try imageFetchModule(allocator);
+    defer module.deinit(allocator);
+    var func = try spirv.lowerModule(allocator, module.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [40]u32 = @splat(0);
+    memory[0] = data_base + 8 * 4;
+    memory[1] = 4 * 16;
+    memory[8] = 0x3f800000;
+    memory[12] = 0x40000000;
+    memory[16] = 0x40400000;
+    memory[20] = 0x40800000;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + 24 * 4;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    try std.testing.expectEqualSlices(u32, &.{ 0x3f800000, 0x40000000, 0x40400000, 0x40800000 }, memory[24..28]);
+}
+
+fn storageImageWriteModule(allocator: std.mem.Allocator, integer: bool) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 25);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 16, 0x6e69616d, 0, 14, 15 });
+    try b.emit(allocator, op.ExecutionMode, &.{ 16, op.ExecutionModeKind.local_size, 4, 1, 1 });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 15, op.Decoration.builtin, op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFloat, &.{ 2, 32 });
+    try b.emit(allocator, op.TypeInt, &.{ 3, 32, 1 });
+    try b.emit(allocator, op.TypeInt, &.{ 4, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 3, 2 });
+    try b.emit(allocator, op.TypeVector, &.{ 6, 4, 3 });
+    try b.emit(allocator, op.TypeVector, &.{ 7, if (integer) 4 else 2, 4 });
+    try b.emit(allocator, op.TypeImage, &.{ 8, if (integer) 4 else 2, op.Dim.dim_2d, 0, 0, 0, 2, if (integer) 30 else 1 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.uniform_constant, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.input, 6 });
+    try b.emit(allocator, op.TypeFunction, &.{ 11, 1 });
+    try b.emit(allocator, op.Constant, &.{ 3, 12, 0 });
+    try b.emit(allocator, op.Constant, &.{ if (integer) 4 else 2, 13, if (integer) 99 else 0x3f800000 });
+    try b.emit(allocator, op.Variable, &.{ 9, 14, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.Variable, &.{ 10, 15, op.StorageClass.input });
+    try b.emit(allocator, op.Function, &.{ 1, 16, 0, 11 });
+    try b.emit(allocator, op.Label, &.{17});
+    try b.emit(allocator, op.Load, &.{ 8, 18, 14 });
+    try b.emit(allocator, op.Load, &.{ 6, 19, 15 });
+    try b.emit(allocator, op.CompositeExtract, &.{ 4, 20, 19, 0 });
+    try b.emit(allocator, op.Bitcast, &.{ 3, 21, 20 });
+    try b.emit(allocator, op.CompositeConstruct, &.{ 5, 22, 21, 12 });
+    try b.emit(allocator, op.Bitcast, &.{ if (integer) 4 else 2, 23, 20 });
+    try b.emit(allocator, op.CompositeConstruct, &.{ 7, 24, 23, 13, 13, 13 });
+    try b.emit(allocator, op.ImageWrite, &.{ 18, 22, 24 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "SPIR-V storage image write runs on Glacier" {
+    const allocator = std.testing.allocator;
+    var module = try storageImageWriteModule(allocator, false);
+    defer module.deinit(allocator);
+    var func = try spirv.lowerModule(allocator, module.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [32]u32 = @splat(0);
+    memory[0] = data_base + 8 * 4;
+    memory[1] = 4 * 16;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    one.launch_args[0] = data_base;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    for (0..4) |lane| {
+        const texel = memory[8 + lane * 4 ..][0..4];
+        try std.testing.expectEqual(@as(u32, @intCast(lane)), texel[0]);
+        try std.testing.expectEqualSlices(u32, &.{ 0x3f800000, 0x3f800000, 0x3f800000 }, texel[1..]);
+    }
+}
+
+test "SPIR-V integer storage image write preserves component types" {
+    const allocator = std.testing.allocator;
+    var module = try storageImageWriteModule(allocator, true);
+    defer module.deinit(allocator);
+    var func = try spirv.lowerModule(allocator, module.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [32]u32 = @splat(0);
+    memory[0] = data_base + 8 * 4;
+    memory[1] = 4 * 16;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    one.launch_args[0] = data_base;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    for (0..4) |lane| {
+        const texel = memory[8 + lane * 4 ..][0..4];
+        try std.testing.expectEqual(@as(u32, @intCast(lane)), texel[0]);
+        try std.testing.expectEqualSlices(u32, &.{ 99, 99, 99 }, texel[1..]);
+    }
+}
+
+test "a null storage image discards writes" {
+    const allocator = std.testing.allocator;
+    var module = try storageImageWriteModule(allocator, false);
+    defer module.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, module.words.items, .{
+        .nullable_image_descriptors = true,
+    });
+    defer func.deinit();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [64]u32 = @splat(0xcccccccc);
+    memory[0] = data_base + 40 * 4;
+    memory[1] = 4 * 16;
+    memory[2] = 4;
+    memory[3] = 1;
+    memory[25] = 0;
+    memory[26] = data_base + 28 * 4;
+    memory[27] = data_base + 32 * 4;
+    memory[28..32].* = @splat(0);
+    memory[40..56].* = @splat(0xdeadbeef);
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    one.launch_args[0] = data_base;
+    _ = try warp.run(code, &mem, &one, 10_000);
+
+    try std.testing.expectEqualSlices(u32, &(@as([16]u32, @splat(0xdeadbeef))), memory[40..56]);
+    try std.testing.expectEqualSlices(u32, &(@as([4]u32, @splat(0))), memory[28..32]);
+}
+
+fn storageImageReadModule(allocator: std.mem.Allocator, integer: bool) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 32);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 21, 0x6e69616d, 0, 18, 19, 20 });
+    try b.emit(allocator, op.ExecutionMode, &.{ 21, op.ExecutionModeKind.local_size, 4, 1, 1 });
+    try b.emit(allocator, op.Decorate, &.{ 18, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 18, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 19, op.Decoration.builtin, op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.Decorate, &.{ 20, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 20, op.Decoration.binding, 1 });
+    try b.emit(allocator, op.MemberDecorate, &.{ 12, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFloat, &.{ 2, 32 });
+    try b.emit(allocator, op.TypeInt, &.{ 3, 32, 1 });
+    try b.emit(allocator, op.TypeInt, &.{ 4, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 3, 2 });
+    try b.emit(allocator, op.TypeVector, &.{ 6, 4, 3 });
+    try b.emit(allocator, op.TypeVector, &.{ 7, if (integer) 4 else 2, 4 });
+    try b.emit(allocator, op.TypeImage, &.{ 8, if (integer) 4 else 2, op.Dim.dim_2d, 0, 0, 0, 2, if (integer) 30 else 1 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.uniform_constant, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.input, 6 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 11, 4 });
+    try b.emit(allocator, op.TypeStruct, &.{ 12, 11 });
+    try b.emit(allocator, op.TypePointer, &.{ 13, op.StorageClass.storage_buffer, 12 });
+    try b.emit(allocator, op.TypePointer, &.{ 14, op.StorageClass.storage_buffer, 4 });
+    try b.emit(allocator, op.TypeFunction, &.{ 15, 1 });
+    try b.emit(allocator, op.Constant, &.{ 3, 16, 0 });
+    try b.emit(allocator, op.Constant, &.{ 4, 17, 0 });
+    try b.emit(allocator, op.Variable, &.{ 9, 18, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.Variable, &.{ 10, 19, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 13, 20, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 21, 0, 15 });
+    try b.emit(allocator, op.Label, &.{22});
+    try b.emit(allocator, op.Load, &.{ 8, 23, 18 });
+    try b.emit(allocator, op.Load, &.{ 6, 24, 19 });
+    try b.emit(allocator, op.CompositeExtract, &.{ 4, 25, 24, 0 });
+    try b.emit(allocator, op.Bitcast, &.{ 3, 26, 25 });
+    try b.emit(allocator, op.CompositeConstruct, &.{ 5, 27, 26, 16 });
+    try b.emit(allocator, op.ImageRead, &.{ 7, 28, 23, 27 });
+    try b.emit(allocator, op.CompositeExtract, &.{ if (integer) 4 else 2, 29, 28, 0 });
+    try b.emit(allocator, op.Bitcast, &.{ 4, 30, 29 });
+    try b.emit(allocator, op.AccessChain, &.{ 14, 31, 20, 17, 25 });
+    try b.emit(allocator, op.Store, &.{ 31, 30 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "SPIR-V storage image read runs on Glacier" {
+    const allocator = std.testing.allocator;
+    var module = try storageImageReadModule(allocator, false);
+    defer module.deinit(allocator);
+    var func = try spirv.lowerModule(allocator, module.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [32]u32 = @splat(0);
+    memory[0] = data_base + 8 * 4;
+    memory[1] = 4 * 16;
+    memory[8] = 0x3f800000;
+    memory[12] = 0x40000000;
+    memory[16] = 0x40400000;
+    memory[20] = 0x40800000;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + 24 * 4;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    try std.testing.expectEqualSlices(u32, &.{ 0x3f800000, 0x40000000, 0x40400000, 0x40800000 }, memory[24..28]);
+}
+
+test "SPIR-V integer storage image read preserves component types" {
+    const allocator = std.testing.allocator;
+    var module = try storageImageReadModule(allocator, true);
+    defer module.deinit(allocator);
+    var func = try spirv.lowerModule(allocator, module.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [32]u32 = @splat(0);
+    memory[0] = data_base + 8 * 4;
+    memory[1] = 4 * 16;
+    memory[8] = 11;
+    memory[12] = 22;
+    memory[16] = 33;
+    memory[20] = 44;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + 24 * 4;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 22, 33, 44 }, memory[24..28]);
+}
+
+test "a null storage image reads zero" {
+    const allocator = std.testing.allocator;
+    var module = try storageImageReadModule(allocator, false);
+    defer module.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, module.words.items, .{
+        .nullable_image_descriptors = true,
+    });
+    defer func.deinit();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [64]u32 = @splat(0xcccccccc);
+    memory[0] = data_base + 40 * 4;
+    memory[1] = 4 * 16;
+    memory[2] = 4;
+    memory[3] = 1;
+    memory[25] = 0;
+    memory[26] = data_base + 28 * 4;
+    memory[27] = data_base + 32 * 4;
+    memory[28..32].* = @splat(0);
+    memory[40..56].* = @splat(0xdeadbeef);
+    memory[56..60].* = @splat(0xffffffff);
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + 56 * 4;
+    _ = try warp.run(code, &mem, &one, 10_000);
+
+    try std.testing.expectEqualSlices(u32, &(@as([4]u32, @splat(0))), memory[56..60]);
+    try std.testing.expectEqualSlices(u32, &(@as([16]u32, @splat(0xdeadbeef))), memory[40..56]);
+}
+
+fn imageSizeModule(allocator: std.mem.Allocator, sampled: bool) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 29);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 17, 0x6e69616d, 0, 15, 16 });
+    try b.emit(allocator, op.ExecutionMode, &.{ 17, op.ExecutionModeKind.local_size, 4, 1, 1 });
+    try b.emit(allocator, op.Decorate, &.{ 15, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 15, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 16, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 16, op.Decoration.binding, 1 });
+    try b.emit(allocator, op.MemberDecorate, &.{ 9, 0, op.Decoration.offset, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 1 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 2, 2 });
+    try b.emit(allocator, op.TypeImage, &.{ 5, 3, op.Dim.dim_2d, 0, 0, 0, if (sampled) 1 else 2, 1 });
+    try b.emit(allocator, op.TypeSampledImage, &.{ 6, 5 });
+    try b.emit(allocator, op.TypePointer, &.{ 7, op.StorageClass.uniform_constant, if (sampled) 6 else 5 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 8, 2 });
+    try b.emit(allocator, op.TypeStruct, &.{ 9, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 9 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 2 });
+    try b.emit(allocator, op.TypeFunction, &.{ 12, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 13, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 14, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 26, 2 });
+    try b.emit(allocator, op.Variable, &.{ 7, 15, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.Variable, &.{ 10, 16, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 17, 0, 12 });
+    try b.emit(allocator, op.Label, &.{18});
+    try b.emit(allocator, op.Load, &.{ if (sampled) 6 else 5, 19, 15 });
+    if (sampled) try b.emit(allocator, op.Image, &.{ 5, 20, 19 });
+    if (sampled) {
+        try b.emit(allocator, op.ImageQuerySizeLod, &.{ 4, 21, 20, 13 });
+    } else {
+        try b.emit(allocator, op.ImageQuerySize, &.{ 4, 21, 19 });
+    }
+    try b.emit(allocator, op.CompositeExtract, &.{ 2, 22, 21, 0 });
+    try b.emit(allocator, op.CompositeExtract, &.{ 2, 23, 21, 1 });
+    try b.emit(allocator, op.AccessChain, &.{ 11, 24, 16, 13, 13 });
+    try b.emit(allocator, op.Store, &.{ 24, 22 });
+    try b.emit(allocator, op.AccessChain, &.{ 11, 25, 16, 13, 14 });
+    try b.emit(allocator, op.Store, &.{ 25, 23 });
+    if (sampled) {
+        try b.emit(allocator, op.ImageQueryLevels, &.{ 2, 27, 20 });
+        try b.emit(allocator, op.AccessChain, &.{ 11, 28, 16, 13, 26 });
+        try b.emit(allocator, op.Store, &.{ 28, 27 });
+    }
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "SPIR-V storage image size reads the descriptor dimensions" {
+    const allocator = std.testing.allocator;
+    var module = try imageSizeModule(allocator, false);
+    defer module.deinit(allocator);
+    var func = try spirv.lowerModule(allocator, module.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [32]u32 = @splat(0);
+    memory[0] = data_base + 8 * 4;
+    memory[1] = 37 * 16;
+    memory[2] = 37;
+    memory[3] = 19;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + 24 * 4;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    try std.testing.expectEqualSlices(u32, &.{ 37, 19 }, memory[24..26]);
+}
+
+test "SPIR-V sampled image size reads the descriptor dimensions" {
+    const allocator = std.testing.allocator;
+    var module = try imageSizeModule(allocator, true);
+    defer module.deinit(allocator);
+    var func = try spirv.lowerModule(allocator, module.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [32]u32 = @splat(0);
+    memory[0] = data_base + 8 * 4;
+    memory[1] = 51 * 16;
+    memory[2] = 51;
+    memory[3] = 23;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + 24 * 4;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    try std.testing.expectEqualSlices(u32, &.{ 51, 23, 1 }, memory[24..27]);
+}
+
+fn vertexOutputModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 17);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.vertex, 12, 0x6e69616d, 0, 10, 11 });
+    try b.emit(allocator, op.Decorate, &.{ 10, op.Decoration.builtin, op.BuiltIn.vertex_index });
+    try b.emit(allocator, op.Decorate, &.{ 11, op.Decoration.builtin, op.BuiltIn.position });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFloat, &.{ 2, 32 });
+    try b.emit(allocator, op.TypeInt, &.{ 3, 32, 1 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 2, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.output, 4 });
+    try b.emit(allocator, op.TypeFunction, &.{ 7, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 8, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 9, 0x3f800000 });
+    try b.emit(allocator, op.Variable, &.{ 5, 10, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 6, 11, op.StorageClass.output });
+    try b.emit(allocator, op.Function, &.{ 1, 12, 0, 7 });
+    try b.emit(allocator, op.Label, &.{13});
+    try b.emit(allocator, op.Load, &.{ 3, 14, 10 });
+    try b.emit(allocator, op.Bitcast, &.{ 2, 15, 14 });
+    try b.emit(allocator, op.CompositeConstruct, &.{ 4, 16, 15, 8, 8, 9 });
+    try b.emit(allocator, op.Store, &.{ 11, 16 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "SPIR-V vertex records carry the Vulkan vertex index" {
+    const allocator = std.testing.allocator;
+    var module = try vertexOutputModule(allocator);
+    defer module.deinit(allocator);
+    var func = try spirv.lowerModule(allocator, module.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileVertex(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [512]u32 = @splat(0xcccccccc);
+    for (0..4) |lane| {
+        const invocation = 4 + lane;
+        memory[
+            invocation * (glacier.isel.vertex_input_stride / 4) +
+                glacier.isel.vertex_input_vertex_index_offset / 4
+        ] = @intCast(20 + lane);
+    }
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .workgroup_base = 1 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    for (0..4) |lane| {
+        const invocation = 4 + lane;
+        const position = invocation * (glacier.isel.vertex_output_stride / 4) + 0x70 / 4;
+        try std.testing.expectEqual(@as(u32, @intCast(20 + lane)), memory[position]);
+        try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0x3f800000 }, memory[position + 1 .. position + 4]);
+    }
+}
+
+test "SPIR-V vertex attributes are loaded by vertex index" {
+    const allocator = std.testing.allocator;
+    var b = try spirv.binary.Builder.init(allocator, 12);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.vertex, 9, 0x6e69616d, 0, 7, 8 });
+    try b.emit(allocator, op.Decorate, &.{ 7, op.Decoration.location, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 8, op.Decoration.builtin, op.BuiltIn.position });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFloat, &.{ 2, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 3, 2, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.input, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.output, 3 });
+    try b.emit(allocator, op.TypeFunction, &.{ 6, 1 });
+    try b.emit(allocator, op.Variable, &.{ 4, 7, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 5, 8, op.StorageClass.output });
+    try b.emit(allocator, op.Function, &.{ 1, 9, 0, 6 });
+    try b.emit(allocator, op.Label, &.{10});
+    try b.emit(allocator, op.Load, &.{ 3, 11, 7 });
+    try b.emit(allocator, op.Store, &.{ 8, 11 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+
+    var func = try spirv.lowerModule(allocator, b.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileVertex(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [2048]u32 = @splat(0xcccccccc);
+    const input_base = data_base;
+    const output_base = data_base + 1024 * 4;
+    for (0..4) |lane| {
+        const vertex = 4 + lane;
+        const attribute = vertex * (glacier.isel.vertex_output_stride / 4) + 0x80 / 4;
+        memory[attribute..][0..4].* = .{
+            @intCast(0x3f800000 + vertex),
+            @intCast(0x40000000 + vertex),
+            @intCast(0x40400000 + vertex),
+            0x3f800000,
+        };
+    }
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .workgroup_base = 1 };
+    one.launch_args[0] = input_base;
+    one.launch_args[1] = output_base;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    for (0..4) |lane| {
+        const vertex = 4 + lane;
+        const output = 1024 + vertex * (glacier.isel.vertex_output_stride / 4) + 0x70 / 4;
+        try std.testing.expectEqualSlices(u32, memory[vertex * 64 + 32 ..][0..4], memory[output..][0..4]);
+    }
+}
+
+test "SPIR-V fragment varyings are written to color records" {
+    const allocator = std.testing.allocator;
+    var b = try spirv.binary.Builder.init(allocator, 12);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.fragment, 9, 0x6e69616d, 0, 7, 8 });
+    try b.emit(allocator, op.Decorate, &.{ 7, op.Decoration.location, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 8, op.Decoration.location, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFloat, &.{ 2, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 3, 2, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 4, op.StorageClass.input, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.output, 3 });
+    try b.emit(allocator, op.TypeFunction, &.{ 6, 1 });
+    try b.emit(allocator, op.Variable, &.{ 4, 7, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 5, 8, op.StorageClass.output });
+    try b.emit(allocator, op.Function, &.{ 1, 9, 0, 6 });
+    try b.emit(allocator, op.Label, &.{10});
+    try b.emit(allocator, op.Load, &.{ 3, 11, 7 });
+    try b.emit(allocator, op.Store, &.{ 8, 11 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+
+    var func = try spirv.lowerModule(allocator, b.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileFragment(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [2048]u32 = @splat(0xcccccccc);
+    const input_base = data_base;
+    const output_base = data_base + 1024 * 4;
+    for (0..4) |lane| {
+        const fragment = 4 + lane;
+        const varying = fragment * (glacier.isel.fragment_record_stride / 4) + 0x80 / 4;
+        memory[varying..][0..4].* = .{
+            @intCast(0x3f800000 + fragment),
+            @intCast(0x40000000 + fragment),
+            @intCast(0x40400000 + fragment),
+            0x3f800000,
+        };
+    }
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .workgroup_base = 1 };
+    one.launch_args[0] = input_base;
+    one.launch_args[1] = output_base;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    for (0..4) |lane| {
+        const fragment = 4 + lane;
+        const input_at = fragment * (glacier.isel.fragment_record_stride / 4) + 32;
+        const output_at = 1024 + fragment * (glacier.isel.fragment_record_stride / 4);
+        try std.testing.expectEqualSlices(u32, memory[input_at..][0..4], memory[output_at..][0..4]);
+    }
+}
+
+test "SPIR-V fragment derivatives read the per-fragment gradient record" {
+    const allocator = std.testing.allocator;
+    var b = try spirv.binary.Builder.init(allocator, 18);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.fragment, 10, 0, 8, 9 });
+    try b.emit(allocator, op.Decorate, &.{ 8, op.Decoration.location, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 9, op.Decoration.location, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFunction, &.{ 2, 1 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 3, 3 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 3, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 7, op.StorageClass.output, 5 });
+    try b.emit(allocator, op.Constant, &.{ 3, 12, @bitCast(@as(f32, 1)) });
+    try b.emit(allocator, op.Variable, &.{ 6, 8, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 7, 9, op.StorageClass.output });
+    try b.emit(allocator, op.Function, &.{ 1, 10, 0, 2 });
+    try b.emit(allocator, op.Label, &.{11});
+    try b.emit(allocator, op.Load, &.{ 4, 13, 8 });
+    try b.emit(allocator, op.DPdx, &.{ 4, 14, 13 });
+    try b.emit(allocator, op.DPdy, &.{ 4, 15, 13 });
+    try b.emit(allocator, op.FAdd, &.{ 4, 16, 14, 15 });
+    try b.emit(allocator, op.CompositeConstruct, &.{ 5, 17, 16, 12 });
+    try b.emit(allocator, op.Store, &.{ 9, 17 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+
+    var func = try spirv.lowerModule(allocator, b.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileFragment(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [3072]u32 = @splat(0);
+    const output_word = 1280;
+    for (0..4) |lane| {
+        const fragment = 4 + lane;
+        const gradient = fragment * (glacier.isel.fragment_record_stride / 4) +
+            glacier.isel.fragment_input_gradient_offset / 4;
+        memory[gradient..][0..6].* = .{
+            @bitCast(@as(f32, 1)),
+            @bitCast(@as(f32, 2)),
+            @bitCast(@as(f32, 3)),
+            @bitCast(@as(f32, 4)),
+            @bitCast(@as(f32, 5)),
+            @bitCast(@as(f32, 6)),
+        };
+    }
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .workgroup_base = 1 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + output_word * 4;
+    _ = try warp.run(code, &mem, &one, 20_000);
+    for (0..4) |lane| {
+        const fragment = 4 + lane;
+        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        try std.testing.expectEqualSlices(u32, &.{
+            @bitCast(@as(f32, 5)),
+            @bitCast(@as(f32, 7)),
+            @bitCast(@as(f32, 9)),
+            @bitCast(@as(f32, 1)),
+        }, memory[output..][0..4]);
+    }
+}
+
+fn normalizedSamplingModule(allocator: std.mem.Allocator, separate: bool, explicit_lod: bool, dynamic_lod: bool) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, if (separate) (if (explicit_lod) 25 else 24) else (if (explicit_lod) 20 else 19));
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.fragment, 14, 0x6e69616d, 0, 11, 13 });
+    try b.emit(allocator, op.Decorate, &.{ 9, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 9, op.Decoration.descriptor_set, 0 });
+    if (separate) {
+        try b.emit(allocator, op.Decorate, &.{ 21, op.Decoration.binding, 1 });
+        try b.emit(allocator, op.Decorate, &.{ 21, op.Decoration.descriptor_set, 0 });
+    }
+    try b.emit(allocator, op.Decorate, &.{ 11, op.Decoration.location, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 13, op.Decoration.location, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFunction, &.{ 2, 1 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 3, 2 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 3, 4 });
+    try b.emit(allocator, op.TypeImage, &.{ 6, 3, op.Dim.dim_2d, 0, 0, 0, 1, 0 });
+    try b.emit(allocator, op.TypeSampledImage, &.{ 7, 6 });
+    try b.emit(allocator, op.TypePointer, &.{ 8, op.StorageClass.uniform_constant, if (separate) 6 else 7 });
+    try b.emit(allocator, op.Variable, &.{ 8, 9, op.StorageClass.uniform_constant });
+    if (separate) {
+        try b.emit(allocator, op.TypeSampler, &.{19});
+        try b.emit(allocator, op.TypePointer, &.{ 20, op.StorageClass.uniform_constant, 19 });
+        try b.emit(allocator, op.Variable, &.{ 20, 21, op.StorageClass.uniform_constant });
+    }
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.Variable, &.{ 10, 11, op.StorageClass.input });
+    try b.emit(allocator, op.TypePointer, &.{ 12, op.StorageClass.output, 5 });
+    try b.emit(allocator, op.Variable, &.{ 12, 13, op.StorageClass.output });
+    const lod_id: u32 = if (separate) 24 else 19;
+    if (explicit_lod and !dynamic_lod) try b.emit(allocator, op.Constant, &.{ 3, lod_id, 0x3f800000 });
+    try b.emit(allocator, op.Function, &.{ 1, 14, 0, 2 });
+    try b.emit(allocator, op.Label, &.{15});
+    try b.emit(allocator, op.Load, &.{ if (separate) 6 else 7, 16, 9 });
+    if (separate) {
+        try b.emit(allocator, op.Load, &.{ 19, 22, 21 });
+        try b.emit(allocator, op.SampledImage, &.{ 7, 23, 16, 22 });
+    }
+    try b.emit(allocator, op.Load, &.{ 4, 17, 11 });
+    if (explicit_lod and dynamic_lod) try b.emit(allocator, op.CompositeExtract, &.{ 3, lod_id, 17, 0 });
+    if (explicit_lod) {
+        try b.emit(allocator, op.ImageSampleExplicitLod, &.{ 5, 18, if (separate) 23 else 16, 17, 2, lod_id });
+    } else {
+        try b.emit(allocator, op.ImageSampleImplicitLod, &.{ 5, 18, if (separate) 23 else 16, 17 });
+    }
+    try b.emit(allocator, op.Store, &.{ 13, 18 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+fn runNormalizedSamplingWithDescriptors(separate: bool, explicit_lod: bool, dynamic_lod: bool, implicit_mip: bool, address_mode_u: u32, sampler_format: u32, texel_bytes: u32, filters: [2]u32, swizzle: ?[4]u32, packed_texels: [4]u32, coordinates: [4]f32, border: [4]f32, expected: [4][4]f32) !void {
+    const allocator = std.testing.allocator;
+    var b = try normalizedSamplingModule(allocator, separate, explicit_lod, dynamic_lod);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModule(allocator, b.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileFragment(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [3072]u32 = @splat(0);
+    const texture_word = 64;
+    const input_word = 256;
+    const output_word = 1280;
+    memory[0] = data_base + texture_word * 4;
+    memory[1] = 4 * texel_bytes;
+    memory[2] = 4;
+    memory[3] = 1;
+    memory[4] = @bitCast(@as(f32, 4));
+    memory[5] = @bitCast(@as(f32, 1));
+    memory[6] = address_mode_u;
+    memory[7] = 2;
+    for (border, 0..) |component, index| memory[8 + index] = @bitCast(component);
+    memory[12] = texel_bytes;
+    memory[13] = sampler_format;
+    memory[14] = @bitCast(@as(f32, 0.25));
+    memory[15] = @bitCast(@as(f32, 1));
+    memory[16] = filters[0];
+    memory[17] = filters[1];
+    const component_mapping = swizzle orelse [4]u32{ 3, 4, 5, 6 };
+    memory[18..][0..4].* = component_mapping;
+    const mipmapped = explicit_lod or implicit_mip;
+    memory[24] = if (mipmapped) 2 else 1;
+    if (sampler_format == 0) {
+        for (0..4) |texel| {
+            memory[texture_word + texel * 4 ..][0..4].* = .{
+                @bitCast(@as(f32, @floatFromInt(texel + 1))),
+                0x3f800000,
+                0x40000000,
+                0x3f800000,
+            };
+        }
+    } else {
+        memory[texture_word..][0..4].* = packed_texels;
+    }
+    if (mipmapped) {
+        const second_descriptor = 25;
+        const second_texture_word = 128;
+        memory[second_descriptor] = data_base + second_texture_word * 4;
+        memory[second_descriptor + 1] = texel_bytes;
+        memory[second_descriptor + 2] = 1;
+        memory[second_descriptor + 3] = 1;
+        memory[second_descriptor + 4] = @bitCast(@as(f32, 1));
+        memory[second_descriptor + 5] = @bitCast(@as(f32, 1));
+        memory[second_descriptor + 6] = address_mode_u;
+        memory[second_descriptor + 7] = 2;
+        for (border, 0..) |component, index| memory[second_descriptor + 8 + index] = @bitCast(component);
+        memory[second_descriptor + 12] = texel_bytes;
+        memory[second_descriptor + 13] = sampler_format;
+        memory[second_descriptor + 14] = @bitCast(@as(f32, 1));
+        memory[second_descriptor + 15] = @bitCast(@as(f32, 1));
+        memory[second_descriptor + 16] = filters[0];
+        memory[second_descriptor + 17] = filters[1];
+        memory[second_descriptor + 18 ..][0..4].* = component_mapping;
+        memory[second_descriptor + 24] = 2;
+        memory[second_texture_word..][0..4].* = .{
+            @bitCast(@as(f32, 9)),
+            @bitCast(@as(f32, 8)),
+            @bitCast(@as(f32, 7)),
+            @bitCast(@as(f32, 1)),
+        };
+    }
+    for (coordinates, 0..) |u, lane| {
+        const fragment = 4 + lane;
+        const input = input_word + fragment * (glacier.isel.fragment_record_stride / 4) + 0x80 / 4;
+        memory[input] = @bitCast(u);
+        memory[input + 1] = @bitCast(@as(f32, 0.5));
+        if (implicit_mip) {
+            const gradient = input_word + fragment * (glacier.isel.fragment_record_stride / 4) +
+                glacier.isel.fragment_input_gradient_offset / 4;
+            memory[gradient..][0..4].* = .{
+                @bitCast(@as(f32, 0.5)),
+                0,
+                0,
+                0,
+            };
+        }
+    }
+    const scratch_base = data_base + 2560 * 4;
+    var mem: warp.Memory = .{
+        .base = data_base,
+        .words = &memory,
+        .scratch = .{ .base = scratch_base, .stride = glacier.encode.Profile.@"gc1.n".scratchBytes(), .harts = 1 },
+    };
+    var one: warp.Warp = .{
+        .hart_id = 0,
+        .hart_count = 1,
+        .lanes = 4,
+        .workgroup_base = 1,
+        .stack_top = scratch_base + glacier.encode.Profile.@"gc1.n".scratchBytes(),
+        .scratch_bytes = glacier.encode.Profile.@"gc1.n".scratchBytes(),
+    };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + input_word * 4;
+    one.launch_args[2] = data_base + output_word * 4;
+    _ = try warp.run(code, &mem, &one, 200_000);
+    for (0..4) |lane| {
+        const fragment = 4 + lane;
+        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        for (0..4) |component| {
+            try std.testing.expectEqual(@as(u32, @bitCast(expected[lane][component])), memory[output + component]);
+        }
+    }
+}
+
+fn runNormalizedSampling(address_mode_u: u32, sampler_format: u32, texel_bytes: u32, filter: u32, swizzle: ?[4]u32, packed_texels: [4]u32, coordinates: [4]f32, border: [4]f32, expected: [4][4]f32) !void {
+    return runNormalizedSamplingWithDescriptors(false, false, false, false, address_mode_u, sampler_format, texel_bytes, .{ filter, filter }, swizzle, packed_texels, coordinates, border, expected);
+}
+
+test "SPIR-V normalized sampling reads one RGBA32F texel per lane" {
+    try runNormalizedSampling(2, 0, 16, 0, null, @splat(0), .{ 0.1, 0.3, 0.6, 0.9 }, @splat(0), .{
+        .{ 1, 1, 2, 1 },
+        .{ 2, 1, 2, 1 },
+        .{ 3, 1, 2, 1 },
+        .{ 4, 1, 2, 1 },
+    });
+}
+
+test "SPIR-V separate image and sampler descriptors sample on Glacier" {
+    try runNormalizedSamplingWithDescriptors(true, false, false, false, 2, 0, 16, .{ 0, 0 }, null, @splat(0), .{ 0.1, 0.3, 0.6, 0.9 }, @splat(0), .{
+        .{ 1, 1, 2, 1 },
+        .{ 2, 1, 2, 1 },
+        .{ 3, 1, 2, 1 },
+        .{ 4, 1, 2, 1 },
+    });
+}
+
+test "SPIR-V explicit LOD sampling selects a mip descriptor" {
+    try runNormalizedSamplingWithDescriptors(false, true, false, false, 2, 0, 16, .{ 0, 0 }, null, @splat(0), @splat(0.5), @splat(0), @splat(.{ 9, 8, 7, 1 }));
+}
+
+test "SPIR-V dynamic explicit LOD samples per lane" {
+    try runNormalizedSamplingWithDescriptors(false, true, true, false, 2, 0, 16, .{ 0, 0 }, null, @splat(0), .{ 0.1, 0.3, 1.0, 1.0 }, @splat(0), .{
+        .{ 1, 1, 2, 1 },
+        .{ 2, 1, 2, 1 },
+        .{ 9, 8, 7, 1 },
+        .{ 9, 8, 7, 1 },
+    });
+}
+
+test "SPIR-V implicit sampling derives a mip level from fragment gradients" {
+    try runNormalizedSamplingWithDescriptors(false, false, false, true, 2, 0, 16, .{ 0, 0 }, null, @splat(0), @splat(0.5), @splat(0), @splat(.{ 9, 8, 7, 1 }));
+}
+
+test "SPIR-V sampling uses the mag filter at LOD zero" {
+    try runNormalizedSamplingWithDescriptors(false, false, false, false, 2, 0, 16, .{ 0, 1 }, null, @splat(0), .{ 0.3, 1.0, 0.3, 1.0 }, @splat(0), .{
+        .{ 2, 1, 2, 1 },
+        .{ 4, 1, 2, 1 },
+        .{ 2, 1, 2, 1 },
+        .{ 4, 1, 2, 1 },
+    });
+}
+
+test "SPIR-V 2D array sampling selects the requested layer" {
+    const allocator = std.testing.allocator;
+    var b = try spirv.binary.Builder.init(allocator, 27);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.fragment, 16, 0x6e69616d, 0, 12, 14 });
+    try b.emit(allocator, op.Decorate, &.{ 10, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 10, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 24, op.Decoration.binding, 1 });
+    try b.emit(allocator, op.Decorate, &.{ 24, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 12, op.Decoration.location, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.location, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFunction, &.{ 2, 1 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 3, 2 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 3, 4 });
+    try b.emit(allocator, op.TypeVector, &.{ 6, 3, 3 });
+    try b.emit(allocator, op.TypeImage, &.{ 7, 3, op.Dim.dim_2d, 0, 1, 0, 1, 0 });
+    try b.emit(allocator, op.TypeSampledImage, &.{ 8, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.uniform_constant, 7 });
+    try b.emit(allocator, op.Variable, &.{ 9, 10, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.TypeSampler, &.{22});
+    try b.emit(allocator, op.TypePointer, &.{ 23, op.StorageClass.uniform_constant, 22 });
+    try b.emit(allocator, op.Variable, &.{ 23, 24, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.Variable, &.{ 11, 12, op.StorageClass.input });
+    try b.emit(allocator, op.TypePointer, &.{ 13, op.StorageClass.output, 5 });
+    try b.emit(allocator, op.Variable, &.{ 13, 14, op.StorageClass.output });
+    try b.emit(allocator, op.Constant, &.{ 3, 15, 0x3f800000 });
+    try b.emit(allocator, op.Function, &.{ 1, 16, 0, 2 });
+    try b.emit(allocator, op.Label, &.{17});
+    try b.emit(allocator, op.Load, &.{ 7, 18, 10 });
+    try b.emit(allocator, op.Load, &.{ 22, 25, 24 });
+    try b.emit(allocator, op.SampledImage, &.{ 8, 26, 18, 25 });
+    try b.emit(allocator, op.Load, &.{ 4, 19, 12 });
+    try b.emit(allocator, op.CompositeConstruct, &.{ 6, 20, 19, 15 });
+    try b.emit(allocator, op.ImageSampleImplicitLod, &.{ 5, 21, 26, 20 });
+    try b.emit(allocator, op.Store, &.{ 14, 21 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+
+    var func = try spirv.lowerModule(allocator, b.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileFragment(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [2048]u32 = @splat(0);
+    const texture_word = 64;
+    const input_word = 256;
+    const output_word = 1024;
+    memory[0] = data_base + texture_word * 4;
+    memory[1] = 64;
+    memory[2] = 4;
+    memory[3] = 1;
+    memory[4] = @bitCast(@as(f32, 4));
+    memory[5] = @bitCast(@as(f32, 1));
+    memory[6] = 2;
+    memory[7] = 2;
+    memory[12] = 16;
+    memory[13] = 0;
+    memory[14] = @bitCast(@as(f32, 0.25));
+    memory[15] = @bitCast(@as(f32, 1));
+    memory[18..][0..4].* = .{ 3, 4, 5, 6 };
+    memory[23] = 64;
+    for (0..8) |texel| {
+        memory[texture_word + texel * 4 ..][0..4].* = .{
+            @bitCast(@as(f32, @floatFromInt(texel + 1))),
+            0x3f800000,
+            0x40000000,
+            0x3f800000,
+        };
+    }
+    for (0..4) |lane| {
+        const fragment = 4 + lane;
+        const input = input_word + fragment * (glacier.isel.fragment_record_stride / 4) + 0x80 / 4;
+        memory[input] = @bitCast((@as(f32, @floatFromInt(lane)) + 0.5) * 0.25);
+        memory[input + 1] = @bitCast(@as(f32, 0.5));
+    }
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .workgroup_base = 1 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + input_word * 4;
+    one.launch_args[2] = data_base + output_word * 4;
+    _ = try warp.run(code, &mem, &one, 300_000);
+    for (0..4) |lane| {
+        const fragment = 4 + lane;
+        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(lane + 5)))), memory[output]);
+    }
+}
+
+test "SPIR-V cube sampling selects all six faces" {
+    const allocator = std.testing.allocator;
+    var b = try spirv.binary.Builder.init(allocator, 21);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.fragment, 14, 0x6e69616d, 0, 11, 13 });
+    try b.emit(allocator, op.Decorate, &.{ 9, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 9, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 11, op.Decoration.location, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 13, op.Decoration.location, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFunction, &.{ 2, 1 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 3, 3 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 3, 4 });
+    try b.emit(allocator, op.TypeImage, &.{ 6, 3, op.Dim.cube, 0, 0, 0, 1, 0 });
+    try b.emit(allocator, op.TypeSampledImage, &.{ 7, 6 });
+    try b.emit(allocator, op.TypePointer, &.{ 8, op.StorageClass.uniform_constant, 7 });
+    try b.emit(allocator, op.Variable, &.{ 8, 9, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.Variable, &.{ 10, 11, op.StorageClass.input });
+    try b.emit(allocator, op.TypePointer, &.{ 12, op.StorageClass.output, 5 });
+    try b.emit(allocator, op.Variable, &.{ 12, 13, op.StorageClass.output });
+    try b.emit(allocator, op.Function, &.{ 1, 14, 0, 2 });
+    try b.emit(allocator, op.Label, &.{15});
+    try b.emit(allocator, op.Load, &.{ 7, 16, 9 });
+    try b.emit(allocator, op.Load, &.{ 4, 17, 11 });
+    try b.emit(allocator, op.ExtInst, &.{ 4, 20, 19, op.Glsl.normalize, 17 });
+    try b.emit(allocator, op.ImageSampleImplicitLod, &.{ 5, 18, 16, 20 });
+    try b.emit(allocator, op.Store, &.{ 13, 18 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+
+    var func = try spirv.lowerModule(allocator, b.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileFragment(allocator, &func, .{ .profile = .@"gc1.s" });
+    defer allocator.free(code);
+
+    var memory: [4096]u32 = @splat(0);
+    const texture_word = 64;
+    const input_word = 512;
+    const output_word = 2048;
+    memory[0] = data_base + texture_word * 4;
+    memory[1] = 16;
+    memory[2] = 1;
+    memory[3] = 1;
+    memory[4] = @bitCast(@as(f32, 1));
+    memory[5] = @bitCast(@as(f32, 1));
+    memory[6] = 2;
+    memory[7] = 2;
+    memory[12] = 16;
+    memory[13] = 0;
+    memory[14] = @bitCast(@as(f32, 1));
+    memory[15] = @bitCast(@as(f32, 1));
+    memory[18..][0..4].* = .{ 3, 4, 5, 6 };
+    memory[23] = 16;
+    for (0..6) |face| {
+        memory[texture_word + face * 4 ..][0..4].* = .{
+            @bitCast(@as(f32, @floatFromInt(face + 1))),
+            0,
+            0,
+            0x3f800000,
+        };
+    }
+    const directions = [8][3]f32{
+        .{ 1, 0, 0 },
+        .{ -1, 0, 0 },
+        .{ 0, 1, 0 },
+        .{ 0, -1, 0 },
+        .{ 0, 0, 1 },
+        .{ 0, 0, -1 },
+        .{ 1, 0, 0 },
+        .{ -1, 0, 0 },
+    };
+    for (directions, 0..) |direction, lane| {
+        const fragment = 8 + lane;
+        const input = input_word + fragment * (glacier.isel.fragment_record_stride / 4) + 0x80 / 4;
+        for (direction, 0..) |component, index| memory[input + index] = @bitCast(component);
+    }
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8, .workgroup_base = 1 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + input_word * 4;
+    one.launch_args[2] = data_base + output_word * 4;
+    _ = try warp.run(code, &mem, &one, 600_000);
+    const expected = [8]f32{ 1, 2, 3, 4, 5, 6, 1, 2 };
+    for (expected, 0..) |value, lane| {
+        const fragment = 8 + lane;
+        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        try std.testing.expectEqual(@as(u32, @bitCast(value)), memory[output]);
+    }
+}
+
+test "SPIR-V depth comparison sampling runs on Glacier" {
+    const allocator = std.testing.allocator;
+    var b = try spirv.binary.Builder.init(allocator, 23);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.fragment, 14, 0x6e69616d, 0, 11, 13 });
+    try b.emit(allocator, op.Decorate, &.{ 9, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 9, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 11, op.Decoration.location, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 13, op.Decoration.location, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFunction, &.{ 2, 1 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 3, 2 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 3, 4 });
+    try b.emit(allocator, op.TypeImage, &.{ 6, 3, op.Dim.dim_2d, 1, 0, 0, 1, 0 });
+    try b.emit(allocator, op.TypeSampledImage, &.{ 7, 6 });
+    try b.emit(allocator, op.TypePointer, &.{ 8, op.StorageClass.uniform_constant, 7 });
+    try b.emit(allocator, op.Variable, &.{ 8, 9, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.Variable, &.{ 10, 11, op.StorageClass.input });
+    try b.emit(allocator, op.TypePointer, &.{ 12, op.StorageClass.output, 5 });
+    try b.emit(allocator, op.Variable, &.{ 12, 13, op.StorageClass.output });
+    try b.emit(allocator, op.Constant, &.{ 3, 18, 0x3f000000 });
+    try b.emit(allocator, op.Constant, &.{ 3, 20, 0 });
+    try b.emit(allocator, op.Constant, &.{ 3, 21, 0x3f800000 });
+    try b.emit(allocator, op.Function, &.{ 1, 14, 0, 2 });
+    try b.emit(allocator, op.Label, &.{15});
+    try b.emit(allocator, op.Load, &.{ 7, 16, 9 });
+    try b.emit(allocator, op.Load, &.{ 4, 17, 11 });
+    try b.emit(allocator, op.ImageSampleDrefImplicitLod, &.{ 3, 19, 16, 17, 18 });
+    try b.emit(allocator, op.CompositeConstruct, &.{ 5, 22, 19, 20, 20, 21 });
+    try b.emit(allocator, op.Store, &.{ 13, 22 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{
+        .nullable_image_descriptors = true,
+    });
+    defer func.deinit();
+    const code = try glacier.isel.compileFragment(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [2048]u32 = @splat(0);
+    const texture_word = 64;
+    const input_word = 256;
+    const output_word = 1024;
+    memory[0] = data_base + texture_word * 4;
+    memory[1] = 16;
+    memory[2] = 4;
+    memory[3] = 1;
+    memory[4] = @bitCast(@as(f32, 4));
+    memory[5] = @bitCast(@as(f32, 1));
+    memory[6] = 2;
+    memory[7] = 2;
+    memory[12] = 4;
+    memory[13] = 3;
+    memory[14] = @bitCast(@as(f32, 0.25));
+    memory[15] = @bitCast(@as(f32, 1));
+    memory[16] = 0;
+    memory[17] = 0;
+    memory[18..][0..4].* = .{ 3, 4, 5, 6 };
+    memory[22] = 3;
+    memory[25] = 1;
+    memory[texture_word..][0..4].* = .{
+        @bitCast(@as(f32, 0.2)),
+        @bitCast(@as(f32, 0.4)),
+        @bitCast(@as(f32, 0.6)),
+        @bitCast(@as(f32, 0.8)),
+    };
+    for (0..4) |lane| {
+        const fragment = 4 + lane;
+        const input = input_word + fragment * (glacier.isel.fragment_record_stride / 4) + 0x80 / 4;
+        memory[input] = @bitCast((@as(f32, @floatFromInt(lane)) + 0.5) * 0.25);
+        memory[input + 1] = @bitCast(@as(f32, 0.5));
+    }
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .workgroup_base = 1 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + input_word * 4;
+    one.launch_args[2] = data_base + output_word * 4;
+    _ = try warp.run(code, &mem, &one, 300_000);
+    const expected = [4]f32{ 0, 0, 1, 1 };
+    for (expected, 0..) |value, lane| {
+        const fragment = 4 + lane;
+        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        try std.testing.expectEqual(@as(u32, @bitCast(value)), memory[output]);
+    }
+
+    memory[25] = 0;
+    var null_one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .workgroup_base = 1 };
+    null_one.launch_args[0] = data_base;
+    null_one.launch_args[1] = data_base + input_word * 4;
+    null_one.launch_args[2] = data_base + output_word * 4;
+    _ = try warp.run(code, &mem, &null_one, 300_000);
+    for (0..4) |lane| {
+        const fragment = 4 + lane;
+        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        try std.testing.expectEqual(@as(u32, 0), memory[output]);
+    }
+}
+
+test "SPIR-V normalized sampling repeats negative and positive coordinates" {
+    try runNormalizedSampling(0, 0, 16, 0, null, @splat(0), .{ -0.1, 1.1, -1.3, 2.6 }, @splat(0), .{
+        .{ 4, 1, 2, 1 },
+        .{ 1, 1, 2, 1 },
+        .{ 3, 1, 2, 1 },
+        .{ 3, 1, 2, 1 },
+    });
+}
+
+test "SPIR-V normalized sampling mirrors each repeated interval" {
+    try runNormalizedSampling(1, 0, 16, 0, null, @splat(0), .{ -0.1, 1.1, -1.3, 2.6 }, @splat(0), .{
+        .{ 1, 1, 2, 1 },
+        .{ 4, 1, 2, 1 },
+        .{ 3, 1, 2, 1 },
+        .{ 3, 1, 2, 1 },
+    });
+}
+
+test "SPIR-V normalized sampling selects the border color outside the image" {
+    try runNormalizedSampling(3, 0, 16, 0, null, @splat(0), .{ -0.1, 0.25, 1.0, 0.9 }, .{ 8, 9, 10, 11 }, .{
+        .{ 8, 9, 10, 11 },
+        .{ 2, 1, 2, 1 },
+        .{ 8, 9, 10, 11 },
+        .{ 4, 1, 2, 1 },
+    });
+}
+
+test "SPIR-V normalized sampling expands RGBA8 UNORM texels" {
+    try runNormalizedSampling(2, 1, 4, 0, null, .{ 0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffffff }, .{ 0.1, 0.3, 0.6, 0.9 }, @splat(0), .{
+        .{ 1, 0, 0, 1 },
+        .{ 0, 1, 0, 1 },
+        .{ 0, 0, 1, 1 },
+        .{ 1, 1, 1, 1 },
+    });
+}
+
+test "SPIR-V normalized sampling reorders BGRA8 UNORM texels" {
+    try runNormalizedSampling(2, 2, 4, 0, null, .{ 0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffffff }, .{ 0.1, 0.3, 0.6, 0.9 }, @splat(0), .{
+        .{ 0, 0, 1, 1 },
+        .{ 0, 1, 0, 1 },
+        .{ 1, 0, 0, 1 },
+        .{ 1, 1, 1, 1 },
+    });
+}
+
+test "SPIR-V normalized sampling filters RGBA32F texels linearly" {
+    try runNormalizedSampling(2, 0, 16, 1, null, @splat(0), .{ 0, 0.25, 0.5, 0.75 }, @splat(0), .{
+        .{ 1, 1, 2, 1 },
+        .{ 1.5, 1, 2, 1 },
+        .{ 2.5, 1, 2, 1 },
+        .{ 3.5, 1, 2, 1 },
+    });
+}
+
+test "SPIR-V normalized sampling filters RGBA8 UNORM texels linearly" {
+    try runNormalizedSampling(2, 1, 4, 1, null, .{ 0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffffff }, .{ 0, 0.25, 0.5, 0.75 }, @splat(0), .{
+        .{ 1, 0, 0, 1 },
+        .{ 0.5, 0.5, 0, 1 },
+        .{ 0, 0.5, 0.5, 1 },
+        .{ 0.5, 0.5, 1, 1 },
+    });
+}
+
+test "SPIR-V linear repeat sampling crosses the normalized edge" {
+    try runNormalizedSampling(0, 0, 16, 1, null, @splat(0), .{ 0, 0.25, 0.75, 1 }, @splat(0), .{
+        .{ 2.5, 1, 2, 1 },
+        .{ 1.5, 1, 2, 1 },
+        .{ 3.5, 1, 2, 1 },
+        .{ 2.5, 1, 2, 1 },
+    });
+}
+
+test "SPIR-V linear sampling blends the border with edge texels" {
+    try runNormalizedSampling(3, 0, 16, 1, null, @splat(0), .{ 0, 0.25, 0.5, 1 }, .{ 9, 9, 9, 9 }, .{
+        .{ 5, 5, 5.5, 5 },
+        .{ 1.5, 1, 2, 1 },
+        .{ 2.5, 1, 2, 1 },
+        .{ 6.5, 5, 5.5, 5 },
+    });
+}
+
+test "SPIR-V normalized sampling applies image view component swizzles" {
+    try runNormalizedSampling(2, 0, 16, 0, .{ 5, 4, 2, 1 }, @splat(0), .{ 0.1, 0.3, 0.6, 0.9 }, @splat(0), .{
+        .{ 2, 1, 1, 0 },
+        .{ 2, 1, 1, 0 },
+        .{ 2, 1, 1, 0 },
+        .{ 2, 1, 1, 0 },
+    });
+}
+
+test "SPIR-V fragment discard marks only killed lanes" {
+    const allocator = std.testing.allocator;
+    var b = try spirv.binary.Builder.init(allocator, 16);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.fragment, 9, 0x6e69616d, 0, 7 });
+    try b.emit(allocator, op.Decorate, &.{ 7, op.Decoration.builtin, op.BuiltIn.frag_coord });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFloat, &.{ 2, 32 });
+    try b.emit(allocator, op.TypeBool, &.{3});
+    try b.emit(allocator, op.TypeVector, &.{ 4, 2, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypeFunction, &.{ 6, 1 });
+    try b.emit(allocator, op.Variable, &.{ 5, 7, op.StorageClass.input });
+    try b.emit(allocator, op.Constant, &.{ 2, 8, 0x40000000 });
+    try b.emit(allocator, op.Function, &.{ 1, 9, 0, 6 });
+    try b.emit(allocator, op.Label, &.{10});
+    try b.emit(allocator, op.Load, &.{ 4, 11, 7 });
+    try b.emit(allocator, op.CompositeExtract, &.{ 2, 12, 11, 0 });
+    try b.emit(allocator, op.FOrdLessThan, &.{ 3, 13, 12, 8 });
+    try b.emit(allocator, op.SelectionMerge, &.{ 15, 0 });
+    try b.emit(allocator, op.BranchConditional, &.{ 13, 14, 15 });
+    try b.emit(allocator, op.Label, &.{14});
+    try b.emit(allocator, op.Kill, &.{});
+    try b.emit(allocator, op.Label, &.{15});
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+
+    var func = try spirv.lowerModule(allocator, b.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileFragment(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    var memory: [2048]u32 = @splat(0);
+    const output_base = data_base + 1024 * 4;
+    for (0..4) |lane| {
+        const fragment = 4 + lane;
+        const coord = fragment * (glacier.isel.fragment_record_stride / 4) +
+            glacier.isel.fragment_input_coord_offset / 4;
+        memory[coord] = @bitCast(@as(f32, @floatFromInt(lane)));
+    }
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .workgroup_base = 1 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = output_base;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    for (0..4) |lane| {
+        const fragment = 4 + lane;
+        const discard = 1024 + fragment * (glacier.isel.fragment_record_stride / 4) +
+            glacier.isel.fragment_output_discard_offset / 4;
+        try std.testing.expectEqual(@as(u32, if (lane < 2) 1 else 0), memory[discard]);
+    }
 }
 
 test "a buffer the host did not place is refused, not guessed" {
@@ -991,6 +2352,70 @@ test "a volatile load and store keep their flag through the lowering" {
     }
 }
 
+test "a null buffer descriptor reads zero and discards writes" {
+    const allocator = std.testing.allocator;
+    var b = try volatileCopyModule(allocator, false);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{
+        .buffer_descriptors = true,
+    });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.mi",
+    });
+    defer allocator.free(words);
+
+    var memory: [32]u32 = @splat(0xcccccccc);
+    memory[0] = data_base + 8 * 4;
+    memory[1] = 0;
+    memory[2] = data_base + 16 * 4;
+    memory[3] = data_base + 17 * 4;
+    memory[8] = 0xdeadbeef;
+    memory[16] = 0;
+    memory[17] = 0xfeedface;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1 };
+    one.launch_args[0] = data_base;
+    _ = try warp.run(words, &mem, &one, 10_000);
+
+    try std.testing.expectEqual(@as(u32, 0xdeadbeef), memory[8]);
+    try std.testing.expectEqual(@as(u32, 0), memory[16]);
+    try std.testing.expectEqual(@as(u32, 0), memory[17]);
+}
+
+test "an out of range buffer descriptor reads zero and discards writes" {
+    const allocator = std.testing.allocator;
+    var b = try volatileCopyModule(allocator, false);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{
+        .buffer_descriptors = true,
+    });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.mi",
+    });
+    defer allocator.free(words);
+
+    var memory: [32]u32 = @splat(0xcccccccc);
+    memory[0] = data_base + 8 * 4;
+    memory[1] = 4;
+    memory[2] = data_base + 16 * 4;
+    memory[3] = data_base + 17 * 4;
+    memory[8] = 0xdeadbeef;
+    memory[9] = 0xabad1dea;
+    memory[16] = 0;
+    memory[17] = 0xfeedface;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 1, .hart_count = 2 };
+    one.launch_args[0] = data_base;
+    _ = try warp.run(words, &mem, &one, 10_000);
+
+    try std.testing.expectEqual(@as(u32, 0xdeadbeef), memory[8]);
+    try std.testing.expectEqual(@as(u32, 0xabad1dea), memory[9]);
+    try std.testing.expectEqual(@as(u32, 0), memory[16]);
+    try std.testing.expectEqual(@as(u32, 0), memory[17]);
+}
+
 /// Every warp does `out.results[warp] = atomicAdd(&out.counter, 1)`, which is the arrival counter a
 /// software barrier across warps is built from: each warp learns how many arrived before it.
 fn atomicCounterModule(allocator: std.mem.Allocator, opcode: u16) !spirv.binary.Builder {
@@ -1032,6 +2457,39 @@ fn atomicCounterModule(allocator: std.mem.Allocator, opcode: u16) !spirv.binary.
     try b.emit(allocator, op.Return, &.{});
     try b.emit(allocator, op.FunctionEnd, &.{});
     return b;
+}
+
+test "a null buffer atomic returns zero and discards its write" {
+    const allocator = std.testing.allocator;
+    var b = try atomicCounterModule(allocator, op.AtomicIAdd);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{
+        .buffer_descriptors = true,
+    });
+    defer func.deinit();
+    const words = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.mi",
+    });
+    defer allocator.free(words);
+
+    var memory: [32]u32 = @splat(0xcccccccc);
+    memory[0] = data_base + 8 * 4;
+    memory[1] = 0;
+    memory[2] = data_base + 16 * 4;
+    memory[3] = data_base + 17 * 4;
+    memory[8] = 0xdeadbeef;
+    memory[9] = 0xabad1dea;
+    memory[16] = 0;
+    memory[17] = 0;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1 };
+    one.launch_args[0] = data_base;
+    _ = try warp.run(words, &mem, &one, 10_000);
+
+    try std.testing.expectEqual(@as(u32, 0xdeadbeef), memory[8]);
+    try std.testing.expectEqual(@as(u32, 0xabad1dea), memory[9]);
+    try std.testing.expectEqual(@as(u32, 0), memory[16]);
+    try std.testing.expectEqual(@as(u32, 0), memory[17]);
 }
 
 test "an atomic add gives every warp a different arrival number" {

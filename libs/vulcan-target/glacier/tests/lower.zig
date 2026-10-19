@@ -5164,55 +5164,56 @@ test "the warp model decodes every word this backend can emit" {
     const rv = glacier.encode.rv;
     const words = [_]u32{
         // RV32I, the scalar half.
-        rv.add(.x5, .x6, .x7),                                    rv.addi(.x5, .x6, 4),                                        rv.and_(.x5, .x6, .x7),
-        rv.andi(.x5, .x6, 3),                                     rv.or_(.x5, .x6, .x7),                                       rv.ori(.x5, .x6, 3),
-        rv.xor_(.x5, .x6, .x7),                                   rv.xori(.x5, .x6, 3),                                        rv.sub(.x5, .x6, .x7),
-        rv.sll(.x5, .x6, .x7),                                    rv.slli(.x5, .x6, 3),                                        rv.srl(.x5, .x6, .x7),
-        rv.srli(.x5, .x6, 3),                                     rv.sra(.x5, .x6, .x7),                                       rv.srai(.x5, .x6, 3),
-        rv.slt(.x5, .x6, .x7),                                    rv.sltu(.x5, .x6, .x7),                                      rv.sltiu(.x5, .x6, 3),
-        rv.lw(.x5, .x10, 0),                                      rv.sw(.x6, .x10, 0),
+        rv.add(.x5, .x6, .x7),                                       rv.addi(.x5, .x6, 4),                                    rv.and_(.x5, .x6, .x7),
+        rv.andi(.x5, .x6, 3),                                        rv.or_(.x5, .x6, .x7),                                   rv.ori(.x5, .x6, 3),
+        rv.xor_(.x5, .x6, .x7),                                      rv.xori(.x5, .x6, 3),                                    rv.sub(.x5, .x6, .x7),
+        rv.sll(.x5, .x6, .x7),                                       rv.slli(.x5, .x6, 3),                                    rv.srl(.x5, .x6, .x7),
+        rv.srli(.x5, .x6, 3),                                        rv.sra(.x5, .x6, .x7),                                   rv.srai(.x5, .x6, 3),
+        rv.slt(.x5, .x6, .x7),                                       rv.sltu(.x5, .x6, .x7),                                  rv.sltiu(.x5, .x6, 3),
+        rv.lw(.x5, .x10, 0),                                         rv.sw(.x6, .x10, 0),
         // RV32M.
-                                                rv.mul(.x5, .x6, .x7),
-        rv.mulh(.x5, .x6, .x7),                                   rv.mulhu(.x5, .x6, .x7),                                     rv.div(.x5, .x6, .x7),
-        rv.divu(.x5, .x6, .x7),                                   rv.rem(.x5, .x6, .x7),                                       rv.remu(.x5, .x6, .x7),
+                                            rv.mul(.x5, .x6, .x7),
+        rv.mulh(.x5, .x6, .x7),                                      rv.mulhu(.x5, .x6, .x7),                                 rv.div(.x5, .x6, .x7),
+        rv.divu(.x5, .x6, .x7),                                      rv.rem(.x5, .x6, .x7),                                   rv.remu(.x5, .x6, .x7),
         // Control transfer. A branch of zero and a jump of four both land on the next word.
-        rv.beq(.x5, .x6, 4),                                      rv.bge(.x5, .x6, 4),                                         rv.jal(.x0, 4),
+        rv.beq(.x5, .x6, 4),                                         rv.bge(.x5, .x6, 4),                                     rv.jal(.x0, 4),
         // The CSRs and both retires. `ecall` is the fault and carries its code in a register.
-        glacier.encode.csrr(.x5, glacier.encode.Csr.mhartid),     glacier.encode.csrr(.x5, glacier.encode.Csr.hart_count),     glacier.encode.csrr(.x5, glacier.encode.Csr.mscratch),
-        glacier.encode.csrr(.x5, glacier.encode.Csr.scratchsize), glacier.encode.csrr(.x5, glacier.encode.Csr.launchArg(0).?),
+        glacier.encode.csrr(.x5, glacier.encode.Csr.mhartid),        glacier.encode.csrr(.x5, glacier.encode.Csr.hart_count), glacier.encode.csrr(.x5, glacier.encode.Csr.workgroup_id),
+        glacier.encode.csrr(.x5, glacier.encode.Csr.grid_dim),       glacier.encode.csrr(.x5, glacier.encode.Csr.mscratch),   glacier.encode.csrr(.x5, glacier.encode.Csr.scratchsize),
+        glacier.encode.csrr(.x5, glacier.encode.Csr.launchArg(0).?),
         // The atomics.
-        rv.amo(.add, .x5, .x10, .x6, false, false),
-        rv.amo(.swap, .x5, .x10, .x6, true, true),
+        rv.amo(.add, .x5, .x10, .x6, false, false),              rv.amo(.swap, .x5, .x10, .x6, true, true),
         // Vector integer arithmetic.
-                       rv.vadd_vv(.v1, .v2, .v3),                                   rv.vadd_vx(.v1, .v2, .x6),
-        rv.vsub_vv(.v1, .v2, .v3),                                rv.vmul_vv(.v1, .v2, .v3),                                   rv.vmul_vx(.v1, .v2, .x6),
-        rv.vmulh_vv(.v1, .v2, .v3),                               rv.vmulhu_vv(.v1, .v2, .v3),                                 rv.vdiv_vv(.v1, .v2, .v3),
-        rv.vdivu_vv(.v1, .v2, .v3),                               rv.vrem_vv(.v1, .v2, .v3),                                   rv.vremu_vv(.v1, .v2, .v3),
-        rv.vand_vv(.v1, .v2, .v3),                                rv.vor_vv(.v1, .v2, .v3),                                    rv.vxor_vv(.v1, .v2, .v3),
-        rv.vsll_vv(.v1, .v2, .v3),                                rv.vsll_vx(.v1, .v2, .x6),                                   rv.vsll_vi(.v1, .v2, 3),
-        rv.vsrl_vv(.v1, .v2, .v3),                                rv.vsrl_vi(.v1, .v2, 3),                                     rv.vsra_vv(.v1, .v2, .v3),
-        rv.vsra_vi(.v1, .v2, 3),
+        rv.vadd_vv(.v1, .v2, .v3),                                   rv.vadd_vx(.v1, .v2, .x6),                               rv.vsub_vv(.v1, .v2, .v3),
+        rv.vmul_vv(.v1, .v2, .v3),                                   rv.vmul_vx(.v1, .v2, .x6),                               rv.vmulh_vv(.v1, .v2, .v3),
+        rv.vmulhu_vv(.v1, .v2, .v3),                                 rv.vdiv_vv(.v1, .v2, .v3),                               rv.vdivu_vv(.v1, .v2, .v3),
+        rv.vrem_vv(.v1, .v2, .v3),                                   rv.vremu_vv(.v1, .v2, .v3),                              rv.vand_vv(.v1, .v2, .v3),
+        rv.vor_vv(.v1, .v2, .v3),                                    rv.vxor_vv(.v1, .v2, .v3),                               rv.vsll_vv(.v1, .v2, .v3),
+        rv.vsll_vx(.v1, .v2, .x6),                                   rv.vsll_vi(.v1, .v2, 3),                                 rv.vsrl_vv(.v1, .v2, .v3),
+        rv.vsrl_vi(.v1, .v2, 3),                                     rv.vsra_vv(.v1, .v2, .v3),                               rv.vsra_vi(.v1, .v2, 3),
         // Vector moves, the lane index and the lane-zero extract.
-                                         rv.vmv_v_v(.v1, .v2),                                        rv.vmv_v_x(.v1, .x6),
-        rv.vmv_x_s(.x5, .v2),                                     rv.vid_v(.v1),                                               rv.vmerge_vvm(.v1, .v2, .v3),
+        rv.vmv_v_v(.v1, .v2),                                        rv.vmv_v_x(.v1, .x6),                                    rv.vmv_x_s(.x5, .v2),
+        rv.vid_v(.v1),                                               rv.vmerge_vvm(.v1, .v2, .v3),
         // Masks: the compares that make them, the logic over them, and the reduction out of one.
-        rv.vmseq_vv(.v1, .v2, .v3),                               rv.vmseq_vx(.v1, .v2, .x6),                                  rv.vmsne_vv(.v1, .v2, .v3),
-        rv.vmslt_vv(.v1, .v2, .v3),                               rv.vmsltu_vv(.v1, .v2, .v3),                                 rv.vmsle_vv(.v1, .v2, .v3),
-        rv.vmsleu_vv(.v1, .v2, .v3),                              rv.vmand_mm(.v1, .v2, .v3),                                  rv.vmor_mm(.v1, .v2, .v3),
-        rv.vmxor_mm(.v1, .v2, .v3),                               rv.vmnand_mm(.v1, .v2, .v3),                                 rv.vcpop_m(.x5, .v2),
+                                   rv.vmseq_vv(.v1, .v2, .v3),
+        rv.vmseq_vx(.v1, .v2, .x6),                                  rv.vmsne_vv(.v1, .v2, .v3),                              rv.vmslt_vv(.v1, .v2, .v3),
+        rv.vmsltu_vv(.v1, .v2, .v3),                                 rv.vmsle_vv(.v1, .v2, .v3),                              rv.vmsleu_vv(.v1, .v2, .v3),
+        rv.vmand_mm(.v1, .v2, .v3),                                  rv.vmor_mm(.v1, .v2, .v3),                               rv.vmxor_mm(.v1, .v2, .v3),
+        rv.vmnand_mm(.v1, .v2, .v3),                                 rv.vcpop_m(.x5, .v2),
         // Floats: the arithmetic, the compares and the converts.
-        rv.vfadd_vv(.v1, .v2, .v3),                               rv.vfsub_vv(.v1, .v2, .v3),                                  rv.vfmul_vv(.v1, .v2, .v3),
-        rv.vfdiv_vv(.v1, .v2, .v3),                               rv.vfwmacc_vv(.v1, .v2, .v3),                                rv.vmfeq_vv(.v1, .v2, .v3),
-        rv.vmflt_vv(.v1, .v2, .v3),                               rv.vmfle_vv(.v1, .v2, .v3),                                  rv.vfcvt_f_x_v(.v1, .v2),
-        rv.vfcvt_rtz_xu_f_v(.v1, .v2),                            rv.vfncvt_f_f_w(.v1, .v2),                                   rv.vfwcvt_f_f_v(.v1, .v2),
+                                           rv.vfadd_vv(.v1, .v2, .v3),
+        rv.vfsub_vv(.v1, .v2, .v3),                                  rv.vfmul_vv(.v1, .v2, .v3),                              rv.vfdiv_vv(.v1, .v2, .v3),
+        rv.vfwmacc_vv(.v1, .v2, .v3),                                rv.vmfeq_vv(.v1, .v2, .v3),                              rv.vmflt_vv(.v1, .v2, .v3),
+        rv.vmfle_vv(.v1, .v2, .v3),                                  rv.vfcvt_f_x_v(.v1, .v2),                                rv.vfcvt_rtz_xu_f_v(.v1, .v2),
+        rv.vfncvt_f_f_w(.v1, .v2),                                   rv.vfwcvt_f_f_v(.v1, .v2),
         // The cross-warp barrier, which is a CONSTANT word and not an encoder call: the grep that
         // collected this list saw `rv.` calls and missed it, and the model did not decode it. A
         // word reachable without a function call is exactly what an audit of calls cannot see.
-        glacier.encode.warp_barrier,
-            // Memory, per lane: unit stride and gather or scatter, masked and not.
-                                     rv.vle32(.v1, .x10),                                         rv.vle32_m(.v1, .x10),
-        rv.vse32(.v1, .x10),                                      rv.vse32_m(.v1, .x10),                                       rv.vluxei32(.v1, .x0, .v4),
-        rv.vluxei32_m(.v1, .x0, .v4),                             rv.vsuxei32(.v1, .x0, .v4),                                  rv.vsuxei32_m(.v1, .x0, .v4),
+                                      glacier.encode.warp_barrier,
+        // Memory, per lane: unit stride and gather or scatter, masked and not.
+        rv.vle32(.v1, .x10),                                         rv.vle32_m(.v1, .x10),                                   rv.vse32(.v1, .x10),
+        rv.vse32_m(.v1, .x10),                                       rv.vluxei32(.v1, .x0, .v4),                              rv.vluxei32_m(.v1, .x0, .v4),
+        rv.vsuxei32(.v1, .x0, .v4),                                  rv.vsuxei32_m(.v1, .x0, .v4),
     };
 
     for (words, 0..) |w, i| {

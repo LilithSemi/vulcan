@@ -175,9 +175,35 @@ pub const Options = struct {
     globals: []const Global = &.{},
 };
 
+pub const vertex_input_stride = 256;
+pub const vertex_output_stride = 256;
+pub const vertex_input_vertex_index_offset = 0x60;
+pub const vertex_input_instance_index_offset = 0x64;
+pub const fragment_record_stride = 512;
+pub const fragment_output_depth_offset = 0x40;
+pub const fragment_output_discard_offset = 0x44;
+pub const fragment_input_point_coord_offset = 0x60;
+pub const fragment_input_front_facing_offset = 0x68;
+pub const fragment_input_coord_offset = 0x70;
+pub const fragment_input_gradient_offset = 0x100;
+
 /// Lower `func` to a Glacier word stream. The caller owns the result.
 pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: Options) Error![]u32 {
     return compileKernelInternal(allocator, func, opts, null);
+}
+
+pub fn compileVertex(allocator: std.mem.Allocator, func: *const Function, opts: Options) Error![]u32 {
+    var work = try func.clone(allocator);
+    defer work.deinit();
+    try lowerVertexIO(allocator, &work);
+    return compileKernelInternal(allocator, &work, opts, null);
+}
+
+pub fn compileFragment(allocator: std.mem.Allocator, func: *const Function, opts: Options) Error![]u32 {
+    var work = try func.clone(allocator);
+    defer work.deinit();
+    try lowerFragmentIO(allocator, &work);
+    return compileKernelInternal(allocator, &work, opts, null);
 }
 
 /// `compileKernel`, and on a refusal it says what it refused. See `Refusal`.
@@ -205,6 +231,13 @@ fn compileKernelInternal(
     // splitting mutates the function, so split a clone and leave the caller's input alone.
     var work = try func.clone(allocator);
     defer work.deinit();
+
+    try lowerImageSample(allocator, &work);
+    try lowerTexelFetch(allocator, &work);
+    try lowerStorageImageWrite(allocator, &work);
+    try lowerImageSize(allocator, &work);
+    try lowerSquareRoot(allocator, &work);
+    try unifyDiscardReturns(allocator, &work);
 
     // Promote every stack slot to an SSA value BEFORE anything else looks at the function. A
     // warp has no stack, so an `alloca` that survives is refused below, and a frontend that keeps
@@ -486,6 +519,1015 @@ fn compileKernelInternal(
     return e.words.toOwnedSlice(allocator);
 }
 
+fn hasGpuKey(func: *const Function, value: Value, key: []const u8) bool {
+    var attrs = func.attributesOf(.{ .value = value });
+    while (attrs.next()) |attr| switch (attr) {
+        .custom => |custom| if (std.mem.eql(u8, custom.namespace, "vulcan.gpu") and std.mem.eql(u8, custom.key, key)) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn hasDiscardParam(func: *const Function) bool {
+    for (func.blockParams(@fromBackingInt(0))) |param| {
+        if (hasGpuKey(func, param, "discard_fn")) return true;
+    }
+    return false;
+}
+
+fn unifyDiscardReturns(allocator: std.mem.Allocator, func: *Function) Error!void {
+    if (!hasDiscardParam(func)) return;
+    var returns = std.ArrayList(Block).empty;
+    defer returns.deinit(allocator);
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const terminator = func.terminator(block) orelse continue;
+        if (terminator != .ret) continue;
+        if (terminator.ret.count != 0) return error.Unsupported;
+        try returns.append(allocator, block);
+    }
+    if (returns.items.len <= 1) return;
+    const exit = try func.appendBlock();
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+    for (returns.items) |block| try func.setJump(block, exit, &.{});
+}
+
+fn gpuIntAttr(func: *const Function, value: Value, key: []const u8) ?u32 {
+    var attrs = func.attributesOf(.{ .value = value });
+    while (attrs.next()) |attr| switch (attr) {
+        .custom => |custom| if (std.mem.eql(u8, custom.namespace, "vulcan.gpu") and std.mem.eql(u8, custom.key, key)) {
+            return switch (custom.value) {
+                .int => |number| @intCast(number),
+                else => null,
+            };
+        },
+        else => {},
+    };
+    return null;
+}
+
+fn hasGpuStage(func: *const Function, stage: []const u8) bool {
+    var attrs = func.attributesOf(.func);
+    while (attrs.next()) |attr| switch (attr) {
+        .custom => |custom| if (std.mem.eql(u8, custom.namespace, "vulcan.gpu") and std.mem.eql(u8, custom.key, "stage")) {
+            return switch (custom.value) {
+                .string => |name| std.mem.eql(u8, name, stage),
+                else => false,
+            };
+        },
+        else => {},
+    };
+    return false;
+}
+
+fn lowerVertexIO(allocator: std.mem.Allocator, func: *Function) Error!void {
+    if (!hasGpuStage(func, "vertex") or func.blockCount() == 0) return error.Unsupported;
+    const entry: Block = @fromBackingInt(0);
+    const original_params = try allocator.dupe(Value, func.blockParams(entry));
+    defer allocator.free(original_params);
+    const index_type = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const invocation_index = try func.appendBlockParam(entry, index_type);
+    try gpu.attrs.setBuiltin(func, invocation_index, .global_id_x);
+    const input = try func.appendBlockParam(entry, try func.types.ptrGlobal());
+    const output = try func.appendBlockParam(entry, try func.types.ptrGlobal());
+
+    const original_entry = try allocator.dupe(Inst, func.blockInsts(entry));
+    defer allocator.free(original_entry);
+    func.blockInstsMut(entry).clearRetainingCapacity();
+    for (original_params) |param| {
+        const slot: u32 = if (gpuIntAttr(func, param, "attr")) |attribute|
+            attribute
+        else if (gpu.attrs.builtinOf(func, param)) |builtin| switch (builtin) {
+            .vertex_index => vertex_input_vertex_index_offset,
+            .instance_index => vertex_input_instance_index_offset,
+            else => continue,
+        } else continue;
+        try func.addAttr(.{ .value = param }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "lowered_graphics_input",
+            .value = .flag,
+        } });
+        const stride = try func.appendInst(entry, index_type, .{ .iconst = vertex_input_stride });
+        const row = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .mul, .lhs = invocation_index, .rhs = stride } });
+        const offset = try func.appendInst(entry, index_type, .{ .iconst = slot });
+        const byte_offset = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = offset } });
+        const source = try func.appendInst(entry, func.valueType(input), .{ .arith = .{ .op = .add, .lhs = input, .rhs = byte_offset } });
+        const value = try func.appendInst(entry, func.valueType(param), .{ .load = .{ .ptr = source } });
+        func.replaceAllUses(param, value);
+    }
+    try func.blockInstsMut(entry).appendSlice(func.allocator, original_entry);
+
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const operation = func.opcode(inst);
+            if (operation != .store) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const store = operation.store;
+            const slot = gpuIntAttr(func, store.ptr, "out_attr") orelse {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            };
+            const stride = try func.appendInst(block, index_type, .{ .iconst = vertex_output_stride });
+            const row = try func.appendInst(block, index_type, .{ .arith = .{ .op = .mul, .lhs = invocation_index, .rhs = stride } });
+            const offset = try func.appendInst(block, index_type, .{ .iconst = slot });
+            const byte_offset = try func.appendInst(block, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = offset } });
+            const destination = try func.appendInst(block, func.valueType(output), .{ .arith = .{ .op = .add, .lhs = output, .rhs = byte_offset } });
+            if (store.mask) |mask| {
+                try func.appendStoreMaskedVol(block, store.value, destination, mask, store.@"volatile");
+            } else {
+                try func.appendStoreVol(block, store.value, destination, store.@"volatile");
+            }
+        }
+    }
+}
+
+fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function) Error!void {
+    if (!hasGpuStage(func, "fragment") or func.blockCount() == 0) return error.Unsupported;
+    const entry: Block = @fromBackingInt(0);
+    const original_params = try allocator.dupe(Value, func.blockParams(entry));
+    defer allocator.free(original_params);
+    const index_type = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const fragment_index = try func.appendBlockParam(entry, index_type);
+    try gpu.attrs.setBuiltin(func, fragment_index, .global_id_x);
+    const input = try func.appendBlockParam(entry, try func.types.ptrGlobal());
+    const output = try func.appendBlockParam(entry, try func.types.ptrGlobal());
+
+    const original_entry = try allocator.dupe(Inst, func.blockInsts(entry));
+    defer allocator.free(original_entry);
+    func.blockInstsMut(entry).clearRetainingCapacity();
+    for (original_params) |param| {
+        if (hasGpuKey(func, param, "grad_buf")) {
+            try func.addAttr(.{ .value = param }, .{ .custom = .{
+                .namespace = "vulcan.gpu",
+                .key = "lowered_graphics_input",
+                .value = .flag,
+            } });
+            const stride = try func.appendInst(entry, index_type, .{ .iconst = fragment_record_stride });
+            const row = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
+            const offset = try func.appendInst(entry, index_type, .{ .iconst = fragment_input_gradient_offset });
+            const byte_offset = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = offset } });
+            const source = try func.appendInst(entry, func.valueType(input), .{ .arith = .{ .op = .add, .lhs = input, .rhs = byte_offset } });
+            func.replaceAllUses(param, source);
+            continue;
+        }
+        if (hasGpuKey(func, param, "discard_fn")) {
+            try func.addAttr(.{ .value = param }, .{ .custom = .{
+                .namespace = "vulcan.gpu",
+                .key = "lowered_graphics_input",
+                .value = .flag,
+            } });
+            continue;
+        }
+        const offset = if (gpuIntAttr(func, param, "attr")) |slot|
+            slot
+        else if (gpu.attrs.builtinOf(func, param)) |builtin| switch (builtin) {
+            .frag_coord => fragment_input_coord_offset + 4 * (gpuIntAttr(func, param, "bicomp") orelse 0),
+            .point_coord => fragment_input_point_coord_offset + 4 * (gpuIntAttr(func, param, "bicomp") orelse 0),
+            .front_facing => fragment_input_front_facing_offset,
+            else => continue,
+        } else continue;
+        try func.addAttr(.{ .value = param }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "lowered_graphics_input",
+            .value = .flag,
+        } });
+        const stride = try func.appendInst(entry, index_type, .{ .iconst = fragment_record_stride });
+        const row = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
+        const slot = try func.appendInst(entry, index_type, .{ .iconst = offset });
+        const byte_offset = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = slot } });
+        const source = try func.appendInst(entry, func.valueType(input), .{ .arith = .{ .op = .add, .lhs = input, .rhs = byte_offset } });
+        const value = try func.appendInst(entry, func.valueType(param), .{ .load = .{ .ptr = source } });
+        func.replaceAllUses(param, value);
+    }
+    try func.blockInstsMut(entry).appendSlice(func.allocator, original_entry);
+
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const operation = func.opcode(inst);
+            if (operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "discard_fn")) {
+                const stride = try func.appendInst(block, index_type, .{ .iconst = fragment_record_stride });
+                const row = try func.appendInst(block, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
+                const offset = try func.appendInst(block, index_type, .{ .iconst = fragment_output_discard_offset });
+                const byte_offset = try func.appendInst(block, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = offset } });
+                const destination = try func.appendInst(block, func.valueType(output), .{ .arith = .{ .op = .add, .lhs = output, .rhs = byte_offset } });
+                const discarded = try func.appendInst(block, index_type, .{ .iconst = 1 });
+                try func.appendStore(block, discarded, destination);
+                continue;
+            }
+            if (operation != .store) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const store = operation.store;
+            const offset = if (gpuIntAttr(func, store.ptr, "color_out")) |component|
+                if (component < 16) component * 4 else return error.Unsupported
+            else if (gpuIntAttr(func, store.ptr, "frag_depth") != null)
+                fragment_output_depth_offset
+            else {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            };
+            const stride = try func.appendInst(block, index_type, .{ .iconst = fragment_record_stride });
+            const row = try func.appendInst(block, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
+            const slot = try func.appendInst(block, index_type, .{ .iconst = offset });
+            const byte_offset = try func.appendInst(block, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = slot } });
+            const destination = try func.appendInst(block, func.valueType(output), .{ .arith = .{ .op = .add, .lhs = output, .rhs = byte_offset } });
+            if (store.mask) |mask| {
+                try func.appendStoreMaskedVol(block, store.value, destination, mask, store.@"volatile");
+            } else {
+                try func.appendStoreVol(block, store.value, destination, store.@"volatile");
+            }
+        }
+    }
+}
+
+fn isSamplerFunction(func: *const Function, value: Value) bool {
+    return hasGpuKey(func, value, "sampler_fn") or
+        hasGpuKey(func, value, "sampler_fetch_fn") or
+        hasGpuKey(func, value, "sampler_fetch_array_fn") or
+        hasGpuKey(func, value, "sampler_fetch_3d_fn") or
+        hasGpuKey(func, value, "sampler_gather_fn") or
+        hasGpuKey(func, value, "sampler_shadow_fn") or
+        hasGpuKey(func, value, "sampler_cube_fn") or
+        hasGpuKey(func, value, "sampler_3d_fn") or
+        hasGpuKey(func, value, "sampler_2darray_fn") or
+        hasGpuKey(func, value, "sampler_cube_shadow_fn") or
+        hasGpuKey(func, value, "sampler_2darray_shadow_fn") or
+        hasGpuKey(func, value, "storage_image_write_fn") or
+        hasGpuKey(func, value, "image_size_fn");
+}
+
+fn isIgnoredEntryParam(func: *const Function, value: Value) bool {
+    return isSamplerFunction(func, value) or hasGpuKey(func, value, "lowered_graphics_input");
+}
+
+fn appendOffset(func: *Function, block: Block, ptr: Value, offset: i64, int_ty: Type) Error!Value {
+    if (offset == 0) return ptr;
+    const amount = try func.appendInst(block, int_ty, .{ .iconst = offset });
+    return func.appendInst(block, func.valueType(ptr), .{ .arith = .{ .op = .add, .lhs = ptr, .rhs = amount } });
+}
+
+fn nullableImagePointer(func: *Function, block: Block, descriptor: Value, pointer: Value, write: bool, component_offset: i64, int_ty: Type) Error!Value {
+    if (!hasGpuKey(func, descriptor, "nullable_desc")) return pointer;
+    const ptr_ty = func.valueType(descriptor);
+    const valid_ptr = try appendOffset(func, block, descriptor, 100, int_ty);
+    const valid = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = valid_ptr } });
+    const zero = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+    const present = try func.appendInst(block, try func.types.intern(.bool), .{
+        .icmp = .{ .op = .ne, .lhs = valid, .rhs = zero },
+    });
+    const fallback_ptr = try appendOffset(func, block, descriptor, if (write) 108 else 104, int_ty);
+    var fallback = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = fallback_ptr } });
+    fallback = try appendOffset(func, block, fallback, component_offset, int_ty);
+    return func.appendInst(block, ptr_ty, .{
+        .select = .{ .cond = present, .then = pointer, .@"else" = fallback },
+    });
+}
+
+const sampler_row_pitch_offset = 4;
+const sampler_width_offset = 8;
+const sampler_height_offset = 12;
+const sampler_width_float_offset = 16;
+const sampler_height_float_offset = 20;
+const sampler_address_u_offset = 24;
+const sampler_address_v_offset = 28;
+const sampler_border_offset = 32;
+const sampler_texel_bytes_offset = 48;
+const sampler_format_offset = 52;
+const sampler_width_reciprocal_offset = 56;
+const sampler_height_reciprocal_offset = 60;
+const sampler_mag_filter_offset = 64;
+const sampler_min_filter_offset = 68;
+const sampler_swizzle_offset = 72;
+const sampler_compare_op_offset = 88;
+const sampler_array_pitch_offset = 92;
+const sampler_level_count_offset = 96;
+const sampler_descriptor_size = 100;
+const nullable_sampler_descriptor_size = 112;
+const rgba32f_texel_bytes = 16;
+
+const SampleCoordinate = struct {
+    index: Value,
+    border: Value,
+};
+
+const LinearCoordinate = struct {
+    first: SampleCoordinate,
+    second: SampleCoordinate,
+    weight: Value,
+};
+
+const SampleImage = struct {
+    desc: Value,
+    base: Value,
+    row_pitch: Value,
+    texel_bytes: Value,
+    float_format: Value,
+    depth_format: Value,
+    bgra_format: Value,
+    integer_bias: Value,
+    unorm_scale: Value,
+    int_ty: Type,
+    ptr_ty: Type,
+    f32_t: Type,
+    bool_t: Type,
+};
+
+fn lowerFloorF32(func: *Function, block: Block, value: Value) Error!Value {
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const f32_t = func.valueType(value);
+    const zero_f = try func.appendInst(block, f32_t, .{ .fconst = 0 });
+    const one_f = try func.appendInst(block, f32_t, .{ .fconst = 1 });
+    const negative_one_f = try func.appendInst(block, f32_t, .{ .fconst = -1 });
+    const bits = try func.appendInst(block, u32_t, .{ .unary = .{ .op = .reinterpret, .value = value } });
+    const signless = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .bit_and, .lhs = bits, .imm = 0x7fff_ffff } });
+    const exponent_shifted = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .shr, .lhs = signless, .imm = 23 } });
+    const exponent = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .bit_and, .lhs = exponent_shifted, .imm = 0xff } });
+    const bias = try func.appendInst(block, u32_t, .{ .iconst = 127 });
+    const whole = try func.appendInst(block, u32_t, .{ .iconst = 150 });
+    const at_least_one = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = exponent, .rhs = bias } });
+    const already_whole = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = exponent, .rhs = whole } });
+    const upper_bounded = try func.appendInst(block, u32_t, .{ .select = .{ .cond = already_whole, .then = whole, .@"else" = exponent } });
+    const bounded_exponent = try func.appendInst(block, u32_t, .{ .select = .{ .cond = at_least_one, .then = upper_bounded, .@"else" = bias } });
+    const shift = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .sub, .lhs = whole, .rhs = bounded_exponent } });
+    const one = try func.appendInst(block, u32_t, .{ .iconst = 1 });
+    const mask_top = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .shl, .lhs = one, .rhs = shift } });
+    const mask = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .sub, .lhs = mask_top, .imm = 1 } });
+    const inverse_mask = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .bit_xor, .lhs = mask, .imm = 0xffff_ffff } });
+    const truncated_bits = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_and, .lhs = bits, .rhs = inverse_mask } });
+    const truncated = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = truncated_bits } });
+    const fraction_bits = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_and, .lhs = signless, .rhs = mask } });
+    const zero_u = try func.appendInst(block, u32_t, .{ .iconst = 0 });
+    const has_fraction = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ne, .lhs = fraction_bits, .rhs = zero_u } });
+    const negative = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = value, .rhs = zero_f } });
+    const negative_fraction = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = negative, .rhs = has_fraction } });
+    const lower = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = truncated, .rhs = one_f } });
+    const middle = try func.appendInst(block, f32_t, .{ .select = .{ .cond = negative_fraction, .then = lower, .@"else" = truncated } });
+    const nonzero = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ne, .lhs = signless, .rhs = zero_u } });
+    const negative_nonzero = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = negative, .rhs = nonzero } });
+    const small = try func.appendInst(block, f32_t, .{ .select = .{ .cond = negative_nonzero, .then = negative_one_f, .@"else" = zero_f } });
+    const finite_floor = try func.appendInst(block, f32_t, .{ .select = .{ .cond = at_least_one, .then = middle, .@"else" = small } });
+    return func.appendInst(block, f32_t, .{ .select = .{ .cond = already_whole, .then = value, .@"else" = finite_floor } });
+}
+
+fn lowerSampleCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64, mode_offset: i64) Error!SampleCoordinate {
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const f32_t = func.valueType(coord);
+    const size_ptr = try appendOffset(func, block, desc, size_offset, u32_t);
+    const size = try func.appendInst(block, u32_t, .{ .load = .{ .ptr = size_ptr } });
+    const size_float_ptr = try appendOffset(func, block, desc, size_float_offset, u32_t);
+    const size_float = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = size_float_ptr } });
+    const zero_f = try func.appendInst(block, f32_t, .{ .fconst = 0 });
+    const one_f = try func.appendInst(block, f32_t, .{ .fconst = 1 });
+    const two_f = try func.appendInst(block, f32_t, .{ .fconst = 2 });
+    const half_f = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
+    const negative = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = coord, .rhs = zero_f } });
+    const past_end = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = coord, .rhs = one_f } });
+    const border = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_or, .lhs = negative, .rhs = past_end } });
+    const floor = try lowerFloorF32(func, block, coord);
+    const repeat = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = coord, .rhs = floor } });
+    const half_coord = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = coord, .rhs = half_f } });
+    const half_floor = try lowerFloorF32(func, block, half_coord);
+    const period_base = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = half_floor, .rhs = two_f } });
+    const phase = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = coord, .rhs = period_base } });
+    const mirror_second_half = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = phase, .rhs = one_f } });
+    const reflected = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = two_f, .rhs = phase } });
+    const mirrored = try func.appendInst(block, f32_t, .{ .select = .{ .cond = mirror_second_half, .then = reflected, .@"else" = phase } });
+    const low_clamped = try func.appendInst(block, f32_t, .{ .select = .{ .cond = negative, .then = zero_f, .@"else" = coord } });
+    const clamped = try func.appendInst(block, f32_t, .{ .select = .{ .cond = past_end, .then = one_f, .@"else" = low_clamped } });
+
+    const mode_ptr = try appendOffset(func, block, desc, mode_offset, u32_t);
+    const mode = try func.appendInst(block, u32_t, .{ .load = .{ .ptr = mode_ptr } });
+    const zero_u = try func.appendInst(block, u32_t, .{ .iconst = 0 });
+    const repeat_mode = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = mode, .rhs = zero_u } });
+    const mirror_value = try func.appendInst(block, u32_t, .{ .iconst = 1 });
+    const mirror_mode = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = mode, .rhs = mirror_value } });
+    const border_value = try func.appendInst(block, u32_t, .{ .iconst = 3 });
+    const border_mode = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = mode, .rhs = border_value } });
+    const repeat_or_clamp = try func.appendInst(block, f32_t, .{ .select = .{ .cond = repeat_mode, .then = repeat, .@"else" = clamped } });
+    const addressed = try func.appendInst(block, f32_t, .{ .select = .{ .cond = mirror_mode, .then = mirrored, .@"else" = repeat_or_clamp } });
+    const scaled = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = addressed, .rhs = size_float } });
+    const converted = try func.appendInst(block, u32_t, .{ .convert = .{ .value = scaled } });
+    const one_u = try func.appendInst(block, u32_t, .{ .iconst = 1 });
+    const size_last = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .sub, .lhs = size, .rhs = one_u } });
+    const index_past_end = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = converted, .rhs = size } });
+    const index = try func.appendInst(block, u32_t, .{ .select = .{ .cond = index_past_end, .then = size_last, .@"else" = converted } });
+    const no_border = try func.appendInst(block, bool_t, .{ .iconst = 0 });
+    const effective_border = try func.appendInst(block, bool_t, .{ .select = .{ .cond = border_mode, .then = border, .@"else" = no_border } });
+    return .{ .index = index, .border = effective_border };
+}
+
+fn lowerLinearCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64, reciprocal_offset: i64, mode_offset: i64) Error!LinearCoordinate {
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = func.valueType(coord);
+    const size_ptr = try appendOffset(func, block, desc, size_float_offset, u32_t);
+    const size = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = size_ptr } });
+    const reciprocal_ptr = try appendOffset(func, block, desc, reciprocal_offset, u32_t);
+    const reciprocal = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = reciprocal_ptr } });
+    const half = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
+    const scaled = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = coord, .rhs = size } });
+    const centered = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = scaled, .rhs = half } });
+    const floor = try lowerFloorF32(func, block, centered);
+    const weight = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = centered, .rhs = floor } });
+    const first_center = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = floor, .rhs = half } });
+    const first_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = first_center, .rhs = reciprocal } });
+    const second_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = first_normalized, .rhs = reciprocal } });
+    return .{
+        .first = try lowerSampleCoordinate(func, block, desc, first_normalized, size_offset, size_float_offset, mode_offset),
+        .second = try lowerSampleCoordinate(func, block, desc, second_normalized, size_offset, size_float_offset, mode_offset),
+        .weight = weight,
+    };
+}
+
+fn selectSampleCoordinate(func: *Function, block: Block, linear: Value, filtered: SampleCoordinate, nearest: SampleCoordinate) Error!SampleCoordinate {
+    return .{
+        .index = try func.appendInst(block, func.valueType(filtered.index), .{ .select = .{ .cond = linear, .then = filtered.index, .@"else" = nearest.index } }),
+        .border = try func.appendInst(block, func.valueType(filtered.border), .{ .select = .{ .cond = linear, .then = filtered.border, .@"else" = nearest.border } }),
+    };
+}
+
+fn lowerSampleTexel(func: *Function, block: Block, image: SampleImage, x: SampleCoordinate, y: SampleCoordinate) Error![4]Value {
+    const outside = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = x.border, .rhs = y.border } });
+    const row = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = y.index, .rhs = image.row_pitch } });
+    const column = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = x.index, .rhs = image.texel_bytes } });
+    const byte_offset = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column } });
+    const texel = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = image.base, .rhs = byte_offset } });
+    const packed_texel = try func.appendInst(block, image.int_ty, .{ .load = .{ .ptr = texel } });
+    const zero = try func.appendInst(block, image.int_ty, .{ .iconst = 0 });
+    var values: [4]Value = undefined;
+    for (0..4) |component| {
+        const offset: i64 = @intCast(component * 4);
+        const float_offset = try func.appendInst(block, image.int_ty, .{ .iconst = offset });
+        const safe_float_offset = try func.appendInst(block, image.int_ty, .{ .select = .{ .cond = image.float_format, .then = float_offset, .@"else" = zero } });
+        const source = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = texel, .rhs = safe_float_offset } });
+        const float_value = try func.appendInst(block, image.f32_t, .{ .load = .{ .ptr = source } });
+        const rgba_shift = try func.appendInst(block, image.int_ty, .{ .iconst = @as(i64, @intCast(component * 8)) });
+        const bgra_shifts = [4]i64{ 16, 8, 0, 24 };
+        const bgra_shift = try func.appendInst(block, image.int_ty, .{ .iconst = bgra_shifts[component] });
+        const shift = try func.appendInst(block, image.int_ty, .{ .select = .{ .cond = image.bgra_format, .then = bgra_shift, .@"else" = rgba_shift } });
+        const shifted = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .shr, .lhs = packed_texel, .rhs = shift } });
+        const byte = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .bit_and, .lhs = shifted, .imm = 0xff } });
+        const biased_bits = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .bit_or, .lhs = byte, .imm = 0x4b00_0000 } });
+        const biased = try func.appendInst(block, image.f32_t, .{ .unary = .{ .op = .reinterpret, .value = biased_bits } });
+        const integer_float = try func.appendInst(block, image.f32_t, .{ .arith = .{ .op = .sub, .lhs = biased, .rhs = image.integer_bias } });
+        const unorm_value = try func.appendInst(block, image.f32_t, .{ .arith = .{ .op = .mul, .lhs = integer_float, .rhs = image.unorm_scale } });
+        const color_value = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = image.float_format, .then = float_value, .@"else" = unorm_value } });
+        const depth_default = try func.appendInst(block, image.f32_t, .{ .fconst = if (component == 3) 1 else 0 });
+        const depth_value = if (component == 0) float_value else depth_default;
+        const value = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = image.depth_format, .then = depth_value, .@"else" = color_value } });
+        const border_ptr = try appendOffset(func, block, image.desc, sampler_border_offset + offset, image.int_ty);
+        const border = try func.appendInst(block, image.f32_t, .{ .load = .{ .ptr = border_ptr } });
+        values[component] = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = outside, .then = border, .@"else" = value } });
+    }
+    return values;
+}
+
+fn lowerShadowCompare(func: *Function, block: Block, compare_op: Value, reference: Value, depth: Value) Error!Value {
+    const int_ty = func.valueType(compare_op);
+    const bool_t = try func.types.intern(.bool);
+    const f32_t = func.valueType(reference);
+    const zero = try func.appendInst(block, f32_t, .{ .fconst = 0 });
+    const one = try func.appendInst(block, f32_t, .{ .fconst = 1 });
+    var result = zero;
+    const relations = [_]ir.function.CmpOp{ .lt, .eq, .le, .gt, .ne, .ge };
+    for (relations, 1..) |relation, code| {
+        const expected = try func.appendInst(block, int_ty, .{ .iconst = @intCast(code) });
+        const selected = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = compare_op, .rhs = expected } });
+        const compared = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = relation, .lhs = reference, .rhs = depth } });
+        const comparison = try func.appendInst(block, f32_t, .{ .select = .{ .cond = compared, .then = one, .@"else" = zero } });
+        result = try func.appendInst(block, f32_t, .{ .select = .{ .cond = selected, .then = comparison, .@"else" = result } });
+    }
+    const always_code = try func.appendInst(block, int_ty, .{ .iconst = 7 });
+    const always = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = compare_op, .rhs = always_code } });
+    return func.appendInst(block, f32_t, .{ .select = .{ .cond = always, .then = one, .@"else" = result } });
+}
+
+const CubeCoordinate = struct {
+    u: Value,
+    v: Value,
+    face: Value,
+};
+
+fn lowerCubeCoordinate(func: *Function, block: Block, x: Value, y: Value, z: Value) Error!CubeCoordinate {
+    const f32_t = func.valueType(x);
+    const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const lane = laneValue(func) orelse return error.Unsupported;
+    const lane_zero_bits = try func.appendInst(block, func.valueType(lane), .{ .arith_imm = .{ .op = .bit_and, .lhs = lane, .imm = 0 } });
+    const lane_zero = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = lane_zero_bits } });
+    const lane_x = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = lane_zero } });
+    const lane_y = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = y, .rhs = lane_zero } });
+    const lane_z = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = z, .rhs = lane_zero } });
+    const zero = try func.appendInst(block, f32_t, .{ .fconst = 0 });
+    const half = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
+    const one = try func.appendInst(block, f32_t, .{ .fconst = 1 });
+    const negative_x = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = lane_x } });
+    const negative_y = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = lane_y } });
+    const negative_z = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = lane_z } });
+    const x_positive = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = lane_x, .rhs = zero } });
+    const y_positive = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = lane_y, .rhs = zero } });
+    const z_positive = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = lane_z, .rhs = zero } });
+    const ax = try func.appendInst(block, f32_t, .{ .select = .{ .cond = x_positive, .then = lane_x, .@"else" = negative_x } });
+    const ay = try func.appendInst(block, f32_t, .{ .select = .{ .cond = y_positive, .then = lane_y, .@"else" = negative_y } });
+    const az = try func.appendInst(block, f32_t, .{ .select = .{ .cond = z_positive, .then = lane_z, .@"else" = negative_z } });
+    const x_over_y = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = ax, .rhs = ay } });
+    const x_over_z = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = ax, .rhs = az } });
+    const x_major = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = x_over_y, .rhs = x_over_z } });
+    const y_major = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = ay, .rhs = az } });
+
+    const x_sc = try func.appendInst(block, f32_t, .{ .select = .{ .cond = x_positive, .then = negative_z, .@"else" = lane_z } });
+    const x_tc = negative_y;
+    const y_sc = lane_x;
+    const y_tc = try func.appendInst(block, f32_t, .{ .select = .{ .cond = y_positive, .then = lane_z, .@"else" = negative_z } });
+    const z_sc = try func.appendInst(block, f32_t, .{ .select = .{ .cond = z_positive, .then = lane_x, .@"else" = negative_x } });
+    const z_tc = negative_y;
+    const yz_sc = try func.appendInst(block, f32_t, .{ .select = .{ .cond = y_major, .then = y_sc, .@"else" = z_sc } });
+    const yz_tc = try func.appendInst(block, f32_t, .{ .select = .{ .cond = y_major, .then = y_tc, .@"else" = z_tc } });
+    const yz_major = try func.appendInst(block, f32_t, .{ .select = .{ .cond = y_major, .then = ay, .@"else" = az } });
+    const sc = try func.appendInst(block, f32_t, .{ .select = .{ .cond = x_major, .then = x_sc, .@"else" = yz_sc } });
+    const tc = try func.appendInst(block, f32_t, .{ .select = .{ .cond = x_major, .then = x_tc, .@"else" = yz_tc } });
+    const major = try func.appendInst(block, f32_t, .{ .select = .{ .cond = x_major, .then = ax, .@"else" = yz_major } });
+    const sc_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .div, .lhs = sc, .rhs = major } });
+    const tc_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .div, .lhs = tc, .rhs = major } });
+    const u_shifted = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = sc_normalized, .rhs = one } });
+    const v_shifted = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = tc_normalized, .rhs = one } });
+
+    const x_positive_face = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+    const x_negative_face = try func.appendInst(block, int_ty, .{ .iconst = 1 });
+    const y_positive_face = try func.appendInst(block, int_ty, .{ .iconst = 2 });
+    const y_negative_face = try func.appendInst(block, int_ty, .{ .iconst = 3 });
+    const z_positive_face = try func.appendInst(block, int_ty, .{ .iconst = 4 });
+    const z_negative_face = try func.appendInst(block, int_ty, .{ .iconst = 5 });
+    const x_face = try func.appendInst(block, int_ty, .{ .select = .{ .cond = x_positive, .then = x_positive_face, .@"else" = x_negative_face } });
+    const y_face = try func.appendInst(block, int_ty, .{ .select = .{ .cond = y_positive, .then = y_positive_face, .@"else" = y_negative_face } });
+    const z_face = try func.appendInst(block, int_ty, .{ .select = .{ .cond = z_positive, .then = z_positive_face, .@"else" = z_negative_face } });
+    const yz_face = try func.appendInst(block, int_ty, .{ .select = .{ .cond = y_major, .then = y_face, .@"else" = z_face } });
+    return .{
+        .u = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = u_shifted, .rhs = half } }),
+        .v = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = v_shifted, .rhs = half } }),
+        .face = try func.appendInst(block, int_ty, .{ .select = .{ .cond = x_major, .then = x_face, .@"else" = yz_face } }),
+    };
+}
+
+fn lerp(func: *Function, block: Block, from: Value, to: Value, amount: Value) Error!Value {
+    const difference = try func.appendInst(block, func.valueType(from), .{ .arith = .{ .op = .sub, .lhs = to, .rhs = from } });
+    const scaled = try func.appendInst(block, func.valueType(from), .{ .arith = .{ .op = .mul, .lhs = difference, .rhs = amount } });
+    return func.appendInst(block, func.valueType(from), .{ .arith = .{ .op = .add, .lhs = from, .rhs = scaled } });
+}
+
+fn lowerSampleSwizzle(func: *Function, block: Block, desc: Value, input: [4]Value) Error![4]Value {
+    const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const f32_t = func.valueType(input[0]);
+    const zero = try func.appendInst(block, f32_t, .{ .fconst = 0 });
+    const one = try func.appendInst(block, f32_t, .{ .fconst = 1 });
+    var output: [4]Value = undefined;
+    for (0..4) |component| {
+        const swizzle_ptr = try appendOffset(func, block, desc, sampler_swizzle_offset + @as(i64, @intCast(component * 4)), int_ty);
+        const swizzle = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = swizzle_ptr } });
+        var value = input[component];
+        for (0..4) |source| {
+            const source_code = try func.appendInst(block, int_ty, .{ .iconst = @as(i64, @intCast(source + 3)) });
+            const select_source = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = swizzle, .rhs = source_code } });
+            value = try func.appendInst(block, f32_t, .{ .select = .{ .cond = select_source, .then = input[source], .@"else" = value } });
+        }
+        const zero_code = try func.appendInst(block, int_ty, .{ .iconst = 1 });
+        const select_zero = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = swizzle, .rhs = zero_code } });
+        value = try func.appendInst(block, f32_t, .{ .select = .{ .cond = select_zero, .then = zero, .@"else" = value } });
+        const one_code = try func.appendInst(block, int_ty, .{ .iconst = 2 });
+        const select_one = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = swizzle, .rhs = one_code } });
+        output[component] = try func.appendInst(block, f32_t, .{ .select = .{ .cond = select_one, .then = one, .@"else" = value } });
+    }
+    return output;
+}
+
+fn lowerInverseSquareRoot(func: *Function, block: Block, value: Value) Error!Value {
+    const f32_t = func.valueType(value);
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bits = try func.appendInst(block, u32_t, .{ .unary = .{ .op = .reinterpret, .value = value } });
+    const half_bits = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .shr, .lhs = bits, .imm = 1 } });
+    const magic = try func.appendInst(block, u32_t, .{ .iconst = 0x5f375a86 });
+    const seed_bits = try func.appendInst(block, u32_t, .{ .arith = .{ .op = .sub, .lhs = magic, .rhs = half_bits } });
+    var estimate = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = seed_bits } });
+    const half = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
+    const one_and_half = try func.appendInst(block, f32_t, .{ .fconst = 1.5 });
+    const value_half = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = value, .rhs = half } });
+    for (0..3) |_| {
+        const squared = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = estimate, .rhs = estimate } });
+        const scaled = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = value_half, .rhs = squared } });
+        const correction = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = one_and_half, .rhs = scaled } });
+        estimate = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = estimate, .rhs = correction } });
+    }
+    return estimate;
+}
+
+fn lowerSquareRoot(allocator: std.mem.Allocator, func: *Function) Error!void {
+    for (0..func.blockCount()) |block_index| {
+        const block: Block = @fromBackingInt(@intCast(block_index));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const operation = func.opcode(inst);
+            if (operation != .unary or operation.unary.op != .sqrt) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const inverse = try lowerInverseSquareRoot(func, block, operation.unary.value);
+            const result = try func.appendInst(block, func.valueType(operation.unary.value), .{ .arith = .{
+                .op = .mul,
+                .lhs = operation.unary.value,
+                .rhs = inverse,
+            } });
+            func.replaceAllUses(func.instResult(inst) orelse return error.Unsupported, result);
+        }
+    }
+}
+
+fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        var sampled = std.AutoHashMapUnmanaged(Value, [4]Value){};
+        defer sampled.deinit(allocator);
+        const Element = struct { base: Value, component: u2 };
+        var elements = std.AutoHashMapUnmanaged(Value, Element){};
+        defer elements.deinit(allocator);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const operation = func.opcode(inst);
+            if (operation == .arith and operation.arith.op == .add) {
+                if (elements.get(operation.arith.lhs)) |element| {
+                    if (func.definingInst(operation.arith.rhs)) |offset_inst| {
+                        const offset = func.opcode(offset_inst);
+                        if (offset == .iconst and offset.iconst >= 0 and offset.iconst <= 12 and @mod(offset.iconst, 4) == 0) {
+                            const result = func.instResult(inst).?;
+                            try elements.put(allocator, result, .{ .base = element.base, .component = @intCast(@divExact(offset.iconst, 4)) });
+                            continue;
+                        }
+                    }
+                }
+            }
+            if (operation == .load) {
+                if (elements.get(operation.load.ptr)) |element| {
+                    const values = sampled.get(element.base) orelse return error.Unsupported;
+                    func.replaceAllUses(func.instResult(inst).?, values[element.component]);
+                    continue;
+                }
+            }
+            const regular_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_fn");
+            const array_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_2darray_fn");
+            const cube_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_cube_fn");
+            const shadow_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_shadow_fn");
+            if (!regular_sample and !array_sample and !cube_sample and !shadow_sample) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const args = func.valueList(operation.call_indirect.args);
+            const expected_arg_count: usize = if (array_sample or cube_sample) 6 else 5;
+            if (args.len != expected_arg_count) return error.Unsupported;
+            var desc = args[0];
+            const nullable = hasGpuKey(func, desc, "nullable_desc");
+            const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+            const bool_t = try func.types.intern(.bool);
+            const ptr_ty = func.valueType(desc);
+            const f32_t = func.valueType(args[1]);
+            const lod_index: usize = if (array_sample or cube_sample) 4 else 3;
+            const lod = args[lod_index];
+            const zero_f = try func.appendInst(block, f32_t, .{ .fconst = 0 });
+            const constant_lod: ?f64 = if (func.definingInst(lod)) |lod_inst| blk: {
+                const lod_op = func.opcode(lod_inst);
+                break :blk if (lod_op == .fconst) lod_op.fconst else null;
+            } else null;
+            const base_lod = if (constant_lod) |value| value <= 0 else false;
+            if (!base_lod) {
+                const requested_level = if (constant_lod) |value|
+                    try func.appendInst(block, int_ty, .{ .iconst = @intFromFloat(@floor(value + 0.5)) })
+                else blk: {
+                    const lane = laneValue(func) orelse return error.Unsupported;
+                    const lane_zero_bits = try func.appendInst(block, func.valueType(lane), .{ .arith_imm = .{ .op = .bit_and, .lhs = lane, .imm = 0 } });
+                    const lane_zero = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = lane_zero_bits } });
+                    const lane_lod = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = lod, .rhs = lane_zero } });
+                    const negative_lod = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = lane_lod, .rhs = zero_f } });
+                    const nonnegative_lod = try func.appendInst(block, f32_t, .{ .select = .{ .cond = negative_lod, .then = zero_f, .@"else" = lane_lod } });
+                    const half_f = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
+                    const rounded_lod = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = nonnegative_lod, .rhs = half_f } });
+                    break :blk try func.appendInst(block, int_ty, .{ .convert = .{ .value = rounded_lod } });
+                };
+                const count_ptr = try appendOffset(func, block, desc, sampler_level_count_offset, int_ty);
+                const count = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = count_ptr } });
+                const one_u = try func.appendInst(block, int_ty, .{ .iconst = 1 });
+                const last_level = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .sub, .lhs = count, .rhs = one_u } });
+                const lod_past_end = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = requested_level, .rhs = count } });
+                const level = try func.appendInst(block, int_ty, .{ .select = .{ .cond = lod_past_end, .then = last_level, .@"else" = requested_level } });
+                const stride = try func.appendInst(block, int_ty, .{
+                    .iconst = if (nullable) nullable_sampler_descriptor_size else sampler_descriptor_size,
+                });
+                const descriptor_offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = level, .rhs = stride } });
+                desc = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = desc, .rhs = descriptor_offset } });
+            }
+            const cube = if (cube_sample) try lowerCubeCoordinate(func, block, args[1], args[2], args[3]) else null;
+            const u = if (cube) |coordinate| coordinate.u else args[1];
+            const v = if (cube) |coordinate| coordinate.v else args[2];
+            const nearest_x = try lowerSampleCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_address_u_offset);
+            const nearest_y = try lowerSampleCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_address_v_offset);
+            const linear_x = try lowerLinearCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_width_reciprocal_offset, sampler_address_u_offset);
+            const linear_y = try lowerLinearCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset, sampler_address_v_offset);
+            const mag_filter_ptr = try appendOffset(func, block, desc, sampler_mag_filter_offset, int_ty);
+            const mag_filter = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = mag_filter_ptr } });
+            const min_filter_ptr = try appendOffset(func, block, desc, sampler_min_filter_offset, int_ty);
+            const min_filter = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = min_filter_ptr } });
+            const filter = if (constant_lod) |value|
+                if (value > 0) min_filter else mag_filter
+            else blk: {
+                const minifying = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = zero_f, .rhs = lod } });
+                break :blk try func.appendInst(block, int_ty, .{ .select = .{ .cond = minifying, .then = min_filter, .@"else" = mag_filter } });
+            };
+            const linear_value = try func.appendInst(block, int_ty, .{ .iconst = 1 });
+            const linear = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = filter, .rhs = linear_value } });
+            const x0 = try selectSampleCoordinate(func, block, linear, linear_x.first, nearest_x);
+            const x1 = try selectSampleCoordinate(func, block, linear, linear_x.second, nearest_x);
+            const y0 = try selectSampleCoordinate(func, block, linear, linear_y.first, nearest_y);
+            const y1 = try selectSampleCoordinate(func, block, linear, linear_y.second, nearest_y);
+            const x_weight = try func.appendInst(block, f32_t, .{ .select = .{ .cond = linear, .then = linear_x.weight, .@"else" = zero_f } });
+            const y_weight = try func.appendInst(block, f32_t, .{ .select = .{ .cond = linear, .then = linear_y.weight, .@"else" = zero_f } });
+            var base = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = desc } });
+            if (array_sample) {
+                const half = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
+                const rounded = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = args[3], .rhs = half } });
+                const layer = try func.appendInst(block, int_ty, .{ .convert = .{ .value = rounded } });
+                const pitch_ptr = try appendOffset(func, block, desc, sampler_array_pitch_offset, int_ty);
+                const pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = pitch_ptr } });
+                const layer_offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = layer, .rhs = pitch } });
+                base = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = layer_offset } });
+            } else if (cube) |coordinate| {
+                const pitch_ptr = try appendOffset(func, block, desc, sampler_array_pitch_offset, int_ty);
+                const pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = pitch_ptr } });
+                const face_offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = coordinate.face, .rhs = pitch } });
+                base = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = face_offset } });
+            }
+            const row_ptr = try appendOffset(func, block, desc, sampler_row_pitch_offset, int_ty);
+            const row_pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = row_ptr } });
+            const texel_bytes_ptr = try appendOffset(func, block, desc, sampler_texel_bytes_offset, int_ty);
+            const texel_bytes = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = texel_bytes_ptr } });
+            const format_ptr = try appendOffset(func, block, desc, sampler_format_offset, int_ty);
+            const format = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = format_ptr } });
+            const float_format_value = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+            const float_format = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = float_format_value } });
+            const bgra_format_value = try func.appendInst(block, int_ty, .{ .iconst = 2 });
+            const bgra_format = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = bgra_format_value } });
+            const depth_format_value = try func.appendInst(block, int_ty, .{ .iconst = 3 });
+            const depth_format = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = depth_format_value } });
+            const integer_bias = try func.appendInst(block, f32_t, .{ .fconst = 8388608 });
+            const unorm_scale = try func.appendInst(block, f32_t, .{ .fconst = 1.0 / 255.0 });
+            const image = SampleImage{
+                .desc = desc,
+                .base = base,
+                .row_pitch = row_pitch,
+                .texel_bytes = texel_bytes,
+                .float_format = float_format,
+                .depth_format = depth_format,
+                .bgra_format = bgra_format,
+                .integer_bias = integer_bias,
+                .unorm_scale = unorm_scale,
+                .int_ty = int_ty,
+                .ptr_ty = ptr_ty,
+                .f32_t = f32_t,
+                .bool_t = bool_t,
+            };
+            const texel00 = try lowerSampleTexel(func, block, image, x0, y0);
+            const texel10 = try lowerSampleTexel(func, block, image, x1, y0);
+            const texel01 = try lowerSampleTexel(func, block, image, x0, y1);
+            const texel11 = try lowerSampleTexel(func, block, image, x1, y1);
+            if (shadow_sample) {
+                const compare_ptr = try appendOffset(func, block, desc, sampler_compare_op_offset, int_ty);
+                const compare_op = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = compare_ptr } });
+                const compared00 = try lowerShadowCompare(func, block, compare_op, args[4], texel00[0]);
+                const compared10 = try lowerShadowCompare(func, block, compare_op, args[4], texel10[0]);
+                const compared01 = try lowerShadowCompare(func, block, compare_op, args[4], texel01[0]);
+                const compared11 = try lowerShadowCompare(func, block, compare_op, args[4], texel11[0]);
+                const top = try lerp(func, block, compared00, compared10, x_weight);
+                const bottom = try lerp(func, block, compared01, compared11, x_weight);
+                var value = try lerp(func, block, top, bottom, y_weight);
+                if (nullable) {
+                    const valid_ptr = try appendOffset(func, block, desc, 100, int_ty);
+                    const valid = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = valid_ptr } });
+                    const zero_u = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+                    const present = try func.appendInst(block, bool_t, .{
+                        .icmp = .{ .op = .ne, .lhs = valid, .rhs = zero_u },
+                    });
+                    value = try func.appendInst(block, f32_t, .{
+                        .select = .{ .cond = present, .then = value, .@"else" = zero_f },
+                    });
+                }
+                func.replaceAllUses(func.instResult(inst) orelse return error.Unsupported, value);
+                continue;
+            }
+            var values: [4]Value = undefined;
+            for (0..4) |component| {
+                const top = try lerp(func, block, texel00[component], texel10[component], x_weight);
+                const bottom = try lerp(func, block, texel01[component], texel11[component], x_weight);
+                values[component] = try lerp(func, block, top, bottom, y_weight);
+            }
+            const out_index: usize = if (array_sample or cube_sample) 5 else 4;
+            const out = args[out_index];
+            try sampled.put(allocator, out, try lowerSampleSwizzle(func, block, desc, values));
+            try elements.put(allocator, out, .{ .base = out, .component = 0 });
+        }
+    }
+}
+
+fn lowerTexelFetch(allocator: std.mem.Allocator, func: *Function) Error!void {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        var fetched = std.AutoHashMapUnmanaged(Value, [4]Value){};
+        defer fetched.deinit(allocator);
+        const Element = struct { base: Value, component: u2 };
+        var elements = std.AutoHashMapUnmanaged(Value, Element){};
+        defer elements.deinit(allocator);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const op = func.opcode(inst);
+            if (op == .arith) {
+                const arith = op.arith;
+                if (arith.op == .add) {
+                    if (elements.get(arith.lhs)) |element| {
+                        if (func.definingInst(arith.rhs)) |offset_inst| {
+                            const offset_op = func.opcode(offset_inst);
+                            if (offset_op == .iconst and offset_op.iconst >= 0 and offset_op.iconst <= 12 and @mod(offset_op.iconst, 4) == 0) {
+                                const result = func.instResult(inst).?;
+                                try elements.put(allocator, result, .{ .base = element.base, .component = @intCast(@divExact(offset_op.iconst, 4)) });
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            if (op == .load) {
+                if (elements.get(op.load.ptr)) |element| {
+                    const values = fetched.get(element.base) orelse return error.Unsupported;
+                    func.replaceAllUses(func.instResult(inst).?, values[element.component]);
+                    continue;
+                }
+            }
+            if (op != .call_indirect or !hasGpuKey(func, op.call_indirect.target, "sampler_fetch_fn")) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const args = func.valueList(op.call_indirect.args);
+            if (args.len != 5) return error.Unsupported;
+            const lod_inst = func.definingInst(args[3]) orelse return error.Unsupported;
+            if (func.opcode(lod_inst) != .iconst or func.opcode(lod_inst).iconst != 0) return error.Unsupported;
+
+            const desc = args[0];
+            const x = args[1];
+            const y = args[2];
+            const out = args[4];
+            const int_ty = func.valueType(x);
+            const ptr_ty = func.valueType(desc);
+            const float_ty = try func.types.intern(.{ .float = .f32 });
+            const base = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = desc } });
+            const row_ptr = try appendOffset(func, block, desc, sampler_row_pitch_offset, int_ty);
+            const row_pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = row_ptr } });
+            const row = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = y, .rhs = row_pitch } });
+            const texel_bytes = try func.appendInst(block, int_ty, .{ .iconst = rgba32f_texel_bytes });
+            const column = try func.appendInst(block, int_ty, .{ .arith = .{
+                .op = .mul,
+                .lhs = x,
+                .rhs = texel_bytes,
+            } });
+            const offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column } });
+            const texel = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+            var values: [4]Value = undefined;
+            for (0..4) |component| {
+                const byte_offset: i64 = @intCast(component * 4);
+                const source = try appendOffset(func, block, texel, byte_offset, int_ty);
+                const read_ptr = try nullableImagePointer(func, block, desc, source, false, byte_offset, int_ty);
+                values[component] = try func.appendInst(block, float_ty, .{ .load = .{ .ptr = read_ptr } });
+            }
+            try fetched.put(allocator, out, values);
+            try elements.put(allocator, out, .{ .base = out, .component = 0 });
+        }
+    }
+}
+
+fn lowerStorageImageWrite(allocator: std.mem.Allocator, func: *Function) Error!void {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const operation = func.opcode(inst);
+            if (operation != .call_indirect or !hasGpuKey(func, operation.call_indirect.target, "storage_image_write_fn")) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const args = func.valueList(operation.call_indirect.args);
+            if (args.len != 7) return error.Unsupported;
+            const desc = args[0];
+            const int_ty = func.valueType(args[1]);
+            const ptr_ty = func.valueType(desc);
+            const base = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = desc } });
+            const row_ptr = try appendOffset(func, block, desc, sampler_row_pitch_offset, int_ty);
+            const row_pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = row_ptr } });
+            const row = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = args[2], .rhs = row_pitch } });
+            const texel_bytes = try func.appendInst(block, int_ty, .{ .iconst = rgba32f_texel_bytes });
+            const column = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = args[1], .rhs = texel_bytes } });
+            const offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column } });
+            const texel = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+            for (0..4) |component| {
+                const byte_offset: i64 = @intCast(component * 4);
+                const destination = try appendOffset(func, block, texel, byte_offset, int_ty);
+                const write_ptr = try nullableImagePointer(func, block, desc, destination, true, byte_offset, int_ty);
+                try func.appendStore(block, args[3 + component], write_ptr);
+            }
+        }
+    }
+}
+
+fn lowerImageSize(allocator: std.mem.Allocator, func: *Function) Error!void {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        var sizes = std.AutoHashMapUnmanaged(Value, [2]Value){};
+        defer sizes.deinit(allocator);
+        const Element = struct { base: Value, component: u1 };
+        var elements = std.AutoHashMapUnmanaged(Value, Element){};
+        defer elements.deinit(allocator);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const operation = func.opcode(inst);
+            if (operation == .arith and operation.arith.op == .add) {
+                if (elements.get(operation.arith.lhs)) |element| {
+                    if (func.definingInst(operation.arith.rhs)) |offset_inst| {
+                        const offset = func.opcode(offset_inst);
+                        if (offset == .iconst and offset.iconst == 4) {
+                            const result = func.instResult(inst).?;
+                            try elements.put(allocator, result, .{ .base = element.base, .component = 1 });
+                            continue;
+                        }
+                    }
+                }
+            }
+            if (operation == .load) {
+                if (elements.get(operation.load.ptr)) |element| {
+                    const values = sizes.get(element.base) orelse return error.Unsupported;
+                    func.replaceAllUses(func.instResult(inst).?, values[element.component]);
+                    continue;
+                }
+            }
+            if (operation != .call_indirect or !hasGpuKey(func, operation.call_indirect.target, "image_size_fn")) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const args = func.valueList(operation.call_indirect.args);
+            if (args.len != 3) return error.Unsupported;
+            const lod_inst = func.definingInst(args[1]) orelse return error.Unsupported;
+            if (func.opcode(lod_inst) != .iconst or func.opcode(lod_inst).iconst != 0) return error.Unsupported;
+            const desc = args[0];
+            const out = args[2];
+            const int_ty = func.valueType(args[1]);
+            const width_ptr = try appendOffset(func, block, desc, 8, int_ty);
+            const height_ptr = try appendOffset(func, block, desc, 12, int_ty);
+            var width = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = width_ptr } });
+            var height = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = height_ptr } });
+            if (hasGpuKey(func, desc, "nullable_desc")) {
+                const valid_ptr = try appendOffset(func, block, desc, 100, int_ty);
+                const valid = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = valid_ptr } });
+                const zero = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+                const present = try func.appendInst(block, try func.types.intern(.bool), .{
+                    .icmp = .{ .op = .ne, .lhs = valid, .rhs = zero },
+                });
+                width = try func.appendInst(block, int_ty, .{
+                    .select = .{ .cond = present, .then = width, .@"else" = zero },
+                });
+                height = try func.appendInst(block, int_ty, .{
+                    .select = .{ .cond = present, .then = height, .@"else" = zero },
+                });
+            }
+            try sizes.put(allocator, out, .{ width, height });
+            try elements.put(allocator, out, .{ .base = out, .component = 0 });
+        }
+    }
+}
+
 // ===========================================================================
 // Divergence: which values are per-lane.
 //
@@ -504,7 +1546,7 @@ const Ctx = struct { divergent: []const bool, macs: *const Macs, strides: *const
 /// lane; a lane or thread index is the point of the exercise.
 fn laneVarying(b: gpu.builtin.Builtin) bool {
     return switch (b) {
-        .thread_id_x, .lane_id, .global_id_x => true,
+        .thread_id_x, .lane_id, .global_id_x, .vertex_index => true,
         else => false,
     };
 }
@@ -1205,19 +2247,16 @@ fn flatten(
         break :blk .{ .target = l.header, .args = edge.args };
     } else null;
 
-    // Nothing is touched until every predicate is known to be buildable, so a refusal leaves the
-    // function alone. The only one that can fail is a complement, and only an integer compare has
-    // one, so the check is the same question asked without emitting anything.
+    // Nothing is touched until every predicate is known to be usable as a mask, so a refusal
+    // leaves the function alone.
     for (r.inside[0..r.count]) |b| {
         for (flows.items[0..flows.count]) |src| {
             if (src.sideTo(b)) |side| {
                 const cond = (src.cond orelse continue);
-                // Every test in the region has to reach the predicates as a MASK, and the ones on
-                // the far side of a branch need their complement as well.
                 if (!maskable(func, cond, divergent)) return false;
-                if (side == 1 and varies(divergent, cond) and complementOf(func, cond) == null) {
+                if (side == 1 and varies(divergent, cond) and
+                    complementOf(func, cond) == null and !hasDiscardParam(func))
                     return false;
-                }
             }
         }
     }
@@ -1561,9 +2600,9 @@ const Complement = union(enum) {
 
 /// The complement of `cond`, or null when there is none to be had.
 ///
-/// An integer compare has one: flip the operator. A NOT has one for FREE, and a frontend writes a
+/// An integer compare has one: flip the operator. A NOT has one for free, and a frontend writes a
 /// NOT as `b ^ 1`, in either the immediate form or with a constant of its own, so the complement
-/// of that is `b`. A FLOAT compare has none: see `invertedCompare`.
+/// of that is `b`.
 fn complementOf(func: *const Function, cond: Value) ?Complement {
     if (invertedCompare(func, cond)) |c| return .{ .compare = c };
     const inst = func.definingInst(cond) orelse return null;
@@ -1594,9 +2633,11 @@ fn isOne(func: *const Function, v: Value) bool {
     };
 }
 
-/// The complement of `cond` as a value, emitted in `at` when it has to be. Null when there is none.
+/// The complement of `cond` as a value, emitted in `at` when it has to be.
 fn appendComplement(func: *Function, at: Block, cond: Value, bool_ty: Type) Error!?Value {
-    return switch (complementOf(func, cond) orelse return null) {
+    const complement = complementOf(func, cond) orelse
+        return try func.appendInst(at, bool_ty, .{ .arith_imm = .{ .op = .bit_xor, .lhs = cond, .imm = 1 } });
+    return switch (complement) {
         .have => |v| v,
         .compare => |c| try func.appendInst(at, bool_ty, .{ .icmp = c }),
     };
@@ -3804,6 +4845,7 @@ fn checkSupported(
     }
     var args: usize = 0;
     for (func.blockParams(@fromBackingInt(0))) |p| {
+        if (isIgnoredEntryParam(func, p)) continue;
         const b = gpu.attrs.builtinOf(func, p) orelse {
             // An entry parameter with no builtin is a KERNEL PARAMETER, read from a launch
             // argument CSR. See `launchArgOf` for the ordering rule.
@@ -4048,14 +5090,13 @@ fn launchArgOf(index: usize) ?u12 {
 
 /// Where a WARP-UNIFORM hardware builtin comes from, or null when the core cannot answer.
 ///
-/// A warp is the workgroup: it owns a program counter and a register file, and `mhartid` is
-/// unique across the whole SoC, which is what a workgroup index is. The lanes inside a warp are
-/// the threads, so a thread or lane index differs between the lanes and comes from `vid.v`
-/// instead. Those are answered by `lanewiseBuiltin`, not here.
+/// A warp is the workgroup: it owns a program counter and a register file. The dispatch CSR adds
+/// the virtual batch offset to the physical hart id. The lanes inside a warp are the threads, so
+/// a thread or lane index differs between the lanes and comes from `vid.v` instead.
 fn builtinSource(b: gpu.builtin.Builtin) ?union(enum) { csr: u12, lanes } {
     return switch (b) {
-        .block_id_x => .{ .csr = glacier.Csr.mhartid },
-        .grid_dim_x => .{ .csr = glacier.Csr.hart_count },
+        .block_id_x => .{ .csr = glacier.Csr.workgroup_id },
+        .grid_dim_x => .{ .csr = glacier.Csr.grid_dim },
         .block_dim_x, .subgroup_size => .lanes,
         else => null,
     };
@@ -4562,6 +5603,7 @@ const Emitter = struct {
         // because the position is the host's argument number and not a register index.
         var args: usize = 0;
         for (self.func.blockParams(block)) |p| {
+            if (isIgnoredEntryParam(self.func, p)) continue;
             const b = gpu.attrs.builtinOf(self.func, p);
             const arg: ?u12 = if (b == null) blk: {
                 defer args += 1;
@@ -4602,11 +5644,11 @@ const Emitter = struct {
     /// NOT safe to reduce across, which is why a lane count comes from the profile.
     fn lanewiseBuiltin(self: *Emitter, b: gpu.builtin.Builtin, dst: VReg) Error!void {
         try self.put(rv.vid_v(dst));
-        if (b != .global_id_x) return;
-        // A global index is this warp's base plus the lane: `mhartid * lanes + vid`. The lane
+        if (b != .global_id_x and b != .vertex_index) return;
+        // A global index is this workgroup's base plus the lane: `workgroup_id * lanes + vid`. The lane
         // count is a power of two, so the multiply is a shift.
         const lanes = self.opts.profile.lanes();
-        try self.put(glacier.csrr(scratch, glacier.Csr.mhartid));
+        try self.put(glacier.csrr(scratch, glacier.Csr.workgroup_id));
         try self.put(rv.slli(scratch, scratch, @intCast(std.math.log2_int(u8, lanes))));
         try self.put(rv.vmv_v_x(vscratch, scratch));
         try self.put(rv.vadd_vv(dst, dst, vscratch));

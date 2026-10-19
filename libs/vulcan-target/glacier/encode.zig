@@ -106,6 +106,12 @@ pub const Csr = struct {
     /// core it is launched on without being told the shape by its host.
     pub const hart_count: u12 = 0xFC0;
 
+    /// Virtual workgroup id for this launch.
+    pub const workgroup_id: u12 = 0xFC9;
+
+    /// Workgroups in the full dispatch.
+    pub const grid_dim: u12 = 0xFCA;
+
     /// How many launch arguments a GC1 core carries.
     pub const launch_args: usize = 8;
 
