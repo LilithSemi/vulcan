@@ -5205,15 +5205,17 @@ test "the warp model decodes every word this backend can emit" {
         rv.vfsub_vv(.v1, .v2, .v3),                                  rv.vfmul_vv(.v1, .v2, .v3),                              rv.vfdiv_vv(.v1, .v2, .v3),
         rv.vfwmacc_vv(.v1, .v2, .v3),                                rv.vmfeq_vv(.v1, .v2, .v3),                              rv.vmflt_vv(.v1, .v2, .v3),
         rv.vmfle_vv(.v1, .v2, .v3),                                  rv.vfcvt_f_x_v(.v1, .v2),                                rv.vfcvt_rtz_xu_f_v(.v1, .v2),
-        rv.vfncvt_f_f_w(.v1, .v2),                                   rv.vfwcvt_f_f_v(.v1, .v2),
+        rv.vfncvt_f_f_w(.v1, .v2),                                   rv.vfwcvt_f_f_v(.v1, .v2),                               rv.vfwcvt_f_x_v(.v1, .v2),
+        rv.vfwcvt_f_xu_v(.v1, .v2),
         // The cross-warp barrier, which is a CONSTANT word and not an encoder call: the grep that
         // collected this list saw `rv.` calls and missed it, and the model did not decode it. A
         // word reachable without a function call is exactly what an audit of calls cannot see.
-                                      glacier.encode.warp_barrier,
-        // Memory, per lane: unit stride and gather or scatter, masked and not.
-        rv.vle32(.v1, .x10),                                         rv.vle32_m(.v1, .x10),                                   rv.vse32(.v1, .x10),
-        rv.vse32_m(.v1, .x10),                                       rv.vluxei32(.v1, .x0, .v4),                              rv.vluxei32_m(.v1, .x0, .v4),
-        rv.vsuxei32(.v1, .x0, .v4),                                  rv.vsuxei32_m(.v1, .x0, .v4),
+                                         glacier.encode.warp_barrier,
+            // Memory, per lane: unit stride and gather or scatter, masked and not.
+                                    rv.vle32(.v1, .x10),
+        rv.vle32_m(.v1, .x10),                                       rv.vse32(.v1, .x10),                                     rv.vse32_m(.v1, .x10),
+        rv.vluxei32(.v1, .x0, .v4),                                  rv.vluxei32_m(.v1, .x0, .v4),                            rv.vsuxei32(.v1, .x0, .v4),
+        rv.vsuxei32_m(.v1, .x0, .v4),
     };
 
     for (words, 0..) |w, i| {
@@ -5857,4 +5859,49 @@ test "the rasteriser refuses more attributes than one loop carries, by the numbe
     try std.testing.expect(std.mem.indexOf(u8, why.reason, "more interpolated attributes") != null);
     try std.testing.expectEqual(@as(u32, 9), why.wanted);
     try std.testing.expectEqual(@as(u32, 8), why.limit);
+}
+
+test "an integer converts to f32 and not to an f16 sitting in an f32 register" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+    const entry = try f.appendBlock();
+    const lane = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, lane, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .mul, lane, 4);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const unsigned = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at } });
+    const signed = try f.appendInst(entry, i32_t, .{ .unary = .{ .op = .reinterpret, .value = unsigned } });
+    const from_unsigned = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = unsigned } });
+    const from_signed = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = signed } });
+    const out_u = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = at, .rhs = try f.appendInst(entry, u32_t, .{ .iconst = 64 }) } });
+    const out_s = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = at, .rhs = try f.appendInst(entry, u32_t, .{ .iconst = 128 }) } });
+    try f.appendStore(entry, from_unsigned, out_u);
+    try f.appendStore(entry, from_signed, out_s);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const code = try compile(allocator, &f);
+    defer allocator.free(code);
+
+    var data: [64]u32 = @splat(0);
+    // 6141 lands in the range where an f16 steps by four, so a convert that wrote f16 bits would
+    // come back as 6140 and as the wrong exponent. A lane index cannot catch that: 0 to 3 are
+    // exact in both formats.
+    data[0] = 6141;
+    data[1] = 0;
+    data[2] = 3;
+    data[3] = @bitCast(@as(i32, -1));
+    try runOnce(code, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 0x45BFE800), data[16]);
+    try std.testing.expectEqual(@as(u32, 0x45BFE800), data[32]);
+    try std.testing.expectEqual(@as(u32, 0), data[17]);
+    try std.testing.expectEqual(@as(u32, 0x40400000), data[18]);
+    // The same word as unsigned and as signed: 4294967295 against -1.
+    try std.testing.expectEqual(@as(u32, 0x4F800000), data[19]);
+    try std.testing.expectEqual(@as(u32, 0xBF800000), data[35]);
 }

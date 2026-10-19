@@ -548,6 +548,12 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
                 0b10100 => halfBits(ftz(f16, @floatCast(asFloat(x)))),
                 // vfwcvt.f.f.v: an f16 widened to f32, which is exact in every case.
                 0b01100 => @bitCast(ftz(f32, @as(f32, asHalf(x)))),
+                // vfwcvt.f.xu.v and vfwcvt.f.x.v: a 32-bit integer to f32, nearest even. The
+                // result format arrives on the SEW port rather than the destination one, so a
+                // wiring mistake in the core returns f16 bits in an f32 register and a lane index
+                // cannot tell: 0 to 3 are exact in both formats.
+                0b01010 => @bitCast(ftz(f32, @as(f32, @floatFromInt(x)))),
+                0b01011 => @bitCast(ftz(f32, @as(f32, @floatFromInt(@as(i32, @bitCast(x)))))),
                 else => return error.Illegal,
             };
         }

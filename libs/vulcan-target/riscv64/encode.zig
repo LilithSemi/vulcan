@@ -203,6 +203,20 @@ pub fn vmfle_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
 pub fn vfwcvt_f_f_v(vd: VReg, vs2: VReg) u32 {
     return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (@as(u32, 0b01100) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010010) << 26);
 }
+
+/// `vfwcvt.f.xu.v vd, vs2` and `vfwcvt.f.x.v vd, vs2`: per-lane integer to float, unsigned and
+/// signed. The same `funct6` as the other converts, selected by the `vs1` field.
+///
+/// A Glacier lane is a fixed 32 bits, so nothing widens here: the source is a 32-bit integer and
+/// the result is an f32 in the same register. `vfcvt.f.x.v` is the NARROW form and writes an f16,
+/// which is not a cheaper road to an f32: the integer rounds to eleven bits of mantissa before any
+/// widening can make it exact again.
+pub fn vfwcvt_f_xu_v(vd: VReg, vs2: VReg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (@as(u32, 0b01010) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010010) << 26);
+}
+pub fn vfwcvt_f_x_v(vd: VReg, vs2: VReg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (@as(u32, 0b01011) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010010) << 26);
+}
 // Fused multiply-add/sub family (OPFVV). Unlike the plain arithmetic ops above, these
 // accumulate INTO vd (vd is a third source operand as well as the destination), so the
 // assembler operand order is conventionally written `vd, vs1, vs2` (the two multiplicands)
@@ -2431,6 +2445,8 @@ test "the RVV float arithmetic, compares and widening convert match LLVM's assem
     try std.testing.expectEqual(@as(u32, 0x6e951457), vmflt_vv(.v8, .v9, .v10));
     try std.testing.expectEqual(@as(u32, 0x66951457), vmfle_vv(.v8, .v9, .v10));
     try std.testing.expectEqual(@as(u32, 0x4a961457), vfwcvt_f_f_v(.v8, .v9));
+    try std.testing.expectEqual(@as(u32, 0x4a951457), vfwcvt_f_xu_v(.v8, .v9));
+    try std.testing.expectEqual(@as(u32, 0x4a959457), vfwcvt_f_x_v(.v8, .v9));
     // The same reference run pins the add this file already had, which checks the parse of the
     // dump the other words came from.
     try std.testing.expectEqual(@as(u32, 0x021111d7), vfadd_vv(.v3, .v1, .v2));

@@ -810,37 +810,16 @@ fn constantColourByte(func: *const Function, value: Value) ?u32 {
     return @intFromFloat(@min(1.0, @max(0.0, constant)) * 255.0);
 }
 
-/// A small integer as a float, for a core that decodes no integer-to-f32 convert.
-///
-/// The value goes in the mantissa of 2 raised to the 23rd and a subtraction takes the exponent away
-/// again, which is exact for every unsigned input below that. A SIGNED source is biased by 2 to the
-/// 22nd first, which halves the range and keeps all of it exact. A screen coordinate, and a
-/// difference of two of them, is far inside either. An f16 destination takes the convert the core
-/// does have.
-///
-/// `vfwcvt.f.f.v` widens an f16 exactly and looks like a cheaper road to the same place. It is not:
-/// the integer rounds to eleven bits of mantissa on the way in, so a coordinate above 2048 comes
-/// out wrong.
-fn smallIntToFloat(func: *Function, block: Block, value: Value, ty: Type, int_t: Type) Error!Value {
-    if (func.types.type_kind(ty).float != .f32) {
+/// An integer as a float. Only an f16 destination needs anything said about it: the core has the
+/// SIGNED convert alone at that width, so an unsigned source is reinterpreted first, which is the
+/// same value for anything below 2 to the 31st.
+fn intToFloat(func: *Function, block: Block, value: Value, ty: Type) Error!Value {
+    if (func.types.type_kind(ty).float == .f16 and !isSigned(func, func.valueType(value))) {
         const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
         const signed = try func.appendInst(block, i32_t, .{ .unary = .{ .op = .reinterpret, .value = value } });
         return func.appendInst(block, ty, .{ .convert = .{ .value = signed } });
     }
-    const source = func.valueType(value);
-    const bias: i64 = if (isSigned(func, source)) 0x400000 else 0;
-    const shifted = if (bias == 0)
-        value
-    else
-        try func.appendArithImm(block, source, .add, value, bias);
-    const bits = if (func.valueType(shifted) == int_t)
-        shifted
-    else
-        try func.appendInst(block, int_t, .{ .unary = .{ .op = .reinterpret, .value = shifted } });
-    const placed = try func.appendArithImm(block, int_t, .bit_or, bits, 0x4B000000);
-    const mantissa = try func.appendInst(block, ty, .{ .unary = .{ .op = .reinterpret, .value = placed } });
-    const away = try func.appendInst(block, ty, .{ .fconst = @floatFromInt(0x800000 + bias) });
-    return func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = mantissa, .rhs = away } });
+    return func.appendInst(block, ty, .{ .convert = .{ .value = value } });
 }
 
 /// Where the generated rasteriser reads a vertex position, inside the vertex output record. This is
@@ -1033,10 +1012,10 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     if (attrs > 0) {
         const wx = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = vx[2], .rhs = vx[0] } });
         const wy = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = vy[2], .rhs = vy[0] } });
-        const fux = try smallIntToFloat(func, entry, dx[0], f32_t, u32_t);
-        const fuy = try smallIntToFloat(func, entry, dy[0], f32_t, u32_t);
-        const fwx = try smallIntToFloat(func, entry, wx, f32_t, u32_t);
-        const fwy = try smallIntToFloat(func, entry, wy, f32_t, u32_t);
+        const fux = try intToFloat(func, entry, dx[0], f32_t);
+        const fuy = try intToFloat(func, entry, dy[0], f32_t);
+        const fwx = try intToFloat(func, entry, wx, f32_t);
+        const fwy = try intToFloat(func, entry, wy, f32_t);
         const across = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = fux, .rhs = fwy } });
         const back = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = fuy, .rhs = fwx } });
         const area = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .sub, .lhs = across, .rhs = back } });
@@ -1045,9 +1024,9 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
         // Where this lane's first pixel sits relative to vertex zero.
         const from_x = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = lane_signed, .rhs = vx[0] } });
         const from_y = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = origin, .rhs = vy[0] } });
-        const fx = try smallIntToFloat(func, entry, from_x, f32_t, u32_t);
-        const fy = try smallIntToFloat(func, entry, from_y, f32_t, u32_t);
-        const flanes = try smallIntToFloat(func, entry, lanes, f32_t, u32_t);
+        const fx = try intToFloat(func, entry, from_x, f32_t);
+        const fy = try intToFloat(func, entry, from_y, f32_t);
+        const flanes = try intToFloat(func, entry, lanes, f32_t);
         for (0..attrs) |a| {
             var corner: [3]Value = undefined;
             for (0..3) |i| {
@@ -1140,7 +1119,7 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
         const whole = if ((gpuIntAttr(func, param, "bicomp") orelse 0) == 0) px else y;
         const ty = func.valueType(param);
         const coord = if (isFloat(func, ty))
-            try smallIntToFloat(func, span, whole, ty, u32_t)
+            try intToFloat(func, span, whole, ty)
         else
             whole;
         func.replaceAllUses(param, coord);
@@ -2332,15 +2311,18 @@ fn flushToZero(comptime T: type, v: T) T {
 
 /// What a `convert` costs on Glacier, or null when the core has no instruction for it.
 ///
-/// Glacier decodes three converts and no scalar form of any of them, so each one is a vector
-/// instruction even when both sides are warp-uniform. Nothing here WIDENS an f16: the core has no
-/// `vfwcvt`, and the only instruction that reads an f16 as an f32 is the widening MAC.
+/// Glacier decodes five converts and no scalar form of any of them, so each one is a vector
+/// instruction even when both sides are warp-uniform.
 const ConvertKind = enum {
     /// Same width and same kind, so the bits already are the value and a move is the whole
     /// lowering.
     move,
     /// `vfcvt.f.x.v`: a SIGNED 32-bit integer to f16, rounding to nearest even.
     int_to_half,
+    /// `vfwcvt.f.x.v`: a SIGNED 32-bit integer to f32, rounding to nearest even.
+    int_to_float,
+    /// `vfwcvt.f.xu.v`: an UNSIGNED 32-bit integer to f32, rounding to nearest even.
+    uint_to_float,
     /// `vfcvt.rtz.xu.f.v`: an f32 to an UNSIGNED 32-bit integer, truncating toward zero.
     float_to_uint,
     /// `vfncvt.f.f.w`: an f32 to an f16, rounding to nearest even, so an overflow gives infinity
@@ -2360,10 +2342,14 @@ fn convertKind(func: *const Function, inst: Inst, cv: ir.function.Convert) ?Conv
         return if (from.int.bits == to.int.bits) .move else null;
     }
     if (from == .int and to == .float) {
-        // The instruction reads its source as signed, so an unsigned value above the signed range
-        // would come out negative.
-        if (from.int.bits != 32 or from.int.signedness != .signed) return null;
-        return if (to.float == .f16) .int_to_half else null;
+        if (from.int.bits != 32) return null;
+        // The f16 form reads its source as signed, so an unsigned value above the signed range
+        // would come out negative. The f32 forms have one of each.
+        return switch (to.float) {
+            .f16 => if (from.int.signedness == .signed) .int_to_half else null,
+            .f32 => if (from.int.signedness == .signed) .int_to_float else .uint_to_float,
+            else => null,
+        };
     }
     if (from == .float and to == .int) {
         // The instruction writes an unsigned result, so a signed destination would read a large
@@ -2385,6 +2371,8 @@ fn convertEncoder(kind: ConvertKind) *const fn (VReg, VReg) u32 {
     return switch (kind) {
         .move => unreachable,
         .int_to_half => rv.vfcvt_f_x_v,
+        .int_to_float => rv.vfwcvt_f_x_v,
+        .uint_to_float => rv.vfwcvt_f_xu_v,
         .float_to_uint => rv.vfcvt_rtz_xu_f_v,
         .narrow_half => rv.vfncvt_f_f_w,
         .widen_half => rv.vfwcvt_f_f_v,
