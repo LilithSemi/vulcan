@@ -225,6 +225,25 @@ pub fn compileFragment(allocator: std.mem.Allocator, func: *const Function, opts
     return compileKernelInternal(allocator, &work, opts, null);
 }
 
+/// `compileFragment`, with a generated rasteriser around the body. See `lowerFragmentRaster`.
+pub fn compileFragmentRaster(allocator: std.mem.Allocator, func: *const Function, opts: Options) Error![]u32 {
+    return compileFragmentRasterExplained(allocator, func, opts, null);
+}
+
+/// `compileFragmentRaster`, and on a refusal it says what it refused. See `Refusal`.
+pub fn compileFragmentRasterExplained(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    opts: Options,
+    why: ?*Refusal,
+) Error![]u32 {
+    if (why) |r| r.* = .{};
+    var work = try func.clone(allocator);
+    defer work.deinit();
+    try lowerFragmentRaster(allocator, &work, why);
+    return compileKernelInternal(allocator, &work, opts, why);
+}
+
 /// `compileKernel`, and on a refusal it says what it refused. See `Refusal`.
 pub fn compileKernelExplained(
     allocator: std.mem.Allocator,
@@ -775,6 +794,339 @@ fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function) Error!void {
             }
         }
     }
+}
+
+/// The framebuffer byte a constant colour component holds, or null when the component is per lane.
+///
+/// This has to agree with the clamp and the convert the per-lane path emits, and
+/// `vfcvt.rtz.xu.f.v` truncates toward zero.
+fn constantColourByte(func: *const Function, value: Value) ?u32 {
+    const inst = func.definingInst(value) orelse return null;
+    const constant = switch (func.opcode(inst)) {
+        .fconst => |x| x,
+        else => return null,
+    };
+    if (std.math.isNan(constant)) return 0;
+    return @intFromFloat(@min(1.0, @max(0.0, constant)) * 255.0);
+}
+
+/// A screen coordinate as a float, for a core that decodes no integer-to-f32 convert.
+///
+/// The value goes in the mantissa of 2 raised to the 23rd and a subtraction takes the exponent
+/// away again, which is exact for every input below that. A screen coordinate is far below it. An
+/// f16 destination takes the convert the core does have.
+fn smallIntToFloat(func: *Function, block: Block, value: Value, ty: Type, u32_t: Type) Error!Value {
+    if (func.types.type_kind(ty).float != .f32) {
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const signed = try func.appendInst(block, i32_t, .{ .unary = .{ .op = .reinterpret, .value = value } });
+        return func.appendInst(block, ty, .{ .convert = .{ .value = signed } });
+    }
+    const biased = try func.appendArithImm(block, u32_t, .bit_or, value, 0x4B000000);
+    const mantissa = try func.appendInst(block, ty, .{ .unary = .{ .op = .reinterpret, .value = biased } });
+    const exponent = try func.appendInst(block, ty, .{ .fconst = 8388608 });
+    return func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = mantissa, .rhs = exponent } });
+}
+
+/// Where the generated rasteriser reads a vertex, inside the vertex output record. The vertex
+/// stage writes attribute slot 0 and slot 4, which is where `lowerVertexIO` puts them, and both
+/// hold SCREEN SPACE integers: a viewport transform belongs to the vertex stage.
+pub const raster_vertex_x_offset = 0;
+pub const raster_vertex_y_offset = 4;
+
+/// Where each colour component sits in a framebuffer word. Red is the third byte and blue is the
+/// first, the way the display reads them, and alpha goes in the byte above, which it ignores.
+const raster_colour_shift: [4]i64 = .{ 16, 8, 0, 24 };
+
+/// Wrap a fragment body in a generated rasteriser, so the core walks the triangle itself.
+///
+/// `lowerFragmentIO` needs the host to write one fragment record per pixel. A screen-filling
+/// triangle at 1080p is two million records and the link moves one word per transaction, so the
+/// host cannot feed that path at a useful rate. The core can: each edge of the triangle has an
+/// integer edge function, the sign of a cross product, and a pixel is covered when all three are
+/// non-negative. One pixel in x adds a constant to each edge and one row adds another, so the
+/// edges are stepped rather than evaluated and the per-pixel path holds no multiply at all.
+///
+/// The loop takes five launch arguments after the shader's own: the framebuffer, the vertex
+/// buffer, the width and height to walk, and the framebuffer pitch in bytes. A lane owns one
+/// pixel and the warp steps along a row, so the pixels past the end of a short final step drop out
+/// with the coverage.
+///
+/// The body writes its colour as four floats, which this packs, or as one 32-bit word, which goes
+/// straight to the framebuffer.
+///
+/// ONE BLOCK for now. A body with control flow of its own has to be if-converted into the span,
+/// which is the next step.
+fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal) Error!void {
+    if (!hasGpuStage(func, "fragment")) {
+        return Refusal.whole(why, "a rasteriser around a function that is not a fragment stage");
+    }
+    if (func.blockCount() != 1) {
+        return Refusal.whole(why, "a rasteriser around a fragment body with control flow of its own");
+    }
+    const entry: Block = @fromBackingInt(0);
+    switch (func.terminator(entry) orelse return Refusal.whole(why, "a fragment body with no terminator")) {
+        .ret => |r| if (r.count != 0) return Refusal.whole(why, "a fragment body that returns a value"),
+        .jump => return Refusal.whole(why, "a fragment body whose only block jumps"),
+    }
+
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const bool_t = try func.types.intern(.bool);
+
+    // Everything this lowering cannot do, named before the function is touched, so a refusal
+    // leaves the caller's clone the way it arrived.
+    const original_params = try allocator.dupe(Value, func.blockParams(entry));
+    defer allocator.free(original_params);
+    for (original_params) |param| {
+        if (isSamplerFunction(func, param)) continue;
+        if (hasGpuKey(func, param, "grad_buf")) {
+            return Refusal.whole(why, "a rasteriser for a fragment body that reads derivatives");
+        }
+        if (hasGpuKey(func, param, "discard_fn")) {
+            return Refusal.whole(why, "a rasteriser for a fragment body that discards");
+        }
+        if (gpuIntAttr(func, param, "attr") != null) {
+            return Refusal.whole(why, "a rasteriser for a fragment body that reads an interpolated attribute");
+        }
+        if (gpu.attrs.builtinOf(func, param)) |builtin| switch (builtin) {
+            .frag_coord => if ((gpuIntAttr(func, param, "bicomp") orelse 0) > 1) {
+                return Refusal.whole(why, "a rasteriser that interpolates depth or the perspective divide");
+            },
+            else => return Refusal.whole(why, "a rasteriser for a fragment body that reads a builtin other than the coordinate"),
+        };
+    }
+    var written: [4]bool = @splat(false);
+    var one_word = false;
+    for (func.blockInsts(entry), 0..) |inst, index| {
+        const operation = func.opcode(inst);
+        if (operation != .store) continue;
+        const store = operation.store;
+        if (gpuIntAttr(func, store.ptr, "frag_depth") != null) {
+            return Refusal.at(why, func, entry, index, inst, "a rasteriser for a fragment body that writes depth");
+        }
+        const component = gpuIntAttr(func, store.ptr, "color_out") orelse continue;
+        if (component > 3 or store.mask != null or written[component]) {
+            return Refusal.at(why, func, entry, index, inst, "a rasteriser for a colour the fragment body does not write once per component");
+        }
+        written[component] = true;
+        switch (func.types.type_kind(func.valueType(store.value))) {
+            .int => |i| {
+                if (component != 0 or i.bits != 32) {
+                    return Refusal.at(why, func, entry, index, inst, "a rasteriser for an integer colour that is not one whole word");
+                }
+                one_word = true;
+            },
+            .float => |f| if (f != .f32) {
+                return Refusal.at(why, func, entry, index, inst, "a rasteriser for a colour component that is not f32");
+            },
+            else => return Refusal.at(why, func, entry, index, inst, "a rasteriser for a colour that is neither a word nor four floats"),
+        }
+    }
+    var components: usize = 0;
+    for (written) |one| components += @intFromBool(one);
+    if (components != @as(usize, if (one_word) 1 else 4)) {
+        return Refusal.whole(why, "a rasteriser for a fragment body that writes neither one word nor four colour components");
+    }
+
+    // The body moves into the span, which leaves the entry block free to become the setup.
+    const body = try allocator.dupe(Inst, func.blockInsts(entry));
+    defer allocator.free(body);
+    func.blockInstsMut(entry).clearRetainingCapacity();
+
+    const lane = try func.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(func, lane, .thread_id_x);
+    const lanes = try func.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(func, lanes, .block_dim_x);
+    const ptr_t = try func.types.ptrGlobal();
+    const frame = try func.appendBlockParam(entry, ptr_t);
+    const vertices = try func.appendBlockParam(entry, ptr_t);
+    const width = try func.appendBlockParam(entry, u32_t);
+    const height = try func.appendBlockParam(entry, u32_t);
+    const pitch = try func.appendBlockParam(entry, u32_t);
+
+    const row_loop = try func.appendBlock();
+    const span = try func.appendBlock();
+    const next_row = try func.appendBlock();
+    const done = try func.appendBlock();
+
+    // Triangle setup. Edge i runs from vertex i to vertex i+1, and its value at (x, y) is
+    //   (x - vx[i]) * dy[i] - (y - vy[i]) * dx[i]
+    // so one pixel in x adds dy[i] and one row adds -dx[i].
+    var vx: [3]Value = undefined;
+    var vy: [3]Value = undefined;
+    for (0..3) |i| {
+        const slot: i64 = @intCast(i * vertex_output_stride);
+        const at_x = try appendOffset(func, entry, vertices, slot + raster_vertex_x_offset, u32_t);
+        const at_y = try appendOffset(func, entry, vertices, slot + raster_vertex_y_offset, u32_t);
+        vx[i] = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = at_x } });
+        vy[i] = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = at_y } });
+    }
+    var dx: [3]Value = undefined;
+    var dy: [3]Value = undefined;
+    for (0..3) |i| {
+        const j = (i + 1) % 3;
+        dx[i] = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = vx[j], .rhs = vx[i] } });
+        dy[i] = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = vy[j], .rhs = vy[i] } });
+    }
+    // Each edge at the first pixel this lane owns, and the step for one whole warp along a row.
+    const lane_signed = try func.appendInst(entry, i32_t, .{ .unary = .{ .op = .reinterpret, .value = lane } });
+    const lanes_signed = try func.appendInst(entry, i32_t, .{ .unary = .{ .op = .reinterpret, .value = lanes } });
+    const origin = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    var first: [3]Value = undefined;
+    var step_x: [3]Value = undefined;
+    for (0..3) |i| {
+        const x_rel = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = lane_signed, .rhs = vx[i] } });
+        const y_rel = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = origin, .rhs = vy[i] } });
+        const along = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = x_rel, .rhs = dy[i] } });
+        const down = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = y_rel, .rhs = dx[i] } });
+        first[i] = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = along, .rhs = down } });
+        step_x[i] = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = lanes_signed, .rhs = dy[i] } });
+    }
+    const top = try func.appendInst(entry, u32_t, .{ .iconst = 0 });
+    // The span tests after it writes, so a draw with no rows has to turn back here. The width
+    // needs no such test: a pixel past the end of a row drops out with the coverage.
+    const rows = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .ne, .lhs = height, .rhs = top } });
+    // A conditional carries both edges itself, so the block it ends may hold no terminator, and
+    // the body left a `ret` on this one.
+    func.terminatorPtr(entry).* = null;
+    try func.appendIf(
+        entry,
+        rows,
+        .{ .target = row_loop, .args = &.{ top, first[0], first[1], first[2], frame } },
+        .{ .target = done, .args = &.{} },
+    );
+
+    // One iteration per row: the row, each edge at the row's first pixel, and the row's base.
+    const y = try func.appendBlockParam(row_loop, u32_t);
+    const row0 = try func.appendBlockParam(row_loop, i32_t);
+    const row1 = try func.appendBlockParam(row_loop, i32_t);
+    const row2 = try func.appendBlockParam(row_loop, i32_t);
+    const row_base = try func.appendBlockParam(row_loop, ptr_t);
+    const row_start = try func.appendInst(row_loop, u32_t, .{ .iconst = 0 });
+    try func.setJump(row_loop, span, &.{ row_start, row0, row1, row2 });
+
+    // One iteration per warp step along the row. Coverage is every edge non-negative, and the
+    // lowering has `lt` and not `ge`, so it is three compares, two ORs and a NOT.
+    const x = try func.appendBlockParam(span, u32_t);
+    const edge0 = try func.appendBlockParam(span, i32_t);
+    const edge1 = try func.appendBlockParam(span, i32_t);
+    const edge2 = try func.appendBlockParam(span, i32_t);
+    const zero = try func.appendInst(span, i32_t, .{ .iconst = 0 });
+    const left0 = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = edge0, .rhs = zero } });
+    const left1 = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = edge1, .rhs = zero } });
+    const left2 = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = edge2, .rhs = zero } });
+    const left01 = try func.appendInst(span, bool_t, .{ .arith = .{ .op = .bit_or, .lhs = left0, .rhs = left1 } });
+    const outside = try func.appendInst(span, bool_t, .{ .arith = .{ .op = .bit_or, .lhs = left01, .rhs = left2 } });
+    const inside = try func.appendArithImm(span, bool_t, .bit_xor, outside, 1);
+    const px = try func.appendInst(span, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = lane } });
+    const on_screen = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = px, .rhs = width } });
+    const covered = try func.appendInst(span, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = inside, .rhs = on_screen } });
+    const offset = try func.appendArithImm(span, u32_t, .mul, px, 4);
+    const pixel = try func.appendInst(span, ptr_t, .{ .arith = .{ .op = .add, .lhs = row_base, .rhs = offset } });
+
+    // The coordinate the body reads, before the body, since it is what the body is written around.
+    for (original_params) |param| {
+        const builtin = gpu.attrs.builtinOf(func, param) orelse continue;
+        if (builtin != .frag_coord) continue;
+        try func.addAttr(.{ .value = param }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "lowered_graphics_input",
+            .value = .flag,
+        } });
+        const whole = if ((gpuIntAttr(func, param, "bicomp") orelse 0) == 0) px else y;
+        const ty = func.valueType(param);
+        const coord = if (isFloat(func, ty))
+            try smallIntToFloat(func, span, whole, ty, u32_t)
+        else
+            whole;
+        func.replaceAllUses(param, coord);
+    }
+
+    // The body, with its colour store held back so the pixel it writes is this lane's.
+    var colour: [4]Value = undefined;
+    for (body) |inst| {
+        const operation = func.opcode(inst);
+        if (operation == .store) {
+            const store = operation.store;
+            if (gpuIntAttr(func, store.ptr, "color_out")) |component| {
+                if (one_word) {
+                    try func.appendStoreMasked(span, store.value, pixel, covered);
+                } else {
+                    colour[component] = store.value;
+                }
+                continue;
+            }
+        }
+        try func.blockInstsMut(span).append(func.allocator, inst);
+    }
+    if (!one_word) {
+        var constants: u32 = 0;
+        var word: ?Value = null;
+        var scale: ?Value = null;
+        var range: ?[2]Value = null;
+        for (colour, 0..) |component, i| {
+            // A constant component folds here. The core has no scalar float unit, so the clamp
+            // on a warp-uniform component would be a float compare it cannot do, and a colour
+            // the shader states outright should cost nothing per pixel anyway.
+            if (constantColourByte(func, component)) |byte| {
+                constants |= byte << @intCast(raster_colour_shift[i]);
+                continue;
+            }
+            if (range == null) {
+                range = .{
+                    try func.appendInst(span, f32_t, .{ .fconst = 0 }),
+                    try func.appendInst(span, f32_t, .{ .fconst = 1 }),
+                };
+                scale = try func.appendInst(span, f32_t, .{ .fconst = 255 });
+            }
+            const low = range.?[0];
+            const high = range.?[1];
+            const under = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = component, .rhs = low } });
+            const lifted = try func.appendInst(span, f32_t, .{ .select = .{ .cond = under, .then = low, .@"else" = component } });
+            // The compare unit has `lt` and `le` and no `gt`, so the operands swap instead.
+            const over = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = high, .rhs = lifted } });
+            const clamped = try func.appendInst(span, f32_t, .{ .select = .{ .cond = over, .then = high, .@"else" = lifted } });
+            const scaled = try func.appendInst(span, f32_t, .{ .arith = .{ .op = .mul, .lhs = clamped, .rhs = scale.? } });
+            const whole = try func.appendInst(span, u32_t, .{ .convert = .{ .value = scaled } });
+            const placed = try func.appendArithImm(span, u32_t, .shl, whole, raster_colour_shift[i]);
+            word = if (word) |so_far|
+                try func.appendInst(span, u32_t, .{ .arith = .{ .op = .bit_or, .lhs = so_far, .rhs = placed } })
+            else
+                placed;
+        }
+        const pixel_word = if (word) |per_lane|
+            if (constants == 0) per_lane else try func.appendArithImm(span, u32_t, .bit_or, per_lane, constants)
+        else
+            try func.appendInst(span, u32_t, .{ .iconst = constants });
+        try func.appendStoreMasked(span, pixel_word, pixel, covered);
+    }
+    // Step the span by one warp, and the row by one pitch.
+    const next_x = try func.appendInst(span, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = lanes } });
+    const next0 = try func.appendInst(span, i32_t, .{ .arith = .{ .op = .add, .lhs = edge0, .rhs = step_x[0] } });
+    const next1 = try func.appendInst(span, i32_t, .{ .arith = .{ .op = .add, .lhs = edge1, .rhs = step_x[1] } });
+    const next2 = try func.appendInst(span, i32_t, .{ .arith = .{ .op = .add, .lhs = edge2, .rhs = step_x[2] } });
+    const more_x = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = next_x, .rhs = width } });
+    try func.appendIf(
+        span,
+        more_x,
+        .{ .target = span, .args = &.{ next_x, next0, next1, next2 } },
+        .{ .target = next_row, .args = &.{} },
+    );
+
+    const next_y = try func.appendArithImm(next_row, u32_t, .add, y, 1);
+    const down0 = try func.appendInst(next_row, i32_t, .{ .arith = .{ .op = .sub, .lhs = row0, .rhs = dx[0] } });
+    const down1 = try func.appendInst(next_row, i32_t, .{ .arith = .{ .op = .sub, .lhs = row1, .rhs = dx[1] } });
+    const down2 = try func.appendInst(next_row, i32_t, .{ .arith = .{ .op = .sub, .lhs = row2, .rhs = dx[2] } });
+    const next_base = try func.appendInst(next_row, ptr_t, .{ .arith = .{ .op = .add, .lhs = row_base, .rhs = pitch } });
+    const more_y = try func.appendInst(next_row, bool_t, .{ .icmp = .{ .op = .lt, .lhs = next_y, .rhs = height } });
+    try func.appendIf(
+        next_row,
+        more_y,
+        .{ .target = row_loop, .args = &.{ next_y, down0, down1, down2, next_base } },
+        .{ .target = done, .args = &.{} },
+    );
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 }
 
 fn isSamplerFunction(func: *const Function, value: Value) bool {
