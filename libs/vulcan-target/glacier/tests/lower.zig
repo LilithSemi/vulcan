@@ -5492,3 +5492,64 @@ test "a scale by a power of two is a shift and not a multiply" {
     try runOnce(words, &data, 2, 4);
     try std.testing.expectEqual(@as(u32, 2), data[2]);
 }
+
+test "a program longer than the aperture is refused by the number" {
+    // The core holds ONE program and a host uploads it a word at a time, so a program that does
+    // not fit has to be refused at compile time. A fallback to reloading per draw would reappear
+    // as milliseconds of upload inside a frame, which nobody sees until they measure one.
+    const allocator = std.testing.allocator;
+    var f = try buildSumKernel(allocator, 40);
+    defer f.deinit();
+
+    // The real length first, so the thresholds below are not guesses.
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expect(words.len > 8);
+
+    // An aperture one word short of the program refuses and names both numbers.
+    {
+        var why: glacier.isel.Refusal = .{};
+        const out = glacier.isel.compileKernelExplained(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+            .program_words = @intCast(words.len - 1),
+        }, &why);
+        try std.testing.expectError(error.Unsupported, out);
+        try std.testing.expectEqual(@as(u32, @intCast(words.len)), why.wanted);
+        try std.testing.expectEqual(@as(u32, @intCast(words.len - 1)), why.limit);
+    }
+
+    // An aperture exactly the size of the program fits.
+    {
+        const out = try glacier.isel.compileKernel(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+            .program_words = @intCast(words.len),
+        });
+        allocator.free(out);
+    }
+
+    // A SECOND STAGE already resident eats the room, which is the case a single compile cannot
+    // see for itself: the caller composing the pipeline passes the first stage's length.
+    {
+        var why: glacier.isel.Refusal = .{};
+        const out = glacier.isel.compileKernelExplained(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+            .program_words = @intCast(words.len),
+            .resident_words = 1,
+        }, &why);
+        try std.testing.expectError(error.Unsupported, out);
+        try std.testing.expectEqual(@as(u32, @intCast(words.len + 1)), why.wanted);
+        try std.testing.expectEqual(@as(u32, @intCast(words.len)), why.limit);
+    }
+
+    // And the default ceiling passes a kernel of this size, so the check is not firing by accident.
+    {
+        const out = try glacier.isel.compileKernel(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+        });
+        allocator.free(out);
+    }
+}

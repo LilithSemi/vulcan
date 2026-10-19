@@ -173,6 +173,25 @@ pub const Options = struct {
     /// Absolute addresses for the symbols the kernel's `global_addr` instructions name. A name
     /// that is not here is refused rather than guessed.
     globals: []const Global = &.{},
+    /// How many words the core's instruction aperture holds. A program longer than this is refused
+    /// rather than truncated at load.
+    ///
+    /// The default is the ARCHITECTURAL CEILING, 8192, and a given SoC may hold FEWER:
+    /// `GlacierPipelinedCoreSoc.programWords` defaults to the whole aperture and a board may lower
+    /// it to pay for less block RAM. That number is a per-BOARD area decision rather than a
+    /// property of the core's shape, so it is not in the profile and this compiler cannot derive
+    /// it: nothing is attached when a kernel is built. A caller that knows the device reads the
+    /// core's `PROG_WORDS` register and passes the real figure here; the ceiling is the honest
+    /// default for everyone else, and the runtime refuses a program the core cannot hold.
+    program_words: u32 = 8192,
+    /// Words ALREADY RESIDENT in the aperture beside this program, which this one has to fit
+    /// around.
+    ///
+    /// A Glacier core holds ONE program, and uploading one costs a PCIe round trip per word, so a
+    /// pipeline keeps both stages resident and a draw is launch arguments plus a launch. Nothing
+    /// inside a single compile can see the other stage, so the caller that composes the pipeline
+    /// passes the first stage's length when it compiles the second.
+    resident_words: u32 = 0,
 };
 
 pub const vertex_input_stride = 256;
@@ -515,6 +534,13 @@ fn compileKernelInternal(
         if (e.cluster_barriers < declared) {
             return Refusal.tooBig(why, "fewer core-wide barriers than the kernel declared, so a pass dropped one", e.cluster_barriers, declared);
         }
+    }
+    // The aperture holds ONE program and a host uploads it a word at a time, so a program that
+    // does not fit is refused here rather than truncated at load. `resident_words` carries the
+    // other stage of a pipeline, which a single compile cannot see.
+    const total: u64 = @as(u64, opts.resident_words) + e.words.items.len;
+    if (total > opts.program_words) {
+        return Refusal.tooBig(why, "a program longer than the core's instruction aperture holds", total, opts.program_words);
     }
     return e.words.toOwnedSlice(allocator);
 }
