@@ -1405,13 +1405,13 @@ fn appendOffset(func: *Function, block: Block, ptr: Value, offset: i64, int_ty: 
 fn nullableImagePointer(func: *Function, block: Block, descriptor: Value, pointer: Value, write: bool, component_offset: i64, int_ty: Type) Error!Value {
     if (!hasGpuKey(func, descriptor, "nullable_desc")) return pointer;
     const ptr_ty = func.valueType(descriptor);
-    const valid_ptr = try appendOffset(func, block, descriptor, 100, int_ty);
+    const valid_ptr = try appendOffset(func, block, descriptor, sampler_valid_offset, int_ty);
     const valid = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = valid_ptr } });
     const zero = try func.appendInst(block, int_ty, .{ .iconst = 0 });
     const present = try func.appendInst(block, try func.types.intern(.bool), .{
         .icmp = .{ .op = .ne, .lhs = valid, .rhs = zero },
     });
-    const fallback_ptr = try appendOffset(func, block, descriptor, if (write) 108 else 104, int_ty);
+    const fallback_ptr = try appendOffset(func, block, descriptor, if (write) sampler_write_fallback_offset else sampler_read_fallback_offset, int_ty);
     var fallback = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = fallback_ptr } });
     fallback = try appendOffset(func, block, fallback, component_offset, int_ty);
     return func.appendInst(block, ptr_ty, .{
@@ -1437,6 +1437,12 @@ const sampler_swizzle_offset = 72;
 const sampler_compare_op_offset = 88;
 const sampler_array_pitch_offset = 92;
 const sampler_level_count_offset = 96;
+// The three words below exist only under the SPIR-V lowering's `nullable_image_descriptors`,
+// which also grows the stride between mip levels to `nullable_sampler_descriptor_size`. A
+// sample from an image the host did not bind reads the fallback pointer instead.
+const sampler_valid_offset = 100;
+const sampler_read_fallback_offset = 104;
+const sampler_write_fallback_offset = 108;
 const sampler_descriptor_size = 100;
 const nullable_sampler_descriptor_size = 112;
 const rgba32f_texel_bytes = 16;
@@ -1948,7 +1954,7 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
                 const bottom = try lerp(func, block, compared01, compared11, x_weight);
                 var value = try lerp(func, block, top, bottom, y_weight);
                 if (nullable) {
-                    const valid_ptr = try appendOffset(func, block, desc, 100, int_ty);
+                    const valid_ptr = try appendOffset(func, block, desc, sampler_valid_offset, int_ty);
                     const valid = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = valid_ptr } });
                     const zero_u = try func.appendInst(block, int_ty, .{ .iconst = 0 });
                     const present = try func.appendInst(block, bool_t, .{
@@ -2134,7 +2140,7 @@ fn lowerImageSize(allocator: std.mem.Allocator, func: *Function) Error!void {
             var width = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = width_ptr } });
             var height = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = height_ptr } });
             if (hasGpuKey(func, desc, "nullable_desc")) {
-                const valid_ptr = try appendOffset(func, block, desc, 100, int_ty);
+                const valid_ptr = try appendOffset(func, block, desc, sampler_valid_offset, int_ty);
                 const valid = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = valid_ptr } });
                 const zero = try func.appendInst(block, int_ty, .{ .iconst = 0 });
                 const present = try func.appendInst(block, try func.types.intern(.bool), .{
