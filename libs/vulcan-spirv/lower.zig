@@ -475,7 +475,22 @@ pub const Options = struct {
     /// `Options.globals`). The name comes from the variable's `OpName`, so a module that does not
     /// name its buffers is refused under this option.
     buffers_as_globals: bool = false,
+    /// Make a storage buffer's entry parameter point at a descriptor, rather than be the base
+    /// address.
+    ///
+    /// The descriptor holds the base pointer, then the size in bytes, then a read and a write
+    /// fallback pointer. The lowering loads the base and compares each access against the size,
+    /// so an access past the end, or a size of zero, goes to the fallback pointer and an unbound
+    /// buffer does not fault. A push-constant block keeps a plain base pointer. The option does
+    /// nothing under `buffers_as_globals`, which removes the parameter.
     buffer_descriptors: bool = false,
+    /// Let a combined-image-sampler descriptor say that the host bound nothing.
+    ///
+    /// This changes the descriptor layout the host writes. The stride between mip levels grows,
+    /// and three words after the mip chain hold a valid flag and a read and a write fallback
+    /// pointer (see `vulcan-target/glacier/isel.zig` `sampler_valid_offset`). A sample from an
+    /// unbound image reads the fallback pointer and a size query answers zero. A host that keeps
+    /// the shorter stride under this option reads the wrong descriptor above the first level.
     nullable_image_descriptors: bool = false,
 };
 
