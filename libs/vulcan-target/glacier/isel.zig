@@ -211,18 +211,48 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: 
     return compileKernelInternal(allocator, func, opts, null);
 }
 
+/// Lower a vertex stage to a kernel over a record array. The entry takes the invocation index
+/// and the input and output record base addresses, and each attribute moves at its fixed offset
+/// in a record. The caller runs one invocation per vertex.
 pub fn compileVertex(allocator: std.mem.Allocator, func: *const Function, opts: Options) Error![]u32 {
-    var work = try func.clone(allocator);
-    defer work.deinit();
-    try lowerVertexIO(allocator, &work);
-    return compileKernelInternal(allocator, &work, opts, null);
+    return compileVertexExplained(allocator, func, opts, null);
 }
 
-pub fn compileFragment(allocator: std.mem.Allocator, func: *const Function, opts: Options) Error![]u32 {
+/// `compileVertex`, and on a refusal it says what it refused. See `Refusal`.
+///
+/// A Glacier kernel cannot report its own refusal, since `ebreak` retires a warp and looks like
+/// success, so a refusal reaches the user from here or not at all.
+pub fn compileVertexExplained(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    opts: Options,
+    why: ?*Refusal,
+) Error![]u32 {
+    if (why) |r| r.* = .{};
     var work = try func.clone(allocator);
     defer work.deinit();
-    try lowerFragmentIO(allocator, &work);
-    return compileKernelInternal(allocator, &work, opts, null);
+    try lowerVertexIO(allocator, &work, why);
+    return compileKernelInternal(allocator, &work, opts, why);
+}
+
+/// Lower a fragment stage the way `compileVertex` does, one invocation per fragment record. The
+/// caller supplies the rasteriser.
+pub fn compileFragment(allocator: std.mem.Allocator, func: *const Function, opts: Options) Error![]u32 {
+    return compileFragmentExplained(allocator, func, opts, null);
+}
+
+/// `compileFragment`, and on a refusal it says what it refused. See `Refusal`.
+pub fn compileFragmentExplained(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    opts: Options,
+    why: ?*Refusal,
+) Error![]u32 {
+    if (why) |r| r.* = .{};
+    var work = try func.clone(allocator);
+    defer work.deinit();
+    try lowerFragmentIO(allocator, &work, why);
+    return compileKernelInternal(allocator, &work, opts, why);
 }
 
 /// `compileFragment`, with a generated rasteriser around the body. See `lowerFragmentRaster`.
@@ -625,8 +655,13 @@ fn hasGpuStage(func: *const Function, stage: []const u8) bool {
     return false;
 }
 
-fn lowerVertexIO(allocator: std.mem.Allocator, func: *Function) Error!void {
-    if (!hasGpuStage(func, "vertex") or func.blockCount() == 0) return error.Unsupported;
+fn lowerVertexIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal) Error!void {
+    if (!hasGpuStage(func, "vertex")) {
+        return Refusal.whole(why, "a vertex kernel from a function that is not a vertex stage");
+    }
+    if (func.blockCount() == 0) {
+        return Refusal.whole(why, "a vertex kernel from a function with no blocks");
+    }
     const entry: Block = @fromBackingInt(0);
     const original_params = try allocator.dupe(Value, func.blockParams(entry));
     defer allocator.free(original_params);
@@ -692,8 +727,13 @@ fn lowerVertexIO(allocator: std.mem.Allocator, func: *Function) Error!void {
     }
 }
 
-fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function) Error!void {
-    if (!hasGpuStage(func, "fragment") or func.blockCount() == 0) return error.Unsupported;
+fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal) Error!void {
+    if (!hasGpuStage(func, "fragment")) {
+        return Refusal.whole(why, "a fragment kernel from a function that is not a fragment stage");
+    }
+    if (func.blockCount() == 0) {
+        return Refusal.whole(why, "a fragment kernel from a function with no blocks");
+    }
     const entry: Block = @fromBackingInt(0);
     const original_params = try allocator.dupe(Value, func.blockParams(entry));
     defer allocator.free(original_params);

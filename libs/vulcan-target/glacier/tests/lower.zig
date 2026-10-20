@@ -5767,6 +5767,62 @@ test "the rasteriser refuses what it cannot generate, and says what" {
     }
 }
 
+test "the vertex and fragment entry points name what they refuse" {
+    const allocator = std.testing.allocator;
+
+    // A Glacier kernel cannot report its own refusal, since `ebreak` retires the warp and looks
+    // like success. So each stage lowering says which stage it wanted, rather than fail bare.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        try markFragment(&f);
+        _ = try f.appendBlock();
+        var why: glacier.isel.Refusal = .{};
+        try std.testing.expectError(
+            error.Unsupported,
+            glacier.isel.compileVertexExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, why.reason, "not a vertex stage") != null);
+    }
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        try f.addAttr(.func, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "stage",
+            .value = .{ .string = "vertex" },
+        } });
+        _ = try f.appendBlock();
+        var why: glacier.isel.Refusal = .{};
+        try std.testing.expectError(
+            error.Unsupported,
+            glacier.isel.compileFragmentExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, why.reason, "not a fragment stage") != null);
+    }
+
+    // A refusal from the instruction half reaches the caller through the stage lowering, which is
+    // where almost every refusal comes from.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        try markFragment(&f);
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const entry = try f.appendBlock();
+        const wide = try f.appendInst(entry, u32_t, .{ .iconst = 0x1_0000_0000 });
+        const out = try colourOut(&f, entry, 0);
+        try f.appendStore(entry, wide, out);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+        var why: glacier.isel.Refusal = .{};
+        try std.testing.expectError(
+            error.Unsupported,
+            glacier.isel.compileFragmentExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, why.reason, "too wide for a 32-bit register") != null);
+        try std.testing.expectEqualStrings("iconst", why.opcode);
+    }
+}
+
 /// The first generic varying slot, which both stages agree on: a vertex Location writes it and a
 /// fragment Location reads the same number.
 const attr_generic0: u32 = 0x80;
