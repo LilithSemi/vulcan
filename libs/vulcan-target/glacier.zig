@@ -20,6 +20,7 @@ const std = @import("std");
 
 pub const encode = @import("glacier/encode.zig");
 pub const isel = @import("glacier/isel.zig");
+pub const decode = @import("glacier/decode.zig");
 
 test {
     // Without this the tests inside `encode.zig` and `isel.zig` are never COLLECTED: a root that
