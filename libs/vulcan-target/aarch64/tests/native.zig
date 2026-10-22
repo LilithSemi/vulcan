@@ -6084,3 +6084,39 @@ test "native f128: an add lowers to an undefined __addtf3 soft-fp call relocatio
     }
     try std.testing.expectEqual(@as(usize, 1), addtf3);
 }
+
+test "native: a sixty four bit immediate operation keeps the whole immediate" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // Each of these needs a bit the low word does not hold, or is negative, and none of them fits
+    // the add and subtract immediate form. The constant used to be materialized from its low
+    // thirty two bits alone, which read as a `w` register's worth and was silently wrong here: a
+    // mask of bit thirty two came out as zero, and a subtraction of a small negative came out
+    // short by four thousand million.
+    const cases = [_]struct { op: ir.function.BinOp, imm: i64, given: u64, want: u64 }{
+        .{ .op = .bit_and, .imm = 1 << 32, .given = 0xffff_ffff_ffff_ffff, .want = 1 << 32 },
+        .{ .op = .bit_and, .imm = 1 << 40, .given = 0xffff_ffff_ffff_ffff, .want = 1 << 40 },
+        .{ .op = .bit_or, .imm = 1 << 33, .given = 0, .want = 1 << 33 },
+        .{ .op = .add, .imm = -5000, .given = 1_000_000, .want = 995_000 },
+        .{ .op = .bit_xor, .imm = -1, .given = 0, .want = 0xffff_ffff_ffff_ffff },
+    };
+
+    const Fn = *const fn (u64) callconv(.c) u64;
+    for (cases) |each| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const b = try f.appendBlock();
+        const a = try f.appendBlockParam(b, t);
+        const got = try f.appendArithImm(b, t, each.op, a, each.imm);
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(got) });
+
+        const code = try isel.selectFunction(allocator, &f);
+        defer allocator.free(code);
+        var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+        defer buf.deinit();
+        const call: Fn = @ptrCast(buf.memory.ptr);
+        try std.testing.expectEqual(each.want, call(each.given));
+    }
+}

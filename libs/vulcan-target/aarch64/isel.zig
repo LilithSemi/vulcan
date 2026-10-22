@@ -1355,7 +1355,14 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // Prefer the add/sub immediate form for a small constant; only fall back to
                     // materializing the constant in a scratch register and a register op otherwise.
                     if (!try tryAddSubImm(allocator, &code, a.op, rd, rl, a.imm, wide)) {
-                        try loadConst(allocator, &code, spill_op[1], a.imm); // imm in x14, x16 stays free for rem
+                        // A sixty four bit operation takes the whole immediate. `loadConst` keeps the low
+                        // word only, which is right for a `w` register and silently wrong here: a mask of
+                        // a bit above the low word came out as zero, and a negative immediate came out
+                        // short by four thousand million.
+                        if (wide)
+                            try loadConst64(allocator, &code, spill_op[1], @bitCast(a.imm))
+                        else
+                            try loadConst(allocator, &code, spill_op[1], a.imm); // imm in x14, x16 stays free for rem
                         try emitBinary(allocator, &code, a.op, rd, rl, spill_op[1], isSignedInt(func, a.lhs), wide);
                     }
                     try storeResult(allocator, &code, ctx, result, rd);
