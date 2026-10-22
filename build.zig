@@ -749,6 +749,20 @@ pub fn build(b: *std.Build) void {
 
     // The `glacierctl exec kernel.spv` path: a SPIR-V compute module through the SPIR-V lowering,
     // through the Glacier selector, executed on the warp model.
+    // The other direction: Glacier words lifted back into IR and compiled for the host, so a
+    // kernel runs with no board attached. Diffed against the warp model, which decodes the words
+    // itself and shares none of the lifter.
+    const glacier_lift = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/glacier/tests/lift.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(glacier_lift).step);
+
     const glacier_spirv = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("libs/vulcan-target/glacier/tests/spirv.zig"),
         .target = target,
