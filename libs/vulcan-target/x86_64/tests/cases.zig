@@ -722,6 +722,22 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
         try expectRun(io, allocator, &f, &.{ 3, 4 }, 48, backend);
     }
+    // A reinterpret between two integers changes no bits and no register file. Reading only
+    // the source sent it down the gpr-to-xmm path, which asked for an xmm the allocator never
+    // gave. A glacier kernel lifted for the host is the first caller to emit one.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try h.i32type(&f);
+        const u = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const bits = try f.appendInst(b, u, .{ .unary = .{ .op = .reinterpret, .value = x } });
+        const twice = try f.appendInst(b, u, .{ .arith = .{ .op = .add, .lhs = bits, .rhs = bits } });
+        const signed = try f.appendInst(b, t, .{ .unary = .{ .op = .reinterpret, .value = twice } });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(signed) });
+        try expectRun(io, allocator, &f, &.{21}, 42, backend);
+    }
 }
 
 fn immediates(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {

@@ -2242,26 +2242,42 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             const result_val = func.instResult(inst);
             const src_float = isFloat(func, u.value);
             if (u.op == .reinterpret) {
-                // int to float reinterpret: same width, movd/movq between
-                // gpr and xmm.
-                if (src_float) {
+                // Which register file each side sits in decides the move. Reading only the source
+                // sends an integer-to-integer reinterpret down the gpr-to-xmm path, where it asks
+                // for an xmm the allocator never gave it. A reinterpret between two integers, or
+                // between an integer and a pointer, changes no bits and no file.
+                const res = result_val orelse {
+                    // Nothing names the result, so nothing moves. The source is still loaded, the
+                    // way the paths below load it.
+                    _ = if (src_float)
+                        try ctx.useXmm(allocator, u.value, xmm_op0)
+                    else
+                        try ctx.use(allocator, u.value, scratch1);
+                    return;
+                };
+                const dst_float = isFloat(func, res);
+                if (src_float and !dst_float) {
                     // float to int: xmm to gpr.
                     const src = try ctx.useXmm(allocator, u.value, xmm_op0);
-                    if (result_val) |res| {
-                        const rd = ctx.dst(res, scratch1);
-                        try ctx.put(allocator, if (isDouble(func, u.value)) encode.movqFromXmm(rd, src) else encode.movdFromXmm(rd, src));
-                        try ctx.store(allocator, res, rd);
-                    }
-                    // void result: src already loaded, nothing to do.
-                } else {
+                    const rd = ctx.dst(res, scratch1);
+                    try ctx.put(allocator, if (isDouble(func, u.value)) encode.movqFromXmm(rd, src) else encode.movdFromXmm(rd, src));
+                    try ctx.store(allocator, res, rd);
+                } else if (dst_float and !src_float) {
                     // int to float: gpr to xmm.
                     const src = try ctx.use(allocator, u.value, scratch1);
-                    if (result_val) |res| {
-                        const rd = try ctx.dstXmm(res, xmm_scratch);
-                        try ctx.put(allocator, if (isDouble(func, res)) encode.movqToXmm(rd, src) else encode.movdToXmm(rd, src));
-                        try ctx.storeXmm(allocator, res, rd);
-                    }
-                    // void result: src already loaded, nothing to do.
+                    const rd = try ctx.dstXmm(res, xmm_scratch);
+                    try ctx.put(allocator, if (isDouble(func, res)) encode.movqToXmm(rd, src) else encode.movdToXmm(rd, src));
+                    try ctx.storeXmm(allocator, res, rd);
+                } else if (!src_float) {
+                    // Both sides in a gpr, so the bits are already where they belong.
+                    const src = try ctx.use(allocator, u.value, scratch2);
+                    const rd = ctx.dst(res, scratch1);
+                    if (rd != src) try ctx.put(allocator, encode.movReg(rd, src));
+                    try ctx.store(allocator, res, rd);
+                } else {
+                    // Both sides in an xmm. The reg-to-reg move differs by width and only the
+                    // 32-bit form is encoded, so refuse rather than move the wrong width.
+                    return error.Unsupported;
                 }
                 return;
             }
