@@ -4153,6 +4153,10 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, stage: Stage, 
             }
         },
         .load => |l| {
+            // A masked load is per-lane predication (see `Load.mask`). This backend predicates
+            // with its own guard registers and nothing builds that from an IR mask yet, so refuse
+            // rather than read every lane.
+            if (l.mask != null) return error.Unsupported;
             const rd = gprOf(loc.*, func.instResult(inst).?);
             // A reload of a sampled-texture result: the four loads of the
             // host-sampler out-pointer resolve to the TEX result block
@@ -4238,6 +4242,10 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, stage: Stage, 
             }
         },
         .store => |st| {
+            // A masked store is per-lane predication (see `Store.mask`). This backend predicates
+            // with its own guard registers and nothing builds that from an IR mask yet, so refuse
+            // rather than write every lane.
+            if (st.mask != null) return error.Unsupported;
             // A store whose pointer is tagged with a graphics output
             // attribute goes to that attribute (AST). A fragment color
             // output is moved into the ROP color register (R0..R3), and
@@ -4670,7 +4678,15 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, stage: Stage, 
             // BAR.SYNC makes every thread of the CTA wait, and the CTA is the workgroup.
             // `checkBarrierConvergence` has already refused a placement the warp can split
             // around, so this emits the plain unpredicated form.
-            .workgroup => try code.append(allocator, encode.barSync(.{})),
+            //
+            // A barrier WIDENED past the workgroup by `gpu.attrs` is refused rather than narrowed.
+            // BAR.SYNC would synchronise one CTA for a kernel that asked for every warp of a
+            // core, which is a weaker guarantee than it was promised and nothing downstream could
+            // tell. This backend has no instruction for the wider scope.
+            .workgroup => {
+                if (gpu.attrs.isClusterBarrier(func, inst)) return error.Unsupported;
+                try code.append(allocator, encode.barSync(.{}));
+            },
             // A subgroup (warp) barrier is a different instruction. Emitting BAR.SYNC for it
             // would make every warp of the workgroup wait, not just the asking one, which
             // deadlocks a kernel whose other warps never reach the barrier. Refuse instead.
@@ -7778,6 +7794,26 @@ test "a workgroup barrier lowers to BAR.SYNC and declares one control barrier" {
     try testing.expectEqual(@as(u32, 1), kernel.launch.barrier_count);
 }
 
+test "a barrier widened past the workgroup is refused rather than narrowed to BAR.SYNC" {
+    // BAR.SYNC synchronises one CTA. A kernel that asked for every warp of a core asked for more
+    // than that, and emitting the narrower instruction would give it a weaker guarantee than it
+    // was promised with nothing downstream able to tell. This backend has no wider barrier.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    const tile = try func.appendBlockParam(b, shared_t);
+    const n = try func.appendBlockParam(b, i32_t);
+    try func.appendStore(b, n, tile);
+    const bar = try func.appendStmtRaw(b, .{ .barrier = .{ .scope = .workgroup } });
+    try gpu.attrs.setClusterBarrier(&func, bar);
+    const v = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = tile } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
 test "a kernel with no barrier declares zero control barriers" {
     const allocator = testing.allocator;
     var func = Function.init(allocator);

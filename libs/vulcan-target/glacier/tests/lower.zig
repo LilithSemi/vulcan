@@ -310,14 +310,14 @@ test "the backend refuses what a Glacier warp cannot do" {
         );
     }
 
-    // An entry parameter that is not a hardware builtin. A kernel has no parameter block to read
-    // it from, so the value would have to come from nowhere.
+    // A NINTH kernel parameter. The core carries eight launch arguments, so there is no CSR to
+    // read the ninth from and the value would have to come from nowhere.
     {
         var f = Function.init(allocator);
         defer f.deinit();
         const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
         const entry = try f.appendBlock();
-        _ = try f.appendBlockParam(entry, u32_t);
+        for (0..9) |_| _ = try f.appendBlockParam(entry, u32_t);
         f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
         try std.testing.expectError(
             error.Unsupported,
@@ -403,6 +403,18 @@ const data_base: u32 = 0x1000;
 /// Run one warp over `data`, with the words after `scratch_at` standing in for the hart scratch
 /// region the SoC build reserves. A hart reads one past the top of its own slice from `mscratch`.
 fn runOnce(code: []const u32, data: []u32, hart_id: u32, hart_count: u32) !void {
+    return runOnceWithArgs(code, data, hart_id, hart_count, @splat(0));
+}
+
+/// `runOnce` with the launch arguments a host wrote before the strobe. One dispatch gives every
+/// warp the same values, so a caller running several warps passes the same array to each.
+fn runOnceWithArgs(
+    code: []const u32,
+    data: []u32,
+    hart_id: u32,
+    hart_count: u32,
+    launch_args: [8]u32,
+) !void {
     const stride = glacier.encode.Profile.@"gc1.n".scratchBytes();
     const scratch_words = (stride / 4) * hart_count;
     const scratch_at = if (data.len > scratch_words) data.len - scratch_words else data.len;
@@ -415,7 +427,14 @@ fn runOnce(code: []const u32, data: []u32, hart_id: u32, hart_count: u32) !void 
     var one: warp.Warp = .{
         .hart_id = hart_id,
         .hart_count = hart_count,
+        // The warp runs the full width of the profile the kernels here are built for. Leaving
+        // this at its default ran ONE lane, which made a per-lane test pass on lane zero alone.
+        .lanes = glacier.encode.Profile.@"gc1.n".lanes(),
         .stack_top = scratch_base + (hart_id + 1) * stride,
+        // The slice this model gives a hart is the profile's own region, so a kernel built for it
+        // passes the check its prologue makes.
+        .scratch_bytes = stride,
+        .launch_args = launch_args,
     };
     _ = try warp.run(code, &mem, &one, budget);
 }
@@ -573,10 +592,10 @@ test "a kernel with more live values than registers spills into the hart's scrat
 }
 
 test "a kernel that needs more scratch than the core has is refused" {
-    // gc1.n holds 256 bytes per hart, so 64 slots. Far more live values than that cannot spill
-    // anywhere, and walking below the region would corrupt the hart underneath.
+    // A hart holds 2048 bytes, so 512 slots. Far more live values than that cannot spill anywhere,
+    // and walking below the region would corrupt the hart underneath.
     const allocator = std.testing.allocator;
-    var f = try buildSumKernel(allocator, 400);
+    var f = try buildSumKernel(allocator, 800);
     defer f.deinit();
     try std.testing.expectError(error.Unsupported, compile(allocator, &f));
 }
@@ -623,4 +642,5412 @@ test "a workgroup barrier emits nothing, because a workgroup is one warp" {
     // the caution about its reserved FENCE field live where a reader will look.
     try std.testing.expectEqual(@as(u32, 0x1000000F), glacier.encode.warp_barrier);
     for (with) |w| try std.testing.expect(w != glacier.encode.warp_barrier);
+}
+
+test "a constant nobody reads costs no words" {
+    // A frontend leaves these behind: an eliminated bounds check removes the only consumer of the
+    // array length but not the constant itself. The allocator still places a result nobody reads,
+    // so the emitter has to drop it on the use count rather than on whether it has a home.
+    const allocator = std.testing.allocator;
+
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    var littered = Function.init(allocator);
+    defer littered.deinit();
+
+    for ([_]*Function{ &plain, &littered }, 0..) |f, i| {
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        if (i == 1) {
+            _ = try f.appendInst(entry, u32_t, .{ .iconst = 4096 });
+            _ = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+        }
+        const v = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+        try f.appendStore(entry, v, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    }
+
+    const without = try compile(allocator, &plain);
+    defer allocator.free(without);
+    const with = try compile(allocator, &littered);
+    defer allocator.free(with);
+    try std.testing.expectEqualSlices(u32, without, with);
+}
+
+test "a per-lane operation against a constant has a vector form for every operator" {
+    // The vector unit has a scalar-operand form for only a few operators, so everything else
+    // broadcasts the constant and uses vector-vector. A bitwise AND against a mask and a modulo
+    // by a constant are both ordinary per-lane shapes, and refusing them would send a whole
+    // kernel back to scalar for the sake of one instruction.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    // (tid & 6) ^ 1, then % 3, then - 1: and, xor, rem and sub all lack a scalar-operand form.
+    const masked = try f.appendArithImm(entry, u32_t, .bit_and, tid, 6);
+    const flipped = try f.appendArithImm(entry, u32_t, .bit_xor, masked, 1);
+    const wrapped = try f.appendArithImm(entry, u32_t, .rem, flipped, 3);
+    const less = try f.appendArithImm(entry, u32_t, .sub, wrapped, 1);
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, less, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..lanes) |i| {
+        const tidv: u32 = @intCast(i);
+        const want = (((tidv & 6) ^ 1) % 3) -% 1;
+        try std.testing.expectEqual(want, data[i]);
+    }
+}
+
+test "a same-width convert costs no instruction" {
+    // The SPIR-V frontend emits `convert` for `OpUConvert` and `OpSConvert`, and a kernel that
+    // only ever holds words gets one between two 32-bit integers, which changes the signedness
+    // and nothing else. Refusing it sent a whole kernel back when a move, coalesced away, is the
+    // entire lowering.
+    const allocator = std.testing.allocator;
+
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    var converted = Function.init(allocator);
+    defer converted.deinit();
+
+    for ([_]*Function{ &plain, &converted }, 0..) |f, i| {
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const v = try f.appendInst(entry, u32_t, .{ .iconst = 9 });
+        const stored = if (i == 1) blk: {
+            const as_signed = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = v } });
+            break :blk try f.appendInst(entry, u32_t, .{ .convert = .{ .value = as_signed } });
+        } else v;
+        try f.appendStore(entry, stored, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    }
+
+    const without = try compile(allocator, &plain);
+    defer allocator.free(without);
+    const with = try compile(allocator, &converted);
+    defer allocator.free(with);
+    try std.testing.expectEqualSlices(u32, without, with);
+
+    var data: [1]u32 = .{0};
+    try runOnce(with, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 9), data[0]);
+}
+
+test "the scalar divide matches the standard layout" {
+    // `fdiv.s f8, f9, f10` from `zig cc -target riscv64-linux-musl -mcpu=generic_rv64+v+f`.
+    // Glacier has no f register file, so the fields name X registers: the same word, read against
+    // a different file.
+    //
+    // This sits here rather than beside the encoder because `glacier/encode.zig` is not a test
+    // root of its own and `refAllDecls` does not reach into it, so a test written there runs
+    // nowhere. Checked: it did not appear in any suite until it moved.
+    try std.testing.expectEqual(@as(u32, 0x18a4f453), glacier.encode.fdiv(.x8, .x9, .x10));
+}
+
+test "a per-lane value stays per-lane through a signedness convert" {
+    // `convert` is in the set `checkSupported` accepts, so the divergence analysis has to visit
+    // its operand. Without that the result of a convert reads as warp-uniform while its source
+    // sits in a vector register, and the two register files are indexed by the same number.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const signed = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const shifted = try f.appendArithImm(entry, i32_t, .add, signed, 100);
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, shifted, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(100 + i)), data[i]);
+    }
+}
+
+test "a float constant is its bit pattern, with a subnormal flushed to zero" {
+    // The lane flushes a subnormal on every operation, so a constant that stayed subnormal would
+    // not equal the same number the hardware computes.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { value: f64, want: u32 }{
+        .{ .value = 1.0, .want = 0x3F80_0000 },
+        .{ .value = -2.5, .want = 0xC020_0000 },
+        .{ .value = 0.0, .want = 0 },
+        // Smaller than the smallest normal f32, so it flushes and keeps its sign.
+        .{ .value = 1.0e-40, .want = 0 },
+        .{ .value = -1.0e-40, .want = 0x8000_0000 },
+    };
+
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const k = try f.appendInst(entry, f32_t, .{ .fconst = c.value });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = k } });
+        try f.appendStore(entry, raw, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var data: [1]u32 = .{0xDEAD_BEEF};
+        try runOnce(words, &data, 0, 1);
+        try std.testing.expectEqual(c.want, data[0]);
+    }
+}
+
+test "the three converts the core decodes run per lane" {
+    // `vfcvt.f.x.v` reads its source SIGNED, `vfcvt.rtz.xu.f.v` writes an UNSIGNED result, and
+    // `vfncvt.f.f.w` rounds to nearest even, so an overflow gives infinity. Each lane gets its
+    // own value, so a convert that collapsed to lane zero shows up here.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    // lane - 1, so lane zero is negative and proves the source is read signed.
+    const signed = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const biased = try f.appendArithImm(entry, i32_t, .sub, signed, 1);
+    const half = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = biased } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = half } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, raw, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [8]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const want: f16 = @floatFromInt(@as(i32, @intCast(i)) - 1);
+        try std.testing.expectEqual(@as(u32, @as(u16, @bitCast(want))), data[i]);
+    }
+}
+
+test "a narrowing convert rounds to nearest even and overflows to infinity" {
+    // Two things are pinned here. The ROUNDING: 2051 sits exactly between the halves 2050 and
+    // 2052, so nearest even gives 2052 while a toward-zero narrowing gives 2050. The OVERFLOW:
+    // nearest even carries a value past the largest finite half up to infinity, where toward zero
+    // would stop at 0x7BFF.
+    //
+    // 1.5 is here because it is what tells a narrowing convert apart from the integer one: read
+    // as a signed integer, 1.5's bit pattern is about 1.07e9 and converts to infinity, which is
+    // the same answer the overflow case wants.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { value: f64, want: u32, not: u32 }{
+        .{ .value = 1.5, .want = 0x3E00, .not = 0x7C00 },
+        .{ .value = 2051.0, .want = 0x6802, .not = 0x6801 },
+        .{ .value = 100000.0, .want = 0x7C00, .not = 0x7BFF },
+    };
+    // The expectations above are what nearest even gives, and the rejected ones what toward zero
+    // gives one step below.
+    try std.testing.expectEqual(cases[1].want, @as(u32, @as(u16, @bitCast(@as(f16, 2052.0)))));
+    try std.testing.expectEqual(cases[1].not, @as(u32, @as(u16, @bitCast(@as(f16, 2050.0)))));
+
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const f16_t = try f.types.intern(.{ .float = .f16 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const wide = try f.appendInst(entry, f32_t, .{ .fconst = c.value });
+        const half = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = wide } });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = half } });
+        try f.appendStore(entry, raw, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var data: [1]u32 = .{0};
+        try runOnce(words, &data, 0, 1);
+        try std.testing.expectEqual(c.want, data[0]);
+    }
+}
+
+test "a float to unsigned convert truncates toward zero" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const v = try f.appendInst(entry, f32_t, .{ .fconst = 7.9 });
+    const n = try f.appendInst(entry, u32_t, .{ .convert = .{ .value = v } });
+    try f.appendStore(entry, n, base);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [1]u32 = .{0};
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 7), data[0]);
+}
+
+test "a warp-uniform float divide becomes the one scalar divide" {
+    // The perspective divide is what this exists for: one divide per vertex or per scanline, not
+    // per pixel. It rounds to nearest even, which 1.0 / 3.0 shows, because that quotient is
+    // inexact and the two roundings name different words.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const one = try f.appendInst(entry, f32_t, .{ .fconst = 1.0 });
+    const three = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+    const q = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = one, .rhs = three } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = q } });
+    try f.appendStore(entry, raw, base);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [1]u32 = .{0};
+    try runOnce(words, &data, 0, 1);
+    // 1.0 / 3.0 rounds to nearest UP, so a truncating divider would give one unit in the last
+    // place less and this would fail.
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.0) / @as(f32, 3.0))), data[0]);
+}
+
+test "the backend refuses the float work Glacier cannot do" {
+    const allocator = std.testing.allocator;
+    const Shape = enum { half_arith, compare, half_store };
+    for ([_]Shape{ .half_arith, .compare, .half_store }) |shape| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const f16_t = try f.types.intern(.{ .float = .f16 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const a = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+        const b = try f.appendInst(entry, f32_t, .{ .fconst = 5.0 });
+        const stored = switch (shape) {
+            // f32 arithmetic works; f16 arithmetic does not. The element width is fixed at 32 bits,
+            // so a plain float op reads whole lanes, and an f16 is the low half of one. Arithmetic
+            // on a pair of them is the MAC's shape and nothing else.
+            .half_arith => blk: {
+                const signed_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+                const s = try f.appendInst(entry, signed_t, .{ .convert = .{ .value = tid } });
+                const h = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = s } });
+                const sum = try f.appendInst(entry, f16_t, .{ .arith = .{ .op = .add, .lhs = h, .rhs = h } });
+                break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
+            },
+            // There is no float compare, and an integer compare over the bits is a different
+            // relation.
+            .compare => blk: {
+                const lt = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
+                const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+                const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+                break :blk try f.appendInst(entry, u32_t, .{ .select = .{ .cond = lt, .then = one, .@"else" = zero } });
+            },
+            // An f16 is the low half of a lane, so a word store would write bits that are not
+            // part of the value.
+            .half_store => blk: {
+                const signed_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+                const s = try f.appendInst(entry, signed_t, .{ .convert = .{ .value = tid } });
+                break :blk try f.appendInst(entry, f16_t, .{ .convert = .{ .value = s } });
+            },
+        };
+        try f.appendStore(entry, stored, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    }
+}
+
+/// How many words in `code` splat x0 into a vector, which is how a destination is zeroed.
+fn countZeroSplats(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0x7 != 0b100) continue;
+        if (w >> 26 != 0b010111) continue;
+        if ((w >> 15) & 0x1F != 0) continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// How many words in `code` are `vmv.v.v`: OP-V, OPIVV, funct6 010111.
+fn countVectorMoves(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0x7 != 0b000) continue;
+        if (w >> 26 != 0b010111) continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// How many words in `code` are `vfwcvt.f.f.v`: OP-V, OPFVV, funct6 0x12, vs1 field 0x0C.
+fn countWidens(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0x7 != 0b001) continue;
+        if (w >> 26 != 0x12 or (w >> 15) & 0x1F != 0x0C) continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// How many words in `code` are a plain float add, subtract or multiply.
+fn countFloatArith(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0x7 != 0b001) continue;
+        switch (w >> 26) {
+            0x00, 0x02, 0x24 => n += 1,
+            else => {},
+        }
+    }
+    return n;
+}
+
+/// How many words in `code` are `vfwmacc.vv`: OP-V, OPFVV, funct6 111100.
+fn countMacs(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0x7 != 0b001) continue;
+        if (w >> 26 != 0b111100) continue;
+        n += 1;
+    }
+    return n;
+}
+
+test "a per-lane multiply-accumulate over f16 becomes one widening MAC" {
+    // `out[lane] += (lane + 1) * (lane + 2)`, with the two factors as f16 and the accumulator as
+    // f32, which is the shape a GEMM inner loop has. The IR spells it as two widening converts, a
+    // multiply and an add, and Glacier has an instruction for none of those on their own.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    // The accumulator is read per lane, which is the GEMM shape: load the running sum, accumulate
+    // into it, store it back.
+    const acc = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const first = try f.appendArithImm(entry, i32_t, .add, lane, 1);
+    const second = try f.appendArithImm(entry, i32_t, .add, lane, 2);
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = first } });
+    const hb = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = second } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wb } });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+    try f.appendStore(entry, sum, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    var data: [8]u32 = @splat(0);
+    for (0..lanes) |i| data[i] = @bitCast(@as(f32, 100.0));
+    try runOnce(words, &data, 0, 1);
+    for (0..lanes) |i| {
+        const n: f32 = @floatFromInt(i);
+        const want: f32 = 100.0 + (n + 1.0) * (n + 2.0);
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), data[i]);
+    }
+}
+
+test "one widened f16 feeds two products" {
+    // `sphi` widened once and read by both `ux` and `uz` is what a sphere writes, and absorbing a
+    // convert used to need exactly one reader. The MAC reads the f16 SOURCE, so the number of
+    // readers of the f32 never mattered; what it needed was for the allocator to be told, which
+    // `fusedOperands` now does.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const plus = try f.appendArithImm(entry, i32_t, .add, lane, 2);
+
+    const shared = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = plus } });
+    const other = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+    // One widening convert, two readers.
+    const wide = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = shared } });
+    const wother = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = other } });
+    const ux = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wide, .rhs = wother } });
+    const uz = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wide, .rhs = wide } });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = ux, .rhs = uz } });
+    try f.appendStore(entry, sum, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // `uz` is a bare product; `ux` accumulates it, so two MACs cover all three operations.
+    try std.testing.expectEqual(@as(usize, 2), countMacs(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        const shared_v = n + 2.0;
+        try std.testing.expectEqual(@as(u32, @bitCast(shared_v * n + shared_v * shared_v)), data[i]);
+    }
+}
+
+test "a partly absorbed widening convert still produces its f32" {
+    // One reader is a MAC and the other is a store, so the convert cannot be suppressed: it is
+    // widened on its own for the store with `vfwcvt.f.f.v`, and the MAC reads the f16 beside it.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const far = try f.appendArithImm(entry, u32_t, .add, offset, 64);
+    const at2 = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = far } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const plus = try f.appendArithImm(entry, i32_t, .add, lane, 3);
+    const h = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = plus } });
+    const wide = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = h } });
+    const two = try f.appendInst(entry, f32_t, .{ .fconst = 2.0 });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wide, .rhs = two } });
+    try f.appendStore(entry, product, at);
+    try f.appendStore(entry, wide, at2);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One MAC for the product, and the convert the store needs is one widening instruction.
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 1), countWidens(words));
+
+    var data: [32]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast((n + 3.0) * 2.0)), data[i]);
+        try std.testing.expectEqual(@as(u32, @bitCast(n + 3.0)), data[16 + i]);
+    }
+}
+
+test "a warp-uniform multiply-accumulate goes out to the vector unit and comes back" {
+    // `vfwmacc.vv` is the only float multiplier the core has, so a MAC whose operands are all the
+    // same in every lane still runs on the vector unit: the accumulator and both factors are
+    // broadcast into scratches, and lane zero carries the answer back. That is three scratches at
+    // once, which is the most any one MAC needs.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const acc = try f.appendInst(entry, f32_t, .{ .fconst = 1.0 });
+    const three = try f.appendInst(entry, i32_t, .{ .iconst = 3 });
+    const four = try f.appendInst(entry, i32_t, .{ .iconst = 4 });
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = three } });
+    const hb = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = four } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wb } });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
+    try f.appendStore(entry, raw, base);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+
+    var data: [1]u32 = .{0};
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.0 + 3.0 * 4.0))), data[0]);
+}
+
+test "a MAC mixes a per-lane accumulator with warp-uniform factors" {
+    // The accumulator varies per lane and both factors do not, so each factor is broadcast into a
+    // scratch while the accumulator keeps its own vector register. Reading a warp-uniform factor
+    // as a vector register would read whatever that scalar register number holds in the other
+    // file, so this is the shape that used to be refused.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const acc = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const seven = try f.appendInst(entry, i32_t, .{ .iconst = 7 });
+    const eight = try f.appendInst(entry, i32_t, .{ .iconst = 8 });
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = seven } });
+    const hb = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = eight } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wb } });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+    try f.appendStore(entry, sum, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    var data: [8]u32 = @splat(0);
+    for (0..lanes) |i| data[i] = @bitCast(@as(f32, @floatFromInt(i * 10)));
+    try runOnce(words, &data, 0, 1);
+    for (0..lanes) |i| {
+        const n: f32 = @floatFromInt(i * 10);
+        try std.testing.expectEqual(@as(u32, @bitCast(n + 56.0)), data[i]);
+    }
+}
+
+test "a bare widening product zeroes the destination and accumulates into it" {
+    // `out[lane] = (lane + 1) * (lane + 2)` as f16 factors with an f32 result. There is nothing to
+    // accumulate into, and no source rewrite can invent one: an added 0.0 folds away before the
+    // module arrives. The sum of a zero and the exact product is the product.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const first = try f.appendArithImm(entry, i32_t, .add, lane, 1);
+    const second = try f.appendArithImm(entry, i32_t, .add, lane, 2);
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = first } });
+    const hb = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = second } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wb } });
+    try f.appendStore(entry, product, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+    // The accumulator starts at zero, and whatever the destination register held before is not
+    // part of the answer. The behaviour check below cannot see this: an f16 bit pattern read as an
+    // f32 is subnormal, which the lane flushes to zero anyway.
+    try std.testing.expectEqual(@as(usize, 1), countZeroSplats(words));
+
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..lanes) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast((n + 1.0) * (n + 2.0))), data[i]);
+    }
+}
+
+test "an addition of a widened f16 is a widening convert and an add" {
+    // Two instructions. A MAC against a constant 1.0 would be four once the constant is
+    // materialized and broadcast, so the native pair wins now that the core has a float add.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const acc = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const first = try f.appendArithImm(entry, i32_t, .add, lane, 1);
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = first } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = wa } });
+    try f.appendStore(entry, sum, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 1), countWidens(words));
+    try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
+
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    var data: [8]u32 = @splat(0);
+    for (0..lanes) |i| data[i] = @bitCast(@as(f32, 40.0));
+    try runOnce(words, &data, 0, 1);
+    for (0..lanes) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(40.0 + n + 1.0)), data[i]);
+    }
+}
+
+test "a chain of MACs keeps one accumulator register" {
+    // `out[lane] += a * b + c * d + e`: a full MAC, a bare product the addition accumulates, and a
+    // final widened term that is now a convert and an add rather than a third MAC. The accumulator
+    // hint is what keeps the chain on one register, so it costs no copies.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const acc = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+
+    // Each factor needs its own convert, because a value read twice cannot be absorbed.
+    var halves: [5]Value = undefined;
+    for (&halves, 1..) |*h, k| {
+        const n = try f.appendArithImm(entry, i32_t, .add, lane, @intCast(k));
+        h.* = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = n } });
+    }
+    const wides = blk: {
+        var w: [5]Value = undefined;
+        for (&w, halves) |*dst, h| dst.* = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = h } });
+        break :blk w;
+    };
+    // acc + h1 * h2
+    const p1 = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wides[0], .rhs = wides[1] } });
+    const s1 = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = p1 } });
+    // + h3 * h4, which the IR spells as a bare product added on
+    const p2 = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wides[2], .rhs = wides[3] } });
+    const s2 = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = s1, .rhs = p2 } });
+    // + h5
+    const s3 = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = s2, .rhs = wides[4] } });
+    try f.appendStore(entry, s3, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 2), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 1), countWidens(words));
+    // One accumulator register means no `vmv.v.v` between them.
+    try std.testing.expectEqual(@as(usize, 0), countVectorMoves(words));
+
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    var data: [8]u32 = @splat(0);
+    for (0..lanes) |i| data[i] = @bitCast(@as(f32, 7.0));
+    try runOnce(words, &data, 0, 1);
+    for (0..lanes) |i| {
+        const n: f32 = @floatFromInt(i);
+        const want = 7.0 + (n + 1.0) * (n + 2.0) + (n + 3.0) * (n + 4.0) + (n + 5.0);
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), data[i]);
+    }
+}
+
+test "a per-lane same-width convert costs no instruction either" {
+    // The scalar path has always elided a move onto the same register. The vector path emitted
+    // `vmv.v.v v1, v1`, one wasted word for every signedness convert of a per-lane value.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const signed = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const doubled = try f.appendArithImm(entry, i32_t, .mul, signed, 3);
+    try f.appendStore(entry, doubled, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countVectorMoves(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i * 3)), data[i]);
+    }
+}
+
+test "an addition of two widened f16 is two converts and an add" {
+    // Neither side is an accumulator and neither needs to be: each f16 widens with one
+    // instruction and the addition is one more. No MAC is involved at all.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const other = try f.appendArithImm(entry, i32_t, .add, lane, 1);
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+    const hb = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = other } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = wa, .rhs = wb } });
+    try f.appendStore(entry, sum, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 2), countWidens(words));
+    try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(n + (n + 1.0))), data[i]);
+    }
+}
+
+test "a widening convert on its own is one instruction" {
+    // `vfwcvt.f.f.v`. It used to be a MAC against a constant 1.0, which cost a zeroed destination,
+    // a materialized constant and a broadcast: five words where this is one.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+    const wide = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = wide } });
+    try f.appendStore(entry, raw, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 1), countWidens(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(n)), data[i]);
+    }
+}
+
+test "a constant factor reaches the MAC already widened by the frontend" {
+    // `@as(f32, a) * @as(f32, b)` with a comptime `b` arrives as a multiply by an f32 CONSTANT:
+    // widening a constant folds in the frontend, so only one side is a convert. Every rotation
+    // constant in a renderer has this shape.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const three = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = three } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = product } });
+    try f.appendStore(entry, raw, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(n * 3.0)), data[i]);
+    }
+}
+
+test "an addition of a float constant is one add" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const acc = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const two = try f.appendInst(entry, f32_t, .{ .fconst = 2.0 });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = two } });
+    const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
+    try f.appendStore(entry, raw, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
+
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+    var data: [8]u32 = @splat(0);
+    for (0..lanes) |i| data[i] = @bitCast(@as(f32, @floatFromInt(i)));
+    try runOnce(words, &data, 0, 1);
+    for (0..lanes) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(n + 2.0)), data[i]);
+    }
+}
+
+test "a constant no f16 holds exactly keeps its full precision" {
+    // Neither can be a MAC factor: 0.1 has no exact f16, and 2^-15 has one only as a SUBNORMAL,
+    // which the lane flushes to zero. That used to be a refusal, because the MAC was the only
+    // float multiply. With a native one the constant stays an f32 and the f16 widens, so the
+    // answer is the one the source asked for rather than a narrowed approximation of it.
+    const allocator = std.testing.allocator;
+    for ([_]f64{ 0.1, 3.0517578125e-05 }) |value| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const f16_t = try f.types.intern(.{ .float = .f16 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+        const plus = try f.appendArithImm(entry, i32_t, .add, lane, 3);
+        const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = plus } });
+        const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+        const k = try f.appendInst(entry, f32_t, .{ .fconst = value });
+        const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = k } });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = product } });
+        try f.appendStore(entry, raw, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+        try std.testing.expectEqual(@as(usize, 1), countWidens(words));
+        try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        // The exact f32 product is the discriminator on its own: the MAC path could not produce it
+        // for either constant. 0.1 would have been rounded to an f16 first, and 2^-15 IS an exact
+        // f16 but only a subnormal one, which the lane flushes, so that path would give zero.
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            const n: f32 = @floatFromInt(i + 3);
+            const want = n * @as(f32, @floatCast(value));
+            try std.testing.expectEqual(@as(u32, @bitCast(want)), data[i]);
+            try std.testing.expect(want != 0.0);
+        }
+    }
+}
+
+test "a MAC mixes a warp-uniform accumulator with a per-lane factor" {
+    // The result varies per lane while the accumulator does not, so the two are in different
+    // register FILES and must not be coalesced onto one register number. `copySource` reports the
+    // accumulator to the allocator, and the files are indexed by the same numbers.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const acc = try f.appendInst(entry, f32_t, .{ .fconst = 1000.0 });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const two = try f.appendInst(entry, f32_t, .{ .fconst = 2.0 });
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = two } });
+    const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+    try f.appendStore(entry, sum, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(1000.0 + n * 2.0)), data[i]);
+    }
+}
+
+test "a positive zero accumulator becomes a zeroed destination, a negative one does not" {
+    // `mac(0.0, a, b)` written by hand carries a real `0.0 +`. Reading that as a bare product
+    // costs one word instead of materializing the zero into a register and broadcasting it.
+    //
+    // A MINUS zero is kept, because it is the one accumulator value the shortcut would change:
+    // adding plus zero to a minus zero product gives plus zero.
+    const allocator = std.testing.allocator;
+    for ([_]f64{ 0.0, -0.0 }) |zero| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const f16_t = try f.types.intern(.{ .float = .f16 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        const acc = try f.appendInst(entry, f32_t, .{ .fconst = zero });
+        const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+        const one_more = try f.appendArithImm(entry, i32_t, .add, lane, 1);
+        const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = one_more } });
+        const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+        const three = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+        const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = three } });
+        const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+        try f.appendStore(entry, sum, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+        // A plus zero zeroes the destination from x0; a minus zero is broadcast like any value.
+        const want_splats: usize = if (zero == 0.0 and !std.math.signbit(zero)) 1 else 0;
+        try std.testing.expectEqual(want_splats, countZeroSplats(words));
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            const n: f32 = @floatFromInt(i);
+            try std.testing.expectEqual(@as(u32, @bitCast((n + 1.0) * 3.0)), data[i]);
+        }
+    }
+}
+
+test "a MAC keeps its factors alive past the converts it absorbed" {
+    // An absorbed convert emits nothing, but the IR still says the f16 dies there, so the
+    // allocator is free to hand that register to a value defined between the convert and the MAC.
+    // The MAC would then multiply whatever landed in it. `fusedOperands` is what tells the
+    // allocator that the MAC, not the convert, is the real reader.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const other = try f.appendArithImm(entry, i32_t, .add, lane, 1);
+    const ha = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = lane } });
+    const hb = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = other } });
+    const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+    const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+    // Per-lane values born after the absorbed converts, each live past the MAC, so the allocator
+    // has every reason to reuse the registers the two f16 appear to have vacated.
+    var junk: [6]Value = undefined;
+    for (&junk, 1..) |*j, k| j.* = try f.appendArithImm(entry, u32_t, .mul, tid, @intCast(k + 1));
+    const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wb } });
+
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, product, at);
+    for (junk, 0..) |j, n| {
+        const slot = try f.appendArithImm(entry, u32_t, .add, offset, @intCast((n + 1) * 32));
+        const where = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = slot } });
+        try f.appendStore(entry, j, where);
+    }
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+
+    var data: [64]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const n: f32 = @floatFromInt(i);
+        try std.testing.expectEqual(@as(u32, @bitCast(n * (n + 1.0))), data[i]);
+    }
+}
+
+test "a table of constants written once spills nothing" {
+    // A SPIR-V module constant has nowhere natural to live, so the lowering puts every one at the
+    // top of the entry block. A kernel that writes a table of them then holds the whole table at
+    // once and the allocator spills it, which costs a store and a reload each where re-emitting
+    // the constant costs one word. A warp has 256 bytes of scratch on the small profiles, so past
+    // about 64 entries that stops being slow code and becomes a refusal.
+    const allocator = std.testing.allocator;
+    const entries = 48;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    var consts: [entries]Value = undefined;
+    for (&consts, 0..) |*c, i| c.* = try f.appendInst(entry, u32_t, .{ .iconst = @intCast(0x1234_0000 + i) });
+    for (consts, 0..) |c, i| {
+        const at = try f.appendArithImm(entry, ptr_t, .add, base, @intCast(i * 4));
+        try f.appendStore(entry, c, at);
+    }
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // The prologue loads the stack pointer only when something spills.
+    const load_sp = glacier.encode.rv.csrrs(.x2, glacier.encode.Csr.mscratch, .x0);
+    for (words) |w| try std.testing.expect(w != load_sp);
+
+    var data: [64]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    for (0..entries) |i| try std.testing.expectEqual(@as(u32, @intCast(0x1234_0000 + i)), data[i]);
+}
+
+test "an atomic add is one instruction and gives back the old value" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const old = try f.appendAtomicRmw(entry, .{
+        .op = .add,
+        .ptr = base,
+        .value = one,
+        .ordering = .relaxed,
+        .scope = .device,
+    });
+    const at = try f.appendArithImm(entry, ptr_t, .add, base, 4);
+    try f.appendStore(entry, old, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var amos: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b0101111) amos += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), amos);
+
+    var data: [4]u32 = @splat(0);
+    data[0] = 40;
+    try runOnce(words, &data, 0, 1);
+    // Memory advanced, and what came back is what was there before.
+    try std.testing.expectEqual(@as(u32, 41), data[0]);
+    try std.testing.expectEqual(@as(u32, 40), data[1]);
+}
+
+test "the atomics Glacier cannot do are refused" {
+    const allocator = std.testing.allocator;
+    const Shape = enum { compare_exchange, per_lane };
+    for ([_]Shape{ .compare_exchange, .per_lane }) |shape| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+        const old = switch (shape) {
+            // Compare-and-swap needs the load-reserved pair, and Glacier decodes the AMOs without
+            // it. See `encode.zig`.
+            .compare_exchange => try f.appendAtomicRmw(entry, .{
+                .op = .compare_exchange,
+                .ptr = base,
+                .value = one,
+                .compare = one,
+                .ordering = .relaxed,
+                .scope = .device,
+            }),
+            // One bus, one read-modify-write. A per-lane atomic is a loop over the lanes.
+            .per_lane => blk: {
+                const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+                const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+                break :blk try f.appendAtomicRmw(entry, .{
+                    .op = .add,
+                    .ptr = at,
+                    .value = one,
+                    .ordering = .relaxed,
+                    .scope = .device,
+                });
+            },
+        };
+        try f.appendStore(entry, old, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+    }
+}
+
+test "an atomic minimum compares as the operand type, not always as signed" {
+    // 0xFFFFFFFF is the largest unsigned value and minus one as a signed one, so the two forms of
+    // the instruction disagree about it. The IR says the compare is against the OPERAND type.
+    const allocator = std.testing.allocator;
+    for ([_]std.builtin.Signedness{ .unsigned, .signed }) |signedness| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const ty = try f.types.intern(.{ .int = .{ .signedness = signedness, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const one = try f.appendInst(entry, ty, .{ .iconst = 1 });
+        const old = try f.appendAtomicRmw(entry, .{
+            .op = .min,
+            .ptr = base,
+            .value = one,
+            .ordering = .relaxed,
+            .scope = .device,
+        });
+        const at = try f.appendArithImm(entry, ptr_t, .add, base, 4);
+        try f.appendStore(entry, old, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var data: [4]u32 = @splat(0);
+        data[0] = 0xFFFF_FFFF;
+        try runOnce(words, &data, 0, 1);
+        // Unsigned keeps the 1; signed keeps the minus one that was already there.
+        const want: u32 = if (signedness == .unsigned) 1 else 0xFFFF_FFFF;
+        try std.testing.expectEqual(want, data[0]);
+        try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), data[1]);
+    }
+}
+
+test "the ordering an atomic asks for reaches its aq and rl bits" {
+    // A warp model that runs one warp to completion cannot observe ordering at all, so this is
+    // checked where it is decided: in the emitted word.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { ordering: ir.function.AtomicOrdering, aq: bool, rl: bool }{
+        .{ .ordering = .relaxed, .aq = false, .rl = false },
+        .{ .ordering = .acquire, .aq = true, .rl = false },
+        .{ .ordering = .release, .aq = false, .rl = true },
+        .{ .ordering = .acq_rel, .aq = true, .rl = true },
+        .{ .ordering = .seq_cst, .aq = true, .rl = true },
+    };
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+        try f.appendAtomicRmwStmt(entry, .{
+            .op = .add,
+            .ptr = base,
+            .value = one,
+            .ordering = c.ordering,
+            .scope = .device,
+        });
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var found = false;
+        for (words) |w| {
+            if (w & 0x7F != 0b0101111) continue;
+            try std.testing.expectEqual(c.aq, (w >> 26) & 1 == 1);
+            try std.testing.expectEqual(c.rl, (w >> 25) & 1 == 1);
+            found = true;
+        }
+        // The old value goes nowhere, and the read-modify-write still has to happen.
+        try std.testing.expect(found);
+    }
+}
+
+test "warp-uniform float arithmetic goes out to the vector unit and comes back" {
+    // There is no scalar form of any of these, so both operands are broadcast, the vector unit
+    // does the work and lane zero carries the answer back.
+    //
+    // 2^20 plus 1 is deliberate on both counts. It is EXACT in f32, needing 21 of the 24 bits, so
+    // no result here depends on the rounding mode, which is not recorded anywhere for these three.
+    // And no f16 holds it, so the MAC cannot claim the multiply: a product of two constants that
+    // ARE exact halves is still lowered as a MAC, correctly and in fewer words, which means a test
+    // using small integers would never reach `vfmul` at all.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { op: ir.function.BinOp, want: f32 }{
+        .{ .op = .add, .want = 1048579.0 },
+        .{ .op = .sub, .want = 1048575.0 },
+        .{ .op = .mul, .want = 2097154.0 },
+    };
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const big = try f.appendInst(entry, f32_t, .{ .fconst = 1048577.0 });
+        const two = try f.appendInst(entry, f32_t, .{ .fconst = 2.0 });
+        const r = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = c.op, .lhs = big, .rhs = two } });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = r } });
+        try f.appendStore(entry, raw, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
+
+        var data: [4]u32 = @splat(0);
+        try runOnce(words, &data, 0, 1);
+        try std.testing.expectEqual(@as(u32, @bitCast(c.want)), data[0]);
+    }
+}
+
+test "per-lane float arithmetic over widened f16" {
+    // `out[lane] = f32(lane + 5) - f32(lane + 3)`, which is 2 in every lane. Written as a subtract
+    // so an encoder that reached for the add would answer differently in every lane.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const f16_t = try f.types.intern(.{ .float = .f16 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const lane = try f.appendInst(entry, i32_t, .{ .convert = .{ .value = tid } });
+    const a5 = try f.appendArithImm(entry, i32_t, .add, lane, 5);
+    const a3 = try f.appendArithImm(entry, i32_t, .add, lane, 3);
+    const h5 = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = a5 } });
+    const h3 = try f.appendInst(entry, f16_t, .{ .convert = .{ .value = a3 } });
+    const w5 = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = h5 } });
+    const w3 = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = h3 } });
+    const diff = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .sub, .lhs = w5, .rhs = w3 } });
+    try f.appendStore(entry, diff, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countMacs(words));
+    try std.testing.expectEqual(@as(usize, 2), countWidens(words));
+    try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 2.0))), data[i]);
+    }
+}
+
+test "a float add rounds to nearest even and the MAC truncates" {
+    // The lane is not uniform about rounding, so the two modes are pinned against each other on
+    // the SAME arithmetic value. 1 + 3*2^-25 is three quarters of an ulp above 1.0 in f32, so
+    // nearest even carries it up one ulp and truncation leaves it at 1.0. A rounding mux that
+    // flipped either way would move that bit with no error anywhere, which is how it would be
+    // missed: every other float test here uses operands whose result is exact.
+    //
+    // This pins the MODEL and the selection, not the hardware. The hardware's modes are recorded
+    // in `warp.zig` with where they were read from.
+    const allocator = std.testing.allocator;
+    const quarter_ulp: f32 = @floatCast(@as(f64, 3.0) / 33554432.0); // 3 * 2^-25, exact in f32
+    const rounded_up: f32 = 1.0 + std.math.floatEps(f32);
+    try std.testing.expect(rounded_up != 1.0);
+
+    // The add: nearest even, so the answer is one ulp above 1.0.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const one = try f.appendInst(entry, f32_t, .{ .fconst = 1.0 });
+        const tiny = try f.appendInst(entry, f32_t, .{ .fconst = quarter_ulp });
+        const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = one, .rhs = tiny } });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
+        try f.appendStore(entry, raw, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 1), countFloatArith(words));
+        var data: [4]u32 = @splat(0);
+        try runOnce(words, &data, 0, 1);
+        try std.testing.expectEqual(@as(u32, @bitCast(rounded_up)), data[0]);
+    }
+
+    // The MAC: toward zero on the same quantity, so the answer stays 1.0. The factors are exact
+    // f16 and their product is exactly the three quarters of an ulp the add rounded up.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const f16_t = try f.types.intern(.{ .float = .f16 });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const acc = try f.appendInst(entry, f32_t, .{ .fconst = 1.0 });
+        // 3 * 2^-13 and 2^-12, both normal halves, whose product is 3 * 2^-25 exactly.
+        const ha = try f.appendInst(entry, f16_t, .{ .fconst = @as(f64, 3.0) / 8192.0 });
+        const hb = try f.appendInst(entry, f16_t, .{ .fconst = @as(f64, 1.0) / 4096.0 });
+        const wa = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = ha } });
+        const wb = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = hb } });
+        const product = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = wa, .rhs = wb } });
+        const sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = product } });
+        const raw = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
+        try f.appendStore(entry, raw, base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 1), countMacs(words));
+        var data: [4]u32 = @splat(0);
+        try runOnce(words, &data, 0, 1);
+        try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.0))), data[0]);
+    }
+}
+
+/// How many words in `code` are an integer vector compare into a mask: OP-V, OPIVV or OPIVX, with
+/// a funct6 in the compare block.
+fn countCompares(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        const f3 = (w >> 12) & 0x7;
+        if (f3 != 0b000 and f3 != 0b100) continue;
+        if (w >> 26 < 0b011000 or w >> 26 > 0b011111) continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// How many words in `code` are `vmerge`, the one masked instruction emitted: funct6 010111 with
+/// `vm` clear.
+fn countMerges(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if (w >> 26 != 0b010111 or (w >> 25) & 1 != 0) continue;
+        n += 1;
+    }
+    return n;
+}
+
+test "a per-lane compare and select pick a different answer in each lane" {
+    // `out[lane] = cmp(lane, 2) ? 100 : 200`, which is the shape a rasteriser's span test has and
+    // which used to be refused outright: a per-lane compare writes a MASK, and reading lane zero's
+    // answer for the whole warp would have been a wrong frame rather than a slow one.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { op: ir.function.CmpOp, taken: [4]bool }{
+        .{ .op = .lt, .taken = .{ true, true, false, false } },
+        .{ .op = .le, .taken = .{ true, true, true, false } },
+        .{ .op = .gt, .taken = .{ false, false, false, true } },
+        .{ .op = .ge, .taken = .{ false, false, true, true } },
+        .{ .op = .eq, .taken = .{ false, false, true, false } },
+        .{ .op = .ne, .taken = .{ true, true, false, true } },
+    };
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+        const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = c.op, .lhs = tid, .rhs = two } });
+        const hit = try f.appendInst(entry, u32_t, .{ .iconst = 100 });
+        const miss = try f.appendInst(entry, u32_t, .{ .iconst = 200 });
+        const pick = try f.appendInst(entry, u32_t, .{ .select = .{ .cond = cond, .then = hit, .@"else" = miss } });
+        try f.appendStore(entry, pick, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        // One compare into a mask and one merge under it. Greater-than has no vector-vector
+        // encoding, so it is the less-than with the operands swapped and still one instruction.
+        try std.testing.expectEqual(@as(usize, 1), countCompares(words));
+        try std.testing.expectEqual(@as(usize, 1), countMerges(words));
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            try std.testing.expectEqual(@as(u32, if (c.taken[i]) 100 else 200), data[i]);
+        }
+    }
+}
+
+test "a warp-uniform condition still merges when the sides are per-lane" {
+    // The condition is the same in every lane but the two sides are not, so the answer is per-lane
+    // and the merge is still how it is built. The mask comes from comparing the broadcast condition
+    // against zero, which is all ones where it is FALSE, so the sides go in the other order.
+    const allocator = std.testing.allocator;
+    for ([_]i64{ 0, 1 }) |flag| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        const cond = try f.appendInst(entry, bool_t, .{ .iconst = flag });
+        const ten = try f.appendArithImm(entry, u32_t, .mul, tid, 10);
+        const hundred = try f.appendArithImm(entry, u32_t, .mul, tid, 100);
+        const pick = try f.appendInst(entry, u32_t, .{ .select = .{ .cond = cond, .then = ten, .@"else" = hundred } });
+        try f.appendStore(entry, pick, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 1), countMerges(words));
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            const want: u32 = @intCast(i * (if (flag != 0) @as(usize, 10) else 100));
+            try std.testing.expectEqual(want, data[i]);
+        }
+    }
+}
+
+test "a per-lane compare takes its signedness from the operand type" {
+    // The lane index is small, so signed and unsigned compares agree on it and a test against a
+    // small bound cannot tell them apart. These bounds are chosen so they disagree on every lane:
+    // 0x80000000 is half the unsigned range and the most negative signed value.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { signedness: std.builtin.Signedness, bound: i64, taken: bool }{
+        // Unsigned: every lane is below half the range.
+        .{ .signedness = .unsigned, .bound = 0x8000_0000, .taken = true },
+        // Signed: the same bits are the most negative value, so no lane is below it.
+        .{ .signedness = .signed, .bound = -0x8000_0000, .taken = false },
+    };
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ty = try f.types.intern(.{ .int = .{ .signedness = c.signedness, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        const lane = try f.appendInst(entry, ty, .{ .convert = .{ .value = tid } });
+        const bound = try f.appendInst(entry, ty, .{ .iconst = c.bound });
+        const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = lane, .rhs = bound } });
+        const hit = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+        const miss = try f.appendInst(entry, u32_t, .{ .iconst = 9 });
+        const pick = try f.appendInst(entry, u32_t, .{ .select = .{ .cond = cond, .then = hit, .@"else" = miss } });
+        try f.appendStore(entry, pick, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            try std.testing.expectEqual(@as(u32, if (c.taken) 7 else 9), data[i]);
+        }
+    }
+}
+
+test "a per-lane float compare answers false where it should" {
+    // Checking only the TRUE cases cannot see a compare that always says true, which is exactly
+    // how a mis-wired one fails: the peer's lane read the fp32 operands as fp16 in their low bits,
+    // both zero there, so every compare returned an all-ones mask and looked plausible. So every
+    // relation here is driven with operands that differ, and each one is checked in BOTH
+    // directions. `5 < 3` being false is what pins the left operand as the left operand.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { op: ir.function.CmpOp, lhs: f64, rhs: f64, taken: bool }{
+        .{ .op = .eq, .lhs = 3.0, .rhs = 5.0, .taken = false },
+        .{ .op = .eq, .lhs = 3.0, .rhs = 3.0, .taken = true },
+        .{ .op = .ne, .lhs = 3.0, .rhs = 5.0, .taken = true },
+        .{ .op = .ne, .lhs = 3.0, .rhs = 3.0, .taken = false },
+        .{ .op = .lt, .lhs = 3.0, .rhs = 5.0, .taken = true },
+        .{ .op = .lt, .lhs = 5.0, .rhs = 3.0, .taken = false },
+        .{ .op = .lt, .lhs = 3.0, .rhs = 3.0, .taken = false },
+        .{ .op = .le, .lhs = 3.0, .rhs = 5.0, .taken = true },
+        .{ .op = .le, .lhs = 5.0, .rhs = 3.0, .taken = false },
+        .{ .op = .le, .lhs = 3.0, .rhs = 3.0, .taken = true },
+        .{ .op = .gt, .lhs = 5.0, .rhs = 3.0, .taken = true },
+        .{ .op = .gt, .lhs = 3.0, .rhs = 5.0, .taken = false },
+        .{ .op = .ge, .lhs = 3.0, .rhs = 3.0, .taken = true },
+        .{ .op = .ge, .lhs = 3.0, .rhs = 5.0, .taken = false },
+    };
+    for (cases) |c| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        // Made per-lane by adding a zeroed lane index, so the compare is a vector one rather than
+        // something a uniform path could answer.
+        const zero = try f.appendArithImm(entry, u32_t, .mul, tid, 0);
+        const bias = try f.appendInst(entry, f32_t, .{ .unary = .{ .op = .reinterpret, .value = zero } });
+        const kl = try f.appendInst(entry, f32_t, .{ .fconst = c.lhs });
+        const kr = try f.appendInst(entry, f32_t, .{ .fconst = c.rhs });
+        const lhs = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = kl, .rhs = bias } });
+        const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = c.op, .lhs = lhs, .rhs = kr } });
+        const hit = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+        const miss = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+        const pick = try f.appendInst(entry, u32_t, .{ .select = .{ .cond = cond, .then = hit, .@"else" = miss } });
+        try f.appendStore(entry, pick, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            try std.testing.expectEqual(@as(u32, if (c.taken) 1 else 0), data[i]);
+        }
+    }
+}
+
+test "a divergent branch becomes straight-line code with a select" {
+    // `out[lane] = (lane < 2) ? lane * 10 : lane + 100`, written as a BRANCH rather than a select.
+    // Lanes disagree about which side to take, which used to be refused outright because a scalar
+    // branch would have sent the whole warp whichever way lane zero went.
+    //
+    // Note what the join parameter would look like to an analysis that only follows operands: both
+    // incoming values are per-lane here, but they need not be, and that is the case this shape is
+    // converted to avoid rather than to tolerate.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const ten = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+    const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+    const result = try f.appendBlockParam(join, u32_t);
+
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+    try f.setJump(then_b, join, &.{ten});
+    try f.setJump(else_b, join, &.{hundred});
+
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, result, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One compare into a mask and one merge, and NO branch: the arms were spliced in and the join
+    // parameter became a select, so nothing jumps anywhere.
+    try std.testing.expectEqual(@as(usize, 1), countCompares(words));
+    try std.testing.expectEqual(@as(usize, 1), countMerges(words));
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011); // no conditional branch
+        try std.testing.expect(w & 0x7F != 0b1101111); // no jump
+    }
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const want: u32 = if (i < 2) @intCast(i * 10) else @intCast(i + 100);
+        try std.testing.expectEqual(want, data[i]);
+    }
+}
+
+test "a store under a divergent branch becomes a masked scatter" {
+    // The span fill: `if (lane < 2) data[lane] = 0xAA`. Both arms run for every lane after
+    // if-conversion, so the store carries the condition as a MASK and the lanes that did not
+    // choose it make no bus access at all. The words they would have written are the proof.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const fill = try f.appendInst(then_b, u32_t, .{ .iconst = 0xAA });
+    const offset = try f.appendArithImm(then_b, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(then_b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(then_b, fill, at);
+
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = join });
+    try f.setJump(then_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One predicated scatter and no branch. `vm` clear is what makes it predicated, so the test
+    // reads that bit rather than trusting the opcode.
+    var masked_stores: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b0100111) continue;
+        try std.testing.expectEqual(@as(u32, 0), (w >> 25) & 1);
+        masked_stores += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), masked_stores);
+    // The run is contiguous as well as masked, so it is the unit-stride form.
+    try std.testing.expectEqual(@as(usize, 1), countAccesses(words, 0b00));
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011);
+        try std.testing.expect(w & 0x7F != 0b1101111);
+    }
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(if (i < 2) @as(u32, 0xAA) else sentinel, data[i]);
+    }
+}
+
+test "a store in the else arm takes the complement of the condition" {
+    // `if (lane < 2) {} else data[lane] = 0xBB`. The else arm runs where the condition is FALSE,
+    // so its mask is the inverted compare, and a wrong polarity shows up as the other two words.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+
+    const fill = try f.appendInst(else_b, u32_t, .{ .iconst = 0xBB });
+    const offset = try f.appendArithImm(else_b, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(else_b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(else_b, fill, at);
+
+    try f.appendIf(entry, cond, .{ .target = join }, .{ .target = else_b });
+    try f.setJump(else_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // ONE compare. The complement is a real instruction, because a mask cannot be negated where
+    // it is used, and the original condition is then dead: the then arm is empty and no join
+    // parameter reads it, so dead-code elimination takes it out.
+    try std.testing.expectEqual(@as(usize, 1), countCompares(words));
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(if (i < 2) sentinel else @as(u32, 0xBB), data[i]);
+    }
+}
+
+test "a float compare converts both arms, and an unordered lane takes the else one" {
+    // `!(a < b)` is not `a >= b` when either is a NaN, which is why the complement here is the MASK
+    // complement and not a flip of the operator: flipping would leave an unordered lane in neither
+    // arm. The mask complement is exactly the else arm, so lane 2 below stores like lane 1 does.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const lane_off = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const lane_at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = lane_off } });
+    const lane_f = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = lane_at } });
+    const limit = try f.appendInst(entry, f32_t, .{ .fconst = 2.0 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = lane_f, .rhs = limit } });
+
+    const fill = try f.appendInst(else_b, u32_t, .{ .iconst = 0xCC });
+    const offset = try f.appendArithImm(else_b, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(else_b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(else_b, fill, at);
+
+    try f.appendIf(entry, cond, .{ .target = join }, .{ .target = else_b });
+    try f.setJump(else_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const code = try compile(allocator, &f);
+    defer allocator.free(code);
+    var data: [64]u32 = @splat(0);
+    data[0] = @bitCast(@as(f32, 1.0)); // below, so the then arm, which stores nothing
+    data[1] = @bitCast(@as(f32, 3.0)); // above
+    data[2] = 0x7FC00000; // a quiet NaN, unordered against everything
+    data[3] = @bitCast(@as(f32, 2.0)); // equal, which is not below
+    try runOnce(code, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.0))), data[0]);
+    try std.testing.expectEqual(@as(u32, 0xCC), data[1]);
+    try std.testing.expectEqual(@as(u32, 0xCC), data[2]);
+    try std.testing.expectEqual(@as(u32, 0xCC), data[3]);
+}
+
+test "a warp-uniform branch keeps its branch instead of running both arms" {
+    // Converting this would be correct and slower: every lane agrees, so one jump runs one arm,
+    // where a merge would run both and then throw one away.
+    const allocator = std.testing.allocator;
+    for ([_]i64{ 0, 1 }) |flag| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const then_b = try f.appendBlock();
+        const else_b = try f.appendBlock();
+        const join = try f.appendBlock();
+
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const cond = try f.appendInst(entry, bool_t, .{ .iconst = flag });
+        const ten = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+        const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+        const result = try f.appendBlockParam(join, u32_t);
+
+        try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+        try f.setJump(then_b, join, &.{ten});
+        try f.setJump(else_b, join, &.{hundred});
+
+        const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        try f.appendStore(join, result, at);
+        f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        try std.testing.expectEqual(@as(usize, 0), countMerges(words));
+        var branches: usize = 0;
+        for (words) |w| {
+            if (w & 0x7F == 0b1100011) branches += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), branches);
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            const want: u32 = if (flag == 1) @intCast(i * 10) else @intCast(i + 100);
+            try std.testing.expectEqual(want, data[i]);
+        }
+    }
+}
+
+test "a divergent branch sharing an arm with another path is refused" {
+    // `then` is also the target of a jump the branch does not control, so moving its body into the
+    // branch would leave that other path running an empty block. Nothing converts here and the
+    // refusal answers instead.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const other = try f.appendBlock();
+    const fork = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const flag = try f.appendInst(entry, bool_t, .{ .iconst = 1 });
+    try f.appendIf(entry, flag, .{ .target = other }, .{ .target = fork });
+    try f.setJump(other, then_b, &.{});
+
+    const two = try f.appendInst(fork, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(fork, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(fork, cond, .{ .target = then_b }, .{ .target = else_b });
+
+    const ten = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+    const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+    const result = try f.appendBlockParam(join, u32_t);
+    try f.setJump(then_b, join, &.{ten});
+    try f.setJump(else_b, join, &.{hundred});
+
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, result, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a join reached from outside the branch keeps its parameters" {
+    // A third path reaches the join, so its parameter takes a value the two arms never pass and
+    // cannot become a select between them.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const other = try f.appendBlock();
+    const fork = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const flag = try f.appendInst(entry, bool_t, .{ .iconst = 1 });
+    try f.appendIf(entry, flag, .{ .target = other }, .{ .target = fork });
+
+    const seven = try f.appendInst(other, u32_t, .{ .iconst = 7 });
+    try f.setJump(other, join, &.{seven});
+
+    const two = try f.appendInst(fork, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(fork, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(fork, cond, .{ .target = then_b }, .{ .target = else_b });
+
+    const ten = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+    const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+    const result = try f.appendBlockParam(join, u32_t);
+    try f.setJump(then_b, join, &.{ten});
+    try f.setJump(else_b, join, &.{hundred});
+
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, result, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a divergent branch that passes an argument to its arm becomes a select" {
+    // The arm reads a parameter the branch edge supplies. Flattening a REGION turns any block's
+    // parameters into selects over the paths that reach it, not just the exit's, so the argument
+    // arrives the same way a join value does. The diamond-only version refused this.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const ten = try f.appendArithImm(entry, u32_t, .mul, tid, 10);
+
+    const carried = try f.appendBlockParam(then_b, u32_t);
+    const bumped = try f.appendArithImm(then_b, u32_t, .add, carried, 1);
+    const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+    const result = try f.appendBlockParam(join, u32_t);
+
+    try f.appendIf(entry, cond, .{ .target = then_b, .args = &.{ten} }, .{ .target = else_b });
+    try f.setJump(then_b, join, &.{bumped});
+    try f.setJump(else_b, join, &.{hundred});
+
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, result, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011);
+        try std.testing.expect(w & 0x7F != 0b1101111);
+    }
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        // The then arm reads its argument, `lane * 10`, and adds one. The else arm does not.
+        const want: u32 = if (i < 2) @intCast(i * 10 + 1) else @intCast(i + 100);
+        try std.testing.expectEqual(want, data[i]);
+    }
+}
+
+test "a divergent branch whose arms go to different places is refused" {
+    // There is no one join to turn into selects: each arm ends somewhere of its own. Nothing here
+    // converts, so the refusal is what answers.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const else_b = try f.appendBlock();
+    const then_end = try f.appendBlock();
+    const else_end = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+
+    const ten = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+    const hundred = try f.appendArithImm(else_b, u32_t, .add, tid, 100);
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+    try f.setJump(then_b, then_end, &.{});
+    try f.setJump(else_b, else_end, &.{});
+
+    try f.appendStore(then_end, ten, at);
+    f.setTerminator(then_end, .{ .ret = ir.function.Ret.none() });
+    try f.appendStore(else_end, hundred, at);
+    f.setTerminator(else_end, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a masked store whose address and value are the same in every lane writes nothing when no lane is active" {
+    // `if (lane > 100) data[0] = 0xAA`. Nothing about the address or the value is per-lane, so
+    // only the mask makes this a vector instruction, and no lane of this warp is in it. The
+    // sentinel surviving is the whole assertion: an unmasked scatter would write the word.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const limit = try f.appendInst(entry, u32_t, .{ .iconst = 100 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = tid, .rhs = limit } });
+    const fill = try f.appendInst(then_b, u32_t, .{ .iconst = 0xAA });
+    try f.appendStore(then_b, fill, base);
+
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = join });
+    try f.setJump(then_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(sentinel, data[0]);
+}
+
+test "a store under two conditions runs where both hold" {
+    // `if (lane < 3) { if (lane > 0) data[lane] = 0xDD }`. The inner diamond converts first and
+    // leaves the store carrying the inner condition, then the outer one ANDs the two masks. Lane
+    // 0 fails the inner test and lane 3 the outer one, so both ends of the span are the
+    // assertion: dropping either mask writes a word that has to stay as it was.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const outer = try f.appendBlock();
+    const inner = try f.appendBlock();
+    const inner_join = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const three = try f.appendInst(entry, u32_t, .{ .iconst = 3 });
+    const outer_cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = three } });
+    try f.appendIf(entry, outer_cond, .{ .target = outer }, .{ .target = join });
+
+    const zero = try f.appendInst(outer, u32_t, .{ .iconst = 0 });
+    const inner_cond = try f.appendInst(outer, bool_t, .{ .icmp = .{ .op = .gt, .lhs = tid, .rhs = zero } });
+    try f.appendIf(outer, inner_cond, .{ .target = inner }, .{ .target = inner_join });
+
+    const fill = try f.appendInst(inner, u32_t, .{ .iconst = 0xDD });
+    const offset = try f.appendArithImm(inner, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(inner, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(inner, fill, at);
+    try f.setJump(inner, inner_join, &.{});
+    try f.setJump(inner_join, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var masked_stores: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b0100111) continue;
+        try std.testing.expectEqual(@as(u32, 0), (w >> 25) & 1);
+        masked_stores += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), masked_stores);
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011);
+        try std.testing.expect(w & 0x7F != 0b1101111);
+    }
+
+    // The two masks combine with `vmand.mm`, funct6 011001 in the OPMVV form, and NOT with the
+    // element-wise `vand.vv`. Both give the same answer at every width this core is built in,
+    // because sixteen lanes of mask fit in the first element, so the structure is the only place
+    // the difference shows. Nothing here can tell them apart by value.
+    // The one into v0 is the move that applies the finished mask to the store, so it is not
+    // counted: the combine is the one that writes an ordinary register.
+    var mask_ands: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0b111 != 0b010) continue;
+        if (w >> 26 != 0b011001) continue;
+        if ((w >> 7) & 0x1F == 0) continue;
+        mask_ands += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), mask_ands);
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const want: u32 = if (i > 0 and i < 3) 0xDD else sentinel;
+        try std.testing.expectEqual(want, data[i]);
+    }
+}
+
+test "a masked store whose mask is the same in every lane is refused" {
+    // Every lane agrees, so the answer is a branch over the store and not a predicate on it.
+    // Nothing the compiler writes has this shape, and hand-written IR says it in one line.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const fill = try f.appendInst(entry, u32_t, .{ .iconst = 0xEE });
+    const always = try f.appendInst(entry, bool_t, .{ .iconst = 1 });
+    try f.appendStoreMasked(entry, fill, base, always);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a mask combined with a warp-uniform bool is refused" {
+    // A per-lane bool is mask BITS and a warp-uniform one is a 0 or a 1 in a scalar register.
+    // Broadcasting the second gives one value per element, not one bit per lane, so reading it as
+    // a mask would make the store write by the wrong rule. Only hand-written IR says this.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const lanes = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const always = try f.appendInst(entry, bool_t, .{ .iconst = 1 });
+    const both = try f.appendInst(entry, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = lanes, .rhs = always } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStoreMasked(entry, two, at, both);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+/// How many vector accesses in `code` use the addressing mode `mop`: 00 unit-stride, 01 indexed.
+fn countAccesses(code: []const u32, mop: u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        const op = w & 0x7F;
+        if (op != 0b0000111 and op != 0b0100111) continue;
+        if ((w >> 12) & 0b111 != 0b110) continue;
+        if ((w >> 26) & 0b11 != mop) continue;
+        n += 1;
+    }
+    return n;
+}
+
+test "an index by lane id becomes one contiguous access" {
+    // `data[lane] += 7`. The lanes address consecutive words, so the load and the store each take
+    // one unit-stride instruction from a scalar start address, and the per-lane address vector is
+    // never built: the shift and the add that made it are absorbed.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const old = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at } });
+    const bumped = try f.appendArithImm(entry, u32_t, .add, old, 7);
+    try f.appendStore(entry, bumped, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 2), countAccesses(words, 0b00));
+    try std.testing.expectEqual(@as(usize, 0), countAccesses(words, 0b01));
+    // The address arithmetic is gone with it. `vsll.vi` is funct6 100101 in the OPIVI form, and
+    // the shift by two that scaled the lane index is the only one this kernel could emit.
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        try std.testing.expect(w >> 26 != 0b100101);
+    }
+
+    var data: [8]u32 = @splat(0);
+    for (0..8) |i| data[i] = @intCast(i * 10);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i * 10 + 7)), data[i]);
+    }
+}
+
+test "an index the lowering cannot prove contiguous stays a scatter" {
+    // `data[lane ^ 1] = lane`. The lanes swap in pairs, so the words are not a run and the access
+    // keeps its address per lane. A miss costs speed and never an answer.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const swapped = try f.appendArithImm(entry, u32_t, .bit_xor, tid, 1);
+    const offset = try f.appendArithImm(entry, u32_t, .shl, swapped, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, tid, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countAccesses(words, 0b00));
+    try std.testing.expectEqual(@as(usize, 1), countAccesses(words, 0b01));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i ^ 1)), data[i]);
+    }
+}
+
+test "a lane index scaled by anything but one word stays a scatter" {
+    // `data[lane * 2] = lane + 1`, so the byte offset is the lane shifted by THREE. The words are
+    // every other one, not a run, and reading the shift amount is the only thing that tells the
+    // two apart. Treating this as contiguous writes the first four words instead of every second
+    // one, which the values below catch.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 3);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const value = try f.appendArithImm(entry, u32_t, .add, tid, 1);
+    try f.appendStore(entry, value, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countAccesses(words, 0b00));
+    try std.testing.expectEqual(@as(usize, 1), countAccesses(words, 0b01));
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [16]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), data[i * 2]);
+        try std.testing.expectEqual(sentinel, data[i * 2 + 1]);
+    }
+}
+
+test "an address a second reader wants is still built" {
+    // `data[lane] = 0x55; table[lane] = &data[lane]`. The address feeds a contiguous store AND
+    // goes into memory as a VALUE, so the arithmetic that built it cannot be absorbed: the second
+    // store would write a register holding nothing. The addresses in the table are the assertion.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+    const lanes = glacier.encode.Profile.@"gc1.n".lanes();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const fill = try f.appendInst(entry, u32_t, .{ .iconst = 0x55 });
+    try f.appendStore(entry, fill, at);
+
+    // The table sits one warp width along, so its own address is unit-stride from there.
+    const table = try f.appendArithImm(entry, ptr_t, .add, base, @intCast(lanes * 4));
+    const table_at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = table, .rhs = offset } });
+    try f.appendStore(entry, at, table_at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 2), countAccesses(words, 0b00));
+
+    var data: [16]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    for (0..lanes) |i| {
+        try std.testing.expectEqual(@as(u32, 0x55), data[i]);
+        try std.testing.expectEqual(data_base + @as(u32, @intCast(i * 4)), data[lanes + i]);
+    }
+}
+
+test "a lane term buried under the index scale still becomes one contiguous access" {
+    // `w[y * row + x + lane] = colour`, which is how a scanline fill indexes: the whole index is
+    // scaled to bytes at once, so the lane term sits INSIDE the shift and the address is
+    // `ptr + (uniform + lane) * 4`. Hoisting the lane term out is what lets the access see a run.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const y = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const row = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const x = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const colour = try f.appendInst(entry, u32_t, .{ .iconst = 0x7E });
+    const scanline = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = y, .rhs = row } });
+    const column = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .add, .lhs = scanline, .rhs = x } });
+    const index = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .add, .lhs = column, .rhs = tid } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, index, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, colour, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countAccesses(words, 0b00));
+    try std.testing.expectEqual(@as(usize, 0), countAccesses(words, 0b01));
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [16]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    const first = 1 * 4 + 1;
+    for (0..data.len) |i| {
+        const inside = i >= first and i < first + glacier.encode.Profile.@"gc1.n".lanes();
+        try std.testing.expectEqual(if (inside) @as(u32, 0x7E) else sentinel, data[i]);
+    }
+}
+
+test "a buried lane term that steps two words stays a scatter" {
+    // `w[uniform + lane * 2]`, so the scale under the shift makes the run step eight bytes. The
+    // stride has to be carried through the shift to see that, and getting it wrong writes a
+    // contiguous block over words the kernel never named.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const start = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const doubled = try f.appendArithImm(entry, u32_t, .mul, tid, 2);
+    const index = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .add, .lhs = start, .rhs = doubled } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, index, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const value = try f.appendArithImm(entry, u32_t, .add, tid, 1);
+    try f.appendStore(entry, value, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 0), countAccesses(words, 0b00));
+    try std.testing.expectEqual(@as(usize, 1), countAccesses(words, 0b01));
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [16]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), data[2 + i * 2]);
+        try std.testing.expectEqual(sentinel, data[2 + i * 2 + 1]);
+    }
+}
+
+test "a constant offset inside the index reaches the start of the run" {
+    // `w[lane + 3] = lane`. The constant is scaled with the index, so it is twelve bytes and not
+    // three, and it belongs to the scalar start of the run rather than to any lane.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const index = try f.appendArithImm(entry, u32_t, .add, tid, 3);
+    const offset = try f.appendArithImm(entry, u32_t, .shl, index, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, tid, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countAccesses(words, 0b00));
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [16]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..data.len) |i| {
+        const lane = @as(i64, @intCast(i)) - 3;
+        const inside = lane >= 0 and lane < glacier.encode.Profile.@"gc1.n".lanes();
+        try std.testing.expectEqual(if (inside) @as(u32, @intCast(lane)) else sentinel, data[i]);
+    }
+}
+
+test "a buried address read and written takes the contiguous form both ways" {
+    // `w[y * row + lane] += 1`. The load and the store share one address, so it is rewritten once
+    // and both accesses read the run from the same scalar start. The reuse itself is an
+    // instruction-count matter and nothing here can see it; what this pins is that BOTH halves of
+    // a read-modify-write take the contiguous form and land on the same words.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const y = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const row = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const scanline = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = y, .rhs = row } });
+    const index = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .add, .lhs = scanline, .rhs = tid } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, index, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const old = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at } });
+    const bumped = try f.appendArithImm(entry, u32_t, .add, old, 1);
+    try f.appendStore(entry, bumped, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 2), countAccesses(words, 0b00));
+    try std.testing.expectEqual(@as(usize, 0), countAccesses(words, 0b01));
+
+    var data: [16]u32 = @splat(0);
+    for (0..data.len) |i| data[i] = @intCast(i * 10);
+    try runOnce(words, &data, 0, 1);
+    for (0..data.len) |i| {
+        const lane = @as(i64, @intCast(i)) - 8;
+        const inside = lane >= 0 and lane < glacier.encode.Profile.@"gc1.n".lanes();
+        const want: u32 = @intCast(i * 10 + @as(usize, if (inside) 1 else 0));
+        try std.testing.expectEqual(want, data[i]);
+    }
+}
+
+test "a loop the lanes leave at different times runs until the last one is done" {
+    // `acc = 0; i = 0; do { acc += lane + 1; i += 1 } while (acc < 10); out[lane] = i`
+    //
+    // Lane 0 steps by one and needs ten iterations, lane 3 steps by four and needs three. The
+    // warp has ONE program counter, so it runs ten iterations and carries the finished lanes
+    // along inactive: their counters must stop where they stopped. A lowering that let the body
+    // keep updating them would give every lane the same answer.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const step = try f.appendArithImm(entry, u32_t, .add, tid, 1);
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const ten = try f.appendInst(entry, u32_t, .{ .iconst = 10 });
+    try f.setJump(entry, loop, &.{ zero, zero });
+
+    const acc = try f.appendBlockParam(loop, u32_t);
+    const count = try f.appendBlockParam(loop, u32_t);
+    const acc_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = step } });
+    const count_next = try f.appendArithImm(loop, u32_t, .add, count, 1);
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = acc_next, .rhs = ten } });
+    try f.appendIf(
+        loop,
+        more,
+        .{ .target = loop, .args = &.{ acc_next, count_next } },
+        .{ .target = exit, .args = &.{count_next} },
+    );
+
+    const total = try f.appendBlockParam(exit, u32_t);
+    const offset = try f.appendArithImm(exit, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(exit, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(exit, total, at);
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // The loop condition is a mask reduced to a lane count: `vcpop.m`, funct6 010000 in the OPMVV
+    // form with vs1 = 16, which is what tells it from `vmv.x.s` sharing that funct6.
+    var reductions: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0b111 != 0b010) continue;
+        if (w >> 26 != 0b010000) continue;
+        if ((w >> 15) & 0x1F != 16) continue;
+        reductions += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), reductions);
+
+    // Eight words is enough only because the kernel does not spill: a spilled value would land in
+    // the scratch region, which sits past the end of a buffer this small.
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    const want = [_]u32{ 10, 5, 4, 3 };
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(want[i], data[i]);
+    }
+}
+
+test "a per-lane parameter fed a warp-uniform value on one edge gets it in every lane" {
+    // `out[lane] = flag ? lane * 10 : 7`, as a BRANCH on a warp-uniform flag. The join parameter
+    // is per-lane because one side is, and the other side hands it a constant: parameter and
+    // argument sit in different register files, and the allocator's move carries the parameter's
+    // class with the argument's location. When the two indices happen to agree it emits NOTHING,
+    // so the lanes read whatever the vector register held. The constant arm is the assertion.
+    const allocator = std.testing.allocator;
+    for ([_]i64{ 0, 1 }) |flag| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const then_b = try f.appendBlock();
+        const else_b = try f.appendBlock();
+        const join = try f.appendBlock();
+
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const cond = try f.appendInst(entry, bool_t, .{ .iconst = flag });
+        const scaled = try f.appendArithImm(then_b, u32_t, .mul, tid, 10);
+        const seven = try f.appendInst(else_b, u32_t, .{ .iconst = 7 });
+        const result = try f.appendBlockParam(join, u32_t);
+
+        try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+        try f.setJump(then_b, join, &.{scaled});
+        try f.setJump(else_b, join, &.{seven});
+
+        const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        try f.appendStore(join, result, at);
+        f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+
+        var data: [8]u32 = @splat(0xFFFF_FFFF);
+        try runOnce(words, &data, 0, 1);
+        for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+            const want: u32 = if (flag == 1) @intCast(i * 10) else 7;
+            try std.testing.expectEqual(want, data[i]);
+        }
+    }
+}
+
+test "a divergent loop whose step is on the back edge counts up by a different stride per lane" {
+    // `acc = 0; while (acc < 10) acc += lane + 1;`, then `out[lane] = acc`. The step is in the
+    // block the back edge goes through, so the values that go round are defined THERE and not in
+    // the header. That is the `while` shape, and the rotation moves the step up into the header
+    // under the test, which is where it has to be for the freezing select to see it.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const header = try f.appendBlock();
+    const mid = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const step = try f.appendArithImm(entry, u32_t, .add, tid, 1);
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const ten = try f.appendInst(entry, u32_t, .{ .iconst = 10 });
+    try f.setJump(entry, header, &.{zero});
+
+    const acc = try f.appendBlockParam(header, u32_t);
+    const more = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = acc, .rhs = ten } });
+    try f.appendIf(header, more, .{ .target = mid }, .{ .target = exit, .args = &.{acc} });
+
+    // The step happens on the back edge, which is what makes this shape different.
+    const bumped = try f.appendInst(mid, u32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = step } });
+    try f.setJump(mid, header, &.{bumped});
+
+    const total = try f.appendBlockParam(exit, u32_t);
+    const offset = try f.appendArithImm(exit, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(exit, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(exit, total, at);
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [8]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    // Lane `l` steps by `l + 1` and stops at or above ten, so it stops at the first multiple of
+    // its stride that reaches ten. Lanes 0 and 1 land ON ten, lanes 2 and 3 overshoot to twelve,
+    // and each keeps the value it had when it stopped rather than the last lane's.
+    try std.testing.expectEqual(@as(u32, 10), data[0]);
+    try std.testing.expectEqual(@as(u32, 10), data[1]);
+    try std.testing.expectEqual(@as(u32, 12), data[2]);
+    try std.testing.expectEqual(@as(u32, 12), data[3]);
+}
+
+test "a uniform term multiplied by three keeps its own multiply and the lane still runs contiguous" {
+    // `w[a * 3 + lane] = lane`, where `a` is warp uniform. The lane steps one word, so the access
+    // is a run, and the rebuild scales the uniform part by the ELEMENT SIZE only: `a * 3` is
+    // already a value, so nothing has to multiply by twelve. Every scale the rebuild emits is a
+    // shift, which is what lets a core leave a wide multiply out and still address memory.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const a = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const three = try f.appendInst(entry, u32_t, .{ .iconst = 3 });
+    const row = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = three } });
+    const index = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .add, .lhs = row, .rhs = tid } });
+    const four = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const offset = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = index, .rhs = four } });
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, tid, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countAccesses(words, 0b00));
+    // One multiply, the kernel's own `a * 3`. The rebuild adds none.
+    var multiplies: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b0110011) continue;
+        if (w >> 25 != 0b0000001) continue;
+        if ((w >> 12) & 0b111 != 0) continue;
+        multiplies += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), multiplies);
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [16]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..data.len) |i| {
+        const lane = @as(i64, @intCast(i)) - 3;
+        const inside = lane >= 0 and lane < glacier.encode.Profile.@"gc1.n".lanes();
+        try std.testing.expectEqual(if (inside) @as(u32, @intCast(lane)) else sentinel, data[i]);
+    }
+}
+
+test "a load under a divergent branch reads nothing in the lanes that did not choose it" {
+    // `out[lane] = (lane < 2) ? data[lane * 1024] : 0`. The address for lanes 2 and 3 is far
+    // outside the buffer, so an unmasked read FAULTS in the model rather than returning a value
+    // nobody looks at. That is the only way to see the mask on a read: the value an inactive lane
+    // loads is thrown away by the select either way, so a value test cannot tell.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+
+    // Lane 0 reads word 0 and lane 1 word 1024, which is past the eight words the run is given.
+    const far = try f.appendArithImm(then_b, u32_t, .shl, tid, 12);
+    const at = try f.appendInst(then_b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = far } });
+    const got = try f.appendInst(then_b, u32_t, .{ .load = .{ .ptr = at } });
+    const picked = try f.appendBlockParam(join, u32_t);
+
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = join, .args = &.{zero} });
+    try f.setJump(then_b, join, &.{got});
+
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const out = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, picked, out);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One predicated gather, vm clear, and no branch left.
+    var masked_loads: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b0000111) continue;
+        try std.testing.expectEqual(@as(u32, 0), (w >> 25) & 1);
+        masked_loads += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), masked_loads);
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011);
+        try std.testing.expect(w & 0x7F != 0b1101111);
+    }
+
+    // 2048 words covers lane 1's read at word 1024 and leaves lanes 2 and 3 pointing past the end.
+    var data: [2048]u32 = @splat(0);
+    data[0] = 11;
+    data[1024] = 22;
+    try runOnce(words, &data, 0, 1);
+    const want = [_]u32{ 11, 22, 0, 0 };
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(want[i], data[i]);
+    }
+}
+
+test "a divergent loop whose body reads memory sums a different run in each lane" {
+    // `acc = 0; i = 0; do { acc += data[i]; i += 1 } while (i <= lane); out[lane] = acc`
+    //
+    // Lane 0 reads one word and lane 3 reads four, so the lanes leave at different times with a
+    // LOAD in the body, which was refused before masked loads existed.
+    //
+    // The mask on that load has no observable effect HERE, and it is worth saying why rather than
+    // implying the test covers it. A finished lane has its index frozen, so it re-reads an address
+    // next to where it stopped, which is in range and whose value the freeze throws away. The mask
+    // matters when the frozen address comes from memory ANOTHER LANE WRITES, which needs a store
+    // in the same loop and is not this test.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    try f.setJump(entry, loop, &.{ zero, zero });
+
+    const acc = try f.appendBlockParam(loop, u32_t);
+    const index = try f.appendBlockParam(loop, u32_t);
+    const offset = try f.appendArithImm(loop, u32_t, .shl, index, 2);
+    const at = try f.appendInst(loop, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const word = try f.appendInst(loop, u32_t, .{ .load = .{ .ptr = at } });
+    const acc_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = word } });
+    const index_next = try f.appendArithImm(loop, u32_t, .add, index, 1);
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .le, .lhs = index_next, .rhs = tid } });
+    try f.appendIf(
+        loop,
+        more,
+        .{ .target = loop, .args = &.{ acc_next, index_next } },
+        .{ .target = exit, .args = &.{acc_next} },
+    );
+
+    const total = try f.appendBlockParam(exit, u32_t);
+    const out_off = try f.appendArithImm(exit, u32_t, .shl, tid, 2);
+    const out_at = try f.appendInst(exit, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = out_off } });
+    try f.appendStore(exit, total, out_at);
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var masked_loads: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b0000111) continue;
+        try std.testing.expectEqual(@as(u32, 0), (w >> 25) & 1);
+        masked_loads += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), masked_loads);
+
+    // The input words are read before the output overwrites them, lane by lane: lane 3 reads
+    // words 0 to 3 and every lane writes its own word, so the inputs have to be read first.
+    var data: [8]u32 = @splat(0);
+    for (0..8) |i| data[i] = @intCast(i + 1);
+    try runOnce(words, &data, 0, 1);
+    const want = [_]u32{ 1, 3, 6, 10 };
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(want[i], data[i]);
+    }
+}
+
+test "a masked load whose mask is the same in every lane is refused" {
+    // The mirror of the masked store rule: every lane agreeing means the answer is a branch over
+    // the load, not a predicate on it. Only hand-written IR says this.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const always = try f.appendInst(entry, bool_t, .{ .iconst = 1 });
+    // The ADDRESS is per-lane, so the result is per-lane and the only thing wrong with this load
+    // is its mask. A uniform address would be refused for its result instead, which would leave
+    // this rule untested.
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const got = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at, .mask = always } });
+    try f.appendStore(entry, got, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a mask nothing else reads is still kept alive for its load" {
+    // A masked load whose mask has NO OTHER READER. In everything the compiler builds itself the
+    // mask is shared: if-conversion gives the same condition to the arm's selects, and a loop
+    // gives the same active mask to every access and freeze. So a use count or a live range that
+    // forgot a load's mask would go unnoticed, and this is the shape that notices.
+    //
+    // Lanes 2 and 3 address far outside the buffer, so the mask is what keeps the run from
+    // faulting, and lanes 0 and 1 holding the right words is what says the mask was the condition
+    // rather than whatever the register happened to contain.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const far = try f.appendArithImm(entry, u32_t, .shl, tid, 12);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = far } });
+    const got = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at, .mask = cond } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const out = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, got, out);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    var data: [2048]u32 = @splat(0);
+    data[0] = 11;
+    data[1024] = 22;
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 11), data[0]);
+    try std.testing.expectEqual(@as(u32, 22), data[1]);
+}
+
+test "a kernel parameter comes from the launch argument the host wrote" {
+    // `out[lane] = arg0 + arg1 * lane`, where arg0 and arg1 are KERNEL PARAMETERS. Nothing about
+    // them is in the instruction stream: the host writes them before the strobe and the kernel
+    // reads 0xFC1 and 0xFC2. That is what lets a buffer be bound without a rebuild.
+    //
+    // Both arguments are read, with different values, so a lowering that confused the two or read
+    // one CSR twice gives the wrong answer rather than a plausible one.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    // The builtin sits BETWEEN the two parameters, so the argument number counts only the
+    // parameters and skips it, the same rule `gpu.abi.layoutParams` uses.
+    const arg0 = try f.appendBlockParam(entry, u32_t);
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const arg1 = try f.appendBlockParam(entry, u32_t);
+
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const scaled = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = arg1, .rhs = tid } });
+    const value = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .add, .lhs = arg0, .rhs = scaled } });
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, value, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // Two CSR reads of the launch arguments, 0xFC1 and 0xFC2, and in that order.
+    var seen: std.ArrayList(u32) = .empty;
+    defer seen.deinit(allocator);
+    for (words) |w| {
+        if (w & 0x7F != 0b1110011) continue;
+        if ((w >> 12) & 0b111 != 2) continue;
+        const csr = w >> 20;
+        if (csr < 0xFC1 or csr > 0xFC8) continue;
+        try seen.append(allocator, csr);
+    }
+    try std.testing.expectEqualSlices(u32, &.{ 0xFC1, 0xFC2 }, seen.items);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    var args: [8]u32 = @splat(0);
+    args[0] = 100;
+    args[1] = 7;
+    try runOnceWithArgs(words, &data, 0, 1, args);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(100 + 7 * i)), data[i]);
+    }
+}
+
+test "an unused kernel parameter does not shift the ones after it" {
+    // `out[lane] = arg1`, with arg0 declared and never read. The host still wrote it to 0xFC1, so
+    // arg1 is 0xFC2 whatever the kernel does with arg0. Numbering by the parameters the ALLOCATOR
+    // gave a register to would renumber the host's arguments behind its back.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    _ = try f.appendBlockParam(entry, u32_t); // arg0, never read
+    const arg1 = try f.appendBlockParam(entry, u32_t);
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, arg1, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var seen: std.ArrayList(u32) = .empty;
+    defer seen.deinit(allocator);
+    for (words) |w| {
+        if (w & 0x7F != 0b1110011) continue;
+        if ((w >> 12) & 0b111 != 2) continue;
+        const csr = w >> 20;
+        if (csr < 0xFC1 or csr > 0xFC8) continue;
+        try seen.append(allocator, csr);
+    }
+    // Only the one that is read is emitted, and it is the SECOND argument.
+    try std.testing.expectEqualSlices(u32, &.{0xFC2}, seen.items);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    var args: [8]u32 = @splat(0);
+    args[0] = 11;
+    args[1] = 22;
+    try runOnceWithArgs(words, &data, 0, 1, args);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, 22), data[i]);
+    }
+}
+
+test "a refusal names the construct and where it is" {
+    // The shape that cost a session four compiles: a divergent branch whose arms the lowering
+    // cannot flatten. `error.Unsupported` on its own says nothing about whose fault it is, so the
+    // refusal carries the phrase, the opcode and the position.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    // An atomic in the arm: not in the pure set, so if-conversion leaves the branch alone.
+    try f.appendAtomicRmwStmt(then_b, .{
+        .op = .add,
+        .ptr = base,
+        .value = two,
+        .ordering = .relaxed,
+        .scope = .device,
+    });
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = join });
+    try f.setJump(then_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{};
+    try std.testing.expectError(
+        error.Unsupported,
+        glacier.isel.compileKernelExplained(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+        }, &why),
+    );
+    try std.testing.expectEqualStrings(
+        "a branch on a per-lane condition that if-conversion could not flatten",
+        why.reason,
+    );
+    try std.testing.expectEqualStrings("if", why.opcode);
+    // The branch is in the entry block, which the caller numbered 0 and the passes before
+    // admission do not renumber.
+    try std.testing.expectEqual(@as(u32, 0), why.block);
+}
+
+test "a refusal about the whole function carries no position" {
+    // A kernel that returns a value is wrong before any instruction is looked at, so there is no
+    // block to point at and the fields say so rather than naming block zero.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const entry = try f.appendBlock();
+    const n = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.one(n) });
+
+    var why: glacier.isel.Refusal = .{};
+    try std.testing.expectError(
+        error.Unsupported,
+        glacier.isel.compileKernelExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+    );
+    try std.testing.expectEqualStrings(
+        "a kernel that returns a value, which has no caller to return it to",
+        why.reason,
+    );
+    try std.testing.expectEqual(glacier.isel.Refusal.unknown, why.block);
+}
+
+test "a kernel that compiles leaves the refusal empty" {
+    // The struct is only written on a refusal, so a caller that prints it unconditionally prints
+    // nothing rather than a stale reason from a kernel that was fine.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(entry, tid, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{ .reason = "stale" };
+    const words = try glacier.isel.compileKernelExplained(allocator, &f, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "data", .address = data_base }},
+    }, &why);
+    defer allocator.free(words);
+    try std.testing.expectEqualStrings("", why.reason);
+}
+
+test "a chain of divergent else ifs flattens into one block" {
+    // `out[lane] = lane < 1 ? 10 : lane < 2 ? 20 : lane < 3 ? 30 : 40`, written as a CHAIN: the
+    // else arm of each test holds the next test. No two arms rejoin immediately and the block
+    // they all end at has four predecessors, which is why a diamond-only if-conversion refused
+    // the shape a real rasteriser writes.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const t1 = try f.appendBlock();
+    const test2 = try f.appendBlock();
+    const t2 = try f.appendBlock();
+    const test3 = try f.appendBlock();
+    const t3 = try f.appendBlock();
+    const t4 = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const three = try f.appendInst(entry, u32_t, .{ .iconst = 3 });
+    const c1 = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = one } });
+    try f.appendIf(entry, c1, .{ .target = t1 }, .{ .target = test2 });
+
+    const v10 = try f.appendInst(t1, u32_t, .{ .iconst = 10 });
+    try f.setJump(t1, join, &.{v10});
+
+    const c2 = try f.appendInst(test2, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(test2, c2, .{ .target = t2 }, .{ .target = test3 });
+    const v20 = try f.appendInst(t2, u32_t, .{ .iconst = 20 });
+    try f.setJump(t2, join, &.{v20});
+
+    const c3 = try f.appendInst(test3, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = three } });
+    try f.appendIf(test3, c3, .{ .target = t3 }, .{ .target = t4 });
+    const v30 = try f.appendInst(t3, u32_t, .{ .iconst = 30 });
+    try f.setJump(t3, join, &.{v30});
+    const v40 = try f.appendInst(t4, u32_t, .{ .iconst = 40 });
+    try f.setJump(t4, join, &.{v40});
+
+    const picked = try f.appendBlockParam(join, u32_t);
+    const offset = try f.appendArithImm(join, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(join, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(join, picked, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // Eight blocks became one: nothing branches and nothing jumps.
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1100011);
+        try std.testing.expect(w & 0x7F != 0b1101111);
+    }
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    const want = [_]u32{ 10, 20, 30, 40 };
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(want[i], data[i]);
+    }
+}
+
+test "a loop whose body branches leaves at different times in each lane" {
+    // `acc = 0; i = 0; do { acc += ((i + lane) & 1) == 0 ? 1 : 100; i += 1 } while (i <= lane)`
+    //
+    // The body holds a branch and the branch is PER LANE, so the loop has a multi-block body that
+    // if-conversion has to flatten before the per-lane exit can apply. That chain is what the
+    // rasteriser's span loop needs.
+    //
+    // The condition has to involve the lane. A branch on the loop index alone is warp-uniform, so
+    // if-conversion leaves it as a branch, correctly, and the body stays several blocks.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const header = try f.appendBlock();
+    const even = try f.appendBlock();
+    const odd = try f.appendBlock();
+    const tail = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    try f.setJump(entry, header, &.{ zero, zero });
+
+    const acc = try f.appendBlockParam(header, u32_t);
+    const index = try f.appendBlockParam(header, u32_t);
+    const sum = try f.appendInst(header, u32_t, .{ .arith = .{ .op = .add, .lhs = index, .rhs = tid } });
+    const low = try f.appendArithImm(header, u32_t, .bit_and, sum, 1);
+    const is_even = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .eq, .lhs = low, .rhs = zero } });
+    try f.appendIf(header, is_even, .{ .target = even }, .{ .target = odd });
+
+    const small = try f.appendInst(even, u32_t, .{ .iconst = 1 });
+    try f.setJump(even, tail, &.{small});
+    const big = try f.appendInst(odd, u32_t, .{ .iconst = 100 });
+    try f.setJump(odd, tail, &.{big});
+
+    const step = try f.appendBlockParam(tail, u32_t);
+    const acc_next = try f.appendInst(tail, u32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = step } });
+    const index_next = try f.appendArithImm(tail, u32_t, .add, index, 1);
+    const more = try f.appendInst(tail, bool_t, .{ .icmp = .{ .op = .le, .lhs = index_next, .rhs = tid } });
+    try f.appendIf(
+        tail,
+        more,
+        .{ .target = header, .args = &.{ acc_next, index_next } },
+        .{ .target = exit, .args = &.{acc_next} },
+    );
+
+    const total = try f.appendBlockParam(exit, u32_t);
+    const out_off = try f.appendArithImm(exit, u32_t, .shl, tid, 2);
+    const out_at = try f.appendInst(exit, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = out_off } });
+    try f.appendStore(exit, total, out_at);
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // The loop is still a loop, so one backward jump stays, and the lane count reduction is what
+    // it branches on.
+    var reductions: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0b111 != 0b010) continue;
+        if (w >> 26 != 0b010000) continue;
+        if ((w >> 15) & 0x1F != 16) continue;
+        reductions += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), reductions);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    // Lane j runs j+1 iterations, adding 1 on even indices and 100 on odd ones.
+    const want = [_]u32{ 1, 101, 102, 202 };
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(want[i], data[i]);
+    }
+}
+
+test "a per-lane guard around a loop becomes the mask the loop starts with" {
+    // `x = lane; if (x <= 2) { do { data[x] = 0x77; x += 4 } while (x <= 2) }`
+    //
+    // This is a span fill written as a guarded do-while, which is the shape a rasteriser wants: a
+    // run can be SHORTER than the warp is wide, so a lane past the end must not store even once.
+    // The guard is a per-lane branch whose arm holds a LOOP, which if-conversion must not flatten,
+    // so instead the guard's condition becomes the mask the loop's first iteration runs under and
+    // the branch goes away. A lane that fails it enters inactive and stores nothing.
+    //
+    // Lane 3 fails the guard. Word 3 staying untouched is the whole assertion: a lowering that
+    // entered every lane would write it on the first iteration.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const done = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const limit = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const colour = try f.appendInst(entry, u32_t, .{ .iconst = 0x77 });
+    const step = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const guard = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .le, .lhs = tid, .rhs = limit } });
+    try f.appendIf(entry, guard, .{ .target = loop, .args = &.{tid} }, .{ .target = done });
+
+    const x = try f.appendBlockParam(loop, u32_t);
+    const offset = try f.appendArithImm(loop, u32_t, .shl, x, 2);
+    const at = try f.appendInst(loop, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(loop, colour, at);
+    const x_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = step } });
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .le, .lhs = x_next, .rhs = limit } });
+    try f.appendIf(loop, more, .{ .target = loop, .args = &.{x_next} }, .{ .target = done });
+    f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One reduction for the loop, and the guard's branch is gone: the only conditional left is the
+    // one the lane count feeds.
+    var branches: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1100011) branches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), branches);
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    for (0..data.len) |i| {
+        const want: u32 = if (i <= 2) 0x77 else sentinel;
+        try std.testing.expectEqual(want, data[i]);
+    }
+}
+
+test "a guard whose other side carries a value of its own selects it at the exit" {
+    // `if (x <= 2) { do { x += 4 } while (x <= 2) } else { x = 7 }`, then `out[lane] = x`. The two
+    // ways out of the guard reach the same block with DIFFERENT values. The guard still becomes
+    // the loop's mask, and a lane that failed it leaves the loop carrying the value ITS side of
+    // the guard had: it ran no iteration, so the loop's value belongs to another lane.
+    //
+    // The two arrivals look alike after critical-edge splitting, which puts an empty block on each
+    // edge, and what tells them apart is the argument those blocks pass. Reading past it without
+    // the select is a wrong answer for every lane the guard turned away.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const done = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const limit = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const seven = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    const step = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const guard = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .le, .lhs = tid, .rhs = limit } });
+    try f.appendIf(entry, guard, .{ .target = loop, .args = &.{tid} }, .{ .target = done, .args = &.{seven} });
+
+    const x = try f.appendBlockParam(loop, u32_t);
+    const x_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = step } });
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .le, .lhs = x_next, .rhs = limit } });
+    try f.appendIf(loop, more, .{ .target = loop, .args = &.{x_next} }, .{ .target = done, .args = &.{x_next} });
+
+    const arrived = try f.appendBlockParam(done, u32_t);
+    const offset = try f.appendArithImm(done, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(done, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(done, arrived, at);
+    f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // The guard's branch is gone, so the loop's own reduction is the only conditional left.
+    var branches: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1100011) branches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), branches);
+
+    const sentinel: u32 = 0x1234_5678;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    // Lanes 0 to 2 enter and leave after one pass with `lane + 4`. Lane 3 failed the guard and
+    // keeps the 7 its own edge carried.
+    try std.testing.expectEqual(@as(u32, 4), data[0]);
+    try std.testing.expectEqual(@as(u32, 5), data[1]);
+    try std.testing.expectEqual(@as(u32, 6), data[2]);
+    try std.testing.expectEqual(@as(u32, 7), data[3]);
+    for (4..data.len) |i| try std.testing.expectEqual(sentinel, data[i]);
+}
+
+test "a store in the block the loop leaves by runs for the lanes the guard admitted" {
+    // The same shape with a STORE in the block the loop leaves by. Dropping the guard sends a lane
+    // that failed it through that block, so the store takes the guard as its mask and that lane
+    // makes no access. The arithmetic around it is left alone: it reads a value from an iteration
+    // the lane never ran, and the select on the way out throws the answer away.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const mid = try f.appendBlock();
+    const done = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const limit = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const seven = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    const step = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const guard = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .le, .lhs = tid, .rhs = limit } });
+    try f.appendIf(entry, guard, .{ .target = loop, .args = &.{tid} }, .{ .target = done, .args = &.{seven} });
+
+    const x = try f.appendBlockParam(loop, u32_t);
+    const x_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = step } });
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .le, .lhs = x_next, .rhs = limit } });
+    try f.appendIf(loop, more, .{ .target = loop, .args = &.{x_next} }, .{ .target = mid, .args = &.{x_next} });
+
+    const left = try f.appendBlockParam(mid, u32_t);
+    // EIGHT WORDS UP, so this store has words of its own. At the lane's own index it would land
+    // where the merge store lands and be overwritten, and the absence this test is about would be
+    // invisible.
+    const slot = try f.appendArithImm(mid, u32_t, .add, left, 8);
+    const mid_at = try f.appendInst(mid, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(mid, u32_t, .shl, slot, 2),
+    } });
+    try f.appendStore(mid, left, mid_at);
+    try f.setJump(mid, done, &.{left});
+
+    const arrived = try f.appendBlockParam(done, u32_t);
+    const offset = try f.appendArithImm(done, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(done, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(done, arrived, at);
+    f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    const sentinel: u32 = 0x1234_5678;
+    var data: [16]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    // Lanes 0 to 2 leave the loop with `lane + 4`, which the merge writes at the lane's own index
+    // and the block the loop leaves by writes eight words up. Lane 3 failed the guard: it carries
+    // the 7 its own edge gave it, and its FROZEN loop value is the 3 it entered with, so an
+    // unmasked store in that block would put a 3 at word 11. That word is the claim.
+    const want = [16]u32{
+        4,        5,        6,        7,
+        sentinel, sentinel, sentinel, sentinel,
+        sentinel, sentinel, sentinel, sentinel,
+        4,        5,        6,        sentinel,
+    };
+    for (want, 0..) |w, i| try std.testing.expectEqual(w, data[i]);
+}
+
+test "a guard stays when the block the loop leaves by holds an atomic" {
+    // The same shape again, with an ATOMIC in the block the loop leaves by. A lane that failed the
+    // guard reaches that block once the guard is a mask, and an atomic takes no mask to stop it, so
+    // the guard cannot be absorbed and the per-lane branch has nowhere to go.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const mid = try f.appendBlock();
+    const done = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const limit = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const seven = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    const step = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const guard = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .le, .lhs = tid, .rhs = limit } });
+    try f.appendIf(entry, guard, .{ .target = loop, .args = &.{tid} }, .{ .target = done, .args = &.{seven} });
+
+    const x = try f.appendBlockParam(loop, u32_t);
+    const x_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = step } });
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .le, .lhs = x_next, .rhs = limit } });
+    try f.appendIf(loop, more, .{ .target = loop, .args = &.{x_next} }, .{ .target = mid, .args = &.{x_next} });
+
+    const left = try f.appendBlockParam(mid, u32_t);
+    try f.appendAtomicRmwStmt(mid, .{
+        .op = .add,
+        .ptr = base,
+        .value = left,
+        .ordering = .relaxed,
+        .scope = .device,
+    });
+    try f.setJump(mid, done, &.{left});
+
+    const arrived = try f.appendBlockParam(done, u32_t);
+    const offset = try f.appendArithImm(done, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(done, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(done, arrived, at);
+    f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(error.Unsupported, compile(allocator, &f));
+}
+
+test "a per-lane float divide runs on the lanes and rounds to nearest even" {
+    // `out[lane] = (lane + 1) / 3`, in f32, per lane. The opcode check is what says the lanes did
+    // the work, because the two dividers give the same quotient and no value can tell them apart.
+    // The bits are checked as well, against the exact IEEE words: 1/3 and 2/3 are both inexact, so
+    // they catch a divider that rounded any other way.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    // The numerator is LOADED rather than converted from the lane index: an integer to f32
+    // convert is not something this core does, so building one here would refuse for a reason
+    // that has nothing to do with the divide.
+    const numerator = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const three = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+    const quotient = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = numerator, .rhs = three } });
+    const as_word = try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = quotient } });
+    try f.appendStore(entry, as_word, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    // One `vfdiv.vv`, funct6 100000 in the OPFVV form, and no scalar `fdiv.s` anywhere.
+    var lane_divides: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0b111 != 0b001) continue;
+        if (w >> 26 != 0b100000) continue;
+        lane_divides += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), lane_divides);
+    for (words) |w| {
+        try std.testing.expect(w & 0x7F != 0b1010011); // no OP-FP, so no scalar divide
+    }
+
+    var data: [8]u32 = @splat(0);
+    for (0..8) |i| data[i] = @bitCast(@as(f32, @floatFromInt(i + 1)));
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const want: f32 = @as(f32, @floatFromInt(i + 1)) / 3.0;
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), data[i]);
+    }
+    // Written out, so a change of rounding anywhere under this has to be read rather than
+    // recomputed by the same expression that produced it.
+    try std.testing.expectEqual(@as(u32, 0x3EAAAAAB), data[0]);
+    try std.testing.expectEqual(@as(u32, 0x3F2AAAAB), data[1]);
+}
+
+test "one kernel can hold both dividers" {
+    // `out[lane] = (lane + 1) / 3` per lane and `out[4] = 1 / 3` once for the warp, so the lowering
+    // selects BOTH dividers in one function. The two give the same quotient, so only the opcodes
+    // say which ran, and both quotients are checked because a kernel that mixes them is where a
+    // wrong selection would be easiest to miss.
+    //
+    // The core has these on separate issue gates and each blocks all issue while it holds a
+    // result. Whether they interact is an OPEN question on the hardware side, so the stream this
+    // emits is the one to run there before a kernel relies on the pair.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const three = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
+
+    const numerator = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+    const per_lane = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = numerator, .rhs = three } });
+    try f.appendStore(entry, try f.appendInst(entry, u32_t, .{
+        .unary = .{ .op = .reinterpret, .value = per_lane },
+    }), at);
+
+    const one = try f.appendInst(entry, f32_t, .{ .fconst = 1.0 });
+    const uniform = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .div, .lhs = one, .rhs = three } });
+    const tail = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendInst(entry, u32_t, .{ .iconst = 16 }),
+    } });
+    try f.appendStore(entry, try f.appendInst(entry, u32_t, .{
+        .unary = .{ .op = .reinterpret, .value = uniform },
+    }), tail);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var scalar: usize = 0;
+    var vector: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1010011) scalar += 1;
+        if (w & 0x7F == 0b1010111 and (w >> 12) & 0b111 == 0b001 and w >> 26 == 0b100000) vector += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), scalar);
+    try std.testing.expectEqual(@as(usize, 1), vector);
+
+    var data: [8]u32 = @splat(0);
+    for (0..8) |i| data[i] = @bitCast(@as(f32, @floatFromInt(i + 1)));
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const want: f32 = @as(f32, @floatFromInt(i + 1)) / 3.0;
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), data[i]);
+    }
+    try std.testing.expectEqual(@as(u32, 0x3EAAAAAB), data[4]);
+}
+
+test "a while loop whose body holds an atomic keeps its branch" {
+    // `while (i < lane) { atomic_add(data, 1); i += 1 }`, in the test-at-the-top shape a SPIR-V
+    // producer emits. The rotation would move the body into the header, where it runs for every
+    // lane on every pass, and an atomic takes no mask to stop that. So the branch stays, and a
+    // per-lane branch is a refusal.
+    //
+    // Hoisting it would not fail anywhere later: the counter would simply come out too high.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const header = try f.appendBlock();
+    const body = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    try f.setJump(entry, header, &.{zero});
+
+    const i = try f.appendBlockParam(header, u32_t);
+    const more = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = tid } });
+    try f.appendIf(header, more, .{ .target = body }, .{ .target = exit });
+
+    try f.appendAtomicRmwStmt(body, .{
+        .op = .add,
+        .ptr = base,
+        .value = one,
+        .ordering = .relaxed,
+        .scope = .device,
+    });
+    const next = try f.appendInst(body, u32_t, .{ .arith = .{ .op = .add, .lhs = i, .rhs = one } });
+    try f.setJump(body, header, &.{next});
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{};
+    try std.testing.expectError(
+        error.Unsupported,
+        glacier.isel.compileKernelExplained(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+        }, &why),
+    );
+    try std.testing.expectEqualStrings(
+        "a branch on a per-lane condition that if-conversion could not flatten",
+        why.reason,
+    );
+    try std.testing.expectEqualStrings("if", why.opcode);
+}
+
+test "a value the body computes and the exit reads keeps the iteration the lane finished on" {
+    // `x = 0; do { y = x + x; x += lane + 1 } while (x < 10); out[lane] = y`
+    //
+    // `y` is computed in the BODY and read after the loop, which is the shape a frontend emits
+    // whenever a loop's working value outlives it. The loop runs until the last lane is done, and
+    // a lane that finished earlier has its parameters frozen, so the body goes on recomputing `y`
+    // from them and lands one iteration past the one that lane ran. Reading `y` directly would
+    // give that. The conversion gives it a slot of its own instead.
+    //
+    // Each lane steps by `lane + 1` and stops at or above ten, so `y` is twice the `x` it had on
+    // its last pass: lanes 0 and 2 stop with x = 9, lanes 1 and 3 with x = 8.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const loop = try f.appendBlock();
+    const latch = try f.appendBlock();
+    const exit = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const step = try f.appendArithImm(entry, u32_t, .add, tid, 1);
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const ten = try f.appendInst(entry, u32_t, .{ .iconst = 10 });
+    try f.setJump(entry, loop, &.{zero});
+
+    const x = try f.appendBlockParam(loop, u32_t);
+    const y = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
+    const x_next = try f.appendInst(loop, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = step } });
+    const more = try f.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x_next, .rhs = ten } });
+    try f.appendIf(loop, more, .{ .target = latch }, .{ .target = exit });
+    try f.setJump(latch, loop, &.{x_next});
+
+    const offset = try f.appendArithImm(exit, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(exit, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    try f.appendStore(exit, y, at);
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [8]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 18), data[0]);
+    try std.testing.expectEqual(@as(u32, 16), data[1]);
+    try std.testing.expectEqual(@as(u32, 18), data[2]);
+    try std.testing.expectEqual(@as(u32, 16), data[3]);
+}
+
+test "a warp-uniform loop inside a divergent one still writes only for the lanes that are going" {
+    // `r = 0; while (r <= lane) { c = 0; do { out[lane * 8 + c] = r; c += 1 } while (c < 2); r += 1 }`
+    //
+    // The inner loop's bound is a CONSTANT, so it runs the same count in every lane and gets no
+    // mask of its own: it keeps its branch and nothing converts it. Its store still belongs to the
+    // lanes the outer test admitted, so the outer conversion masks the inner loop's blocks along
+    // with the rest of its body. Without that, a lane that has finished the outer loop keeps
+    // storing with the counter it was frozen at, one pass too high.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const outer = try f.appendBlock();
+    const pre = try f.appendBlock();
+    const inner = try f.appendBlock();
+    const ilatch = try f.appendBlock();
+    const tail = try f.appendBlock();
+    const done = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const lane_base = try f.appendArithImm(entry, u32_t, .shl, tid, 3);
+    try f.setJump(entry, outer, &.{zero});
+
+    const r = try f.appendBlockParam(outer, u32_t);
+    const going = try f.appendInst(outer, bool_t, .{ .icmp = .{ .op = .le, .lhs = r, .rhs = tid } });
+    try f.appendIf(outer, going, .{ .target = pre }, .{ .target = done });
+    try f.setJump(pre, inner, &.{zero});
+
+    const c = try f.appendBlockParam(inner, u32_t);
+    const slot = try f.appendInst(inner, u32_t, .{ .arith = .{ .op = .add, .lhs = lane_base, .rhs = c } });
+    const at = try f.appendInst(inner, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(inner, u32_t, .shl, slot, 2),
+    } });
+    try f.appendStore(inner, r, at);
+    const c_next = try f.appendInst(inner, u32_t, .{ .arith = .{ .op = .add, .lhs = c, .rhs = one } });
+    const more = try f.appendInst(inner, bool_t, .{ .icmp = .{ .op = .lt, .lhs = c_next, .rhs = two } });
+    try f.appendIf(inner, more, .{ .target = ilatch }, .{ .target = tail });
+    try f.setJump(ilatch, inner, &.{c_next});
+
+    const r_next = try f.appendInst(tail, u32_t, .{ .arith = .{ .op = .add, .lhs = r, .rhs = one } });
+    try f.setJump(tail, outer, &.{r_next});
+    f.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    const sentinel: u32 = 0x1234_5678;
+    var data: [32]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    // Each lane's two words hold the LAST outer pass it took part in, which is its own lane index.
+    for (0..4) |l| {
+        try std.testing.expectEqual(@as(u32, @intCast(l)), data[l * 8]);
+        try std.testing.expectEqual(@as(u32, @intCast(l)), data[l * 8 + 1]);
+        for (2..8) |k| try std.testing.expectEqual(sentinel, data[l * 8 + k]);
+    }
+}
+
+test "a warp-uniform test inside a per-lane branch reaches the mask" {
+    // `if (lane < 2) { out[lane] = (flag == 7) ? 1 : 2 }`, where `flag` is loaded from one address
+    // and is therefore the same in every lane. The predicate for each arm is the per-lane mask
+    // ANDed with that test, and a mask op reads one BIT per lane where a warp-uniform bool is a 0
+    // or a 1 in a scalar register. So the test is rebuilt per lane, which is the same answer in
+    // every lane and arrives as a real mask.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const arm = try f.appendBlock();
+    const one_b = try f.appendBlock();
+    const two_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const seven = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const flag_at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendInst(entry, u32_t, .{ .iconst = 32 }),
+    } });
+    const flag = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = flag_at } });
+    const uniform = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = flag, .rhs = seven } });
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+    const mine = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(entry, mine, .{ .target = arm }, .{ .target = join });
+    try f.appendIf(arm, uniform, .{ .target = one_b }, .{ .target = two_b });
+    try f.appendStore(one_b, one, at);
+    try f.setJump(one_b, join, &.{});
+    try f.appendStore(two_b, two, at);
+    try f.setJump(two_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    const sentinel: u32 = 0x1234_5678;
+    var data: [9]u32 = @splat(sentinel);
+    data[8] = 7;
+    try runOnce(words, &data, 0, 1);
+    // Lanes 0 and 1 take the arm and the uniform test sends both to the same side. Lanes 2 and 3
+    // run every instruction of both sides and write nothing.
+    try std.testing.expectEqual(@as(u32, 1), data[0]);
+    try std.testing.expectEqual(@as(u32, 1), data[1]);
+    for (2..8) |i| try std.testing.expectEqual(sentinel, data[i]);
+}
+
+test "a per-lane branch on a NOT takes both sides" {
+    // `if (!(lane < 2)) out[lane] = 10 else out[lane] = 20`, with the NOT as the `b ^ 1` a frontend
+    // writes. Flattening needs the complement of the branch's condition for the far side, and the
+    // complement of a NOT is free: it is what the NOT negates. Without that the condition has no
+    // complement to find and the branch is refused.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const high = try f.appendBlock();
+    const low = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const ten = try f.appendInst(entry, u32_t, .{ .iconst = 10 });
+    const twenty = try f.appendInst(entry, u32_t, .{ .iconst = 20 });
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+    const small = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const not_small = try f.appendArithImm(entry, bool_t, .bit_xor, small, 1);
+    try f.appendIf(entry, not_small, .{ .target = high }, .{ .target = low });
+
+    try f.appendStore(high, ten, at);
+    try f.setJump(high, join, &.{});
+    try f.appendStore(low, twenty, at);
+    try f.setJump(low, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    // ONE `vmnand.mm` and no `vmxor.mm`: a NOT of a mask is that one instruction against the same
+    // source twice, where xoring against an all-ones mask would be two instructions and would need
+    // the all-ones mask to live in a register of its own.
+    var nands: usize = 0;
+    var xors: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F != 0b1010111) continue;
+        if ((w >> 12) & 0b111 != 0b010) continue;
+        switch (w >> 26) {
+            0b011101 => nands += 1,
+            0b011011 => xors += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), nands);
+    try std.testing.expectEqual(@as(usize, 0), xors);
+
+    var data: [8]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 20), data[0]);
+    try std.testing.expectEqual(@as(u32, 20), data[1]);
+    try std.testing.expectEqual(@as(u32, 10), data[2]);
+    try std.testing.expectEqual(@as(u32, 10), data[3]);
+}
+
+test "a per-lane branch between two identical arrivals becomes a jump" {
+    // Both arms of the per-lane branch are empty and reach the same block with the same values, so
+    // the branch decides nothing. An optimizer leaves this shape behind after it empties the arms.
+    // The block they meet at has a third predecessor, so there is no region to flatten and the
+    // branch has to go instead.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const pre = try f.appendBlock();
+    const arm_a = try f.appendBlock();
+    const arm_b = try f.appendBlock();
+    const other = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const seven = try f.appendInst(entry, u32_t, .{ .iconst = 7 });
+    const flag_at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendInst(entry, u32_t, .{ .iconst = 32 }),
+    } });
+    const flag = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = flag_at } });
+    const uniform = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = flag, .rhs = seven } });
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+    const mine = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(entry, uniform, .{ .target = pre }, .{ .target = other });
+
+    try f.appendIf(pre, mine, .{ .target = arm_a }, .{ .target = arm_b });
+    try f.setJump(arm_a, join, &.{});
+    try f.setJump(arm_b, join, &.{});
+    try f.setJump(other, join, &.{});
+
+    const ten = try f.appendInst(join, u32_t, .{ .iconst = 10 });
+    const out = try f.appendInst(join, u32_t, .{ .arith = .{ .op = .mul, .lhs = tid, .rhs = ten } });
+    try f.appendStore(join, out, at);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [9]u32 = @splat(0);
+    data[8] = 7;
+    try runOnce(words, &data, 0, 1);
+    for (0..4) |i| try std.testing.expectEqual(@as(u32, @intCast(i * 10)), data[i]);
+}
+
+test "a per-lane value that waits in the scratch region comes back per lane" {
+    // Twenty-eight live per-lane values and the lane index and the address make more than the core
+    // has vector registers, so the allocator puts one in the scratch region and reads it back. The
+    // sum consumes them in reverse, which makes the first value the one with the farthest use. A
+    // reload that kept only the first element would give every lane lane zero's answer.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+
+    var vals: [28]ir.function.Value = undefined;
+    for (&vals, 1..) |*v, k| v.* = try f.appendArithImm(entry, u32_t, .add, tid, @intCast(k));
+    var sum = vals[vals.len - 1];
+    for (1..vals.len) |i| {
+        sum = try f.appendInst(entry, u32_t, .{ .arith = .{
+            .op = .add,
+            .lhs = sum,
+            .rhs = vals[vals.len - 1 - i],
+        } });
+    }
+    try f.appendStore(entry, sum, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    // A whole vector register goes out and comes back, addressed from the scalar scratch, which is
+    // what tells these apart from the kernel's own store.
+    var spill_stores: usize = 0;
+    var reloads: usize = 0;
+    for (words) |w| {
+        if ((w >> 15) & 0x1F != 31) continue;
+        if (w & 0x7F == 0b0100111) spill_stores += 1;
+        if (w & 0x7F == 0b0000111) reloads += 1;
+    }
+    try std.testing.expect(spill_stores > 0);
+    try std.testing.expect(reloads > 0);
+
+    // The words past the output stand in for the hart scratch region, so a spill that walked out
+    // of its slice would land in the output rather than pass unseen.
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [8 + scratch_words]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    for (0..4) |i| {
+        const want: u32 = @intCast(28 * i + 406);
+        try std.testing.expectEqual(want, data[i]);
+    }
+}
+
+test "two masked stores under one predicate install the mask once" {
+    // `if (lane < 2) { out[lane] = 1; out[lane + 4] = 2; }`. Both stores read the predicate from
+    // v0, which only the install writes, and a mask never changes after it is computed. So the
+    // second install is dead.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const arm = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const off = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = off } });
+    const far = try f.appendArithImm(entry, ptr_t, .add, at, 16);
+    const mine = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    try f.appendIf(entry, mine, .{ .target = arm }, .{ .target = join });
+
+    try f.appendStore(arm, one, at);
+    try f.appendStore(arm, two, far);
+    try f.setJump(arm, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    var installs: usize = 0;
+    var masked_stores: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b1010111 and (w >> 12) & 7 == 2 and w >> 26 == 0b011001 and (w >> 7) & 0x1F == 0) {
+            installs += 1;
+        }
+        if (w & 0x7F == 0b0100111 and (w >> 25) & 1 == 0) masked_stores += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), masked_stores);
+    try std.testing.expectEqual(@as(usize, 1), installs);
+
+    const sentinel: u32 = 0x5555_5555;
+    var data: [8]u32 = @splat(sentinel);
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 1), data[0]);
+    try std.testing.expectEqual(@as(u32, 1), data[1]);
+    try std.testing.expectEqual(sentinel, data[2]);
+    try std.testing.expectEqual(sentinel, data[3]);
+    try std.testing.expectEqual(@as(u32, 2), data[4]);
+    try std.testing.expectEqual(@as(u32, 2), data[5]);
+    try std.testing.expectEqual(sentinel, data[6]);
+    try std.testing.expectEqual(sentinel, data[7]);
+}
+
+test "constants that spill are re-emitted and still add up" {
+    // Forty constants, each read twice, with the first pass reading them in reverse so the one
+    // defined first lives longest. Far more than the core has registers, so most of them spill.
+    // A narrow constant is re-emitted at the read instead of stored and loaded back, and three
+    // wide ones keep their slots, so both paths run in one kernel.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, i32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .block_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+
+    var nums: [40]i64 = undefined;
+    for (&nums, 0..) |*n, k| n.* = @as(i64, @intCast(k)) * 7 + 1;
+    nums[37] = 0x12345;
+    nums[38] = 0x7FFFF;
+    nums[39] = -70000;
+
+    var vals: [nums.len]ir.function.Value = undefined;
+    for (&vals, nums) |*v, n| v.* = try f.appendInst(entry, i32_t, .{ .iconst = n });
+
+    var sum = try f.appendInst(entry, i32_t, .{ .iconst = 0 });
+    var want: i64 = 0;
+    for (0..vals.len) |i| {
+        const k = vals.len - 1 - i;
+        sum = try f.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = vals[k] } });
+        want += nums[k];
+    }
+    for (vals, nums) |v, n| {
+        sum = try f.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = v } });
+        want += n;
+    }
+    try f.appendStore(entry, sum, base);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    // The kernel spills, and a narrow constant is no longer part of that traffic: what is left
+    // belongs to the three wide ones and to the running sum.
+    var spill_stores: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b0100011 and (w >> 15) & 0x1F == 2) spill_stores += 1;
+    }
+    // `addi rd, x0, imm` is a narrow constant. More of them than there are constants means they
+    // are re-emitted at the read rather than materialised once and spilled.
+    var narrow: usize = 0;
+    for (words) |w| {
+        if (w & 0x7F == 0b0010011 and (w >> 12) & 7 == 0 and (w >> 15) & 0x1F == 0) narrow += 1;
+    }
+    try std.testing.expect(narrow > vals.len);
+    // What spilling is left belongs to the three wide constants and the running sum.
+    try std.testing.expect(spill_stores > 0);
+    try std.testing.expect(spill_stores < 10);
+
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [8 + scratch_words]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(i32, @intCast(want)))), data[0]);
+}
+
+test "constants arriving on one edge of a wide join keep the parameters' slots" {
+    // Thirty-two parameters on one join, which is more than the core has registers, so some of
+    // them have to live in spill slots. One predecessor passes CONSTANTS and the other passes
+    // loaded values. A slot belongs to the PARAMETER and not to the constant that arrives in it,
+    // so the write has to happen: dropping it leaves the join reading a slot nothing wrote.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const from_const = try f.appendBlock();
+    const from_load = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const warp_id = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, warp_id, .block_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const out = try f.appendArithImm(entry, ptr_t, .add, base, 128);
+
+    const count = 32;
+    var loads: [count]ir.function.Value = undefined;
+    for (&loads, 0..) |*v, k| {
+        const at = try f.appendArithImm(entry, ptr_t, .add, base, @intCast(k * 4));
+        v.* = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at } });
+    }
+    const pick_at = try f.appendArithImm(entry, ptr_t, .add, base, 140);
+    const pick = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = pick_at } });
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    const take = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = pick, .rhs = one } });
+    try f.appendIf(entry, take, .{ .target = from_const }, .{ .target = from_load });
+
+    var consts: [count]ir.function.Value = undefined;
+    var want: u32 = 0;
+    for (&consts, 0..) |*c, k| {
+        const n: i64 = @intCast(100 + k);
+        c.* = try f.appendInst(from_const, u32_t, .{ .iconst = n });
+        want += @intCast(n);
+    }
+    try f.setJump(from_const, join, &consts);
+    try f.setJump(from_load, join, &loads);
+
+    var params: [count]ir.function.Value = undefined;
+    for (&params) |*p| p.* = try f.appendBlockParam(join, u32_t);
+    var sum = try f.appendInst(join, u32_t, .{ .iconst = 0 });
+    for (params) |p| {
+        sum = try f.appendInst(join, u32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = p } });
+    }
+    try f.appendStore(join, sum, out);
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [40 + scratch_words]u32 = @splat(0);
+    for (0..count) |k| data[k] = @intCast(1000 + k);
+    data[35] = 1; // take the constant side
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(want, data[32]);
+}
+
+test "lanes of a workgroup share one window in the hart's scratch" {
+    // Every lane writes its own slot of a four-word workgroup array, then every lane reads SLOT
+    // ZERO, which is the same address in every lane. So each lane ends with what lane zero wrote,
+    // which is only true if the window is shared between them.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+    const shared_t = try f.types.intern(.{ .ptr = .shared });
+    const tile_t = try f.types.intern(.{ .array = .{ .len = 4, .elem = u32_t } });
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const tile = try f.appendInst(entry, shared_t, .{ .alloca = .{ .elem = tile_t } });
+
+    // tile[lane] = lane * 10 + 1
+    const mine = try f.appendInst(entry, shared_t, .{ .arith = .{
+        .op = .add,
+        .lhs = tile,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+    const ten = try f.appendInst(entry, u32_t, .{ .iconst = 10 });
+    const scaled = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = tid, .rhs = ten } });
+    try f.appendStore(entry, try f.appendArithImm(entry, u32_t, .add, scaled, 1), mine);
+
+    // data[lane] = tile[0], the same address in every lane.
+    const seen = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = tile } });
+    const out = try f.appendInst(entry, ptr_t, .{ .arith = .{
+        .op = .add,
+        .lhs = base,
+        .rhs = try f.appendArithImm(entry, u32_t, .shl, tid, 2),
+    } });
+    try f.appendStore(entry, seen, out);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [8 + scratch_words]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    // Every lane read what lane zero wrote.
+    for (0..4) |i| try std.testing.expectEqual(@as(u32, 1), data[i]);
+    // The window is the TOP of the hart's slice, so the four slots are the last four words of it,
+    // and each holds its own lane's value.
+    const top = data.len;
+    for (0..4) |i| {
+        const want: u32 = @intCast(i * 10 + 1);
+        try std.testing.expectEqual(want, data[top - 4 + i]);
+    }
+}
+
+test "a workgroup object larger than the scratch region is refused by the number" {
+    // Four kilobytes of workgroup memory on a hart that owns two. The refusal names both numbers,
+    // because "too large" without them leaves the author guessing how much to cut.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+    const shared_t = try f.types.intern(.{ .ptr = .shared });
+    const tile_t = try f.types.intern(.{ .array = .{ .len = 1024, .elem = u32_t } });
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const tile = try f.appendInst(entry, shared_t, .{ .alloca = .{ .elem = tile_t } });
+    try f.appendStore(entry, tid, tile);
+    try f.appendStore(entry, try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = tile } }), base);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{};
+    const out = glacier.isel.compileKernelExplained(allocator, &f, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "data", .address = data_base }},
+    }, &why);
+    try std.testing.expectError(error.Unsupported, out);
+    try std.testing.expectEqual(@as(u32, 4096), why.wanted);
+    try std.testing.expectEqual(@as(u32, 2048), why.limit);
+}
+
+test "a kernel faults when the hart's scratch slice is smaller than it was built for" {
+    // The slots and the window are placed against the PROFILE's region size, which this compiler
+    // mirrors from the SoC's configuration. A core whose slice is smaller would have the kernel
+    // writing into the hart underneath it, so the prologue reads `scratchsize` and faults instead.
+    const allocator = std.testing.allocator;
+    const count = 40; // above the 29 allocatable registers, so it spills
+
+    var f = try buildSumKernel(allocator, count);
+    defer f.deinit();
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [count + 1 + scratch_words]u32 = @splat(0);
+    for (0..count) |i| data[i] = @intCast(i * 7 + 1);
+
+    const stride = glacier.encode.Profile.@"gc1.n".scratchBytes();
+    const scratch_base = data_base + (count + 1) * 4;
+    var mem: warp.Memory = .{
+        .base = data_base,
+        .words = &data,
+        .scratch = .{ .base = scratch_base, .stride = stride, .harts = 1 },
+    };
+    var one: warp.Warp = .{
+        .hart_id = 0,
+        .hart_count = 1,
+        .lanes = glacier.encode.Profile.@"gc1.n".lanes(),
+        .stack_top = scratch_base + stride,
+        // A core that reserved sixteen bytes a hart, which is nothing like enough for forty slots.
+        .scratch_bytes = 16,
+    };
+    try std.testing.expectError(error.Fault, warp.run(words, &mem, &one, budget));
+    try std.testing.expectEqual(@as(u32, glacier.encode.fault_scratch_too_small), one.fault_code);
+
+    // The output is untouched: the kernel faulted before it stored anything.
+    try std.testing.expectEqual(@as(u32, 0), data[count]);
+
+    // And the same kernel on a core with the region it was built for runs to the right answer.
+    var want: u32 = 0;
+    for (0..count) |i| want +%= data[i];
+    one = .{
+        .hart_id = 0,
+        .hart_count = 1,
+        .lanes = glacier.encode.Profile.@"gc1.n".lanes(),
+        .stack_top = scratch_base + stride,
+        .scratch_bytes = stride,
+    };
+    _ = try warp.run(words, &mem, &one, budget);
+    try std.testing.expectEqual(want, data[count]);
+}
+
+test "the warp model decodes every word this backend can emit" {
+    // The fault retire was EMITTED for a week and executed never: the model reached its opcode,
+    // failed the CSR test beside it and called the word illegal, so a feature looked present at
+    // both ends while being exercised at neither. This closes that gap by construction rather than
+    // by remembering: every encoder the selector can reach is listed here, and the model must
+    // decode each one.
+    //
+    // The operands are deliberately dull. This asks whether the model KNOWS the word, not whether
+    // it computes the right answer, which the kernels above are for.
+    const rv = glacier.encode.rv;
+    const words = [_]u32{
+        // RV32I, the scalar half.
+        rv.add(.x5, .x6, .x7),                                       rv.addi(.x5, .x6, 4),                                    rv.and_(.x5, .x6, .x7),
+        rv.andi(.x5, .x6, 3),                                        rv.or_(.x5, .x6, .x7),                                   rv.ori(.x5, .x6, 3),
+        rv.xor_(.x5, .x6, .x7),                                      rv.xori(.x5, .x6, 3),                                    rv.sub(.x5, .x6, .x7),
+        rv.sll(.x5, .x6, .x7),                                       rv.slli(.x5, .x6, 3),                                    rv.srl(.x5, .x6, .x7),
+        rv.srli(.x5, .x6, 3),                                        rv.sra(.x5, .x6, .x7),                                   rv.srai(.x5, .x6, 3),
+        rv.slt(.x5, .x6, .x7),                                       rv.sltu(.x5, .x6, .x7),                                  rv.sltiu(.x5, .x6, 3),
+        rv.lw(.x5, .x10, 0),                                         rv.sw(.x6, .x10, 0),
+        // RV32M.
+                                            rv.mul(.x5, .x6, .x7),
+        rv.mulh(.x5, .x6, .x7),                                      rv.mulhu(.x5, .x6, .x7),                                 rv.div(.x5, .x6, .x7),
+        rv.divu(.x5, .x6, .x7),                                      rv.rem(.x5, .x6, .x7),                                   rv.remu(.x5, .x6, .x7),
+        // Control transfer. A branch of zero and a jump of four both land on the next word.
+        rv.beq(.x5, .x6, 4),                                         rv.bge(.x5, .x6, 4),                                     rv.jal(.x0, 4),
+        // The CSRs and both retires. `ecall` is the fault and carries its code in a register.
+        glacier.encode.csrr(.x5, glacier.encode.Csr.mhartid),        glacier.encode.csrr(.x5, glacier.encode.Csr.hart_count), glacier.encode.csrr(.x5, glacier.encode.Csr.workgroup_id),
+        glacier.encode.csrr(.x5, glacier.encode.Csr.grid_dim),       glacier.encode.csrr(.x5, glacier.encode.Csr.mscratch),   glacier.encode.csrr(.x5, glacier.encode.Csr.scratchsize),
+        glacier.encode.csrr(.x5, glacier.encode.Csr.launchArg(0).?),
+        // The atomics.
+        rv.amo(.add, .x5, .x10, .x6, false, false),              rv.amo(.swap, .x5, .x10, .x6, true, true),
+        // Vector integer arithmetic.
+        rv.vadd_vv(.v1, .v2, .v3),                                   rv.vadd_vx(.v1, .v2, .x6),                               rv.vsub_vv(.v1, .v2, .v3),
+        rv.vmul_vv(.v1, .v2, .v3),                                   rv.vmul_vx(.v1, .v2, .x6),                               rv.vmulh_vv(.v1, .v2, .v3),
+        rv.vmulhu_vv(.v1, .v2, .v3),                                 rv.vdiv_vv(.v1, .v2, .v3),                               rv.vdivu_vv(.v1, .v2, .v3),
+        rv.vrem_vv(.v1, .v2, .v3),                                   rv.vremu_vv(.v1, .v2, .v3),                              rv.vand_vv(.v1, .v2, .v3),
+        rv.vor_vv(.v1, .v2, .v3),                                    rv.vxor_vv(.v1, .v2, .v3),                               rv.vsll_vv(.v1, .v2, .v3),
+        rv.vsll_vx(.v1, .v2, .x6),                                   rv.vsll_vi(.v1, .v2, 3),                                 rv.vsrl_vv(.v1, .v2, .v3),
+        rv.vsrl_vi(.v1, .v2, 3),                                     rv.vsra_vv(.v1, .v2, .v3),                               rv.vsra_vi(.v1, .v2, 3),
+        // Vector moves, the lane index and the lane-zero extract.
+        rv.vmv_v_v(.v1, .v2),                                        rv.vmv_v_x(.v1, .x6),                                    rv.vmv_x_s(.x5, .v2),
+        rv.vid_v(.v1),                                               rv.vmerge_vvm(.v1, .v2, .v3),
+        // Masks: the compares that make them, the logic over them, and the reduction out of one.
+                                   rv.vmseq_vv(.v1, .v2, .v3),
+        rv.vmseq_vx(.v1, .v2, .x6),                                  rv.vmsne_vv(.v1, .v2, .v3),                              rv.vmslt_vv(.v1, .v2, .v3),
+        rv.vmsltu_vv(.v1, .v2, .v3),                                 rv.vmsle_vv(.v1, .v2, .v3),                              rv.vmsleu_vv(.v1, .v2, .v3),
+        rv.vmand_mm(.v1, .v2, .v3),                                  rv.vmor_mm(.v1, .v2, .v3),                               rv.vmxor_mm(.v1, .v2, .v3),
+        rv.vmnand_mm(.v1, .v2, .v3),                                 rv.vcpop_m(.x5, .v2),
+        // Floats: the arithmetic, the compares and the converts.
+                                           rv.vfadd_vv(.v1, .v2, .v3),
+        rv.vfsub_vv(.v1, .v2, .v3),                                  rv.vfmul_vv(.v1, .v2, .v3),                              rv.vfdiv_vv(.v1, .v2, .v3),
+        rv.vfwmacc_vv(.v1, .v2, .v3),                                rv.vmfeq_vv(.v1, .v2, .v3),                              rv.vmflt_vv(.v1, .v2, .v3),
+        rv.vmfle_vv(.v1, .v2, .v3),                                  rv.vfcvt_f_x_v(.v1, .v2),                                rv.vfcvt_rtz_xu_f_v(.v1, .v2),
+        rv.vfncvt_f_f_w(.v1, .v2),                                   rv.vfwcvt_f_f_v(.v1, .v2),                               rv.vfwcvt_f_x_v(.v1, .v2),
+        rv.vfwcvt_f_xu_v(.v1, .v2),
+        // The cross-warp barrier, which is a CONSTANT word and not an encoder call: the grep that
+        // collected this list saw `rv.` calls and missed it, and the model did not decode it. A
+        // word reachable without a function call is exactly what an audit of calls cannot see.
+                                         glacier.encode.warp_barrier,
+            // Memory, per lane: unit stride and gather or scatter, masked and not.
+                                    rv.vle32(.v1, .x10),
+        rv.vle32_m(.v1, .x10),                                       rv.vse32(.v1, .x10),                                     rv.vse32_m(.v1, .x10),
+        rv.vluxei32(.v1, .x0, .v4),                                  rv.vluxei32_m(.v1, .x0, .v4),                            rv.vsuxei32(.v1, .x0, .v4),
+        rv.vsuxei32_m(.v1, .x0, .v4),
+    };
+
+    for (words, 0..) |w, i| {
+        var data: [64]u32 = @splat(0);
+        var mem: warp.Memory = .{ .base = data_base, .words = &data };
+        var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+        // A base address for the loads and stores, and an in-range per-lane offset for a gather.
+        one.x[10] = data_base + 16;
+        one.v[4] = @splat(data_base + 32);
+        // v0 predicates, so a masked op with it clear would skip every lane and prove nothing.
+        one.v[0] = @splat(0xFFFF_FFFF);
+        const program = [_]u32{ w, glacier.encode.ebreak };
+        _ = warp.run(&program, &mem, &one, 8) catch |e| {
+            std.debug.print("word {d} of {d}, {x:0>8}, was not decoded: {any}\n", .{ i, words.len, w, e });
+            return e;
+        };
+    }
+
+    // The fault retire, which is the one this test exists for. It is NOT in the list above because
+    // it ends the run rather than falling through to the `ebreak`.
+    {
+        var data: [64]u32 = @splat(0);
+        var mem: warp.Memory = .{ .base = data_base, .words = &data };
+        var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+        const program = [_]u32{
+            rv.addi(.x31, .x0, glacier.encode.fault_compiler_bug),
+            glacier.encode.ecall(.x31),
+            glacier.encode.ebreak,
+        };
+        try std.testing.expectError(error.Fault, warp.run(&program, &mem, &one, 8));
+        try std.testing.expectEqual(@as(u32, glacier.encode.fault_compiler_bug), one.fault_code);
+    }
+}
+
+test "the model charges a memory access what the caller says it costs" {
+    // The step count is instructions, which is low on what removing a memory access is worth. A
+    // caller that knows the stall can read a cost out of the same run instead.
+    const allocator = std.testing.allocator;
+    var f = try buildSumKernel(allocator, 8);
+    defer f.deinit();
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+
+    const scratch_words = comptime glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    var data: [8 + 1 + scratch_words]u32 = @splat(0);
+    for (0..8) |i| data[i] = @intCast(i + 1);
+
+    const stride = glacier.encode.Profile.@"gc1.n".scratchBytes();
+    const scratch_base = data_base + 9 * 4;
+    var mem: warp.Memory = .{
+        .base = data_base,
+        .words = &data,
+        .scratch = .{ .base = scratch_base, .stride = stride, .harts = 1 },
+    };
+    var free: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .stack_top = scratch_base + stride, .scratch_bytes = stride };
+    const steps = try warp.run(words, &mem, &free, budget);
+    // With the default of zero, a cycle IS a step.
+    try std.testing.expectEqual(@as(u64, steps), free.cycles);
+
+    var charged: warp.Warp = .{
+        .hart_id = 0,
+        .hart_count = 1,
+        .stack_top = scratch_base + stride,
+        .scratch_bytes = stride,
+        .stall_cycles = 51,
+    };
+    _ = try warp.run(words, &mem, &charged, budget);
+    // Eight loads and the store it writes, so nine accesses at fifty-one apiece and nothing else
+    // moves.
+    try std.testing.expectEqual(free.cycles + 9 * 51, charged.cycles);
+}
+
+test "a barrier widened to the core emits the warp barrier and a narrower one emits nothing" {
+    // The warps of a core are separate instruction streams and do drift apart, so a barrier over
+    // them is a real instruction. The lanes of ONE warp share a stream and have nothing to wait
+    // for, so a workgroup barrier is still no instruction at all.
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |widen| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+
+        const entry = try f.appendBlock();
+        const warp_id = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, warp_id, .block_id_x);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        try f.appendStore(entry, warp_id, base);
+        const bar = try f.appendStmtRaw(entry, .{ .barrier = .{ .scope = .workgroup } });
+        if (widen) {
+            try gpu.attrs.setClusterBarrier(&f, bar);
+            try gpu.attrs.setClusterBarriers(&f, 1);
+        }
+        try f.appendStore(entry, try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = base } }), base);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const words = try compile(allocator, &f);
+        defer allocator.free(words);
+        var bars: usize = 0;
+        for (words) |w| {
+            if (w == glacier.encode.warp_barrier) bars += 1;
+        }
+        try std.testing.expectEqual(@as(usize, if (widen) 1 else 0), bars);
+    }
+}
+
+test "a core-wide barrier a pass dropped is refused by the count the kernel declared" {
+    // The width rides on an INSTRUCTION attribute, which a pass that clones or rebuilds the
+    // instruction can drop, and the narrower barrier it would leave behind is no instruction at
+    // all here. The count stands in for the attribute surviving. Declaring two with one present
+    // is the same arithmetic a lost attribute produces.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const warp_id = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, warp_id, .block_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    try f.appendStore(entry, warp_id, base);
+    const bar = try f.appendStmtRaw(entry, .{ .barrier = .{ .scope = .workgroup } });
+    try gpu.attrs.setClusterBarrier(&f, bar);
+    try gpu.attrs.setClusterBarriers(&f, 2);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{};
+    const out = glacier.isel.compileKernelExplained(allocator, &f, .{
+        .profile = .@"gc1.n",
+        .globals = &.{.{ .name = "data", .address = data_base }},
+    }, &why);
+    try std.testing.expectError(error.Unsupported, out);
+    try std.testing.expectEqual(@as(u32, 1), why.wanted);
+    try std.testing.expectEqual(@as(u32, 2), why.limit);
+}
+
+test "nothing a kernel emits addresses at or above the stack pointer" {
+    // `mscratch` is ONE PAST the top of the hart's slice, so every address a kernel forms from it
+    // must be strictly below it. The top warp of a core has nothing above its slice: an access at
+    // or above its stack pointer leaves the scratch region entirely, and for every other warp the
+    // same access lands in the NEXT WARP'S SLICE and corrupts it with nothing to report. A frame
+    // that grew upward, or an offset that reached the window size rather than stopping short of
+    // it, would do it, so the invariant is pinned here rather than left to reading.
+    const allocator = std.testing.allocator;
+
+    // Three kernels that use the region three ways: scalar slots, per-lane slots, and a workgroup
+    // window above the slots.
+    var scalar = try buildSumKernel(allocator, 40);
+    defer scalar.deinit();
+
+    var lanes = Function.init(allocator);
+    defer lanes.deinit();
+    {
+        const u32_t = try lanes.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try lanes.types.ptrGlobal();
+        const entry = try lanes.appendBlock();
+        const tid = try lanes.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&lanes, tid, .thread_id_x);
+        const base = try lanes.appendGlobalAddr(entry, ptr_t, "data");
+        const at = try lanes.appendInst(entry, ptr_t, .{ .arith = .{
+            .op = .add,
+            .lhs = base,
+            .rhs = try lanes.appendArithImm(entry, u32_t, .shl, tid, 2),
+        } });
+        var vals: [28]ir.function.Value = undefined;
+        for (&vals, 1..) |*v, k| v.* = try lanes.appendArithImm(entry, u32_t, .add, tid, @intCast(k));
+        var sum = vals[vals.len - 1];
+        for (1..vals.len) |i| {
+            sum = try lanes.appendInst(entry, u32_t, .{ .arith = .{
+                .op = .add,
+                .lhs = sum,
+                .rhs = vals[vals.len - 1 - i],
+            } });
+        }
+        try lanes.appendStore(entry, sum, at);
+        lanes.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    }
+
+    var window = Function.init(allocator);
+    defer window.deinit();
+    {
+        const u32_t = try window.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try window.types.ptrGlobal();
+        const shared_t = try window.types.intern(.{ .ptr = .shared });
+        const tile_t = try window.types.intern(.{ .array = .{ .len = 64, .elem = u32_t } });
+        const entry = try window.appendBlock();
+        const tid = try window.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&window, tid, .thread_id_x);
+        const base = try window.appendGlobalAddr(entry, ptr_t, "data");
+        const tile = try window.appendInst(entry, shared_t, .{ .alloca = .{ .elem = tile_t } });
+        // The LAST word of the window, which is the one closest to the stack pointer.
+        const last = try window.appendArithImm(entry, shared_t, .add, tile, 63 * 4);
+        try window.appendStore(entry, tid, last);
+        try window.appendStore(entry, try window.appendInst(entry, u32_t, .{ .load = .{ .ptr = last } }), base);
+        window.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    }
+
+    for ([_]*Function{ &scalar, &lanes, &window }) |f| {
+        const words = try compile(allocator, f);
+        defer allocator.free(words);
+        var touched: usize = 0;
+        var deepest: i32 = 0;
+        for (words) |w| {
+            const op = w & 0x7F;
+            const rs1 = (w >> 15) & 0x1F;
+            const rs2 = (w >> 20) & 0x1F;
+            const f3 = (w >> 12) & 0x7;
+            const sp_reg = @as(u32, @backingInt(glacier.encode.Reg.x2));
+            // An immediate form reads its base from rs1: a load, a store, or the `addi` that forms
+            // a per-lane slot or a workgroup address.
+            const imm: ?i32 = switch (op) {
+                0b0000011 => @as(i32, @bitCast(w)) >> 20,
+                0b0100011 => (@as(i32, @bitCast(w & 0xFE00_0000)) >> 20) | @as(i32, @intCast((w >> 7) & 0x1F)),
+                0b0010011 => if (f3 == 0) @as(i32, @bitCast(w)) >> 20 else null,
+                else => null,
+            };
+            if (imm) |off| {
+                if (rs1 != sp_reg) continue;
+                touched += 1;
+                try std.testing.expect(off < 0);
+                if (off < deepest) deepest = off;
+                continue;
+            }
+            // Anything else that reads the stack pointer would form an address this cannot bound,
+            // so the kernel must not do it at all: a register-plus-register address, an atomic, a
+            // per-lane access based on it directly.
+            const reads_sp = switch (op) {
+                0b0110011, 0b0101111, 0b0100111, 0b0000111 => rs1 == sp_reg or rs2 == sp_reg,
+                else => false,
+            };
+            try std.testing.expect(!reads_sp);
+        }
+        // The kernel really does use the region, or the test proves nothing.
+        try std.testing.expect(touched > 0);
+        try std.testing.expect(deepest >= -@as(i32, @intCast(glacier.encode.Profile.@"gc1.n".scratchBytes())));
+    }
+}
+
+test "a scale by a power of two is a shift and not a multiply" {
+    // An indexed access reaches the IR as a multiply by the element size, and this core HAS a
+    // multiplier, so nothing downstream was obliged to notice: every address computation went
+    // through it. A shift is cheaper on any core, and it keeps address arithmetic out of a unit
+    // whose answer is wider than the register that holds it.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const warp_id = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, warp_id, .block_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    // `base[warp * 4]`, written the way a frontend writes it: a multiply by the element size with
+    // the size as a separate constant, not an immediate.
+    const four = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+    const scaled = try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = warp_id, .rhs = four } });
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = scaled } });
+    try f.appendStore(entry, warp_id, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var multiplies: usize = 0;
+    var shifts: usize = 0;
+    for (words) |w| {
+        // RV32M MUL is funct7 1 with funct3 0 on the register-register opcode.
+        if (w & 0x7F == 0b0110011 and w >> 25 == 1 and (w >> 12) & 7 == 0) multiplies += 1;
+        if (w & 0x7F == 0b0010011 and (w >> 12) & 7 == 1) shifts += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), multiplies);
+    try std.testing.expectEqual(@as(usize, 1), shifts);
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 2, 4);
+    try std.testing.expectEqual(@as(u32, 2), data[2]);
+}
+
+test "a program longer than the aperture is refused by the number" {
+    // The core holds ONE program and a host uploads it a word at a time, so a program that does
+    // not fit has to be refused at compile time. A fallback to reloading per draw would reappear
+    // as milliseconds of upload inside a frame, which nobody sees until they measure one.
+    const allocator = std.testing.allocator;
+    var f = try buildSumKernel(allocator, 40);
+    defer f.deinit();
+
+    // The real length first, so the thresholds below are not guesses.
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expect(words.len > 8);
+
+    // An aperture one word short of the program refuses and names both numbers.
+    {
+        var why: glacier.isel.Refusal = .{};
+        const out = glacier.isel.compileKernelExplained(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+            .program_words = @intCast(words.len - 1),
+        }, &why);
+        try std.testing.expectError(error.Unsupported, out);
+        try std.testing.expectEqual(@as(u32, @intCast(words.len)), why.wanted);
+        try std.testing.expectEqual(@as(u32, @intCast(words.len - 1)), why.limit);
+    }
+
+    // An aperture exactly the size of the program fits.
+    {
+        const out = try glacier.isel.compileKernel(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+            .program_words = @intCast(words.len),
+        });
+        allocator.free(out);
+    }
+
+    // A SECOND STAGE already resident eats the room, which is the case a single compile cannot
+    // see for itself: the caller composing the pipeline passes the first stage's length.
+    {
+        var why: glacier.isel.Refusal = .{};
+        const out = glacier.isel.compileKernelExplained(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+            .program_words = @intCast(words.len),
+            .resident_words = 1,
+        }, &why);
+        try std.testing.expectError(error.Unsupported, out);
+        try std.testing.expectEqual(@as(u32, @intCast(words.len + 1)), why.wanted);
+        try std.testing.expectEqual(@as(u32, @intCast(words.len)), why.limit);
+    }
+
+    // And the default ceiling passes a kernel of this size, so the check is not firing by accident.
+    {
+        const out = try glacier.isel.compileKernel(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .globals = &.{.{ .name = "data", .address = data_base }},
+        });
+        allocator.free(out);
+    }
+}
+
+/// A fragment stage, which is what tells the rasteriser lowering the function is one.
+fn markFragment(f: *Function) !void {
+    try f.addAttr(.func, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "stage",
+        .value = .{ .string = "fragment" },
+    } });
+}
+
+/// A pointer standing for colour component `component` of the fragment's output.
+fn colourOut(f: *Function, block: ir.function.Block, component: u32) !Value {
+    const ptr_t = try f.types.ptrGlobal();
+    const out = try f.appendInst(block, ptr_t, .{ .iconst = 0 });
+    try f.addAttr(.{ .value = out }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "color_out",
+        .value = .{ .int = component },
+    } });
+    return out;
+}
+
+/// The three corners the rasteriser tests draw, in the vertex output record the vertex stage
+/// writes. The winding puts every edge function at or above zero inside.
+const raster_corners: [3][2]u32 = .{ .{ 0, 0 }, .{ 0, 22 }, .{ 30, 0 } };
+const raster_width = 32;
+const raster_height = 24;
+
+fn writeRasterVertices(data: []u32) void {
+    const stride = glacier.isel.vertex_output_stride / 4;
+    const verts = data[raster_width * raster_height ..];
+    for (raster_corners, 0..) |corner, i| {
+        verts[i * stride + glacier.isel.raster_vertex_x_offset / 4] = corner[0];
+        verts[i * stride + glacier.isel.raster_vertex_y_offset / 4] = corner[1];
+    }
+}
+
+fn rasterArgs(data_len: usize) [8]u32 {
+    _ = data_len;
+    var args: [8]u32 = @splat(0);
+    args[0] = data_base;
+    args[1] = data_base + raster_width * raster_height * 4;
+    args[2] = raster_width;
+    args[3] = raster_height;
+    args[4] = raster_width * 4;
+    return args;
+}
+
+test "the generated rasteriser covers the triangle its vertex buffer names" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    try markFragment(&f);
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const entry = try f.appendBlock();
+    const colour = try f.appendInst(entry, u32_t, .{ .iconst = 0x00FF2020 });
+    const out = try colourOut(&f, entry, 0);
+    try f.appendStore(entry, colour, out);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    const area = raster_width * raster_height;
+    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
+    defer allocator.free(data);
+    @memset(data, 0);
+    writeRasterVertices(data);
+    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+
+    var covered: usize = 0;
+    for (data[0..area]) |pixel| {
+        if (pixel != 0) covered += 1;
+    }
+    // A right triangle with legs of 30 and 22 holds about 350 area, and the corner is the one
+    // pixel the loop is certain to reach first.
+    try std.testing.expectEqual(@as(u32, 0x00FF2020), data[0]);
+    try std.testing.expect(covered > 300 and covered < 400);
+    // Nothing outside the triangle, which also covers a lane running past the end of a row: the
+    // width is not a whole number of warps.
+    for (0..raster_height) |row| {
+        for (0..raster_width) |column| {
+            const inside = column * 22 + row * 30 <= 22 * 30 and column <= 30 and row <= 22;
+            if (!inside) try std.testing.expectEqual(@as(u32, 0), data[row * raster_width + column]);
+        }
+    }
+}
+
+test "the generated rasteriser packs four float colour components and reads the coordinate" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    try markFragment(&f);
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const entry = try f.appendBlock();
+    const coord = try f.appendBlockParam(entry, f32_t);
+    try gpu.attrs.setBuiltin(&f, coord, .frag_coord);
+    try f.addAttr(.{ .value = coord }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "bicomp",
+        .value = .{ .int = 0 },
+    } });
+    // Red is below the range, so the clamp owes a zero rather than whatever a convert makes of a
+    // negative. Green is the coordinate, which saturates one pixel in.
+    const below = try f.appendInst(entry, f32_t, .{ .fconst = -1 });
+    const none = try f.appendInst(entry, f32_t, .{ .fconst = 0 });
+    const full = try f.appendInst(entry, f32_t, .{ .fconst = 1 });
+    for ([4]Value{ below, coord, none, full }, 0..) |component, i| {
+        const out = try colourOut(&f, entry, @intCast(i));
+        try f.appendStore(entry, component, out);
+    }
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    const area = raster_width * raster_height;
+    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
+    defer allocator.free(data);
+    @memset(data, 0);
+    writeRasterVertices(data);
+    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+
+    try std.testing.expectEqual(@as(u32, 0xFF000000), data[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), data[1]);
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), data[5 * raster_width + 3]);
+    try std.testing.expectEqual(@as(u32, 0), data[23 * raster_width + 31]);
+}
+
+test "the rasteriser refuses what it cannot generate, and says what" {
+    const allocator = std.testing.allocator;
+
+    // A body whose first block is a loop header. That block becomes the span, which is already the
+    // header of the warp-step loop, and one block cannot carry two sets of loop parameters.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        try markFragment(&f);
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const entry = try f.appendBlock();
+        const again = try f.appendBlock();
+        const colour = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+        const out = try colourOut(&f, entry, 0);
+        try f.appendStore(entry, colour, out);
+        try f.setJump(entry, again, &.{});
+        try f.setJump(again, entry, &.{});
+        var why: glacier.isel.Refusal = .{};
+        try std.testing.expectError(
+            error.Unsupported,
+            glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, why.reason, "first block is a loop header") != null);
+    }
+
+    // A body that reads an interpolated attribute, which nothing interpolates yet.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        try markFragment(&f);
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const entry = try f.appendBlock();
+        const attribute = try f.appendBlockParam(entry, u32_t);
+        try f.addAttr(.{ .value = attribute }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "attr",
+            .value = .{ .int = 16 },
+        } });
+        const out = try colourOut(&f, entry, 0);
+        try f.appendStore(entry, attribute, out);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+        var why: glacier.isel.Refusal = .{};
+        try std.testing.expectError(
+            error.Unsupported,
+            glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, why.reason, "interpolated attribute") != null);
+    }
+
+    // Three of the four colour components.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        try markFragment(&f);
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const entry = try f.appendBlock();
+        const none = try f.appendInst(entry, f32_t, .{ .fconst = 0 });
+        for (0..3) |i| {
+            const out = try colourOut(&f, entry, @intCast(i));
+            try f.appendStore(entry, none, out);
+        }
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+        var why: glacier.isel.Refusal = .{};
+        try std.testing.expectError(
+            error.Unsupported,
+            glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, why.reason, "a part of a colour") != null);
+    }
+}
+
+test "the vertex and fragment entry points name what they refuse" {
+    const allocator = std.testing.allocator;
+
+    // A Glacier kernel cannot report its own refusal, since `ebreak` retires the warp and looks
+    // like success. So each stage lowering says which stage it wanted, rather than fail bare.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        try markFragment(&f);
+        _ = try f.appendBlock();
+        var why: glacier.isel.Refusal = .{};
+        try std.testing.expectError(
+            error.Unsupported,
+            glacier.isel.compileVertexExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, why.reason, "not a vertex stage") != null);
+    }
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        try f.addAttr(.func, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "stage",
+            .value = .{ .string = "vertex" },
+        } });
+        _ = try f.appendBlock();
+        var why: glacier.isel.Refusal = .{};
+        try std.testing.expectError(
+            error.Unsupported,
+            glacier.isel.compileFragmentExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, why.reason, "not a fragment stage") != null);
+    }
+
+    // A refusal from the instruction half reaches the caller through the stage lowering, which is
+    // where almost every refusal comes from.
+    {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        try markFragment(&f);
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const entry = try f.appendBlock();
+        const wide = try f.appendInst(entry, u32_t, .{ .iconst = 0x1_0000_0000 });
+        const out = try colourOut(&f, entry, 0);
+        try f.appendStore(entry, wide, out);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+        var why: glacier.isel.Refusal = .{};
+        try std.testing.expectError(
+            error.Unsupported,
+            glacier.isel.compileFragmentExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, why.reason, "too wide for a 32-bit register") != null);
+        try std.testing.expectEqualStrings("iconst", why.opcode);
+    }
+}
+
+/// The first generic varying slot, which both stages agree on: a vertex Location writes it and a
+/// fragment Location reads the same number.
+const attr_generic0: u32 = 0x80;
+
+/// A fragment body that reads one interpolated attribute and writes it as the red component.
+fn attributeBody(allocator: std.mem.Allocator) !Function {
+    var f = Function.init(allocator);
+    errdefer f.deinit();
+    try markFragment(&f);
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const entry = try f.appendBlock();
+    const shade = try f.appendBlockParam(entry, f32_t);
+    try f.addAttr(.{ .value = shade }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "attr",
+        .value = .{ .int = attr_generic0 },
+    } });
+    const none = try f.appendInst(entry, f32_t, .{ .fconst = 0 });
+    const full = try f.appendInst(entry, f32_t, .{ .fconst = 1 });
+    for ([4]Value{ shade, none, none, full }, 0..) |component, i| {
+        const out = try colourOut(&f, entry, @intCast(i));
+        try f.appendStore(entry, component, out);
+    }
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    return f;
+}
+
+fn writeRasterAttribute(data: []u32, corners: [3]f32) void {
+    const stride = glacier.isel.vertex_output_stride / 4;
+    const verts = data[raster_width * raster_height ..];
+    for (corners, 0..) |value, i| {
+        verts[i * stride + attr_generic0 / 4] = @bitCast(value);
+    }
+}
+
+test "the generated rasteriser steps an interpolated attribute across the triangle" {
+    const allocator = std.testing.allocator;
+    var f = try attributeBody(allocator);
+    defer f.deinit();
+    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    const area = raster_width * raster_height;
+    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
+    defer allocator.free(data);
+
+    // The same value at all three corners. Both gradients come out zero, so this says the solve
+    // carries the base value through rather than that it interpolates.
+    @memset(data, 0);
+    writeRasterVertices(data);
+    writeRasterAttribute(data, .{ 0.5, 0.5, 0.5 });
+    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+    try std.testing.expectEqual(@as(u32, 0xFF7F0000), data[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF7F0000), data[5 * raster_width + 3]);
+
+    // Zero at the first corner and one at the other two, so the attribute rises along the row and
+    // down the column. The ends are exact and the middle is left to the arithmetic, which is what
+    // a tolerance is for.
+    @memset(data, 0);
+    writeRasterVertices(data);
+    writeRasterAttribute(data, .{ 0, 1, 1 });
+    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), data[0]);
+    var last: u32 = 0;
+    for (0..30) |column| {
+        const red = (data[column] >> 16) & 0xFF;
+        try std.testing.expect(red >= last);
+        last = red;
+    }
+    try std.testing.expect(last >= 240);
+    // The attribute reaches red alone. Nothing bleeds into green or blue.
+    for (0..30) |column| {
+        try std.testing.expectEqual(@as(u32, 0), data[column] & 0x0000FFFF);
+    }
+}
+
+test "the rasteriser refuses more attributes than one loop carries, by the number" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    try markFragment(&f);
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const entry = try f.appendBlock();
+    var sum = try f.appendInst(entry, f32_t, .{ .fconst = 0 });
+    for (0..9) |i| {
+        const varying = try f.appendBlockParam(entry, f32_t);
+        try f.addAttr(.{ .value = varying }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "attr",
+            .value = .{ .int = @intCast(attr_generic0 + i * 4) },
+        } });
+        sum = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = varying } });
+    }
+    const out = try colourOut(&f, entry, 0);
+    try f.appendStore(entry, sum, out);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    var why: glacier.isel.Refusal = .{};
+    try std.testing.expectError(
+        error.Unsupported,
+        glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, why.reason, "more interpolated attributes") != null);
+    try std.testing.expectEqual(@as(u32, 9), why.wanted);
+    try std.testing.expectEqual(@as(u32, 8), why.limit);
+}
+
+test "an integer converts to f32 and not to an f16 sitting in an f32 register" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const ptr_t = try f.types.ptrGlobal();
+    const entry = try f.appendBlock();
+    const lane = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, lane, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .mul, lane, 4);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const unsigned = try f.appendInst(entry, u32_t, .{ .load = .{ .ptr = at } });
+    const signed = try f.appendInst(entry, i32_t, .{ .unary = .{ .op = .reinterpret, .value = unsigned } });
+    const from_unsigned = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = unsigned } });
+    const from_signed = try f.appendInst(entry, f32_t, .{ .convert = .{ .value = signed } });
+    const out_u = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = at, .rhs = try f.appendInst(entry, u32_t, .{ .iconst = 64 }) } });
+    const out_s = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = at, .rhs = try f.appendInst(entry, u32_t, .{ .iconst = 128 }) } });
+    try f.appendStore(entry, from_unsigned, out_u);
+    try f.appendStore(entry, from_signed, out_s);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const code = try compile(allocator, &f);
+    defer allocator.free(code);
+
+    var data: [64]u32 = @splat(0);
+    // 6141 lands in the range where an f16 steps by four, so a convert that wrote f16 bits would
+    // come back as 6140 and as the wrong exponent. A lane index cannot catch that: 0 to 3 are
+    // exact in both formats.
+    data[0] = 6141;
+    data[1] = 0;
+    data[2] = 3;
+    data[3] = @bitCast(@as(i32, -1));
+    try runOnce(code, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 0x45BFE800), data[16]);
+    try std.testing.expectEqual(@as(u32, 0x45BFE800), data[32]);
+    try std.testing.expectEqual(@as(u32, 0), data[17]);
+    try std.testing.expectEqual(@as(u32, 0x40400000), data[18]);
+    // The same word as unsigned and as signed: 4294967295 against -1.
+    try std.testing.expectEqual(@as(u32, 0x4F800000), data[19]);
+    try std.testing.expectEqual(@as(u32, 0xBF800000), data[35]);
+}
+
+/// A fragment body that branches on the coordinate and writes a different colour in each arm. The
+/// branch varies per lane, so the pass that handles every other kernel if-converts it, and each
+/// arm's masked store carries the coverage as well as the arm's own mask.
+fn branchingBody(allocator: std.mem.Allocator, packed_word: bool) !Function {
+    var f = Function.init(allocator);
+    errdefer f.deinit();
+    try markFragment(&f);
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const bool_t = try f.types.intern(.bool);
+    const entry = try f.appendBlock();
+    const near = try f.appendBlock();
+    const far = try f.appendBlock();
+    const coord = try f.appendBlockParam(entry, f32_t);
+    try gpu.attrs.setBuiltin(&f, coord, .frag_coord);
+    try f.addAttr(.{ .value = coord }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "bicomp",
+        .value = .{ .int = 0 },
+    } });
+    const edge = try f.appendInst(entry, f32_t, .{ .fconst = 8 });
+    const left = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = coord, .rhs = edge } });
+    try f.appendIf(entry, left, .{ .target = near }, .{ .target = far });
+    if (packed_word) {
+        for ([2]ir.function.Block{ near, far }, [2]i64{ 0x00FF0000, 0x000000FF }) |block, word| {
+            const colour = try f.appendInst(block, u32_t, .{ .iconst = word });
+            const out = try colourOut(&f, block, 0);
+            try f.appendStore(block, colour, out);
+            f.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+        }
+        return f;
+    }
+    for ([2]ir.function.Block{ near, far }, [2][4]f64{ .{ 1, 0, 0, 1 }, .{ 0, 0, 1, 1 } }) |block, parts| {
+        for (parts, 0..) |part, i| {
+            const component = try f.appendInst(block, f32_t, .{ .fconst = part });
+            const out = try colourOut(&f, block, @intCast(i));
+            try f.appendStore(block, component, out);
+        }
+        f.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+    }
+    return f;
+}
+
+test "the generated rasteriser keeps a fragment body's own branch" {
+    const allocator = std.testing.allocator;
+    const area = raster_width * raster_height;
+    for ([2]bool{ true, false }) |packed_word| {
+        var f = try branchingBody(allocator, packed_word);
+        defer f.deinit();
+        var why: glacier.isel.Refusal = .{};
+        const code = glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why) catch |e| {
+            std.debug.print("REFUSED {any}: {s} on {s} block {d} index {d}\n", .{ e, why.reason, why.opcode, why.block, why.index });
+            return e;
+        };
+        defer allocator.free(code);
+
+        const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
+        defer allocator.free(data);
+        @memset(data, 0);
+        writeRasterVertices(data);
+        try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+
+        const near: u32 = if (packed_word) 0x00FF0000 else 0xFFFF0000;
+        const far: u32 = if (packed_word) 0x000000FF else 0xFF0000FF;
+        // Row 0 runs the whole width of the triangle, so it holds both arms.
+        try std.testing.expectEqual(near, data[0]);
+        try std.testing.expectEqual(near, data[7]);
+        try std.testing.expectEqual(far, data[8]);
+        try std.testing.expectEqual(far, data[30]);
+        // A row further down, where the triangle is narrower, still takes the near arm at its left.
+        try std.testing.expectEqual(near, data[11 * raster_width]);
+        // And nothing outside the triangle takes either.
+        try std.testing.expectEqual(@as(u32, 0), data[23 * raster_width + 31]);
+        try std.testing.expectEqual(@as(u32, 0), data[31]);
+    }
 }

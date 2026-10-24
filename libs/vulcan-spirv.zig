@@ -18,8 +18,11 @@ pub const disassemble = disasm.format;
 pub const disassembleBytes = disasm.formatBytes;
 
 /// Lower the first function of a SPIR-V module (words) to a Vulcan IR function. Caller
-/// owns and must `deinit` the result.
+/// owns and must `deinit` the result. `lowerModuleFor` takes the lowering choices in
+/// `LowerOptions`, which is what a target with no parameter block needs.
 pub const lowerModule = lower.lowerModule;
+pub const lowerModuleFor = lower.lowerModuleFor;
+pub const LowerOptions = lower.Options;
 
 /// Inline every `OpFunctionCall` in a multi-function SPIR-V module into its entry function,
 /// returning a single-function word stream with no calls. Vulkan shaders are non-recursive,

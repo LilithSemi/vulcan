@@ -185,8 +185,17 @@ fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Va
         .convert => |c| .{ .convert = .{ .value = rv(vmap, c.value) } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = rv(vmap, u.value) } },
         .extract => |e| .{ .extract = .{ .aggregate = rv(vmap, e.aggregate), .index = e.index } },
-        .load => |l| .{ .load = .{ .ptr = rv(vmap, l.ptr), .@"volatile" = l.@"volatile" } },
-        .store => |s| .{ .store = .{ .value = rv(vmap, s.value), .ptr = rv(vmap, s.ptr), .@"volatile" = s.@"volatile" } },
+        .load => |l| .{ .load = .{
+            .ptr = rv(vmap, l.ptr),
+            .@"volatile" = l.@"volatile",
+            .mask = if (l.mask) |m| rv(vmap, m) else null,
+        } },
+        .store => |s| .{ .store = .{
+            .value = rv(vmap, s.value),
+            .ptr = rv(vmap, s.ptr),
+            .@"volatile" = s.@"volatile",
+            .mask = if (s.mask) |m| rv(vmap, m) else null,
+        } },
         .prefetch => |p| .{ .prefetch = .{ .ptr = rv(vmap, p.ptr) } },
         .struct_new => |sn| blk: {
             var fields: std.ArrayList(Value) = .empty;
@@ -296,7 +305,9 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
             },
             .store => |s| {
                 // Same reasoning as the `load` arm above: V observable stores must not become one.
-                if (s.@"volatile") return bail(&accesses, allocator);
+                // A masked store cannot be widened either: one vector store writes every element,
+                // and a masked lane writes nothing.
+                if (s.@"volatile" or s.mask != null) return bail(&accesses, allocator);
                 const sa = stridedAddress(func, s.ptr, i_alias) orelse return bail(&accesses, allocator);
                 if (sa.stride != byteSize(func, func.valueType(s.value))) return bail(&accesses, allocator);
                 try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = true });
@@ -443,7 +454,7 @@ fn usesValue(func: *const Function, inst: Inst, v: Value) bool {
         .dequantize_nvfp4, .quantize_nvfp4 => |c| c.value == v or c.block_scale == v or c.global_scale == v,
         .unary => |u| u.value == v,
         .load => |l| l.ptr == v,
-        .store => |s| s.value == v or s.ptr == v,
+        .store => |s| s.value == v or s.ptr == v or s.mask == v,
         .atomic_rmw => |a| a.ptr == v or a.value == v or (a.compare != null and a.compare.? == v),
         .prefetch => |p| p.ptr == v,
         .dot => |d| d.acc == v or d.a == v or d.b == v,

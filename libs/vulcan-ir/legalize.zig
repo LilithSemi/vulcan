@@ -412,10 +412,14 @@ fn applySubst(func: *Function, subst: *const Subst) void {
                 cv.global_scale = sub(subst, cv.global_scale);
             },
             .unary => |*u| u.value = sub(subst, u.value),
-            .load => |*ld| ld.ptr = sub(subst, ld.ptr),
+            .load => |*ld| {
+                ld.ptr = sub(subst, ld.ptr);
+                if (ld.mask) |m| ld.mask = sub(subst, m);
+            },
             .store => |*st| {
                 st.value = sub(subst, st.value);
                 st.ptr = sub(subst, st.ptr);
+                if (st.mask) |m| st.mask = sub(subst, m);
             },
             .prefetch => |*pf| pf.ptr = sub(subst, pf.ptr),
             .va_start => |*vs| vs.list = sub(subst, vs.list),
@@ -532,10 +536,14 @@ fn countUses(func: *const Function, uses: []u32) void {
                     uses[@backingInt(cv.global_scale)] += 1;
                 },
                 .unary => |u| uses[@backingInt(u.value)] += 1,
-                .load => |ld| uses[@backingInt(ld.ptr)] += 1,
+                .load => |ld| {
+                    uses[@backingInt(ld.ptr)] += 1;
+                    if (ld.mask) |m| uses[@backingInt(m)] += 1;
+                },
                 .store => |st| {
                     uses[@backingInt(st.value)] += 1;
                     uses[@backingInt(st.ptr)] += 1;
+                    if (st.mask) |m| uses[@backingInt(m)] += 1;
                 },
                 .prefetch => |pf| uses[@backingInt(pf.ptr)] += 1,
                 .va_start => |vs| uses[@backingInt(vs.list)] += 1,

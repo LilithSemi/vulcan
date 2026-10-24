@@ -1,14 +1,32 @@
-//! A model of one Glacier warp's scalar execution, so two word streams can be compared by what
-//! they RENDER rather than by how they are spelled.
+//! A model of one Glacier warp, so two word streams can be compared by what they COMPUTE rather
+//! than by how they are spelled.
 //!
 //! A compiler and a hand assembler pick different registers and a different instruction order, so
-//! a word diff says nothing about whether they agree. Running both and diffing the framebuffer
-//! does. The FPGA is the real answer, and this is what makes a disagreement visible before a
-//! kernel ever reaches it.
+//! a word diff says nothing about whether they agree. Running both and diffing the result does.
+//! The FPGA is the real answer, and this is what makes a disagreement visible before a kernel ever
+//! reaches it.
 //!
-//! It models only what a Glacier core decodes and only what a scalar kernel uses: RV32I, RV32M,
-//! and a CSR read. An unknown word is an error, never a no-op, so a lowering that emits something
-//! this model does not know about is caught rather than silently skipped.
+//! It models only what a Glacier core decodes and only what a kernel uses: RV32I, RV32M, the A
+//! extension word atomics, a CSR read, the RVV integer subset the lowering emits, and the float
+//! converts and scalar divide. An unknown word is an error, never a no-op, so a lowering that
+//! emits something this model does not know about is caught rather than silently skipped.
+//!
+//! The float rules are the ones the core implements, which are NOT the ones the mnemonics imply:
+//! the widening MAC truncates its accumulate, the float-to-integer converts truncate toward zero,
+//! the adds, the multiplies, both divides and the other converts round to nearest even, and every
+//! lane flushes a subnormal result to a signed zero. A model that rounded the way the names
+//! suggest would disagree with the hardware in the last bit.
+//!
+//! ONE WARP AT A TIME, TO COMPLETION. `run` returns when its warp hits EBREAK, so a caller that
+//! wants several warps runs them one after another and they never interleave. Real warps issue
+//! round-robin, and a kernel cannot order two of them: both IR barrier scopes are one warp here,
+//! so both emit nothing. This model therefore cannot show a cross-warp race whatever the hardware
+//! does, so give every address one owning warp rather than reading a passing test as proof there
+//! is no race.
+//!
+//! Lane behaviour is modelled faithfully because it cannot be checked any other way here: every
+//! vector write is gated by the launch mask, and a lane outside it keeps `stale_lane`. A kernel
+//! that reads an inactive lane therefore gets an obviously wrong answer instead of a plausible one.
 
 const std = @import("std");
 
@@ -23,14 +41,29 @@ pub const Error = error{
     /// A warp reached into another hart's scratch slice. On hardware this corrupts that hart and
     /// shows up as its wrong answer somewhere else, so it is caught here instead.
     CrossHart,
+    /// The kernel retired with a FAULT rather than finishing: an `ecall`, whose code the hardware
+    /// reads out of the named register. `Warp.fault_code` carries it.
+    Fault,
 };
 
 /// The CSRs a Glacier core answers. Anything else is an illegal word here, because a kernel that
 /// reads one is relying on hardware this model cannot stand in for.
 const csr_mhartid: u12 = 0xF14;
 const csr_hart_count: u12 = 0xFC0;
+const csr_workgroup_id: u12 = 0xFC9;
+const csr_grid_dim: u12 = 0xFCA;
 
 const csr_mscratch: u12 = 0x340;
+const csr_scratchsize: u12 = 0xFD2;
+
+/// The cross-warp barrier word, mirrored from `glacier/encode.zig` rather than imported, because
+/// this file is the independent side of the check.
+const glacier_warp_barrier: u32 = 0x1000000F;
+
+/// The launch arguments, 0xFC1 through 0xFC8. The strobe latches them, so every warp of one
+/// dispatch reads the same values and a read is constant for the whole of it.
+const csr_launch_arg_first: u12 = 0xFC1;
+const csr_launch_arg_last: u12 = 0xFC8;
 
 const ebreak: u32 = 0x00100073;
 
@@ -68,18 +101,70 @@ pub const Memory = struct {
     }
 };
 
+/// The widest warp any GC1 profile runs.
+pub const max_lanes = 16;
+
+/// A value left in a lane the launch mask does not name. The hardware leaves whatever the previous
+/// kernel wrote; this model leaves something recognisable instead, so a kernel that reads an
+/// inactive lane produces an obviously wrong answer rather than a plausible one.
+pub const stale_lane: u32 = 0xBAD0_BAD0;
+
 /// One warp: a register file, a program counter, and the identity the hardware gives it.
 pub const Warp = struct {
     x: [32]u32 = @splat(0),
+    /// The vector registers, `lanes` elements of each in use. Lanes past the launch mask hold
+    /// `stale_lane`: every vector write is gated by that mask, so they are never written.
+    v: [32][max_lanes]u32 = @splat(@splat(stale_lane)),
     pc: u32 = 0,
     hart_id: u32,
     hart_count: u32,
+    workgroup_base: u32 = 0,
+    grid_dim: u32 = 0,
+    /// Lanes this warp runs. A warp may be launched NARROWER than the core is wide, and then the
+    /// rest are inactive for its whole life with no instruction able to turn them on.
+    lanes: u8 = 1,
     /// What `mscratch` reads: one past the top of this hart's own scratch slice. Zero on a core
     /// built with no scratch, same as the hardware.
     stack_top: u32 = 0,
+    /// Cycles the run has taken: one per step, plus `stall_cycles` for each memory access. Equal
+    /// to the step count until a caller sets a stall.
+    cycles: u64 = 0,
+    /// The code of the fault the kernel retired with, when it did. Set by the model.
+    fault_code: u32 = 0,
+    /// EXTRA cycles a memory access costs beyond its one step, so a caller can read a cost out of
+    /// a run rather than only a count. Zero is the default, where a cycle is a step and the model
+    /// behaves as it always has.
+    ///
+    /// Nothing here knows the real figure. Solving this model's step counts against render
+    /// intervals from the eight-warp simulation puts it near 51, and that number is worth only
+    /// what its provenance says: the two sides came from DIFFERENT BINARIES, the pre-remat side is
+    /// ONE interval with no spread, and a third of each render here is the one-time table setup.
+    /// The SHAPE is the solid part, since treating every access alike fits the two solutions to 8
+    /// percent where charging spills alone leaves them 35 apart: the stall is tens of cycles and
+    /// it does not depend on which kind of access makes it.
+    stall_cycles: u32 = 0,
+    /// What `scratchsize` reads: the bytes in this hart's own slice. A test sets it SMALLER than
+    /// the profile to stand in for a core whose region does not fit the kernel.
+    scratch_bytes: u32 = 0,
+    /// What the launch argument CSRs read. A dispatch gives every warp the same values, so a test
+    /// that runs several warps sets these once.
+    launch_args: [8]u32 = @splat(0),
 
     fn set(self: *Warp, rd: u5, value: u32) void {
         if (rd != 0) self.x[rd] = value;
+    }
+
+    /// A mask register, as THIS MODEL keeps one: the bits in element ZERO, rather than packed
+    /// across the register the way the hardware lays them out. Nothing reads a mask as elements, so
+    /// the difference is invisible, and the rest of the register is left recognisably stale so a
+    /// misuse shows up as an obviously wrong answer.
+    fn mask(self: *const Warp, reg: u5) u32 {
+        return self.v[reg][0];
+    }
+
+    fn setMask(self: *Warp, reg: u5, bits: u32) void {
+        self.v[reg] = @splat(stale_lane);
+        self.v[reg][0] = bits;
     }
 };
 
@@ -116,6 +201,15 @@ fn immJ(word: u32) i32 {
 
 /// Run `code` from word zero until it retires, and return how many instructions it took.
 ///
+/// The count is instructions and not cycles, and the difference is not a rounding error. A memory
+/// access costs one step here and a bus round trip on the core, where the warp parks for the whole
+/// of it and is covered only while another warp is ready. So the count is low on what removing a
+/// memory access is worth, and right on what removing arithmetic is worth.
+///
+/// On the per-lane ball, re-emitting constants instead of spilling them came to 1.08x by this
+/// count and 2.12x by frame intervals on the hardware. So of two changes with similar step counts,
+/// the one touching `sp` wins. Do not rank an optimisation by this number alone.
+///
 /// `code` sits at address zero of its own aperture, which is separate from `mem`: a Glacier core
 /// takes its program through the instruction aperture and its data over the bus, so nothing a
 /// kernel stores can rewrite the kernel.
@@ -136,6 +230,14 @@ pub fn run(code: []const u32, mem: *Memory, warp: *Warp, budget: usize) Error!us
 
 fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
     const opcode = word & 0x7F;
+    // Every step is one cycle, and a memory access adds what the caller says it costs. The four
+    // opcodes here are the scalar load and store and the per-lane pair; an atomic is a load and a
+    // store at one address and is charged once.
+    warp.cycles +%= 1;
+    switch (opcode) {
+        0b0000011, 0b0100011, 0b0000111, 0b0100111, 0b0101111 => warp.cycles +%= warp.stall_cycles,
+        else => {},
+    }
     const rd: u5 = @intCast((word >> 7) & 0x1F);
     const rs1: u5 = @intCast((word >> 15) & 0x1F);
     const rs2: u5 = @intCast((word >> 20) & 0x1F);
@@ -175,6 +277,30 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
             };
             if (taken) warp.pc = (warp.pc -% 4) +% @as(u32, @bitCast(immB(word)));
         },
+        // Vector loads and stores. Only the 32-bit indexed forms, which is what the lowering
+        // emits: lane i accesses `rs1 + vs2[i]`, and only for a lane the launch mask names.
+        0x07, 0x27 => {
+            if (funct3 != 0b110) return error.Illegal; // width must be 32-bit
+            // mop 00 is unit stride, where lane i takes the i'th word from `rs1` and the offset
+            // register is not read at all. mop 01 is indexed-unordered, where lane i takes its own
+            // offset from `vs2`. Nothing else is decoded.
+            const mop = (word >> 26) & 0b11;
+            if (mop != 0b00 and mop != 0b01) return error.Illegal;
+            const unit = mop == 0b00;
+            // A clear `vm` predicates the access on v0. A lane whose bit is clear makes NO access:
+            // it does not read, it does not write, and the hardware skips it on the bus rather
+            // than driving a harmless cycle. That is what a store under divergent control flow
+            // relies on, so the model has to skip it here too and not merely discard the result.
+            const masked = (word >> 25) & 1 == 0;
+            const bits = warp.mask(0);
+            for (0..warp.lanes) |i| {
+                if (masked and (bits >> @intCast(i)) & 1 == 0) continue;
+                const addr = if (unit) a +% @as(u32, @intCast(i * 4)) else a +% warp.v[rs2][i];
+                if (mem.crossesHart(addr, warp.hart_id)) return error.CrossHart;
+                const at = try mem.index(addr);
+                if (opcode == 0x07) warp.v[rd][i] = mem.words[at] else mem.words[at] = warp.v[rd][i];
+            }
+        },
         // Loads. Only LW: the lowering emits nothing narrower, so a narrow load here would be a
         // lowering this model has not been taught rather than one it should quietly accept.
         0x03 => {
@@ -213,18 +339,360 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
         },
         // Register-register arithmetic, including the M extension.
         0x33 => warp.set(rd, try arith(funct3, funct7, a, b)),
+        // The A extension, word width. Read, combine, write back, give back the ORIGINAL. One warp
+        // runs at a time here, so the model cannot show whether the pair is really indivisible;
+        // what it does check is the VALUE and that the old one comes back rather than the new.
+        0x2F => {
+            if (funct3 != 2) return error.Illegal;
+            if (mem.crossesHart(a, warp.hart_id)) return error.CrossHart;
+            const at = try mem.index(a);
+            const old = mem.words[at];
+            mem.words[at] = switch (@as(u5, @intCast(funct7 >> 2))) {
+                0b00000 => old +% b,
+                0b00001 => b,
+                0b00100 => old ^ b,
+                0b01100 => old & b,
+                0b01000 => old | b,
+                0b10000 => if (@as(i32, @bitCast(old)) < @as(i32, @bitCast(b))) old else b,
+                0b10100 => if (@as(i32, @bitCast(old)) > @as(i32, @bitCast(b))) old else b,
+                0b11000 => @min(old, b),
+                0b11100 => @max(old, b),
+                else => return error.Illegal,
+            };
+            warp.set(rd, old);
+        },
+        // OP-V: every vector arithmetic form.
+        0x57 => try vectorOp(word, warp),
+        // OP-FP. Glacier decodes exactly one of these, FDIV.S, and its register fields name X
+        // registers because the core has no f register file. The rounding mode in funct3 is
+        // accepted and ignored: the core ties the divider's mode to nearest even.
+        0x53 => {
+            if (funct7 != 0b0001100) return error.Illegal;
+            warp.set(rd, @bitCast(ftz(f32, asFloat(a) / asFloat(b))));
+        },
         // CSR read. CSRRS with x0 as the set mask is the only CSR access a Glacier core decodes.
+        // The cross-warp barrier, a FENCE with fm = 0001 and no operands, so it is one constant
+        // word. This model drives ONE warp, which is always the last to arrive at a barrier over
+        // every live warp, so it continues. A model that ran several warps would have to park here.
+        0x0F => if (word != glacier_warp_barrier) return error.Illegal,
         0x73 => {
+            // A FAULT retire: `ecall`, with the code in the register `rs1` names. The whole word is
+            // `0x73` plus that register, so it differs from `ebreak` only in the immediate, which
+            // is why `run` checks for `ebreak` by the whole word and not by the opcode.
+            if (funct3 == 0 and word >> 20 == 0) {
+                warp.fault_code = warp.x[rs1];
+                return error.Fault;
+            }
             if (funct3 != 2 or rs1 != 0) return error.Illegal;
-            warp.set(rd, switch (@as(u12, @intCast(word >> 20))) {
+            const csr: u12 = @intCast(word >> 20);
+            if (csr >= csr_launch_arg_first and csr <= csr_launch_arg_last) {
+                warp.set(rd, warp.launch_args[csr - csr_launch_arg_first]);
+                return;
+            }
+            warp.set(rd, switch (csr) {
                 csr_mhartid => warp.hart_id,
                 csr_hart_count => warp.hart_count,
+                csr_workgroup_id => warp.hart_id +% warp.workgroup_base,
+                csr_grid_dim => if (warp.grid_dim == 0) warp.hart_count else warp.grid_dim,
                 csr_mscratch => warp.stack_top,
+                csr_scratchsize => warp.scratch_bytes,
                 else => return error.Illegal,
             });
         },
         else => return error.Illegal,
     }
+}
+
+/// One OP-V instruction. Every write is gated by the launch mask, so a lane outside it keeps what
+/// it held, which in this model is `stale_lane`.
+fn vectorOp(word: u32, warp: *Warp) Error!void {
+    const vd: u5 = @intCast((word >> 7) & 0x1F);
+    const funct3 = (word >> 12) & 0x7;
+    const src: u5 = @intCast((word >> 15) & 0x1F); // vs1, rs1, or a 5-bit immediate
+    const vs2: u5 = @intCast((word >> 20) & 0x1F);
+    const funct6 = word >> 26;
+    // `vmerge` is the ONE masked instruction the lowering emits, and it is handled below. Anything
+    // else with `vm` clear is predicated, which nothing emits yet, so it is an error rather than a
+    // quietly unpredicated write.
+    const masked = (word >> 25) & 1 == 0;
+    if (masked and funct6 != 0b010111) return error.Illegal;
+
+    // vid.v and vmv.v.x write a value that does not come from vs2, so they are taken first.
+    if (funct3 == 0b010 and funct6 == 0b010100) {
+        if (src != 17) return error.Illegal; // only vid.v in this group
+        for (0..warp.lanes) |i| warp.v[vd][i] = @intCast(i);
+        return;
+    }
+    // The two moves share their funct6 with `vmerge`, which is told apart ONLY by the mask bit. A
+    // merge reaching here would copy one side over every lane and lose the mask entirely.
+    if (funct3 == 0b100 and funct6 == 0b010111 and !masked) {
+        for (0..warp.lanes) |i| warp.v[vd][i] = warp.x[src];
+        return;
+    }
+    if (funct3 == 0b000 and funct6 == 0b010111 and !masked) {
+        for (0..warp.lanes) |i| warp.v[vd][i] = warp.v[src][i];
+        return;
+    }
+    // The three OPMVV instructions that write a SCALAR register, told apart by `vs1` and not by
+    // funct6, which they share. Reading only funct6 ran a mask reduction as `vmv.x.s` and gave
+    // back the mask word instead of a count.
+    if (funct3 == 0b010 and funct6 == 0b010000) {
+        switch (src) {
+            // vmv.x.s moves lane 0 to a scalar register, so it writes no vector lane.
+            0 => warp.set(vd, warp.v[vs2][0]),
+            // vcpop.m counts the lanes the mask names. Only the launched lanes count: a bit above
+            // them belongs to no lane and a warp that polled it would never finish.
+            16 => {
+                const bits = warp.mask(vs2);
+                var n: u32 = 0;
+                for (0..warp.lanes) |i| n += (bits >> @intCast(i)) & 1;
+                warp.set(vd, n);
+            },
+            // vfirst.m gives the lowest lane the mask names, or -1 when it names none.
+            17 => {
+                const bits = warp.mask(vs2);
+                var found: i32 = -1;
+                for (0..warp.lanes) |i| {
+                    if ((bits >> @intCast(i)) & 1 == 1) {
+                        found = @intCast(i);
+                        break;
+                    }
+                }
+                warp.set(vd, @bitCast(found));
+            },
+            else => return error.Illegal,
+        }
+        return;
+    }
+
+    // The plain float arithmetic. These read WHOLE lanes as f32: the element width is fixed at 32
+    // bits, so there is no f16 form of any of them.
+    //
+    // These round to NEAREST EVEN, from Harbor's `fp_round_pack.dart`, which uses the RISC-V
+    // encoding where rm 0 is rne. The lane is NOT uniform about rounding: the widening MAC and the
+    // float-to-integer convert truncate toward zero while these and the other converts round to
+    // nearest. Getting one of them wrong moves a low bit with no error anywhere, so the two modes
+    // are pinned against each other by test rather than left to a comment.
+    // The float compares, which write a MASK exactly as the integer ones do. Three instructions,
+    // not six: there is no greater-than, which is less-than with the operands swapped, and no
+    // `vmfne`, which the lowering builds by inverting the equality.
+    //
+    // Ordered semantics: a NaN compares FALSE against everything, including itself.
+    if (funct3 == 0b001 and (funct6 == 0b011000 or funct6 == 0b011001 or funct6 == 0b011011)) {
+        var bits: u32 = 0;
+        for (0..warp.lanes) |i| {
+            const x = asFloat(warp.v[vs2][i]);
+            const y = asFloat(warp.v[src][i]);
+            const take = switch (funct6) {
+                0b011000 => x == y,
+                0b011001 => x <= y,
+                0b011011 => x < y,
+                else => unreachable,
+            };
+            if (take) bits |= @as(u32, 1) << @intCast(i);
+        }
+        warp.setMask(vd, bits);
+        return;
+    }
+    if (funct3 == 0b001) switch (funct6) {
+        0b000000, 0b000010, 0b100100, 0b000100, 0b000110, 0b100000 => {
+            for (0..warp.lanes) |i| {
+                const x = asFloat(warp.v[vs2][i]);
+                const y = asFloat(warp.v[src][i]);
+                warp.v[vd][i] = @bitCast(ftz(f32, switch (funct6) {
+                    0b000000 => x + y,
+                    0b000010 => x - y,
+                    0b100100 => x * y,
+                    0b000100 => @min(x, y),
+                    0b000110 => @max(x, y),
+                    // vfdiv.vv is a second divider, not the scalar one reused, and it is the same
+                    // unit with the same mode tied to nearest even. So the two agree bit for bit
+                    // and which one a kernel took is a question of cost alone.
+                    0b100000 => x / y,
+                    else => unreachable,
+                }));
+            }
+            return;
+        },
+        // The converts and the widening MAC are handled below.
+        else => {},
+    };
+
+    // The float converts. One funct6 holds all three and the vs1 field picks which, so the field
+    // that names a source register everywhere else is a selector here. An f32 fills a lane and an
+    // f16 is its LOW HALF, because the core has no f register file.
+    if (funct3 == 0b001) {
+        // vfwmacc.vv: the destination accumulates the f32 product of two f16. The product is
+        // exact, because two 11-bit significands fit an f32 one, so the only rounding is the sum,
+        // and the core TRUNCATES that.
+        if (funct6 == 0b111100) {
+            for (0..warp.lanes) |i| {
+                const a: f32 = asHalf(warp.v[src][i]);
+                const b: f32 = asHalf(warp.v[vs2][i]);
+                const product = ftz(f32, a * b);
+                const sum = @as(f64, asFloat(warp.v[vd][i])) + @as(f64, product);
+                warp.v[vd][i] = @bitCast(ftz(f32, truncToF32(sum)));
+            }
+            return;
+        }
+        if (funct6 != 0b010010) return error.Illegal;
+        for (0..warp.lanes) |i| {
+            const x = warp.v[vs2][i];
+            warp.v[vd][i] = switch (src) {
+                // vfcvt.f.x.v: a SIGNED integer to f16, nearest even.
+                0b00011 => halfBits(ftz(f16, @floatFromInt(@as(i32, @bitCast(x))))),
+                // vfcvt.rtz.xu.f.v: an f32 to an UNSIGNED integer, toward zero.
+                0b00110 => unsignedFromFloat(asFloat(x)),
+                // vfncvt.f.f.w: an f32 narrowed to f16, nearest even, so an overflow gives
+                // INFINITY rather than the largest finite value.
+                0b10100 => halfBits(ftz(f16, @floatCast(asFloat(x)))),
+                // vfwcvt.f.f.v: an f16 widened to f32, which is exact in every case.
+                0b01100 => @bitCast(ftz(f32, @as(f32, asHalf(x)))),
+                // vfwcvt.f.xu.v and vfwcvt.f.x.v: a 32-bit integer to f32, nearest even. The
+                // result format arrives on the SEW port rather than the destination one, so a
+                // wiring mistake in the core returns f16 bits in an f32 register and a lane index
+                // cannot tell: 0 to 3 are exact in both formats.
+                0b01010 => @bitCast(ftz(f32, @as(f32, @floatFromInt(x)))),
+                0b01011 => @bitCast(ftz(f32, @as(f32, @floatFromInt(@as(i32, @bitCast(x)))))),
+                else => return error.Illegal,
+            };
+        }
+        return;
+    }
+
+    // The integer compares and the mask ops. A MASK is one bit per lane in the low bits of a
+    // register, not a word per lane, so these are modelled on bits and the element path below
+    // would read the wrong thing entirely.
+    if ((funct3 == 0b000 or funct3 == 0b100) and funct6 >= 0b011000 and funct6 <= 0b011111) {
+        var bits: u32 = 0;
+        for (0..warp.lanes) |i| {
+            const x = warp.v[vs2][i];
+            const y = if (funct3 == 0b000) warp.v[src][i] else warp.x[src];
+            const take = switch (funct6) {
+                0b011000 => x == y,
+                0b011001 => x != y,
+                0b011010 => x < y,
+                0b011011 => @as(i32, @bitCast(x)) < @as(i32, @bitCast(y)),
+                0b011100 => x <= y,
+                0b011101 => @as(i32, @bitCast(x)) <= @as(i32, @bitCast(y)),
+                0b011110 => x > y,
+                0b011111 => @as(i32, @bitCast(x)) > @as(i32, @bitCast(y)),
+                else => return error.Illegal,
+            };
+            if (take) bits |= @as(u32, 1) << @intCast(i);
+        }
+        warp.setMask(vd, bits);
+        return;
+    }
+    // Mask logic, also bit-wise. These share their funct6 with the compares and are told apart by
+    // OPMVV, which is why they are checked after.
+    if (funct3 == 0b010 and funct6 >= 0b011000 and funct6 <= 0b011111) {
+        const a = warp.mask(vs2);
+        const b = warp.mask(src);
+        warp.setMask(vd, switch (funct6) {
+            0b011000 => a & ~b, // vmandn
+            0b011001 => a & b, // vmand
+            0b011010 => a | b, // vmor
+            0b011011 => a ^ b, // vmxor
+            0b011101 => ~(a & b), // vmnand
+            else => return error.Illegal,
+        });
+        return;
+    }
+    // vmerge: the one masked instruction here, so `vm` is clear and v0 is implicit.
+    if (funct6 == 0b010111 and masked) {
+        const m = warp.mask(0);
+        for (0..warp.lanes) |i| {
+            const take = (m >> @intCast(i)) & 1 == 1;
+            const t: u32 = if (funct3 == 0b000) warp.v[src][i] else warp.x[src];
+            warp.v[vd][i] = if (take) t else warp.v[vs2][i];
+        }
+        return;
+    }
+
+    for (0..warp.lanes) |i| {
+        const x = warp.v[vs2][i];
+        const y: u32 = switch (funct3) {
+            0b000, 0b010 => warp.v[src][i], // vector-vector
+            0b100, 0b110 => warp.x[src], // vector-scalar
+            0b011 => src, // vector-immediate, zero extended
+            else => return error.Illegal,
+        };
+        // The integer funct6 space is read differently by category: OPIVV/OPIVX/OPIVI take the
+        // shift and bitwise set, OPMVV/OPMVX the multiply and divide set, so 0b100101 is `vsll`
+        // in one and `vmul` in the other.
+        const multiply_group = funct3 == 0b010 or funct3 == 0b110;
+        warp.v[vd][i] = if (multiply_group)
+            try arith(mulFunct3(funct6) orelse return error.Illegal, 0x01, x, y)
+        else switch (funct6) {
+            0b000000 => x +% y,
+            0b000010 => x -% y,
+            0b000011 => y -% x, // vrsub
+            0b001001 => x & y,
+            0b001010 => x | y,
+            0b001011 => x ^ y,
+            0b100101 => x << @truncate(y),
+            0b101000 => x >> @truncate(y),
+            0b101001 => @bitCast(@as(i32, @bitCast(x)) >> @truncate(y)),
+            else => return error.Illegal,
+        };
+    }
+}
+
+fn asFloat(bits: u32) f32 {
+    return @bitCast(bits);
+}
+
+/// The low half of a lane read as an f16, which is where Glacier keeps one.
+fn asHalf(bits: u32) f16 {
+    return @bitCast(@as(u16, @truncate(bits)));
+}
+
+fn halfBits(v: f16) u32 {
+    return @as(u16, @bitCast(v));
+}
+
+/// A lane flushes a subnormal result to a zero of the same sign, on every operation. A NaN and an
+/// infinity pass through.
+fn ftz(comptime T: type, v: T) T {
+    if (v != 0 and @abs(v) < std.math.floatMin(T)) return std.math.copysign(@as(T, 0.0), v);
+    return v;
+}
+
+/// An f32 to a u32, truncating toward zero. A value outside the range saturates, which is what
+/// RVV defines. What Glacier itself answers there is not recorded, so no test may depend on it.
+fn unsignedFromFloat(v: f32) u32 {
+    if (std.math.isNan(v)) return std.math.maxInt(u32);
+    if (v <= 0) return 0;
+    if (v >= 4294967296.0) return std.math.maxInt(u32);
+    return @intFromFloat(v);
+}
+
+/// `v` as the nearest f32 toward zero.
+fn truncToF32(v: f64) f32 {
+    const near: f32 = @floatCast(v);
+    if (!std.math.isFinite(near)) return near;
+    if (@abs(@as(f64, near)) <= @abs(v)) return near;
+    // Rounding to nearest went away from zero, so step back one representable value.
+    const bits: u32 = @bitCast(near);
+    const magnitude = bits & 0x7FFF_FFFF;
+    if (magnitude == 0) return near;
+    return @bitCast((bits & 0x8000_0000) | (magnitude - 1));
+}
+
+/// The scalar M-extension funct3 that computes the same thing as an OPMVV/OPMVX `funct6`, so the
+/// lane arithmetic reuses `arith` instead of restating the multiply and divide rules.
+fn mulFunct3(funct6: u32) ?u32 {
+    return switch (funct6) {
+        0b100101 => 0, // vmul   -> mul
+        0b100111 => 1, // vmulh  -> mulh
+        0b100100 => 3, // vmulhu -> mulhu
+        0b100001 => 4, // vdiv   -> div
+        0b100000 => 5, // vdivu  -> divu
+        0b100011 => 6, // vrem   -> rem
+        0b100010 => 7, // vremu  -> remu
+        else => null,
+    };
 }
 
 fn arith(funct3: u32, funct7: u32, a: u32, b: u32) Error!u32 {
@@ -297,4 +765,64 @@ pub fn render(
         _ = try run(code, &mem, &warp, budget);
     }
     return frame;
+}
+
+const rv = @import("vulcan-target").glacier.encode.rv;
+
+test "vid.v numbers only the launched lanes" {
+    var frame: [4]u32 = @splat(0);
+    var mem: Memory = .{ .base = 0, .words = &frame };
+    // A four-lane warp on a core that could run more. Lanes past the launch mask are never
+    // written, so they keep the recognisable stale value rather than their index.
+    var w: Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    const code = [_]u32{ rv.vid_v(.v1), ebreak };
+    _ = try run(&code, &mem, &w, 10);
+    for (0..4) |i| try std.testing.expectEqual(@as(u32, @intCast(i)), w.v[1][i]);
+    for (4..max_lanes) |i| try std.testing.expectEqual(stale_lane, w.v[1][i]);
+}
+
+test "a scatter writes one word per lane and a gather reads them back" {
+    var frame: [8]u32 = @splat(0);
+    var mem: Memory = .{ .base = 0, .words = &frame };
+    var w: Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    // offsets = vid*4, values = vid+10, scatter to (x0), gather back into v4.
+    const code = [_]u32{
+        rv.vid_v(.v1),
+        rv.vsll_vi(.v2, .v1, 2), // byte offsets
+        rv.addi(.x5, .x0, 10),
+        rv.vadd_vx(.v3, .v1, .x5), // values
+        rv.vsuxei32(.v3, .x0, .v2),
+        rv.vluxei32(.v4, .x0, .v2),
+        ebreak,
+    };
+    _ = try run(&code, &mem, &w, 20);
+    for (0..4) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)) + 10, frame[i]);
+        try std.testing.expectEqual(@as(u32, @intCast(i)) + 10, w.v[4][i]);
+    }
+    // Only the launched lanes touched memory.
+    for (4..8) |i| try std.testing.expectEqual(@as(u32, 0), frame[i]);
+}
+
+test "vector arithmetic covers the forms the lowering emits" {
+    var frame: [1]u32 = @splat(0);
+    var mem: Memory = .{ .base = 0, .words = &frame };
+    var w: Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    const code = [_]u32{
+        rv.vid_v(.v1), // 0 1 2 3
+        rv.addi(.x5, .x0, 3),
+        rv.vmv_v_x(.v2, .x5), // 3 3 3 3
+        rv.vmul_vv(.v3, .v1, .v2), // 0 3 6 9
+        rv.vadd_vv(.v4, .v3, .v1), // 0 4 8 12
+        rv.vsub_vv(.v5, .v4, .v1), // 0 3 6 9
+        rv.vxor_vv(.v6, .v5, .v2), // 3 0 5 10
+        rv.vsrl_vi(.v7, .v4, 2), // 0 1 2 3
+        rv.vmv_x_s(.x6, .v6), // lane 0 of v6 = 3
+        ebreak,
+    };
+    _ = try run(&code, &mem, &w, 30);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 6, 9 }, w.v[5][0..4]);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 0, 5, 10 }, w.v[6][0..4]);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, w.v[7][0..4]);
+    try std.testing.expectEqual(@as(u32, 3), w.x[6]);
 }

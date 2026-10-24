@@ -1045,7 +1045,10 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
             // An `endian`-tagged C write is refused for the byte-order reason (see
             // `Attribute.endian`): the `matmul` writes the whole C tile and cannot byte-swap each
             // element, so the tag would be dropped and the output would come out in native order.
-            if (s.@"volatile" or func.isByteOrderTagged(inst)) return null;
+            //
+            // A MASKED C write is refused for a third reason: `matmul` writes its whole C tile and
+            // has no per-element predicate, so the lanes the mask excluded would be written.
+            if (s.@"volatile" or s.mask != null or func.isByteOrderTagged(inst)) return null;
             if (store_inst != null) return null; // more than one store of the accumulator: ambiguous
             store_inst = inst;
         },

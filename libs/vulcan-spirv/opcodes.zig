@@ -6,6 +6,9 @@ pub const Undef = 1;
 
 // Debug / annotation (skipped by the frontend).
 pub const Name = 5;
+/// `OpLine`, a debug annotation interleaved between real instructions. Carries no value.
+pub const Line = 8;
+pub const NoLine = 317;
 pub const MemberName = 6;
 pub const Decorate = 71;
 pub const MemberDecorate = 72;
@@ -13,6 +16,7 @@ pub const MemberDecorate = 72;
 // Module setup.
 pub const EntryPoint = 15;
 pub const ExecutionMode = 16;
+pub const ExecutionModeId = 331;
 pub const Capability = 17;
 pub const MemoryModel = 14;
 pub const Source = 3;
@@ -64,6 +68,7 @@ pub const TypeFloat = 22;
 pub const TypeVector = 23;
 pub const TypeMatrix = 24; // `cols` column vectors of a vector type
 pub const TypeImage = 25;
+pub const TypeSampler = 26;
 pub const TypeSampledImage = 27;
 pub const TypeArray = 28;
 pub const TypeRuntimeArray = 29;
@@ -104,6 +109,24 @@ pub const Image = 100;
 /// it to a host fetch call.
 pub const ImageFetch = 95;
 
+/// `OpImageRead resultType result image coordinate [imageOperands]`: read one
+/// texel from a storage image at integer coordinates.
+pub const ImageRead = 98;
+
+/// `OpImageWrite image coordinate texel [imageOperands]`: write one texel to
+/// a storage image at integer coordinates.
+pub const ImageWrite = 99;
+
+/// `OpImageQuerySizeLod resultType result image level`: query the dimensions
+/// of one sampled-image mip level.
+pub const ImageQuerySizeLod = 103;
+
+/// `OpImageQuerySize resultType result image`: query storage-image dimensions.
+pub const ImageQuerySize = 104;
+
+/// `OpImageQueryLevels resultType result image`: query sampled-image mip levels.
+pub const ImageQueryLevels = 106;
+
 /// `OpTypeImage` Dim operand (subset the frontend emits).
 pub const Dim = struct {
     pub const dim_2d = 1;
@@ -117,6 +140,9 @@ pub const StorageClass = struct {
     pub const input = 1;
     pub const uniform = 2;
     pub const output = 3;
+    /// Per-workgroup shared memory. No target here has a region for it, so a variable in this
+    /// class is refused rather than lowered. See the variable classification in `lower.zig`.
+    pub const workgroup = 4;
     pub const function = 7;
     pub const push_constant = 9;
     pub const storage_buffer = 12;
@@ -144,6 +170,10 @@ pub const BuiltIn = struct {
     pub const point_coord = 16; // gl_PointCoord (a fragment-shader vec2 point-sprite coord, 0..1)
     pub const front_facing = 17; // gl_FrontFacing (a fragment-shader bool input)
     pub const frag_depth = 22; // gl_FragDepth (a fragment-shader depth output)
+    pub const num_workgroups = 24; // gl_NumWorkGroups (a compute-shader uvec3 input)
+    /// gl_WorkGroupSize. The Vulkan convention decorates a CONSTANT with this, but Zig's SPIR-V
+    /// backend declares it as an ordinary Input variable, which is the form handled here.
+    pub const workgroup_size = 25;
     pub const workgroup_id = 26;
     pub const local_invocation_id = 27;
     pub const global_invocation_id = 28;
@@ -267,8 +297,57 @@ pub const MatrixTimesMatrix = 146;
 pub const Dot = 148;
 
 // Misc.
+/// `OpCopyObject`: the result IS the operand, with no change of bits or type. spirv-opt leaves
+/// these behind where it folded something away, and it is an ordinary instruction any producer may
+/// emit, so the lowering aliases the value rather than copying it.
+pub const CopyObject = 83;
 pub const Select = 169;
 pub const Variable = 59;
 pub const Load = 61;
 pub const Store = 62;
+/// `OpControlBarrier execution_scope memory_scope semantics`. All three operands are ids of
+/// constants and not literals. The execution scope is what decides how wide the barrier is.
+pub const ControlBarrier = 224;
 pub const AccessChain = 65;
+/// `OpInBoundsAccessChain`. InBounds is a promise about the index, not a different operation,
+/// so it lowers exactly as `AccessChain` does. Zig's SPIR-V backend emits this one, not 65.
+pub const InBoundsAccessChain = 66;
+
+/// The optional Memory Operands mask on `OpLoad` and `OpStore`. Only `volatile` matters here: it
+/// says the access must happen exactly as written, which is what keeps a poll inside a spin loop.
+pub const MemoryOperand = struct {
+    pub const @"volatile": u32 = 0x0001;
+};
+
+// Atomic read-modify-write. Each takes a pointer, a memory SCOPE id and a memory-semantics id,
+// then the operand. The scope and semantics are ids of constants, not literals.
+pub const AtomicExchange = 229;
+pub const AtomicIIncrement = 232;
+pub const AtomicIDecrement = 233;
+pub const AtomicIAdd = 234;
+pub const AtomicISub = 235;
+pub const AtomicSMin = 236;
+pub const AtomicUMin = 237;
+pub const AtomicSMax = 238;
+pub const AtomicUMax = 239;
+pub const AtomicAnd = 240;
+pub const AtomicOr = 241;
+pub const AtomicXor = 242;
+
+/// The memory-semantics bits that say how strongly an atomic orders what is around it. The rest of
+/// the mask names which storage class is ordered, which a Glacier core does not distinguish.
+pub const MemorySemantics = struct {
+    pub const acquire: u32 = 0x0002;
+    pub const release: u32 = 0x0004;
+    pub const acquire_release: u32 = 0x0008;
+    pub const sequentially_consistent: u32 = 0x0010;
+};
+
+/// SPIR-V execution scopes, as `OpAtomic*` takes them.
+pub const Scope = struct {
+    pub const cross_device: u32 = 0;
+    pub const device: u32 = 1;
+    pub const workgroup: u32 = 2;
+    pub const subgroup: u32 = 3;
+    pub const invocation: u32 = 4;
+};

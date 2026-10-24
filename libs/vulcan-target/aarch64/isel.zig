@@ -1355,7 +1355,14 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // Prefer the add/sub immediate form for a small constant; only fall back to
                     // materializing the constant in a scratch register and a register op otherwise.
                     if (!try tryAddSubImm(allocator, &code, a.op, rd, rl, a.imm, wide)) {
-                        try loadConst(allocator, &code, spill_op[1], a.imm); // imm in x14, x16 stays free for rem
+                        // A sixty four bit operation takes the whole immediate. `loadConst` keeps the low
+                        // word only, which is right for a `w` register and silently wrong here: a mask of
+                        // a bit above the low word came out as zero, and a negative immediate came out
+                        // short by four thousand million.
+                        if (wide)
+                            try loadConst64(allocator, &code, spill_op[1], @bitCast(a.imm))
+                        else
+                            try loadConst(allocator, &code, spill_op[1], a.imm); // imm in x14, x16 stays free for rem
                         try emitBinary(allocator, &code, a.op, rd, rl, spill_op[1], isSignedInt(func, a.lhs), wide);
                     }
                     try storeResult(allocator, &code, ctx, result, rd);
@@ -1635,6 +1642,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .load => {
+                    // A masked load is per-lane predication (see `Load.mask`), which this backend
+                    // has no form for. Reading every lane is a wrong answer, so refuse.
+                    if (func.opcode(inst).load.mask != null) return error.Unsupported;
                     // A folded load addresses `[base, #off]` directly: `baseOf` yields the fold base
                     // (the add's lhs) and `offOf` the displacement. Both are the raw ptr and 0 when
                     // unfolded, so the non-folding case is byte-identical.
@@ -1645,6 +1655,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .store => |st| {
+                    // A masked store is per-lane predication (see `Store.mask`), which this backend
+                    // has no form for. Writing every lane is a wrong answer, so refuse.
+                    if (st.mask != null) return error.Unsupported;
                     const val = try ctx.loadOp(allocator, &code, st.value, if (regClass(func, st.value) == .fpr) fp_spill_op[0] else spill_op[0]);
                     const base = try ctx.loadOp(allocator, &code, fold.baseOf(func, inst), spill_op[1]);
                     try emitStore(allocator, &code, func, st.value, val, base, @intCast(fold.offOf(inst)), fp16);

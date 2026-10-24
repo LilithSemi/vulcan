@@ -16,5 +16,17 @@
 //! identity comes from `mhartid` and the resident count from a custom CSR, which is the closest
 //! thing to a workgroup id the hardware has.
 
+const std = @import("std");
+
 pub const encode = @import("glacier/encode.zig");
 pub const isel = @import("glacier/isel.zig");
+pub const decode = @import("glacier/decode.zig");
+pub const lift = @import("glacier/lift.zig");
+
+test {
+    // Without this the tests inside `encode.zig` and `isel.zig` are never COLLECTED: a root that
+    // imports this as a module analyses only what it references, and a test that is not collected
+    // reads exactly like a test that passed. `riscv64.zig` carries the same block for the same
+    // reason. The suites under `glacier/tests/` run from their own roots and do not need it.
+    std.testing.refAllDecls(@This());
+}
