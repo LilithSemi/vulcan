@@ -2699,3 +2699,34 @@ test "wasm: memory.copy overlaps the way memmove does, in both directions" {
     // last byte instead and give 0x04040404.
     try std.testing.expectEqual(@as(i32, 0x04040302), try overlappingCopy(allocator, 0, 1));
 }
+
+test "wasm: a store past the declared memory traps instead of reaching the host" {
+    const allocator = std.testing.allocator;
+    // One page, so the last whole i32 starts at 65532. A store at 65535 runs three bytes past the
+    // end, where wasmtime traps and this used to write into the host process. The two addresses
+    // sit either side of the limit, so an off-by-one in the check fails one of them.
+    const addrs = [2][3]u8{ .{ 0xFC, 0xFF, 0x03 }, .{ 0xFF, 0xFF, 0x03 } }; // 65532, 65535
+    const traps = [2]bool{ false, true };
+    for (addrs, traps) |at, want_trap| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+        try body.append(allocator, 0x41); // i32.const <at>
+        try body.appendSlice(allocator, &at);
+        try body.appendSlice(allocator, &.{ 0x41, 0x2A, 0x36, 0x02, 0x00 }); // i32.const 42, i32.store
+        try body.appendSlice(allocator, &.{ 0x41, 0x07 }); // i32.const 7
+        const bytes = try oneFunctionMemoryModule(allocator, &.{}, &.{valtype_i32}, body.items, "test", 1);
+        defer allocator.free(bytes);
+        var inst = try wasm.Instance.instantiate(allocator, bytes, &.{});
+        defer inst.deinit();
+        const got = try inst.call0(i32, "test");
+        if (want_trap) {
+            const code = @backingInt(wasm.Instance.TrapCode.memory_out_of_bounds);
+            try std.testing.expectEqual(@as(?u32, code), inst.trap());
+            // The trap block returns a zero, not the 7 the body would have pushed.
+            try std.testing.expectEqual(@as(i32, 0), got);
+        } else {
+            try std.testing.expectEqual(@as(?u32, null), inst.trap());
+            try std.testing.expectEqual(@as(i32, 7), got);
+        }
+    }
+}

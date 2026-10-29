@@ -18,6 +18,13 @@ const Cursor = reader.Cursor;
 
 pub const Error = reader.Error || error{Unsupported} || std.mem.Allocator.Error;
 
+/// The code a failed check hands the host's trap handler. `engine.zig` `TrapCode` names these for
+/// a caller; the numbers live here because this is what the generated code loads into the
+/// argument register.
+pub const trap_memory_out_of_bounds: i64 = 1;
+pub const trap_table_out_of_bounds: i64 = 2;
+pub const trap_indirect_type_mismatch: i64 = 3;
+
 /// Upper bound on function-table entries a module may declare. An element segment's
 /// init offset is untrusted; without a cap a tiny module could name a near-maxInt(u32)
 /// slot and force the table-growth loop into a multi-GB allocation. 1M funcref entries
@@ -427,6 +434,13 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     const imports_base: ?Value = if (ctx.has_imports) try loadBase(&func, entry, ptr_t, context.?, 24) else null;
     // The opaque import-context pointer host imports receive as their hidden first arg.
     const import_ctx: ?Value = if (ctx.has_imports) try loadBase(&func, entry, ptr_t, context.?, 32) else null;
+    // What a bounds check reads: the limits to compare against, and the handler to call when a
+    // comparison fails. The sizes are loaded as 64-bit integers rather than pointers, because the
+    // check is integer arithmetic. A module with neither a memory nor a table checks nothing.
+    const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const mem_size: ?Value = if (ctx.has_memory) try loadBase(&func, entry, u64_t, context.?, 40) else null;
+    const table_len: ?Value = if (ctx.has_table) try loadBase(&func, entry, u64_t, context.?, 48) else null;
+    const trap_fn: ?Value = if (ctx.has_memory or ctx.has_table) try loadBase(&func, entry, ptr_t, context.?, 56) else null;
     var locals: std.ArrayList(Local) = .empty;
     defer locals.deinit(allocator);
     var pvals: std.ArrayList(Value) = .empty;
@@ -465,7 +479,7 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     var stack: std.ArrayList(Value) = .empty;
     defer stack.deinit(allocator);
 
-    var l = L{ .func = &func, .block = entry, .stack = &stack, .allocator = allocator, .bool_as = i32s, .ptr_t = ptr_t, .i32_t = i32s, .mem_base = mem_base, .min_pages = ctx.min_pages, .globals_base = globals_base, .global_types = ctx.global_types, .table_base = table_base, .imports_base = imports_base, .import_ctx = import_ctx, .n_imports = ctx.n_imports, .context = context };
+    var l = L{ .func = &func, .block = entry, .stack = &stack, .allocator = allocator, .bool_as = i32s, .ptr_t = ptr_t, .i32_t = i32s, .mem_base = mem_base, .min_pages = ctx.min_pages, .globals_base = globals_base, .global_types = ctx.global_types, .table_base = table_base, .imports_base = imports_base, .import_ctx = import_ctx, .n_imports = ctx.n_imports, .context = context, .mem_size = mem_size, .table_len = table_len, .trap_fn = trap_fn, .result_ty = if (ft.results.len == 0) null else try irType(&func, ft.results[0]) };
 
     // Structured control flow. Each block/loop/if pushes a `Frame`. `reachable` tracks
     // whether the current point is live. Dead code after an unconditional branch is not
@@ -944,6 +958,16 @@ const L = struct {
     n_imports: u32 = 0,
     /// The hidden context pointer (threaded to defined-function calls), if any.
     context: ?Value = null,
+    /// The declared memory size in bytes, the table length in elements, and the trap handler's
+    /// address, all read from the context. Null when the module has nothing of that kind, and a
+    /// check that has no limit to compare against is not emitted.
+    mem_size: ?Value = null,
+    table_len: ?Value = null,
+    trap_fn: ?Value = null,
+    /// This function's result type, which the trap block has to return. Null for a void result.
+    result_ty: ?ir.types.Type = null,
+    /// The block a failed check jumps to, made on first use. See `trapTarget`.
+    trap_block: ?Block = null,
 
     fn pop(self: *L) Error!Value {
         return self.stack.pop() orelse error.InvalidWasm;
@@ -1025,9 +1049,68 @@ fn globalSet(l: *L, idx: u32) Error!void {
     try l.func.appendStore(l.block, try l.pop(), ptr);
 }
 
-/// The effective address pointer for a memory access: `mem_base + (addr + offset)`.
-fn memPtr(l: *L, addr: Value, offset: u32) Error!Value {
+/// The one block a failed check in this function leaves through, made on first use.
+///
+/// It takes the trap code as its parameter, so every check in the function shares it. The handler
+/// returns, so the block still needs a terminator, and it returns a zero of the function's result
+/// type. See `engine.zig` `trapHandler` for what the host does with the code and why the zero is
+/// not a real answer.
+fn trapTarget(l: *L) Error!Block {
+    if (l.trap_block) |b| return b;
+    const target = l.trap_fn orelse return error.InvalidWasm;
+    const ctx = l.context orelse return error.InvalidWasm;
+    const b = try l.func.appendBlock();
+    const code = try l.func.appendBlockParam(b, l.i32_t);
+    // A host function with no result is called for an i32 the caller drops, the way an import is.
+    _ = try l.func.appendCallIndirect(b, l.i32_t, target, &.{ ctx, code });
+    if (l.result_ty) |ty| {
+        const zero = switch (l.func.types.type_kind(ty)) {
+            .float => try l.func.appendInst(b, ty, .{ .fconst = 0 }),
+            else => try l.func.appendInst(b, ty, .{ .iconst = 0 }),
+        };
+        l.func.setTerminator(b, .{ .ret = ir.function.Ret.one(zero) });
+    } else {
+        l.func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    }
+    l.trap_block = b;
+    return b;
+}
+
+/// How many bytes an access of `ty` touches. An unknown kind answers with the widest, which makes
+/// the bounds check stricter rather than looser.
+fn accessBytes(func: *const Function, ty: ir.types.Type) u32 {
+    return switch (func.types.type_kind(ty)) {
+        .int => |i| (i.bits + 7) / 8,
+        .float => |f| switch (f) {
+            .f16 => 2,
+            .f32 => 4,
+            .f64 => 8,
+            else => 16,
+        },
+        else => 16,
+    };
+}
+
+/// The effective address pointer for a memory access: `mem_base + (addr + offset)`, after a check
+/// that the `size` bytes it names are inside the declared memory.
+///
+/// Wasm computes the effective address without wrapping, so the address widens to 64 bits before
+/// the offset and the width are added. A 32-bit sum could wrap back into range and let the access
+/// through.
+fn memPtr(l: *L, addr: Value, offset: u32, size: u32) Error!Value {
     const base = l.mem_base orelse return error.InvalidWasm;
+    if (l.mem_size) |limit| {
+        const u32_t = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const u64_t = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const wide = try l.func.appendInst(l.block, u64_t, .{ .convert = .{ .value = try l.coerce(addr, u32_t) } });
+        const last = try l.func.appendArithImm(l.block, u64_t, .add, wide, @as(i64, offset) + @as(i64, size));
+        const over = try l.func.appendInst(l.block, l.bool_as, .{ .icmp = .{ .op = .gt, .lhs = last, .rhs = limit } });
+        const code = try l.func.appendInst(l.block, l.i32_t, .{ .iconst = trap_memory_out_of_bounds });
+        const trap = try trapTarget(l);
+        const ok = try l.func.appendBlock();
+        try l.func.appendIf(l.block, over, .{ .target = trap, .args = &.{code} }, .{ .target = ok, .args = &.{} });
+        l.block = ok;
+    }
     const a = if (offset == 0) addr else try l.func.appendArithImm(l.block, l.i32_t, .add, addr, @intCast(offset));
     return l.func.appendInst(l.block, l.ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = a } });
 }
@@ -1191,7 +1274,7 @@ fn memLoad(l: *L, c: *Cursor, ty: ir.types.Type) Error!void {
     _ = try c.u32leb(); // alignment hint (ignored)
     const offset = try c.u32leb();
     const addr = try l.pop();
-    const ptr = try memPtr(l, addr, offset);
+    const ptr = try memPtr(l, addr, offset, accessBytes(l.func, ty));
     try l.push(try l.func.appendInst(l.block, ty, .{ .load = .{ .ptr = ptr } }));
 }
 
@@ -1201,7 +1284,7 @@ fn memStore(l: *L, c: *Cursor) Error!void {
     const offset = try c.u32leb();
     const value = try l.pop();
     const addr = try l.pop();
-    const ptr = try memPtr(l, addr, offset);
+    const ptr = try memPtr(l, addr, offset, accessBytes(l.func, l.func.valueType(value)));
     try l.func.appendStore(l.block, value, ptr);
 }
 
@@ -1212,7 +1295,7 @@ fn memLoadN(l: *L, c: *Cursor, narrow: ir.types.Type, canonical: ir.types.Type, 
     _ = try c.u32leb();
     const offset = try c.u32leb();
     const addr = try l.pop();
-    const ptr = try memPtr(l, addr, offset);
+    const ptr = try memPtr(l, addr, offset, accessBytes(l.func, narrow));
     const v = try l.func.appendInst(l.block, narrow, .{ .load = .{ .ptr = ptr } });
     if (sext64) {
         const w = try l.func.appendInst(l.block, canonical, .{ .convert = .{ .value = v } });
@@ -1230,7 +1313,7 @@ fn memStoreN(l: *L, c: *Cursor, narrow: ir.types.Type) Error!void {
     const offset = try c.u32leb();
     const value = try l.pop();
     const addr = try l.pop();
-    const ptr = try memPtr(l, addr, offset);
+    const ptr = try memPtr(l, addr, offset, accessBytes(l.func, narrow));
     try l.func.appendStore(l.block, try l.coerce(value, narrow), ptr);
 }
 

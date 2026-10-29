@@ -2,12 +2,13 @@
 //! memory/globals/table/imports, and call its exports with a typed interface. Runnable
 //! layer over `lower.zig` and `vulcan-target.native` (host JIT).
 //!
-//! Lowered functions take one hidden "context" pointer to five base pointers at fixed
-//! offsets: memory (0), globals (8), table (16), imports (24), and an opaque
-//! import-context (32) that host imports receive as their hidden first argument.
-//! `Instance` builds and owns that context; callers pass only the Wasm arguments. The
-//! import-context lets a host-import layer (e.g. WASI) reach per-instance state without a
-//! global, so multiple instances can run side by side. Set it with `setImportContext`.
+//! Lowered functions take one hidden "context" pointer to eight slots at fixed offsets:
+//! memory (0), globals (8), table (16), imports (24), an opaque import-context (32) that
+//! host imports receive as their hidden first argument, the memory size in bytes (40), the
+//! table length in elements (48), and the trap handler's address (56). `Instance` builds and
+//! owns that context; callers pass only the Wasm arguments. The import-context lets a
+//! host-import layer (e.g. WASI) reach per-instance state without a global, so multiple
+//! instances can run side by side. Set it with `setImportContext`.
 
 const std = @import("std");
 const lower = @import("lower.zig");
@@ -34,10 +35,17 @@ pub const Instance = struct {
     globals: []i64,
     table: []usize,
     imports: []usize,
-    /// Base pointers passed to functions: [memory, globals, table, imports, import_ctx].
-    /// The last slot is an opaque per-instance pointer forwarded to host imports (see
-    /// `setImportContext`); 0 until set.
-    context: [5]usize align(8),
+    /// What a lowered function reads through its hidden context pointer, by slot:
+    /// 0 memory base, 1 globals base, 2 table base, 3 imports base, 4 import context,
+    /// 5 memory size in bytes, 6 table length in elements, 7 the trap handler's address.
+    ///
+    /// Slot 4 is an opaque per-instance pointer forwarded to host imports (see
+    /// `setImportContext`); 0 until set. Slots 5 to 7 are what a bounds check reads: the
+    /// generated code compares against the size and calls the handler rather than reaching
+    /// past the end. See `trap`.
+    context: [8]usize align(8),
+    /// The code of the first trap since `takeTrap`, or null. See `trap`.
+    trap_code: ?u32 = null,
 
     /// Load, JIT (host's default provider), and set up a module. `host_imports` gives
     /// the host address for each import in `module.imports` order. Caller owns it.
@@ -116,9 +124,53 @@ pub const Instance = struct {
             .globals = globals,
             .table = table,
             .imports = imports,
-            .context = .{ @intFromPtr(memory.ptr), @intFromPtr(globals.ptr), @intFromPtr(table.ptr), @intFromPtr(imports.ptr), 0 },
+            .context = .{
+                @intFromPtr(memory.ptr),
+                @intFromPtr(globals.ptr),
+                @intFromPtr(table.ptr),
+                @intFromPtr(imports.ptr),
+                0,
+                memory.len,
+                table.len,
+                @intFromPtr(&trapHandler),
+            },
         };
     }
+
+    /// What the generated code calls instead of an access that would leave the sandbox. It
+    /// records the code and returns, and the function that trapped then returns a zero.
+    ///
+    /// A real engine unwinds here. This does not, so guest code between the trap and the
+    /// return runs on with a zero where it wanted a value. No access reaches past the end
+    /// either way, and every later access traps too, so the host sees the trap by reading
+    /// `trap` after the call rather than from where it happened.
+    fn trapHandler(ctx: *anyopaque, code: u32) callconv(.c) void {
+        const slots: *[8]usize = @ptrCast(@alignCast(ctx));
+        const self: *Instance = @alignCast(@fieldParentPtr("context", slots));
+        if (self.trap_code == null) self.trap_code = code;
+    }
+
+    /// The code of the first trap since `takeTrap`, or null if the guest has not trapped.
+    /// A caller reads this after a call to tell a real answer from a trapped one.
+    pub fn trap(self: *const Instance) ?u32 {
+        return self.trap_code;
+    }
+
+    /// Read the trap and clear it, so the next call starts from no trap.
+    pub fn takeTrap(self: *Instance) ?u32 {
+        defer self.trap_code = null;
+        return self.trap_code;
+    }
+
+    /// Why the guest trapped. The number reaches `trapHandler` as its `code`.
+    pub const TrapCode = enum(u32) {
+        /// A load or a store whose address, plus its width, leaves the declared memory.
+        memory_out_of_bounds = lower.trap_memory_out_of_bounds,
+        /// A `call_indirect` whose table index is past the end of the table.
+        table_out_of_bounds = lower.trap_table_out_of_bounds,
+        /// A `call_indirect` whose target does not have the type the call names.
+        indirect_type_mismatch = lower.trap_indirect_type_mismatch,
+    };
 
     /// Bind the opaque import-context pointer that every host import receives as its
     /// hidden first argument. A host-import layer (e.g. WASI) points this at its
