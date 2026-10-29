@@ -1933,3 +1933,47 @@ test "x86_64: a clamped pin hint never makes a param steal another param's pin" 
     try std.testing.expect(entryLoc(&alloc, p2) == .reg);
     try std.testing.expect(entryLoc(&alloc, p2).reg != 1);
 }
+
+/// A chain of `blocks` blocks with `live` values defined before it and used after it, so every
+/// value is live across every edge. This is the shape a C toolchain produces at scale, and the
+/// shape that asking "is this value live here" by scanning every interval is quadratic in.
+fn liveAcrossChain(allocator: std.mem.Allocator, blocks: usize, live: usize) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const held = try allocator.alloc(Value, live);
+    defer allocator.free(held);
+    for (held, 0..) |*h, i| h.* = try func.appendInst(entry, t, .{ .iconst = @intCast(i + 1) });
+
+    var prev = entry;
+    for (0..blocks) |i| {
+        const next = try func.appendBlock();
+        try func.setJump(prev, next, &.{});
+        _ = try func.appendInst(next, t, .{ .iconst = @intCast(i) });
+        prev = next;
+    }
+
+    // The last block reads every held value, which is what keeps them live the whole way down.
+    var sum = held[0];
+    for (held[1..]) |h| sum = try func.appendInst(prev, t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = h } });
+    func.setTerminator(prev, .{ .ret = ir.function.Ret.one(sum) });
+    return func;
+}
+
+test "wimmer: a long chain with many live values allocates without scanning every interval per edge" {
+    const allocator = std.testing.allocator;
+    // Sized for a clear gap: about 0.7 seconds through the index, against about 28 seconds when
+    // the same question scans every interval at every edge. A regression does not fail here, it
+    // gets slow, and a real function out of a C toolchain does not finish at all.
+    var func = try liveAcrossChain(allocator, 1000, 1500);
+    defer func.deinit();
+
+    var desc = try aarch64.aarch64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+    var alloc = try wimmer.allocate(allocator, &func, &desc);
+    defer alloc.deinit(allocator);
+
+    // The values are live to the end, so every one of them has a placement.
+    try std.testing.expect(alloc.segments.count() >= 1500);
+}

@@ -1547,7 +1547,7 @@ fn coalesceEdgeParams(all: []const *Interval, parent: []u32, class_off: []const 
 /// is exactly the condition `orderClassMoves` forbids. Covers both parameter moves and the live-in
 /// (through) values whose location changes across the edge, matching `addEdgeMoves`. Reads the
 /// post-rewrite slot numbers now in each interval's `location`.
-fn edgeSlotBothSrcAndDst(all: []const *Interval, intervals: []const Interval, children: []const *Interval, func: *const Function, desc: *const RegDescription, class_off: []const u32, mark: []u8, block_from: []const u32, block_to: []const u32, pred: Block, edge: Jump) bool {
+fn edgeSlotBothSrcAndDst(all: []const *Interval, live: *const LiveIndex, func: *const Function, desc: *const RegDescription, class_off: []const u32, mark: []u8, block_from: []const u32, block_to: []const u32, pred: Block, edge: Jump) bool {
     const succ = edge.target;
     const pt = block_to[@backingInt(pred)] - 1;
     const ss = block_from[@backingInt(succ)];
@@ -1581,7 +1581,7 @@ fn edgeSlotBothSrcAndDst(all: []const *Interval, intervals: []const Interval, ch
     for (all) |iv| {
         const v = iv.value.?;
         if (isParamOf(func, succ, v)) continue;
-        if (!valueLiveAt(intervals, children, v, ss)) continue;
+        if (!live.liveAt(v, ss)) continue;
         const from = valueLocAt(all, v, pt) orelse continue;
         const to = valueLocAt(all, v, ss) orelse continue;
         _ = Marker.go(mark, class_off, desc.classOf(desc.ctx, func, v), from, to);
@@ -1612,6 +1612,9 @@ fn coalesceSpillSlots(allocator: std.mem.Allocator, func: *const Function, inter
     var total: u32 = 0;
     for (slots) |s| total += s;
     if (total == 0) return; // nothing spilled
+
+    var live = try LiveIndex.build(allocator, intervals, children);
+    defer live.deinit(allocator);
 
     // Flatten every value interval (originals + split children); each has a filled location.
     var all_list: std.ArrayList(*Interval) = .empty;
@@ -1730,7 +1733,7 @@ fn coalesceSpillSlots(allocator: std.mem.Allocator, func: *const Function, inter
                     const cf = func.opcode(inst).@"if";
                     for ([_]Jump{ cf.then, cf.@"else" }) |e| {
                         @memset(mark, 0);
-                        if (edgeSlotBothSrcAndDst(all, intervals, children, func, desc, class_off, mark, bounds.from, bounds.to, pred, e)) {
+                        if (edgeSlotBothSrcAndDst(all, &live, func, desc, class_off, mark, bounds.from, bounds.to, pred, e)) {
                             unsafe = true;
                             break :walk;
                         }
@@ -1740,7 +1743,7 @@ fn coalesceSpillSlots(allocator: std.mem.Allocator, func: *const Function, inter
             if (func.terminator(pred)) |term| switch (term) {
                 .jump => |j| {
                     @memset(mark, 0);
-                    if (edgeSlotBothSrcAndDst(all, intervals, children, func, desc, class_off, mark, bounds.from, bounds.to, pred, j)) {
+                    if (edgeSlotBothSrcAndDst(all, &live, func, desc, class_off, mark, bounds.from, bounds.to, pred, j)) {
                         unsafe = true;
                         break :walk;
                     }
@@ -2792,18 +2795,49 @@ fn locationAt(segs: []const Segment, pos: u32) Location {
 /// True iff some VALUE interval of `v`, an original or a split child, never a fixed interval,
 /// covers `pos`. A value's lifetime is the union of its intervals, so this is its true liveness
 /// at `pos`.
-fn valueLiveAt(intervals: []const Interval, children: []const *Interval, v: Value, pos: u32) bool {
-    for (intervals) |*iv| {
-        if (iv.fixed_reg != null) continue;
-        const iv_v = iv.value orelse continue;
-        if (iv_v == v and iv.covers(pos)) return true;
+/// Every interval that belongs to a value, so asking whether a value is live costs a lookup and a
+/// walk of that value's own intervals instead of a scan of the whole function's.
+///
+/// `resolveDataFlow` asks that question once per value per edge. Scanning every interval each time
+/// made the pass cubic in the function: a 735-block body out of a C toolchain reached roughly
+/// 5 * 10^10 interval checks and did not finish.
+const LiveIndex = struct {
+    map: std.AutoHashMapUnmanaged(Value, std.ArrayListUnmanaged(*const Interval)) = .empty,
+
+    fn build(allocator: std.mem.Allocator, intervals: []const Interval, children: []const *Interval) Error!LiveIndex {
+        var self: LiveIndex = .{};
+        errdefer self.deinit(allocator);
+        for (intervals) |*iv| {
+            if (iv.fixed_reg != null) continue;
+            const v = iv.value orelse continue;
+            try self.add(allocator, v, iv);
+        }
+        for (children) |iv| {
+            std.debug.assert(iv.fixed_reg == null);
+            try self.add(allocator, iv.value.?, iv);
+        }
+        return self;
     }
-    for (children) |iv| {
-        std.debug.assert(iv.fixed_reg == null);
-        if (iv.value.? == v and iv.covers(pos)) return true;
+
+    fn add(self: *LiveIndex, allocator: std.mem.Allocator, v: Value, iv: *const Interval) Error!void {
+        const slot = try self.map.getOrPut(allocator, v);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(allocator, iv);
     }
-    return false;
-}
+
+    fn deinit(self: *LiveIndex, allocator: std.mem.Allocator) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |list| list.deinit(allocator);
+        self.map.deinit(allocator);
+    }
+
+    /// True iff any interval of `v` covers `pos`. Same answer as a scan of every interval.
+    fn liveAt(self: *const LiveIndex, v: Value, pos: u32) bool {
+        const list = self.map.getPtr(v) orelse return false;
+        for (list.items) |iv| if (iv.covers(pos)) return true;
+        return false;
+    }
+};
 
 /// True iff `v` is a block parameter of `block`.
 fn isParamOf(func: *const Function, block: Block, v: Value) bool {
@@ -2827,6 +2861,8 @@ fn resolveDataFlow(
     if (std.debug.runtime_safety and !desc.hosts_critical_edge_moves) try assertNoCriticalEdges(allocator, func);
 
     const bounds = try computeBlockBounds(allocator, func);
+    var live = try LiveIndex.build(allocator, intervals, children);
+    defer live.deinit(allocator);
     defer allocator.free(bounds.from);
     defer allocator.free(bounds.to);
 
@@ -2843,13 +2879,13 @@ fn resolveDataFlow(
         for (func.blockInsts(block)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
-                try addEdgeMoves(allocator, func, desc, intervals, children, result, bounds.from, bounds.to, &edges, block, cf.then);
-                try addEdgeMoves(allocator, func, desc, intervals, children, result, bounds.from, bounds.to, &edges, block, cf.@"else");
+                try addEdgeMoves(allocator, func, desc, &live, result, bounds.from, bounds.to, &edges, block, cf.then);
+                try addEdgeMoves(allocator, func, desc, &live, result, bounds.from, bounds.to, &edges, block, cf.@"else");
             }
         }
         // A `jump` terminator contributes one edge. A `ret` contributes none.
         if (func.terminator(block)) |term| switch (term) {
-            .jump => |j| try addEdgeMoves(allocator, func, desc, intervals, children, result, bounds.from, bounds.to, &edges, block, j),
+            .jump => |j| try addEdgeMoves(allocator, func, desc, &live, result, bounds.from, bounds.to, &edges, block, j),
             .ret => {},
         };
     }
@@ -2866,8 +2902,7 @@ fn addEdgeMoves(
     allocator: std.mem.Allocator,
     func: *const Function,
     desc: *const RegDescription,
-    intervals: []const Interval,
-    children: []const *Interval,
+    live: *const LiveIndex,
     result: *const Allocation,
     block_from: []const u32,
     block_to: []const u32,
@@ -2918,7 +2953,7 @@ fn addEdgeMoves(
     while (it.next()) |e| {
         const v = e.key_ptr.*;
         if (isParamOf(func, succ, v)) continue;
-        if (!valueLiveAt(intervals, children, v, ss)) continue;
+        if (!live.liveAt(v, ss)) continue;
         const segs = e.value_ptr.*;
         // Live-in to succ across this edge implies defined before the edge, so both lookups are valid.
         std.debug.assert(segs[0].from <= ss);
