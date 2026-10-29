@@ -901,11 +901,24 @@ const RasterColour = struct {
 /// and the masks the conversion ANDs in are what keeps them apart.
 fn rasterColourInto(func: *Function, block: Block, insts: []const Inst, colour: *RasterColour) Error!void {
     colour.held_mask = 0;
+    // A discard kills the fragment, so a block that discards writes no colour, whichever order
+    // the two appear in. The call goes nowhere: there is no fragment record to mark, and the
+    // discarded lane leaves through the `ret` that ends the block.
+    var discards = false;
     for (insts) |inst| {
         const operation = func.opcode(inst);
+        if (operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "discard_fn")) {
+            discards = true;
+            break;
+        }
+    }
+    for (insts) |inst| {
+        const operation = func.opcode(inst);
+        if (operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "discard_fn")) continue;
         if (operation == .store) {
             const store = operation.store;
             if (gpuIntAttr(func, store.ptr, "color_out")) |component| {
+                if (discards) continue;
                 if (colour.one_word) {
                     try func.appendStoreMasked(block, store.value, colour.pixel, colour.covered);
                 } else {
@@ -1039,6 +1052,7 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     var attr_param: [raster_max_attributes]Value = undefined;
     var attr_slot: [raster_max_attributes]u32 = undefined;
     var attrs: usize = 0;
+    var discard_param: ?Value = null;
     const original_params = try allocator.dupe(Value, func.blockParams(entry));
     defer allocator.free(original_params);
     for (original_params) |param| {
@@ -1047,7 +1061,8 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
             return Refusal.whole(why, "a rasteriser for a fragment body that reads derivatives");
         }
         if (hasGpuKey(func, param, "discard_fn")) {
-            return Refusal.whole(why, "a rasteriser for a fragment body that discards");
+            discard_param = param;
+            continue;
         }
         if (gpuIntAttr(func, param, "attr")) |slot| {
             if (!isF32(func, func.valueType(param))) {
@@ -1079,6 +1094,16 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
         var held: u4 = 0;
         for (func.blockInsts(block), 0..) |inst, index| {
             const operation = func.opcode(inst);
+            if (operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "discard_fn")) {
+                // A discard kills the invocation, and the lowering ends its block with a `ret` that
+                // the loop turns into a step to the next pixel. One that fell through would leave a
+                // later block free to write the colour of a fragment that is already dead.
+                const ends_here = if (func.terminator(block)) |term| term == .ret else false;
+                if (!ends_here) {
+                    return Refusal.at(why, func, block, index, inst, "a rasteriser for a discard whose block carries on");
+                }
+                continue;
+            }
             if (operation != .store) continue;
             const store = operation.store;
             if (gpuIntAttr(func, store.ptr, "frag_depth") != null) {
@@ -1120,6 +1145,14 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     if (colours == 0) {
         return Refusal.whole(why, "a rasteriser for a fragment body that writes no colour");
     }
+
+    // Nothing calls the discard any more. The parameter stays, so the entry keeps the shape the
+    // body was written against, tagged for the backend to pass over.
+    if (discard_param) |param| try func.addAttr(.{ .value = param }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "lowered_graphics_input",
+        .value = .flag,
+    } });
 
     // The body's first block moves into the span, which leaves the entry block free to become the
     // setup. Its terminator moves with it, so the body's own control flow is undisturbed.

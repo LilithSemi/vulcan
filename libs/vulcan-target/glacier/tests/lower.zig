@@ -6051,3 +6051,106 @@ test "the generated rasteriser keeps a fragment body's own branch" {
         try std.testing.expectEqual(@as(u32, 0), data[31]);
     }
 }
+
+/// A body that kills the left of the triangle and paints the rest. This is the shape an `OpKill`
+/// lowers to: a call to the discard parameter, and a `ret` that ends the block.
+fn discardingBody(allocator: std.mem.Allocator) !Function {
+    var f = Function.init(allocator);
+    errdefer f.deinit();
+    try markFragment(&f);
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+    const entry = try f.appendBlock();
+    const kill = try f.appendBlock();
+    const draw = try f.appendBlock();
+    const coord = try f.appendBlockParam(entry, f32_t);
+    try gpu.attrs.setBuiltin(&f, coord, .frag_coord);
+    try f.addAttr(.{ .value = coord }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "bicomp",
+        .value = .{ .int = 0 },
+    } });
+    const discard = try f.appendBlockParam(entry, ptr_t);
+    try f.addAttr(.{ .value = discard }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "discard_fn",
+        .value = .flag,
+    } });
+    const edge = try f.appendInst(entry, f32_t, .{ .fconst = 8 });
+    const left = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = coord, .rhs = edge } });
+    try f.appendIf(entry, left, .{ .target = kill }, .{ .target = draw });
+    // The killed arm paints first and discards after, which is how a shader writes it. The
+    // colour must not land: a discard kills the fragment whichever order the two appear in.
+    const killed = try f.appendInst(kill, u32_t, .{ .iconst = 0x000000FF });
+    const killed_out = try colourOut(&f, kill, 0);
+    try f.appendStore(kill, killed, killed_out);
+    try f.appendVoidCallIndirect(kill, discard, &.{});
+    f.setTerminator(kill, .{ .ret = ir.function.Ret.none() });
+    const colour = try f.appendInst(draw, u32_t, .{ .iconst = 0x00FF0000 });
+    const out = try colourOut(&f, draw, 0);
+    try f.appendStore(draw, colour, out);
+    f.setTerminator(draw, .{ .ret = ir.function.Ret.none() });
+    return f;
+}
+
+test "the generated rasteriser leaves a discarded fragment alone and paints the rest" {
+    const allocator = std.testing.allocator;
+    const area = raster_width * raster_height;
+    var f = try discardingBody(allocator);
+    defer f.deinit();
+    var why: glacier.isel.Refusal = .{};
+    const code = glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why) catch |e| {
+        std.debug.print("REFUSED {any}: {s} on {s} block {d} index {d}\n", .{ e, why.reason, why.opcode, why.block, why.index });
+        return e;
+    };
+    defer allocator.free(code);
+
+    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
+    defer allocator.free(data);
+    @memset(data, 0);
+    writeRasterVertices(data);
+    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+
+    const red: u32 = 0x00FF0000;
+    // Row 0 crosses the whole triangle, so it holds both the killed left and the painted right.
+    try std.testing.expectEqual(@as(u32, 0), data[0]);
+    try std.testing.expectEqual(@as(u32, 0), data[7]);
+    try std.testing.expectEqual(red, data[8]);
+    try std.testing.expectEqual(red, data[30]);
+    // Further down the triangle is narrower, and its left is killed the same way.
+    try std.testing.expectEqual(@as(u32, 0), data[11 * raster_width]);
+    try std.testing.expectEqual(red, data[11 * raster_width + 8]);
+    // Outside the triangle nothing is written by either arm.
+    try std.testing.expectEqual(@as(u32, 0), data[31]);
+}
+
+test "the rasteriser refuses a discard that does not end its block" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    try markFragment(&f);
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try f.types.ptrGlobal();
+    const entry = try f.appendBlock();
+    const after = try f.appendBlock();
+    const discard = try f.appendBlockParam(entry, ptr_t);
+    try f.addAttr(.{ .value = discard }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "discard_fn",
+        .value = .flag,
+    } });
+    try f.appendVoidCallIndirect(entry, discard, &.{});
+    try f.setJump(entry, after, &.{});
+    const colour = try f.appendInst(after, u32_t, .{ .iconst = 0x00FF0000 });
+    const out = try colourOut(&f, after, 0);
+    try f.appendStore(after, colour, out);
+    f.setTerminator(after, .{ .ret = ir.function.Ret.none() });
+    var why: glacier.isel.Refusal = .{};
+    try std.testing.expectError(
+        error.Unsupported,
+        glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, why.reason, "discard whose block carries on") != null);
+}
