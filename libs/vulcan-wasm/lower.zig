@@ -1070,40 +1070,81 @@ fn memFill(l: *L) Error!void {
     l.block = cont;
 }
 
-/// memory.copy: a forward byte loop copying `size` bytes from `src` to `dest`. Forward-only,
-/// correct for disjoint regions and dest <= src. Overlapping dest > src is not handled yet
-/// (it would need a backward pass).
+/// memory.copy: a byte loop copying `size` bytes from `src` to `dest`, from the top down when the
+/// two overlap with `dest` above `src`.
+///
+/// The spec gives memory.copy the behaviour of memmove for every overlap, and clang lowers a C
+/// `memmove` straight to it. The direction is a runtime question, because `dest` and `src` are
+/// runtime values, so this is one compare outside two loops rather than a select inside one.
 fn memCopy(l: *L) Error!void {
     const i32t = l.i32_t;
     const i32u = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
-    const i8u = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
     const size = try l.pop();
     const src = try l.pop();
     const dest = try l.pop();
     const mem = l.mem_base orelse return error.InvalidWasm;
 
-    const header = try l.func.appendBlock();
-    const iv = try l.func.appendBlockParam(header, i32t);
-    const body = try l.func.appendBlock();
-    const jv = try l.func.appendBlockParam(body, i32t);
+    // Every block is made before the one they all leave through, because the backend's allocator
+    // wants the blocks in dominance order.
+    const down_head = try l.func.appendBlock();
+    const down_body = try l.func.appendBlock();
+    const up_head = try l.func.appendBlock();
+    const up_body = try l.func.appendBlock();
     const cont = try l.func.appendBlock();
 
+    const over = try l.func.appendInst(l.block, l.bool_as, .{
+        .icmp = .{ .op = .gt, .lhs = try l.coerce(dest, i32u), .rhs = try l.coerce(src, i32u) },
+    });
     const zero = try l.func.appendInst(l.block, i32t, .{ .iconst = 0 });
-    try l.func.setJump(l.block, header, &.{zero});
+    try l.func.appendIf(
+        l.block,
+        over,
+        .{ .target = down_head, .args = &.{zero} },
+        .{ .target = up_head, .args = &.{zero} },
+    );
 
-    l.block = header;
-    const cond = try l.func.appendInst(header, l.bool_as, .{ .icmp = .{ .op = .lt, .lhs = try l.coerce(iv, i32u), .rhs = try l.coerce(size, i32u) } });
-    try l.func.appendIf(header, cond, .{ .target = body, .args = &.{iv} }, .{ .target = cont, .args = &.{} });
-
-    l.block = body;
-    const saddr = try byteAddr(l, body, mem, src, jv);
-    const byte = try l.func.appendInst(body, i8u, .{ .load = .{ .ptr = saddr } });
-    const daddr = try byteAddr(l, body, mem, dest, jv);
-    try l.func.appendStore(body, byte, daddr);
-    const next = try l.func.appendArithImm(body, i32t, .add, jv, 1);
-    try l.func.setJump(body, header, &.{next});
+    try memCopyLoop(l, mem, dest, src, size, down_head, down_body, cont, true);
+    try memCopyLoop(l, mem, dest, src, size, up_head, up_body, cont, false);
 
     l.block = cont;
+}
+
+/// One direction of `memCopy`: `size` iterations, one byte each, leaving through `cont`. The step
+/// counts up either way and `down` only changes which byte it names.
+fn memCopyLoop(
+    l: *L,
+    mem: Value,
+    dest: Value,
+    src: Value,
+    size: Value,
+    head: Block,
+    body: Block,
+    cont: Block,
+    down: bool,
+) Error!void {
+    const i32t = l.i32_t;
+    const i32u = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i8u = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const iv = try l.func.appendBlockParam(head, i32t);
+    const jv = try l.func.appendBlockParam(body, i32t);
+
+    l.block = head;
+    const cond = try l.func.appendInst(head, l.bool_as, .{
+        .icmp = .{ .op = .lt, .lhs = try l.coerce(iv, i32u), .rhs = try l.coerce(size, i32u) },
+    });
+    try l.func.appendIf(head, cond, .{ .target = body, .args = &.{iv} }, .{ .target = cont, .args = &.{} });
+
+    l.block = body;
+    const at = if (down) blk: {
+        const last = try l.func.appendArithImm(body, i32t, .sub, size, 1);
+        break :blk try l.func.appendInst(body, i32t, .{ .arith = .{ .op = .sub, .lhs = last, .rhs = jv } });
+    } else jv;
+    const saddr = try byteAddr(l, body, mem, src, at);
+    const byte = try l.func.appendInst(body, i8u, .{ .load = .{ .ptr = saddr } });
+    const daddr = try byteAddr(l, body, mem, dest, at);
+    try l.func.appendStore(body, byte, daddr);
+    const next = try l.func.appendArithImm(body, i32t, .add, jv, 1);
+    try l.func.setJump(body, head, &.{next});
 }
 
 /// Advance past an opcode's immediates without decoding it, to skip unreachable code. The

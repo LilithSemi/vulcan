@@ -46,15 +46,28 @@ fn section(out: *std.ArrayList(u8), allocator: std.mem.Allocator, id: u8, conten
     try out.appendSlice(allocator, content);
 }
 
-/// Build a one-function module exporting `name`, with the given param/result
-/// valtypes and instruction `body` (the trailing `end` is added here). No extra
-/// locals. Caller owns the bytes.
+/// Build a one-function module exporting `name`, with the given param/result valtypes and
+/// instruction `body` (the trailing `end` is added here). No extra locals, and no memory.
+/// Caller owns the bytes.
 fn oneFunctionModule(
     allocator: std.mem.Allocator,
     params: []const u8,
     results: []const u8,
     body: []const u8,
     name: []const u8,
+) ![]u8 {
+    return oneFunctionMemoryModule(allocator, params, results, body, name, null);
+}
+
+/// `oneFunctionModule`, and with `pages` it declares a memory of that many pages, which a body
+/// that reaches memory needs.
+fn oneFunctionMemoryModule(
+    allocator: std.mem.Allocator,
+    params: []const u8,
+    results: []const u8,
+    body: []const u8,
+    name: []const u8,
+    pages: ?u32,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -78,6 +91,15 @@ fn oneFunctionModule(
     try lebU(&fn_sec, allocator, 0);
     try section(&out, allocator, 3, fn_sec.items);
 
+    // Memory section: one memory with only a minimum.
+    if (pages) |min| {
+        var mem: std.ArrayList(u8) = .empty;
+        defer mem.deinit(allocator);
+        try lebU(&mem, allocator, 1);
+        try mem.append(allocator, 0x00);
+        try lebU(&mem, allocator, min);
+        try section(&out, allocator, 5, mem.items);
+    }
     // Export section: name -> func 0.
     var ex: std.ArrayList(u8) = .empty;
     defer ex.deinit(allocator);
@@ -2648,4 +2670,32 @@ test "wasm target: int<->f16 conversions go through f32, bit-exact vs Zig casts"
         const want = @as(i32, @intFromFloat(@as(f16, @floatCast(hv))));
         try std.testing.expectEqual(want, got);
     }
+}
+
+/// Put 1, 2, 3, 4 in the first four bytes, `memory.copy(dest, src, 3)`, and read the word back.
+/// The wasm spec gives memory.copy the behaviour of memmove for every overlap, and clang lowers a
+/// C `memmove` straight to it.
+fn overlappingCopy(allocator: std.mem.Allocator, dest: u8, src: u8) !i32 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    for ([4]u8{ 1, 2, 3, 4 }, 0..) |value, at| {
+        try body.appendSlice(allocator, &.{ 0x41, @intCast(at), 0x41, value, 0x3A, 0x00, 0x00 });
+    }
+    try body.appendSlice(allocator, &.{ 0x41, dest, 0x41, src, 0x41, 3, 0xFC, 0x0A, 0x00, 0x00 });
+    try body.appendSlice(allocator, &.{ 0x41, 0x00, 0x28, 0x02, 0x00 });
+    const bytes = try oneFunctionMemoryModule(allocator, &.{}, &.{valtype_i32}, body.items, "test", 1);
+    defer allocator.free(bytes);
+    var inst = try wasm.Instance.instantiate(allocator, bytes, &.{});
+    defer inst.deinit();
+    return inst.call0(i32, "test");
+}
+
+test "wasm: memory.copy overlaps the way memmove does, in both directions" {
+    const allocator = std.testing.allocator;
+    // dest above src reads a byte it has already written if the loop runs forward, which smears
+    // the first byte over all four and gives 0x01010101.
+    try std.testing.expectEqual(@as(i32, 0x03020101), try overlappingCopy(allocator, 1, 0));
+    // dest below src is the other direction, and a loop that always ran backward would smear the
+    // last byte instead and give 0x04040404.
+    try std.testing.expectEqual(@as(i32, 0x04040302), try overlappingCopy(allocator, 0, 1));
 }
