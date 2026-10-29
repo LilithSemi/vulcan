@@ -56,11 +56,11 @@ fn oneFunctionModule(
     body: []const u8,
     name: []const u8,
 ) ![]u8 {
-    return oneFunctionMemoryModule(allocator, params, results, body, name, null);
+    return oneFunctionMemoryModule(allocator, params, results, body, name, null, null);
 }
 
 /// `oneFunctionModule`, and with `pages` it declares a memory of that many pages, which a body
-/// that reaches memory needs.
+/// that reaches memory needs. `max` gives the declared maximum, without which it cannot grow.
 fn oneFunctionMemoryModule(
     allocator: std.mem.Allocator,
     params: []const u8,
@@ -68,6 +68,7 @@ fn oneFunctionMemoryModule(
     body: []const u8,
     name: []const u8,
     pages: ?u32,
+    max: ?u32,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -96,8 +97,9 @@ fn oneFunctionMemoryModule(
         var mem: std.ArrayList(u8) = .empty;
         defer mem.deinit(allocator);
         try lebU(&mem, allocator, 1);
-        try mem.append(allocator, 0x00);
+        try mem.append(allocator, if (max == null) @as(u8, 0x00) else @as(u8, 0x01));
         try lebU(&mem, allocator, min);
+        if (max) |m| try lebU(&mem, allocator, m);
         try section(&out, allocator, 5, mem.items);
     }
     // Export section: name -> func 0.
@@ -2683,7 +2685,7 @@ fn overlappingCopy(allocator: std.mem.Allocator, dest: u8, src: u8) !i32 {
     }
     try body.appendSlice(allocator, &.{ 0x41, dest, 0x41, src, 0x41, 3, 0xFC, 0x0A, 0x00, 0x00 });
     try body.appendSlice(allocator, &.{ 0x41, 0x00, 0x28, 0x02, 0x00 });
-    const bytes = try oneFunctionMemoryModule(allocator, &.{}, &.{valtype_i32}, body.items, "test", 1);
+    const bytes = try oneFunctionMemoryModule(allocator, &.{}, &.{valtype_i32}, body.items, "test", 1, null);
     defer allocator.free(bytes);
     var inst = try wasm.Instance.instantiate(allocator, bytes, &.{});
     defer inst.deinit();
@@ -2714,7 +2716,7 @@ test "wasm: a store past the declared memory traps instead of reaching the host"
         try body.appendSlice(allocator, &at);
         try body.appendSlice(allocator, &.{ 0x41, 0x2A, 0x36, 0x02, 0x00 }); // i32.const 42, i32.store
         try body.appendSlice(allocator, &.{ 0x41, 0x07 }); // i32.const 7
-        const bytes = try oneFunctionMemoryModule(allocator, &.{}, &.{valtype_i32}, body.items, "test", 1);
+        const bytes = try oneFunctionMemoryModule(allocator, &.{}, &.{valtype_i32}, body.items, "test", 1, null);
         defer allocator.free(bytes);
         var inst = try wasm.Instance.instantiate(allocator, bytes, &.{});
         defer inst.deinit();
@@ -2803,4 +2805,49 @@ test "wasm: call_indirect checks the table index and the slot's type" {
         try std.testing.expectEqual(@as(i32, 0), try inst.call2(i32, i32, i32, "dispatch", 1, 5));
         try std.testing.expectEqual(@as(?u32, @backingInt(Trap.indirect_type_mismatch)), inst.takeTrap());
     }
+}
+
+/// Run `body` against a memory declared `min` pages, and `max` when given.
+fn growModule(allocator: std.mem.Allocator, body: []const u8, min: u32, max: ?u32) !struct { got: i32, trap: ?u32 } {
+    const bytes = try oneFunctionMemoryModule(allocator, &.{}, &.{valtype_i32}, body, "test", min, max);
+    defer allocator.free(bytes);
+    var inst = try wasm.Instance.instantiate(allocator, bytes, &.{});
+    defer inst.deinit();
+    return .{ .got = try inst.call0(i32, "test"), .trap = inst.trap() };
+}
+
+test "wasm: memory.grow moves the limit, and only inside the declared maximum" {
+    const allocator = std.testing.allocator;
+    const grow1 = [_]u8{ 0x41, 0x01, 0x40, 0x00 }; // memory.grow(1)
+    const size = [_]u8{ 0x3F, 0x00 }; // memory.size
+
+    // The answer is the page count BEFORE the grow, and the size moves after it.
+    try std.testing.expectEqual(@as(i32, 1), (try growModule(allocator, &grow1, 1, 3)).got);
+    try std.testing.expectEqual(@as(i32, 2), (try growModule(allocator, &(grow1 ++ [_]u8{0x1A} ++ size), 1, 3)).got);
+
+    // Past the declared maximum it changes nothing and answers -1.
+    const grow5 = [_]u8{ 0x41, 0x05, 0x40, 0x00, 0x1A } ++ size;
+    try std.testing.expectEqual(@as(i32, 2), (try growModule(allocator, &[_]u8{ 0x41, 0x01, 0x40, 0x00, 0x1A } ++ grow5, 1, 3)).got);
+    try std.testing.expectEqual(@as(i32, -1), (try growModule(allocator, &[_]u8{ 0x41, 0x05, 0x40, 0x00 }, 1, 3)).got);
+
+    // A maximum equal to the minimum cannot grow, which is what a fixed-heap artefact declares,
+    // and a module with no maximum at all cannot either.
+    try std.testing.expectEqual(@as(i32, -1), (try growModule(allocator, &grow1, 2, 2)).got);
+    try std.testing.expectEqual(@as(i32, -1), (try growModule(allocator, &grow1, 2, null)).got);
+}
+
+test "wasm: a page inside the capacity is still out of bounds until it is grown into" {
+    const allocator = std.testing.allocator;
+    // Address 65536 is page 1. The runtime allocated three pages up front so the memory never
+    // moves, so the bounds check has to read the LIVE size and not the capacity.
+    const store_page1 = [_]u8{ 0x41, 0x80, 0x80, 0x04, 0x41, 0x2A, 0x36, 0x02, 0x00 };
+    const load_page1 = [_]u8{ 0x41, 0x80, 0x80, 0x04, 0x28, 0x02, 0x00 };
+    const before = try growModule(allocator, &store_page1 ++ [_]u8{ 0x41, 0x07 }, 1, 3);
+    try std.testing.expectEqual(@as(?u32, @backingInt(wasm.Instance.TrapCode.memory_out_of_bounds)), before.trap);
+    try std.testing.expectEqual(@as(i32, 0), before.got);
+
+    // After the grow the same store lands, which proves the limit moved rather than the memory.
+    const after = try growModule(allocator, &[_]u8{ 0x41, 0x01, 0x40, 0x00, 0x1A } ++ store_page1 ++ load_page1, 1, 3);
+    try std.testing.expectEqual(@as(?u32, null), after.trap);
+    try std.testing.expectEqual(@as(i32, 42), after.got);
 }

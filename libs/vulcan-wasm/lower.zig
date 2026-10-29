@@ -48,6 +48,10 @@ pub const Module = struct {
     /// Whether the module declares a linear memory, and its initial size in pages.
     has_memory: bool = false,
     min_pages: u32 = 0,
+    /// The declared maximum in pages, when the module gives one. The runtime allocates this
+    /// much up front so a `memory.grow` never moves the memory, which would leave every
+    /// running function holding a stale base pointer.
+    max_pages: ?u32 = null,
     /// Whether functions take the hidden context pointer (any memory/globals/table/
     /// imports). The runtime must pass the context to exported calls iff this is set.
     needs_context: bool = false,
@@ -119,6 +123,7 @@ const Ctx = struct {
     /// hidden leading pointer parameter (the memory base), threaded through calls.
     has_memory: bool,
     min_pages: u32,
+    max_pages: ?u32,
     /// The value type of each global (for `global.get` load typing). When non-empty,
     /// every function takes a hidden "globals base" pointer (after the memory base).
     global_types: []const u8,
@@ -144,6 +149,7 @@ pub fn module(allocator: std.mem.Allocator, bytes: []const u8) Error!Module {
     defer exports.deinit(allocator);
     var has_memory = false;
     var min_pages: u32 = 0;
+    var max_pages: ?u32 = null;
     var global_types: std.ArrayList(u8) = .empty;
     defer global_types.deinit(allocator);
     var global_inits: std.ArrayList(GlobalInit) = .empty;
@@ -245,7 +251,7 @@ pub fn module(allocator: std.mem.Allocator, bytes: []const u8) Error!Module {
                     has_memory = true;
                     const flags = try s.byte();
                     min_pages = try s.u32leb();
-                    if (flags & 0x01 != 0) _ = try s.u32leb(); // max pages (ignored)
+                    if (flags & 0x01 != 0) max_pages = try s.u32leb();
                 }
             },
             9 => { // Element section (active, table 0, func indices)
@@ -319,6 +325,7 @@ pub fn module(allocator: std.mem.Allocator, bytes: []const u8) Error!Module {
         .exports = exports.items,
         .has_memory = has_memory,
         .min_pages = min_pages,
+        .max_pages = max_pages,
         .global_types = global_types.items,
         .has_table = has_table,
         .n_imports = n_imports,
@@ -371,7 +378,7 @@ pub fn module(allocator: std.mem.Allocator, bytes: []const u8) Error!Module {
         try list.append(allocator, .{ .name = name, .func = func });
     }
     const needs_context = has_memory or global_types.items.len > 0 or has_table or n_imports > 0;
-    return .{ .functions = try list.toOwnedSlice(allocator), .has_memory = has_memory, .min_pages = min_pages, .needs_context = needs_context, .globals = globals, .data = data, .table = table, .imports = imports, .func_type_idx = try allocator.dupe(u32, all_type_idx.items) };
+    return .{ .functions = try list.toOwnedSlice(allocator), .has_memory = has_memory, .min_pages = min_pages, .max_pages = max_pages, .needs_context = needs_context, .globals = globals, .data = data, .table = table, .imports = imports, .func_type_idx = try allocator.dupe(u32, all_type_idx.items) };
 }
 
 /// Evaluate a constant init expression (one numeric const, then `end`) to its raw
@@ -447,6 +454,10 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     const mem_size: ?Value = if (ctx.has_memory) try loadBase(&func, entry, u64_t, context.?, 40) else null;
     const table_len: ?Value = if (ctx.has_table) try loadBase(&func, entry, u64_t, context.?, 48) else null;
     const trap_fn: ?Value = if (ctx.has_memory or ctx.has_table) try loadBase(&func, entry, ptr_t, context.?, 56) else null;
+    // A module whose maximum is its minimum cannot grow, which is what a fixed-heap artefact
+    // declares, and it pays nothing for the checks being re-readable.
+    const growable = if (ctx.max_pages) |m| m > ctx.min_pages else false;
+    const cap_bytes: i64 = if (ctx.max_pages) |m| @as(i64, m) * 65536 else 0;
     const table_types: ?Value = if (ctx.has_table) try loadBase(&func, entry, ptr_t, context.?, 64) else null;
     var locals: std.ArrayList(Local) = .empty;
     defer locals.deinit(allocator);
@@ -486,7 +497,7 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     var stack: std.ArrayList(Value) = .empty;
     defer stack.deinit(allocator);
 
-    var l = L{ .func = &func, .block = entry, .stack = &stack, .allocator = allocator, .bool_as = i32s, .ptr_t = ptr_t, .i32_t = i32s, .mem_base = mem_base, .min_pages = ctx.min_pages, .globals_base = globals_base, .global_types = ctx.global_types, .table_base = table_base, .imports_base = imports_base, .import_ctx = import_ctx, .n_imports = ctx.n_imports, .context = context, .mem_size = mem_size, .table_len = table_len, .table_types = table_types, .trap_fn = trap_fn, .result_ty = if (ft.results.len == 0) null else try irType(&func, ft.results[0]) };
+    var l = L{ .func = &func, .block = entry, .stack = &stack, .allocator = allocator, .bool_as = i32s, .ptr_t = ptr_t, .i32_t = i32s, .mem_base = mem_base, .min_pages = ctx.min_pages, .globals_base = globals_base, .global_types = ctx.global_types, .table_base = table_base, .imports_base = imports_base, .import_ctx = import_ctx, .n_imports = ctx.n_imports, .context = context, .mem_size = mem_size, .table_len = table_len, .table_types = table_types, .trap_fn = trap_fn, .mem_growable = growable, .mem_cap_bytes = cap_bytes, .result_ty = if (ft.results.len == 0) null else try irType(&func, ft.results[0]) };
 
     // Structured control flow. Each block/loop/if pushes a `Frame`. `reachable` tracks
     // whether the current point is live. Dead code after an unconditional branch is not
@@ -752,14 +763,14 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
                     else => return error.Unsupported,
                 }
             },
-            0x3F => { // memory.size (fixed: the declared minimum)
+            0x3F => { // memory.size, in pages
                 _ = try c.byte();
-                try stack.append(allocator, try func.appendInst(l.block, i32s, .{ .iconst = l.min_pages }));
+                try stack.append(allocator, try memPages(&l));
             },
-            0x40 => { // memory.grow (unsupported growth: returns -1)
+            0x40 => { // memory.grow, which only moves the limit: see `memGrow`
                 _ = try c.byte();
-                _ = stack.pop() orelse return error.InvalidWasm;
-                try stack.append(allocator, try func.appendInst(l.block, i32s, .{ .iconst = -1 }));
+                const delta = stack.pop() orelse return error.InvalidWasm;
+                try stack.append(allocator, try memGrow(&l, delta));
             },
 
             else => return error.Unsupported,
@@ -972,6 +983,14 @@ const L = struct {
     table_len: ?Value = null,
     table_types: ?Value = null,
     trap_fn: ?Value = null,
+    /// Whether `memory.grow` can move the limit in this module, which decides where a bounds
+    /// check reads it. A module that cannot grow keeps the size the entry block loaded; one
+    /// that can has to read it again at every access, because a grow earlier in the same
+    /// function makes the entry value stale. See `memSize`.
+    mem_growable: bool = false,
+    /// The declared maximum in bytes, which is what a `memory.grow` may not pass. Only read
+    /// when `mem_growable` is set.
+    mem_cap_bytes: i64 = 0,
     /// This function's result type, which the trap block has to return. Null for a void result.
     result_ty: ?ir.types.Type = null,
     /// The block a failed check jumps to, made on first use. See `trapTarget`.
@@ -1057,6 +1076,63 @@ fn globalSet(l: *L, idx: u32) Error!void {
     try l.func.appendStore(l.block, try l.pop(), ptr);
 }
 
+/// `memory.size`: the live size in pages, which is the size in bytes divided by the page size.
+fn memPages(l: *L) Error!Value {
+    const u64_t = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const bytes = try memSize(l);
+    const pages = try l.func.appendArithImm(l.block, u64_t, .shr, bytes, 16);
+    return l.func.appendInst(l.block, l.i32_t, .{ .convert = .{ .value = pages } });
+}
+
+/// `memory.grow`: move the limit in the context by `delta` pages and answer the old page count, or
+/// answer -1 and change nothing.
+///
+/// The bytes never move, because the runtime allocated the declared maximum up front, so a
+/// function already running keeps a valid base pointer. A module that declares no maximum, or one
+/// whose maximum is its minimum, cannot grow at all and this is the constant -1 it was before.
+fn memGrow(l: *L, delta: Value) Error!Value {
+    if (!l.mem_growable) return l.func.appendInst(l.block, l.i32_t, .{ .iconst = -1 });
+    const ctx = l.context orelse return error.InvalidWasm;
+    const cap = l.mem_cap_bytes;
+    const u32_t = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const u64_t = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+
+    const have = try memSize(l);
+    const old = try l.func.appendArithImm(l.block, u64_t, .shr, have, 16);
+    const wide = try l.func.appendInst(l.block, u64_t, .{ .convert = .{ .value = try l.coerce(delta, u32_t) } });
+    // Both sides are at most 2^32 pages, so the shift and the add cannot wrap in 64 bits.
+    const added = try l.func.appendArithImm(l.block, u64_t, .shl, wide, 16);
+    const want = try l.func.appendInst(l.block, u64_t, .{ .arith = .{ .op = .add, .lhs = have, .rhs = added } });
+    const over = try l.func.appendInst(l.block, l.bool_as, .{ .icmp = .{ .op = .gt, .lhs = want, .rhs = try l.func.appendInst(l.block, u64_t, .{ .iconst = cap }) } });
+
+    const refuse = try l.func.appendBlock();
+    const accept = try l.func.appendBlock();
+    const after = try l.func.appendBlock();
+    const answer = try l.func.appendBlockParam(after, l.i32_t);
+    try l.func.appendIf(l.block, over, .{ .target = refuse, .args = &.{} }, .{ .target = accept, .args = &.{} });
+
+    const no = try l.func.appendInst(refuse, l.i32_t, .{ .iconst = -1 });
+    try l.func.setJump(refuse, after, &.{no});
+
+    const at = try l.func.appendArithImm(accept, l.ptr_t, .add, ctx, 40);
+    try l.func.appendStore(accept, want, at);
+    const yes = try l.func.appendInst(accept, l.i32_t, .{ .convert = .{ .value = old } });
+    try l.func.setJump(accept, after, &.{yes});
+
+    l.block = after;
+    return answer;
+}
+
+/// The declared memory size in bytes, where a bounds check reads it from. A growable module reads
+/// the context again, because a `memory.grow` earlier in this function moved it.
+fn memSize(l: *L) Error!Value {
+    if (!l.mem_growable) return l.mem_size orelse error.InvalidWasm;
+    const ctx = l.context orelse return error.InvalidWasm;
+    const u64_t = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const at = try l.func.appendArithImm(l.block, l.ptr_t, .add, ctx, 40);
+    return l.func.appendInst(l.block, u64_t, .{ .load = .{ .ptr = at } });
+}
+
 /// The one block a failed check in this function leaves through, made on first use.
 ///
 /// It takes the trap code as its parameter, so every check in the function shares it. The handler
@@ -1107,7 +1183,8 @@ fn accessBytes(func: *const Function, ty: ir.types.Type) u32 {
 /// through.
 fn memPtr(l: *L, addr: Value, offset: u32, size: u32) Error!Value {
     const base = l.mem_base orelse return error.InvalidWasm;
-    if (l.mem_size) |limit| {
+    if (l.mem_size != null) {
+        const limit = try memSize(l);
         const u32_t = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
         const u64_t = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
         const wide = try l.func.appendInst(l.block, u64_t, .{ .convert = .{ .value = try l.coerce(addr, u32_t) } });

@@ -85,7 +85,15 @@ pub const Instance = struct {
             mem_bytes = @max(mem_bytes, end);
         }
         if (mem_bytes > @as(usize, max_pages) * page_size) return error.InvalidWasm;
-        const memory = try allocator.alloc(u8, mem_bytes);
+        // The whole declared maximum is allocated up front, so a `memory.grow` only moves the
+        // limit in the context and never the memory: a function already running holds its base
+        // pointer in a register, and a reallocation that moved the bytes would leave it stale.
+        var cap_bytes = mem_bytes;
+        if (module.max_pages) |mp| {
+            if (mp < module.min_pages or mp > max_pages) return error.InvalidWasm;
+            cap_bytes = @max(cap_bytes, std.math.mul(usize, mp, page_size) catch return error.InvalidWasm);
+        }
+        const memory = try allocator.alloc(u8, cap_bytes);
         errdefer allocator.free(memory);
         @memset(memory, 0);
         for (module.data) |seg| @memcpy(memory[seg.offset..][0..seg.bytes.len], seg.bytes);
@@ -146,7 +154,7 @@ pub const Instance = struct {
                 @intFromPtr(table.ptr),
                 @intFromPtr(imports.ptr),
                 0,
-                memory.len,
+                mem_bytes,
                 table.len,
                 @intFromPtr(&trapHandler),
                 @intFromPtr(table_types.ptr),
