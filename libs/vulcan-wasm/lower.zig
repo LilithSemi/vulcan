@@ -70,6 +70,10 @@ pub const Module = struct {
     /// that calls an import takes a hidden "imports base" pointer to a buffer the
     /// runtime fills with the host address of each import.
     imports: [][]u8,
+    /// The type index of every function, imports first and then the defined ones, so a
+    /// `call_indirect` can be checked against the type the call names. The runtime turns
+    /// this into a type index per TABLE slot.
+    func_type_idx: []u32,
 
     pub fn deinit(self: *Module, allocator: std.mem.Allocator) void {
         for (self.functions) |*lf| {
@@ -83,11 +87,13 @@ pub const Module = struct {
         allocator.free(self.data);
         allocator.free(self.table);
         allocator.free(self.imports);
+        allocator.free(self.func_type_idx);
         self.functions = &.{};
         self.globals = &.{};
         self.data = &.{};
         self.table = &.{};
         self.imports = &.{};
+        self.func_type_idx = &.{};
     }
 
     pub fn find(self: *const Module, name: []const u8) ?*const Function {
@@ -365,7 +371,7 @@ pub fn module(allocator: std.mem.Allocator, bytes: []const u8) Error!Module {
         try list.append(allocator, .{ .name = name, .func = func });
     }
     const needs_context = has_memory or global_types.items.len > 0 or has_table or n_imports > 0;
-    return .{ .functions = try list.toOwnedSlice(allocator), .has_memory = has_memory, .min_pages = min_pages, .needs_context = needs_context, .globals = globals, .data = data, .table = table, .imports = imports };
+    return .{ .functions = try list.toOwnedSlice(allocator), .has_memory = has_memory, .min_pages = min_pages, .needs_context = needs_context, .globals = globals, .data = data, .table = table, .imports = imports, .func_type_idx = try allocator.dupe(u32, all_type_idx.items) };
 }
 
 /// Evaluate a constant init expression (one numeric const, then `end`) to its raw
@@ -441,6 +447,7 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     const mem_size: ?Value = if (ctx.has_memory) try loadBase(&func, entry, u64_t, context.?, 40) else null;
     const table_len: ?Value = if (ctx.has_table) try loadBase(&func, entry, u64_t, context.?, 48) else null;
     const trap_fn: ?Value = if (ctx.has_memory or ctx.has_table) try loadBase(&func, entry, ptr_t, context.?, 56) else null;
+    const table_types: ?Value = if (ctx.has_table) try loadBase(&func, entry, ptr_t, context.?, 64) else null;
     var locals: std.ArrayList(Local) = .empty;
     defer locals.deinit(allocator);
     var pvals: std.ArrayList(Value) = .empty;
@@ -479,7 +486,7 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     var stack: std.ArrayList(Value) = .empty;
     defer stack.deinit(allocator);
 
-    var l = L{ .func = &func, .block = entry, .stack = &stack, .allocator = allocator, .bool_as = i32s, .ptr_t = ptr_t, .i32_t = i32s, .mem_base = mem_base, .min_pages = ctx.min_pages, .globals_base = globals_base, .global_types = ctx.global_types, .table_base = table_base, .imports_base = imports_base, .import_ctx = import_ctx, .n_imports = ctx.n_imports, .context = context, .mem_size = mem_size, .table_len = table_len, .trap_fn = trap_fn, .result_ty = if (ft.results.len == 0) null else try irType(&func, ft.results[0]) };
+    var l = L{ .func = &func, .block = entry, .stack = &stack, .allocator = allocator, .bool_as = i32s, .ptr_t = ptr_t, .i32_t = i32s, .mem_base = mem_base, .min_pages = ctx.min_pages, .globals_base = globals_base, .global_types = ctx.global_types, .table_base = table_base, .imports_base = imports_base, .import_ctx = import_ctx, .n_imports = ctx.n_imports, .context = context, .mem_size = mem_size, .table_len = table_len, .table_types = table_types, .trap_fn = trap_fn, .result_ty = if (ft.results.len == 0) null else try irType(&func, ft.results[0]) };
 
     // Structured control flow. Each block/loop/if pushes a `Frame`. `reachable` tracks
     // whether the current point is live. Dead code after an unconditional branch is not
@@ -963,6 +970,7 @@ const L = struct {
     /// check that has no limit to compare against is not emitted.
     mem_size: ?Value = null,
     table_len: ?Value = null,
+    table_types: ?Value = null,
     trap_fn: ?Value = null,
     /// This function's result type, which the trap block has to return. Null for a void result.
     result_ty: ?ir.types.Type = null,
@@ -1481,6 +1489,33 @@ fn callIndirect(l: *L, ctx: Ctx, allocator: std.mem.Allocator, type_idx: u32) Er
     const base = l.table_base orelse return error.InvalidWasm;
 
     const elem = try l.pop();
+    // The index and the slot's type are both checked before the slot is read. Without the first,
+    // an index past the end reads a host pointer from past the table and calls it; without the
+    // second, a slot holding a function of another type is called with this call's arguments.
+    if (l.table_len) |limit| {
+        const u32_t = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const u64_t = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const wide = try l.func.appendInst(l.block, u64_t, .{ .convert = .{ .value = try l.coerce(elem, u32_t) } });
+        const over = try l.func.appendInst(l.block, l.bool_as, .{ .icmp = .{ .op = .ge, .lhs = wide, .rhs = limit } });
+        const code = try l.func.appendInst(l.block, l.i32_t, .{ .iconst = trap_table_out_of_bounds });
+        const trap = try trapTarget(l);
+        const ok = try l.func.appendBlock();
+        try l.func.appendIf(l.block, over, .{ .target = trap, .args = &.{code} }, .{ .target = ok, .args = &.{} });
+        l.block = ok;
+    }
+    if (l.table_types) |types_base| {
+        const u32_t = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const at = try l.func.appendArithImm(l.block, l.i32_t, .mul, elem, 4);
+        const where = try l.func.appendInst(l.block, l.ptr_t, .{ .arith = .{ .op = .add, .lhs = types_base, .rhs = at } });
+        const have = try l.func.appendInst(l.block, u32_t, .{ .load = .{ .ptr = where } });
+        const want = try l.func.appendInst(l.block, u32_t, .{ .iconst = @intCast(type_idx) });
+        const wrong = try l.func.appendInst(l.block, l.bool_as, .{ .icmp = .{ .op = .ne, .lhs = have, .rhs = want } });
+        const code = try l.func.appendInst(l.block, l.i32_t, .{ .iconst = trap_indirect_type_mismatch });
+        const trap = try trapTarget(l);
+        const ok = try l.func.appendBlock();
+        try l.func.appendIf(l.block, wrong, .{ .target = trap, .args = &.{code} }, .{ .target = ok, .args = &.{} });
+        l.block = ok;
+    }
     const scaled = try l.func.appendArithImm(l.block, l.i32_t, .mul, elem, 8);
     const slot = try l.func.appendInst(l.block, l.ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = scaled } });
     const target = try l.func.appendInst(l.block, l.ptr_t, .{ .load = .{ .ptr = slot } });

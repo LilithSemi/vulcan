@@ -2,13 +2,14 @@
 //! memory/globals/table/imports, and call its exports with a typed interface. Runnable
 //! layer over `lower.zig` and `vulcan-target.native` (host JIT).
 //!
-//! Lowered functions take one hidden "context" pointer to eight slots at fixed offsets:
+//! Lowered functions take one hidden "context" pointer to nine slots at fixed offsets:
 //! memory (0), globals (8), table (16), imports (24), an opaque import-context (32) that
 //! host imports receive as their hidden first argument, the memory size in bytes (40), the
-//! table length in elements (48), and the trap handler's address (56). `Instance` builds and
-//! owns that context; callers pass only the Wasm arguments. The import-context lets a
-//! host-import layer (e.g. WASI) reach per-instance state without a global, so multiple
-//! instances can run side by side. Set it with `setImportContext`.
+//! table length in elements (48), the trap handler's address (56), and a type index per table
+//! slot (64). `Instance` builds and owns that context; callers pass only the Wasm
+//! arguments. The import-context lets a host-import layer (e.g. WASI) reach per-instance
+//! state without a global, so multiple instances can run side by side. Set it with
+//! `setImportContext`.
 
 const std = @import("std");
 const lower = @import("lower.zig");
@@ -24,6 +25,10 @@ pub const default_provider = vt.jit_platform.default_provider;
 
 pub const page_size: usize = 65536;
 
+/// The type index a table slot holds when no element segment names it. No real type index
+/// reaches it, so a `call_indirect` through a null funcref is refused.
+const no_type: u32 = std.math.maxInt(u32);
+
 pub const Error = lower.Error || native.Error || error{ MissingExport, ImportCountMismatch };
 
 /// An instantiated module: JITed code plus its mutable state.
@@ -34,16 +39,19 @@ pub const Instance = struct {
     memory: []u8,
     globals: []i64,
     table: []usize,
+    /// The type index of whatever each table slot holds, parallel to `table`.
+    table_types: []u32,
     imports: []usize,
     /// What a lowered function reads through its hidden context pointer, by slot:
     /// 0 memory base, 1 globals base, 2 table base, 3 imports base, 4 import context,
-    /// 5 memory size in bytes, 6 table length in elements, 7 the trap handler's address.
+    /// 5 memory size in bytes, 6 table length in elements, 7 the trap handler's address,
+    /// 8 a type index per table slot.
     ///
     /// Slot 4 is an opaque per-instance pointer forwarded to host imports (see
     /// `setImportContext`); 0 until set. Slots 5 to 7 are what a bounds check reads: the
-    /// generated code compares against the size and calls the handler rather than reaching
+    /// generated code compares against the limit and calls the handler rather than reaching
     /// past the end. See `trap`.
-    context: [8]usize align(8),
+    context: [9]usize align(8),
     /// The code of the first trap since `takeTrap`, or null. See `trap`.
     trap_code: ?u32 = null,
 
@@ -100,16 +108,23 @@ pub const Instance = struct {
         // function in a module with no imports.
         const table = try allocator.alloc(usize, module.table.len);
         errdefer allocator.free(table);
+        // The type index of whatever each slot holds, which is what a `call_indirect`
+        // compares against the type the call names. A slot nothing names gets an index no
+        // call can name, so calling a null funcref is refused like a mismatch.
+        const table_types = try allocator.alloc(u32, module.table.len);
+        errdefer allocator.free(table_types);
         const n_imports = module.imports.len;
         for (module.table, 0..) |entry, t| {
             const fi: usize = entry orelse {
                 table[t] = 0;
+                table_types[t] = no_type;
                 continue;
             };
             if (fi < n_imports) return error.Unsupported;
             if (fi - n_imports >= module.functions.len) return error.InvalidWasm;
             const name = module.functions[fi - n_imports].name;
             table[t] = @intFromPtr(jitted.entry(*const fn () callconv(.c) void, name) orelse return error.MissingExport);
+            table_types[t] = module.func_type_idx[fi];
         }
 
         if (host_imports.len != module.imports.len) return error.ImportCountMismatch;
@@ -123,6 +138,7 @@ pub const Instance = struct {
             .memory = memory,
             .globals = globals,
             .table = table,
+            .table_types = table_types,
             .imports = imports,
             .context = .{
                 @intFromPtr(memory.ptr),
@@ -133,6 +149,7 @@ pub const Instance = struct {
                 memory.len,
                 table.len,
                 @intFromPtr(&trapHandler),
+                @intFromPtr(table_types.ptr),
             },
         };
     }
@@ -145,7 +162,7 @@ pub const Instance = struct {
     /// either way, and every later access traps too, so the host sees the trap by reading
     /// `trap` after the call rather than from where it happened.
     fn trapHandler(ctx: *anyopaque, code: u32) callconv(.c) void {
-        const slots: *[8]usize = @ptrCast(@alignCast(ctx));
+        const slots: *[9]usize = @ptrCast(@alignCast(ctx));
         const self: *Instance = @alignCast(@fieldParentPtr("context", slots));
         if (self.trap_code == null) self.trap_code = code;
     }
@@ -186,6 +203,7 @@ pub const Instance = struct {
         self.allocator.free(self.memory);
         self.allocator.free(self.globals);
         self.allocator.free(self.table);
+        self.allocator.free(self.table_types);
         self.allocator.free(self.imports);
     }
 

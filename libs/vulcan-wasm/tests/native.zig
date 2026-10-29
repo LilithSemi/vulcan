@@ -2730,3 +2730,77 @@ test "wasm: a store past the declared memory traps instead of reaching the host"
         }
     }
 }
+
+/// The `call_indirect` module from the table test above, with the element segment given, so a test
+/// can put a function of the wrong type in a slot. type0 = (i32)->i32, type1 = (i32,i32)->i32;
+/// func0 double, func1 triple, func2 dispatch(sel, x) = table[sel](x) naming type0.
+fn dispatchModule(allocator: std.mem.Allocator, elems: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, &.{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 });
+    try section(&out, allocator, 1, &.{ 0x02, 0x60, 0x01, 0x7F, 0x01, 0x7F, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F });
+    try section(&out, allocator, 3, &.{ 0x03, 0x00, 0x00, 0x01 });
+    try section(&out, allocator, 4, &.{ 0x01, 0x70, 0x00, 0x02 });
+    var ex: std.ArrayList(u8) = .empty;
+    defer ex.deinit(allocator);
+    try lebU(&ex, allocator, 1);
+    try lebU(&ex, allocator, "dispatch".len);
+    try ex.appendSlice(allocator, "dispatch");
+    try ex.append(allocator, 0x00);
+    try lebU(&ex, allocator, 2);
+    try section(&out, allocator, 7, ex.items);
+    var el: std.ArrayList(u8) = .empty;
+    defer el.deinit(allocator);
+    try el.appendSlice(allocator, &.{ 0x01, 0x00, 0x41, 0x00, 0x0B });
+    try lebU(&el, allocator, elems.len);
+    try el.appendSlice(allocator, elems);
+    try section(&out, allocator, 9, el.items);
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try lebU(&code, allocator, 3);
+    const bodies = [_][]const u8{
+        &.{ 0x00, 0x20, 0x00, 0x41, 0x02, 0x6C, 0x0B },
+        &.{ 0x00, 0x20, 0x00, 0x41, 0x03, 0x6C, 0x0B },
+        &.{ 0x00, 0x20, 0x01, 0x20, 0x00, 0x11, 0x00, 0x00, 0x0B },
+    };
+    for (bodies) |b| {
+        try lebU(&code, allocator, b.len);
+        try code.appendSlice(allocator, b);
+    }
+    try section(&out, allocator, 10, code.items);
+    return out.toOwnedSlice(allocator);
+}
+
+test "wasm: call_indirect checks the table index and the slot's type" {
+    const allocator = std.testing.allocator;
+    const Trap = wasm.Instance.TrapCode;
+    {
+        // The table holds double and triple, both of the type the call names.
+        const bytes = try dispatchModule(allocator, &.{ 0x00, 0x01 });
+        defer allocator.free(bytes);
+        var inst = try wasm.Instance.instantiate(allocator, bytes, &.{});
+        defer inst.deinit();
+        try std.testing.expectEqual(@as(i32, 10), try inst.call2(i32, i32, i32, "dispatch", 0, 5));
+        try std.testing.expectEqual(@as(?u32, null), inst.trap());
+
+        // One past the end of a two-entry table read a host pointer from past the table and
+        // called it, which is a call to an arbitrary address rather than a crash.
+        try std.testing.expectEqual(@as(i32, 0), try inst.call2(i32, i32, i32, "dispatch", 2, 5));
+        try std.testing.expectEqual(@as(?u32, @backingInt(Trap.table_out_of_bounds)), inst.takeTrap());
+
+        // A negative index is a huge one unsigned, so the compare has to be unsigned.
+        try std.testing.expectEqual(@as(i32, 0), try inst.call2(i32, i32, i32, "dispatch", -1, 5));
+        try std.testing.expectEqual(@as(?u32, @backingInt(Trap.table_out_of_bounds)), inst.takeTrap());
+    }
+    {
+        // Slot 1 holds dispatch, which is (i32, i32) -> i32, where the call names (i32) -> i32.
+        const bytes = try dispatchModule(allocator, &.{ 0x00, 0x02 });
+        defer allocator.free(bytes);
+        var inst = try wasm.Instance.instantiate(allocator, bytes, &.{});
+        defer inst.deinit();
+        try std.testing.expectEqual(@as(i32, 10), try inst.call2(i32, i32, i32, "dispatch", 0, 5));
+        try std.testing.expectEqual(@as(?u32, null), inst.trap());
+        try std.testing.expectEqual(@as(i32, 0), try inst.call2(i32, i32, i32, "dispatch", 1, 5));
+        try std.testing.expectEqual(@as(?u32, @backingInt(Trap.indirect_type_mismatch)), inst.takeTrap());
+    }
+}
