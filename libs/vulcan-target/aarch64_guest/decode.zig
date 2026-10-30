@@ -1,8 +1,10 @@
 //! AArch64 instruction classification; encoding masks live only here.
 
 pub const Error = error{UnsupportedInstruction};
+
+const simd = @import("simd.zig");
 pub const Width = enum(u8) { w32 = 32, x64 = 64 };
-pub const Size = enum(u8) { byte = 1, half = 2, word = 4, double = 8 };
+pub const Size = enum(u8) { byte = 1, half = 2, word = 4, double = 8, quad = 16 };
 /// How a load extends the bytes it read into its register: not at all, to 32 bits
 /// (a `W` destination, whose upper half is then zero), or to the whole 64. Named
 /// here because the decoder and the run loop that performs the load must agree.
@@ -46,6 +48,8 @@ pub const Memory = struct {
     /// For a load, whether the value read is sign-extended as it is put in the
     /// register, and to which width: `LDRSB`, `LDRSH` and `LDRSW`.
     signed: SignExtend = .none,
+    /// Whether `rt` names a SIMD and floating point register instead of a general one.
+    vector: bool = false,
 };
 /// A load or store of two adjacent registers. The pair is presented to the
 /// memory system as two accesses of one element each, so the second register
@@ -60,6 +64,8 @@ pub const Pair = struct {
     rt2: u5,
     addressing: Addressing,
     signed: SignExtend = .none,
+    /// Whether `rt` and `rt2` name SIMD and floating point registers.
+    vector: bool = false,
 };
 /// A product, optionally added to or subtracted from an accumulator. Register 31
 /// as the accumulator means there is none, which is how `MUL` and `MNEG` are
@@ -94,7 +100,7 @@ pub const MultiplyHigh = struct { signed: bool, rn: u5, rm: u5, rd: u5 };
 /// widths into a general register are decoded. The sign-extending word load needs
 /// an extension the run loop does not perform on a load, the prefetch is a hint,
 /// and the SIMD form is another register file.
-pub const Literal = struct { size: Size, rt: u5, offset: i64 };
+pub const Literal = struct { size: Size, rt: u5, offset: i64, vector: bool = false };
 /// A load-exclusive or a store-exclusive: `LDXR` and `STXR` at all four sizes, with
 /// the acquire and release variants `LDAXR` and `STLXR`, which order memory and so
 /// mean nothing on a coherent machine with one CPU. A store-exclusive reports in
@@ -336,6 +342,8 @@ pub const Bitfield = struct {
     len: u7,
 };
 pub const Instruction = union(enum) {
+    /// A SIMD or floating point instruction, which `simd.zig` knows how to lift.
+    simd: simd.Op,
     movz: Wide,
     movn: Wide,
     movk: Wide,
@@ -397,7 +405,7 @@ pub const Instruction = union(enum) {
 
     pub fn terminates(self: Instruction) bool {
         return switch (self) {
-            .movz, .movn, .movk, .arith_imm, .arith_reg, .arith_ext, .arith_carry, .logic_reg, .logic_imm, .csel, .cond_compare, .variable, .unary, .bitfield, .extract, .mul, .mul_long, .mul_high, .adr, .system, .cache_op, .clrex, .nop, .dsb, .dmb, .sev, .sevl, .yield => false,
+            .movz, .movn, .movk, .arith_imm, .arith_reg, .arith_ext, .arith_carry, .logic_reg, .logic_imm, .csel, .cond_compare, .variable, .unary, .bitfield, .extract, .mul, .mul_long, .mul_high, .adr, .system, .cache_op, .clrex, .nop, .dsb, .dmb, .sev, .sevl, .yield, .simd => false,
             .memory, .exclusive, .literal, .pair, .b, .b_cond, .test_branch, .call, .indirect, .svc, .psci, .wfi, .wfe, .trap, .isb, .dc_zva, .eret, .tlbi => true,
         };
     }
@@ -592,6 +600,45 @@ fn bitfield(word: u32) Error!Instruction {
         .lsb = @intCast(if (extract) immr else bits - immr),
         .len = if (extract) imms - immr + 1 else imms + 1,
     } };
+}
+
+/// The address of a load or store of one register, in all four of its forms. It does not depend on
+/// whether the register is a general one or a vector one; the size of the access does.
+fn singleAddressing(word: u32, size: Size) Error!Addressing {
+    return if ((word & 0x0100_0000) != 0) blk: {
+        // Here bits 11:10 belong to the twelve-bit immediate rather than
+        // choosing a form, so the whole field is the offset.
+        break :blk .{ .offset = @intCast(@as(u64, (word >> 10) & 0xfff) * @backingInt(size)) };
+    } else if ((word & 0x0020_0000) != 0) blk: {
+        // The offset is a register, and bits 11:10 being `10` is what says so. The
+        // option field says how it is extended, and the `S` bit whether it is scaled.
+        if ((word & 0x0000_0c00) != 0x0000_0800) return error.UnsupportedInstruction;
+        // Four of the eight options are allocated for an index: the 32-bit ones,
+        // zero- or sign-extended, and the 64-bit ones, of which `lsl` is UXTX.
+        const extend: Extend = switch ((word >> 13) & 7) {
+            2 => .uxtw,
+            3 => .uxtx,
+            6 => .sxtw,
+            7 => .sxtx,
+            else => return error.UnsupportedInstruction,
+        };
+        // The `S` bit says the index is scaled by the size of the access, so the
+        // shift is the log2 of that size (2 for a word, 3 for a doubleword), not a
+        // constant. Without it there is no shift at all.
+        const scaled = (word & 0x0000_1000) != 0;
+        break :blk .{ .register = .{
+            .rm = @truncate(word >> 16),
+            .extend = extend,
+            .amount = if (scaled) @intCast(@ctz(@backingInt(size))) else 0,
+        } };
+    } else switch ((word >> 10) & 3) {
+        // `2` is the unprivileged form (LDTR/STTR), which Linux uses for user memory. It
+        // addresses like the unscaled form. Its access is not yet checked as EL0.
+        0, 2 => .{ .offset = signExtend9(word) },
+        1 => .{ .post_index = signExtend9(word) },
+        3 => .{ .pre_index = signExtend9(word) },
+        else => unreachable, // masked to two bits above
+    };
 }
 
 pub fn decode(word: u32) Error!Instruction {
@@ -836,6 +883,67 @@ pub fn decode(word: u32) Error!Instruction {
         if (load and rs != 31) return error.UnsupportedInstruction;
         return .{ .exclusive = .{ .op = if (load) .load else .store, .size = size, .rn = rn, .rt = rt, .rs = rs } };
     }
+    // The SIMD and floating point loads and stores of one register. They share every
+    // addressing form with the general ones. The size is the two bits at 31:30, except
+    // that a 128-bit access has size 0 and the top bit of `opc` set, which is why `opc`
+    // above 1 is a quad here and a sign extension in the general class.
+    if ((word & 0x3f00_0000) == 0x3d00_0000 or (word & 0x3f00_0000) == 0x3c00_0000) {
+        const opc = (word >> 22) & 3;
+        const size: Size = if (opc >= 2)
+            (if ((word >> 30) == 0) .quad else return error.UnsupportedInstruction)
+        else
+            @fromBackingInt(@intCast(@as(u8, 1) << @intCast(word >> 30)));
+        return .{ .memory = .{
+            .op = if (opc & 1 == 0) .store else .load,
+            .size = size,
+            .rn = @truncate(word >> 5),
+            .rt = @truncate(word),
+            .addressing = try singleAddressing(word, size),
+            .vector = true,
+        } };
+    }
+    // The pair forms, and the literal form, of the same registers.
+    if ((word & 0x3e00_0000) == 0x2c00_0000) {
+        const opc: u2 = @truncate(word >> 30);
+        const size: Size = switch (opc) {
+            0 => .word,
+            1 => .double,
+            2 => .quad,
+            else => return error.UnsupportedInstruction,
+        };
+        const scale: i64 = @backingInt(size);
+        const raw: i7 = @bitCast(@as(u7, @truncate(word >> 15)));
+        const displacement = @as(i64, raw) * scale;
+        const addressing: Addressing = switch ((word >> 23) & 7) {
+            0, 2 => .{ .offset = displacement },
+            3 => .{ .pre_index = displacement },
+            1 => .{ .post_index = displacement },
+            else => return error.UnsupportedInstruction,
+        };
+        return .{ .pair = .{
+            .op = if ((word & 0x0040_0000) != 0) .load else .store,
+            .size = size,
+            .rn = @truncate(word >> 5),
+            .rt = @truncate(word),
+            .rt2 = @truncate(word >> 10),
+            .addressing = addressing,
+            .vector = true,
+        } };
+    }
+    if ((word & 0x3f00_0000) == 0x1c00_0000) {
+        const size: Size = switch (word >> 30) {
+            0 => .word,
+            1 => .double,
+            2 => .quad,
+            else => return error.UnsupportedInstruction,
+        };
+        return .{ .literal = .{
+            .size = size,
+            .rt = @truncate(word),
+            .offset = @as(i64, @as(i19, @bitCast(@as(u19, @truncate(word >> 5))))) << 2,
+            .vector = true,
+        } };
+    }
     // The load and store class for one register, in all four of its addressing
     // forms. Bit 24 picks the scaled twelve-bit offset from the rest, and within
     // those bit 21 picks a register offset, leaving the three immediate forms to
@@ -856,40 +964,7 @@ pub fn decode(word: u32) Error!Instruction {
             3 => if (size == .byte or size == .half) .to32 else return error.UnsupportedInstruction,
             else => unreachable,
         };
-        const addressing: Addressing = if ((word & 0x0100_0000) != 0) blk: {
-            // Here bits 11:10 belong to the twelve-bit immediate rather than
-            // choosing a form, so the whole field is the offset.
-            break :blk .{ .offset = @intCast(@as(u64, (word >> 10) & 0xfff) * @backingInt(size)) };
-        } else if ((word & 0x0020_0000) != 0) blk: {
-            // The offset is a register, and bits 11:10 being `10` is what says so. The
-            // option field says how it is extended, and the `S` bit whether it is scaled.
-            if ((word & 0x0000_0c00) != 0x0000_0800) return error.UnsupportedInstruction;
-            // Four of the eight options are allocated for an index: the 32-bit ones,
-            // zero- or sign-extended, and the 64-bit ones, of which `lsl` is UXTX.
-            const extend: Extend = switch ((word >> 13) & 7) {
-                2 => .uxtw,
-                3 => .uxtx,
-                6 => .sxtw,
-                7 => .sxtx,
-                else => return error.UnsupportedInstruction,
-            };
-            // The `S` bit says the index is scaled by the size of the access, so the
-            // shift is the log2 of that size (2 for a word, 3 for a doubleword), not a
-            // constant. Without it there is no shift at all.
-            const scaled = (word & 0x0000_1000) != 0;
-            break :blk .{ .register = .{
-                .rm = @truncate(word >> 16),
-                .extend = extend,
-                .amount = if (scaled) @intCast(@ctz(@backingInt(size))) else 0,
-            } };
-        } else switch ((word >> 10) & 3) {
-            // `2` is the unprivileged form (LDTR/STTR), which Linux uses for user memory. It
-            // addresses like the unscaled form. Its access is not yet checked as EL0.
-            0, 2 => .{ .offset = signExtend9(word) },
-            1 => .{ .post_index = signExtend9(word) },
-            3 => .{ .pre_index = signExtend9(word) },
-            else => unreachable, // masked to two bits above
-        };
+        const addressing = try singleAddressing(word, size);
         return .{ .memory = .{
             .op = if (opc == 0) .store else .load,
             .size = size,
@@ -1208,6 +1283,7 @@ pub fn decode(word: u32) Error!Instruction {
         0xd400_0001 => .svc,
         0xd400_0002 => .psci,
         0xd503_207f => .wfi,
-        else => error.UnsupportedInstruction,
+        // What is left is the SIMD and floating point classes, or nothing at all.
+        else => .{ .simd = try simd.parse(word) },
     };
 }

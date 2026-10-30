@@ -6,13 +6,20 @@ const decode = @import("decode.zig");
 pub const Cpu = extern struct {
     x: [31]u64 = @splat(0),
     sp: u64 = 0,
+    /// The SIMD and floating point registers, each as its low and high 64 bits. A scalar view
+    /// of one is its low bytes, and writing a scalar zeroes the rest of the register.
+    v: [32][2]u64 = @splat(.{ 0, 0 }),
     pc: u64 = 0,
     /// NZCV, packed as in PSTATE: N at bit 31, Z at 30, C at 29, V at 28.
     flags: u32 = 0,
     trap: Trap = .none,
     address: u64 = 0,
     value: u64 = 0,
+    /// The upper half of a 128-bit store, and of the second access of a pair of them.
+    value_hi: u64 = 0,
     width: u8 = 0,
+    /// The register a load fills. 0 to 30 is a general register and 31 is none. 32 and up is
+    /// vector register `dest - 32`, which is how an access says which file it belongs to.
     dest: u8 = 0,
     /// Whether the load `trap` describes sign-extends what it reads, and to what width.
     /// The run loop consumes it when the load completes, which may be after a device has
@@ -40,6 +47,7 @@ pub const Cpu = extern struct {
     second_pending: bool = false,
     second_address: u64 = 0,
     second_value: u64 = 0,
+    second_value_hi: u64 = 0,
     second_width: u8 = 0,
     second_dest: u8 = 0,
     /// Whether the second half of a pair sign-extends what it reads. Only `LDPSW`

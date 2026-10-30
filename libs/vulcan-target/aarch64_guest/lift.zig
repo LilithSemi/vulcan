@@ -13,6 +13,7 @@ const ir = @import("vulcan-ir");
 const Cpu = @import("cpu.zig").Cpu;
 const Decode = @import("decode.zig");
 const Identification = @import("identification.zig");
+const simd = @import("simd.zig");
 
 pub const Error = std.mem.Allocator.Error || Decode.Error || error{ UnsupportedInstruction, EmptyBlock };
 
@@ -287,16 +288,17 @@ pub fn region(func: *Function, guest_pc: u64, bytes: []const u8) Error!void {
                 const result = try func.appendInst(entry, ty, .{ .select = .{ .cond = cond, .then = lhs, .@"else" = alternative } });
                 if (select.rd != 31) try storeReg(func, entry, cpu_ptr, select.rd, result, u64_t, ptr_t);
             },
+            .simd => |op| {
+                const context = try simd.Context.init(func, entry, cpu_ptr);
+                try simd.emit(&context, op);
+            },
             .memory => |mem| {
                 const address = try computeAddress(func, entry, cpu_ptr, mem.rn, mem.addressing, u64_t, u8_t, ptr_t);
                 try storeField(func, entry, cpu_ptr, @offsetOf(Cpu, "address"), address, u64_t, ptr_t);
                 try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "width"), @backingInt(mem.size), u8_t, u64_t, ptr_t);
-                try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "dest"), mem.rt, u8_t, u64_t, ptr_t);
+                try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "dest"), accessDest(mem.rt, mem.vector), u8_t, u64_t, ptr_t);
                 if (mem.signed != .none) try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "load_signed"), @backingInt(mem.signed), u8_t, u64_t, ptr_t);
-                if (mem.op == .store) {
-                    const value = if (mem.rt == 31) try func.appendInst(entry, u64_t, .{ .iconst = 0 }) else try loadReg(func, entry, cpu_ptr, mem.rt, u64_t, u64_t, ptr_t);
-                    try storeField(func, entry, cpu_ptr, @offsetOf(Cpu, "value"), value, u64_t, ptr_t);
-                }
+                if (mem.op == .store) try storeValue(func, entry, cpu_ptr, "value", "value_hi", mem.rt, mem.vector, mem.size, u64_t, ptr_t);
                 const trap: Cpu.Trap = if (mem.op == .store) .store else .load;
                 try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "trap"), @backingInt(trap), u8_t, u64_t, ptr_t);
                 const next = try func.appendInst(entry, u64_t, .{ .iconst = @bitCast(pc +% 4) });
@@ -308,7 +310,7 @@ pub fn region(func: *Function, guest_pc: u64, bytes: []const u8) Error!void {
                 const address = try func.appendInst(entry, u64_t, .{ .iconst = @bitCast(pc +% @as(u64, @bitCast(load.offset))) });
                 try storeField(func, entry, cpu_ptr, @offsetOf(Cpu, "address"), address, u64_t, ptr_t);
                 try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "width"), @backingInt(load.size), u8_t, u64_t, ptr_t);
-                try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "dest"), load.rt, u8_t, u64_t, ptr_t);
+                try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "dest"), accessDest(load.rt, load.vector), u8_t, u64_t, ptr_t);
                 try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "trap"), @backingInt(Cpu.Trap.load), u8_t, u64_t, ptr_t);
                 const next = try func.appendInst(entry, u64_t, .{ .iconst = @bitCast(pc +% 4) });
                 func.setTerminator(entry, .{ .ret = ir.function.Ret.one(next) });
@@ -344,24 +346,18 @@ pub fn region(func: *Function, guest_pc: u64, bytes: []const u8) Error!void {
                 const address = try computeAddress(func, entry, cpu_ptr, mem.rn, mem.addressing, u64_t, u8_t, ptr_t);
                 try storeField(func, entry, cpu_ptr, @offsetOf(Cpu, "address"), address, u64_t, ptr_t);
                 try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "width"), @backingInt(mem.size), u8_t, u64_t, ptr_t);
-                try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "dest"), mem.rt, u8_t, u64_t, ptr_t);
+                try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "dest"), accessDest(mem.rt, mem.vector), u8_t, u64_t, ptr_t);
                 if (mem.signed != .none) try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "load_signed"), @backingInt(mem.signed), u8_t, u64_t, ptr_t);
-                if (mem.op == .store) {
-                    const value = if (mem.rt == 31) try func.appendInst(entry, u64_t, .{ .iconst = 0 }) else try loadReg(func, entry, cpu_ptr, mem.rt, u64_t, u64_t, ptr_t);
-                    try storeField(func, entry, cpu_ptr, @offsetOf(Cpu, "value"), value, u64_t, ptr_t);
-                }
+                if (mem.op == .store) try storeValue(func, entry, cpu_ptr, "value", "value_hi", mem.rt, mem.vector, mem.size, u64_t, ptr_t);
                 // The second access. Its value is read from the register now, but
                 // the access itself waits, so that a load cannot write its
                 // destination before the first half has been delivered.
                 const second_address = try func.appendArithImm(entry, u64_t, .add, address, @backingInt(mem.size));
                 try storeField(func, entry, cpu_ptr, @offsetOf(Cpu, "second_address"), second_address, u64_t, ptr_t);
                 try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "second_width"), @backingInt(mem.size), u8_t, u64_t, ptr_t);
-                try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "second_dest"), mem.rt2, u8_t, u64_t, ptr_t);
+                try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "second_dest"), accessDest(mem.rt2, mem.vector), u8_t, u64_t, ptr_t);
                 if (mem.signed != .none) try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "second_signed"), @backingInt(mem.signed), u8_t, u64_t, ptr_t);
-                if (mem.op == .store) {
-                    const value = if (mem.rt2 == 31) try func.appendInst(entry, u64_t, .{ .iconst = 0 }) else try loadReg(func, entry, cpu_ptr, mem.rt2, u64_t, u64_t, ptr_t);
-                    try storeField(func, entry, cpu_ptr, @offsetOf(Cpu, "second_value"), value, u64_t, ptr_t);
-                }
+                if (mem.op == .store) try storeValue(func, entry, cpu_ptr, "second_value", "second_value_hi", mem.rt2, mem.vector, mem.size, u64_t, ptr_t);
                 try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "second_pending"), 1, u8_t, u64_t, ptr_t);
                 const trap: Cpu.Trap = if (mem.op == .store) .store else .load;
                 try storeFieldConst(func, entry, cpu_ptr, @offsetOf(Cpu, "trap"), @backingInt(trap), u8_t, u64_t, ptr_t);
@@ -635,7 +631,32 @@ fn setLogicFlags(
     try storeField(func, block, cpu_ptr, @offsetOf(Cpu, "flags"), flags, u64_t, ptr_t);
 }
 
-fn loadRegOrZero(func: *Function, block: ir.function.Block, cpu_ptr: Value, reg: u32, ty: ir.types.Type, u64_t: ir.types.Type, ptr_t: ir.types.Type) Error!Value {
+/// What the `dest` of an access holds for a register of either file.
+fn accessDest(reg: u5, vector: bool) u64 {
+    return if (vector) 32 + @as(u64, reg) else reg;
+}
+
+/// The offset of the low half of vector register `reg`, or of its high half.
+fn vectorAt(reg: u5, half: usize) usize {
+    return @offsetOf(Cpu, "v") + @as(usize, reg) * 16 + half * 8;
+}
+
+/// Put the datum of a store where the run loop reads it. A 128-bit store has a second half.
+fn storeValue(func: *Function, block: ir.function.Block, cpu_ptr: Value, comptime lo_field: []const u8, comptime hi_field: []const u8, reg: u5, vector: bool, size: Decode.Size, u64_t: ir.types.Type, ptr_t: ir.types.Type) Error!void {
+    if (vector) {
+        const lo = try loadField(func, block, cpu_ptr, vectorAt(reg, 0), u64_t, ptr_t);
+        try storeField(func, block, cpu_ptr, @offsetOf(Cpu, lo_field), lo, u64_t, ptr_t);
+        if (size == .quad) {
+            const hi = try loadField(func, block, cpu_ptr, vectorAt(reg, 1), u64_t, ptr_t);
+            try storeField(func, block, cpu_ptr, @offsetOf(Cpu, hi_field), hi, u64_t, ptr_t);
+        }
+        return;
+    }
+    const value = if (reg == 31) try func.appendInst(block, u64_t, .{ .iconst = 0 }) else try loadReg(func, block, cpu_ptr, reg, u64_t, u64_t, ptr_t);
+    try storeField(func, block, cpu_ptr, @offsetOf(Cpu, lo_field), value, u64_t, ptr_t);
+}
+
+pub fn loadRegOrZero(func: *Function, block: ir.function.Block, cpu_ptr: Value, reg: u32, ty: ir.types.Type, u64_t: ir.types.Type, ptr_t: ir.types.Type) std.mem.Allocator.Error!Value {
     if (reg != 31) return loadReg(func, block, cpu_ptr, reg, ty, u64_t, ptr_t);
     return func.appendInst(block, ty, .{ .iconst = 0 });
 }
@@ -822,7 +843,7 @@ fn packFlags(func: *Function, block: ir.function.Block, flags: struct { n: Value
 /// The condition codes as A64 numbers them, read out of the stored flags. The
 /// composite codes are their architectural definitions rather than shorthand:
 /// `hi` is `c && !z`, and the signed comparisons are `n` differing from `v`.
-fn conditionValue(func: *Function, block: ir.function.Block, cpu_ptr: Value, cond: Decode.Condition, u32_t: ir.types.Type, bool_t: ir.types.Type, ptr_t: ir.types.Type) Error!Value {
+pub fn conditionValue(func: *Function, block: ir.function.Block, cpu_ptr: Value, cond: Decode.Condition, u32_t: ir.types.Type, bool_t: ir.types.Type, ptr_t: ir.types.Type) Error!Value {
     const flags = try loadField(func, block, cpu_ptr, @offsetOf(Cpu, "flags"), u32_t, ptr_t);
     const zero = try func.appendInst(block, u32_t, .{ .iconst = 0 });
     const read = struct {
@@ -1029,7 +1050,7 @@ fn loadReg(func: *Function, block: ir.function.Block, cpu_ptr: Value, reg: u32, 
     return func.appendInst(block, ty, .{ .convert = .{ .value = full } });
 }
 
-fn storeReg(func: *Function, block: ir.function.Block, cpu_ptr: Value, reg: u32, value: Value, u64_t: ir.types.Type, ptr_t: ir.types.Type) std.mem.Allocator.Error!void {
+pub fn storeReg(func: *Function, block: ir.function.Block, cpu_ptr: Value, reg: u32, value: Value, u64_t: ir.types.Type, ptr_t: ir.types.Type) std.mem.Allocator.Error!void {
     const address = try regAddress(func, block, cpu_ptr, reg, u64_t, ptr_t);
     const value_ty = func.valueType(value);
     const full = if (value_ty == u64_t) value else try func.appendInst(block, u64_t, .{ .convert = .{ .value = value } });
