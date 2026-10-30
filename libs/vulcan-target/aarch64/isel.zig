@@ -1469,7 +1469,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         const el = try ctx.loadOp(allocator, &code, s.@"else", scratch_imm);
                         const rd = ctx.resultReg(result);
                         try code.append(allocator, encode.cmp(c, .zr));
-                        try code.append(allocator, encode.csel(rd, tr, el, .ne));
+                        // A 64-bit result needs the 64-bit form: `csel w` would zero the top half.
+                        try code.append(allocator, if (isWide(func, result)) encode.csel64(rd, tr, el, .ne) else encode.csel(rd, tr, el, .ne));
                         try storeResult(allocator, &code, ctx, result, rd);
                     }
                 },

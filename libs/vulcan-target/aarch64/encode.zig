@@ -569,6 +569,11 @@ pub fn csel(rd: Reg, rn: Reg, rm: Reg, cond: Cond) u32 {
     return 0x1A800000 | (n(rm) << 16) | (@as(u32, @backingInt(cond)) << 12) | (n(rn) << 5) | n(rd);
 }
 
+/// `csel xd, xn, xm, cond` (64-bit): xd = cond ? xn : xm. The 32-bit form zeroes the top half.
+pub fn csel64(rd: Reg, rn: Reg, rm: Reg, cond: Cond) u32 {
+    return sf64 | csel(rd, rn, rm, cond);
+}
+
 // FP register operands are also indices 0..31, naming v0..v31 (s/d/h views). The scalar
 // FP encodings carry a 2-bit `ftype` field at bits [23:22] selecting the operand precision.
 
