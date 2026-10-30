@@ -17,6 +17,7 @@ const ir = @import("vulcan-ir");
 const Cpu = @import("cpu.zig").Cpu;
 const Decode = @import("decode.zig");
 const lift = @import("lift.zig");
+const vector = @import("vector.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -33,8 +34,13 @@ pub const Precision = enum(u2) {
     fn bytes(self: Precision) u8 {
         return if (self == .single) 4 else 8;
     }
+
+    pub fn bytesPublic(self: Precision) u8 {
+        return self.bytes();
+    }
 };
 
+pub const Format = enum { half, single, double };
 pub const Binary = enum { mul, div, add, sub, max, min, maxnm, minnm, nmul };
 pub const Unary = enum { mov, abs, neg, sqrt, rint_nearest, rint_up, rint_down, rint_zero };
 pub const Fused = enum { madd, msub, nmadd, nmsub };
@@ -51,8 +57,8 @@ pub const Op = union(enum) {
     fp_binary: struct { op: Binary, precision: Precision, rd: u5, rn: u5, rm: u5 },
     /// `FMOV`, `FABS`, `FNEG`, `FSQRT` and `FRINT*` between registers of one precision.
     fp_unary: struct { op: Unary, precision: Precision, rd: u5, rn: u5 },
-    /// `FCVT` between single and double.
-    fp_convert: struct { from: Precision, rd: u5, rn: u5 },
+    /// `FCVT` between half, single and double.
+    fp_convert: struct { from: Format, to: Format, rd: u5, rn: u5 },
     /// `FMADD`, `FMSUB`, `FNMADD` and `FNMSUB`: `Ra` plus or minus the product of `Rn` and `Rm`.
     fp_fused: struct { op: Fused, precision: Precision, rd: u5, rn: u5, rm: u5, ra: u5 },
     /// `FCMP` and `FCMPE`, against a register or against zero.
@@ -89,6 +95,8 @@ pub const Op = union(enum) {
     mov_to_gpr: struct { signed: bool, size: u2, index: u4, wide: bool, rd: u5, rn: u5 },
     /// `MOVI`, `MVNI`, `ORR` and `BIC` with an immediate, and the `FMOV` of a vector constant.
     modified_immediate: struct { kind: ImmediateKind, q: bool, rd: u5, imm64: u64 },
+    /// Everything else in Advanced SIMD that is decoded.
+    vector: vector.Op,
 };
 
 pub const ImmediateKind = enum { movi, orr, bic };
@@ -204,9 +212,22 @@ pub fn parse(word: u32) Error!Op {
                     };
                     return .{ .fp_unary = .{ .op = op, .precision = precision, .rd = rd, .rn = rn } };
                 },
-                // To single from double, and to double from single.
-                4 => if (ftype == 1) return .{ .fp_convert = .{ .from = .double, .rd = rd, .rn = rn } },
-                5 => if (ftype == 0) return .{ .fp_convert = .{ .from = .single, .rd = rd, .rn = rn } },
+                // The destination is in the opcode and the source in `ftype`; they must differ.
+                4, 5, 7 => {
+                    const from: Format = switch (ftype) {
+                        0 => .single,
+                        1 => .double,
+                        3 => .half,
+                        else => return error.UnsupportedInstruction,
+                    };
+                    const to: Format = switch (opcode) {
+                        4 => .single,
+                        5 => .double,
+                        else => .half,
+                    };
+                    if (from == to) return error.UnsupportedInstruction;
+                    return .{ .fp_convert = .{ .from = from, .to = to, .rd = rd, .rn = rn } };
+                },
                 else => {},
             }
             return error.UnsupportedInstruction;
@@ -272,7 +293,7 @@ pub fn parse(word: u32) Error!Op {
         } };
     }
     // Advanced SIMD three same: `0 Q U 01110 size 1 Rm opcode 1 Rn Rd`.
-    if ((word & 0x9f20_0400) == 0x0e20_0400) return threeSame(word);
+    if ((word & 0x9f20_0400) == 0x0e20_0400) return threeSame(word) catch |err| return vectorOr(word, err);
     // Advanced SIMD copy: `0 Q op 01110000 imm5 0 imm4 1 Rn Rd`.
     if ((word & 0x9fe0_8400) == 0x0e00_0400) return copy(word);
     // Advanced SIMD modified immediate: `0 Q op 0111100000 abc cmode o2 1 defgh Rd`.
@@ -289,7 +310,13 @@ pub fn parse(word: u32) Error!Op {
             .imm64 = result.value,
         } };
     }
-    return error.UnsupportedInstruction;
+    return vectorOr(word, error.UnsupportedInstruction);
+}
+
+/// Hand a word the first decoder did not know to the second, keeping the first's reason if the
+/// second does not know it either.
+fn vectorOr(word: u32, first: Error) Error!Op {
+    return .{ .vector = vector.parse(word) catch return first };
 }
 
 fn floatInteger(word: u32) Error!Op {
@@ -431,6 +458,7 @@ pub const Context = struct {
     i16_t: Type,
     i32_t: Type,
     i64_t: Type,
+    f16_t: Type,
     f32_t: Type,
     f64_t: Type,
     bool_t: Type,
@@ -450,6 +478,7 @@ pub const Context = struct {
             .i16_t = try t.intern(.{ .int = .{ .signedness = .signed, .bits = 16 } }),
             .i32_t = try t.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }),
             .i64_t = try t.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } }),
+            .f16_t = try t.intern(.{ .float = .f16 }),
             .f32_t = try t.intern(.{ .float = .f32 }),
             .f64_t = try t.intern(.{ .float = .f64 }),
             .bool_t = try t.intern(.bool),
@@ -457,7 +486,14 @@ pub const Context = struct {
         };
     }
 
-    fn uint(self: *const Context, size: u2) Type {
+    /// A value of a signed lane type as the unsigned one of the same width, which is how lanes are
+    /// stored. A value that is already unsigned is returned as it is.
+    pub fn convertBack(self: *const Context, ty: Type, value: Value) std.mem.Allocator.Error!Value {
+        if (self.func.valueType(value) == ty) return value;
+        return self.convert(ty, value);
+    }
+
+    pub fn uint(self: *const Context, size: u2) Type {
         return switch (size) {
             0 => self.u8_t,
             1 => self.u16_t,
@@ -466,7 +502,7 @@ pub const Context = struct {
         };
     }
 
-    fn sint(self: *const Context, size: u2) Type {
+    pub fn sint(self: *const Context, size: u2) Type {
         return switch (size) {
             0 => self.i8_t,
             1 => self.i16_t,
@@ -475,51 +511,51 @@ pub const Context = struct {
         };
     }
 
-    fn float(self: *const Context, precision: Precision) Type {
+    pub fn float(self: *const Context, precision: Precision) Type {
         return if (precision == .single) self.f32_t else self.f64_t;
     }
 
-    fn unsignedOf(self: *const Context, precision: Precision) Type {
+    pub fn unsignedOf(self: *const Context, precision: Precision) Type {
         return if (precision == .single) self.u32_t else self.u64_t;
     }
 
-    fn constant(self: *const Context, ty: Type, value: u64) std.mem.Allocator.Error!Value {
+    pub fn constant(self: *const Context, ty: Type, value: u64) std.mem.Allocator.Error!Value {
         return self.func.appendInst(self.block, ty, .{ .iconst = @bitCast(value) });
     }
 
-    fn arith(self: *const Context, ty: Type, op: ir.function.BinOp, lhs: Value, rhs: Value) std.mem.Allocator.Error!Value {
+    pub fn arith(self: *const Context, ty: Type, op: ir.function.BinOp, lhs: Value, rhs: Value) std.mem.Allocator.Error!Value {
         return self.func.appendInst(self.block, ty, .{ .arith = .{ .op = op, .lhs = lhs, .rhs = rhs } });
     }
 
-    fn compare(self: *const Context, op: ir.function.CmpOp, lhs: Value, rhs: Value) std.mem.Allocator.Error!Value {
+    pub fn compare(self: *const Context, op: ir.function.CmpOp, lhs: Value, rhs: Value) std.mem.Allocator.Error!Value {
         return self.func.appendInst(self.block, self.bool_t, .{ .icmp = .{ .op = op, .lhs = lhs, .rhs = rhs } });
     }
 
-    fn select(self: *const Context, ty: Type, cond: Value, then: Value, otherwise: Value) std.mem.Allocator.Error!Value {
+    pub fn select(self: *const Context, ty: Type, cond: Value, then: Value, otherwise: Value) std.mem.Allocator.Error!Value {
         return self.func.appendInst(self.block, ty, .{ .select = .{ .cond = cond, .then = then, .@"else" = otherwise } });
     }
 
-    fn convert(self: *const Context, ty: Type, value: Value) std.mem.Allocator.Error!Value {
+    pub fn convert(self: *const Context, ty: Type, value: Value) std.mem.Allocator.Error!Value {
         return self.func.appendInst(self.block, ty, .{ .convert = .{ .value = value } });
     }
 
-    fn reinterpret(self: *const Context, ty: Type, value: Value) std.mem.Allocator.Error!Value {
+    pub fn reinterpret(self: *const Context, ty: Type, value: Value) std.mem.Allocator.Error!Value {
         return self.func.appendInst(self.block, ty, .{ .unary = .{ .op = .reinterpret, .value = value } });
     }
 
-    fn unary(self: *const Context, ty: Type, op: ir.function.UnaryOp, value: Value) std.mem.Allocator.Error!Value {
+    pub fn unary(self: *const Context, ty: Type, op: ir.function.UnaryOp, value: Value) std.mem.Allocator.Error!Value {
         return self.func.appendInst(self.block, ty, .{ .unary = .{ .op = op, .value = value } });
     }
 
     /// Lane `lane` of register `reg`, which is `1 << size` bytes wide, as an integer of `ty`.
-    fn load(self: *const Context, reg: u5, byte: usize, ty: Type) std.mem.Allocator.Error!Value {
+    pub fn load(self: *const Context, reg: u5, byte: usize, ty: Type) std.mem.Allocator.Error!Value {
         const at = @offsetOf(Cpu, "v") + @as(usize, reg) * 16 + byte;
         const delta = try self.constant(self.u64_t, at);
         const address = try self.arith(self.ptr_t, .add, self.cpu_ptr, delta);
         return self.func.appendInst(self.block, ty, .{ .load = .{ .ptr = address } });
     }
 
-    fn store(self: *const Context, reg: u5, byte: usize, value: Value) std.mem.Allocator.Error!void {
+    pub fn store(self: *const Context, reg: u5, byte: usize, value: Value) std.mem.Allocator.Error!void {
         const at = @offsetOf(Cpu, "v") + @as(usize, reg) * 16 + byte;
         const delta = try self.constant(self.u64_t, at);
         const address = try self.arith(self.ptr_t, .add, self.cpu_ptr, delta);
@@ -527,7 +563,7 @@ pub const Context = struct {
     }
 
     /// Zero the bytes of register `reg` from `from` up to its top.
-    fn clearFrom(self: *const Context, reg: u5, from: usize) std.mem.Allocator.Error!void {
+    pub fn clearFrom(self: *const Context, reg: u5, from: usize) std.mem.Allocator.Error!void {
         var at = from;
         if (at == 4) {
             try self.store(reg, 4, try self.constant(self.u32_t, 0));
@@ -539,27 +575,27 @@ pub const Context = struct {
     }
 
     /// The scalar view of register `reg`, as the bits of a float of `precision`.
-    fn scalar(self: *const Context, reg: u5, precision: Precision) std.mem.Allocator.Error!Value {
+    pub fn scalar(self: *const Context, reg: u5, precision: Precision) std.mem.Allocator.Error!Value {
         return self.load(reg, 0, self.unsignedOf(precision));
     }
 
-    fn floatOf(self: *const Context, reg: u5, precision: Precision) std.mem.Allocator.Error!Value {
+    pub fn floatOf(self: *const Context, reg: u5, precision: Precision) std.mem.Allocator.Error!Value {
         return self.reinterpret(self.float(precision), try self.scalar(reg, precision));
     }
 
     /// Write a scalar result: the bits in the bottom of the register and zero above them.
-    fn putScalar(self: *const Context, reg: u5, precision: Precision, bits_value: Value) std.mem.Allocator.Error!void {
+    pub fn putScalar(self: *const Context, reg: u5, precision: Precision, bits_value: Value) std.mem.Allocator.Error!void {
         try self.store(reg, 0, bits_value);
         try self.clearFrom(reg, precision.bytes());
     }
 
-    fn putFloat(self: *const Context, reg: u5, precision: Precision, value: Value) std.mem.Allocator.Error!void {
+    pub fn putFloat(self: *const Context, reg: u5, precision: Precision, value: Value) std.mem.Allocator.Error!void {
         try self.putScalar(reg, precision, try self.reinterpret(self.unsignedOf(precision), value));
     }
 
     /// Whether a float is a NaN, decided on its bits. Comparing a value with itself is the usual
     /// test and the optimizer folds it away as always equal, which is right for integers.
-    fn isNan(self: *const Context, value: Value, precision: Precision) std.mem.Allocator.Error!Value {
+    pub fn isNan(self: *const Context, value: Value, precision: Precision) std.mem.Allocator.Error!Value {
         const int_ty = self.unsignedOf(precision);
         const magnitude: u64 = if (precision == .single) 0x7fff_ffff else 0x7fff_ffff_ffff_ffff;
         const infinity: u64 = if (precision == .single) 0x7f80_0000 else 0x7ff0_0000_0000_0000;
@@ -600,9 +636,30 @@ pub fn emit(c: *const Context, op: Op) !void {
         .fp_binary => |b| try binary(c, b.op, b.precision, b.rd, b.rn, b.rm),
         .fp_unary => |u| try unaryOp(c, u.op, u.precision, u.rd, u.rn),
         .fp_convert => |v| {
-            const to: Precision = if (v.from == .single) .double else .single;
-            const source = try c.floatOf(v.rn, v.from);
-            try c.putFloat(v.rd, to, try c.convert(c.float(to), source));
+            switch (v.to) {
+                .half => {
+                    const half = if (v.from == .single) try singleToHalf(c, try c.load(v.rn, 0, c.u32_t)) else try doubleToHalf(c, try c.load(v.rn, 0, c.u64_t));
+                    try c.store(v.rd, 0, half);
+                    try c.store(v.rd, 2, try c.constant(c.u16_t, 0));
+                    try c.clearFrom(v.rd, 4);
+                },
+                .single => {
+                    if (v.from == .half) {
+                        const wide = try c.convert(c.u32_t, try c.load(v.rn, 0, c.u16_t));
+                        try c.putScalar(v.rd, .single, try halfToSingle(c, wide));
+                    } else {
+                        try c.putFloat(v.rd, .single, try c.convert(c.f32_t, try c.floatOf(v.rn, .double)));
+                    }
+                },
+                .double => {
+                    if (v.from == .half) {
+                        const wide = try c.convert(c.u32_t, try c.load(v.rn, 0, c.u16_t));
+                        try c.putScalar(v.rd, .double, try halfToDouble(c, wide));
+                    } else {
+                        try c.putFloat(v.rd, .double, try c.convert(c.f64_t, try c.floatOf(v.rn, .single)));
+                    }
+                },
+            }
         },
         .fp_fused => |f| try fused(c, f.op, f.precision, f.rd, f.rn, f.rm, f.ra),
         .fp_compare => |f| {
@@ -681,6 +738,7 @@ pub fn emit(c: *const Context, op: Op) !void {
             }
         },
         .modified_immediate => |v| try modified(c, v.kind, v.q, v.rd, v.imm64),
+        .vector => |v| try vector.emit(c, v),
     }
 }
 
@@ -702,7 +760,7 @@ fn binary(c: *const Context, op: Binary, precision: Precision, rd: u5, rn: u5, r
 /// `FMAX` and friends. A NaN in either operand gives a NaN, a signalling one before a quiet one and
 /// the first operand before the second, quieted. The `NM` forms prefer a number to a quiet NaN.
 /// Plus zero is greater than minus zero, which a compare cannot see, so ties are settled on the bits.
-fn minMax(c: *const Context, op: Binary, ty: Type, precision: Precision, lhs_in: Value, rhs_in: Value) !Value {
+pub fn minMax(c: *const Context, op: Binary, ty: Type, precision: Precision, lhs_in: Value, rhs_in: Value) !Value {
     const want_max = op == .max or op == .maxnm;
     const prefer_number = op == .maxnm or op == .minnm;
     const int_ty = c.unsignedOf(precision);
@@ -936,4 +994,110 @@ fn modified(c: *const Context, kind: ImmediateKind, q: bool, rd: u5, pattern: u6
         try c.store(rd, at, result);
     }
     if (!q) try c.store(rd, 8, try c.constant(c.u64_t, 0));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Half precision
+//
+// The host's half precision type is not used: an f16 in the IR is a widened single on some
+// targets, so the bits of one cannot be moved through it. The conversions are done on the bits.
+// ---------------------------------------------------------------------------------------------
+
+fn pickBits(c: *const Context, ty: Type, cond: Value, then: Value, otherwise: Value) !Value {
+    return c.select(ty, cond, then, otherwise);
+}
+
+/// The single precision bits of the half precision value in the low 16 bits of `half`.
+pub fn halfToSingle(c: *const Context, half: Value) !Value {
+    const t = c.u32_t;
+    const sign = try c.arith(t, .shl, try c.arith(t, .bit_and, half, try c.constant(t, 0x8000)), try c.constant(t, 16));
+    const exponent = try c.arith(t, .bit_and, try c.arith(t, .shr, half, try c.constant(t, 10)), try c.constant(t, 0x1f));
+    const fraction = try c.arith(t, .bit_and, half, try c.constant(t, 0x3ff));
+    const zero = try c.constant(t, 0);
+    // A normal number: rebias the exponent and widen the fraction.
+    const normal = try c.arith(t, .bit_or, try c.arith(t, .shl, try c.arith(t, .add, exponent, try c.constant(t, 112)), try c.constant(t, 23)), try c.arith(t, .shl, fraction, try c.constant(t, 13)));
+    // Infinity and NaN: all ones exponent, with a NaN made quiet.
+    const special_fraction = try c.arith(t, .bit_or, try c.arith(t, .shl, fraction, try c.constant(t, 13)), try c.select(t, try c.compare(.ne, fraction, zero), try c.constant(t, 0x40_0000), zero));
+    const special = try c.arith(t, .bit_or, try c.constant(t, 0x7f80_0000), special_fraction);
+    // A subnormal is the fraction times two to the minus twenty-four, which a single holds exactly.
+    const scale = try c.func.appendInst(c.block, c.f32_t, .{ .fconst = 5.9604644775390625e-08 });
+    const subnormal = try c.reinterpret(t, try c.arith(c.f32_t, .mul, try c.convert(c.f32_t, fraction), scale));
+    var result = normal;
+    result = try c.select(t, try c.compare(.eq, exponent, zero), subnormal, result);
+    result = try c.select(t, try c.compare(.eq, exponent, try c.constant(t, 31)), special, result);
+    return c.arith(t, .bit_or, result, sign);
+}
+
+/// The double precision bits of a half precision value, through the single.
+pub fn halfToDouble(c: *const Context, half: Value) !Value {
+    const single = try c.reinterpret(c.f32_t, try halfToSingle(c, half));
+    // A NaN keeps its payload through the widening because the conversion preserves it.
+    return c.reinterpret(c.u64_t, try c.convert(c.f64_t, single));
+}
+
+/// Round the significand of a float to a half. `bits` is the width of the source, 32 or 64.
+fn toHalf(c: *const Context, comptime source_bits: u7, value_bits: Value) !Value {
+    const t = if (source_bits == 32) c.u32_t else c.u64_t;
+    const fraction_bits: u7 = if (source_bits == 32) 23 else 52;
+    const bias_difference: u64 = if (source_bits == 32) 112 else 1008;
+    const exponent_mask: u64 = if (source_bits == 32) 0xff else 0x7ff;
+    const fraction_mask: u64 = (@as(u64, 1) << fraction_bits) - 1;
+    const drop: u64 = fraction_bits - 10;
+    const k = struct {
+        fn n(ctx: *const Context, ty: Type, v: u64) !Value {
+            return ctx.constant(ty, v);
+        }
+    }.n;
+    const sign = try c.convert(c.u32_t, try c.arith(t, .bit_and, try c.arith(t, .shr, value_bits, try k(c, t, source_bits - 16)), try k(c, t, 0x8000)));
+    const exponent = try c.arith(t, .bit_and, try c.arith(t, .shr, value_bits, try k(c, t, fraction_bits)), try k(c, t, exponent_mask));
+    const fraction = try c.arith(t, .bit_and, value_bits, try k(c, t, fraction_mask));
+    // Everything below is done in the source width; the result is cut to 16 bits at the end.
+    const u = c.u32_t;
+    const he = try c.arith(t, .sub, exponent, try k(c, t, bias_difference));
+    const he_signed = try c.convert(c.i32_t, he);
+    const normal = he_signed;
+    _ = normal;
+    // Normal range: half exponent 1 to 30 before rounding.
+    const half_normal = try c.convert(u, try c.arith(t, .bit_or, try c.arith(t, .shl, he, try k(c, t, 10)), try c.arith(t, .shr, fraction, try k(c, t, drop))));
+    const round_bit_n = try c.convert(u, try c.arith(t, .bit_and, try c.arith(t, .shr, fraction, try k(c, t, drop - 1)), try k(c, t, 1)));
+    const sticky_n = try c.compare(.ne, try c.arith(t, .bit_and, fraction, try k(c, t, (@as(u64, 1) << @intCast(drop - 1)) - 1)), try k(c, t, 0));
+    const one = try c.constant(u, 1);
+    const zero = try c.constant(u, 0);
+    const up_n = try c.arith(c.bool_t, .bit_and, try c.compare(.ne, round_bit_n, zero), try c.arith(c.bool_t, .bit_or, sticky_n, try c.compare(.ne, try c.arith(u, .bit_and, half_normal, one), zero)));
+    const rounded_normal = try c.select(u, up_n, try c.arith(u, .add, half_normal, one), half_normal);
+    // Subnormal range: the significand with its hidden bit, shifted right by `14 - he` (or the
+    // same count in the double case) and rounded.
+    const significand = try c.arith(t, .bit_or, fraction, try k(c, t, @as(u64, 1) << @intCast(fraction_bits)));
+    const shift_wide = try c.arith(t, .sub, try k(c, t, if (source_bits == 32) 126 else 1051), exponent);
+    const too_small = try c.compare(.gt, shift_wide, try k(c, t, if (source_bits == 32) 25 else 54));
+    const shift = try c.select(t, too_small, try k(c, t, 1), shift_wide);
+    const half_sub = try c.convert(u, try c.arith(t, .shr, significand, shift));
+    const round_sub = try c.convert(u, try c.arith(t, .bit_and, try c.arith(t, .shr, significand, try c.arith(t, .sub, shift, try k(c, t, 1))), try k(c, t, 1)));
+    const lower = try c.arith(t, .sub, try c.arith(t, .shl, try k(c, t, 1), try c.arith(t, .sub, shift, try k(c, t, 1))), try k(c, t, 1));
+    const sticky_s = try c.compare(.ne, try c.arith(t, .bit_and, significand, lower), try k(c, t, 0));
+    const up_s = try c.arith(c.bool_t, .bit_and, try c.compare(.ne, round_sub, zero), try c.arith(c.bool_t, .bit_or, sticky_s, try c.compare(.ne, try c.arith(u, .bit_and, half_sub, one), zero)));
+    const rounded_sub = try c.select(u, up_s, try c.arith(u, .add, half_sub, one), half_sub);
+    const subnormal = try c.select(u, too_small, zero, rounded_sub);
+    // Classify by the source exponent.
+    const is_special = try c.compare(.eq, exponent, try k(c, t, exponent_mask));
+    const is_small = try c.compare(.le, try c.convert(c.i64_t, exponent), try c.constant(c.i64_t, @intCast(bias_difference)));
+    const overflow = try c.compare(.ge, he, try k(c, t, 31));
+    const infinity = try c.constant(u, 0x7c00);
+    var magnitude = rounded_normal;
+    magnitude = try c.select(u, overflow, infinity, magnitude);
+    magnitude = try c.select(u, is_small, subnormal, magnitude);
+    // Infinity, and a NaN made quiet with the top of its payload kept.
+    const payload = try c.convert(u, try c.arith(t, .shr, fraction, try k(c, t, drop)));
+    const is_nan = try c.compare(.ne, fraction, try k(c, t, 0));
+    const special = try c.select(u, is_nan, try c.arith(u, .bit_or, try c.constant(u, 0x7e00), payload), infinity);
+    magnitude = try c.select(u, is_special, special, magnitude);
+    return c.convert(c.u16_t, try c.arith(u, .bit_or, magnitude, sign));
+}
+
+pub fn singleToHalf(c: *const Context, bits_value: Value) !Value {
+    return toHalf(c, 32, bits_value);
+}
+
+pub fn doubleToHalf(c: *const Context, bits_value: Value) !Value {
+    return toHalf(c, 64, bits_value);
 }
