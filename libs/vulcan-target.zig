@@ -10,7 +10,6 @@ pub const x86 = @import("vulcan-target/x86.zig");
 pub const x86_64 = @import("vulcan-target/x86_64.zig");
 pub const nvidia = @import("vulcan-target/nvidia.zig");
 pub const glacier = @import("vulcan-target/glacier.zig");
-pub const aarch64_guest = @import("vulcan-target/aarch64_guest.zig");
 pub const wasm = @import("vulcan-target/wasm.zig");
 
 /// Portable C99 source backend: lowers an IR function to equivalent C.

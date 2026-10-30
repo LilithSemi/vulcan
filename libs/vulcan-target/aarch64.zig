@@ -1,5 +1,11 @@
 //! AArch64 (A64) target: encoding and codegen. Bring-up in progress. Host is
 //! aarch64, so generated code is validated by native in-process execution.
+//!
+//! It is also an instruction set to run: `decode` and `lift` turn the words of an AArch64 guest
+//! into IR over a `GuestCpu`, the way `glacier.lift` does for Glacier kernels, so a host of any
+//! architecture can compile and run that guest. Everything about the guest side is in `decode`,
+//! `lift`, `simd`, `vector`, `identification` and `cpu`; the rest of this directory emits code
+//! for an AArch64 host.
 
 const std = @import("std");
 
@@ -10,6 +16,13 @@ pub const peephole = @import("aarch64/peephole.zig");
 pub const link = @import("aarch64/link.zig");
 pub const object = @import("aarch64/object.zig");
 pub const jit = @import("aarch64/jit.zig");
+
+// The guest side.
+pub const decode = @import("aarch64/decode.zig");
+pub const identification = @import("aarch64/identification.zig");
+pub const lift = @import("aarch64/lift.zig");
+/// The state of one guest cpu, as lifted code addresses it.
+pub const GuestCpu = @import("aarch64/cpu.zig").Cpu;
 
 /// Execution-test runners, one per backend (see each file). Skip when the
 /// backend is unavailable or incompatible.
