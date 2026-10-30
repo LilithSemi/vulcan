@@ -142,6 +142,9 @@ pub const SystemRegister = enum {
     cntvct_el0,
     cntv_ctl_el0,
     cntv_cval_el0,
+    /// `CNTV_TVAL_EL0`: the compare as a signed 32-bit distance from the counter, which is how a
+    /// kernel arms the timer. It has no storage of its own.
+    cntv_tval_el0,
     tpidr_el1,
     mdscr_el1,
     cntkctl_el1,
@@ -521,6 +524,7 @@ fn systemRegister(op1: u3, crn: u4, crm: u4, op2: u3) Error!SystemRegister {
         0x3e02 => .cntvct_el0,
         0x3e31 => .cntv_ctl_el0,
         0x3e32 => .cntv_cval_el0,
+        0x3e30 => .cntv_tval_el0,
         0x0d04 => .tpidr_el1,
         0x0022 => .mdscr_el1,
         0x0104 => .oslar_el1,

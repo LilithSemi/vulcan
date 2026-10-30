@@ -226,6 +226,24 @@ pub fn region(func: *Function, guest_pc: u64, bytes: []const u8) Error!void {
                         const masks = try func.appendArithImm(entry, u64_t, .bit_and, try func.appendArithImm(entry, u64_t, .shr, from, 6), 0xf);
                         try storeField(func, entry, cpu_ptr, at, masks, u64_t, ptr_t);
                     }
+                } else if (sys.register == .cntv_tval_el0) {
+                    // The compare relative to the counter, as a signed 32-bit number. The
+                    // counter is the one the block is running with, so it is read as it stands.
+                    const at = @offsetOf(Cpu, "system");
+                    const counter = try loadField(func, entry, cpu_ptr, at + @offsetOf(Cpu.System, "cntvct_el0"), u64_t, ptr_t);
+                    const cval_at = at + @offsetOf(Cpu.System, "cntv_cval_el0");
+                    if (sys.read) {
+                        const compare = try loadField(func, entry, cpu_ptr, cval_at, u64_t, ptr_t);
+                        const distance = try func.appendInst(entry, u64_t, .{ .arith = .{ .op = .sub, .lhs = compare, .rhs = counter } });
+                        try storeReg(func, entry, cpu_ptr, sys.rt, try func.appendArithImm(entry, u64_t, .bit_and, distance, 0xffff_ffff), u64_t, ptr_t);
+                    } else {
+                        const from = try loadRegOrZero(func, entry, cpu_ptr, sys.rt, u32_t, u64_t, ptr_t);
+                        const signed32 = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+                        const signed64 = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+                        const extended = try func.appendInst(entry, u64_t, .{ .convert = .{ .value = try func.appendInst(entry, signed64, .{ .convert = .{ .value = try func.appendInst(entry, signed32, .{ .convert = .{ .value = from } }) } }) } });
+                        const target = try func.appendInst(entry, u64_t, .{ .arith = .{ .op = .add, .lhs = counter, .rhs = extended } });
+                        try storeField(func, entry, cpu_ptr, cval_at, target, u64_t, ptr_t);
+                    }
                 } else {
                     const offset = systemOffset(sys.register).?;
                     if (sys.read) {
@@ -912,6 +930,7 @@ fn systemOffset(register: Decode.SystemRegister) ?usize {
         .cntvct_el0 => @offsetOf(Cpu.System, "cntvct_el0"),
         .cntv_ctl_el0 => @offsetOf(Cpu.System, "cntv_ctl_el0"),
         .cntv_cval_el0 => @offsetOf(Cpu.System, "cntv_cval_el0"),
+        .cntv_tval_el0 => unreachable, // derived from the compare and the counter
         .tpidr_el1 => @offsetOf(Cpu.System, "tpidr_el1"),
         .mdscr_el1 => @offsetOf(Cpu.System, "mdscr_el1"),
         .cntkctl_el1 => @offsetOf(Cpu.System, "cntkctl_el1"),
