@@ -1493,13 +1493,19 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         // view first (isDouble(f16) is false), then rounds to nearest-even half so
                         // the S reg holds an exact half. fkindOf yields `.single` there, keeping
                         // the emulation encoding byte-identical.
-                        try code.append(allocator, encode.cvtIntToFloat(rd, src, fkindOf(func, result, fp16), isSignedInt(func, cv.value)));
+                        try code.append(allocator, if (isWide(func, cv.value))
+                            encode.cvtIntToFloat64(rd, src, fkindOf(func, result, fp16), isSignedInt(func, cv.value))
+                        else
+                            encode.cvtIntToFloat(rd, src, fkindOf(func, result, fp16), isSignedInt(func, cv.value)));
                         if (isHalf(func, result) and !fp16) try roundToHalf(allocator, &code, rd);
                     } else if (sc == .fpr and dc == .gpr) {
                         // float -> int: fcvtzs/fcvtzu (round toward zero). NATIVE (fp16) reads the
                         // f16 straight from the H view. EMULATION reads the exact f32 widening in
                         // the S view (fkindOf yields `.single`, byte-identical to before).
-                        try code.append(allocator, encode.cvtFloatToInt(rd, src, fkindOf(func, cv.value, fp16), isSignedInt(func, result)));
+                        try code.append(allocator, if (isWide(func, result))
+                            encode.cvtFloatToInt64(rd, src, fkindOf(func, cv.value, fp16), isSignedInt(func, result))
+                        else
+                            encode.cvtFloatToInt(rd, src, fkindOf(func, cv.value, fp16), isSignedInt(func, result)));
                     } else if (sc == .fpr and dc == .fpr) {
                         const src_half = isHalf(func, cv.value);
                         const dst_half = isHalf(func, result);

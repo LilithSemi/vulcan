@@ -886,11 +886,23 @@ pub fn cvtIntToFloat(rd: Reg, rn: Reg, kind: FKind, signed: bool) u32 {
     return base | ftype(kind) | (n(rn) << 5) | n(rd);
 }
 
+/// `scvtf`/`ucvtf` sd/dd, xn: the same from a 64-bit integer. The 32-bit form reads only the low
+/// half of the register, so a 64-bit source needs this one.
+pub fn cvtIntToFloat64(rd: Reg, rn: Reg, kind: FKind, signed: bool) u32 {
+    return sf64 | cvtIntToFloat(rd, rn, kind, signed);
+}
+
 /// `fcvtzs`/`fcvtzu` wd, sn/dn/hn: convert floating point to a 32-bit integer (round toward
 /// zero). `kind` selects the SOURCE precision (`.half` is the native FEAT_FP16 `fcvtzs wd, hn`).
 pub fn cvtFloatToInt(rd: Reg, rn: Reg, kind: FKind, signed: bool) u32 {
     const base: u32 = if (signed) 0x1E380000 else 0x1E390000;
     return base | ftype(kind) | (n(rn) << 5) | n(rd);
+}
+
+/// `fcvtzs`/`fcvtzu` xd, sn/dn: the same into a 64-bit integer, which the 32-bit form would
+/// saturate at 32 bits.
+pub fn cvtFloatToInt64(rd: Reg, rn: Reg, kind: FKind, signed: bool) u32 {
+    return sf64 | cvtFloatToInt(rd, rn, kind, signed);
 }
 
 /// `fcvt`: single<->double precision conversion. `to_double` widens s->d, else d->s.
@@ -1289,4 +1301,11 @@ test "aarch64 byte and halfword offset-form load/store encoders match the disass
     try std.testing.expectEqual(strh(.x0, .x1), strhOff(.x0, .x1, 0));
     try std.testing.expectEqual(ldrh(.x0, .x1), ldrhOff(.x0, .x1, 0));
     try std.testing.expectEqual(ldrsh(.x0, .x1), ldrshOff(.x0, .x1, 0));
+}
+
+test "64-bit integer <-> float conversions use the X register forms" {
+    try std.testing.expectEqual(@as(u32, 0x9E620020), cvtIntToFloat64(.x0, .x1, .double, true)); // scvtf d0, x1
+    try std.testing.expectEqual(@as(u32, 0x9E630020), cvtIntToFloat64(.x0, .x1, .double, false)); // ucvtf d0, x1
+    try std.testing.expectEqual(@as(u32, 0x9E780020), cvtFloatToInt64(.x0, .x1, .double, true)); // fcvtzs x0, d1
+    try std.testing.expectEqual(@as(u32, 0x9E790020), cvtFloatToInt64(.x0, .x1, .double, false)); // fcvtzu x0, d1
 }
