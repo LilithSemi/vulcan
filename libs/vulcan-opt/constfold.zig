@@ -11,7 +11,7 @@ const Value = ir.function.Value;
 const BinOp = ir.function.BinOp;
 const CmpOp = ir.function.CmpOp;
 
-pub const pass_def = pass.Pass{ .name = "constfold", .run = run };
+pub const pass_def = pass.Pass{ .name = "constfold", .run = run, .preserves_cfg = true, .preserves_value_defs = true };
 
 /// Wrap `v` to `bits` bits with `signedness`, returning the canonical `i64` an
 /// `iconst` of that type holds.
@@ -128,10 +128,12 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     var consts = try allocator.alloc(?i64, func.valueCount());
     defer allocator.free(consts);
     @memset(consts, null);
-    for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
-        if (func.opcode(inst) == .iconst) {
-            if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
+    for (0..func.blockCount()) |bi| {
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            if (func.opcode(inst) == .iconst) {
+                if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
+            }
         }
     }
 
@@ -140,39 +142,47 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     var again = true;
     while (again) {
         again = false;
-        for (0..func.instCount()) |i| {
-            const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
-            const result = func.instResult(inst) orelse continue;
-            if (consts[@backingInt(result)] != null) continue; // already a constant
-            const folded: ?i64 = switch (func.opcode(inst)) {
-                .arith => |a| blk: {
-                    const lc = consts[@backingInt(a.lhs)] orelse break :blk null;
-                    const rc = consts[@backingInt(a.rhs)] orelse break :blk null;
-                    const ty = intType(func, result) orelse break :blk null;
-                    break :blk evalBin(a.op, lc, rc, ty);
-                },
-                .arith_imm => |a| blk: {
-                    const lc = consts[@backingInt(a.lhs)] orelse break :blk null;
-                    const ty = intType(func, result) orelse break :blk null;
-                    break :blk evalBin(a.op, lc, a.imm, ty);
-                },
-                .icmp => |c| blk: {
-                    const lc = consts[@backingInt(c.lhs)] orelse break :blk null;
-                    const rc = consts[@backingInt(c.rhs)] orelse break :blk null;
-                    const ty = intType(func, c.lhs) orelse break :blk null;
-                    break :blk evalCmp(c.op, lc, rc, ty);
-                },
-                // `convert` is deliberately not folded. In this IR an int-to-int convert is a plain
-                // register move that keeps the low bits with no width truncation, the way aarch64 isel
-                // lowers it. A C-style `wrap` here would disagree with codegen, which the equivalence
-                // differential caught.
-                else => null,
-            };
-            if (folded) |value| {
-                func.opcodeMut(inst).* = .{ .iconst = value };
-                consts[@backingInt(result)] = value;
-                changed = true;
-                again = true;
+        for (0..func.blockCount()) |bi| {
+            const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+            for (func.blockInsts(block)) |inst| {
+                const result = func.instResult(inst) orelse continue;
+                if (consts[@backingInt(result)] != null) continue; // already a constant
+                const folded: ?i64 = switch (func.opcode(inst)) {
+                    .arith => |a| blk: {
+                        const lc = consts[@backingInt(a.lhs)] orelse break :blk null;
+                        const rc = consts[@backingInt(a.rhs)] orelse break :blk null;
+                        const ty = intType(func, result) orelse break :blk null;
+                        break :blk evalBin(a.op, lc, rc, ty);
+                    },
+                    .arith_imm => |a| blk: {
+                        const lc = consts[@backingInt(a.lhs)] orelse break :blk null;
+                        const ty = intType(func, result) orelse break :blk null;
+                        break :blk evalBin(a.op, lc, a.imm, ty);
+                    },
+                    .icmp => |c| blk: {
+                        const lc = consts[@backingInt(c.lhs)] orelse break :blk null;
+                        const rc = consts[@backingInt(c.rhs)] orelse break :blk null;
+                        const ty = intType(func, c.lhs) orelse break :blk null;
+                        break :blk evalCmp(c.op, lc, rc, ty);
+                    },
+                    // Same-width integer conversion changes only the type's signed interpretation; the
+                    // emitted bits are identical. Widening and narrowing remain deliberately unfolded:
+                    // this IR lowers them as register operations whose exact behavior must stay aligned
+                    // with each backend rather than applying C-style wrapping here.
+                    .convert => |c| blk: {
+                        const source_ty = intType(func, c.value) orelse break :blk null;
+                        const result_ty = intType(func, result) orelse break :blk null;
+                        if (source_ty.bits != result_ty.bits) break :blk null;
+                        break :blk consts[@backingInt(c.value)];
+                    },
+                    else => null,
+                };
+                if (folded) |value| {
+                    func.opcodeMut(inst).* = .{ .iconst = value };
+                    consts[@backingInt(result)] = value;
+                    changed = true;
+                    again = true;
+                }
             }
         }
     }
@@ -217,4 +227,43 @@ test "folds an unsigned comparison to a bool constant" {
     defer analyses.deinit();
     try std.testing.expect(try run(allocator, &func, &analyses));
     try std.testing.expectEqual(@as(i64, 1), func.opcode(func.definingInst(cmp).?).iconst); // 200 > 100 unsigned
+}
+
+test "folds only same-width integer constant conversions" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const b = try func.appendBlock();
+    const minus_one = try func.appendInst(b, i32_t, .{ .iconst = -1 });
+    const same_width = try func.appendInst(b, u32_t, .{ .convert = .{ .value = minus_one } });
+    const narrowed = try func.appendInst(b, u8_t, .{ .convert = .{ .value = same_width } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(narrowed) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+    try std.testing.expectEqual(@as(i64, -1), func.opcode(func.definingInst(same_width).?).iconst);
+    try std.testing.expect(func.opcode(func.definingInst(narrowed).?) == .convert);
+}
+
+test "constant folding skips instructions removed from blocks" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const x = try func.appendBlockParam(block, ty);
+    const one = try func.createInst(ty, .{ .iconst = 1 });
+    const two = try func.createInst(ty, .{ .iconst = 2 });
+    const orphan = try func.createInst(ty, .{ .arith = .{ .op = .add, .lhs = one, .rhs = two } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(x) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+    try std.testing.expectEqual(ir.function.BinOp.add, func.opcode(func.definingInst(orphan).?).arith.op);
 }

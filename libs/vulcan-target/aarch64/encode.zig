@@ -73,6 +73,18 @@ pub fn mul(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x1B000000 | (n(rm) << 16) | (31 << 10) | (n(rn) << 5) | n(rd);
 }
 
+/// `madd wd, wn, wm, wa` and its 64-bit counterpart.
+pub fn madd(rd: Reg, rn: Reg, rm: Reg, ra: Reg, wide: bool) u32 {
+    return (if (wide) @as(u32, 1) << 31 else 0) |
+        0x1B000000 | (n(rm) << 16) | (n(ra) << 10) | (n(rn) << 5) | n(rd);
+}
+
+/// `msub wd, wn, wm, wa` computes `wa - wn * wm`.
+pub fn msubInt(rd: Reg, rn: Reg, rm: Reg, ra: Reg, wide: bool) u32 {
+    return (if (wide) @as(u32, 1) << 31 else 0) |
+        0x1B008000 | (n(rm) << 16) | (n(ra) << 10) | (n(rn) << 5) | n(rd);
+}
+
 /// `smulh xd, xn, xm` (high 64 bits of the signed 64x64 product). Ra (bits 14:10) is 31.
 pub fn smulh(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x9B407C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
@@ -108,6 +120,100 @@ pub fn orr(rd: Reg, rn: Reg, rm: Reg) u32 {
 /// `eor wd, wn, wm` (32-bit register bitwise exclusive-or).
 pub fn eor(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x4A000000 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn addVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4EA08400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn subVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6EA08400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn mulVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4EA09C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn andVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4E201C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn orrVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4EA01C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn eorVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6E201C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+const LogicalImmediate = struct { n: u1, immr: u6, imms: u6 };
+
+fn rotateRight(value: u64, amount: u6, width: u7) u64 {
+    const mask: u64 = if (width == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(width)) - 1;
+    const shift: u6 = @intCast(amount % width);
+    if (shift == 0) return value & mask;
+    return ((value >> shift) | (value << @intCast(width - shift))) & mask;
+}
+
+/// Encode an A64 logical immediate. Such an immediate is a rotated, non-empty run of ones in a
+/// power-of-two element, replicated across the 32- or 64-bit operand. Brute-forcing the at most
+/// 63 run lengths and 64 rotations keeps this small and is compile-time work in instruction
+/// selection, not generated code.
+fn logicalImmediate(value: u64, wide: bool) ?LogicalImmediate {
+    const width: u7 = if (wide) 64 else 32;
+    const width_mask: u64 = if (wide) std.math.maxInt(u64) else std.math.maxInt(u32);
+    const wanted = value & width_mask;
+    if (wanted == 0 or wanted == width_mask) return null;
+
+    var element_width: u7 = 2;
+    while (element_width <= width) : (element_width *= 2) {
+        const element_mask: u64 = if (element_width == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(element_width)) - 1;
+        const element = wanted & element_mask;
+        var replicated: u64 = 0;
+        var offset: u7 = 0;
+        while (offset < width) : (offset += element_width) replicated |= element << @intCast(offset);
+        if (replicated != wanted or element == 0 or element == element_mask) continue;
+
+        var ones: u7 = 1;
+        while (ones < element_width) : (ones += 1) {
+            const run = (@as(u64, 1) << @intCast(ones)) - 1;
+            var rotation: u7 = 0;
+            while (rotation < element_width) : (rotation += 1) {
+                if (rotateRight(run, @intCast(rotation), element_width) != element) continue;
+                const prefix = ~(@as(u64, element_width) * 2 - 1) & 0x3f;
+                return .{
+                    .n = if (element_width == 64) 1 else 0,
+                    .immr = @intCast(rotation),
+                    .imms = @intCast(prefix | (ones - 1)),
+                };
+            }
+        }
+    }
+    return null;
+}
+
+fn logicalImm(opc: u2, rd: Reg, rn: Reg, value: u64, wide: bool) ?u32 {
+    const imm = logicalImmediate(value, wide) orelse return null;
+    return (if (wide) @as(u32, 1) << 31 else 0) |
+        (@as(u32, opc) << 29) |
+        0x12000000 |
+        (@as(u32, imm.n) << 22) |
+        (@as(u32, imm.immr) << 16) |
+        (@as(u32, imm.imms) << 10) |
+        (n(rn) << 5) |
+        n(rd);
+}
+
+pub fn andImm(rd: Reg, rn: Reg, value: u64, wide: bool) ?u32 {
+    return logicalImm(0, rd, rn, value, wide);
+}
+
+pub fn orrImm(rd: Reg, rn: Reg, value: u64, wide: bool) ?u32 {
+    return logicalImm(1, rd, rn, value, wide);
+}
+
+pub fn eorImm(rd: Reg, rn: Reg, value: u64, wide: bool) ?u32 {
+    return logicalImm(2, rd, rn, value, wide);
 }
 
 /// `mov xd, xm` (64-bit register move), i.e. `orr xd, xzr, xm`. Always copies the
@@ -1210,6 +1316,61 @@ test "flag-setting S-form encoders (subs/adds/ands + immediate) match the disass
     const d5 = try disasm.one(a, addsImm64(.x8, .x8, 1));
     defer a.free(d5);
     try std.testing.expectEqualStrings("adds x8, x8, #1", d5);
+}
+
+test "logical immediate encoders match the disassembler" {
+    const disasm = @import("disasm.zig");
+    const a = std.testing.allocator;
+
+    const and_word = andImm(.x0, .x1, 0xff00ff00, false).?;
+    const and_text = try disasm.one(a, and_word);
+    defer a.free(and_text);
+    try std.testing.expectEqualStrings("and w0, w1, #0xff00ff00", and_text);
+
+    const orr_word = orrImm(.x2, .x3, 0x00ff00ff00ff00ff, true).?;
+    const orr_text = try disasm.one(a, orr_word);
+    defer a.free(orr_text);
+    try std.testing.expectEqualStrings("orr x2, x3, #0xff00ff00ff00ff", orr_text);
+
+    const eor_word = eorImm(.x4, .x5, 0x80000001, false).?;
+    const eor_text = try disasm.one(a, eor_word);
+    defer a.free(eor_text);
+    try std.testing.expectEqualStrings("eor w4, w5, #0x80000001", eor_text);
+
+    try std.testing.expect(andImm(.x0, .x1, 0, false) == null);
+    try std.testing.expect(andImm(.x0, .x1, std.math.maxInt(u64), true) == null);
+    try std.testing.expect(orrImm(.x0, .x1, 0x01234567, false) == null);
+}
+
+test "integer multiply-add encoders match the disassembler" {
+    const disasm = @import("disasm.zig");
+    const a = std.testing.allocator;
+
+    const add_text = try disasm.one(a, madd(.x0, .x1, .x2, .x3, false));
+    defer a.free(add_text);
+    try std.testing.expectEqualStrings("madd w0, w1, w2, w3", add_text);
+
+    const sub_text = try disasm.one(a, msubInt(.x4, .x5, .x6, .x7, true));
+    defer a.free(sub_text);
+    try std.testing.expectEqualStrings("msub x4, x5, x6, x7", sub_text);
+}
+
+test "integer vector arithmetic encoders match the disassembler" {
+    const disasm = @import("disasm.zig");
+    const a = std.testing.allocator;
+    const cases = .{
+        .{ addVecI32(.x0, .x1, .x2), "add v0.4s, v1.4s, v2.4s" },
+        .{ subVecI32(.x3, .x4, .x5), "sub v3.4s, v4.4s, v5.4s" },
+        .{ mulVecI32(.x6, .x7, .x8), "mul v6.4s, v7.4s, v8.4s" },
+        .{ andVec(.x9, .x10, .x11), "and v9.16b, v10.16b, v11.16b" },
+        .{ orrVec(.x12, .x13, .x14), "orr v12.16b, v13.16b, v14.16b" },
+        .{ eorVec(.x15, .x16, .x17), "eor v15.16b, v16.16b, v17.16b" },
+    };
+    inline for (cases) |case| {
+        const text = try disasm.one(a, case[0]);
+        defer a.free(text);
+        try std.testing.expectEqualStrings(case[1], text);
+    }
 }
 
 test "ldp/stp offset-form encoders match known bytes" {

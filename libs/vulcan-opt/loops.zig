@@ -36,8 +36,13 @@ pub const LoopInfo = struct {
 pub fn analyze(allocator: std.mem.Allocator, func: *const Function) std.mem.Allocator.Error!LoopInfo {
     var cfg = try cfg_mod.build(allocator, func);
     defer cfg.deinit(allocator);
-    var doms = try dominators.compute(allocator, func);
+    var doms = try dominators.computeFromCfg(allocator, &cfg);
     defer doms.deinit(allocator);
+    return analyzeFromCfg(allocator, &cfg, &doms);
+}
+
+/// Compute natural loops from cached CFG and dominator analyses.
+pub fn analyzeFromCfg(allocator: std.mem.Allocator, cfg: *const cfg_mod.Cfg, doms: *const dominators.Dominators) std.mem.Allocator.Error!LoopInfo {
     const n = cfg.blockCount();
 
     // Map each loop header to its (unioned) body bitset.
@@ -57,7 +62,7 @@ pub fn analyze(allocator: std.mem.Allocator, func: *const Function) std.mem.Allo
                 gop.value_ptr.* = try allocator.alloc(bool, n);
                 @memset(gop.value_ptr.*, false);
             }
-            try addNaturalLoop(allocator, &cfg, s, @intCast(b), gop.value_ptr.*);
+            try addNaturalLoop(allocator, cfg, s, @intCast(b), gop.value_ptr.*);
         }
     }
 
@@ -67,7 +72,7 @@ pub fn analyze(allocator: std.mem.Allocator, func: *const Function) std.mem.Allo
     while (it.next()) |entry| {
         const h = entry.key_ptr.*;
         const body = entry.value_ptr.*;
-        loops[i] = .{ .header = h, .body = body, .preheader = findPreheader(&cfg, h, body) };
+        loops[i] = .{ .header = h, .body = body, .preheader = findPreheader(cfg, h, body) };
         i += 1;
     }
     return .{ .loops = loops };

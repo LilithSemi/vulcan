@@ -14,11 +14,10 @@ const Value = ir.function.Value;
 const Block = ir.function.Block;
 const Inst = ir.function.Inst;
 
-pub const pass_def = pass.Pass{ .name = "mem2reg", .run = run };
+pub const pass_def = pass.Pass{ .name = "mem2reg", .run = run, .preserves_cfg = true };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
-    _ = analyses;
-
+    if (!hasLiveAlloca(func)) return false;
     const promotable = try findPromotable(allocator, func);
     defer allocator.free(promotable);
 
@@ -52,7 +51,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     var b = Builder{
         .allocator = allocator,
         .func = func,
-        .cfg = try cfg_mod.build(allocator, func),
+        .cfg = try analyses.cfg(),
         .slot_of_value = slot_of_value,
         .slot_elem = slot_elem.items,
         .num_slots = num_slots,
@@ -64,6 +63,15 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     return true;
 }
 
+fn hasLiveAlloca(func: *const Function) bool {
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (func.opcode(inst) == .alloca) return true;
+        }
+    }
+    return false;
+}
+
 /// SSA construction over the promotable slots, adapted from Braun et al. "Simple and Efficient
 /// Construction of SSA Form" (CC 2013) onto this IR's block parameters. `local_end`/`writes` are
 /// precomputed per (slot, block) in `buildTables`, so `readEndOfBlock` never depends on the order
@@ -71,7 +79,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 const Builder = struct {
     allocator: std.mem.Allocator,
     func: *Function,
-    cfg: cfg_mod.Cfg,
+    cfg: *const cfg_mod.Cfg,
     slot_of_value: []const ?u32,
     slot_elem: []const ir.types.Type,
     num_slots: usize,
@@ -89,7 +97,6 @@ const Builder = struct {
     undef_zero: []?Value = &.{},
 
     fn deinit(self: *Builder) void {
-        self.cfg.deinit(self.allocator);
         self.allocator.free(self.local_end);
         self.allocator.free(self.writes);
         self.allocator.free(self.entry_memo);
@@ -203,7 +210,7 @@ const Builder = struct {
         if (c.distinct_two) return phi; // a genuine merge of >=2 values: keep the block parameter
 
         const v: Value = c.same orelse try self.undefZero(slot);
-        self.func.replaceAllUses(phi, v);
+        self.func.replaceAllLiveUses(phi, v);
         self.repointCaches(phi, v);
         try self.dropParamAndEdgeArgs(blk, pidx);
         return v;
@@ -257,7 +264,7 @@ const Builder = struct {
     /// backend threads each one across every edge, the generated code. This runs to a fixpoint:
     /// collapsing one parameter can make a parameter that referenced it trivial, so it repeats until a
     /// full sweep collapses nothing. A parameter with no non-self operand (an unreachable self-cycle)
-    /// is left alone. `replaceAllUses` fixes every use, including the edge arguments feeding other
+    /// is left alone. `replaceAllLiveUses` fixes every use, including the edge arguments feeding other
     /// parameters, so a later sweep sees the exposed triviality.
     fn collapseTrivialPhis(self: *Builder) pass.Error!void {
         var changed = true;
@@ -273,7 +280,7 @@ const Builder = struct {
                         pi += 1; // a real merge, or an unreachable self-cycle: keep it
                         continue;
                     }
-                    self.func.replaceAllUses(param, c.same.?);
+                    self.func.replaceAllLiveUses(param, c.same.?);
                     try self.dropParamAndEdgeArgs(blk, pi);
                     changed = true;
                     // The parameter at `pi` is gone and the next one shifted into its place, so do
@@ -285,10 +292,10 @@ const Builder = struct {
 
     /// Repoint every cached reference to `from` (a value just folded into `to`, its defining
     /// instruction dropped and every use existing *at this moment* already fixed by
-    /// `replaceAllUses`) across both of `Builder`'s value caches: `entry_memo` (a block's resolved
+    /// `replaceAllLiveUses`) across both of `Builder`'s value caches: `entry_memo` (a block's resolved
     /// entry value, which `removeTrivialPhi` can collapse straight to a raw predecessor value) and
     /// `local_end` (Phase 1's snapshot of each block's last store, which can itself be a promotable
-    /// load's result). Neither cache is part of the IR, so `replaceAllUses` cannot see into it - a
+    /// load's result). Neither cache is part of the IR, so `replaceAllLiveUses` cannot see into it - a
     /// cache entry equal to `from` is only patched here. This matters because both caches are read
     /// lazily and repeatedly as `rewrite` walks blocks in index order: `readEntry`/`readEndOfBlock`
     /// can hand a cached value back out to build a *new* edge argument or replacement long after
@@ -441,7 +448,7 @@ const Builder = struct {
                             break :blk v;
                         };
                         const result = self.func.instResult(inst).?;
-                        self.func.replaceAllUses(result, val);
+                        self.func.replaceAllLiveUses(result, val);
                         // `local_end`/`entry_memo` may have snapshotted this very load's result
                         // (e.g. `store (load a_slot), r_slot`, Phase 1's `local_end[r_slot, block]`)
                         // before this promotion dropped it. Repoint so a later cache read (an
@@ -496,9 +503,9 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
             if (@backingInt(v) < p.len) p[@backingInt(v)] = false;
         }
     }.hit;
-    for (0..func.instCount()) |i| {
-        const inst: Inst = @fromBackingInt(@intCast(i));
-        switch (func.opcode(inst)) {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
             // ld.ptr is the sanctioned use - UNLESS the load is `volatile` (SM9 Plan 2 Task 4):
             // a volatile access must observably hit memory, so its alloca cannot be promoted
             // to an SSA value and the load must stay in the IR.
@@ -592,7 +599,7 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
                 for (func.blockArgs(cf.then)) |arg| esc(promotable, arg);
                 for (func.blockArgs(cf.@"else")) |arg| esc(promotable, arg);
             },
-        }
+        };
     }
     for (0..func.blockCount()) |bi| {
         if (func.terminator(@fromBackingInt(@intCast(bi)))) |term| switch (term) {
@@ -679,6 +686,27 @@ test "single-block store then load forwards the stored value" {
 
     try testing.expect(try runOnce(allocator, &func));
     try testing.expectEqual(x, func.terminator(b).?.ret.values[0]); // load became x
+    try expectNoMemoryInsts(&func, b);
+    try testing.expect(!hasLiveAlloca(&func));
+    try testing.expect(!try runOnce(allocator, &func));
+}
+
+test "an orphaned address use does not block promotion" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
+    try func.appendStore(b, x, slot);
+    const y = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+    _ = try func.createInst(ptr_t, .{ .arith = .{ .op = .add, .lhs = slot, .rhs = x } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    try testing.expectEqual(x, func.terminator(b).?.ret.values[0]);
     try expectNoMemoryInsts(&func, b);
 }
 

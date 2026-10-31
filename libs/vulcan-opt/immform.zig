@@ -5,10 +5,9 @@
 //! instruction. The rewrite is a pure representation change: `arith_imm{op, x, c}` computes exactly
 //! what `arith{op, x, (iconst c)}` did. The now-orphaned `iconst` is left for DCE.
 //!
-//! Only add/sub and the bitwise and shift ops are canonicalized. mul/div/rem are left to the strength
-//! pass, which already reads both forms. A commutative op (add, and, or, xor) accepts the constant on
-//! either side; a non-commutative op (sub, shl, shr) only when the constant is the RIGHT operand,
-//! since the immediate form fixes it there. An instruction with two constant operands is skipped, so
+//! Only add is canonicalized here. Mul/div/rem are left to strength reduction, while the other
+//! operations retain their register form for folds that specifically inspect it. Add is commutative,
+//! so the constant may sit on either side. An instruction with two constant operands is skipped, so
 //! constant folding collapses it to a single `iconst` instead.
 
 const std = @import("std");
@@ -20,11 +19,11 @@ const Function = ir.function.Function;
 const Value = ir.function.Value;
 const BinOp = ir.function.BinOp;
 
-pub const pass_def = pass.Pass{ .name = "immform", .run = run };
+pub const pass_def = pass.Pass{ .name = "immform", .run = run, .preserves_cfg = true, .preserves_value_defs = true };
 
 /// Whether `op` has an `arith_imm` form this pass emits, and whether it is commutative (so the
-/// constant may sit on the left). Only `add` is canonicalized: it is the op the backend folds into a
-/// load or store address offset, the whole point of this pass. The other ops (sub, bitwise, shift)
+/// constant may sit on the left). `add` is canonicalized because backends fold it into either a
+/// load/store address or an immediate-form arithmetic instruction. The other ops (sub, bitwise, shift)
 /// gain nothing from the `arith_imm` form here (the backend materializes their immediate either way)
 /// and canonicalizing them only disturbs folds that read the `arith` form, so they are left alone.
 fn immOp(op: BinOp) ?struct { commutative: bool } {
@@ -36,6 +35,7 @@ fn immOp(op: BinOp) ?struct { commutative: bool } {
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
+    if (!hasImmediateCandidate(func)) return false;
 
     // Map each value defined by an `iconst` to its constant. Iterate LIVE block instructions, not the
     // pool, so a dropped instruction is not re-processed (matching the other passes).
@@ -57,23 +57,6 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     @memset(uses, 0);
     dce.countUses(func, uses);
 
-    // Only an `add` whose result is used as a load or store ADDRESS is folded. There the backend
-    // folds the offset straight into the memory access (`ldr [base, #off]`), a clear win. A plain
-    // `x + c` gains nothing from `arith_imm` (the backend materializes the immediate either way) and
-    // canonicalizing it only disturbs other folds that read the `arith` form, so it is left alone.
-    var is_addr = try allocator.alloc(bool, func.valueCount());
-    defer allocator.free(is_addr);
-    @memset(is_addr, false);
-    for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
-            switch (func.opcode(inst)) {
-                .load => |l| is_addr[@backingInt(l.ptr)] = true,
-                .store => |st| is_addr[@backingInt(st.ptr)] = true,
-                else => {},
-            }
-        }
-    }
-
     var changed = false;
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
@@ -82,8 +65,6 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 else => continue,
             };
             const info = immOp(a.op) orelse continue;
-            const result = func.instResult(inst) orelse continue;
-            if (!is_addr[@backingInt(result)]) continue; // not an address base: leave it as `arith`
             const lc = consts[@backingInt(a.lhs)];
             const rc = consts[@backingInt(a.rhs)];
             if (lc != null and rc != null) continue; // both constant: leave it for constant folding
@@ -101,7 +82,23 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     return changed;
 }
 
-test "an address add of a single-use constant becomes arith_imm; a plain add is left alone" {
+fn hasImmediateCandidate(func: *const Function) bool {
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const a = switch (func.opcode(inst)) {
+                .arith => |a| if (immOp(a.op) != null) a else continue,
+                else => continue,
+            };
+            for ([_]Value{ a.lhs, a.rhs }) |operand| {
+                const def = func.definingInst(operand) orelse continue;
+                if (func.opcode(def) == .iconst) return true;
+            }
+        }
+    }
+    return false;
+}
+
+test "single-use constant adds become arith_imm" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -115,7 +112,7 @@ test "an address add of a single-use constant becomes arith_imm; a plain add is 
     const off = try func.appendInst(b, i32_t, .{ .iconst = 40 });
     const addr = try func.appendInst(b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = off } });
     const loaded = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = addr } });
-    // A PLAIN add: x + 7, not an address -> left as `arith`.
+    // A plain add also benefits: its backend immediate no longer consumes a register.
     const seven = try func.appendInst(b, i32_t, .{ .iconst = 7 });
     const plain = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = seven } });
     const sum = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = loaded, .rhs = plain } });
@@ -129,8 +126,48 @@ test "an address add of a single-use constant becomes arith_imm; a plain add is 
     const a2 = func.opcode(func.definingInst(addr).?).arith_imm;
     try std.testing.expectEqual(@as(i64, 40), a2.imm);
     try std.testing.expectEqual(base, a2.lhs);
-    // The plain add is untouched (not an address base).
-    try std.testing.expect(func.opcode(func.definingInst(plain).?) == .arith);
+    const p2 = func.opcode(func.definingInst(plain).?).arith_imm;
+    try std.testing.expectEqual(@as(i64, 7), p2.imm);
+    try std.testing.expectEqual(x, p2.lhs);
+}
+
+test "a plain constant add needs no memory use" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32_t);
+    const c = try func.appendInst(b, i32_t, .{ .iconst = 8 });
+    const sum = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = c } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(hasImmediateCandidate(&func));
+    try std.testing.expect(try run(allocator, &func, &analyses));
+    try std.testing.expectEqual(@as(i64, 8), func.opcode(func.definingInst(sum).?).arith_imm.imm);
+}
+
+test "a shared constant remains register form" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32_t);
+    const y = try func.appendBlockParam(b, i32_t);
+    const c = try func.appendInst(b, i32_t, .{ .iconst = 8 });
+    const xc = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = c } });
+    const yc = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = y, .rhs = c } });
+    const sum = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = xc, .rhs = yc } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+    try std.testing.expect(func.opcode(func.definingInst(xc).?) == .arith);
+    try std.testing.expect(func.opcode(func.definingInst(yc).?) == .arith);
 }
 
 test {

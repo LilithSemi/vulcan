@@ -65,6 +65,8 @@ const Budget = struct {
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
     if (func.blockCount() == 0) return false;
+    const candidates = findCandidates(func);
+    if (!candidates.has_if and !candidates.has_forwarder) return false;
 
     var changed = false;
 
@@ -73,17 +75,32 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     // a belt-and-braces termination guarantee (every applied step strictly removes a P->B edge). The
     // extra `tail_dup_total_budget` headroom covers the fresh blocks tail duplication appends, none
     // of which end in an `@"if"` so none becomes a new threading candidate.
-    var budget = Budget{ .remaining = tail_dup_total_budget };
-    var steps: usize = 0;
-    const cap = func.blockCount() * 4 + 4 + tail_dup_total_budget;
-    while (steps < cap) : (steps += 1) {
-        if (!try threadOne(allocator, func, &budget)) break;
-        changed = true;
+    if (candidates.has_if) {
+        var budget = Budget{ .remaining = tail_dup_total_budget };
+        var steps: usize = 0;
+        const cap = func.blockCount() * 4 + 4 + tail_dup_total_budget;
+        while (steps < cap) : (steps += 1) {
+            if (!try threadOne(allocator, func, &budget)) break;
+            changed = true;
+        }
     }
 
     // Then the identity forwarder rewrite (the original transform).
     if (try forwardIdentity(allocator, func)) changed = true;
     return changed;
+}
+
+const Candidates = struct { has_if: bool = false, has_forwarder: bool = false };
+
+fn findCandidates(func: *const Function) Candidates {
+    var result: Candidates = .{};
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        if (endsInIf(func, block) != null) result.has_if = true;
+        if (identityForwardTarget(func, block) != null) result.has_forwarder = true;
+        if (result.has_if and result.has_forwarder) break;
+    }
+    return result;
 }
 
 /// Redirect every out-edge that lands on a pure identity forwarder to the forwarder's target.
@@ -668,6 +685,23 @@ fn applyCmp(op: ir.function.CmpOp, lhs: i64, rhs: i64) i64 {
         .ge => lhs >= rhs,
     };
     return if (r) 1 else 0;
+}
+
+test "a function without branches or forwarders skips jump-thread analyses" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const value = try func.appendBlockParam(block, ty);
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(value) });
+
+    const candidates = findCandidates(&func);
+    try std.testing.expect(!candidates.has_if);
+    try std.testing.expect(!candidates.has_forwarder);
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
 }
 
 test "a jump through an identity-forwarding block is redirected to its target" {

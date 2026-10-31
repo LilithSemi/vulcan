@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
+const cfg_mod = @import("cfg.zig");
 const dom = @import("dominators.zig");
 const loops_mod = @import("loops.zig");
 
@@ -15,6 +16,9 @@ pub const Error = std.mem.Allocator.Error;
 pub const Analyses = struct {
     allocator: std.mem.Allocator,
     func: *const Function,
+    cfg_cache: ?cfg_mod.Cfg = null,
+    rpo_cache: ?[]u32 = null,
+    def_blocks: ?[]u32 = null,
     doms: ?dom.Dominators = null,
     loop_info: ?loops_mod.LoopInfo = null,
 
@@ -22,24 +26,73 @@ pub const Analyses = struct {
         self.invalidate();
     }
 
+    /// The control-flow graph, computed once and cached until invalidation.
+    pub fn cfg(self: *Analyses) Error!*const cfg_mod.Cfg {
+        if (self.cfg_cache == null) self.cfg_cache = try cfg_mod.build(self.allocator, self.func);
+        return &self.cfg_cache.?;
+    }
+
+    /// Reachable blocks in reverse postorder, shared by forward dataflow passes.
+    pub fn reversePostorder(self: *Analyses) Error![]const u32 {
+        if (self.rpo_cache == null) {
+            if (self.cfg_cache == null) self.cfg_cache = try cfg_mod.build(self.allocator, self.func);
+            self.rpo_cache = try self.cfg_cache.?.reversePostorder(self.allocator);
+        }
+        return self.rpo_cache.?;
+    }
+
+    /// The live block defining each value. Orphaned values default to entry.
+    pub fn definingBlocks(self: *Analyses) Error![]const u32 {
+        if (self.def_blocks == null) {
+            const blocks = try self.allocator.alloc(u32, self.func.valueCount());
+            @memset(blocks, 0);
+            for (0..self.func.blockCount()) |bi| {
+                const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+                for (self.func.blockParams(block)) |param| blocks[@backingInt(param)] = @intCast(bi);
+                for (self.func.blockInsts(block)) |inst| {
+                    if (self.func.instResult(inst)) |result| blocks[@backingInt(result)] = @intCast(bi);
+                }
+            }
+            self.def_blocks = blocks;
+        }
+        return self.def_blocks.?;
+    }
+
+    fn invalidateValues(self: *Analyses) void {
+        if (self.def_blocks) |blocks| self.allocator.free(blocks);
+        self.def_blocks = null;
+    }
+
     /// The dominator analysis, computed once and cached until invalidation.
     pub fn dominators(self: *Analyses) Error!*const dom.Dominators {
-        if (self.doms == null) self.doms = try dom.compute(self.allocator, self.func);
+        if (self.doms == null) {
+            if (self.cfg_cache == null) self.cfg_cache = try cfg_mod.build(self.allocator, self.func);
+            self.doms = try dom.computeFromCfg(self.allocator, &self.cfg_cache.?);
+        }
         return &self.doms.?;
     }
 
     /// The natural-loop analysis, computed once and cached until invalidation.
     pub fn loops(self: *Analyses) Error!*const loops_mod.LoopInfo {
-        if (self.loop_info == null) self.loop_info = try loops_mod.analyze(self.allocator, self.func);
+        if (self.loop_info == null) {
+            if (self.cfg_cache == null) self.cfg_cache = try cfg_mod.build(self.allocator, self.func);
+            if (self.doms == null) self.doms = try dom.computeFromCfg(self.allocator, &self.cfg_cache.?);
+            self.loop_info = try loops_mod.analyzeFromCfg(self.allocator, &self.cfg_cache.?, &self.doms.?);
+        }
         return &self.loop_info.?;
     }
 
     /// Drop every cached analysis (call after the function is modified).
     pub fn invalidate(self: *Analyses) void {
+        self.invalidateValues();
+        if (self.rpo_cache) |order| self.allocator.free(order);
+        self.rpo_cache = null;
         if (self.doms) |*d| d.deinit(self.allocator);
         self.doms = null;
         if (self.loop_info) |*l| l.deinit(self.allocator);
         self.loop_info = null;
+        if (self.cfg_cache) |*graph| graph.deinit(self.allocator);
+        self.cfg_cache = null;
     }
 };
 
@@ -48,6 +101,10 @@ pub const Analyses = struct {
 pub const Pass = struct {
     name: []const u8,
     run: *const fn (allocator: std.mem.Allocator, func: *Function, analyses: *Analyses) Error!bool,
+    /// A successful rewrite leaves all CFG-derived analyses valid.
+    preserves_cfg: bool = false,
+    /// A successful rewrite neither adds, removes, nor moves live definitions.
+    preserves_value_defs: bool = false,
 };
 
 /// Run each pass once in order. Analyses are invalidated after any modifying
@@ -59,7 +116,11 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, passes: []const Pass) 
     var changed = false;
     for (passes) |pass| {
         if (try pass.run(allocator, func, &analyses)) {
-            analyses.invalidate();
+            if (!pass.preserves_cfg) {
+                analyses.invalidate();
+            } else if (!pass.preserves_value_defs) {
+                analyses.invalidateValues();
+            }
             changed = true;
         }
     }
@@ -78,7 +139,11 @@ pub fn runToFixpoint(allocator: std.mem.Allocator, func: *Function, passes: []co
         var changed = false;
         for (passes) |pass| {
             if (try pass.run(allocator, func, &analyses)) {
-                analyses.invalidate();
+                if (!pass.preserves_cfg) {
+                    analyses.invalidate();
+                } else if (!pass.preserves_value_defs) {
+                    analyses.invalidateValues();
+                }
                 changed = true;
             }
         }
@@ -86,4 +151,50 @@ pub fn runToFixpoint(allocator: std.mem.Allocator, func: *Function, passes: []co
         changed_overall = true;
     }
     return changed_overall;
+}
+
+const CacheTestPasses = struct {
+    fn prime(_: std.mem.Allocator, _: *Function, analyses: *Analyses) Error!bool {
+        _ = try analyses.loops();
+        _ = try analyses.reversePostorder();
+        _ = try analyses.definingBlocks();
+        return true;
+    }
+
+    fn check(_: std.mem.Allocator, _: *Function, analyses: *Analyses) Error!bool {
+        std.debug.assert(analyses.cfg_cache != null);
+        std.debug.assert(analyses.rpo_cache != null);
+        std.debug.assert(analyses.def_blocks != null);
+        std.debug.assert(analyses.doms != null);
+        std.debug.assert(analyses.loop_info != null);
+        return false;
+    }
+
+    fn changeDefinitions(_: std.mem.Allocator, _: *Function, _: *Analyses) Error!bool {
+        return true;
+    }
+
+    fn checkDefinitionsInvalidated(_: std.mem.Allocator, _: *Function, analyses: *Analyses) Error!bool {
+        std.debug.assert(analyses.cfg_cache != null);
+        std.debug.assert(analyses.rpo_cache != null);
+        std.debug.assert(analyses.doms != null);
+        std.debug.assert(analyses.loop_info != null);
+        std.debug.assert(analyses.def_blocks == null);
+        return false;
+    }
+};
+
+test "a CFG-preserving pass keeps cached analyses for the next pass" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    _ = try func.appendBlock();
+
+    const passes = [_]Pass{
+        .{ .name = "prime", .run = CacheTestPasses.prime, .preserves_cfg = true, .preserves_value_defs = true },
+        .{ .name = "check", .run = CacheTestPasses.check },
+        .{ .name = "change-definitions", .run = CacheTestPasses.changeDefinitions, .preserves_cfg = true },
+        .{ .name = "check-definitions-invalidated", .run = CacheTestPasses.checkDefinitionsInvalidated },
+    };
+    try std.testing.expect(try run(allocator, &func, &passes));
 }

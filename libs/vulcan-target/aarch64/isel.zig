@@ -1211,6 +1211,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // materializing it into a register here.
                     if (foldsAsCmpImm(func, insts, inst_idx)) continue;
                     if (foldsAsAddSubImm(func, insts, inst_idx)) continue;
+                    if (foldsAsLogicalImm(func, insts, inst_idx)) continue;
                     const result = func.instResult(inst).?;
                     const rd = ctx.resultReg(result);
                     if (regClass(func, result) == .fpr) {
@@ -1331,6 +1332,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try storeResult(allocator, &code, ctx, result, rd);
                         continue;
                     }
+                    if (logicalImmFold(func, a, result)) |f| {
+                        const rl = try ctx.loadOp(allocator, &code, f.base, spill_op[0]);
+                        const rd = ctx.resultReg(result);
+                        std.debug.assert(try tryLogicalImm(allocator, &code, a.op, rd, rl, f.imm, isWide(func, result)));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     try ctx.binary(allocator, &code, result, a.op, a.lhs, a.rhs);
                 },
                 .arith_imm => |a| {
@@ -1354,7 +1362,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const wide = isWide(func, result);
                     // Prefer the add/sub immediate form for a small constant; only fall back to
                     // materializing the constant in a scratch register and a register op otherwise.
-                    if (!try tryAddSubImm(allocator, &code, a.op, rd, rl, a.imm, wide)) {
+                    if (!try tryAddSubImm(allocator, &code, a.op, rd, rl, a.imm, wide) and
+                        !try tryLogicalImm(allocator, &code, a.op, rd, rl, a.imm, wide))
+                    {
                         // A sixty four bit operation takes the whole immediate. `loadConst` keeps the low
                         // word only, which is right for a `w` register and silently wrong here: a mask of
                         // a bit above the low word came out as zero, and a negative immediate came out
@@ -2276,16 +2286,26 @@ const Ctx = struct {
         rhs: Value,
     ) Error!void {
         if (isVector(self.func, result)) {
-            // NEON lane-wise arithmetic over a packed vector (currently <4 x f32> only).
             const rl = try self.loadOp(allocator, code, lhs, fp_spill_op[0]);
             const rr = try self.loadOp(allocator, code, rhs, fp_spill_op[1]);
             const rd = self.resultReg(result);
-            try code.append(allocator, switch (op) {
-                .add => encode.faddVec(rd, rl, rr),
-                .sub => encode.fsubVec(rd, rl, rr),
-                .mul => encode.fmulVec(rd, rl, rr),
-                .div => encode.fdivVec(rd, rl, rr),
-                else => return error.Unsupported,
+            try code.append(allocator, switch (laneKind(self.func, result) orelse return error.Unsupported) {
+                .f32 => switch (op) {
+                    .add => encode.faddVec(rd, rl, rr),
+                    .sub => encode.fsubVec(rd, rl, rr),
+                    .mul => encode.fmulVec(rd, rl, rr),
+                    .div => encode.fdivVec(rd, rl, rr),
+                    else => return error.Unsupported,
+                },
+                .i32 => switch (op) {
+                    .add => encode.addVecI32(rd, rl, rr),
+                    .sub => encode.subVecI32(rd, rl, rr),
+                    .mul => encode.mulVecI32(rd, rl, rr),
+                    .bit_and => encode.andVec(rd, rl, rr),
+                    .bit_or => encode.orrVec(rd, rl, rr),
+                    .bit_xor => encode.eorVec(rd, rl, rr),
+                    else => return error.Unsupported,
+                },
             });
             try storeResult(allocator, code, self, result, rd);
             return;
@@ -3959,8 +3979,36 @@ fn addSubImmFold(func: *const Function, a: ir.function.Arith) ?struct { base: Va
     return null;
 }
 
-/// Whether the `iconst` at `insts[inst_idx]` is consumed ONLY as the folded immediate of an add/sub
-/// in the same block, so its register materialization can be skipped. Requires it to fit the add/sub
+const LogicalImmFold = struct { base: Value, immediate: Value, imm: i64 };
+
+fn logicalImmWord(op: ir.function.BinOp, imm: i64, wide: bool) ?u32 {
+    const bits: u64 = @bitCast(imm);
+    return switch (op) {
+        .bit_and => encode.andImm(.x0, .x0, bits, wide),
+        .bit_or => encode.orrImm(.x0, .x0, bits, wide),
+        .bit_xor => encode.eorImm(.x0, .x0, bits, wide),
+        else => null,
+    };
+}
+
+fn logicalImmConst(func: *const Function, value: Value, op: ir.function.BinOp, wide: bool) ?i64 {
+    const def = func.definingInst(value) orelse return null;
+    if (func.opcode(def) != .iconst) return null;
+    const imm = func.opcode(def).iconst;
+    return if (logicalImmWord(op, imm, wide) != null) imm else null;
+}
+
+/// A commutative and/or/xor whose constant operand is an encodable A64 bitmask immediate.
+fn logicalImmFold(func: *const Function, a: ir.function.Arith, result: Value) ?LogicalImmFold {
+    if (a.op != .bit_and and a.op != .bit_or and a.op != .bit_xor) return null;
+    const wide = isWide(func, result);
+    if (logicalImmConst(func, a.rhs, a.op, wide)) |imm| return .{ .base = a.lhs, .immediate = a.rhs, .imm = imm };
+    if (logicalImmConst(func, a.lhs, a.op, wide)) |imm| return .{ .base = a.rhs, .immediate = a.lhs, .imm = imm };
+    return null;
+}
+
+/// Whether the `iconst` at `insts[inst_idx]` is consumed ONLY as the folded immediate of an add/sub,
+/// so its register materialization can be skipped. Requires it to fit the add/sub
 /// immediate, to have exactly one use, and that use to be a foldable operand (a `sub` LEFT operand is
 /// `c - x`, which does not fold).
 fn foldsAsAddSubImm(func: *const Function, insts: []const ir.function.Inst, inst_idx: usize) bool {
@@ -3969,18 +4017,41 @@ fn foldsAsAddSubImm(func: *const Function, insts: []const ir.function.Inst, inst
     const result = func.instResult(inst) orelse return false;
     if (addSubImmConst(func, result) == null) return false;
     if (countUses(func, result) != 1) return false;
-    for (insts) |other| {
-        const oa = switch (func.opcode(other)) {
-            .arith => |x| x,
-            else => continue,
-        };
-        if (oa.op != .add and oa.op != .sub) continue;
-        // The RIGHT operand is always the immediate candidate (`addSubImmFold` checks it first). The
-        // LEFT operand only becomes the immediate for a commutative `add`, and only when the RIGHT
-        // operand is NOT itself a constant (otherwise the right is the immediate and this left is the
-        // base register, which must stay materialized).
-        if (oa.rhs == result) return true;
-        if (oa.lhs == result) return oa.op == .add and addSubImmConst(func, oa.rhs) == null;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |other| {
+            const oa = switch (func.opcode(other)) {
+                .arith => |x| x,
+                else => continue,
+            };
+            if (oa.op != .add and oa.op != .sub) continue;
+            // The RIGHT operand is always the immediate candidate (`addSubImmFold` checks it first).
+            // The LEFT operand only becomes the immediate for a commutative `add`, and only when the
+            // RIGHT operand is NOT itself a constant (otherwise the right is the immediate and this
+            // left is the base register, which must stay materialized).
+            if (oa.rhs == result) return true;
+            if (oa.lhs == result) return oa.op == .add and addSubImmConst(func, oa.rhs) == null;
+        }
+    }
+    return false;
+}
+
+/// Whether an integer constant has one use and that use emits it in an A64 logical-immediate
+/// instruction, allowing the constant's register materialization to disappear.
+fn foldsAsLogicalImm(func: *const Function, insts: []const ir.function.Inst, inst_idx: usize) bool {
+    const inst = insts[inst_idx];
+    if (func.opcode(inst) != .iconst) return false;
+    const result = func.instResult(inst) orelse return false;
+    if (countUses(func, result) != 1) return false;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |other| {
+            const a = switch (func.opcode(other)) {
+                .arith => |arith| arith,
+                else => continue,
+            };
+            const other_result = func.instResult(other) orelse continue;
+            const fold = logicalImmFold(func, a, other_result) orelse continue;
+            if (fold.immediate == result) return true;
+        }
     }
     return false;
 }
@@ -3994,7 +4065,7 @@ fn cmpFoldImm(func: *const Function, v: Value) ?u12 {
 }
 
 /// Whether the `iconst` at `insts[inst_idx]` is consumed ONLY as the folded immediate right-hand
-/// operand of a compare in the same block, so its register materialization can be skipped: the
+/// operand of a compare, so its register materialization can be skipped: the
 /// compare emits it inline through `cmpFoldImm`. Requires the constant to fit the compare immediate
 /// and to have exactly one use, and that use to read it as the compare's `rhs` (a `lhs` constant is
 /// not folded, since the immediate compare form fixes the immediate on the right).
@@ -4004,13 +4075,60 @@ fn foldsAsCmpImm(func: *const Function, insts: []const ir.function.Inst, inst_id
     const result = func.instResult(inst) orelse return false;
     if (cmpFoldImm(func, result) == null) return false;
     if (countUses(func, result) != 1) return false;
-    for (insts) |other| {
-        if (func.opcode(other) != .icmp) continue;
-        const cmp = func.opcode(other).icmp;
-        if (cmp.lhs == result) return false; // read as the left operand: not folded
-        if (cmp.rhs == result) return true;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |other| {
+            if (func.opcode(other) != .icmp) continue;
+            const cmp = func.opcode(other).icmp;
+            if (cmp.lhs == result) return false; // read as the left operand: not folded
+            if (cmp.rhs == result) return true;
+        }
     }
     return false;
+}
+
+test "cross-block compare immediate skips constant materialization" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_ty = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const body = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, ty);
+    const bound = try func.appendInst(entry, ty, .{ .iconst = 64 });
+    try func.setJump(entry, body, &.{x});
+    const bx = try func.appendBlockParam(body, ty);
+    const cmp = try func.appendInst(body, bool_ty, .{ .icmp = .{ .op = .lt, .lhs = bx, .rhs = bound } });
+    func.setTerminator(body, .{ .ret = ir.function.Ret.one(cmp) });
+
+    const insts = func.blockInsts(entry);
+    try std.testing.expectEqual(@as(usize, 1), insts.len);
+    try std.testing.expect(foldsAsCmpImm(&func, insts, 0));
+}
+
+test "cross-block logical immediate skips constant materialization" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+
+    const entry = try func.appendBlock();
+    const mask = try func.appendInst(entry, ty, .{ .iconst = 0xff00ff00 });
+    const arbitrary = try func.appendInst(entry, ty, .{ .iconst = 0x12345678 });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const body = try func.appendBlock();
+    const x = try func.appendBlockParam(body, ty);
+    const masked = try func.appendInst(body, ty, .{ .arith = .{ .op = .bit_and, .lhs = x, .rhs = mask } });
+    _ = try func.appendInst(body, ty, .{ .arith = .{ .op = .bit_xor, .lhs = x, .rhs = arbitrary } });
+    func.setTerminator(body, .{ .ret = ir.function.Ret.one(masked) });
+
+    const entry_insts = func.blockInsts(entry);
+    try std.testing.expect(foldsAsLogicalImm(&func, entry_insts, 0));
+    try std.testing.expect(!foldsAsLogicalImm(&func, entry_insts, 1));
+    const fold = logicalImmFold(&func, func.opcode(func.definingInst(masked).?).arith, masked).?;
+    try std.testing.expectEqual(x, fold.base);
+    try std.testing.expectEqual(@as(i64, 0xff00ff00), fold.imm);
 }
 
 fn countUses(func: *const Function, v: Value) usize {
@@ -4545,6 +4663,18 @@ fn tryAddSubImm(allocator: std.mem.Allocator, code: *std.ArrayList(u32), op: ir.
     return true;
 }
 
+fn tryLogicalImm(allocator: std.mem.Allocator, code: *std.ArrayList(u32), op: ir.function.BinOp, rd: Reg, rn: Reg, imm: i64, wide: bool) Error!bool {
+    const bits: u64 = @bitCast(imm);
+    const word = switch (op) {
+        .bit_and => encode.andImm(rd, rn, bits, wide),
+        .bit_or => encode.orrImm(rd, rn, bits, wide),
+        .bit_xor => encode.eorImm(rd, rn, bits, wide),
+        else => null,
+    } orelse return false;
+    try code.append(allocator, word);
+    return true;
+}
+
 fn emitBinary(
     allocator: std.mem.Allocator,
     code: *std.ArrayList(u32),
@@ -4636,10 +4766,10 @@ test "selects a straight-line arithmetic function" {
 
     const code = try selectFunction(allocator, &func);
     defer allocator.free(code);
-    // The first instruction multiplies the two parameters (x0, x1) into an
-    // allocator-chosen register. The function ends in ret.
+    // The post-allocation peephole combines the adjacent product-plus-x into one madd. Its
+    // destination remains allocator-selected, so compare every field except Rd.
     const rd_mask = ~@as(u32, 0x1f);
-    try std.testing.expectEqual(encode.mul(.x0, .x0, .x1) & rd_mask, code[0] & rd_mask);
+    try std.testing.expectEqual(encode.madd(.x0, .x0, .x1, .x0, false) & rd_mask, code[0] & rd_mask);
     try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
 }
 

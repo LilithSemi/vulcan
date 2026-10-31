@@ -1,13 +1,14 @@
 //! Strength reduction replaces an integer multiply, divide, or remainder by a constant power of two
 //! with a cheap shift or mask.
 //!   x * 2^k  -> x << k      any signedness, the low bits are identical
-//!   x /u 2^k -> x >> k      unsigned only, a logical shift. signed division rounds differently
+//!   x /u 2^k -> x >> k      unsigned, a logical shift
+//!   x /s 2^k -> (x + ((x >> (w-1)) & (2^k-1))) >> k
 //!   x %u 2^k -> x & (2^k-1) unsigned only
 //! This pays off most where division is slow or absent. On the NVIDIA GPU path it sidesteps the
 //! roughly 256-instruction `lowerdiv` expansion entirely. It handles both `arith_imm` and an `arith`
-//! with a constant operand, where DCE later cleans the now-dead constant. Signed div/rem by a power
-//! of two is not a plain shift, since it rounds toward zero rather than toward negative infinity, so
-//! it is left alone.
+//! with a constant operand, where DCE later cleans the now-dead constant. Signed division needs a
+//! bias before the arithmetic shift so negative values round toward zero. Signed remainder reuses
+//! that quotient as `x - q*2^k`.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -18,7 +19,7 @@ const Value = ir.function.Value;
 const BinOp = ir.function.BinOp;
 const Opcode = ir.function.Opcode;
 
-pub const pass_def = pass.Pass{ .name = "strength", .run = run };
+pub const pass_def = pass.Pass{ .name = "strength", .run = run, .preserves_cfg = true };
 
 const IntTy = struct { bits: u16, signedness: std.builtin.Signedness };
 
@@ -40,88 +41,196 @@ fn log2Pow2(c: i64, bits: u16) ?u6 {
     return @intCast(k);
 }
 
+fn log2AbsPow2(c: i64, bits: u16) ?u6 {
+    const magnitude: u64 = @abs(c);
+    if (magnitude <= 1 or magnitude & (magnitude - 1) != 0) return null;
+    const k = @ctz(magnitude);
+    if (k == 0 or k >= bits) return null;
+    return @intCast(k);
+}
+
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
-    var changed = try shiftPhase(allocator, func);
+    if (!hasCandidate(func)) return false;
 
-    // Second phase: replace division or remainder by a non-power-of-two constant with a
-    // magic-number multiply (Granlund-Montgomery). A narrower type WIDENS TO 64 BITS to do it,
+    const consts = try allocator.alloc(?i64, func.valueCount());
+    defer allocator.free(consts);
+    collectConstants(func, consts);
+
+    var changed = shiftPhaseWithConsts(func, consts);
+
+    // Later phases replace signed power-of-two division and division or remainder by a
+    // non-power-of-two constant with short arithmetic sequences or a magic-number multiply
+    // (Granlund-Montgomery). A narrower type WIDENS TO 64 BITS to do it,
     // because the `mulh` this emits is defined only on 64-bit operands, so a target with 32-bit
     // registers cannot take this phase at all and calls `shiftPhase` by itself.
-    var consts2 = try allocator.alloc(?i64, func.valueCount());
-    defer allocator.free(consts2);
-    @memset(consts2, null);
-    for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
-        if (func.opcode(inst) == .iconst) {
-            if (func.instResult(inst)) |r| consts2[@backingInt(r)] = func.opcode(inst).iconst;
+    if (try signedPow2Phase(allocator, func, consts)) changed = true;
+    if (try magicPhase(allocator, func, consts)) changed = true;
+    return changed;
+}
+
+fn hasCandidate(func: *const Function) bool {
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
+            .arith => |a| if (a.op == .mul or a.op == .div or a.op == .rem) return true,
+            .arith_imm => |a| if (a.op == .mul or a.op == .div or a.op == .rem) return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
+fn collectConstants(func: *const Function, consts: []?i64) void {
+    @memset(consts, null);
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (func.opcode(inst) == .iconst) {
+                if (func.instResult(inst)) |result| consts[@backingInt(result)] = func.opcode(inst).iconst;
+            }
         }
     }
-    if (try magicPhase(allocator, func, consts2)) changed = true;
-    return changed;
 }
 
 /// Replace a multiply, divide or remainder by a constant POWER OF TWO with a shift or a mask, and
 /// report whether anything changed. Rewrites opcodes in place, so it adds no value and no type: a
 /// 32-bit target can run this where it cannot run the magic-number phase in `run`.
 pub fn shiftPhase(allocator: std.mem.Allocator, func: *Function) pass.Error!bool {
+    if (!hasCandidate(func)) return false;
     // Constant values (to spot a power-of-two operand of an `arith`).
-    var consts = try allocator.alloc(?i64, func.valueCount());
+    const consts = try allocator.alloc(?i64, func.valueCount());
     defer allocator.free(consts);
-    @memset(consts, null);
-    for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
-        if (func.opcode(inst) == .iconst) {
-            if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
+    collectConstants(func, consts);
+    return shiftPhaseWithConsts(func, consts);
+}
+
+fn shiftPhaseWithConsts(func: *Function, consts: []const ?i64) bool {
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            // Extract (op, x, c) where `c` is the constant operand, or skip.
+            var op: BinOp = undefined;
+            var x: Value = undefined;
+            var c: i64 = undefined;
+            switch (func.opcode(inst)) {
+                .arith_imm => |a| {
+                    op = a.op;
+                    x = a.lhs;
+                    c = a.imm;
+                },
+                .arith => |a| {
+                    op = a.op;
+                    if (a.op == .mul) { // commutative: either operand may be the constant
+                        if (consts[@backingInt(a.rhs)]) |cc| {
+                            x = a.lhs;
+                            c = cc;
+                        } else if (consts[@backingInt(a.lhs)]) |cc| {
+                            x = a.rhs;
+                            c = cc;
+                        } else continue;
+                    } else if (a.op == .div or a.op == .rem) { // only the divisor (rhs)
+                        x = a.lhs;
+                        c = consts[@backingInt(a.rhs)] orelse continue;
+                    } else continue;
+                },
+                else => continue,
+            }
+            if (op != .mul and op != .div and op != .rem) continue;
+            const ty = intType(func, x) orelse continue;
+            const k = log2Pow2(c, ty.bits) orelse continue;
+
+            const new: ?Opcode = switch (op) {
+                .mul => .{ .arith_imm = .{ .op = .shl, .lhs = x, .imm = @as(i64, k) } },
+                .div => if (ty.signedness == .unsigned) Opcode{ .arith_imm = .{ .op = .shr, .lhs = x, .imm = @as(i64, k) } } else null,
+                .rem => if (ty.signedness == .unsigned) Opcode{ .arith_imm = .{ .op = .bit_and, .lhs = x, .imm = @bitCast((@as(u64, 1) << k) - 1) } } else null,
+                else => null,
+            };
+            if (new) |n| {
+                func.opcodeMut(inst).* = n;
+                changed = true;
+            }
         }
     }
 
-    var changed = false;
-    for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
-        // Extract (op, x, c) where `c` is the constant operand, or skip.
-        var op: BinOp = undefined;
-        var x: Value = undefined;
-        var c: i64 = undefined;
-        switch (func.opcode(inst)) {
-            .arith_imm => |a| {
-                op = a.op;
-                x = a.lhs;
-                c = a.imm;
-            },
-            .arith => |a| {
-                op = a.op;
-                if (a.op == .mul) { // commutative: either operand may be the constant
-                    if (consts[@backingInt(a.rhs)]) |cc| {
-                        x = a.lhs;
-                        c = cc;
-                    } else if (consts[@backingInt(a.lhs)]) |cc| {
-                        x = a.rhs;
-                        c = cc;
-                    } else continue;
-                } else if (a.op == .div or a.op == .rem) { // only the divisor (rhs)
-                    x = a.lhs;
-                    c = consts[@backingInt(a.rhs)] orelse continue;
-                } else continue;
-            },
-            else => continue,
-        }
-        if (op != .mul and op != .div and op != .rem) continue;
-        const ty = intType(func, x) orelse continue;
-        const k = log2Pow2(c, ty.bits) orelse continue;
+    return changed;
+}
 
-        const new: ?Opcode = switch (op) {
-            .mul => .{ .arith_imm = .{ .op = .shl, .lhs = x, .imm = @as(i64, k) } },
-            .div => if (ty.signedness == .unsigned) Opcode{ .arith_imm = .{ .op = .shr, .lhs = x, .imm = @as(i64, k) } } else null,
-            .rem => if (ty.signedness == .unsigned) Opcode{ .arith_imm = .{ .op = .bit_and, .lhs = x, .imm = @bitCast((@as(u64, 1) << k) - 1) } } else null,
-            else => null,
-        };
-        if (new) |n| {
-            func.opcodeMut(inst).* = n;
+const SignedPow2 = struct {
+    x: Value,
+    magnitude: u64,
+    negative: bool,
+    shift: u6,
+    bits: u16,
+    is_rem: bool,
+};
+
+fn signedPow2(func: *const Function, consts: []const ?i64, inst: ir.function.Inst) ?SignedPow2 {
+    var op: BinOp = undefined;
+    var x: Value = undefined;
+    var divisor: i64 = undefined;
+    switch (func.opcode(inst)) {
+        .arith_imm => |a| {
+            op = a.op;
+            x = a.lhs;
+            divisor = a.imm;
+        },
+        .arith => |a| {
+            op = a.op;
+            x = a.lhs;
+            divisor = consts[@backingInt(a.rhs)] orelse return null;
+        },
+        else => return null,
+    }
+    if (op != .div and op != .rem) return null;
+    const ty = intType(func, x) orelse return null;
+    if (ty.signedness != .signed) return null;
+    const shift = log2AbsPow2(divisor, ty.bits) orelse return null;
+    return .{ .x = x, .magnitude = @abs(divisor), .negative = divisor < 0, .shift = shift, .bits = ty.bits, .is_rem = op == .rem };
+}
+
+/// Lower signed division by a power of two with a rounding bias. This
+/// avoids the generic division expansion while keeping C's round-toward-zero
+/// semantics for negative dividends.
+fn signedPow2Phase(allocator: std.mem.Allocator, func: *Function, consts: []const ?i64) pass.Error!bool {
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+        var has_candidate = false;
+        for (func.blockInsts(block)) |inst| {
+            if (signedPow2(func, consts, inst) != null) {
+                has_candidate = true;
+                break;
+            }
+        }
+        if (!has_candidate) continue;
+
+        var out: std.ArrayList(ir.function.Inst) = .empty;
+        defer out.deinit(allocator);
+        const original = try allocator.dupe(ir.function.Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        for (original) |inst| {
+            const info = signedPow2(func, consts, inst) orelse {
+                try out.append(allocator, inst);
+                continue;
+            };
+            const result = func.instResult(inst).?;
+            const builder = Builder{ .f = func, .o = &out, .a = allocator, .ty = func.valueType(result) };
+            const sign = try builder.opImm(.shr, info.x, @intCast(info.bits - 1));
+            const bias = try builder.opImm(.bit_and, sign, @intCast(info.magnitude - 1));
+            const adjusted = try builder.op(.add, info.x, bias);
+            const positive_quotient = try builder.opImm(.shr, adjusted, @as(i64, info.shift));
+            const replacement = if (info.is_rem) blk: {
+                const product = try builder.opImm(.shl, positive_quotient, @as(i64, info.shift));
+                break :blk try builder.op(.sub, info.x, product);
+            } else if (info.negative) blk: {
+                const zero = try builder.konst(0);
+                break :blk try builder.op(.sub, zero, positive_quotient);
+            } else positive_quotient;
+            func.replaceAllUses(result, replacement);
             changed = true;
         }
+        try func.setBlockInsts(block, out.items);
     }
-
     return changed;
 }
 
@@ -497,6 +606,8 @@ fn applyOp(op: BinOp, l: i64, r: i64, info: anytype) i64 {
         .add => l +% r,
         .sub => l -% r,
         .mul => l *% r,
+        .bit_and => @bitCast(@as(u64, @bitCast(l)) & @as(u64, @bitCast(r))),
+        .shl => @bitCast(@as(u64, @bitCast(l)) << @intCast(@as(u64, @bitCast(r)) & 63)),
         .mulh => @truncate(@as(i128, l) * @as(i128, r) >> @intCast(info.bits)),
         .shr => switch (info.signedness) {
             .signed => l >> @intCast(@as(u64, @bitCast(r)) & 63),
@@ -586,17 +697,18 @@ test "unsigned x / 4 becomes x >> 2, x % 4 becomes x & 3" {
     try testing.expectEqual(@as(i64, 3), ri.imm);
 }
 
-test "signed division by a power of two is left alone (rounding differs)" {
+test "signed division by a power of two uses a rounding bias" {
     const allocator = testing.allocator;
-    var func = Function.init(allocator);
-    defer func.deinit();
-    const t = try intTy(&func, 32, .signed);
-    const b = try func.appendBlock();
-    const x = try func.appendBlockParam(b, t);
-    const q = try func.appendArithImm(b, t, .div, x, 4);
-    func.setTerminator(b, .{ .ret = ir.function.Ret.one(q) });
-    try testing.expect(!try runOnce(allocator, &func));
-    try testing.expectEqual(BinOp.div, func.opcode(func.definingInst(q).?).arith_imm.op);
+    const divisors = [_]i64{ 2, 4, 8, 256, -2, -4, -8, -256 };
+    const dividends = [_]i64{ 0, 1, -1, 7, -7, 8, -8, 255, -255, std.math.maxInt(i32), std.math.minInt(i32) };
+    for (divisors) |divisor| {
+        for (dividends) |dividend| {
+            const quotient: i32 = @truncate(try magicAtWidth(allocator, dividend, divisor, 32, .signed, false));
+            try testing.expectEqual(@as(i32, @intCast(@divTrunc(dividend, divisor))), quotient);
+            const remainder: i32 = @truncate(try magicAtWidth(allocator, dividend, divisor, 32, .signed, true));
+            try testing.expectEqual(@as(i32, @intCast(@rem(dividend, divisor))), remainder);
+        }
+    }
 }
 
 test "non-power-of-two multiply is left alone" {
@@ -609,6 +721,34 @@ test "non-power-of-two multiply is left alone" {
     const y = try func.appendArithImm(b, t, .mul, x, 3);
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
     try testing.expect(!try runOnce(allocator, &func));
+}
+
+test "a function without multiply or division skips strength analysis" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const y = try func.appendArithImm(b, t, .add, x, 3);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    try testing.expect(!hasCandidate(&func));
+    try testing.expect(!try runOnce(allocator, &func));
+}
+
+test "strength reduction skips instructions removed from blocks" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const orphan = try func.createInst(t, .{ .arith_imm = .{ .op = .mul, .lhs = x, .imm = 8 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
+
+    try testing.expect(!try runOnce(allocator, &func));
+    try testing.expectEqual(BinOp.mul, func.opcode(func.definingInst(orphan).?).arith_imm.op);
 }
 
 test "arith form: x * (iconst 16) reduces via the constant operand" {

@@ -10,14 +10,13 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const pass = @import("pass.zig");
-const cfg_mod = @import("cfg.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
 const Inst = ir.function.Inst;
 const Block = ir.function.Block;
 
-pub const pass_def = pass.Pass{ .name = "gvn", .run = run };
+pub const pass_def = pass.Pass{ .name = "gvn", .run = run, .preserves_cfg = true, .preserves_value_defs = true };
 
 const ExprKind = enum(u8) { iconst, fconst, fconst128, arith, arith_imm, icmp, select, convert, unary, extract, global_addr, dot, reduce, splat };
 
@@ -39,29 +38,21 @@ fn isCommutative(op: ir.function.BinOp) bool {
 }
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
-    const n = func.blockCount();
-    if (n == 0) return false;
+    // CSE needs at least two numberable expressions. Most tiny helpers do not
+    // reach that threshold, so avoid building CFG, dominator, RPO, defining-block,
+    // canonical-value, and hash-table state for them. On larger functions this
+    // scan normally stops after the first couple of instructions.
+    if (!hasDuplicateCandidate(func)) return false;
 
     const doms = try analyses.dominators();
-    var cfg = try cfg_mod.build(allocator, func);
-    defer cfg.deinit(allocator);
-    const rpo = try cfg.reversePostorder(allocator);
-    defer allocator.free(rpo);
+    const rpo = try analyses.reversePostorder();
 
     // The canonical (leader) value for each value, and the block each is defined
     // in. Both start as the identity.
     const canon = try allocator.alloc(Value, func.valueCount());
     defer allocator.free(canon);
     for (canon, 0..) |*c, i| c.* = @fromBackingInt(@intCast(i));
-    const def_block = try allocator.alloc(u32, func.valueCount());
-    defer allocator.free(def_block);
-    for (0..n) |bi| {
-        const block: Block = @fromBackingInt(@intCast(bi));
-        for (func.blockParams(block)) |p| def_block[@backingInt(p)] = @intCast(bi);
-        for (func.blockInsts(block)) |inst| {
-            if (func.instResult(inst)) |r| def_block[@backingInt(r)] = @intCast(bi);
-        }
-    }
+    const def_block = try analyses.definingBlocks();
 
     var table: std.AutoHashMapUnmanaged(Key, Value) = .empty;
     defer table.deinit(allocator);
@@ -85,8 +76,38 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         }
     }
 
-    if (changed) rewriteOperands(func, canon);
+    if (changed) func.rewriteAllUses(canon);
     return changed;
+}
+
+fn hasDuplicateCandidate(func: *const Function) bool {
+    var found_one = false;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (func.instResult(inst) == null) continue;
+            const numberable = switch (func.opcode(inst)) {
+                .fconst,
+                .fconst128,
+                .arith,
+                .arith_imm,
+                .icmp,
+                .select,
+                .convert,
+                .unary,
+                .extract,
+                .global_addr,
+                .dot,
+                .reduce,
+                .splat,
+                => true,
+                else => false,
+            };
+            if (!numberable) continue;
+            if (found_one) return true;
+            found_one = true;
+        }
+    }
+    return false;
 }
 
 /// Build the canonical key for `inst` (whose result is `result`), or null if the
@@ -159,106 +180,6 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
     };
 }
 
-fn sub(canon: []const Value, v: Value) Value {
-    return canon[@backingInt(v)];
-}
-
-/// Rewrite every value operand (in instructions, `if` edges, and terminators) to
-/// its canonical leader, so redundant definitions fall out of use.
-fn rewriteOperands(func: *Function, canon: []const Value) void {
-    for (0..func.instCount()) |i| {
-        const op = func.opcodeMut(@fromBackingInt(@intCast(i)));
-        switch (op.*) {
-            // An atomic's three operands are canonicalized like any other. This rewrites
-            // WHICH value each operand names; it never removes the atomic itself, which
-            // `keyOf` refuses to number.
-            .atomic_rmw => |*a| {
-                a.ptr = sub(canon, a.ptr);
-                a.value = sub(canon, a.value);
-                if (a.compare) |*c| c.* = sub(canon, c.*);
-            },
-            // A barrier carries no Value operand to canonicalize.
-            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
-            .arith => |*a| {
-                a.lhs = sub(canon, a.lhs);
-                a.rhs = sub(canon, a.rhs);
-            },
-            .arith_imm => |*a| a.lhs = sub(canon, a.lhs),
-            .icmp => |*c| {
-                c.lhs = sub(canon, c.lhs);
-                c.rhs = sub(canon, c.rhs);
-            },
-            .select => |*s| {
-                s.cond = sub(canon, s.cond);
-                s.then = sub(canon, s.then);
-                s.@"else" = sub(canon, s.@"else");
-            },
-            .extract => |*e| e.aggregate = sub(canon, e.aggregate),
-            .convert => |*cv| cv.value = sub(canon, cv.value),
-            .decode_low_float, .encode_low_float => |*cv| cv.value = sub(canon, cv.value),
-            .dequantize_nvfp4, .quantize_nvfp4 => |*cv| {
-                cv.value = sub(canon, cv.value);
-                cv.block_scale = sub(canon, cv.block_scale);
-                cv.global_scale = sub(canon, cv.global_scale);
-            },
-            .unary => |*u| u.value = sub(canon, u.value),
-            .load => |*l| {
-                l.ptr = sub(canon, l.ptr);
-                if (l.mask) |m| l.mask = sub(canon, m);
-            },
-            .store => |*st| {
-                st.value = sub(canon, st.value);
-                st.ptr = sub(canon, st.ptr);
-                if (st.mask) |m| st.mask = sub(canon, m);
-            },
-            .prefetch => |*pf| pf.ptr = sub(canon, pf.ptr),
-            .va_start => |*vs| vs.list = sub(canon, vs.list),
-            .va_arg => |*va| va.list = sub(canon, va.list),
-            .va_end => |*ve| ve.list = sub(canon, ve.list),
-            .dot => |*d| {
-                d.acc = sub(canon, d.acc);
-                d.a = sub(canon, d.a);
-                d.b = sub(canon, d.b);
-            },
-            .reduce => |*red| red.vector = sub(canon, red.vector),
-            .splat => |*sp| sp.scalar = sub(canon, sp.scalar),
-            .matmul => |*mm| {
-                mm.a = sub(canon, mm.a);
-                mm.b = sub(canon, mm.b);
-                mm.c = sub(canon, mm.c);
-            },
-            .struct_new => |sn| for (func.valueListMut(sn.fields)) |*f| {
-                f.* = sub(canon, f.*);
-            },
-            .call => |*c| {
-                for (func.valueListMut(c.args)) |*arg| arg.* = sub(canon, arg.*);
-                if (c.ret_dest) |d| c.ret_dest = sub(canon, d); // SM14 M4d-c: the struct-return destination is a call operand
-            },
-            .call_indirect => |*c| {
-                c.target = sub(canon, c.target);
-                for (func.valueListMut(c.args)) |*arg| arg.* = sub(canon, arg.*);
-                if (c.ret_dest) |d| c.ret_dest = sub(canon, d); // SM14 M4d-c
-            },
-            .@"if" => |*cf| {
-                cf.cond = sub(canon, cf.cond);
-                for (func.valueListMut(cf.then.args)) |*arg| arg.* = sub(canon, arg.*);
-                for (func.valueListMut(cf.@"else".args)) |*arg| arg.* = sub(canon, arg.*);
-            },
-        }
-    }
-    for (0..func.blockCount()) |bi| {
-        const term = func.terminatorPtr(@fromBackingInt(@intCast(bi)));
-        if (term.*) |*t| switch (t.*) {
-            .ret => |*r| for (r.values[0..r.count]) |*vv| {
-                vv.* = sub(canon, vv.*);
-            },
-            .jump => |*j| for (func.valueListMut(j.args)) |*arg| {
-                arg.* = sub(canon, arg.*);
-            },
-        };
-    }
-}
-
 test "cse reuses a redundant arithmetic expression" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
@@ -282,6 +203,26 @@ test "cse reuses a redundant arithmetic expression" {
     const rdef = func.definingInst(r).?;
     try std.testing.expectEqual(e1, func.opcode(rdef).arith.lhs);
     try std.testing.expectEqual(e1, func.opcode(rdef).arith.rhs);
+}
+
+test "gvn skips analyses when fewer than two expressions can be numbered" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32_t);
+    const y = try func.appendInst(b, i32_t, .{ .arith_imm = .{ .op = .add, .lhs = x, .imm = 1 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+    try std.testing.expect(analyses.cfg_cache == null);
+    try std.testing.expect(analyses.rpo_cache == null);
+    try std.testing.expect(analyses.def_blocks == null);
+    try std.testing.expect(analyses.doms == null);
 }
 
 test "cse does not reuse across a non-dominating block" {

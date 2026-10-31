@@ -39,15 +39,9 @@ const BinOp = ir.function.BinOp;
 const PACK_COST_PER_LANE: f64 = 0.2;
 const UNPACK_COST_PER_LANE: f64 = 0.2;
 
-// Cost of ONE coalesced contiguous vector load (in place of a pack) or vector store (in place of an
-// unpack). When the operand scalars are adjacent loads, the vectorizer emits a single wide load
-// instead of `lanes` lane-inserts; when the result lanes are stored to adjacent memory it emits a
-// single wide store instead of `lanes` lane-extracts. A wide memory op is one instruction, not N
-// lane moves, so it is priced at a single lane's worth of the pack/unpack knob rather than `lanes`
-// of them. This is what turns a wide-core cheap-op group (declined when it must pack/unpack) into a
-// profitable one when its operands/results ride contiguous memory, without ever making a
-// register-input group (no coalesceable memory) profitable.
-const VECTOR_MEM_COST: f64 = PACK_COST_PER_LANE;
+// A splat is one lane-move instruction. Keep it on the same deliberately sub-unit scale as a
+// pack insertion; loads and stores are instead priced from the model's real memory-port count.
+const SPLAT_COST: f64 = PACK_COST_PER_LANE;
 
 /// Build the throwaway opcode used only to query the model's per-op `throughput`/`unitOf`. Both
 /// functions switch on `.arith.op` alone and never read the operands, so placeholder operand
@@ -95,6 +89,10 @@ fn scalarParallelism(model: *const Model, class: UnitClass) f64 {
     const ports = sched.classPorts(model, class); // maxInt(u32) when the class is unmodeled
     const eff = @min(@as(u32, model.issue_width), ports);
     return @floatFromInt(@max(@as(u32, 1), eff));
+}
+
+fn memoryParallelism(model: *const Model) f64 {
+    return scalarParallelism(model, .mem);
 }
 
 /// Throughput cost of leaving the group scalar: `lanes` independent ops of one class, retiring
@@ -148,16 +146,16 @@ pub fn vectorCostMem(
     // coalesce to one wide load, are reused for free from an earlier group, or are a splat.
     const packed_vectors: f64 = @floatFromInt(distinct_operand_vectors - coalesced_operand_vectors - chained_operand_vectors - splat_operand_vectors);
     const pack = packed_vectors * lanes_f * PACK_COST_PER_LANE;
-    const loads = @as(f64, @floatFromInt(coalesced_operand_vectors)) * VECTOR_MEM_COST;
+    const loads = @as(f64, @floatFromInt(coalesced_operand_vectors)) / memoryParallelism(model);
     // A splat operand (the same scalar in every lane, e.g. the SAXPY multiplier) is one broadcast
     // instruction (`dup`), not a per-lane pack, so it is priced like a single wide op, not `lanes`.
-    const splats = @as(f64, @floatFromInt(splat_operand_vectors)) * VECTOR_MEM_COST;
+    const splats = @as(f64, @floatFromInt(splat_operand_vectors)) * SPLAT_COST;
     // Chained results cost nothing (no extract, no store, they ride a vector register into the next
     // group); a coalesced store is one wide store; otherwise `lanes` lane-extracts.
     const unpack = if (result_chained)
         0.0
     else if (result_coalesced_store)
-        VECTOR_MEM_COST
+        1.0 / memoryParallelism(model)
     else
         lanes_f * UNPACK_COST_PER_LANE;
     return vec_op + pack + loads + splats + unpack;
@@ -208,7 +206,19 @@ pub fn slpProfitableMem(
     std.debug.assert(lanes >= 2);
     std.debug.assert(distinct_operand_vectors >= 1 and distinct_operand_vectors <= 2);
     std.debug.assert(coalesced_operand_vectors + chained_operand_vectors + splat_operand_vectors <= distinct_operand_vectors);
-    const scalar = scalarCost(model, group_op, elem_is_float, lanes);
+    // The coalesced shape replaces `lanes` scalar memory instructions with one vector instruction
+    // for each participating load/store stream. Charge both sides for those real instructions;
+    // previously only the vector side paid for memory, which could reject a 4-wide load/add/store
+    // kernel even though it removes nine instructions.
+    // Only credit scalar memory traffic for an end-to-end vector chain. A load-only group whose
+    // result must immediately be unpacked has not removed the expensive boundary that motivated
+    // this path; likewise, coalescing stores alone must not rescue two packed register operands.
+    const scalar_mem_streams: u8 = if ((coalesced_operand_vectors > 0 or chained_operand_vectors > 0) and (result_coalesced_store or result_chained))
+        coalesced_operand_vectors + @intFromBool(result_coalesced_store)
+    else
+        0;
+    const scalar_mem = (@as(f64, @floatFromInt(scalar_mem_streams)) * @as(f64, @floatFromInt(lanes))) / memoryParallelism(model);
+    const scalar = scalarCost(model, group_op, elem_is_float, lanes) + scalar_mem;
     const vector = vectorCostMem(model, group_op, elem_is_float, lanes, distinct_operand_vectors, coalesced_operand_vectors, chained_operand_vectors, splat_operand_vectors, result_coalesced_store, result_chained);
     return vector < scalar;
 }

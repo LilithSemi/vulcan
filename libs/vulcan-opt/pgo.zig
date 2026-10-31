@@ -26,12 +26,14 @@ pub const Profile = struct {
     allocator: std.mem.Allocator,
     names: std.ArrayList([]u8) = .empty,
     counts: std.ArrayList([]u64) = .empty,
+    index: std.StringHashMapUnmanaged(usize) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Profile {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *Profile) void {
+        self.index.deinit(self.allocator);
         for (self.names.items) |n| self.allocator.free(n);
         for (self.counts.items) |c| self.allocator.free(c);
         self.names.deinit(self.allocator);
@@ -40,20 +42,22 @@ pub const Profile = struct {
 
     /// Record `counts` (copied) for the function `name` (copied).
     pub fn add(self: *Profile, name: []const u8, counts: []const u64) Error!void {
+        if (self.index.contains(name)) return error.MalformedProfile;
         const n = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(n);
         const c = try self.allocator.dupe(u64, counts);
         errdefer self.allocator.free(c);
+        const index = self.names.items.len;
         try self.names.append(self.allocator, n);
         errdefer _ = self.names.pop();
         try self.counts.append(self.allocator, c);
+        errdefer _ = self.counts.pop();
+        try self.index.put(self.allocator, n, index);
     }
 
     pub fn get(self: *const Profile, name: []const u8) ?[]const u64 {
-        for (self.names.items, 0..) |n, i| {
-            if (std.mem.eql(u8, n, name)) return self.counts.items[i];
-        }
-        return null;
+        const index = self.index.get(name) orelse return null;
+        return self.counts.items[index];
     }
 };
 
@@ -86,6 +90,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!Profile {
         for (counts) |*c| c.* = try getU64(data, &pos);
         try profile.add(name, counts);
     }
+    if (pos != data.len) return error.MalformedProfile;
     return profile;
 }
 
@@ -171,11 +176,16 @@ pub fn guidedInline(allocator: std.mem.Allocator, module: *lto.Module, profile: 
     const lk = module.lookup();
     for (module.names.items, 0..) |name, i| {
         const counts = profile.get(name) orelse continue;
-        var filt = HotFilter{ .counts = counts, .threshold = threshold };
-        const filter = inlining.Filter{ .context = &filt, .func = HotFilter.allow };
-        if (try inlining.runFiltered(allocator, module.funcs.items[i], lk, filter)) changed = true;
+        if (try guidedInlineFunction(allocator, module.funcs.items[i], lk, counts, threshold)) changed = true;
     }
     return changed;
+}
+
+/// Inline call sites in blocks whose profile count reaches `threshold`.
+pub fn guidedInlineFunction(allocator: std.mem.Allocator, caller: *Function, lookup: inlining.Lookup, counts: []const u64, threshold: u64) Error!bool {
+    var filt = HotFilter{ .counts = counts, .threshold = threshold };
+    const filter = inlining.Filter{ .context = &filt, .func = HotFilter.allow };
+    return inlining.runFiltered(allocator, caller, lookup, filter);
 }
 
 fn i32k(func: *Function) std.mem.Allocator.Error!Type {
@@ -197,7 +207,9 @@ test "profile round-trips through its binary format" {
     try std.testing.expectEqualSlices(u64, &.{ 1000, 0, 999 }, back.get("hot").?);
     try std.testing.expectEqualSlices(u64, &.{5}, back.get("cold").?);
     try std.testing.expect(back.get("missing") == null);
+    try std.testing.expectError(error.MalformedProfile, p.add("hot", &.{1}));
     try std.testing.expectError(error.MalformedProfile, decode(allocator, "\x01\x00\x00\x00"));
+    try std.testing.expectError(error.MalformedProfile, decode(allocator, "\x00\x00\x00\x00trailing"));
 }
 
 test "instrumentation adds a transparent counter to every block" {

@@ -37,6 +37,38 @@ const InputSpec = union(enum) {
     lib: struct { name: []const u8, prefer_dynamic: bool },
 };
 
+const OptimizationLevel = enum {
+    off,
+    debug,
+    one,
+    two,
+    three,
+    size,
+    min_size,
+    fast,
+
+    fn optimizes(self: OptimizationLevel) bool {
+        return switch (self) {
+            .off, .debug => false,
+            .one, .two, .three, .size, .min_size, .fast => true,
+        };
+    }
+
+    fn runsMicroarch(self: OptimizationLevel) bool {
+        return switch (self) {
+            .two, .three, .fast => true,
+            .off, .debug, .one, .size, .min_size => false,
+        };
+    }
+
+    fn inlinesCalls(self: OptimizationLevel) bool {
+        return switch (self) {
+            .two, .three, .fast => true,
+            .off, .debug, .one, .size, .min_size => false,
+        };
+    }
+};
+
 const Options = struct {
     /// Every positional or `-l` input, in command-line order. `-c`/`-E` still require
     /// exactly one `.c`/`.i` entry. The LINK path (the default when neither is given)
@@ -139,13 +171,11 @@ const Options = struct {
     /// so a plain link runs the mark-and-sweep pass without any extra flag. `--no-gc-sections`
     /// opts back out to the old keep-everything behavior. See the LINK step in `main`.
     gc_sections: bool = true,
-    /// Whether to run the IR optimization pipeline (`vulcan-opt`'s mem2reg, then the clean-up
-    /// passes) before code generation. Set by an `-O<n>` flag with a level of 1 or higher
-    /// (`-O1`/`-O2`/`-O3`/`-Os`/`-Ofast`). `-O0`, `-Og`, and NO `-O` flag leave it false, so
-    /// the output stays exactly what the un-optimized single-level pipeline produced before.
-    /// This mirrors clang, whose default is `-O0`. `./configure` builds pass `-O2`, so a real
-    /// autotools compile optimizes.
-    optimize: bool = false,
+    /// `-ftime-report`: print per-stage compiler wall times to stderr.
+    time_report: bool = false,
+    /// `-fprofile-use=<file>`: use Vulcan's binary block-count profile.
+    profile_use: ?[]const u8 = null,
+    optimize: OptimizationLevel = .off,
 };
 
 /// Which autoconf-style version probe was requested. `main` answers these BEFORE running
@@ -254,6 +284,12 @@ fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (e
             opts.preprocess_only = true;
         } else if (std.mem.eql(u8, arg, "-freproducible-compile")) {
             opts.reproducible = true;
+        } else if (std.mem.eql(u8, arg, "-ftime-report")) {
+            opts.time_report = true;
+        } else if (std.mem.startsWith(u8, arg, "-fprofile-use=")) {
+            const path = arg["-fprofile-use=".len..];
+            if (path.len == 0) return fail(errw, "-fprofile-use requires a profile file", .{});
+            opts.profile_use = path;
         } else if (std.mem.eql(u8, arg, "-I")) {
             const dir = it.next() orelse return fail(errw, "-I requires an argument", .{});
             try opts.includes.append(allocator, dir);
@@ -375,11 +411,7 @@ fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (e
         } else if (std.mem.startsWith(u8, arg, "-march=")) {
             // ISA selection. VCC's ISA is fixed by -target, so accept and ignore.
         } else if (std.mem.startsWith(u8, arg, "-O")) {
-            // Optimization level. A level of 1 or higher (`-O1`/`-O2`/`-O3`/`-Os`/`-Ofast`)
-            // turns the IR optimization pipeline on. `-O0` and `-Og` leave it off, matching
-            // clang's default. The exact level does not further tune the pipeline yet, so all
-            // "on" levels run the same passes. Last flag on the line wins.
-            opts.optimize = optLevelEnablesOpt(arg["-O".len..]);
+            opts.optimize = parseOptimizationLevel(arg["-O".len..]);
         } else if (std.mem.eql(u8, arg, "--gc-sections")) {
             opts.gc_sections = true;
         } else if (std.mem.eql(u8, arg, "--no-gc-sections")) {
@@ -431,21 +463,19 @@ fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (e
     return opts;
 }
 
-/// Whether `arg` is a warning, optimization, debug, or standard-selection flag VCC
-/// recognizes but does not act on. `./configure`/`make` throw the full gcc flag surface at
-/// the compiler. Most of it (which warnings to print, which optimization level, how much
-/// debug info) has no effect on VCC's own single-level pipeline.
-/// Whether an `-O<level>` flag (the text after `-O`) turns the optimization pipeline on. A bare
-/// `-O` is gcc's `-O1`, so it counts. `-O0` and `-Og` (a debug-friendly build) stay off. Every
-/// other level (`-O1`/`-O2`/`-O3`/`-Os`/`-Oz`/`-Ofast`) turns it on. The exact level does not yet
-/// tune which passes run.
-fn optLevelEnablesOpt(level: []const u8) bool {
-    if (level.len == 0) return true; // bare -O is -O1
-    if (std.mem.eql(u8, level, "0")) return false;
-    if (std.mem.eql(u8, level, "g")) return false;
-    return true;
+fn parseOptimizationLevel(level: []const u8) OptimizationLevel {
+    if (level.len == 0 or std.mem.eql(u8, level, "1")) return .one;
+    if (std.mem.eql(u8, level, "0")) return .off;
+    if (std.mem.eql(u8, level, "g")) return .debug;
+    if (std.mem.eql(u8, level, "2")) return .two;
+    if (std.mem.eql(u8, level, "3")) return .three;
+    if (std.mem.eql(u8, level, "s")) return .size;
+    if (std.mem.eql(u8, level, "z")) return .min_size;
+    if (std.mem.eql(u8, level, "fast")) return .fast;
+    return .two;
 }
 
+/// Whether `arg` is a warning, debug, or standard-selection flag VCC accepts without action.
 fn isIgnoredFlag(arg: []const u8) bool {
     if (std.mem.startsWith(u8, arg, "-std=")) return true; // -std=gnu11, -std=c99, ...
     if (std.mem.startsWith(u8, arg, "-O")) return true; // -O, -O0.. -Ofast, -Os, -Og
@@ -921,42 +951,126 @@ fn buildModuleData(allocator: std.mem.Allocator, objs: []const cc.DataObject) st
 /// microarch model for `arch` (see `resolveModel`). It tunes both the IR layer and the
 /// backend for every function this call compiles. Used by both the `-c` path (a single
 /// source) and the link step (one call per `.c`/`.i` input, in command order).
-fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: bool) ![]u8 {
+fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool, profile: ?*const opt.pgo.Profile) ![]u8 {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
     var pp_opts = pp_base;
     pp_opts.filename = try filenameForPreproc(allocator, path);
-    return compileSourceToObject(allocator, source, pp_opts, arch, model, optimize);
+    return compileSourceToObject(allocator, io, source, pp_opts, arch, model, optimize, time_report, profile);
 }
 
 /// Compiles in-memory `source` (already-read text, `pp_opts` carrying its filename and
 /// predefines) to a relocatable object. Split from `compileToObject` so the driver can
 /// also compile a SYNTHETIC source string it never read from disk (see
-/// `synthDsoHandleObject`). When `optimize` is set, the target-independent optimization
-/// pipeline (`opt.optimize`: mem2reg, then the clean-up passes) runs over each function's IR
-/// FIRST, so its allocas become register-resident SSA values. `model`, when set, then runs
-/// `mm.optimize` (the microarch layer, which needs that mem2reg'd form to do anything) over the
-/// same IR, and is handed to `writeObjectDataForModel` so the backend tunes its own choices
-/// (instruction selection, scheduling) for it too.
+/// `synthDsoHandleObject`). The target-independent and model-driven transforms run before final
+/// scheduling and block layout. The backend also receives `model` for its instruction choices.
 ///
 /// The target-independent pipeline runs in TWO halves with the microarch layer between them.
 /// `opt.optimizeLate` reduces a loop's addresses to loop-carried pointers, which changes the shape
 /// four microarch idiom recognizers match on, so it has to come after them. `opt.optimize` is the
 /// two halves back to back, for a caller with no microarch layer to fit in between.
-fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: bool) ![]u8 {
+fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool, profile: ?*const opt.pgo.Profile) ![]u8 {
+    const frontend_start = std.Io.Timestamp.now(io, .awake);
     var mod = try cc.compileWithOpts(allocator, source, pp_opts);
     defer mod.deinit(allocator);
+    const frontend_end = std.Io.Timestamp.now(io, .awake);
 
-    var mfs: std.ArrayList(target.native.ModuleFunction) = .empty;
-    for (mod.funcs) |*nf| {
-        if (optimize) _ = try opt.optimizeEarly(allocator, &nf.func);
-        if (model) |m| _ = try mm.optimize(allocator, &nf.func, m);
-        if (optimize) _ = try opt.optimizeLate(allocator, &nf.func);
-        try mfs.append(allocator, .{ .name = nf.name, .func = &nf.func });
+    const inline_start = frontend_end;
+    if (optimize.inlinesCalls()) try inlineTranslationUnit(allocator, &mod, profile);
+    const inline_end = std.Io.Timestamp.now(io, .awake);
+
+    const early_start = inline_end;
+    if (optimize.optimizes()) {
+        for (mod.funcs) |*nf| _ = try opt.optimizeEarly(allocator, &nf.func);
     }
+    const early_end = std.Io.Timestamp.now(io, .awake);
+
+    const microarch_start = early_end;
+    if (optimize.runsMicroarch()) if (model) |m| {
+        for (mod.funcs) |*nf| _ = try mm.optimizeTransforms(allocator, &nf.func, m);
+    };
+    const microarch_end = std.Io.Timestamp.now(io, .awake);
+
+    const late_start = microarch_end;
+    if (optimize.optimizes()) {
+        for (mod.funcs) |*nf| _ = try opt.optimizeLate(allocator, &nf.func);
+    }
+    const late_end = std.Io.Timestamp.now(io, .awake);
+
+    const final_start = late_end;
+    for (mod.funcs) |*nf| {
+        if (optimize.runsMicroarch()) if (model) |m| try mm.schedule.run(allocator, &nf.func, m);
+        if (optimize.optimizes()) {
+            const counts = try expandedProfileCounts(allocator, profile, nf.name, nf.func.blockCount());
+            defer if (counts) |owned| allocator.free(owned);
+            _ = try opt.layout(allocator, &nf.func, counts);
+        }
+    }
+    const final_end = std.Io.Timestamp.now(io, .awake);
 
     const data = try buildModuleData(allocator, mod.data);
+    var mfs: std.ArrayList(target.native.ModuleFunction) = .empty;
+    for (mod.funcs) |*nf| try mfs.append(allocator, .{ .name = nf.name, .func = &nf.func });
+    const codegen_start = std.Io.Timestamp.now(io, .awake);
+    const object = try target.native.writeObjectDataForModel(allocator, arch, mfs.items, data.items, model);
+    const codegen_end = std.Io.Timestamp.now(io, .awake);
 
-    return target.native.writeObjectDataForModel(allocator, arch, mfs.items, data.items, model);
+    if (time_report) {
+        var buffer: [1024]u8 = undefined;
+        var writer = std.Io.File.stderr().writer(io, &buffer);
+        try writer.interface.print("vcc time (us): frontend={d} inline={d} early-opt={d} microarch={d} late-opt={d} schedule-layout={d} codegen={d}\n", .{
+            micros(frontend_start, frontend_end),
+            micros(inline_start, inline_end),
+            micros(early_start, early_end),
+            micros(microarch_start, microarch_end),
+            micros(late_start, late_end),
+            micros(final_start, final_end),
+            micros(codegen_start, codegen_end),
+        });
+        try writer.interface.flush();
+    }
+    return object;
+}
+
+fn micros(start: std.Io.Timestamp, end: std.Io.Timestamp) u64 {
+    const nanoseconds = start.durationTo(end).nanoseconds;
+    std.debug.assert(nanoseconds >= 0);
+    return @intCast(@divTrunc(nanoseconds, std.time.ns_per_us));
+}
+
+/// Extend an input profile with zero-count entries for blocks added by optimization.
+fn expandedProfileCounts(allocator: std.mem.Allocator, profile: ?*const opt.pgo.Profile, name: []const u8, block_count: usize) !?[]u64 {
+    const raw = (profile orelse return null).get(name) orelse return null;
+    if (raw.len > block_count) return error.MalformedProfile;
+    const counts = try allocator.alloc(u64, block_count);
+    @memset(counts, 0);
+    @memcpy(counts[0..raw.len], raw);
+    return counts;
+}
+
+const ModuleLookup = struct {
+    fn get(context: *anyopaque, name: []const u8) ?*const cc.Function {
+        const mod: *const cc.Module = @ptrCast(@alignCast(context));
+        return mod.find(name);
+    }
+};
+
+/// Inline calls whose definitions are available in this translation unit.
+fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module, profile: ?*const opt.pgo.Profile) !void {
+    const lookup = opt.inlining.Lookup{ .context = mod, .func = ModuleLookup.get };
+    for (mod.funcs) |*named| {
+        if (profile) |p| {
+            const counts = p.get(named.name) orelse continue;
+            if (counts.len != named.func.blockCount()) return error.MalformedProfile;
+            _ = try opt.pgo.guidedInlineFunction(allocator, &named.func, lookup, counts, profileHotThreshold(counts));
+        } else {
+            _ = try opt.inlining.run(allocator, &named.func, lookup);
+        }
+    }
+}
+
+fn profileHotThreshold(counts: []const u64) u64 {
+    if (counts.len == 0 or counts[0] == 0) return 1;
+    return @max(@as(u64, 1), counts[0] / 100);
 }
 
 /// A synthetic object defining `__dso_handle` (a NULL `void *`), the per-DSO handle the
@@ -964,11 +1078,11 @@ fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_op
 /// normally supplies it. VCC links a minimal crt (`crt1.o` only), so the driver provides it
 /// instead. A whole-program (main-executable) handle is NULL, so the stored value is 0. This
 /// object holds data only, no functions, so it passes no microarch model through.
-fn synthDsoHandleObject(allocator: std.mem.Allocator, pp_base: preproc.Options, arch: link.Arch) ![]u8 {
+fn synthDsoHandleObject(allocator: std.mem.Allocator, io: std.Io, pp_base: preproc.Options, arch: link.Arch) ![]u8 {
     var pp_opts = pp_base;
     pp_opts.filename = "<vcc-dso-handle>";
     // Data only, no functions, so optimization has nothing to act on: pass it off.
-    return compileSourceToObject(allocator, "void *__dso_handle = 0;\n", pp_opts, arch, null, false);
+    return compileSourceToObject(allocator, io, "void *__dso_handle = 0;\n", pp_opts, arch, null, .off, false, null);
 }
 
 /// The `vcc` driver entry point: parse argv, then dispatch on mode. `-E` preprocesses and
@@ -1113,6 +1227,16 @@ pub fn main(init: std.process.Init) !void {
     // even with no flags given. See `resolveModel`.
     const model = try resolveModel(&opts, arch, errw);
 
+    var profile_storage: ?opt.pgo.Profile = null;
+    defer if (profile_storage) |*profile| profile.deinit();
+    if (opts.profile_use) |profile_path| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, profile_path, allocator, .limited(64 * 1024 * 1024)) catch
+            return fail(errw, "cannot read profile '{s}'", .{profile_path});
+        profile_storage = opt.pgo.decode(allocator, bytes) catch
+            return fail(errw, "malformed profile '{s}'", .{profile_path});
+    }
+    const profile: ?*const opt.pgo.Profile = if (profile_storage) |*stored| stored else null;
+
     // Default system include directory: the host glibc dev tree when `arch` is the host's
     // own arch, else a CROSS glibc dev tree for `arch`'s triple. This lets `#include
     // <stdio.h>` resolve with no explicit `-I`/`-isystem`. `-nostdinc` suppresses this; the
@@ -1191,7 +1315,7 @@ pub fn main(init: std.process.Init) !void {
     if (opts.compile_only) {
         const input = single_source.?;
         if (classifyExt(input) != .c) return fail(errw, "-c requires a .c/.i source file, got '{s}'", .{input});
-        const obj = try compileToObject(allocator, io, input, pp_base, arch, model, opts.optimize);
+        const obj = try compileToObject(allocator, io, input, pp_base, arch, model, opts.optimize, opts.time_report, profile);
         const out = opts.output orelse try derivedOutputName(allocator, input);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = obj });
         if (opts.gen_depfile) {
@@ -1219,9 +1343,16 @@ pub fn main(init: std.process.Init) !void {
         var w = std.Io.File.stdout().writer(io, &buf);
         // With an optimization level (`-O1`+), dump the IR the backend actually sees, not the raw
         // lowering: run the same pipeline the object path runs.
-        if (opts.optimize) for (mod.funcs) |*nf| {
-            _ = try opt.optimize(allocator, &nf.func);
-        };
+        if (opts.optimize.inlinesCalls()) try inlineTranslationUnit(allocator, &mod, profile);
+        if (opts.optimize.optimizes()) {
+            for (mod.funcs) |*nf| {
+                _ = try opt.optimizeEarly(allocator, &nf.func);
+                _ = try opt.optimizeLate(allocator, &nf.func);
+                const counts = try expandedProfileCounts(allocator, profile, nf.name, nf.func.blockCount());
+                defer if (counts) |owned| allocator.free(owned);
+                _ = try opt.layout(allocator, &nf.func, counts);
+            }
+        }
         for (mod.funcs) |nf| try w.interface.print("; function {s}\n{f}\n", .{ nf.name, nf.func });
         try w.interface.flush();
         return;
@@ -1243,7 +1374,7 @@ pub fn main(init: std.process.Init) !void {
     for (opts.inputs.items) |spec| switch (spec) {
         .path => |p| switch (classifyExt(p)) {
             .c => {
-                const obj = try compileToObject(allocator, io, p, pp_base, arch, model, opts.optimize);
+                const obj = try compileToObject(allocator, io, p, pp_base, arch, model, opts.optimize, opts.time_report, profile);
                 try dyn_inputs.append(allocator, .{ .object = obj });
                 try display_names.append(allocator, "");
             },
@@ -1326,7 +1457,7 @@ pub fn main(init: std.process.Init) !void {
             // supplies it. This is an always-included synthetic object, ahead of the user
             // inputs.
             if (add_libc) {
-                const dso = try synthDsoHandleObject(allocator, pp_base, arch);
+                const dso = try synthDsoHandleObject(allocator, io, pp_base, arch);
                 try autolinked.append(allocator, .{ .object = dso });
                 try autolinked_names.append(allocator, "<vcc-dso-handle>");
             }
@@ -1755,6 +1886,131 @@ test "parseArgs: an unrelated -Wl, value leaves gc_sections at the default" {
     var it = SliceArgs{ .items = &.{ "-Wl,-z,now", "foo.c" } };
     const o = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expect(o.gc_sections);
+}
+
+test "parseArgs: optimization levels keep their policy" {
+    const Case = struct { arg: []const u8, expected: OptimizationLevel };
+    const cases = [_]Case{
+        .{ .arg = "-O0", .expected = .off },
+        .{ .arg = "-Og", .expected = .debug },
+        .{ .arg = "-O1", .expected = .one },
+        .{ .arg = "-O2", .expected = .two },
+        .{ .arg = "-O3", .expected = .three },
+        .{ .arg = "-Os", .expected = .size },
+        .{ .arg = "-Oz", .expected = .min_size },
+        .{ .arg = "-Ofast", .expected = .fast },
+    };
+
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var it = SliceArgs{ .items = &.{ case.arg, "foo.c" } };
+        const opts = try parseArgs(arena.allocator(), testErrw(), &it);
+        try std.testing.expectEqual(case.expected, opts.optimize);
+    }
+}
+
+test "optimization level gates microarchitecture transforms" {
+    try std.testing.expect(!OptimizationLevel.off.runsMicroarch());
+    try std.testing.expect(!OptimizationLevel.one.runsMicroarch());
+    try std.testing.expect(OptimizationLevel.two.runsMicroarch());
+    try std.testing.expect(OptimizationLevel.three.runsMicroarch());
+    try std.testing.expect(!OptimizationLevel.size.runsMicroarch());
+}
+
+test "optimization level gates translation-unit inlining" {
+    try std.testing.expect(!OptimizationLevel.one.inlinesCalls());
+    try std.testing.expect(OptimizationLevel.two.inlinesCalls());
+    try std.testing.expect(OptimizationLevel.three.inlinesCalls());
+    try std.testing.expect(OptimizationLevel.fast.inlinesCalls());
+    try std.testing.expect(!OptimizationLevel.size.inlinesCalls());
+    try std.testing.expect(!OptimizationLevel.min_size.inlinesCalls());
+}
+
+test "parseArgs: -ftime-report enables stage timing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var it = SliceArgs{ .items = &.{ "-ftime-report", "foo.c" } };
+    const opts = try parseArgs(arena.allocator(), testErrw(), &it);
+    try std.testing.expect(opts.time_report);
+}
+
+test "parseArgs: -fprofile-use records the profile path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var it = SliceArgs{ .items = &.{ "-fprofile-use=run.vpgo", "foo.c" } };
+    const opts = try parseArgs(arena.allocator(), testErrw(), &it);
+    try std.testing.expectEqualStrings("run.vpgo", opts.profile_use.?);
+}
+
+test "profile counts extend across blocks added by optimization" {
+    const allocator = std.testing.allocator;
+    var profile = opt.pgo.Profile.init(allocator);
+    defer profile.deinit();
+    try profile.add("main", &.{ 100, 25 });
+    const counts = (try expandedProfileCounts(allocator, &profile, "main", 4)).?;
+    defer allocator.free(counts);
+    try std.testing.expectEqualSlices(u64, &.{ 100, 25, 0, 0 }, counts);
+    try std.testing.expectError(error.MalformedProfile, expandedProfileCounts(allocator, &profile, "main", 1));
+}
+
+test "profile hot threshold is one percent of entry count" {
+    try std.testing.expectEqual(@as(u64, 1), profileHotThreshold(&.{}));
+    try std.testing.expectEqual(@as(u64, 1), profileHotThreshold(&.{0}));
+    try std.testing.expectEqual(@as(u64, 1), profileHotThreshold(&.{99}));
+    try std.testing.expectEqual(@as(u64, 100), profileHotThreshold(&.{10_000}));
+}
+
+test "translation-unit inlining removes a call to a local leaf" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\int add1(int x) { return x + 1; }
+        \\int main(void) { return add1(4); }
+    );
+    defer mod.deinit(allocator);
+    const main_func = mod.find("main") orelse return error.TestUnexpectedResult;
+    var calls_before: usize = 0;
+    for (0..main_func.blockCount()) |bi| {
+        for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (main_func.opcode(inst) == .call) calls_before += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls_before);
+
+    try inlineTranslationUnit(allocator, &mod, null);
+    var calls_after: usize = 0;
+    for (0..main_func.blockCount()) |bi| {
+        for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (main_func.opcode(inst) == .call) calls_after += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), calls_after);
+}
+
+test "profile-guided translation-unit inlining keeps a cold call" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\int add1(int x) { return x + 1; }
+        \\int main(void) { return add1(4); }
+    );
+    defer mod.deinit(allocator);
+    const main_func = mod.find("main") orelse return error.TestUnexpectedResult;
+
+    const cold_counts = try allocator.alloc(u64, main_func.blockCount());
+    defer allocator.free(cold_counts);
+    @memset(cold_counts, 0);
+    var profile = opt.pgo.Profile.init(allocator);
+    defer profile.deinit();
+    try profile.add("main", cold_counts);
+
+    try inlineTranslationUnit(allocator, &mod, &profile);
+    var calls_after: usize = 0;
+    for (0..main_func.blockCount()) |bi| {
+        for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (main_func.opcode(inst) == .call) calls_after += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls_after);
 }
 
 test "pickModel: named part matching target -> model" {

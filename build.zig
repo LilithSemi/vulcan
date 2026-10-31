@@ -159,6 +159,23 @@ pub fn build(b: *std.Build) void {
     const vcc_cli = b.addExecutable(.{ .name = "vcc", .root_module = vcc_module });
     b.installArtifact(vcc_cli);
 
+    // End-to-end C frontend compile benchmark. Keep its VCC graph ReleaseFast even when the
+    // surrounding build uses the default Debug mode, so `zig build bench` is meaningful and
+    // comparable to installed Clang/GCC binaries without requiring extra flags.
+    const bench_vcc = addBenchVcc(b, target);
+    const frontend_bench_cli = b.addExecutable(.{ .name = "vulcan-frontend-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/frontend-bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }) });
+    const run_frontend_bench = b.addRunArtifact(frontend_bench_cli);
+    run_frontend_bench.addArtifactArg(bench_vcc);
+    run_frontend_bench.addDirectoryArg(b.path("bench/frontends/c"));
+    _ = run_frontend_bench.addOutputDirectoryArg("frontend-bench");
+    run_frontend_bench.stdio = .inherit;
+    const bench_step = b.step("bench", "Run the benchmark suite");
+    bench_step.dependOn(&run_frontend_bench.step);
+
     // The `ld.vulcan` linker frontend CLI: a standalone driver over the shared static
     // linker (`vulcan-link`), so the linker is usable with any compiler's `.o`/`.a`
     // output, not just Vulcan's own frontends. Only `run`/`main` (what actually ships)
@@ -255,6 +272,20 @@ pub fn build(b: *std.Build) void {
             run_uarch_bench.addPassthruArgs();
             const run_uarch_bench_step = b.step("run-uarch-bench", "Benchmark the microarch optimizer: -- [--model <tag> | --list | --custom]");
             run_uarch_bench_step.dependOn(&run_uarch_bench.step);
+
+            const opt_bench_cli = b.addExecutable(.{ .name = "vulcan-opt-bench", .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/opt-bench.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "vulcan-ir", .module = vulcan_ir },
+                    .{ .name = "vulcan-opt", .module = vulcan_opt },
+                },
+            }) });
+            b.installArtifact(opt_bench_cli);
+            const run_opt_bench = b.addRunArtifact(opt_bench_cli);
+            const run_opt_bench_step = b.step("run-opt-bench", "Benchmark target-independent optimizer compile time");
+            run_opt_bench_step.dependOn(&run_opt_bench.step);
         }
     }
 
@@ -679,7 +710,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nvidia", .module = nvidia_dep.module("nvidia") },
         },
     }) });
-    test_step.dependOn(&b.addRunArtifact(nvidia_execute).step);
+    const run_nvidia_execute = b.addRunArtifact(nvidia_execute);
+    test_step.dependOn(&run_nvidia_execute.step);
+    const nvidia_execute_step = b.step("test-nvidia-execute", "Run NVIDIA hardware execution tests");
+    nvidia_execute_step.dependOn(&run_nvidia_execute.step);
 
     // The 64-bit address carry chain. A global pointer add is an IADD3 plus an
     // IADD3.X that reads the carry, and every other pointer test in this
@@ -815,4 +849,73 @@ pub fn build(b: *std.Build) void {
     // The freestanding object is a compile check too (no run), so `test` keeps the core
     // building for whatever target is selected.
     test_step.dependOn(&freestanding_proof.step);
+}
+
+fn addBenchVcc(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.Compile {
+    const bench_ir = b.addModule("vulcan-bench-ir", .{
+        .root_source_file = b.path("libs/vulcan-ir.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_gpu = b.addModule("vulcan-bench-gpu", .{
+        .root_source_file = b.path("libs/vulcan-gpu.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "vulcan-ir", .module = bench_ir }},
+    });
+    const bench_opt = b.addModule("vulcan-bench-opt", .{
+        .root_source_file = b.path("libs/vulcan-opt.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = bench_ir },
+            .{ .name = "vulcan-gpu", .module = bench_gpu },
+        },
+    });
+    const bench_spirv = b.addModule("vulcan-bench-spirv", .{
+        .root_source_file = b.path("libs/vulcan-spirv.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = bench_ir },
+            .{ .name = "vulcan-gpu", .module = bench_gpu },
+        },
+    });
+    const bench_link = b.addModule("vulcan-bench-link", .{
+        .root_source_file = b.path("libs/vulcan-link.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_target = b.addModule("vulcan-bench-target", .{
+        .root_source_file = b.path("libs/vulcan-target.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = bench_ir },
+            .{ .name = "vulcan-opt", .module = bench_opt },
+            .{ .name = "vulcan-spirv", .module = bench_spirv },
+            .{ .name = "vulcan-gpu", .module = bench_gpu },
+            .{ .name = "vulcan-link", .module = bench_link },
+        },
+    });
+    const bench_cc = b.addModule("vulcan-bench-cc", .{
+        .root_source_file = b.path("libs/vulcan-cc.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = bench_ir },
+            .{ .name = "vulcan-target", .module = bench_target },
+        },
+    });
+    return b.addExecutable(.{ .name = "vcc-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("frontends/vcc.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "vulcan-cc", .module = bench_cc },
+            .{ .name = "vulcan-target", .module = bench_target },
+            .{ .name = "vulcan-link", .module = bench_link },
+            .{ .name = "vulcan-opt", .module = bench_opt },
+        },
+    }) });
 }

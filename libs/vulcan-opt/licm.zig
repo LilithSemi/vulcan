@@ -17,7 +17,7 @@ const Inst = ir.function.Inst;
 const Block = ir.function.Block;
 const BinOp = ir.function.BinOp;
 
-pub const pass_def = pass.Pass{ .name = "licm", .run = run };
+pub const pass_def = pass.Pass{ .name = "licm", .run = run, .preserves_cfg = true };
 
 /// An instruction to hoist, with the loop block it currently lives in.
 const Hoist = struct { inst: Inst, from: u32 };
@@ -99,14 +99,10 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     const info = try analyses.loops();
     if (info.loops.len == 0) return false;
 
-    // Which block defines each value (recomputed per loop, since hoisting in an
-    // earlier loop moves instructions between blocks).
-    const def_block = try allocator.alloc(u32, func.valueCount());
+    // Which block defines each value. Keep a local copy because hoisting updates
+    // entries between loops while the pass-manager cache describes the input.
+    const def_block = try allocator.dupe(u32, try analyses.definingBlocks());
     defer allocator.free(def_block);
-    // Only live block params and instruction results get assigned below. Default everything
-    // to the entry block so a value with no live definition, like one orphaned by an earlier
-    // rewrite, never leaves the invariant scan reading uninitialized memory.
-    @memset(def_block, 0);
 
     // Instructions to move, paired with their source block. Collected in
     // dependency-respecting order (program order, fixpoint), then applied.
@@ -119,14 +115,6 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     var changed = false;
     for (info.loops) |loop| {
         const pre = loop.preheader orelse continue;
-
-        for (0..func.blockCount()) |bi| {
-            const block: Block = @fromBackingInt(@intCast(bi));
-            for (func.blockParams(block)) |p| def_block[@backingInt(p)] = @intCast(bi);
-            for (func.blockInsts(block)) |inst| {
-                if (func.instResult(inst)) |r| def_block[@backingInt(r)] = @intCast(bi);
-            }
-        }
 
         // A value is invariant if it is defined outside the loop. Loop block
         // params stay variant. Loop instructions become invariant once proven.
@@ -165,7 +153,10 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         }
         // Append them to the preheader (before its terminator), in order.
         const pre_insts = func.blockInstsMut(@fromBackingInt(@intCast(pre)));
-        for (to_hoist.items) |h| try pre_insts.append(allocator, h.inst);
+        for (to_hoist.items) |h| {
+            try pre_insts.append(allocator, h.inst);
+            if (func.instResult(h.inst)) |result| def_block[@backingInt(result)] = pre;
+        }
         changed = true;
     }
     return changed;

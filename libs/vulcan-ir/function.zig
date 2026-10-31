@@ -1469,6 +1469,117 @@ pub const Function = struct {
         for (0..self.blockCount()) |bi| self.replaceUsesInTerm(@fromBackingInt(@intCast(bi)), from, to);
     }
 
+    /// Replace uses of `from` with `to` in instructions currently present in a
+    /// block and in block terminators. Use this only when detached instructions
+    /// cannot later be reattached.
+    pub fn replaceAllLiveUses(self: *Function, from: Value, to: Value) void {
+        for (0..self.blockCount()) |bi| {
+            const block: Block = @fromBackingInt(@intCast(bi));
+            for (self.blockInsts(block)) |inst| self.replaceUsesInInst(inst, from, to);
+            self.replaceUsesInTerm(block, from, to);
+        }
+    }
+
+    /// Rewrite every value use through an indexed replacement table in one
+    /// whole-function traversal. `replacements[v]` is the final value that should
+    /// replace `v`; callers must resolve replacement chains before calling.
+    pub fn rewriteAllUses(self: *Function, replacements: []const Value) void {
+        std.debug.assert(replacements.len >= self.valueCount());
+        const mapped = struct {
+            fn get(table: []const Value, value: Value) Value {
+                return table[@backingInt(value)];
+            }
+        }.get;
+
+        for (0..self.blockCount()) |bi| {
+            const block: Block = @fromBackingInt(@intCast(bi));
+            for (self.blockInsts(block)) |inst| {
+                const op = self.opcodeMut(inst);
+                switch (op.*) {
+                    .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
+                    .arith => |*a| {
+                        a.lhs = mapped(replacements, a.lhs);
+                        a.rhs = mapped(replacements, a.rhs);
+                    },
+                    .arith_imm => |*a| a.lhs = mapped(replacements, a.lhs),
+                    .icmp => |*c| {
+                        c.lhs = mapped(replacements, c.lhs);
+                        c.rhs = mapped(replacements, c.rhs);
+                    },
+                    .select => |*s| {
+                        s.cond = mapped(replacements, s.cond);
+                        s.then = mapped(replacements, s.then);
+                        s.@"else" = mapped(replacements, s.@"else");
+                    },
+                    .extract => |*e| e.aggregate = mapped(replacements, e.aggregate),
+                    .convert => |*cv| cv.value = mapped(replacements, cv.value),
+                    .decode_low_float, .encode_low_float => |*cv| cv.value = mapped(replacements, cv.value),
+                    .dequantize_nvfp4, .quantize_nvfp4 => |*cv| {
+                        cv.value = mapped(replacements, cv.value);
+                        cv.block_scale = mapped(replacements, cv.block_scale);
+                        cv.global_scale = mapped(replacements, cv.global_scale);
+                    },
+                    .unary => |*u| u.value = mapped(replacements, u.value),
+                    .load => |*l| {
+                        l.ptr = mapped(replacements, l.ptr);
+                        if (l.mask) |mask| l.mask = mapped(replacements, mask);
+                    },
+                    .store => |*st| {
+                        st.value = mapped(replacements, st.value);
+                        st.ptr = mapped(replacements, st.ptr);
+                        if (st.mask) |mask| st.mask = mapped(replacements, mask);
+                    },
+                    .prefetch => |*pf| pf.ptr = mapped(replacements, pf.ptr),
+                    .va_start => |*vs| vs.list = mapped(replacements, vs.list),
+                    .va_arg => |*va| va.list = mapped(replacements, va.list),
+                    .va_end => |*ve| ve.list = mapped(replacements, ve.list),
+                    .dot => |*d| {
+                        d.acc = mapped(replacements, d.acc);
+                        d.a = mapped(replacements, d.a);
+                        d.b = mapped(replacements, d.b);
+                    },
+                    .reduce => |*red| red.vector = mapped(replacements, red.vector),
+                    .splat => |*sp| sp.scalar = mapped(replacements, sp.scalar),
+                    .matmul => |*mm| {
+                        mm.a = mapped(replacements, mm.a);
+                        mm.b = mapped(replacements, mm.b);
+                        mm.c = mapped(replacements, mm.c);
+                    },
+                    .atomic_rmw => |*a| {
+                        a.ptr = mapped(replacements, a.ptr);
+                        a.value = mapped(replacements, a.value);
+                        if (a.compare) |*compare| compare.* = mapped(replacements, compare.*);
+                    },
+                    .struct_new => |sn| for (self.valueListMut(sn.fields)) |*field| {
+                        field.* = mapped(replacements, field.*);
+                    },
+                    .call => |*c| {
+                        if (c.ret_dest) |*dest| dest.* = mapped(replacements, dest.*);
+                        for (self.valueListMut(c.args)) |*arg| arg.* = mapped(replacements, arg.*);
+                    },
+                    .call_indirect => |*c| {
+                        c.target = mapped(replacements, c.target);
+                        if (c.ret_dest) |*dest| dest.* = mapped(replacements, dest.*);
+                        for (self.valueListMut(c.args)) |*arg| arg.* = mapped(replacements, arg.*);
+                    },
+                    .@"if" => |*cf| {
+                        cf.cond = mapped(replacements, cf.cond);
+                        for (self.valueListMut(cf.then.args)) |*arg| arg.* = mapped(replacements, arg.*);
+                        for (self.valueListMut(cf.@"else".args)) |*arg| arg.* = mapped(replacements, arg.*);
+                    },
+                }
+            }
+            if (self.terminatorPtr(block).*) |*term| switch (term.*) {
+                .ret => |*ret| for (ret.values[0..ret.count]) |*value| {
+                    value.* = mapped(replacements, value.*);
+                },
+                .jump => |*jump| for (self.valueListMut(jump.args)) |*arg| {
+                    arg.* = mapped(replacements, arg.*);
+                },
+            };
+        }
+    }
+
     /// Replace uses of `from` with `to` in ONE block: its instructions, the edge arguments of a
     /// branch it holds, and its terminator. For a rewrite that must not reach the rest of the
     /// function, where `replaceAllUses` would be wrong.
@@ -2734,6 +2845,25 @@ test "arith records its operator and operands" {
     try std.testing.expectEqual(BinOp.add, op.arith.op);
     try std.testing.expectEqual(a, op.arith.lhs);
     try std.testing.expectEqual(b, op.arith.rhs);
+}
+
+test "replaceAllUses rewrites a detached instruction before it is installed" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const old = try func.appendInst(block, i32_t, .{ .iconst = 1 });
+    const replacement = try func.appendInst(block, i32_t, .{ .iconst = 2 });
+    const detached = try func.createInst(i32_t, .{ .arith = .{ .op = .add, .lhs = old, .rhs = old } });
+    const detached_inst = func.definingInst(detached).?;
+
+    func.replaceAllUses(old, replacement);
+    try func.setBlockInsts(block, &.{detached_inst});
+
+    const op = func.opcode(detached_inst).arith;
+    try std.testing.expectEqual(replacement, op.lhs);
+    try std.testing.expectEqual(replacement, op.rhs);
 }
 
 test "a block can be terminated with a return" {

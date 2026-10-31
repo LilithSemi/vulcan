@@ -1,5 +1,4 @@
-//! aarch64 ldr/str -> ldp/stp peephole, decode + fusion-predicate stage (Task 2 of the ldp/stp
-//! peephole). These two functions are PURE: `decodeMem` recognizes the bounded set of
+//! AArch64 post-allocation peepholes. `decodeMem` recognizes the bounded set of
 //! offset-form ldr/str encodings the isel emits (see encode.zig), and `tryFuse` decides whether
 //! two adjacent decoded memory ops may be combined into a single ldp/stp. Neither function
 //! walks or mutates a code buffer. Wiring this into an actual pass over emitted code is Task 3.
@@ -125,6 +124,28 @@ pub fn tryFuse(a: MemInsn, b: MemInsn) ?u32 {
     };
 }
 
+/// Fuse an adjacent integer `mul` and register `add` when the add consumes the product exactly
+/// once. Physical-register matching after allocation makes this safe without extending the SSA
+/// operands' live ranges: `madd` reads the multiply operands and the add's other input together.
+pub fn tryFuseMulAdd(mul_word: u32, add_word: u32) ?u32 {
+    const operand_mask: u32 = 0x7FE0FC00;
+    if (mul_word & operand_mask != 0x1B007C00) return null;
+    if (add_word & operand_mask != 0x0B000000) return null;
+    const mul_wide = mul_word >> 31 != 0;
+    if ((add_word >> 31 != 0) != mul_wide) return null;
+
+    const product: u5 = @truncate(mul_word);
+    const add_lhs: u5 = @truncate(add_word >> 5);
+    const add_rhs: u5 = @truncate(add_word >> 16);
+    if ((add_lhs == product) == (add_rhs == product)) return null;
+
+    const rd: Reg = @fromBackingInt(@as(u5, @truncate(add_word)));
+    const rn: Reg = @fromBackingInt(@as(u5, @truncate(mul_word >> 5)));
+    const rm: Reg = @fromBackingInt(@as(u5, @truncate(mul_word >> 16)));
+    const ra: Reg = @fromBackingInt(if (add_lhs == product) add_rhs else add_lhs);
+    return encode.madd(rd, rn, rm, ra, mul_wide);
+}
+
 /// Fuse adjacent ldr/str pairs into ldp/stp in `words`, updating the side tables to the new
 /// layout. Only fuses IMMEDIATELY-ADJACENT words where both decode as mem, `tryFuse` succeeds,
 /// AND the SECOND word is not a block start (control flow must not be able to enter between the
@@ -169,21 +190,22 @@ pub fn pairMemory(
     var i: usize = 0;
     while (i < len) {
         var did_fuse = false;
-        // A pair needs a following word that is not a block start, and both members must decode as
-        // memory ops that `tryFuse` accepts. Never chain a third word into the same pair (i += 2).
+        // A pair needs a following word that is not a block start. Never chain a third word into
+        // the same pair (i += 2).
         if (i + 1 < len and !is_block_start[i + 1]) {
-            if (decodeMem(words.items[i])) |a| {
-                if (decodeMem(words.items[i + 1])) |b| {
-                    if (tryFuse(a, b)) |fused| {
-                        removed_before[i] = removed;
-                        removed += 1;
-                        removed_before[i + 1] = removed; // deleted slot collapses onto the fused word
-                        words.items[write] = fused;
-                        write += 1;
-                        i += 2;
-                        did_fuse = true;
-                    }
-                }
+            const fused = tryFuseMulAdd(words.items[i], words.items[i + 1]) orelse memory: {
+                const a = decodeMem(words.items[i]) orelse break :memory null;
+                const b = decodeMem(words.items[i + 1]) orelse break :memory null;
+                break :memory tryFuse(a, b);
+            };
+            if (fused) |word| {
+                removed_before[i] = removed;
+                removed += 1;
+                removed_before[i + 1] = removed; // deleted slot collapses onto the fused word
+                words.items[write] = word;
+                write += 1;
+                i += 2;
+                did_fuse = true;
             }
         }
         if (!did_fuse) {
@@ -259,6 +281,39 @@ test "tryFuse pairs two adjacent consecutive-offset x loads into ldp" {
     const s = try disasm.one(alloc, fused.?);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("ldp x0, x1, [x2]", s);
+}
+
+test "tryFuseMulAdd combines either add operand orientation" {
+    const mul_word = encode.mul(.x4, .x1, .x2);
+    try std.testing.expectEqual(
+        encode.madd(.x5, .x1, .x2, .x3, false),
+        tryFuseMulAdd(mul_word, encode.add(.x5, .x4, .x3)).?,
+    );
+    try std.testing.expectEqual(
+        encode.madd(.x5, .x1, .x2, .x3, false),
+        tryFuseMulAdd(mul_word, encode.add(.x5, .x3, .x4)).?,
+    );
+}
+
+test "tryFuseMulAdd rejects width mismatch and a doubled product" {
+    const mul_word = encode.mul(.x4, .x1, .x2);
+    try std.testing.expectEqual(@as(?u32, null), tryFuseMulAdd(mul_word, encode.add64(.x5, .x4, .x3)));
+    try std.testing.expectEqual(@as(?u32, null), tryFuseMulAdd(mul_word, encode.add(.x5, .x4, .x4)));
+}
+
+test "pairMemory also fuses multiply-add and remaps side tables" {
+    const alloc = std.testing.allocator;
+    var words = try wordsFrom(alloc, &.{
+        encode.mul(.x4, .x1, .x2),
+        encode.add(.x5, .x4, .x3),
+        encode.ret(),
+    });
+    defer words.deinit(alloc);
+    var block_start = [_]usize{0};
+
+    try pairMemory(alloc, &words, &block_start, &.{}, &.{}, &.{});
+
+    try std.testing.expectEqualSlices(u32, &.{ encode.madd(.x5, .x1, .x2, .x3, false), encode.ret() }, words.items);
 }
 
 test "tryFuse pairs two adjacent consecutive-offset w stores into stp" {

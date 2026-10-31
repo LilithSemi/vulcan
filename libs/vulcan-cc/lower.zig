@@ -30,7 +30,7 @@ const ctype = @import("ctype.zig");
 const consteval = @import("consteval.zig");
 const abi = @import("abi.zig");
 
-const Function = ir.function.Function;
+pub const Function = ir.function.Function;
 const Value = ir.function.Value;
 const Block = ir.function.Block;
 const Type = ir.types.Type;
@@ -67,6 +67,29 @@ test "lower and JIT-run a constant return" {
     defer jitted.deinit();
     const f = jitted.entry(*const fn () callconv(.c) i32, "f") orelse return error.NoEntry;
     try std.testing.expectEqual(@as(i32, -7), f());
+}
+
+test "balanced switch dispatch selects every dense case and the default" {
+    const allocator = std.testing.allocator;
+    var mod = try compile(allocator,
+        \\int f(int x) {
+        \\  switch (x) {
+        \\    case 0: return 100; case 1: return 101; case 2: return 102; case 3: return 103;
+        \\    case 4: return 104; case 5: return 105; case 6: return 106; case 7: return 107;
+        \\    case 8: return 108; case 9: return 109; case 10: return 110; case 11: return 111;
+        \\    case 12: return 112; case 13: return 113; case 14: return 114; case 15: return 115;
+        \\    default: return -1;
+        \\  }
+        \\}
+    );
+    defer mod.deinit(allocator);
+    const f_ir = mod.find("f") orelse return error.NoFunc;
+    var jitted = try target.native.jitModule(allocator, &.{.{ .name = "f", .func = f_ir }});
+    defer jitted.deinit();
+    const f = jitted.entry(*const fn (i32) callconv(.c) i32, "f") orelse return error.NoEntry;
+    try std.testing.expectEqual(@as(i32, -1), f(-1));
+    for (0..16) |i| try std.testing.expectEqual(@as(i32, @intCast(100 + i)), f(@intCast(i)));
+    try std.testing.expectEqual(@as(i32, -1), f(16));
 }
 
 /// A lowered, named function: its link name and its IR. Caller owns both.
@@ -848,6 +871,37 @@ fn hasUnsizedDim(ty: ctype.CType) bool {
     };
 }
 
+/// Emit a balanced dispatch tree for sorted switch labels. Each internal node partitions with one
+/// ordered comparison; leaves perform the equality check that distinguishes an exact case from the
+/// default. This keeps dense, non-fallthrough switches logarithmic without requiring an indirect
+/// branch opcode or target-specific jump-table representation in the IR.
+fn lowerBalancedSwitch(
+    l: *L,
+    block: Block,
+    value: Value,
+    ty: Type,
+    labels: []const i64,
+    targets: []const Block,
+    default_target: Block,
+) Error!void {
+    std.debug.assert(labels.len == targets.len and labels.len != 0);
+    if (labels.len == 1) {
+        const label = try l.func.appendInst(block, ty, .{ .iconst = labels[0] });
+        const eq = try l.func.appendInst(block, l.boolt, .{ .icmp = .{ .op = .eq, .lhs = value, .rhs = label } });
+        try l.func.appendIf(block, eq, .{ .target = targets[0] }, .{ .target = default_target });
+        return;
+    }
+
+    const mid = (labels.len - 1) / 2;
+    const pivot = try l.func.appendInst(block, ty, .{ .iconst = labels[mid] });
+    const le = try l.func.appendInst(block, l.boolt, .{ .icmp = .{ .op = .le, .lhs = value, .rhs = pivot } });
+    const left = try l.func.appendBlock();
+    const right = try l.func.appendBlock();
+    try l.func.appendIf(block, le, .{ .target = left }, .{ .target = right });
+    try lowerBalancedSwitch(l, left, value, ty, labels[0 .. mid + 1], targets[0 .. mid + 1], default_target);
+    try lowerBalancedSwitch(l, right, value, ty, labels[mid + 1 ..], targets[mid + 1 ..], default_target);
+}
+
 /// Lower one statement. Returns whether it terminated the current path.
 fn lowerStmt(l: *L, stmt: parser.Stmt) Error!bool {
     switch (stmt) {
@@ -1149,9 +1203,23 @@ fn lowerStmt(l: *L, stmt: parser.Stmt) Error!bool {
             // or an unsigned controlling expression alike. A shorter run keeps the per-case
             // equality ladder unchanged, so every switch without such a run stays byte-identical.
             const range_cluster_min = 4;
+            var labels: std.ArrayList(i64) = .empty;
+            defer labels.deinit(l.allocator);
+            var targets: std.ArrayList(Block) = .empty;
+            defer targets.deinit(l.allocator);
+            var sorted_nonnegative = true;
+            for (sw.cases, 0..) |c, ci| if (c.label) |label| {
+                if (label < 0 or (labels.items.len != 0 and label <= labels.items[labels.items.len - 1])) sorted_nonnegative = false;
+                try labels.append(l.allocator, label);
+                try targets.append(l.allocator, body_blocks[ci]);
+            };
+
             var test_block = l.block;
+            const balanced = sorted_nonnegative and labels.items.len >= 8;
+            if (balanced) try lowerBalancedSwitch(l, test_block, v.value, vt, labels.items, targets.items, default_target);
+
             var i: usize = 0;
-            while (i < sw.cases.len) {
+            while (!balanced and i < sw.cases.len) {
                 if (sw.cases[i].label == null) {
                     i += 1; // The default arm is not a dispatch test, it is the fall-off target.
                     continue;
@@ -1190,7 +1258,7 @@ fn lowerStmt(l: *L, stmt: parser.Stmt) Error!bool {
                 i = j + 1;
             }
             // The last test block falls through to the default target.
-            try l.func.setJump(test_block, default_target, &.{});
+            if (!balanced) try l.func.setJump(test_block, default_target, &.{});
 
             // Lower each case body. Fall through to the next body block (C fallthrough).
             try l.loops.append(l.allocator, .{ .brk = exit_b, .cont = exit_b, .is_switch = true });

@@ -28,10 +28,13 @@ const ArrayAccess = struct { base: Value, stride: i64, addr_inst: Inst, scale_in
 const Plan = struct {
     header: Block,
     body: Block,
+    latch: Block,
     preheader: Block,
     exit_cond: CmpOp,
     bound: Value,
     induction: usize,
+    induction_alias: Value,
+    induction_update: Inst,
     step: i64,
     accesses: []ArrayAccess, // owned
     factor: u32, // V
@@ -92,12 +95,11 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
 
     // Main body: V copies emitted OP-MAJOR (all V copies of each instruction adjacently), which is
     // the run of contiguous same-op instructions the SLP pass fuses into vectors. Per unique address,
-    // base_i = base + bmi*stride computed once; copy m reads/writes base_i + m*stride. The induction
-    // maps to bmi (it appears only inside addresses, regenerated here); the address/scale/induction-
-    // update instructions are skipped when cloning.
+    // base_i = base + bmi*stride computed once; copy m reads/writes base_i + m*stride. Each copy's
+    // induction maps to bmi+m, so pure body computation may observe the raw index too. The original
+    // address/scale/induction-update instructions are skipped when cloning.
     const bmi = try func.appendBlockParam(mainbody, ind_ty);
-    const back_args = func.blockArgs(func.terminator(plan.body).?.jump);
-    const ind_update = func.definingInst(back_args[plan.induction]).?;
+    const ind_update = plan.induction_update;
     const base_ty = func.valueType(plan.accesses[0].base);
 
     // Per-copy value maps, pre-seeded with the induction and every regenerated address. Deduplicate by
@@ -108,11 +110,17 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         allocator.free(vmaps);
     }
     for (vmaps) |*vm| vm.* = .empty;
-    const i_alias = func.blockParams(plan.body)[plan.induction];
+    const i_alias = plan.induction_alias;
     var skip: std.AutoHashMapUnmanaged(Inst, void) = .empty;
     defer skip.deinit(allocator);
     try skip.put(allocator, ind_update, {});
-    for (vmaps) |*vm| try vm.put(allocator, i_alias, bmi);
+    for (vmaps, 0..) |*vm, m| {
+        const lane_i = if (m == 0)
+            bmi
+        else
+            try func.appendArithImm(mainbody, ind_ty, .add, bmi, @intCast(m));
+        try vm.put(allocator, i_alias, lane_i);
+    }
     for (plan.accesses) |acc| {
         try skip.put(allocator, acc.addr_inst, {});
         try skip.put(allocator, acc.scale_inst, {});
@@ -227,8 +235,9 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     const header: Block = @fromBackingInt(@intCast(loop.header));
     const preheader = loop.preheader orelse return null;
 
-    // Single-block straight-line body that is the only latch, no `if`/`matmul`.
-    var body: ?Block = null;
+    // Straight-line body with either an integrated latch (the hand-built IR shape) or one separate
+    // trivial latch block (the shape emitted by the C frontend after mem2reg).
+    var latch: ?Block = null;
     var in_loop_blocks: usize = 0;
     for (0..func.blockCount()) |bi| {
         if (bi >= loop.body.len or !loop.body[bi]) continue;
@@ -237,14 +246,14 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         if (b == header) continue;
         switch (func.terminator(b) orelse return null) {
             .jump => |j| if (j.target == header) {
-                if (body != null) return null;
-                body = b;
-            } else return null,
+                if (latch != null) return null;
+                latch = b;
+            },
             .ret => return null,
         }
     }
-    if (in_loop_blocks != 2) return null;
-    const bodyb = body orelse return null;
+    if (in_loop_blocks != 2 and in_loop_blocks != 3) return null;
+    const latchb = latch orelse return null;
 
     // Header: pure test ending in an `if`, body on the then edge, passing the header params through.
     var if_inst: ?Inst = null;
@@ -257,11 +266,17 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         else => return null,
     };
     const cf = func.opcode(if_inst orelse return null).@"if";
-    if (cf.then.target != bodyb) return null;
+    const bodyb = cf.then.target;
+    if (bodyb == header) return null;
+    if (bodyb != latchb) {
+        if (in_loop_blocks != 3) return null;
+        const body_term = func.terminator(bodyb) orelse return null;
+        if (body_term != .jump or body_term.jump.target != latchb) return null;
+    } else if (in_loop_blocks != 2) return null;
     const hparams = func.blockParams(header);
     const body_args = func.blockArgs(cf.then);
-    if (body_args.len != hparams.len) return null;
-    for (body_args, hparams) |arg, hp| if (arg != hp) return null;
+    if (body_args.len != 0 and body_args.len != hparams.len) return null;
+    if (body_args.len != 0) for (body_args, hparams) |arg, hp| if (arg != hp) return null;
 
     // Phase 1: only the induction is carried (no reductions).
     if (hparams.len != 1) return null;
@@ -275,17 +290,19 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     const bound = cmp.rhs;
 
     const bparams = func.blockParams(bodyb);
-    const i_alias = bparams[induction];
-    const back_args = func.blockArgs(func.terminator(bodyb).?.jump);
+    if (body_args.len == 0 and bparams.len != 0) return null;
+    const i_alias = if (body_args.len == 0) hparams[induction] else bparams[induction];
+    const back_args = func.blockArgs(func.terminator(latchb).?.jump);
     const step = constAddend(func, back_args[induction], i_alias) orelse return null;
     if (step != 1) return null; // unit induction step: consecutive iterations touch consecutive elements
-    const ind_update = func.definingInst(back_args[induction]).?;
-
+    const ind_update = func.definingInst(back_args[induction]) orelse return null;
+    if (latchb != bodyb) {
+        const latch_insts = func.blockInsts(latchb);
+        if (latch_insts.len != 1 or latch_insts[0] != ind_update) return null;
+    }
     // Every load/store address must be unit-stride contiguous; other ops must be pure compute.
     var accesses: std.ArrayList(ArrayAccess) = .empty;
     errdefer accesses.deinit(allocator);
-    var scale_insts: std.ArrayList(Inst) = .empty;
-    defer scale_insts.deinit(allocator);
     for (func.blockInsts(bodyb)) |inst| {
         switch (func.opcode(inst)) {
             .load => |l| {
@@ -301,7 +318,6 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
                 const sa = stridedAddress(func, l.ptr, i_alias) orelse return bail(&accesses, allocator);
                 if (sa.stride != byteSize(func, func.valueType(func.instResult(inst).?))) return bail(&accesses, allocator);
                 try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = false });
-                try scale_insts.append(allocator, sa.scale_inst);
             },
             .store => |s| {
                 // Same reasoning as the `load` arm above: V observable stores must not become one.
@@ -311,7 +327,6 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
                 const sa = stridedAddress(func, s.ptr, i_alias) orelse return bail(&accesses, allocator);
                 if (sa.stride != byteSize(func, func.valueType(s.value))) return bail(&accesses, allocator);
                 try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = true });
-                try scale_insts.append(allocator, sa.scale_inst);
             },
             .arith, .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .convert, .unary => {},
             else => return bail(&accesses, allocator), // call/alloca/dot/matmul/etc: not handled
@@ -319,18 +334,16 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     }
     if (accesses.items.len == 0) return bail(&accesses, allocator);
 
-    // The induction alias must be used ONLY inside the address scales and the induction update, so the
-    // main body can regenerate addresses and map the induction to the group base without changing a
-    // compute that observed the raw index.
-    if (!inductionOnlyInAddresses(func, bodyb, i_alias, scale_insts.items, ind_update)) return bail(&accesses, allocator);
-
     return Plan{
         .header = header,
         .body = bodyb,
+        .latch = latchb,
         .preheader = @fromBackingInt(@intCast(preheader)),
         .exit_cond = cmp.op,
         .bound = bound,
         .induction = induction,
+        .induction_alias = i_alias,
+        .induction_update = ind_update,
         .step = step,
         .accesses = try accesses.toOwnedSlice(allocator),
         .factor = V,
@@ -366,7 +379,7 @@ fn scaleOf(func: *const Function, v: Value, i_alias: Value) ?struct { stride: i6
     const di = func.definingInst(v) orelse return null;
     switch (func.opcode(di)) {
         .arith_imm => |a| {
-            if (a.lhs != i_alias) return null;
+            if (!isInductionOrConvert(func, a.lhs, i_alias)) return null;
             return switch (a.op) {
                 .mul => .{ .stride = a.imm, .inst = di },
                 .shl => .{ .stride = @as(i64, 1) << @intCast(a.imm), .inst = di },
@@ -375,18 +388,30 @@ fn scaleOf(func: *const Function, v: Value, i_alias: Value) ?struct { stride: i6
         },
         .arith => |a| {
             if (a.op == .mul) {
-                if (a.lhs == i_alias) {
+                if (isInductionOrConvert(func, a.lhs, i_alias)) {
                     if (constOf(func, a.rhs)) |c| return .{ .stride = c, .inst = di };
-                } else if (a.rhs == i_alias) {
+                } else if (isInductionOrConvert(func, a.rhs, i_alias)) {
                     if (constOf(func, a.lhs)) |c| return .{ .stride = c, .inst = di };
                 }
-            } else if (a.op == .shl and a.lhs == i_alias) {
+            } else if (a.op == .shl and isInductionOrConvert(func, a.lhs, i_alias)) {
                 if (constOf(func, a.rhs)) |c| return .{ .stride = @as(i64, 1) << @intCast(c), .inst = di };
             }
             return null;
         },
         else => return null,
     }
+}
+
+/// C pointer arithmetic widens a 32-bit induction to pointer width before scaling it. That convert
+/// is still the same affine induction for address analysis; the cloned compute path retains any
+/// independent conversion that is used as data.
+fn isInductionOrConvert(func: *const Function, v: Value, i_alias: Value) bool {
+    if (v == i_alias) return true;
+    const inst = func.definingInst(v) orelse return false;
+    return switch (func.opcode(inst)) {
+        .convert => |c| c.value == i_alias,
+        else => false,
+    };
 }
 
 fn constOf(func: *const Function, v: Value) ?i64 {
@@ -419,23 +444,6 @@ fn byteSize(func: *const Function, ty: ir.types.Type) i64 {
         .ptr => 8,
         else => 0,
     };
-}
-
-/// True when `i_alias` is used only by the given address-scale instructions and the induction update
-/// (so no compute or memory value observes the raw index, which the main body would compute wrong).
-fn inductionOnlyInAddresses(func: *const Function, body: Block, i_alias: Value, scales: []const Inst, ind_update: Inst) bool {
-    for (func.blockInsts(body)) |inst| {
-        if (usesValue(func, inst, i_alias)) {
-            if (inst == ind_update) continue;
-            var is_scale = false;
-            for (scales) |s| if (s == inst) {
-                is_scale = true;
-            };
-            if (!is_scale) return false;
-        }
-    }
-    // The back-edge/terminator may reference i only through the induction update (already an inst use).
-    return true;
 }
 
 /// Whether `inst` reads `v` in any operand slot. The callers count uses to prove a value is
@@ -861,6 +869,40 @@ test "recognizes a saxpy map loop: two contiguous loads, one contiguous store, V
     try testing.expectEqual(@as(usize, 1), stores);
 }
 
+test "frontend-shaped map loop may use the induction value as stored data" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const latch = try func.appendBlock();
+    const done = try func.appendBlock();
+    const out = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{zero});
+    const i = try func.appendBlockParam(loop, i32_t);
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    const off = try func.appendArithImm(body, i32_t, .mul, bi, 4);
+    const addr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = out, .rhs = off } });
+    try func.appendStore(body, bi, addr);
+    try func.setJump(body, latch, &.{});
+    const ni = try func.appendArithImm(latch, i32_t, .add, bi, 1);
+    try func.setJump(latch, loop, &.{ni});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    try testing.expect(try run(allocator, &func, registry.modelFor(.@"ampere-altra")));
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
 test "declines a non-unit-stride access (a[2*i])" {
     const allocator = testing.allocator;
     var func = Function.init(allocator);
@@ -954,8 +996,8 @@ test "a reduction body with a second memory effect is declined" {
 }
 
 test "usesValue sees every operand slot, not only the arithmetic ones" {
-    // `countUses` and `inductionOnlyInAddresses` call this to prove a value is read only
-    // where they expect. A missed reader answers "unused" and lets an unsound rewrite
+    // `countUses` calls this to prove a value is read only where expected. A missed reader answers
+    // "unused" and lets an unsound rewrite
     // through. A trailing `else => false` hid every call argument, both `matmul` operands
     // and the `va_*` list.
     const allocator = testing.allocator;
