@@ -357,12 +357,26 @@ fn countMinLeadingZeros(a: Bits, w: u16) u16 {
     return count;
 }
 
+fn canonical(replacements: []const Value, value: Value) Value {
+    var current = value;
+    while (replacements[@backingInt(current)] != current) current = replacements[@backingInt(current)];
+    return current;
+}
+
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     if (!hasRewriteCandidate(func)) return false;
     const bits = try analyzeInOrder(allocator, func, try analyses.reversePostorder());
     defer allocator.free(bits);
 
+    // Forward every proven identity in one final operand traversal. Calling
+    // replaceAllUses for each redundant mask or extension made R rewrites scan
+    // the whole function R times.
+    const replacements = try allocator.alloc(Value, func.valueCount());
+    defer allocator.free(replacements);
+    for (replacements, 0..) |*replacement, index| replacement.* = @fromBackingInt(@intCast(index));
+
     var changed = false;
+    var has_replacements = false;
     // Iterate LIVE block instructions, not the whole instruction pool: an instruction dropped from
     // its block by dce still sits in the pool, and re-processing it would re-fire a no-op
     // `replaceAllUses` and report a spurious change every iteration, so the pipeline fixpoint would
@@ -374,7 +388,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             switch (func.opcode(inst)) {
                 .arith_imm => |a| if (a.op == .bit_and) {
                     if (redundantMask(func, bits, a.lhs, a.imm)) {
-                        func.replaceAllUses(result, a.lhs);
+                        replacements[@backingInt(result)] = canonical(replacements, a.lhs);
+                        has_replacements = true;
                         changed = true;
                     }
                 },
@@ -393,13 +408,15 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 // Redundant sign/zero-extension: a widen of a narrow of `s` recovers `s` when `s` already
                 // fits the narrower width (its extended bits are known), so the round-trip is dropped.
                 .convert => if (redundantExtend(func, bits, inst)) |s| {
-                    func.replaceAllUses(result, s);
+                    replacements[@backingInt(result)] = canonical(replacements, s);
+                    has_replacements = true;
                     changed = true;
                 },
                 else => {},
             }
         }
     }
+    if (has_replacements) func.rewriteAllUses(replacements);
     return changed;
 }
 
@@ -1326,6 +1343,23 @@ test "knownbits: redundant mask removed via a convert's known-0 high bits" {
     try testing.expect(try runOnce(allocator, &func));
     // The redundant `& 0xFF` now forwards `z` directly.
     try testing.expectEqual(z, func.terminator(b).?.ret.values[0]);
+}
+
+test "knownbits: a long redundant-mask chain is forwarded in one batched rewrite" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8t = try uintTy(&func, 8);
+    const u32t = try uintTy(&func, 32);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, u8t);
+    const widened = try func.appendInst(b, u32t, .{ .convert = .{ .value = x } });
+    var value = widened;
+    for (0..256) |_| value = try func.appendArithImm(b, u32t, .bit_and, value, 0xFF);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(value) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    try testing.expectEqual(widened, func.terminator(b).?.ret.values[0]);
 }
 
 test "knownbits: icmp eq folds to false via a convert's known-bit conflict" {
