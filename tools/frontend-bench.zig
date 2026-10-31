@@ -17,6 +17,12 @@ const Result = struct {
     object_bytes: u64,
 };
 
+const ExecutionResult = struct {
+    best_ns: u64,
+    median_ns: u64,
+    checksum: []const u8,
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const io = init.io;
@@ -100,6 +106,51 @@ pub fn main(init: std.process.Init) !void {
         try printDuration(writer, totals[index]);
         try writer.print("  {d:>7}% of vcc\n", .{@divTrunc(totals[index] * 100, vcc_total)});
     }
+
+    @memset(totals, 0);
+    try writer.writeAll("\ngenerated-code execution (best/median of 7; lower is better)\n");
+    try writer.writeAll("Checksums must match across compilers; process startup is included.\n\n");
+    try writer.writeAll("workload             compiler       best       median   time/vcc  checksum\n");
+    try writer.writeAll("-------------------  --------  ---------  -----------  ---------  --------\n");
+    for (workloads.items) |workload| {
+        const source_path = try std.fs.path.join(allocator, &.{ source_dir, workload });
+        var vcc_best: u64 = 0;
+        var expected_checksum: ?[]const u8 = null;
+        for (compilers.items, 0..) |compiler, compiler_index| {
+            const stem = workload[0 .. workload.len - 2];
+            const output_name = try std.fmt.allocPrint(allocator, "{s}.{s}.bench", .{ stem, compiler.name });
+            const output_path = try std.fs.path.join(allocator, &.{ output_dir, output_name });
+            try buildExecutable(allocator, io, compiler, source_path, output_path);
+            const result = try benchmarkExecutable(allocator, io, compiler, output_path);
+            if (expected_checksum) |expected| {
+                if (!std.mem.eql(u8, expected, result.checksum)) {
+                    std.debug.print("checksum mismatch for {s}: vcc={s}, {s}={s}\n", .{ workload, expected, compiler.name, result.checksum });
+                    return error.ChecksumMismatch;
+                }
+            } else {
+                expected_checksum = result.checksum;
+            }
+            if (compiler_index == 0) vcc_best = result.best_ns;
+            totals[compiler_index] += result.best_ns;
+            try writer.print("{s:<19}  {s:<8}  ", .{ workload, compiler.name });
+            try printDuration(writer, result.best_ns);
+            try writer.writeAll("  ");
+            try printDuration(writer, result.median_ns);
+            try writer.print("  {d:>7}%  {s}\n", .{
+                @divTrunc(result.best_ns * 100, vcc_best),
+                result.checksum,
+            });
+        }
+        try writer.writeByte('\n');
+    }
+
+    try writer.writeAll("aggregate best execution time\n");
+    const vcc_execution_total = totals[0];
+    for (compilers.items, 0..) |compiler, index| {
+        try writer.print("  {s:<8}  ", .{compiler.name});
+        try printDuration(writer, totals[index]);
+        try writer.print("  {d:>7}% of vcc\n", .{@divTrunc(totals[index] * 100, vcc_execution_total)});
+    }
     try writer.flush();
 }
 
@@ -167,6 +218,52 @@ fn compileOnce(allocator: std.mem.Allocator, io: std.Io, compiler: Compiler, sou
         },
     }
     return if (timed) @intCast(start.durationTo(finish).nanoseconds) else 0;
+}
+
+fn buildExecutable(allocator: std.mem.Allocator, io: std.Io, compiler: Compiler, source: []const u8, output: []const u8) !void {
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ compiler.command, "-O2", "-DBENCH_EXECUTE", source, "-o", output },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("{s} failed building executable for {s} (exit {d}):\n{s}\n", .{ compiler.name, source, code, result.stderr });
+            return error.CompileFailed;
+        },
+        else => return error.CompileFailed,
+    }
+}
+
+fn benchmarkExecutable(allocator: std.mem.Allocator, io: std.Io, compiler: Compiler, executable: []const u8) !ExecutionResult {
+    var checksum: ?[]const u8 = null;
+    var times: [samples]u64 = undefined;
+    for (&times) |*elapsed| {
+        const start = std.Io.Timestamp.now(io, .awake);
+        const result = try std.process.run(allocator, io, .{ .argv = &.{executable} });
+        const finish = std.Io.Timestamp.now(io, .awake);
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| if (code != 0) {
+                std.debug.print("{s} executable {s} failed (exit {d}):\n{s}\n", .{ compiler.name, executable, code, result.stderr });
+                return error.ExecutionFailed;
+            },
+            else => return error.ExecutionFailed,
+        }
+        const current = std.mem.trim(u8, result.stdout, " \t\r\n");
+        if (checksum) |expected| {
+            if (!std.mem.eql(u8, expected, current)) {
+                std.debug.print("unstable checksum from {s} executable {s}: first={s}, current={s}\n", .{ compiler.name, executable, expected, current });
+                return error.UnstableChecksum;
+            }
+        } else {
+            checksum = try allocator.dupe(u8, current);
+        }
+        elapsed.* = @intCast(start.durationTo(finish).nanoseconds);
+    }
+    std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+    return .{ .best_ns = times[0], .median_ns = times[samples / 2], .checksum = checksum.? };
 }
 
 fn printDuration(writer: *std.Io.Writer, nanoseconds: u64) !void {
