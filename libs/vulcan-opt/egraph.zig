@@ -350,9 +350,8 @@ fn hasFactorCandidateAt(func: *const Function, value: Value, sum: ir.function.Ar
         else => null,
     } else null;
     if (factorInner(sum.op)) |inner| {
-        if (isAssociative(sum.op)) {
-            if (hasNestedFactorCandidate(func, value, sum.op, inner)) return true;
-        } else if (lhs != null and rhs != null and lhs.?.op == inner and rhs.?.op == inner) return true;
+        if (lhs != null and rhs != null and lhs.?.op == inner and rhs.?.op == inner) return true;
+        if (isAssociative(sum.op) and hasNestedFactorCandidate(func, value, sum.op, inner)) return true;
     }
     if (lhs != null and rhs != null) {
         if (cancellationInner(sum.op)) |inner| if (lhs.?.op == inner and rhs.?.op == inner) return true;
