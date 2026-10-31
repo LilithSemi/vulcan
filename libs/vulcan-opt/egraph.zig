@@ -668,17 +668,30 @@ fn optimizeRoot(graph: *Graph, extraction: *const Extraction, func: *Function, b
 pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limits) pass.Error!bool {
     if (limits.max_nodes == 0 or limits.max_iters == 0) return false;
     var changed = false;
+    // These maps are indexed by function-global Value handles, but every graph below is
+    // block-local. Allocate them lazily for the first candidate and reuse the storage rather than
+    // allocating two valueCount-sized maps per candidate block. This matters especially for arena
+    // allocators, where free is intentionally a no-op until the whole compilation is torn down.
+    var classes_storage: ?[]?u32 = null;
+    defer if (classes_storage) |classes| allocator.free(classes);
+    var costs_storage: ?[]usize = null;
+    defer if (costs_storage) |costs| allocator.free(costs);
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         const term = func.terminator(block) orelse continue;
         if (!hasFactorCandidate(func, block)) continue;
         var graph = Graph{ .allocator = allocator, .limits = limits };
         defer graph.deinit();
-        const classes = try allocator.alloc(?u32, func.valueCount());
-        defer allocator.free(classes);
+        if (classes_storage == null) {
+            const classes = try allocator.alloc(?u32, func.valueCount());
+            errdefer allocator.free(classes);
+            const costs = try allocator.alloc(usize, func.valueCount());
+            classes_storage = classes;
+            costs_storage = costs;
+        }
+        const classes = classes_storage.?;
         @memset(classes, null);
-        const original_costs = try allocator.alloc(usize, func.valueCount());
-        defer allocator.free(original_costs);
+        const original_costs = costs_storage.?;
         @memset(original_costs, 0);
         try importBlock(&graph, func, block, classes, original_costs);
         try saturate(&graph);
@@ -761,6 +774,35 @@ test "egraph factors a shared multiplier from a returned expression" {
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
     try std.testing.expect(diags.ok());
+}
+
+test "egraph optimizes multiple candidate blocks while values grow" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const exit = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ty);
+    const b = try func.appendBlockParam(entry, ty);
+    const c = try func.appendBlockParam(entry, ty);
+    _ = try func.appendBlockParam(exit, ty);
+
+    const ab0 = try func.appendInst(entry, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const ac0 = try func.appendInst(entry, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
+    const sum0 = try func.appendInst(entry, ty, .{ .arith = .{ .op = .add, .lhs = ab0, .rhs = ac0 } });
+    try func.setJump(entry, exit, &.{sum0});
+
+    const ab1 = try func.appendInst(exit, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const ac1 = try func.appendInst(exit, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
+    const sum1 = try func.appendInst(exit, ty, .{ .arith = .{ .op = .add, .lhs = ab1, .rhs = ac1 } });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(sum1) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const jump_value = func.blockArgs(func.terminator(entry).?.jump)[0];
+    const return_value = func.terminator(exit).?.ret.values[0];
+    try std.testing.expectEqual(BinOp.mul, func.opcode(func.definingInst(jump_value).?).arith.op);
+    try std.testing.expectEqual(BinOp.mul, func.opcode(func.definingInst(return_value).?).arith.op);
 }
 
 test "egraph factors a shared multiplier from a subtraction" {
