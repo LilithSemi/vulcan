@@ -338,66 +338,100 @@ fn bitwisePairResult(outer: BinOp, left: BinOp, right: BinOp) ?BinOp {
     };
 }
 
-/// Avoid graph construction for blocks that cannot match the current rule set.
-fn hasFactorCandidate(func: *const Function, block: Block) bool {
-    for (func.blockInsts(block)) |inst| {
-        const sum = switch (func.opcode(inst)) {
-            .arith => |arith| if (factorInner(arith.op) != null or cancellationInner(arith.op) != null or absorptionInner(arith.op) != null) arith else continue,
-            else => continue,
-        };
-        const lhs = if (func.definingInst(sum.lhs)) |lhs_inst| switch (func.opcode(lhs_inst)) {
-            .arith => |arith| arith,
-            else => null,
-        } else null;
-        const rhs = if (func.definingInst(sum.rhs)) |rhs_inst| switch (func.opcode(rhs_inst)) {
-            .arith => |arith| arith,
-            else => null,
-        } else null;
-        if (factorInner(sum.op)) |inner| {
-            if (isAssociative(sum.op)) {
-                if (func.instResult(inst)) |result| if (hasNestedFactorCandidate(func, result, sum.op, inner)) return true;
-            } else if (lhs != null and rhs != null and lhs.?.op == inner and rhs.?.op == inner) return true;
-        }
+fn hasFactorCandidateAt(func: *const Function, value: Value, sum: ir.function.Arith) bool {
+    const lhs = if (func.definingInst(sum.lhs)) |lhs_inst| switch (func.opcode(lhs_inst)) {
+        .arith => |arith| arith,
+        else => null,
+    } else null;
+    const rhs = if (func.definingInst(sum.rhs)) |rhs_inst| switch (func.opcode(rhs_inst)) {
+        .arith => |arith| arith,
+        else => null,
+    } else null;
+    if (factorInner(sum.op)) |inner| {
+        if (isAssociative(sum.op)) {
+            if (hasNestedFactorCandidate(func, value, sum.op, inner)) return true;
+        } else if (lhs != null and rhs != null and lhs.?.op == inner and rhs.?.op == inner) return true;
+    }
+    if (lhs != null and rhs != null) {
+        if (cancellationInner(sum.op)) |inner| if (lhs.?.op == inner and rhs.?.op == inner) return true;
+        if (sum.op == .sub and lhs.?.op == .sub and rhs.?.op == .sub) return true;
+    }
+    if (absorptionInner(sum.op)) |inner| {
+        if (lhs) |op| if (op.op == inner and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
+        if (rhs) |op| if (op.op == inner and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
+    }
+    if (sum.op == .add) {
+        if (lhs) |op| if (op.op == .sub and op.rhs == sum.rhs) return true;
+        if (rhs) |op| if (op.op == .sub and op.rhs == sum.lhs) return true;
         if (lhs != null and rhs != null) {
-            if (cancellationInner(sum.op)) |inner| if (lhs.?.op == inner and rhs.?.op == inner) return true;
-            if (sum.op == .sub and lhs.?.op == .sub and rhs.?.op == .sub) return true;
+            if (lhs.?.op == .sub and rhs.?.op == .add and (lhs.?.rhs == rhs.?.lhs or lhs.?.rhs == rhs.?.rhs)) return true;
+            if (lhs.?.op == .add and rhs.?.op == .sub and (rhs.?.rhs == lhs.?.lhs or rhs.?.rhs == lhs.?.rhs)) return true;
+            if (lhs.?.op == .sub and rhs.?.op == .sub and (lhs.?.rhs == rhs.?.lhs or lhs.?.lhs == rhs.?.rhs)) return true;
         }
-        if (absorptionInner(sum.op)) |inner| {
-            if (lhs) |op| if (op.op == inner and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
-            if (rhs) |op| if (op.op == inner and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
-        }
-        if (sum.op == .add) {
-            if (lhs) |op| if (op.op == .sub and op.rhs == sum.rhs) return true;
-            if (rhs) |op| if (op.op == .sub and op.rhs == sum.lhs) return true;
-            if (lhs != null and rhs != null) {
-                if (lhs.?.op == .sub and rhs.?.op == .add and (lhs.?.rhs == rhs.?.lhs or lhs.?.rhs == rhs.?.rhs)) return true;
-                if (lhs.?.op == .add and rhs.?.op == .sub and (rhs.?.rhs == lhs.?.lhs or rhs.?.rhs == lhs.?.rhs)) return true;
-                if (lhs.?.op == .sub and rhs.?.op == .sub and (lhs.?.rhs == rhs.?.lhs or lhs.?.lhs == rhs.?.rhs)) return true;
-            }
-            if (lhs != null and rhs != null and
-                (((lhs.?.op == .add and rhs.?.op == .sub) or (lhs.?.op == .sub and rhs.?.op == .add)) and
-                    sameValueOperands(lhs.?, rhs.?))) return true;
-            if (lhs != null and rhs != null and
-                ((lhs.?.op == .bit_or and rhs.?.op == .bit_and) or
-                    (lhs.?.op == .bit_and and rhs.?.op == .bit_or)) and
-                sameValueOperands(lhs.?, rhs.?)) return true;
-        } else if (sum.op == .sub) {
-            if (lhs) |op| if (op.op == .add and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
-            if (rhs) |op| if (op.op == .sub and op.lhs == sum.lhs) return true;
-            if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and (rhs.?.lhs == lhs.?.lhs or rhs.?.lhs == lhs.?.rhs)) return true;
-            if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and sameValueOperands(lhs.?, rhs.?)) return true;
-            if (lhs != null and rhs != null and lhs.?.op == .bit_or and rhs.?.op == .bit_and and sameValueOperands(lhs.?, rhs.?)) return true;
-        } else if (sum.op == .bit_xor) {
-            if (lhs) |op| if (op.op == .bit_xor and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
-            if (rhs) |op| if (op.op == .bit_xor and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
-            if (lhs != null and rhs != null and bitwisePairResult(sum.op, lhs.?.op, rhs.?.op) != null and sameValueOperands(lhs.?, rhs.?)) return true;
-        } else if (sum.op == .bit_and or sum.op == .bit_or) {
-            if (lhs) |op| if (op.op == sum.op and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
-            if (rhs) |op| if (op.op == sum.op and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
-            if (lhs != null and rhs != null and bitwisePairResult(sum.op, lhs.?.op, rhs.?.op) != null and sameValueOperands(lhs.?, rhs.?)) return true;
-        }
+        if (lhs != null and rhs != null and
+            (((lhs.?.op == .add and rhs.?.op == .sub) or (lhs.?.op == .sub and rhs.?.op == .add)) and
+                sameValueOperands(lhs.?, rhs.?))) return true;
+        if (lhs != null and rhs != null and
+            ((lhs.?.op == .bit_or and rhs.?.op == .bit_and) or
+                (lhs.?.op == .bit_and and rhs.?.op == .bit_or)) and
+            sameValueOperands(lhs.?, rhs.?)) return true;
+    } else if (sum.op == .sub) {
+        if (lhs) |op| if (op.op == .add and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
+        if (rhs) |op| if (op.op == .sub and op.lhs == sum.lhs) return true;
+        if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and (rhs.?.lhs == lhs.?.lhs or rhs.?.lhs == lhs.?.rhs)) return true;
+        if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and sameValueOperands(lhs.?, rhs.?)) return true;
+        if (lhs != null and rhs != null and lhs.?.op == .bit_or and rhs.?.op == .bit_and and sameValueOperands(lhs.?, rhs.?)) return true;
+    } else if (sum.op == .bit_xor) {
+        if (lhs) |op| if (op.op == .bit_xor and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
+        if (rhs) |op| if (op.op == .bit_xor and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
+        if (lhs != null and rhs != null and bitwisePairResult(sum.op, lhs.?.op, rhs.?.op) != null and sameValueOperands(lhs.?, rhs.?)) return true;
+    } else if (sum.op == .bit_and or sum.op == .bit_or) {
+        if (lhs) |op| if (op.op == sum.op and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
+        if (rhs) |op| if (op.op == sum.op and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
+        if (lhs != null and rhs != null and bitwisePairResult(sum.op, lhs.?.op, rhs.?.op) != null and sameValueOperands(lhs.?, rhs.?)) return true;
     }
     return false;
+}
+
+fn isEgraphOp(op: BinOp) bool {
+    return switch (op) {
+        .add, .sub, .mul, .bit_and, .bit_or, .bit_xor => true,
+        else => false,
+    };
+}
+
+fn hasFactorCandidateFromRoot(func: *const Function, root: Value) bool {
+    var pending: [64]Value = undefined;
+    var len: usize = 1;
+    pending[0] = root;
+    while (len != 0) {
+        len -= 1;
+        const value = pending[len];
+        const inst = func.definingInst(value) orelse continue;
+        const arith = switch (func.opcode(inst)) {
+            .arith => |arith| if (isEgraphOp(arith.op)) arith else continue,
+            else => continue,
+        };
+        if ((factorInner(arith.op) != null or cancellationInner(arith.op) != null or absorptionInner(arith.op) != null) and
+            hasFactorCandidateAt(func, value, arith)) return true;
+        if (len + 2 > pending.len) return true;
+        pending[len] = arith.lhs;
+        pending[len + 1] = arith.rhs;
+        len += 2;
+    }
+    return false;
+}
+
+/// Avoid graph construction unless an outgoing expression can match the current rule set.
+fn hasFactorCandidate(func: *const Function, term: ir.function.Terminator) bool {
+    return switch (term) {
+        .ret => |ret| for (ret.slice()) |root| {
+            if (hasFactorCandidateFromRoot(func, root)) break true;
+        } else false,
+        .jump => |jump| for (func.valueList(jump.args)) |root| {
+            if (hasFactorCandidateFromRoot(func, root)) break true;
+        } else false,
+    };
 }
 
 fn recordClass(allocator: std.mem.Allocator, classes: []?u32, costs: []usize, touched: *std.ArrayList(usize), value: Value, class: u32, cost: usize) !void {
@@ -430,7 +464,7 @@ fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u
                 continue;
             },
         };
-        if (arith.op != .add and arith.op != .sub and arith.op != .mul and arith.op != .bit_and and arith.op != .bit_or and arith.op != .bit_xor) {
+        if (!isEgraphOp(arith.op)) {
             _ = try classForValue(graph, classes, costs, touched, result);
             continue;
         }
@@ -967,7 +1001,7 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
         const block: Block = @fromBackingInt(@intCast(bi));
         const term = func.terminator(block) orelse continue;
         if (!hasOptimizableRoots(term)) continue;
-        if (!hasFactorCandidate(func, block)) continue;
+        if (!hasFactorCandidate(func, term)) continue;
         graph.reset();
         if (classes_storage == null) {
             const classes = try allocator.alloc(?u32, func.valueCount());
@@ -1122,6 +1156,23 @@ test "egraph recognizes terminators without optimizable roots" {
     try std.testing.expect(hasOptimizableRoots(.{ .ret = ir.function.Ret.one(@fromBackingInt(0)) }));
     try std.testing.expect(!hasOptimizableRoots(.{ .jump = .{ .target = @fromBackingInt(0), .args = .{ .start = 0, .len = 0 } } }));
     try std.testing.expect(hasOptimizableRoots(.{ .jump = .{ .target = @fromBackingInt(0), .args = .{ .start = 0, .len = 1 } } }));
+}
+
+test "egraph candidate discovery follows outgoing expressions" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
+    const sum = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = ab, .rhs = ac } });
+
+    try std.testing.expect(!hasFactorCandidate(&func, .{ .ret = ir.function.Ret.one(a) }));
+    try std.testing.expect(hasFactorCandidate(&func, .{ .ret = ir.function.Ret.one(sum) }));
 }
 
 test "egraph hash-consing follows merged child classes" {
