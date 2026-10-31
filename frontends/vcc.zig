@@ -975,7 +975,7 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
     const frontend_end = std.Io.Timestamp.now(io, .awake);
 
     const inline_start = frontend_end;
-    if (optimize.inlinesCalls()) try inlineTranslationUnit(allocator, &mod);
+    if (optimize.inlinesCalls()) try inlineTranslationUnit(allocator, &mod, profile);
     const inline_end = std.Io.Timestamp.now(io, .awake);
 
     const early_start = inline_end;
@@ -1055,9 +1055,22 @@ const ModuleLookup = struct {
 };
 
 /// Inline calls whose definitions are available in this translation unit.
-fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module) !void {
+fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module, profile: ?*const opt.pgo.Profile) !void {
     const lookup = opt.inlining.Lookup{ .context = mod, .func = ModuleLookup.get };
-    for (mod.funcs) |*named| _ = try opt.inlining.run(allocator, &named.func, lookup);
+    for (mod.funcs) |*named| {
+        if (profile) |p| {
+            const counts = p.get(named.name) orelse continue;
+            if (counts.len != named.func.blockCount()) return error.MalformedProfile;
+            _ = try opt.pgo.guidedInlineFunction(allocator, &named.func, lookup, counts, profileHotThreshold(counts));
+        } else {
+            _ = try opt.inlining.run(allocator, &named.func, lookup);
+        }
+    }
+}
+
+fn profileHotThreshold(counts: []const u64) u64 {
+    if (counts.len == 0 or counts[0] == 0) return 1;
+    return @max(@as(u64, 1), counts[0] / 100);
 }
 
 /// A synthetic object defining `__dso_handle` (a NULL `void *`), the per-DSO handle the
@@ -1330,7 +1343,7 @@ pub fn main(init: std.process.Init) !void {
         var w = std.Io.File.stdout().writer(io, &buf);
         // With an optimization level (`-O1`+), dump the IR the backend actually sees, not the raw
         // lowering: run the same pipeline the object path runs.
-        if (opts.optimize.inlinesCalls()) try inlineTranslationUnit(allocator, &mod);
+        if (opts.optimize.inlinesCalls()) try inlineTranslationUnit(allocator, &mod, profile);
         if (opts.optimize.optimizes()) {
             for (mod.funcs) |*nf| {
                 _ = try opt.optimizeEarly(allocator, &nf.func);
@@ -1941,6 +1954,13 @@ test "profile counts extend across blocks added by optimization" {
     try std.testing.expectError(error.MalformedProfile, expandedProfileCounts(allocator, &profile, "main", 1));
 }
 
+test "profile hot threshold is one percent of entry count" {
+    try std.testing.expectEqual(@as(u64, 1), profileHotThreshold(&.{}));
+    try std.testing.expectEqual(@as(u64, 1), profileHotThreshold(&.{0}));
+    try std.testing.expectEqual(@as(u64, 1), profileHotThreshold(&.{99}));
+    try std.testing.expectEqual(@as(u64, 100), profileHotThreshold(&.{10_000}));
+}
+
 test "translation-unit inlining removes a call to a local leaf" {
     const allocator = std.testing.allocator;
     var mod = try cc.compile(allocator,
@@ -1957,7 +1977,7 @@ test "translation-unit inlining removes a call to a local leaf" {
     }
     try std.testing.expectEqual(@as(usize, 1), calls_before);
 
-    try inlineTranslationUnit(allocator, &mod);
+    try inlineTranslationUnit(allocator, &mod, null);
     var calls_after: usize = 0;
     for (0..main_func.blockCount()) |bi| {
         for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
@@ -1965,6 +1985,32 @@ test "translation-unit inlining removes a call to a local leaf" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), calls_after);
+}
+
+test "profile-guided translation-unit inlining keeps a cold call" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\int add1(int x) { return x + 1; }
+        \\int main(void) { return add1(4); }
+    );
+    defer mod.deinit(allocator);
+    const main_func = mod.find("main") orelse return error.TestUnexpectedResult;
+
+    const cold_counts = try allocator.alloc(u64, main_func.blockCount());
+    defer allocator.free(cold_counts);
+    @memset(cold_counts, 0);
+    var profile = opt.pgo.Profile.init(allocator);
+    defer profile.deinit();
+    try profile.add("main", cold_counts);
+
+    try inlineTranslationUnit(allocator, &mod, &profile);
+    var calls_after: usize = 0;
+    for (0..main_func.blockCount()) |bi| {
+        for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (main_func.opcode(inst) == .call) calls_after += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls_after);
 }
 
 test "pickModel: named part matching target -> model" {

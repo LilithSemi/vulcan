@@ -172,11 +172,16 @@ pub fn guidedInline(allocator: std.mem.Allocator, module: *lto.Module, profile: 
     const lk = module.lookup();
     for (module.names.items, 0..) |name, i| {
         const counts = profile.get(name) orelse continue;
-        var filt = HotFilter{ .counts = counts, .threshold = threshold };
-        const filter = inlining.Filter{ .context = &filt, .func = HotFilter.allow };
-        if (try inlining.runFiltered(allocator, module.funcs.items[i], lk, filter)) changed = true;
+        if (try guidedInlineFunction(allocator, module.funcs.items[i], lk, counts, threshold)) changed = true;
     }
     return changed;
+}
+
+/// Inline call sites in blocks whose profile count reaches `threshold`.
+pub fn guidedInlineFunction(allocator: std.mem.Allocator, caller: *Function, lookup: inlining.Lookup, counts: []const u64, threshold: u64) Error!bool {
+    var filt = HotFilter{ .counts = counts, .threshold = threshold };
+    const filter = inlining.Filter{ .context = &filt, .func = HotFilter.allow };
+    return inlining.runFiltered(allocator, caller, lookup, filter);
 }
 
 fn i32k(func: *Function) std.mem.Allocator.Error!Type {
