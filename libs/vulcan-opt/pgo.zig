@@ -86,6 +86,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!Profile {
         for (counts) |*c| c.* = try getU64(data, &pos);
         try profile.add(name, counts);
     }
+    if (pos != data.len) return error.MalformedProfile;
     return profile;
 }
 
@@ -198,6 +199,7 @@ test "profile round-trips through its binary format" {
     try std.testing.expectEqualSlices(u64, &.{5}, back.get("cold").?);
     try std.testing.expect(back.get("missing") == null);
     try std.testing.expectError(error.MalformedProfile, decode(allocator, "\x01\x00\x00\x00"));
+    try std.testing.expectError(error.MalformedProfile, decode(allocator, "\x00\x00\x00\x00trailing"));
 }
 
 test "instrumentation adds a transparent counter to every block" {

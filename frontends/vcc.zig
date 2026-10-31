@@ -173,6 +173,8 @@ const Options = struct {
     gc_sections: bool = true,
     /// `-ftime-report`: print per-stage compiler wall times to stderr.
     time_report: bool = false,
+    /// `-fprofile-use=<file>`: use Vulcan's binary block-count profile.
+    profile_use: ?[]const u8 = null,
     optimize: OptimizationLevel = .off,
 };
 
@@ -284,6 +286,10 @@ fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (e
             opts.reproducible = true;
         } else if (std.mem.eql(u8, arg, "-ftime-report")) {
             opts.time_report = true;
+        } else if (std.mem.startsWith(u8, arg, "-fprofile-use=")) {
+            const path = arg["-fprofile-use=".len..];
+            if (path.len == 0) return fail(errw, "-fprofile-use requires a profile file", .{});
+            opts.profile_use = path;
         } else if (std.mem.eql(u8, arg, "-I")) {
             const dir = it.next() orelse return fail(errw, "-I requires an argument", .{});
             try opts.includes.append(allocator, dir);
@@ -945,11 +951,11 @@ fn buildModuleData(allocator: std.mem.Allocator, objs: []const cc.DataObject) st
 /// microarch model for `arch` (see `resolveModel`). It tunes both the IR layer and the
 /// backend for every function this call compiles. Used by both the `-c` path (a single
 /// source) and the link step (one call per `.c`/`.i` input, in command order).
-fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool) ![]u8 {
+fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool, profile: ?*const opt.pgo.Profile) ![]u8 {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
     var pp_opts = pp_base;
     pp_opts.filename = try filenameForPreproc(allocator, path);
-    return compileSourceToObject(allocator, io, source, pp_opts, arch, model, optimize, time_report);
+    return compileSourceToObject(allocator, io, source, pp_opts, arch, model, optimize, time_report, profile);
 }
 
 /// Compiles in-memory `source` (already-read text, `pp_opts` carrying its filename and
@@ -962,7 +968,7 @@ fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, p
 /// `opt.optimizeLate` reduces a loop's addresses to loop-carried pointers, which changes the shape
 /// four microarch idiom recognizers match on, so it has to come after them. `opt.optimize` is the
 /// two halves back to back, for a caller with no microarch layer to fit in between.
-fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool) ![]u8 {
+fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool, profile: ?*const opt.pgo.Profile) ![]u8 {
     const frontend_start = std.Io.Timestamp.now(io, .awake);
     var mod = try cc.compileWithOpts(allocator, source, pp_opts);
     defer mod.deinit(allocator);
@@ -993,7 +999,11 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
     const final_start = late_end;
     for (mod.funcs) |*nf| {
         if (optimize.runsMicroarch()) if (model) |m| try mm.schedule.run(allocator, &nf.func, m);
-        if (optimize.optimizes()) _ = try opt.layout(allocator, &nf.func, null);
+        if (optimize.optimizes()) {
+            const counts = try expandedProfileCounts(allocator, profile, nf.name, nf.func.blockCount());
+            defer if (counts) |owned| allocator.free(owned);
+            _ = try opt.layout(allocator, &nf.func, counts);
+        }
     }
     const final_end = std.Io.Timestamp.now(io, .awake);
 
@@ -1027,6 +1037,16 @@ fn micros(start: std.Io.Timestamp, end: std.Io.Timestamp) u64 {
     return @intCast(@divTrunc(nanoseconds, std.time.ns_per_us));
 }
 
+/// Extend an input profile with zero-count entries for blocks added by optimization.
+fn expandedProfileCounts(allocator: std.mem.Allocator, profile: ?*const opt.pgo.Profile, name: []const u8, block_count: usize) !?[]u64 {
+    const raw = (profile orelse return null).get(name) orelse return null;
+    if (raw.len > block_count) return error.MalformedProfile;
+    const counts = try allocator.alloc(u64, block_count);
+    @memset(counts, 0);
+    @memcpy(counts[0..raw.len], raw);
+    return counts;
+}
+
 const ModuleLookup = struct {
     fn get(context: *anyopaque, name: []const u8) ?*const cc.Function {
         const mod: *const cc.Module = @ptrCast(@alignCast(context));
@@ -1049,7 +1069,7 @@ fn synthDsoHandleObject(allocator: std.mem.Allocator, io: std.Io, pp_base: prepr
     var pp_opts = pp_base;
     pp_opts.filename = "<vcc-dso-handle>";
     // Data only, no functions, so optimization has nothing to act on: pass it off.
-    return compileSourceToObject(allocator, io, "void *__dso_handle = 0;\n", pp_opts, arch, null, .off, false);
+    return compileSourceToObject(allocator, io, "void *__dso_handle = 0;\n", pp_opts, arch, null, .off, false, null);
 }
 
 /// The `vcc` driver entry point: parse argv, then dispatch on mode. `-E` preprocesses and
@@ -1194,6 +1214,16 @@ pub fn main(init: std.process.Init) !void {
     // even with no flags given. See `resolveModel`.
     const model = try resolveModel(&opts, arch, errw);
 
+    var profile_storage: ?opt.pgo.Profile = null;
+    defer if (profile_storage) |*profile| profile.deinit();
+    if (opts.profile_use) |profile_path| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, profile_path, allocator, .limited(64 * 1024 * 1024)) catch
+            return fail(errw, "cannot read profile '{s}'", .{profile_path});
+        profile_storage = opt.pgo.decode(allocator, bytes) catch
+            return fail(errw, "malformed profile '{s}'", .{profile_path});
+    }
+    const profile: ?*const opt.pgo.Profile = if (profile_storage) |*stored| stored else null;
+
     // Default system include directory: the host glibc dev tree when `arch` is the host's
     // own arch, else a CROSS glibc dev tree for `arch`'s triple. This lets `#include
     // <stdio.h>` resolve with no explicit `-I`/`-isystem`. `-nostdinc` suppresses this; the
@@ -1272,7 +1302,7 @@ pub fn main(init: std.process.Init) !void {
     if (opts.compile_only) {
         const input = single_source.?;
         if (classifyExt(input) != .c) return fail(errw, "-c requires a .c/.i source file, got '{s}'", .{input});
-        const obj = try compileToObject(allocator, io, input, pp_base, arch, model, opts.optimize, opts.time_report);
+        const obj = try compileToObject(allocator, io, input, pp_base, arch, model, opts.optimize, opts.time_report, profile);
         const out = opts.output orelse try derivedOutputName(allocator, input);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = obj });
         if (opts.gen_depfile) {
@@ -1302,7 +1332,13 @@ pub fn main(init: std.process.Init) !void {
         // lowering: run the same pipeline the object path runs.
         if (opts.optimize.inlinesCalls()) try inlineTranslationUnit(allocator, &mod);
         if (opts.optimize.optimizes()) {
-            for (mod.funcs) |*nf| _ = try opt.optimize(allocator, &nf.func);
+            for (mod.funcs) |*nf| {
+                _ = try opt.optimizeEarly(allocator, &nf.func);
+                _ = try opt.optimizeLate(allocator, &nf.func);
+                const counts = try expandedProfileCounts(allocator, profile, nf.name, nf.func.blockCount());
+                defer if (counts) |owned| allocator.free(owned);
+                _ = try opt.layout(allocator, &nf.func, counts);
+            }
         }
         for (mod.funcs) |nf| try w.interface.print("; function {s}\n{f}\n", .{ nf.name, nf.func });
         try w.interface.flush();
@@ -1325,7 +1361,7 @@ pub fn main(init: std.process.Init) !void {
     for (opts.inputs.items) |spec| switch (spec) {
         .path => |p| switch (classifyExt(p)) {
             .c => {
-                const obj = try compileToObject(allocator, io, p, pp_base, arch, model, opts.optimize, opts.time_report);
+                const obj = try compileToObject(allocator, io, p, pp_base, arch, model, opts.optimize, opts.time_report, profile);
                 try dyn_inputs.append(allocator, .{ .object = obj });
                 try display_names.append(allocator, "");
             },
@@ -1884,6 +1920,25 @@ test "parseArgs: -ftime-report enables stage timing" {
     var it = SliceArgs{ .items = &.{ "-ftime-report", "foo.c" } };
     const opts = try parseArgs(arena.allocator(), testErrw(), &it);
     try std.testing.expect(opts.time_report);
+}
+
+test "parseArgs: -fprofile-use records the profile path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var it = SliceArgs{ .items = &.{ "-fprofile-use=run.vpgo", "foo.c" } };
+    const opts = try parseArgs(arena.allocator(), testErrw(), &it);
+    try std.testing.expectEqualStrings("run.vpgo", opts.profile_use.?);
+}
+
+test "profile counts extend across blocks added by optimization" {
+    const allocator = std.testing.allocator;
+    var profile = opt.pgo.Profile.init(allocator);
+    defer profile.deinit();
+    try profile.add("main", &.{ 100, 25 });
+    const counts = (try expandedProfileCounts(allocator, &profile, "main", 4)).?;
+    defer allocator.free(counts);
+    try std.testing.expectEqualSlices(u64, &.{ 100, 25, 0, 0 }, counts);
+    try std.testing.expectError(error.MalformedProfile, expandedProfileCounts(allocator, &profile, "main", 1));
 }
 
 test "translation-unit inlining removes a call to a local leaf" {
