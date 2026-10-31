@@ -385,7 +385,9 @@ fn hasFactorCandidateAt(func: *const Function, value: Value, sum: ir.function.Ar
         if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and (rhs.?.lhs == lhs.?.lhs or rhs.?.lhs == lhs.?.rhs)) return true;
         if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and sameValueOperands(lhs.?, rhs.?)) return true;
         if (lhs != null and rhs != null and lhs.?.op == .bit_or and (rhs.?.op == .bit_and or rhs.?.op == .bit_xor) and sameValueOperands(lhs.?, rhs.?)) return true;
-        if (lhs != null and rhs != null and lhs.?.op == .add and (rhs.?.op == .bit_or or rhs.?.op == .bit_and) and sameValueOperands(lhs.?, rhs.?)) return true;
+        if (lhs != null and rhs != null and lhs.?.op == .add and
+            (rhs.?.op == .bit_or or rhs.?.op == .bit_and or rhs.?.op == .bit_xor) and
+            sameValueOperands(lhs.?, rhs.?)) return true;
     } else if (sum.op == .bit_xor) {
         if (lhs) |op| if (op.op == .bit_xor and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
         if (rhs) |op| if (op.op == .bit_xor and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
@@ -531,7 +533,8 @@ fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u
             .ty = func.valueType(result),
             .existing = result,
         }) orelse return;
-        try recordClass(graph.allocator, classes, costs, touched, result, class, 1 + costs[@backingInt(arith.lhs)] + costs[@backingInt(arith.rhs)]);
+        const rhs_cost = if (arith.lhs == arith.rhs) 0 else costs[@backingInt(arith.rhs)];
+        try recordClass(graph.allocator, classes, costs, touched, result, class, 1 + costs[@backingInt(arith.lhs)] + rhs_cost);
     }
 }
 
@@ -665,9 +668,20 @@ fn foldBitwiseArithmetic(graph: *Graph, outer_class: u32, outer_op: BinOp, disju
     return graph.merge(outer_class, replacement);
 }
 
-/// (a + b) - (a | b) == a & b and (a + b) - (a & b) == a | b.
+/// (a + b) - (a | b) == a & b, (a + b) - (a & b) == a | b, and
+/// (a + b) - (a ^ b) == (a & b) + (a & b).
 fn foldAddBitwiseDifference(graph: *Graph, outer_class: u32, addition: OpNode, bitwise: OpNode) !bool {
     if (!sameClassOperands(graph, addition, bitwise)) return false;
+    if (bitwise.op == .bit_xor) {
+        const intersection = try graph.addOp(.{
+            .op = .bit_and,
+            .lhs = addition.lhs,
+            .rhs = addition.rhs,
+            .ty = addition.ty,
+            .existing = null,
+        }) orelse return false;
+        return mergeDouble(graph, outer_class, addition.ty, intersection);
+    }
     const replacement = try graph.addOp(.{
         .op = if (bitwise.op == .bit_or) .bit_and else .bit_or,
         .lhs = addition.lhs,
@@ -986,11 +1000,11 @@ fn saturate(graph: *Graph) !void {
                 }
             }
             if (sum.op == .sub and classHasOp(graph, sum.lhs, .add) and
-                (classHasOp(graph, sum.rhs, .bit_or) or classHasOp(graph, sum.rhs, .bit_and)))
+                (classHasOp(graph, sum.rhs, .bit_or) or classHasOp(graph, sum.rhs, .bit_and) or classHasOp(graph, sum.rhs, .bit_xor)))
             {
                 left.clearRetainingCapacity();
                 try matchingOps(graph, sum.lhs, .add, sum.ty, left);
-                for ([_]BinOp{ .bit_or, .bit_and }) |rhs_op| {
+                for ([_]BinOp{ .bit_or, .bit_and, .bit_xor }) |rhs_op| {
                     right.clearRetainingCapacity();
                     try matchingOps(graph, sum.rhs, rhs_op, sum.ty, right);
                     for (left.items) |addition| for (right.items) |bitwise| {
@@ -1039,10 +1053,12 @@ fn extract(graph: *Graph, costs: []usize, best: []?usize) Extraction {
                 .leaf => 0,
                 .op => |raw| blk: {
                     const op = canonical(graph, raw);
-                    const lhs = costs[graph.find(op.lhs)];
-                    const rhs = costs[graph.find(op.rhs)];
+                    const lhs_root = graph.find(op.lhs);
+                    const rhs_root = graph.find(op.rhs);
+                    const lhs = costs[lhs_root];
+                    const rhs = costs[rhs_root];
                     if (lhs == std.math.maxInt(usize) or rhs == std.math.maxInt(usize)) continue;
-                    break :blk 1 + lhs + rhs;
+                    break :blk 1 + lhs + if (lhs_root == rhs_root) 0 else rhs;
                 },
             };
             if (cost < costs[root]) {
@@ -1663,6 +1679,29 @@ test "egraph reduces the difference of bitwise union and xor" {
 test "egraph reduces addition minus matching bitwise terms" {
     try expectAddBitwiseDifference(.bit_or, .bit_and);
     try expectAddBitwiseDifference(.bit_and, .bit_or);
+}
+
+test "egraph reduces addition minus xor to doubled intersection" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const sum = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    const exclusive = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = b, .rhs = a } });
+    const difference = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = sum, .rhs = exclusive } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(difference) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const doubled = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.add, doubled.op);
+    try std.testing.expectEqual(doubled.lhs, doubled.rhs);
+    const intersection = func.opcode(func.definingInst(doubled.lhs).?).arith;
+    try std.testing.expectEqual(BinOp.bit_and, intersection.op);
+    try std.testing.expect((intersection.lhs == a and intersection.rhs == b) or (intersection.lhs == b and intersection.rhs == a));
 }
 
 test "egraph folds xor combinations of matching bitwise terms" {
