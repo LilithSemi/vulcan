@@ -26,7 +26,7 @@ const Value = ir.function.Value;
 const Inst = ir.function.Inst;
 const BinOp = ir.function.BinOp;
 
-pub const pass_def = pass.Pass{ .name = "knownbits", .run = run };
+pub const pass_def = pass.Pass{ .name = "knownbits", .run = run, .preserves_cfg = true };
 
 /// Per-value known bits: a set bit in `zeros` means that bit is known 0, in `ones` known 1. A bit
 /// set in neither is unknown. A well-formed entry never has the same bit set in both.

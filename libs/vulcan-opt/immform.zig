@@ -20,7 +20,7 @@ const Function = ir.function.Function;
 const Value = ir.function.Value;
 const BinOp = ir.function.BinOp;
 
-pub const pass_def = pass.Pass{ .name = "immform", .run = run };
+pub const pass_def = pass.Pass{ .name = "immform", .run = run, .preserves_cfg = true };
 
 /// Whether `op` has an `arith_imm` form this pass emits, and whether it is commutative (so the
 /// constant may sit on the left). Only `add` is canonicalized: it is the op the backend folds into a

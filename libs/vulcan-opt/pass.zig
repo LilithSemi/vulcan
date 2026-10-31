@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
+const cfg_mod = @import("cfg.zig");
 const dom = @import("dominators.zig");
 const loops_mod = @import("loops.zig");
 
@@ -15,6 +16,7 @@ pub const Error = std.mem.Allocator.Error;
 pub const Analyses = struct {
     allocator: std.mem.Allocator,
     func: *const Function,
+    cfg_cache: ?cfg_mod.Cfg = null,
     doms: ?dom.Dominators = null,
     loop_info: ?loops_mod.LoopInfo = null,
 
@@ -22,15 +24,28 @@ pub const Analyses = struct {
         self.invalidate();
     }
 
+    /// The control-flow graph, computed once and cached until invalidation.
+    pub fn cfg(self: *Analyses) Error!*const cfg_mod.Cfg {
+        if (self.cfg_cache == null) self.cfg_cache = try cfg_mod.build(self.allocator, self.func);
+        return &self.cfg_cache.?;
+    }
+
     /// The dominator analysis, computed once and cached until invalidation.
     pub fn dominators(self: *Analyses) Error!*const dom.Dominators {
-        if (self.doms == null) self.doms = try dom.compute(self.allocator, self.func);
+        if (self.doms == null) {
+            if (self.cfg_cache == null) self.cfg_cache = try cfg_mod.build(self.allocator, self.func);
+            self.doms = try dom.computeFromCfg(self.allocator, &self.cfg_cache.?);
+        }
         return &self.doms.?;
     }
 
     /// The natural-loop analysis, computed once and cached until invalidation.
     pub fn loops(self: *Analyses) Error!*const loops_mod.LoopInfo {
-        if (self.loop_info == null) self.loop_info = try loops_mod.analyze(self.allocator, self.func);
+        if (self.loop_info == null) {
+            if (self.cfg_cache == null) self.cfg_cache = try cfg_mod.build(self.allocator, self.func);
+            if (self.doms == null) self.doms = try dom.computeFromCfg(self.allocator, &self.cfg_cache.?);
+            self.loop_info = try loops_mod.analyzeFromCfg(self.allocator, &self.cfg_cache.?, &self.doms.?);
+        }
         return &self.loop_info.?;
     }
 
@@ -40,6 +55,8 @@ pub const Analyses = struct {
         self.doms = null;
         if (self.loop_info) |*l| l.deinit(self.allocator);
         self.loop_info = null;
+        if (self.cfg_cache) |*graph| graph.deinit(self.allocator);
+        self.cfg_cache = null;
     }
 };
 
@@ -48,6 +65,8 @@ pub const Analyses = struct {
 pub const Pass = struct {
     name: []const u8,
     run: *const fn (allocator: std.mem.Allocator, func: *Function, analyses: *Analyses) Error!bool,
+    /// A successful rewrite leaves all CFG-derived analyses valid.
+    preserves_cfg: bool = false,
 };
 
 /// Run each pass once in order. Analyses are invalidated after any modifying
@@ -59,7 +78,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, passes: []const Pass) 
     var changed = false;
     for (passes) |pass| {
         if (try pass.run(allocator, func, &analyses)) {
-            analyses.invalidate();
+            if (!pass.preserves_cfg) analyses.invalidate();
             changed = true;
         }
     }
@@ -78,7 +97,7 @@ pub fn runToFixpoint(allocator: std.mem.Allocator, func: *Function, passes: []co
         var changed = false;
         for (passes) |pass| {
             if (try pass.run(allocator, func, &analyses)) {
-                analyses.invalidate();
+                if (!pass.preserves_cfg) analyses.invalidate();
                 changed = true;
             }
         }
@@ -86,4 +105,31 @@ pub fn runToFixpoint(allocator: std.mem.Allocator, func: *Function, passes: []co
         changed_overall = true;
     }
     return changed_overall;
+}
+
+const CacheTestPasses = struct {
+    fn prime(_: std.mem.Allocator, _: *Function, analyses: *Analyses) Error!bool {
+        _ = try analyses.loops();
+        return true;
+    }
+
+    fn check(_: std.mem.Allocator, _: *Function, analyses: *Analyses) Error!bool {
+        std.debug.assert(analyses.cfg_cache != null);
+        std.debug.assert(analyses.doms != null);
+        std.debug.assert(analyses.loop_info != null);
+        return false;
+    }
+};
+
+test "a CFG-preserving pass keeps cached analyses for the next pass" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    _ = try func.appendBlock();
+
+    const passes = [_]Pass{
+        .{ .name = "prime", .run = CacheTestPasses.prime, .preserves_cfg = true },
+        .{ .name = "check", .run = CacheTestPasses.check },
+    };
+    try std.testing.expect(try run(allocator, &func, &passes));
 }

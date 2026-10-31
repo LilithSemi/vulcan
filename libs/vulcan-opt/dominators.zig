@@ -49,6 +49,11 @@ pub const Dominators = struct {
 pub fn compute(allocator: std.mem.Allocator, func: *const Function) std.mem.Allocator.Error!Dominators {
     var cfg = try cfg_mod.build(allocator, func);
     defer cfg.deinit(allocator);
+    return computeFromCfg(allocator, &cfg);
+}
+
+/// Compute dominators from an existing CFG. The caller owns the result.
+pub fn computeFromCfg(allocator: std.mem.Allocator, cfg: *const cfg_mod.Cfg) std.mem.Allocator.Error!Dominators {
     const n = cfg.blockCount();
 
     // Reachability from the entry (block 0), by CFG traversal.

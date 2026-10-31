@@ -17,7 +17,7 @@ const Inst = ir.function.Inst;
 const Block = ir.function.Block;
 const BinOp = ir.function.BinOp;
 
-pub const pass_def = pass.Pass{ .name = "licm", .run = run };
+pub const pass_def = pass.Pass{ .name = "licm", .run = run, .preserves_cfg = true };
 
 /// An instruction to hoist, with the loop block it currently lives in.
 const Hoist = struct { inst: Inst, from: u32 };

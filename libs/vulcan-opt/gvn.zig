@@ -17,7 +17,7 @@ const Value = ir.function.Value;
 const Inst = ir.function.Inst;
 const Block = ir.function.Block;
 
-pub const pass_def = pass.Pass{ .name = "gvn", .run = run };
+pub const pass_def = pass.Pass{ .name = "gvn", .run = run, .preserves_cfg = true };
 
 const ExprKind = enum(u8) { iconst, fconst, fconst128, arith, arith_imm, icmp, select, convert, unary, extract, global_addr, dot, reduce, splat };
 

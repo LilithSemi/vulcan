@@ -14,7 +14,7 @@ const Value = ir.function.Value;
 const Block = ir.function.Block;
 const Inst = ir.function.Inst;
 
-pub const pass_def = pass.Pass{ .name = "mem2reg", .run = run };
+pub const pass_def = pass.Pass{ .name = "mem2reg", .run = run, .preserves_cfg = true };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;

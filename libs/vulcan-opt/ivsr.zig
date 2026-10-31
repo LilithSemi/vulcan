@@ -64,7 +64,7 @@ const Block = ir.function.Block;
 const BinOp = ir.function.BinOp;
 const Type = ir.types.Type;
 
-pub const pass_def = pass.Pass{ .name = "ivsr", .run = run };
+pub const pass_def = pass.Pass{ .name = "ivsr", .run = run, .preserves_cfg = true };
 
 /// An invariant integer expression, built during analysis and emitted into the preheader only for
 /// the reductions this pass keeps. `binary` operands index the pool that holds the node.

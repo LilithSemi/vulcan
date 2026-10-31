@@ -18,7 +18,7 @@ const Value = ir.function.Value;
 const BinOp = ir.function.BinOp;
 const Opcode = ir.function.Opcode;
 
-pub const pass_def = pass.Pass{ .name = "strength", .run = run };
+pub const pass_def = pass.Pass{ .name = "strength", .run = run, .preserves_cfg = true };
 
 const IntTy = struct { bits: u16, signedness: std.builtin.Signedness };
 

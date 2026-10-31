@@ -8,7 +8,7 @@ const pass = @import("pass.zig");
 
 const Function = ir.function.Function;
 
-pub const pass_def = pass.Pass{ .name = "dce", .run = run };
+pub const pass_def = pass.Pass{ .name = "dce", .run = run, .preserves_cfg = true };
 
 /// Whether an instruction has no side effects, so it may be dropped when unused.
 fn isPure(op: ir.function.Opcode) bool {

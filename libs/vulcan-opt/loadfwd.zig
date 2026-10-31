@@ -17,7 +17,7 @@ const Value = ir.function.Value;
 const Block = ir.function.Block;
 const Inst = ir.function.Inst;
 
-pub const pass_def = pass.Pass{ .name = "loadfwd", .run = run };
+pub const pass_def = pass.Pass{ .name = "loadfwd", .run = run, .preserves_cfg = true };
 
 /// One address with an available value: `ptr` currently holds `value` (from a store or a prior
 /// load), valid until an aliasing store or a barrier invalidates it.
