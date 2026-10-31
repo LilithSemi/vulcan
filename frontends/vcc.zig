@@ -1022,7 +1022,9 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
 }
 
 fn micros(start: std.Io.Timestamp, end: std.Io.Timestamp) u64 {
-    return @intCast(start.durationTo(end).nanoseconds / std.time.ns_per_us);
+    const nanoseconds = start.durationTo(end).nanoseconds;
+    std.debug.assert(nanoseconds >= 0);
+    return @intCast(@divTrunc(nanoseconds, std.time.ns_per_us));
 }
 
 const ModuleLookup = struct {
