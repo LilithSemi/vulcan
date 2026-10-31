@@ -174,8 +174,16 @@ pub fn build(b: *std.Build) void {
     run_frontend_bench.addDirectoryArg(b.path("bench/frontends/c"));
     _ = run_frontend_bench.addOutputDirectoryArg("frontend-bench");
     run_frontend_bench.stdio = .inherit;
+
+    const cuda_bench_cli = addCudaBench(b, target);
+    const run_cuda_bench = b.addRunArtifact(cuda_bench_cli);
+    run_cuda_bench.addFileArg(b.path("bench/cuda/vector_mix.ptx"));
+    run_cuda_bench.addFileArg(b.path("bench/cuda/vector_mix.cu"));
+    _ = run_cuda_bench.addOutputDirectoryArg("cuda-bench");
+    run_cuda_bench.stdio = .inherit;
+    run_cuda_bench.step.dependOn(&run_frontend_bench.step);
     const bench_step = b.step("bench", "Run the benchmark suite");
-    bench_step.dependOn(&run_frontend_bench.step);
+    bench_step.dependOn(&run_cuda_bench.step);
 
     // The `ld.vulcan` linker frontend CLI: a standalone driver over the shared static
     // linker (`vulcan-link`), so the linker is usable with any compiler's `.o`/`.a`
@@ -918,6 +926,67 @@ fn addBenchVcc(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.
             .{ .name = "vulcan-target", .module = bench_target },
             .{ .name = "vulcan-link", .module = bench_link },
             .{ .name = "vulcan-opt", .module = bench_opt },
+        },
+    }) });
+}
+
+fn addCudaBench(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.Compile {
+    const bench_ir = b.addModule("vulcan-cuda-bench-ir", .{
+        .root_source_file = b.path("libs/vulcan-ir.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_gpu = b.addModule("vulcan-cuda-bench-gpu", .{
+        .root_source_file = b.path("libs/vulcan-gpu.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "vulcan-ir", .module = bench_ir }},
+    });
+    const bench_opt = b.addModule("vulcan-cuda-bench-opt", .{
+        .root_source_file = b.path("libs/vulcan-opt.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = bench_ir },
+            .{ .name = "vulcan-gpu", .module = bench_gpu },
+        },
+    });
+    const bench_spirv = b.addModule("vulcan-cuda-bench-spirv", .{
+        .root_source_file = b.path("libs/vulcan-spirv.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = bench_ir },
+            .{ .name = "vulcan-gpu", .module = bench_gpu },
+        },
+    });
+    const bench_link = b.addModule("vulcan-cuda-bench-link", .{
+        .root_source_file = b.path("libs/vulcan-link.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_target = b.addModule("vulcan-cuda-bench-target", .{
+        .root_source_file = b.path("libs/vulcan-target.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = bench_ir },
+            .{ .name = "vulcan-opt", .module = bench_opt },
+            .{ .name = "vulcan-spirv", .module = bench_spirv },
+            .{ .name = "vulcan-gpu", .module = bench_gpu },
+            .{ .name = "vulcan-link", .module = bench_link },
+        },
+    });
+    const nvidia_dep = b.dependency("nvidia", .{ .target = target, .optimize = .ReleaseFast });
+    return b.addExecutable(.{ .name = "vulcan-cuda-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/cuda-bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = bench_ir },
+            .{ .name = "vulcan-gpu", .module = bench_gpu },
+            .{ .name = "vulcan-target", .module = bench_target },
+            .{ .name = "nvidia", .module = nvidia_dep.module("nvidia") },
         },
     }) });
 }

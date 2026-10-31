@@ -55,6 +55,7 @@
             overlays = [
               self.overlays.default
             ];
+            config.allowUnfree = true;
           };
 
           treefmt.programs = {

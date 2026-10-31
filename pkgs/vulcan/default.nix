@@ -10,6 +10,7 @@
   etsoc-sysemu,
   llvmPackages,
   gcc,
+  cudaPackages,
 }:
 let
   inherit (stdenv) targetPlatform hostPlatform;
@@ -51,6 +52,12 @@ stdenv.mkDerivation (finalAttrs: {
         binutils
         llvmPackages.clang
         gcc
+      ]
+      ++ lib.optionals stdenv.hostPlatform.isLinux [
+        # nvcc injects cuda_runtime.h even for a cubin-only compilation.
+        cudaPackages.cuda_cudart
+        cudaPackages.cuda_nvcc
+        cudaPackages.cuda_nvdisasm
       ];
     };
 
