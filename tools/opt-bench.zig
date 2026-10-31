@@ -19,6 +19,8 @@ pub fn main(init: std.process.Init) !void {
     defer factor.deinit();
     var nested = try buildNestedWorkload(allocator, blocks);
     defer nested.deinit();
+    var rootless = try buildRootlessWorkload(allocator, blocks);
+    defer rootless.deinit();
 
     var buffer: [1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &buffer);
@@ -28,12 +30,14 @@ pub fn main(init: std.process.Init) !void {
     const factor_pipeline_ns = try measure(init.io, allocator, &factor, runPipeline);
     const nested_egraph_ns = try measure(init.io, allocator, &nested, runEgraph);
     const nested_pipeline_ns = try measure(init.io, allocator, &nested, runPipeline);
+    const rootless_egraph_ns = try measure(init.io, allocator, &rootless, runEgraph);
     try writer.print(
         "optimizer benchmark ({d} candidate blocks, best of {d})\n" ++
             "  factor egraph:          {d} ns/block\n" ++
             "  factor early pipeline:  {d} ns/block\n" ++
             "  nested egraph:          {d} ns/block\n" ++
-            "  nested early pipeline:  {d} ns/block\n",
+            "  nested early pipeline:  {d} ns/block\n" ++
+            "  rootless egraph:        {d} ns/block\n",
         .{
             blocks,
             samples,
@@ -41,6 +45,7 @@ pub fn main(init: std.process.Init) !void {
             factor_pipeline_ns / blocks,
             nested_egraph_ns / blocks,
             nested_pipeline_ns / blocks,
+            rootless_egraph_ns / blocks,
         },
     );
     try writer.flush();
@@ -105,6 +110,23 @@ fn buildNestedWorkload(allocator: std.mem.Allocator, count: usize) !Function {
         const partial = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = ab, .rhs = ac } });
         const total = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = partial, .rhs = ad } });
         func.setTerminator(block, .{ .ret = ir.function.Ret.one(total) });
+    }
+    return func;
+}
+
+fn buildRootlessWorkload(allocator: std.mem.Allocator, count: usize) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    for (0..count) |_| {
+        const block = try func.appendBlock();
+        const a = try func.appendBlockParam(block, ty);
+        const b = try func.appendBlockParam(block, ty);
+        const c = try func.appendBlockParam(block, ty);
+        const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+        const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
+        _ = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = ab, .rhs = ac } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
     }
     return func;
 }
