@@ -3,10 +3,11 @@
 //! call) sits between them. This is the in-memory analogue of mem2reg: mem2reg promotes the slots
 //! whose address never escapes, this handles the memory that stays in memory (escaped locals, heap,
 //! incoming pointers). A light alias oracle keeps it cheap and correct: two distinct allocas never
-//! alias, two distinct globals never alias, an alloca and a global never alias, and anything else is
-//! conservatively assumed to alias. A call, a matmul, a `va_list` operation or a barrier may touch
-//! any memory, so each of them clears everything. An atomic is a store of its address, and an
-//! atomic ordered above `relaxed` is a barrier as well.
+//! alias, two distinct globals never alias, and an alloca and a global never alias. Constant-offset
+//! accesses from the same root also cannot alias when their known primitive byte ranges are
+//! disjoint; unresolved roots and widths remain conservative. A call, a matmul, a `va_list`
+//! operation or a barrier may touch any memory, so each of them clears everything. An atomic is a
+//! store of its address, and an atomic ordered above `relaxed` is a barrier as well.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -74,7 +75,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     // mask bit is clear did not write, so the address does not hold `st.value`
                     // afterwards. It still invalidates, because the lanes that did write changed
                     // what is there.
-                    invalidateAliasing(&avail, func, st.ptr);
+                    invalidateAliasing(&avail, func, st.ptr, func.valueType(st.value));
                     if (!st.@"volatile" and st.mask == null and !func.isByteOrderTagged(inst)) {
                         try avail.append(allocator, .{ .ptr = st.ptr, .value = st.value });
                     }
@@ -88,7 +89,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 // before it visible after it, which is what a barrier does, so it drops the
                 // whole set the way the `barrier` arm below does.
                 .atomic_rmw => |a| switch (a.ordering) {
-                    .relaxed => invalidateAliasing(&avail, func, a.ptr),
+                    .relaxed => invalidateAliasing(&avail, func, a.ptr, func.valueType(a.value)),
                     .acquire, .release, .acq_rel, .seq_cst => avail.clearRetainingCapacity(),
                 },
                 // A call or a matmul may write any memory, so everything recorded is dropped.
@@ -158,10 +159,10 @@ fn find(items: []const Avail, func: *const Function, ptr: Value, want_ty: ir.typ
 
 /// Drop every availability entry whose address may alias `ptr` (a store to `ptr` may have
 /// overwritten it). Entries at provably-distinct addresses survive.
-fn invalidateAliasing(avail: *std.ArrayList(Avail), func: *const Function, ptr: Value) void {
+fn invalidateAliasing(avail: *std.ArrayList(Avail), func: *const Function, ptr: Value, stored_ty: ir.types.Type) void {
     var i: usize = 0;
     while (i < avail.items.len) {
-        if (mayAlias(func, avail.items[i].ptr, ptr)) {
+        if (mayAlias(func, avail.items[i].ptr, func.valueType(avail.items[i].value), ptr, stored_ty)) {
             _ = avail.swapRemove(i);
         } else i += 1;
     }
@@ -208,23 +209,50 @@ fn baseOf(func: *const Function, v: Value) Addr {
 }
 
 /// Whether a store to `b` may alias the address `a`. Distinct identified roots (two allocas, two
-/// globals, an alloca vs a global) never alias; everything else is assumed to alias.
-fn mayAlias(func: *const Function, a: Value, b: Value) bool {
+/// globals, an alloca vs a global) never alias. Disjoint constant-offset ranges from the same root
+/// also cannot alias; unresolved roots or access widths remain conservative.
+fn mayAlias(func: *const Function, a: Value, a_ty: ir.types.Type, b: Value, b_ty: ir.types.Type) bool {
     if (a == b) return true;
-    const ra = baseOf(func, a).root;
-    const rb = baseOf(func, b).root;
-    return switch (ra) {
-        .alloca => |ia| switch (rb) {
-            .alloca => |ib| ia == ib, // distinct allocas never alias
+    const aa = baseOf(func, a);
+    const ab = baseOf(func, b);
+    const same_root = switch (aa.root) {
+        .alloca => |ia| switch (ab.root) {
+            .alloca => |ib| ia == ib,
             .global => false,
-            .unknown => true,
+            .unknown => null,
         },
-        .global => |ga| switch (rb) {
-            .global => |gb| ga == gb, // distinct globals never alias
+        .global => |ga| switch (ab.root) {
+            .global => |gb| ga == gb,
             .alloca => false,
-            .unknown => true,
+            .unknown => null,
         },
-        .unknown => true, // an unknown base could be anything
+        .unknown => |ua| switch (ab.root) {
+            .unknown => |ub| if (ua == ub) true else null,
+            else => null,
+        },
+    };
+    if (same_root == false) return false;
+    if (same_root == null) return true;
+    const a_size = accessSize(func, a_ty) orelse return true;
+    const b_size = accessSize(func, b_ty) orelse return true;
+    const a_end = std.math.add(i64, aa.offset, @intCast(a_size)) catch return true;
+    const b_end = std.math.add(i64, ab.offset, @intCast(b_size)) catch return true;
+    return aa.offset < b_end and ab.offset < a_end;
+}
+
+/// The exact byte width of primitive memory operations. Aggregate layout and pointer width are
+/// target-dependent, so those remain unknown and conservatively alias.
+fn accessSize(func: *const Function, ty: ir.types.Type) ?u64 {
+    return switch (func.types.type_kind(ty)) {
+        .int => |int| (@as(u64, int.bits) + 7) / 8,
+        .float => |float| switch (float) {
+            .f16 => 2,
+            .f32 => 4,
+            .f64 => 8,
+            .f128 => 16,
+        },
+        .vector => |vector| std.math.mul(u64, accessSize(func, vector.elem) orelse return null, vector.len) catch null,
+        .bool, .ptr, .@"struct", .array, .slice => null,
     };
 }
 
@@ -314,6 +342,49 @@ test "a store to a possibly-aliasing pointer forces a reload" {
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     try testing.expect(!try runOnce(allocator, &func)); // second load cannot be forwarded
+}
+
+test "a non-overlapping constant-offset store preserves an available load" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try i32Ty(&func);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const base = try func.appendBlockParam(b, ptr_t);
+    const value = try func.appendBlockParam(b, t);
+    const field12 = try func.appendArithImm(b, ptr_t, .add, base, 12);
+    const first = try func.appendInst(b, t, .{ .load = .{ .ptr = field12 } });
+    try func.appendStore(b, value, base);
+    const second = try func.appendInst(b, t, .{ .load = .{ .ptr = field12 } });
+    const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = first, .rhs = second } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    const add = func.opcode(func.definingInst(sum).?).arith;
+    try testing.expectEqual(first, add.rhs);
+}
+
+test "an overlapping constant-offset store invalidates an available load" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try i32Ty(&func);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const base = try func.appendBlockParam(b, ptr_t);
+    const value = try func.appendBlockParam(b, t);
+    const field12 = try func.appendArithImm(b, ptr_t, .add, base, 12);
+    const overlap = try func.appendArithImm(b, ptr_t, .add, base, 14);
+    const first = try func.appendInst(b, t, .{ .load = .{ .ptr = field12 } });
+    try func.appendStore(b, value, overlap);
+    const second = try func.appendInst(b, t, .{ .load = .{ .ptr = field12 } });
+    const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = first, .rhs = second } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    try testing.expect(!try runOnce(allocator, &func));
+    const add = func.opcode(func.definingInst(sum).?).arith;
+    try testing.expectEqual(second, add.rhs);
 }
 
 // SM6 Task 2 (vcc struct copy) surfaced this: a struct's whole-blob copy stores/loads a WIDE
