@@ -54,7 +54,9 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     if (!ld.@"volatile" and ld.mask == null and !func.isByteOrderTagged(inst)) {
                         const result = func.instResult(inst).?;
                         if (find(avail.items, func, ld.ptr, func.valueType(result))) |v| {
-                            func.replaceAllUses(result, v);
+                            // This pass never reattaches instructions orphaned by an earlier
+                            // transform, so avoid scanning that historical instruction storage.
+                            func.replaceAllLiveUses(result, v);
                             block_changed = true;
                             continue; // drop the now-redundant load
                         }
