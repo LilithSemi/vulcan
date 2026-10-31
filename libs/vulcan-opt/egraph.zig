@@ -105,7 +105,7 @@ const Graph = struct {
         var node = raw;
         node.lhs = self.find(node.lhs);
         node.rhs = self.find(node.rhs);
-        if (node.lhs > node.rhs) std.mem.swap(u32, &node.lhs, &node.rhs);
+        if (isCommutative(node.op) and node.lhs > node.rhs) std.mem.swap(u32, &node.lhs, &node.rhs);
         const key = opKey(node);
         if (self.ops.get(key)) |index| {
             const entry = &self.nodes.items[index];
@@ -162,8 +162,12 @@ fn canonical(graph: *Graph, op: OpNode) OpNode {
     var result = op;
     result.lhs = graph.find(result.lhs);
     result.rhs = graph.find(result.rhs);
-    if (result.lhs > result.rhs) std.mem.swap(u32, &result.lhs, &result.rhs);
+    if (isCommutative(result.op) and result.lhs > result.rhs) std.mem.swap(u32, &result.lhs, &result.rhs);
     return result;
+}
+
+fn isCommutative(op: BinOp) bool {
+    return op == .add or op == .mul;
 }
 
 fn isInteger(func: *const Function, value: Value) bool {
@@ -177,7 +181,7 @@ fn isInteger(func: *const Function, value: Value) bool {
 fn hasFactorCandidate(func: *const Function, block: Block) bool {
     for (func.blockInsts(block)) |inst| {
         const sum = switch (func.opcode(inst)) {
-            .arith => |arith| if (arith.op == .add) arith else continue,
+            .arith => |arith| if (arith.op == .add or arith.op == .sub) arith else continue,
             else => continue,
         };
         const lhs_inst = func.definingInst(sum.lhs) orelse continue;
@@ -219,7 +223,7 @@ fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u
                 continue;
             },
         };
-        if (arith.op != .add and arith.op != .mul) {
+        if (arith.op != .add and arith.op != .sub and arith.op != .mul) {
             _ = try classForValue(graph, classes, costs, result);
             continue;
         }
@@ -250,7 +254,7 @@ fn matchingOps(graph: *Graph, class: u32, op: BinOp, ty: Type, output: *std.Arra
     }
 }
 
-fn factorPair(graph: *Graph, sum_class: u32, left: OpNode, right: OpNode) !bool {
+fn factorPair(graph: *Graph, sum_class: u32, sum_op: BinOp, left: OpNode, right: OpNode) !bool {
     var common: ?u32 = null;
     var lhs_other: u32 = undefined;
     var rhs_other: u32 = undefined;
@@ -272,7 +276,7 @@ fn factorPair(graph: *Graph, sum_class: u32, left: OpNode, right: OpNode) !bool 
         rhs_other = right.lhs;
     }
     const shared = common orelse return false;
-    const inner = try graph.addOp(.{ .op = .add, .lhs = lhs_other, .rhs = rhs_other, .ty = left.ty, .existing = null }) orelse return false;
+    const inner = try graph.addOp(.{ .op = sum_op, .lhs = lhs_other, .rhs = rhs_other, .ty = left.ty, .existing = null }) orelse return false;
     const product = try graph.addOp(.{ .op = .mul, .lhs = shared, .rhs = inner, .ty = left.ty, .existing = null }) orelse return false;
     return graph.merge(sum_class, product);
 }
@@ -284,7 +288,7 @@ fn saturate(graph: *Graph) !void {
         const count = graph.nodes.items.len;
         for (graph.nodes.items[0..count]) |entry| {
             const sum = switch (entry.node) {
-                .op => |op| if (op.op == .add) canonical(graph, op) else continue,
+                .op => |op| if (op.op == .add or op.op == .sub) canonical(graph, op) else continue,
                 .leaf => continue,
             };
             var left: std.ArrayList(OpNode) = .empty;
@@ -294,7 +298,7 @@ fn saturate(graph: *Graph) !void {
             try matchingOps(graph, sum.lhs, .mul, sum.ty, &left);
             try matchingOps(graph, sum.rhs, .mul, sum.ty, &right);
             for (left.items) |a| for (right.items) |b| {
-                changed = try factorPair(graph, entry.class, a, b) or changed;
+                changed = try factorPair(graph, entry.class, sum.op, a, b) or changed;
                 if (graph.hit_limit) break;
             };
             if (graph.hit_limit) break;
@@ -359,8 +363,8 @@ fn materialize(graph: *Graph, extraction: *const Extraction, func: *Function, bl
             const rhs = try materialize(graph, extraction, func, block, op.rhs, memo);
             if (op.existing) |existing| {
                 const existing_op = func.opcode(func.definingInst(existing).?).arith;
-                if ((existing_op.lhs == lhs and existing_op.rhs == rhs) or
-                    (existing_op.lhs == rhs and existing_op.rhs == lhs)) break :blk existing;
+                if (existing_op.lhs == lhs and existing_op.rhs == rhs) break :blk existing;
+                if (isCommutative(op.op) and existing_op.lhs == rhs and existing_op.rhs == lhs) break :blk existing;
             }
             break :blk try func.appendInst(block, op.ty, .{ .arith = .{ .op = op.op, .lhs = lhs, .rhs = rhs } });
         },
@@ -469,6 +473,34 @@ test "egraph factors a shared multiplier from a returned expression" {
     const inner_value = if (product.lhs == a) product.rhs else product.lhs;
     const inner = func.opcode(func.definingInst(inner_value).?).arith;
     try std.testing.expectEqual(BinOp.add, inner.op);
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "egraph factors a shared multiplier from a subtraction" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
+    const difference = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = ab, .rhs = ac } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(difference) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const product = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.mul, product.op);
+    const inner_value = if (product.lhs == a) product.rhs else product.lhs;
+    const inner = func.opcode(func.definingInst(inner_value).?).arith;
+    try std.testing.expectEqual(BinOp.sub, inner.op);
+    try std.testing.expectEqual(b, inner.lhs);
+    try std.testing.expectEqual(c, inner.rhs);
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
     try std.testing.expect(diags.ok());
