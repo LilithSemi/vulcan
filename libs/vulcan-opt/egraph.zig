@@ -51,6 +51,7 @@ const Graph = struct {
     nodes: std.ArrayList(Entry) = .empty,
     leaves: std.AutoHashMapUnmanaged(Value, u32) = .empty,
     ops: std.AutoHashMapUnmanaged(OpKey, usize) = .empty,
+    op_nodes: std.EnumArray(BinOp, std.ArrayList(usize)) = std.EnumArray(BinOp, std.ArrayList(usize)).initFill(.empty),
     ops_valid: bool = true,
     hit_limit: bool = false,
 
@@ -59,6 +60,7 @@ const Graph = struct {
         self.nodes.deinit(self.allocator);
         self.leaves.deinit(self.allocator);
         self.ops.deinit(self.allocator);
+        inline for (std.meta.tags(BinOp)) |op| self.op_nodes.getPtr(op).deinit(self.allocator);
     }
 
     fn reset(self: *Graph) void {
@@ -66,6 +68,7 @@ const Graph = struct {
         self.nodes.clearRetainingCapacity();
         self.leaves.clearRetainingCapacity();
         self.ops.clearRetainingCapacity();
+        inline for (std.meta.tags(BinOp)) |op| self.op_nodes.getPtr(op).clearRetainingCapacity();
         self.ops_valid = true;
         self.hit_limit = false;
     }
@@ -127,7 +130,9 @@ const Graph = struct {
         }
         const class = try self.addClass();
         try self.nodes.append(self.allocator, .{ .class = class, .node = .{ .op = node } });
-        try self.ops.put(self.allocator, key, self.nodes.items.len - 1);
+        const index = self.nodes.items.len - 1;
+        try self.op_nodes.getPtr(node.op).append(self.allocator, index);
+        try self.ops.put(self.allocator, key, index);
         return class;
     }
 
@@ -358,14 +363,11 @@ fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u
 
 fn matchingOps(graph: *Graph, class: u32, op: BinOp, ty: Type, output: *std.ArrayList(OpNode)) !void {
     const root = graph.find(class);
-    for (graph.nodes.items) |entry| {
+    for (graph.op_nodes.get(op).items) |index| {
+        const entry = graph.nodes.items[index];
         if (graph.find(entry.class) != root) continue;
-        switch (entry.node) {
-            .leaf => {},
-            .op => |candidate| if (candidate.op == op and candidate.ty == ty) {
-                try output.append(graph.allocator, canonical(graph, candidate));
-            },
-        }
+        const candidate = entry.node.op;
+        if (candidate.ty == ty) try output.append(graph.allocator, canonical(graph, candidate));
     }
 }
 
