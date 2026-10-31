@@ -165,10 +165,16 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                         const ty = intType(func, c.lhs) orelse break :blk null;
                         break :blk evalCmp(c.op, lc, rc, ty);
                     },
-                    // `convert` is deliberately not folded. In this IR an int-to-int convert is a plain
-                    // register move that keeps the low bits with no width truncation, the way aarch64 isel
-                    // lowers it. A C-style `wrap` here would disagree with codegen, which the equivalence
-                    // differential caught.
+                    // Same-width integer conversion changes only the type's signed interpretation; the
+                    // emitted bits are identical. Widening and narrowing remain deliberately unfolded:
+                    // this IR lowers them as register operations whose exact behavior must stay aligned
+                    // with each backend rather than applying C-style wrapping here.
+                    .convert => |c| blk: {
+                        const source_ty = intType(func, c.value) orelse break :blk null;
+                        const result_ty = intType(func, result) orelse break :blk null;
+                        if (source_ty.bits != result_ty.bits) break :blk null;
+                        break :blk consts[@backingInt(c.value)];
+                    },
                     else => null,
                 };
                 if (folded) |value| {
@@ -221,6 +227,27 @@ test "folds an unsigned comparison to a bool constant" {
     defer analyses.deinit();
     try std.testing.expect(try run(allocator, &func, &analyses));
     try std.testing.expectEqual(@as(i64, 1), func.opcode(func.definingInst(cmp).?).iconst); // 200 > 100 unsigned
+}
+
+test "folds only same-width integer constant conversions" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const b = try func.appendBlock();
+    const minus_one = try func.appendInst(b, i32_t, .{ .iconst = -1 });
+    const same_width = try func.appendInst(b, u32_t, .{ .convert = .{ .value = minus_one } });
+    const narrowed = try func.appendInst(b, u8_t, .{ .convert = .{ .value = same_width } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(narrowed) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+    try std.testing.expectEqual(@as(i64, -1), func.opcode(func.definingInst(same_width).?).iconst);
+    try std.testing.expect(func.opcode(func.definingInst(narrowed).?) == .convert);
 }
 
 test "constant folding skips instructions removed from blocks" {
