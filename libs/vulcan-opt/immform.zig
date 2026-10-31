@@ -36,6 +36,7 @@ fn immOp(op: BinOp) ?struct { commutative: bool } {
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
+    if (!hasMemoryAddressUse(func)) return false;
 
     // Map each value defined by an `iconst` to its constant. Iterate LIVE block instructions, not the
     // pool, so a dropped instruction is not re-processed (matching the other passes).
@@ -101,6 +102,16 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     return changed;
 }
 
+fn hasMemoryAddressUse(func: *const Function) bool {
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
+            .load, .store => return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
 test "an address add of a single-use constant becomes arith_imm; a plain add is left alone" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
@@ -131,6 +142,23 @@ test "an address add of a single-use constant becomes arith_imm; a plain add is 
     try std.testing.expectEqual(base, a2.lhs);
     // The plain add is untouched (not an address base).
     try std.testing.expect(func.opcode(func.definingInst(plain).?) == .arith);
+}
+
+test "a function without memory accesses skips immediate-form analysis" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32_t);
+    const c = try func.appendInst(b, i32_t, .{ .iconst = 8 });
+    const sum = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = c } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!hasMemoryAddressUse(&func));
+    try std.testing.expect(!try run(allocator, &func, &analyses));
 }
 
 test {
