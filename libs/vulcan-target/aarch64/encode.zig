@@ -122,6 +122,18 @@ pub fn eor(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x4A000000 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
+pub fn andrShifted(rd: Reg, rn: Reg, rm: Reg, shift: u6, shift_type: ShiftType, wide: bool) u32 {
+    return (if (wide) @as(u32, 1) << 31 else 0) | andr(rd, rn, rm) | (@as(u32, @backingInt(shift_type)) << 22) | (@as(u32, shift) << 10);
+}
+
+pub fn orrShifted(rd: Reg, rn: Reg, rm: Reg, shift: u6, shift_type: ShiftType, wide: bool) u32 {
+    return (if (wide) @as(u32, 1) << 31 else 0) | orr(rd, rn, rm) | (@as(u32, @backingInt(shift_type)) << 22) | (@as(u32, shift) << 10);
+}
+
+pub fn eorShifted(rd: Reg, rn: Reg, rm: Reg, shift: u6, shift_type: ShiftType, wide: bool) u32 {
+    return (if (wide) @as(u32, 1) << 31 else 0) | eor(rd, rn, rm) | (@as(u32, @backingInt(shift_type)) << 22) | (@as(u32, shift) << 10);
+}
+
 pub fn addVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x4EA08400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
@@ -134,6 +146,21 @@ pub fn mulVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x4EA09C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
+/// Per-lane shift by signed counts. Positive counts shift left, matching scalar `shl`.
+pub fn ushlVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6EA04400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn sshlVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4EA04400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// `shl vd.4s, vn.4s, #shift`: shift every i32 lane left by an immediate count.
+pub fn shlVecI32Imm(rd: Reg, rn: Reg, shift: u5) u32 {
+    const imm7 = @as(u32, 32) + shift;
+    return 0x4F005400 | (imm7 << 16) | (n(rn) << 5) | n(rd);
+}
+
 pub fn andVec(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x4E201C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
@@ -144,6 +171,12 @@ pub fn orrVec(rd: Reg, rn: Reg, rm: Reg) u32 {
 
 pub fn eorVec(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x6E201C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// `ext Vd.16B, Vn.16B, Vm.16B, #index`: concatenate `Vn:Vm` and select sixteen bytes starting
+/// at `index`. The horizontal XOR reduction uses offsets 8 and 4 to fold four i32 lanes in half.
+pub fn extVec(rd: Reg, rn: Reg, rm: Reg, index: u4) u32 {
+    return 0x6E000000 | (n(rm) << 16) | (@as(u32, index) << 11) | (n(rn) << 5) | n(rd);
 }
 
 const LogicalImmediate = struct { n: u1, immr: u6, imms: u6 };
@@ -628,9 +661,32 @@ pub fn asrv(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x1AC02800 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
+pub fn lslImm(rd: Reg, rn: Reg, shift: u6, wide: bool) u32 {
+    const mask: u32 = if (wide) 63 else 31;
+    const amount: u32 = shift;
+    const immr = (mask + 1 - amount) & mask;
+    const imms = mask - amount;
+    const base: u32 = if (wide) 0xD3400000 else 0x53000000;
+    return base | (immr << 16) | (imms << 10) | (n(rn) << 5) | n(rd);
+}
+
+pub fn lsrImm(rd: Reg, rn: Reg, shift: u6, wide: bool) u32 {
+    const imms: u32 = if (wide) 63 else 31;
+    const base: u32 = if (wide) 0xD3400000 else 0x53000000;
+    return base | (@as(u32, shift) << 16) | (imms << 10) | (n(rn) << 5) | n(rd);
+}
+
+pub fn asrImm(rd: Reg, rn: Reg, shift: u6, wide: bool) u32 {
+    const imms: u32 = if (wide) 63 else 31;
+    const base: u32 = if (wide) 0x93400000 else 0x13000000;
+    return base | (@as(u32, shift) << 16) | (imms << 10) | (n(rn) << 5) | n(rd);
+}
+
 // 64-bit (x-register) data processing. The `sf` bit (bit 31) widens the operation
 // to 64 bits. These are needed for pointer/address arithmetic, which is 64-bit.
 const sf64: u32 = 1 << 31;
+
+pub const ShiftType = enum(u2) { lsl, lsr, asr, ror };
 
 /// `add xd, xn, xm` (64-bit register add).
 pub fn add64(rd: Reg, rn: Reg, rm: Reg) u32 {
@@ -645,7 +701,11 @@ pub fn sub64(rd: Reg, rn: Reg, rm: Reg) u32 {
 /// `add wd, wn, wm, lsl #shift` (32-bit register add with a logical-left shift on the second
 /// operand, shift in 0..63). imm6 sits at bits [15:10].
 pub fn addShifted(rd: Reg, rn: Reg, rm: Reg, shift: u6) u32 {
-    return add(rd, rn, rm) | (@as(u32, shift) << 10);
+    return addShiftedType(rd, rn, rm, shift, .lsl);
+}
+
+pub fn addShiftedType(rd: Reg, rn: Reg, rm: Reg, shift: u6, shift_type: ShiftType) u32 {
+    return add(rd, rn, rm) | (@as(u32, @backingInt(shift_type)) << 22) | (@as(u32, shift) << 10);
 }
 
 /// `add xd, xn, xm, lsl #shift` (64-bit).
@@ -653,14 +713,26 @@ pub fn addShifted64(rd: Reg, rn: Reg, rm: Reg, shift: u6) u32 {
     return sf64 | addShifted(rd, rn, rm, shift);
 }
 
+pub fn addShiftedType64(rd: Reg, rn: Reg, rm: Reg, shift: u6, shift_type: ShiftType) u32 {
+    return sf64 | addShiftedType(rd, rn, rm, shift, shift_type);
+}
+
 /// `sub wd, wn, wm, lsl #shift` (32-bit).
 pub fn subShifted(rd: Reg, rn: Reg, rm: Reg, shift: u6) u32 {
-    return sub(rd, rn, rm) | (@as(u32, shift) << 10);
+    return subShiftedType(rd, rn, rm, shift, .lsl);
+}
+
+pub fn subShiftedType(rd: Reg, rn: Reg, rm: Reg, shift: u6, shift_type: ShiftType) u32 {
+    return sub(rd, rn, rm) | (@as(u32, @backingInt(shift_type)) << 22) | (@as(u32, shift) << 10);
 }
 
 /// `sub xd, xn, xm, lsl #shift` (64-bit).
 pub fn subShifted64(rd: Reg, rn: Reg, rm: Reg, shift: u6) u32 {
     return sf64 | subShifted(rd, rn, rm, shift);
+}
+
+pub fn subShiftedType64(rd: Reg, rn: Reg, rm: Reg, shift: u6, shift_type: ShiftType) u32 {
+    return sf64 | subShiftedType(rd, rn, rm, shift, shift_type);
 }
 
 /// `mul xd, xn, xm` (64-bit), i.e. `madd xd, xn, xm, xzr`.
@@ -1103,6 +1175,12 @@ test "sbfm / ubfm encoding (sign/zero-extend a narrower value)" {
     try std.testing.expectEqual(@as(u32, 0x93401d28), sbfm(.x8, .x9, 0, 7)); // sxtb
 }
 
+test "immediate shift encoding" {
+    try std.testing.expectEqual(@as(u32, 0x531a642a), lslImm(.x10, .x1, 6, false));
+    try std.testing.expectEqual(@as(u32, 0xd360fd6c), lsrImm(.x12, .x11, 32, true));
+    try std.testing.expectEqual(@as(u32, 0x13037c20), asrImm(.x0, .x1, 3, false));
+}
+
 test "nop encoding" {
     try std.testing.expectEqual(@as(u32, 0xD503201F), nop());
 }
@@ -1138,6 +1216,7 @@ test "NEON vector op encodings" {
     try std.testing.expectEqual(@as(u32, 0x6EA2E420), fcmgtVec(.x0, .x1, .x2)); // fcmgt v0.4s,v1.4s,v2.4s
     try std.testing.expectEqual(@as(u32, 0x6E22E420), fcmgeVec(.x0, .x1, .x2)); // fcmge v0.4s,v1.4s,v2.4s
     try std.testing.expectEqual(@as(u32, 0x6E621C20), bslVec(.x0, .x1, .x2)); // bsl v0.16b,v1.16b,v2.16b
+    try std.testing.expectEqual(@as(u32, 0x6E024020), extVec(.x0, .x1, .x2, 8)); // ext v0.16b,v1.16b,v2.16b,#8
     try std.testing.expectEqual(@as(u32, 0x4E040C20), dupFromGpr(.x0, .x1)); // dup v0.4s, w1
     try std.testing.expectEqual(@as(u32, 0x4E140420), dupVecLane(.x0, .x1, 2)); // dup v0.4s, v1.s[2]
     try std.testing.expectEqual(@as(u32, 0x6E205820), mvnVec(.x0, .x1)); // mvn v0.16b, v1.16b
@@ -1267,6 +1346,15 @@ test "aarch64 shifted-register add/sub encoders match the disassembler" {
     defer a.free(s2);
     try std.testing.expectEqualStrings("sub x5, x6, x7, lsl #1", s2);
 
+    try std.testing.expectEqual(@as(u32, 0x0B4B0D6B), addShiftedType(.x11, .x11, .x11, 3, .lsr));
+    const right = try disasm.one(a, addShiftedType(.x11, .x11, .x11, 3, .lsr));
+    defer a.free(right);
+    try std.testing.expectEqualStrings("add w11, w11, w11, lsr #3", right);
+
+    const logical = try disasm.one(a, eorShifted(.x14, .x14, .x14, 7, .lsl, false));
+    defer a.free(logical);
+    try std.testing.expectEqualStrings("eor w14, w14, w14, lsl #7", logical);
+
     // A shift of 0 has no lsl suffix, it just reads as the plain 32-bit register form.
     const s3 = try disasm.one(a, addShifted(.x0, .x1, .x2, 0));
     defer a.free(s3);
@@ -1375,9 +1463,12 @@ test "integer vector arithmetic encoders match the disassembler" {
         .{ addVecI32(.x0, .x1, .x2), "add v0.4s, v1.4s, v2.4s" },
         .{ subVecI32(.x3, .x4, .x5), "sub v3.4s, v4.4s, v5.4s" },
         .{ mulVecI32(.x6, .x7, .x8), "mul v6.4s, v7.4s, v8.4s" },
-        .{ andVec(.x9, .x10, .x11), "and v9.16b, v10.16b, v11.16b" },
-        .{ orrVec(.x12, .x13, .x14), "orr v12.16b, v13.16b, v14.16b" },
-        .{ eorVec(.x15, .x16, .x17), "eor v15.16b, v16.16b, v17.16b" },
+        .{ ushlVecI32(.x9, .x10, .x11), "ushl v9.4s, v10.4s, v11.4s" },
+        .{ sshlVecI32(.x12, .x13, .x14), "sshl v12.4s, v13.4s, v14.4s" },
+        .{ shlVecI32Imm(.x3, .x1, 1), "shl v3.4s, v1.4s, #1" },
+        .{ andVec(.x15, .x16, .x17), "and v15.16b, v16.16b, v17.16b" },
+        .{ orrVec(.x18, .x19, .x20), "orr v18.16b, v19.16b, v20.16b" },
+        .{ eorVec(.x21, .x22, .x23), "eor v21.16b, v22.16b, v23.16b" },
     };
     inline for (cases) |case| {
         const text = try disasm.one(a, case[0]);

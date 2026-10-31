@@ -262,9 +262,8 @@ fn condName(v: u4) []const u8 {
 /// the w and x forms.
 const rrr_mask: u32 = 0x7FE0FC00;
 
-/// `rrr_mask` with the imm6 shift-amount field (bits[15:10]) dropped, for the add/sub
-/// shifted-register form where that field is a real operand and not part of the opcode.
-const rrr_no_imm6_mask: u32 = rrr_mask & ~@as(u32, 0xFC00);
+/// `rrr_mask` with the shift kind and amount dropped for add/sub shifted-register forms.
+const rrr_shifted_mask: u32 = rrr_mask & ~@as(u32, 0x00C0FC00);
 
 const RRR = struct { match: u32, mnem: []const u8 };
 
@@ -322,19 +321,42 @@ fn decode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32, ctx: ?Context) 
         }
     }
 
-    // add/sub, shifted-register form with a nonzero LSL shift amount (imm6 at bits[15:10]).
-    // The shift-0 case is already handled by rrr_table above, so this covers the same add/sub
-    // opcodes but with the imm6 field dropped from the match mask, and prints the ", lsl #N"
-    // suffix the encoder's `addShifted`/`subShifted` family produces.
-    if (w & rrr_no_imm6_mask == 0x0B000000 or w & rrr_no_imm6_mask == 0x4B000000) {
-        const is_sub = w & rrr_no_imm6_mask == 0x4B000000;
+    // add/sub shifted-register form. Shift 0 with LSL is already handled above.
+    if (w & rrr_shifted_mask == 0x0B000000 or w & rrr_shifted_mask == 0x4B000000) {
+        const is_sub = w & rrr_shifted_mask == 0x4B000000;
+        const shift_name: []const u8 = switch ((w >> 22) & 0x3) {
+            0 => "lsl",
+            1 => "lsr",
+            2 => "asr",
+            else => "ror",
+        };
         try buf.print(a, "{s} ", .{if (is_sub) "sub" else "add"});
         try gp(buf, a, sf(w), rd(w));
         try buf.appendSlice(a, ", ");
         try gp(buf, a, sf(w), rn(w));
         try buf.appendSlice(a, ", ");
         try gp(buf, a, sf(w), rm(w));
-        try buf.print(a, ", lsl #{d}", .{(w >> 10) & 0x3F});
+        try buf.print(a, ", {s} #{d}", .{ shift_name, (w >> 10) & 0x3F });
+        return;
+    }
+
+    // and/orr/eor shifted-register forms use the same shift fields as add/sub.
+    const logical_match = w & rrr_shifted_mask;
+    if (logical_match == 0x0A000000 or logical_match == 0x2A000000 or logical_match == 0x4A000000) {
+        const mnem: []const u8 = if (logical_match == 0x0A000000) "and" else if (logical_match == 0x2A000000) "orr" else "eor";
+        const shift_name: []const u8 = switch ((w >> 22) & 0x3) {
+            0 => "lsl",
+            1 => "lsr",
+            2 => "asr",
+            else => "ror",
+        };
+        try buf.print(a, "{s} ", .{mnem});
+        try gp(buf, a, sf(w), rd(w));
+        try buf.appendSlice(a, ", ");
+        try gp(buf, a, sf(w), rn(w));
+        try buf.appendSlice(a, ", ");
+        try gp(buf, a, sf(w), rm(w));
+        try buf.print(a, ", {s} #{d}", .{ shift_name, (w >> 10) & 0x3F });
         return;
     }
 
@@ -913,10 +935,19 @@ fn fpDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
 
 /// NEON (128-bit vector) instructions. Returns whether it matched.
 fn vecDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
+    if (w & 0xFFE08400 == 0x6E000000) {
+        try buf.print(a, "ext v{d}.16b, v{d}.16b, v{d}.16b, #{d}", .{ rd(w), rn(w), rm(w), (w >> 11) & 0xF });
+        return true;
+    }
     // mov vd.16b, vn.16b is the orr alias with identical inputs. Check it before the general
     // three-register ORR decoder so canonical disassembly keeps the alias.
     if (w & 0xFFE0FC00 == 0x4EA01C00 and rm(w) == rn(w)) {
         try buf.print(a, "mov v{d}.16b, v{d}.16b", .{ rd(w), rn(w) });
+        return true;
+    }
+    if (w & 0xFF80FC00 == 0x4F005400) {
+        const shift = ((w >> 16) & 0x7F) - 32;
+        try buf.print(a, "shl v{d}.4s, v{d}.4s, #{d}", .{ rd(w), rn(w), shift });
         return true;
     }
     // Three-register 4S / 16B forms.
@@ -925,6 +956,8 @@ fn vecDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
         .{ .match = 0x4EA08400, .mnem = "add", .b16 = false },
         .{ .match = 0x6EA08400, .mnem = "sub", .b16 = false },
         .{ .match = 0x4EA09C00, .mnem = "mul", .b16 = false },
+        .{ .match = 0x6EA04400, .mnem = "ushl", .b16 = false },
+        .{ .match = 0x4EA04400, .mnem = "sshl", .b16 = false },
         .{ .match = 0x4E201C00, .mnem = "and", .b16 = true },
         .{ .match = 0x4EA01C00, .mnem = "orr", .b16 = true },
         .{ .match = 0x6E201C00, .mnem = "eor", .b16 = true },
