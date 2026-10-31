@@ -154,6 +154,11 @@ pub fn mulVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x4EA09C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
+/// `mla Vd.4S, Vn.4S, Vm.4S`: Vd = Vd + Vn * Vm.
+pub fn mlaVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4EA09400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
 /// Per-lane shift by signed counts. Positive counts shift left, matching scalar `shl`.
 pub fn ushlVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x6EA04400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
@@ -1477,10 +1482,12 @@ test "integer multiply-add encoders match the disassembler" {
 test "integer vector arithmetic encoders match the disassembler" {
     const disasm = @import("disasm.zig");
     const a = std.testing.allocator;
+    try std.testing.expectEqual(@as(u32, 0x4EA697E2), mlaVecI32(.x2, .zr, .x6));
     const cases = .{
         .{ addVecI32(.x0, .x1, .x2), "add v0.4s, v1.4s, v2.4s" },
         .{ subVecI32(.x3, .x4, .x5), "sub v3.4s, v4.4s, v5.4s" },
         .{ mulVecI32(.x6, .x7, .x8), "mul v6.4s, v7.4s, v8.4s" },
+        .{ mlaVecI32(.x2, .zr, .x6), "mla v2.4s, v31.4s, v6.4s" },
         .{ ushlVecI32(.x9, .x10, .x11), "ushl v9.4s, v10.4s, v11.4s" },
         .{ sshlVecI32(.x12, .x13, .x14), "sshl v12.4s, v13.4s, v14.4s" },
         .{ shlVecI32Imm(.x3, .x1, 1), "shl v3.4s, v1.4s, #1" },

@@ -967,6 +967,7 @@ fn vecDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
         .{ .match = 0x4EA08400, .mnem = "add", .b16 = false },
         .{ .match = 0x6EA08400, .mnem = "sub", .b16 = false },
         .{ .match = 0x4EA09C00, .mnem = "mul", .b16 = false },
+        .{ .match = 0x4EA09400, .mnem = "mla", .b16 = false },
         .{ .match = 0x6EA04400, .mnem = "ushl", .b16 = false },
         .{ .match = 0x4EA04400, .mnem = "sshl", .b16 = false },
         .{ .match = 0x4E201C00, .mnem = "and", .b16 = true },

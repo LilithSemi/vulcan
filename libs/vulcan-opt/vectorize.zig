@@ -144,6 +144,15 @@ fn interleaveLane(func: *const Function, inst: Inst) ?u2 {
     return null;
 }
 
+fn tagInterleaveResult(func: *Function, value: Value, lane: u2) Error!void {
+    const inst = func.definingInst(value) orelse return;
+    try func.addAttr(.{ .inst = inst }, .{ .custom = .{
+        .namespace = "vulcan.aarch64",
+        .key = "interleave4_result",
+        .value = .{ .int = lane },
+    } });
+}
+
 /// Put the four backend-private structure loads and stores next to one another. The AArch64
 /// selector deliberately accepts only complete adjacent groups, so malformed or partial groups are
 /// left unchanged and rejected rather than silently acquiring ordinary wide-load semantics.
@@ -176,6 +185,16 @@ fn groupInterleavedMemory(allocator: std.mem.Allocator, func: *Function, block: 
     }
     if (load_count == 0 and store_count == 0) return false;
     if (load_count != 4 or store_count != 4) return false;
+
+    // These store vectors are defined and consumed inside this vectorized block, so they may live
+    // directly in the corresponding v28-v31 structure registers. Besides removing store-side
+    // moves, this lets isel turn an immediately preceding integer vector mul+add into one MLA.
+    // Interleaved reduction plans are rejected by loopvec, so none of these values escape on an
+    // edge as a carried accumulator.
+    for (stores, 0..) |member, lane| {
+        const value = func.opcode(member.?).store.value;
+        try tagInterleaveResult(func, value, @intCast(lane));
+    }
 
     const old = func.blockInsts(block);
     var rebuilt: std.ArrayList(Inst) = .empty;

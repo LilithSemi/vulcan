@@ -674,6 +674,18 @@ fn interleaveScratch(lane: u2) Reg {
     return @fromBackingInt(@backingInt(fp_interleave_base) + @as(u5, lane));
 }
 
+fn interleaveResultLane(func: *const Function, value: Value) ?u2 {
+    const inst = func.definingInst(value) orelse return null;
+    var it = func.attributesOf(.{ .inst = inst });
+    while (it.next()) |attr| switch (attr) {
+        .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.aarch64") and std.mem.eql(u8, c.key, "interleave4_result")) {
+            if (c.value == .int and c.value.int >= 0 and c.value.int < 4) return @intCast(c.value.int);
+        },
+        else => {},
+    };
+    return null;
+}
+
 fn validInterleaveRun(func: *const Function, insts: []const ir.function.Inst, index: usize, load: bool) bool {
     const lane = interleaveLane(func, insts[index]) orelse return false;
     if (index < lane) return false;
@@ -1914,7 +1926,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         var consecutive = true;
                         for (insts[inst_idx .. inst_idx + 4], 0..) |member, member_lane| {
                             const value = func.opcode(member).store.value;
-                            direct[member_lane] = switch (ctx.locationAt(value)) {
+                            direct[member_lane] = if (interleaveResultLane(func, value)) |result_lane|
+                                interleaveScratch(result_lane)
+                            else switch (ctx.locationAt(value)) {
                                 .reg => |reg| reg,
                                 .slot => blk: {
                                     consecutive = false;
@@ -2403,6 +2417,7 @@ const Ctx = struct {
     /// The register holding `v` at the current position: its assigned register, or reload a
     /// spilled value into `scratch` (a register of `v`'s class). A SIMD vector reloads all 128 bits.
     fn loadOp(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), v: Value, scratch: Reg) Error!Reg {
+        if (interleaveResultLane(self.func, v)) |lane| return interleaveScratch(lane);
         if (self.func.definingInst(v)) |inst| if (interleaveLane(self.func, inst)) |lane| {
             if (self.func.opcode(inst) == .load) return interleaveScratch(lane);
         };
@@ -2427,6 +2442,7 @@ const Ctx = struct {
     /// `storeResult`). At a def position a split value's first segment is always `.reg`, so `.slot`
     /// here means a wholly-spilled value, identical to today's behavior.
     fn resultReg(self: Ctx, result: Value) Reg {
+        if (interleaveResultLane(self.func, result)) |lane| return interleaveScratch(lane);
         return switch (self.locationAt(result)) {
             .reg => |r| r,
             .slot => if (regClass(self.func, result) == .fpr) fp_spill_res else spill_res,
@@ -2558,6 +2574,12 @@ const Ctx = struct {
         const c = try self.loadOp(allocator, code, ra_val, fp_spill_res);
         const rd = self.resultReg(result);
         if (isVector(self.func, result)) {
+            if (laneKind(self.func, result) == .i32) {
+                std.debug.assert(op == .add and @backingInt(rd) == @backingInt(c));
+                try code.append(allocator, encode.mlaVecI32(rd, a, b));
+                try storeResult(allocator, code, self, result, rd);
+                return;
+            }
             // `op == .sub` here only ever means `sub(c, mul)` (`fusesIntoNextArith` rejects
             // `sub(mul, c)` for a vector), so fmls's `Vd - Vn*Vm` is always the right shape.
             try code.append(allocator, encode.movVec(fp_move, c));
@@ -4368,15 +4390,16 @@ fn isFloatVector(func: *const Function, v: Value) bool {
     };
 }
 
-/// Whether the float `mul` at `insts[idx]` fuses into an immediately-following `add`/`sub`
-/// that consumes its result as a fused multiply-add/subtract (one rounding instead of
-/// two, legal because Vulcan permits fp-contraction). When it fuses, the mul's
+/// Whether the `mul` at `insts[idx]` fuses into an immediately-following `add`/`sub`
+/// that consumes its result as a fused multiply-add/subtract. Float contraction is legal because
+/// Vulcan permits it; integer-vector contraction is restricted to the backend-private
+/// interleaved-record accumulator shape. When it fuses, the mul's
 /// materialization is skipped and the add/sub emits fmadd/fmsub/fnmsub (scalar) or
 /// fmla/fmls (vector) on the mul's own operands (see `Ctx.emitFusedArith`). This is the ONE
 /// eligibility predicate shared by the mul-skip and the fused add/sub emission, so they
 /// never disagree (no dangling or doubled multiply). It mirrors `fusesIntoNextIf`. Gated to
-/// float operands (scalar or vector): integer `add(mul,c)` has no rounding to fuse away and
-/// is never an fma. For a vector mul, only the two shapes a single NEON instruction can
+/// float operands (scalar or vector), plus tagged integer vectors that select MLA. For a float
+/// vector mul, only the two shapes a single NEON instruction can
 /// express are allowed: `add(mul,c)` = a*b+c -> FMLA, and `sub(c,mul)` = c-a*b -> FMLS.
 /// `sub(mul,c)` = a*b-c has no matching NEON op (FMLA/FMLS only ever add or subtract the
 /// product, never negate the whole result), so that shape is rejected here and falls
@@ -4392,10 +4415,11 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     };
     if (mul.op != .mul) return false;
     const vector = isVector(func, mul.lhs);
+    const integer_vector = vector and !isFloatVector(func, mul.lhs);
     // Float operands only: regClass != .fpr means an integer scalar mul (no rounding to
     // fuse away). A vector mul must have a float element (see `isFloatVector`).
     if (vector) {
-        if (!isFloatVector(func, mul.lhs)) return false;
+        if (integer_vector and laneKind(func, mul.lhs) != .i32) return false;
     } else if (regClass(func, mul.lhs) != .fpr) {
         return false;
     } else if (isHalf(func, mul.lhs)) {
@@ -4414,6 +4438,15 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     if (addsub.op != .add and addsub.op != .sub) return false;
     const result = func.instResult(insts[idx]) orelse return false;
     if (addsub.lhs != result and addsub.rhs != result) return false; // must consume this mul's result
+    if (integer_vector) {
+        if (addsub.op != .add) return false;
+        const add_result = func.instResult(insts[idx + 1]) orelse return false;
+        const lane = interleaveResultLane(func, add_result) orelse return false;
+        const accumulator = if (addsub.lhs == result) addsub.rhs else addsub.lhs;
+        const accumulator_inst = func.definingInst(accumulator) orelse return false;
+        if (func.opcode(accumulator_inst) != .load or interleaveLane(func, accumulator_inst) != lane)
+            return false;
+    }
     // Vector sub(mul, c) = a*b-c has no single-instruction NEON form: reject it here so
     // both call sites (the mul-skip and the fused emit) agree and fall back to fmul+fsub.
     if (vector and addsub.op == .sub and addsub.lhs == result) return false;
@@ -5689,6 +5722,57 @@ test "tagged four-way vector memory groups lower to one ld4 and st4" {
     }
     try std.testing.expectEqual(@as(usize, 1), loads);
     try std.testing.expectEqual(@as(usize, 1), stores);
+}
+
+test "interleaved store results fuse integer vector multiply-adds" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const ptr_t = try func.types.ptrGlobal();
+    const block = try func.appendBlock();
+    const ptr = try func.appendBlockParam(block, ptr_t);
+    const multiplier = try func.appendBlockParam(block, vec_t);
+    var fields: [4]Value = undefined;
+    for (&fields, 0..) |*field, lane| {
+        field.* = try func.appendInst(block, vec_t, .{ .load = .{ .ptr = ptr } });
+        try func.addAttr(.{ .inst = func.definingInst(field.*).? }, .{ .custom = .{
+            .namespace = "vulcan.aarch64",
+            .key = "interleave4",
+            .value = .{ .int = @intCast(lane) },
+        } });
+    }
+    var results: [4]Value = undefined;
+    for (&results, fields, 0..) |*result, field, lane| {
+        const product = try func.appendInst(block, vec_t, .{ .arith = .{ .op = .mul, .lhs = field, .rhs = multiplier } });
+        result.* = try func.appendInst(block, vec_t, .{ .arith = .{ .op = .add, .lhs = field, .rhs = product } });
+        try func.addAttr(.{ .inst = func.definingInst(result.*).? }, .{ .custom = .{
+            .namespace = "vulcan.aarch64",
+            .key = "interleave4_result",
+            .value = .{ .int = @intCast(lane) },
+        } });
+    }
+    for (results, 0..) |result, lane| {
+        const store = try func.appendStmtRaw(block, .{ .store = .{ .value = result, .ptr = ptr } });
+        try func.addAttr(.{ .inst = store }, .{ .custom = .{
+            .namespace = "vulcan.aarch64",
+            .key = "interleave4",
+            .value = .{ .int = @intCast(lane) },
+        } });
+    }
+    func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var multiply_adds: usize = 0;
+    var multiplies: usize = 0;
+    for (code) |word| {
+        if (word & 0xFFE0FC00 == 0x4EA09400) multiply_adds += 1;
+        if (word & 0xFFE0FC00 == 0x4EA09C00) multiplies += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), multiply_adds);
+    try std.testing.expectEqual(@as(usize, 0), multiplies);
 }
 
 test "via_got global_addr lowers to adrp+ldr with got_pg/got_lo12 relocs (GOT-indirect)" {

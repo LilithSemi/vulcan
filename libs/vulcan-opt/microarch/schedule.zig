@@ -179,12 +179,46 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
     }
     for (0..func.blockCount()) |bi| try scheduleBlock(allocator, func, @fromBackingInt(@intCast(bi)), model);
 
-    if (model.fuses(.shift_add)) {
+    if (model.fuses(.shift_add) or model.arch == .aarch64) {
         const uses = try allocator.alloc(u32, func.valueCount());
         defer allocator.free(uses);
         dce.countUses(func, uses);
         for (0..func.blockCount()) |bi| {
-            restoreShiftAddPairs(func, @fromBackingInt(@intCast(bi)), model, uses);
+            const block: Block = @fromBackingInt(@intCast(bi));
+            if (model.fuses(.shift_add)) restoreShiftAddPairs(func, block, model, uses);
+            if (model.arch == .aarch64) restoreVectorMultiplyAddPairs(func, block, uses);
+        }
+    }
+}
+
+/// The resource scheduler separates independent multiplies to cover their latency. AArch64's
+/// vector MLA/FMLA selection instead needs each single-use product adjacent to its add, so restore
+/// those pairs after scoreboarding. Moving a pure producer later preserves every dependency and
+/// reduces two instructions to one in isel.
+fn restoreVectorMultiplyAddPairs(func: *Function, block: Block, uses: []const u32) void {
+    const insts = func.blockInstsMut(block).items;
+    var consumer_index: usize = 1;
+    while (consumer_index < insts.len) : (consumer_index += 1) {
+        const consumer = switch (func.opcode(insts[consumer_index])) {
+            .arith => |arith| arith,
+            else => continue,
+        };
+        if (consumer.op != .add and consumer.op != .sub) continue;
+        const result = func.instResult(insts[consumer_index]) orelse continue;
+        if (func.types.type_kind(func.valueType(result)) != .vector) continue;
+
+        for ([_]Value{ consumer.lhs, consumer.rhs }) |product| {
+            if (uses[@backingInt(product)] != 1) continue;
+            const producer = func.definingInst(product) orelse continue;
+            const multiply = switch (func.opcode(producer)) {
+                .arith => |arith| arith,
+                else => continue,
+            };
+            if (multiply.op != .mul) continue;
+            const producer_index = std.mem.indexOfScalar(Inst, insts[0..consumer_index], producer) orelse continue;
+            if (producer_index + 1 == consumer_index) break;
+            std.mem.rotate(Inst, insts[producer_index..consumer_index], 1);
+            break;
         }
     }
 }
