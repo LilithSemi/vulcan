@@ -51,6 +51,7 @@ const Graph = struct {
     parents: std.ArrayList(u32) = .empty,
     class_heads: std.ArrayList(?usize) = .empty,
     class_tails: std.ArrayList(?usize) = .empty,
+    class_ops: std.ArrayList(u16) = .empty,
     nodes: std.ArrayList(Entry) = .empty,
     leaves: std.AutoHashMapUnmanaged(Value, u32) = .empty,
     ops: std.AutoHashMapUnmanaged(OpKey, usize) = .empty,
@@ -63,6 +64,7 @@ const Graph = struct {
         self.parents.deinit(self.allocator);
         self.class_heads.deinit(self.allocator);
         self.class_tails.deinit(self.allocator);
+        self.class_ops.deinit(self.allocator);
         self.nodes.deinit(self.allocator);
         self.leaves.deinit(self.allocator);
         self.ops.deinit(self.allocator);
@@ -74,6 +76,7 @@ const Graph = struct {
         self.parents.clearRetainingCapacity();
         self.class_heads.clearRetainingCapacity();
         self.class_tails.clearRetainingCapacity();
+        self.class_ops.clearRetainingCapacity();
         self.nodes.clearRetainingCapacity();
         self.leaves.clearRetainingCapacity();
         self.ops.clearRetainingCapacity();
@@ -109,6 +112,7 @@ const Graph = struct {
                 self.class_tails.items[ar] = self.class_tails.items[br];
             }
         }
+        self.class_ops.items[ar] |= self.class_ops.items[br];
         self.ops_valid = false;
         return true;
     }
@@ -118,6 +122,7 @@ const Graph = struct {
         try self.parents.append(self.allocator, class);
         try self.class_heads.append(self.allocator, null);
         try self.class_tails.append(self.allocator, null);
+        try self.class_ops.append(self.allocator, 0);
         return class;
     }
 
@@ -125,6 +130,10 @@ const Graph = struct {
         std.debug.assert(self.class_heads.items[class] == null);
         self.class_heads.items[class] = index;
         self.class_tails.items[class] = index;
+        switch (self.nodes.items[index].node) {
+            .leaf => {},
+            .op => |op| self.class_ops.items[class] |= opBit(op.op),
+        }
     }
 
     fn addLeaf(self: *Graph, value: Value) !?u32 {
@@ -218,6 +227,10 @@ fn isCommutative(op: BinOp) bool {
         .add, .mul, .bit_and, .bit_or, .bit_xor => true,
         else => false,
     };
+}
+
+fn opBit(op: BinOp) u16 {
+    return @as(u16, 1) << @intCast(@backingInt(op));
 }
 
 fn isAssociative(op: BinOp) bool {
@@ -421,6 +434,7 @@ fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u
 
 fn matchingOps(graph: *Graph, class: u32, op: BinOp, ty: Type, output: *std.ArrayList(OpNode)) !void {
     const root = graph.find(class);
+    if (graph.class_ops.items[root] & opBit(op) == 0) return;
     var current = graph.class_heads.items[root];
     while (current) |index| {
         const entry = graph.nodes.items[index];
