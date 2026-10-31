@@ -446,6 +446,7 @@ fn collectReachableFromRoot(func: *const Function, root: Value, reachable: *Reac
     while (len != 0) {
         len -= 1;
         const value = pending[len];
+        if (std.mem.indexOfScalar(Value, reachable.values[0..reachable.len], value) != null) continue;
         if (reachable.len == reachable.values.len) {
             reachable.complete = false;
             reachable.candidate = true;
@@ -1475,6 +1476,26 @@ test "egraph candidate discovery follows outgoing expressions" {
     var reachable: ReachableExpressions = .{};
     try std.testing.expect(!collectReachableExpressions(&func, .{ .ret = ir.function.Ret.one(a) }, &reachable));
     try std.testing.expect(collectReachableExpressions(&func, .{ .ret = ir.function.Ret.one(sum) }, &reachable));
+}
+
+test "egraph candidate discovery visits shared expressions once" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
+    var shared = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = ab, .rhs = ac } });
+    for (0..9) |_| shared = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = shared, .rhs = shared } });
+
+    var reachable: ReachableExpressions = .{};
+    try std.testing.expect(collectReachableExpressions(&func, .{ .ret = ir.function.Ret.one(shared) }, &reachable));
+    try std.testing.expect(reachable.complete);
+    try std.testing.expectEqual(@as(usize, 15), reachable.len);
 }
 
 test "egraph hash-consing follows merged child classes" {
