@@ -1441,6 +1441,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (a.op == .mul and fusesIntoNextArith(func, insts, inst_idx)) continue;
                     if ((a.op == .shl or a.op == .shr) and fusesIntoNextShiftAdd(func, insts, inst_idx, caps.fuse_shift_add)) continue;
                     const result = func.instResult(inst).?;
+                    if ((a.op == .shl or a.op == .shr) and foldsAsBitfieldExtractSource(func, result)) continue;
                     if ((a.op == .add or a.op == .sub) and inst_idx >= 1 and fusesIntoNextArith(func, insts, inst_idx - 1)) {
                         const mul = func.opcode(insts[inst_idx - 1]).arith;
                         const mul_result = func.instResult(insts[inst_idx - 1]).?;
@@ -1473,6 +1474,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try storeResult(allocator, &code, ctx, result, rd);
                         continue;
                     }
+                    if (bitfieldExtractFold(func, a, result)) |f| {
+                        const rl = try ctx.loadOp(allocator, &code, f.base, spill_op[0]);
+                        const rd = ctx.resultReg(result);
+                        try code.append(allocator, encode.ubfx(rd, rl, f.lsb, f.width, f.wide));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     if (logicalImmFold(func, a, result)) |f| {
                         const rl = try ctx.loadOp(allocator, &code, f.base, spill_op[0]);
                         const rd = ctx.resultReg(result);
@@ -1501,6 +1509,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // by the fold, so it claims no register and emits nothing (mirrors the mul/icmp
                     // fusion skips). `ctx.pos` still advances from `inst_idx`, so numbering holds.
                     if (fold.isDeadAdd(inst)) continue;
+                    if (func.instResult(inst)) |result| if (foldsAsBitfieldExtractSource(func, result)) continue;
                     // The consumer emits a constant shift folded into its shifted-register form.
                     if ((a.op == .shl or a.op == .shr) and fusesIntoNextShiftAdd(func, insts, inst_idx, caps.fuse_shift_add)) continue;
                     // Arith-branch fold (immediate form): this add/sub of a u12 immediate is the
@@ -3426,6 +3435,10 @@ fn aarch64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.f
                 out[0] = fold.base;
                 return 1;
             }
+            if (bitfieldExtractFold(func, arith, result)) |fold| {
+                out[0] = fold.base;
+                return 1;
+            }
             if (logicalImmFold(func, arith, result)) |fold| {
                 out[0] = fold.base;
                 return 1;
@@ -4395,6 +4408,7 @@ fn addSubImmFold(func: *const Function, a: ir.function.Arith) ?struct { base: Va
 
 const LogicalImmFold = struct { base: Value, immediate: Value, imm: i64 };
 const ShiftImmFold = struct { base: Value, immediate: Value, imm: i64, signed: bool, wide: bool };
+const BitfieldExtractFold = struct { base: Value, shifted: Value, lsb: u6, width: u6, wide: bool };
 
 fn logicalImmWord(op: ir.function.BinOp, imm: i64, wide: bool) ?u32 {
     const bits: u64 = @bitCast(imm);
@@ -4420,6 +4434,64 @@ fn logicalImmFold(func: *const Function, a: ir.function.Arith, result: Value) ?L
     if (logicalImmConst(func, a.rhs, a.op, wide)) |imm| return .{ .base = a.lhs, .immediate = a.rhs, .imm = imm };
     if (logicalImmConst(func, a.lhs, a.op, wide)) |imm| return .{ .base = a.rhs, .immediate = a.lhs, .imm = imm };
     return null;
+}
+
+fn lowMaskWidth(mask: i64, bits: u7) ?u6 {
+    if (mask <= 0) return null;
+    const value: u64 = @bitCast(mask);
+    const limit: u64 = if (bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bits)) - 1;
+    if (value > limit or value == limit) return null;
+    const next = value + 1;
+    if (!std.math.isPowerOfTwo(next)) return null;
+    return @intCast(@ctz(next));
+}
+
+/// Fold `(unsigned_value >> lsb) & low_mask` into one UBFM/UBFX instruction.
+fn bitfieldExtractFold(func: *const Function, a: ir.function.Arith, result: Value) ?BitfieldExtractFold {
+    if (a.op != .bit_and or isSignedInt(func, result)) return null;
+    const wide = isWide(func, result);
+    const bits: u7 = if (wide) 64 else 32;
+    const candidates = [_]struct { shifted: Value, mask: Value }{
+        .{ .shifted = a.lhs, .mask = a.rhs },
+        .{ .shifted = a.rhs, .mask = a.lhs },
+    };
+    for (candidates) |candidate| {
+        const mask_inst = func.definingInst(candidate.mask) orelse continue;
+        const mask = switch (func.opcode(mask_inst)) {
+            .iconst => |constant| constant,
+            else => continue,
+        };
+        const width = lowMaskWidth(mask, bits) orelse continue;
+        const shift_inst = func.definingInst(candidate.shifted) orelse continue;
+        const shift = constantShift(func, shift_inst) orelse continue;
+        if (shift.op != .shr or isSignedInt(func, shift.lhs)) continue;
+        if (shift.imm < 0 or shift.imm >= bits or @as(u7, @intCast(shift.imm)) + width > bits) continue;
+        if (countUses(func, candidate.shifted) != 1) continue;
+        return .{
+            .base = shift.lhs,
+            .shifted = candidate.shifted,
+            .lsb = @intCast(shift.imm),
+            .width = width,
+            .wide = wide,
+        };
+    }
+    return null;
+}
+
+fn foldsAsBitfieldExtractSource(func: *const Function, value: Value) bool {
+    if (countUses(func, value) != 1) return false;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const arith = switch (func.opcode(inst)) {
+                .arith => |candidate| candidate,
+                else => continue,
+            };
+            const result = func.instResult(inst) orelse continue;
+            const fold = bitfieldExtractFold(func, arith, result) orelse continue;
+            if (fold.shifted == value) return true;
+        }
+    }
+    return false;
 }
 
 fn shiftImmFold(func: *const Function, a: ir.function.Arith, result: Value) ?ShiftImmFold {
@@ -5383,6 +5455,26 @@ test "folds a constant shift into a logical operand" {
     defer allocator.free(code);
     try std.testing.expectEqual(@as(usize, 2), code.len);
     try std.testing.expectEqual(encode.eorShifted(.x0, .x0, .x0, 7, .lsl, false), code[0]);
+    try std.testing.expectEqual(encode.ret(), code[1]);
+}
+
+test "folds a shifted low mask into ubfx" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const eleven = try func.appendInst(b, t, .{ .iconst = 11 });
+    const shifted = try func.appendInst(b, t, .{ .arith = .{ .op = .shr, .lhs = x, .rhs = eleven } });
+    const mask = try func.appendInst(b, t, .{ .iconst = 0x7ff });
+    const extracted = try func.appendInst(b, t, .{ .arith = .{ .op = .bit_and, .lhs = shifted, .rhs = mask } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(extracted) });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    try std.testing.expectEqual(@as(usize, 2), code.len);
+    try std.testing.expectEqual(encode.ubfx(.x0, .x0, 11, 11, false), code[0]);
     try std.testing.expectEqual(encode.ret(), code[1]);
 }
 

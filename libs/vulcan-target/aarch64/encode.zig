@@ -107,6 +107,14 @@ pub fn ubfm(rd: Reg, rn: Reg, immr: u6, imms: u6) u32 {
     return 0xD3400000 | (@as(u32, immr) << 16) | (@as(u32, imms) << 10) | (n(rn) << 5) | n(rd);
 }
 
+/// Unsigned bitfield extract: `rd = (rn >> lsb) & ((1 << width) - 1)`.
+pub fn ubfx(rd: Reg, rn: Reg, lsb: u6, width: u6, wide: bool) u32 {
+    std.debug.assert(width > 0);
+    const imms: u6 = @intCast(@as(u7, lsb) + @as(u7, width) - 1);
+    const base: u32 = if (wide) 0xD3400000 else 0x53000000;
+    return base | (@as(u32, lsb) << 16) | (@as(u32, imms) << 10) | (n(rn) << 5) | n(rd);
+}
+
 /// `and wd, wn, wm` (32-bit register bitwise and).
 pub fn andr(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x0A000000 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
@@ -1173,6 +1181,7 @@ test "sbfm / ubfm encoding (sign/zero-extend a narrower value)" {
     try std.testing.expectEqual(@as(u32, 0x93407d28), sbfm(.x8, .x9, 0, 31));
     try std.testing.expectEqual(@as(u32, 0xd3407d28), ubfm(.x8, .x9, 0, 31));
     try std.testing.expectEqual(@as(u32, 0x93401d28), sbfm(.x8, .x9, 0, 7)); // sxtb
+    try std.testing.expectEqual(@as(u32, 0x530b5528), ubfx(.x8, .x9, 11, 11, false));
 }
 
 test "immediate shift encoding" {
