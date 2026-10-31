@@ -45,13 +45,17 @@ const OpKey = struct {
     ty: Type,
 };
 
+const ClassData = struct {
+    head: ?usize = null,
+    tail: ?usize = null,
+    ops: u16 = 0,
+};
+
 const Graph = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
     parents: std.ArrayList(u32) = .empty,
-    class_heads: std.ArrayList(?usize) = .empty,
-    class_tails: std.ArrayList(?usize) = .empty,
-    class_ops: std.ArrayList(u16) = .empty,
+    class_data: std.ArrayList(ClassData) = .empty,
     nodes: std.ArrayList(Entry) = .empty,
     leaves: std.AutoHashMapUnmanaged(Value, u32) = .empty,
     ops: std.AutoHashMapUnmanaged(OpKey, usize) = .empty,
@@ -62,9 +66,7 @@ const Graph = struct {
 
     fn deinit(self: *Graph) void {
         self.parents.deinit(self.allocator);
-        self.class_heads.deinit(self.allocator);
-        self.class_tails.deinit(self.allocator);
-        self.class_ops.deinit(self.allocator);
+        self.class_data.deinit(self.allocator);
         self.nodes.deinit(self.allocator);
         self.leaves.deinit(self.allocator);
         self.ops.deinit(self.allocator);
@@ -74,9 +76,7 @@ const Graph = struct {
 
     fn reset(self: *Graph) void {
         self.parents.clearRetainingCapacity();
-        self.class_heads.clearRetainingCapacity();
-        self.class_tails.clearRetainingCapacity();
-        self.class_ops.clearRetainingCapacity();
+        self.class_data.clearRetainingCapacity();
         self.nodes.clearRetainingCapacity();
         self.leaves.clearRetainingCapacity();
         self.ops.clearRetainingCapacity();
@@ -103,16 +103,16 @@ const Graph = struct {
         const br = self.find(b);
         if (ar == br) return false;
         self.parents.items[br] = ar;
-        if (self.class_heads.items[br]) |br_head| {
-            if (self.class_heads.items[ar]) |ar_head| {
-                self.nodes.items[self.class_tails.items[br].?].next_in_class = ar_head;
-                self.class_heads.items[ar] = br_head;
+        if (self.class_data.items[br].head) |br_head| {
+            if (self.class_data.items[ar].head) |ar_head| {
+                self.nodes.items[self.class_data.items[br].tail.?].next_in_class = ar_head;
+                self.class_data.items[ar].head = br_head;
             } else {
-                self.class_heads.items[ar] = br_head;
-                self.class_tails.items[ar] = self.class_tails.items[br];
+                self.class_data.items[ar].head = br_head;
+                self.class_data.items[ar].tail = self.class_data.items[br].tail;
             }
         }
-        self.class_ops.items[ar] |= self.class_ops.items[br];
+        self.class_data.items[ar].ops |= self.class_data.items[br].ops;
         self.ops_valid = false;
         return true;
     }
@@ -120,19 +120,17 @@ const Graph = struct {
     fn addClass(self: *Graph) !u32 {
         const class: u32 = @intCast(self.parents.items.len);
         try self.parents.append(self.allocator, class);
-        try self.class_heads.append(self.allocator, null);
-        try self.class_tails.append(self.allocator, null);
-        try self.class_ops.append(self.allocator, 0);
+        try self.class_data.append(self.allocator, .{});
         return class;
     }
 
     fn attachNode(self: *Graph, class: u32, index: usize) void {
-        std.debug.assert(self.class_heads.items[class] == null);
-        self.class_heads.items[class] = index;
-        self.class_tails.items[class] = index;
+        std.debug.assert(self.class_data.items[class].head == null);
+        self.class_data.items[class].head = index;
+        self.class_data.items[class].tail = index;
         switch (self.nodes.items[index].node) {
             .leaf => {},
-            .op => |op| self.class_ops.items[class] |= opBit(op.op),
+            .op => |op| self.class_data.items[class].ops |= opBit(op.op),
         }
     }
 
@@ -239,7 +237,7 @@ fn opBit(op: BinOp) u16 {
 }
 
 fn classHasOp(graph: *Graph, class: u32, op: BinOp) bool {
-    return graph.class_ops.items[graph.find(class)] & opBit(op) != 0;
+    return graph.class_data.items[graph.find(class)].ops & opBit(op) != 0;
 }
 
 fn isAssociative(op: BinOp) bool {
@@ -444,8 +442,8 @@ fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u
 
 fn matchingOps(graph: *Graph, class: u32, op: BinOp, ty: Type, output: *std.ArrayList(OpNode)) !void {
     const root = graph.find(class);
-    if (graph.class_ops.items[root] & opBit(op) == 0) return;
-    var current = graph.class_heads.items[root];
+    if (graph.class_data.items[root].ops & opBit(op) == 0) return;
+    var current = graph.class_data.items[root].head;
     while (current) |index| {
         const entry = graph.nodes.items[index];
         switch (entry.node) {
