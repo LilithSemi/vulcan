@@ -149,6 +149,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("frontends/vcc.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = optimize != .debug,
         .imports = &.{
             .{ .name = "vulcan-cc", .module = vulcan_cc },
             .{ .name = "vulcan-target", .module = vulcan_target },
@@ -911,6 +912,7 @@ fn addBenchVcc(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.
         .root_source_file = b.path("frontends/vcc.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .strip = true,
         .imports = &.{
             .{ .name = "vulcan-cc", .module = bench_cc },
             .{ .name = "vulcan-target", .module = bench_target },
