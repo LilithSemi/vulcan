@@ -58,16 +58,15 @@ fn isUnsigned(func: *const Function, v: Value) bool {
 fn analyze(allocator: std.mem.Allocator, func: *const Function) pass.Error![]Bits {
     var cfg = try cfg_mod.build(allocator, func);
     defer cfg.deinit(allocator);
-    return analyzeFromCfg(allocator, func, &cfg);
+    const rpo = try cfg.reversePostorder(allocator);
+    defer allocator.free(rpo);
+    return analyzeInOrder(allocator, func, rpo);
 }
 
-fn analyzeFromCfg(allocator: std.mem.Allocator, func: *const Function, cfg: *const cfg_mod.Cfg) pass.Error![]Bits {
+fn analyzeInOrder(allocator: std.mem.Allocator, func: *const Function, rpo: []const u32) pass.Error![]Bits {
     const bits = try allocator.alloc(Bits, func.valueCount());
     errdefer allocator.free(bits);
     @memset(bits, .{});
-
-    const rpo = try cfg.reversePostorder(allocator);
-    defer allocator.free(rpo);
 
     for (rpo) |bi| {
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
@@ -360,7 +359,7 @@ fn countMinLeadingZeros(a: Bits, w: u16) u16 {
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     if (!hasRewriteCandidate(func)) return false;
-    const bits = try analyzeFromCfg(allocator, func, try analyses.cfg());
+    const bits = try analyzeInOrder(allocator, func, try analyses.reversePostorder());
     defer allocator.free(bits);
 
     var changed = false;

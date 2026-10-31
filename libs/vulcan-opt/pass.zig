@@ -17,6 +17,7 @@ pub const Analyses = struct {
     allocator: std.mem.Allocator,
     func: *const Function,
     cfg_cache: ?cfg_mod.Cfg = null,
+    rpo_cache: ?[]u32 = null,
     doms: ?dom.Dominators = null,
     loop_info: ?loops_mod.LoopInfo = null,
 
@@ -28,6 +29,15 @@ pub const Analyses = struct {
     pub fn cfg(self: *Analyses) Error!*const cfg_mod.Cfg {
         if (self.cfg_cache == null) self.cfg_cache = try cfg_mod.build(self.allocator, self.func);
         return &self.cfg_cache.?;
+    }
+
+    /// Reachable blocks in reverse postorder, shared by forward dataflow passes.
+    pub fn reversePostorder(self: *Analyses) Error![]const u32 {
+        if (self.rpo_cache == null) {
+            if (self.cfg_cache == null) self.cfg_cache = try cfg_mod.build(self.allocator, self.func);
+            self.rpo_cache = try self.cfg_cache.?.reversePostorder(self.allocator);
+        }
+        return self.rpo_cache.?;
     }
 
     /// The dominator analysis, computed once and cached until invalidation.
@@ -51,6 +61,8 @@ pub const Analyses = struct {
 
     /// Drop every cached analysis (call after the function is modified).
     pub fn invalidate(self: *Analyses) void {
+        if (self.rpo_cache) |order| self.allocator.free(order);
+        self.rpo_cache = null;
         if (self.doms) |*d| d.deinit(self.allocator);
         self.doms = null;
         if (self.loop_info) |*l| l.deinit(self.allocator);
@@ -110,11 +122,13 @@ pub fn runToFixpoint(allocator: std.mem.Allocator, func: *Function, passes: []co
 const CacheTestPasses = struct {
     fn prime(_: std.mem.Allocator, _: *Function, analyses: *Analyses) Error!bool {
         _ = try analyses.loops();
+        _ = try analyses.reversePostorder();
         return true;
     }
 
     fn check(_: std.mem.Allocator, _: *Function, analyses: *Analyses) Error!bool {
         std.debug.assert(analyses.cfg_cache != null);
+        std.debug.assert(analyses.rpo_cache != null);
         std.debug.assert(analyses.doms != null);
         std.debug.assert(analyses.loop_info != null);
         return false;

@@ -41,10 +41,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     const n = func.blockCount();
     if (n == 0) return false;
 
-    const cfg = try analyses.cfg();
     const doms = try analyses.dominators();
-    const rpo = try cfg.reversePostorder(allocator);
-    defer allocator.free(rpo);
+    const rpo = try analyses.reversePostorder();
 
     // The canonical (leader) value for each value, and the block each is defined
     // in. Both start as the identity.
