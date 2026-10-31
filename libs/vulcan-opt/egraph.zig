@@ -12,6 +12,8 @@ const Function = ir.function.Function;
 const Type = ir.types.Type;
 const Value = ir.function.Value;
 
+const reachable_marker = std.math.maxInt(u32);
+
 pub const pass_def = pass.Pass{ .name = "egraph", .run = run, .preserves_cfg = true };
 
 pub const Limits = struct {
@@ -434,6 +436,54 @@ fn hasFactorCandidate(func: *const Function, term: ir.function.Terminator) bool 
     };
 }
 
+fn markReachableValue(allocator: std.mem.Allocator, classes: []?u32, touched: *std.ArrayList(usize), value: Value) !bool {
+    const index = @backingInt(value);
+    if (classes[index] != null) return false;
+    classes[index] = reachable_marker;
+    try touched.append(allocator, index);
+    return true;
+}
+
+fn markReachableFromRoot(allocator: std.mem.Allocator, func: *const Function, root: Value, classes: []?u32, touched: *std.ArrayList(usize)) !bool {
+    var pending: [512]Value = undefined;
+    var len: usize = 1;
+    pending[0] = root;
+    while (len != 0) {
+        len -= 1;
+        const value = pending[len];
+        if (!try markReachableValue(allocator, classes, touched, value)) continue;
+        const inst = func.definingInst(value) orelse continue;
+        const arith = switch (func.opcode(inst)) {
+            .arith => |arith| if (isEgraphOp(arith.op)) arith else continue,
+            else => continue,
+        };
+        if (len + 2 > pending.len) return false;
+        pending[len] = arith.lhs;
+        pending[len + 1] = arith.rhs;
+        len += 2;
+    }
+    return true;
+}
+
+fn markReachableRoots(allocator: std.mem.Allocator, func: *const Function, term: ir.function.Terminator, classes: []?u32, touched: *std.ArrayList(usize)) !bool {
+    return switch (term) {
+        .ret => |ret| for (ret.slice()) |root| {
+            if (!try markReachableFromRoot(allocator, func, root, classes, touched)) break false;
+        } else true,
+        .jump => |jump| for (func.valueList(jump.args)) |root| {
+            if (!try markReachableFromRoot(allocator, func, root, classes, touched)) break false;
+        } else true,
+    };
+}
+
+fn markWholeBlock(allocator: std.mem.Allocator, func: *const Function, block: Block, classes: []?u32, touched: *std.ArrayList(usize)) !void {
+    for (func.blockParams(block)) |param| _ = try markReachableValue(allocator, classes, touched, param);
+    for (func.blockInsts(block)) |inst| {
+        const result = func.instResult(inst) orelse continue;
+        _ = try markReachableValue(allocator, classes, touched, result);
+    }
+}
+
 fn recordClass(allocator: std.mem.Allocator, classes: []?u32, costs: []usize, touched: *std.ArrayList(usize), value: Value, class: u32, cost: usize) !void {
     const index = @backingInt(value);
     if (classes[index] == null) try touched.append(allocator, index);
@@ -443,16 +493,19 @@ fn recordClass(allocator: std.mem.Allocator, classes: []?u32, costs: []usize, to
 
 fn classForValue(graph: *Graph, classes: []?u32, costs: []usize, touched: *std.ArrayList(usize), value: Value) !?u32 {
     const index = @backingInt(value);
-    if (classes[index]) |class| return class;
+    if (classes[index]) |class| if (class != reachable_marker) return class;
     const class = try graph.addLeaf(value) orelse return null;
     try recordClass(graph.allocator, classes, costs, touched, value, class, 0);
     return class;
 }
 
 fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u32, costs: []usize, touched: *std.ArrayList(usize)) !void {
-    for (func.blockParams(block)) |param| _ = try classForValue(graph, classes, costs, touched, param);
+    for (func.blockParams(block)) |param| if (classes[@backingInt(param)] != null) {
+        _ = try classForValue(graph, classes, costs, touched, param);
+    };
     for (func.blockInsts(block)) |inst| {
         const result = func.instResult(inst) orelse continue;
+        if (classes[@backingInt(result)] == null) continue;
         if (!isInteger(func, result)) {
             _ = try classForValue(graph, classes, costs, touched, result);
             continue;
@@ -478,6 +531,17 @@ fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u
             .existing = result,
         }) orelse return;
         try recordClass(graph.allocator, classes, costs, touched, result, class, 1 + costs[@backingInt(arith.lhs)] + costs[@backingInt(arith.rhs)]);
+    }
+}
+
+fn importRoots(graph: *Graph, func: *const Function, term: ir.function.Terminator, classes: []?u32, costs: []usize, touched: *std.ArrayList(usize)) !void {
+    switch (term) {
+        .ret => |ret| for (ret.slice()) |root| {
+            _ = try classForValue(graph, classes, costs, touched, root);
+        },
+        .jump => |jump| for (func.valueList(jump.args)) |root| {
+            _ = try classForValue(graph, classes, costs, touched, root);
+        },
     }
 }
 
@@ -971,6 +1035,7 @@ fn materialize(graph: *Graph, extraction: *const Extraction, func: *Function, bl
 
 fn optimizeRoot(graph: *Graph, extraction: *const Extraction, func: *Function, block: Block, classes: []const ?u32, original_costs: []const usize, root_value: Value, memo: []?Value) !?Value {
     const class = classes[@backingInt(root_value)] orelse return null;
+    if (class == reachable_marker) return null;
     const root = graph.find(class);
     if (extraction.costs[root] >= original_costs[@backingInt(root_value)]) return null;
     return try materialize(graph, extraction, func, block, root, memo);
@@ -1014,7 +1079,11 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
         const classes = classes_storage.?;
         const original_costs = costs_storage.?;
         std.debug.assert(touched.items.len == 0);
+        if (!try markReachableRoots(allocator, func, term, classes, &touched)) {
+            try markWholeBlock(allocator, func, block, classes, &touched);
+        }
         try importBlock(&graph, func, block, classes, original_costs, &touched);
+        try importRoots(&graph, func, term, classes, original_costs, &touched);
         try saturate(&graph);
         try extraction_costs.resize(allocator, graph.parents.items.len);
         try extraction_best.resize(allocator, graph.parents.items.len);
