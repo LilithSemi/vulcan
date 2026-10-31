@@ -267,6 +267,7 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
         }
         if (lhs != null and rhs != null) {
             if (cancellationInner(sum.op)) |inner| if (lhs.?.op == inner and rhs.?.op == inner) return true;
+            if (sum.op == .sub and lhs.?.op == .sub and rhs.?.op == .sub) return true;
         }
         if (absorptionInner(sum.op)) |inner| {
             if (lhs) |op| if (op.op == inner and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
@@ -370,6 +371,18 @@ fn cancelPair(graph: *Graph, sum_class: u32, sum_op: BinOp, left: OpNode, right:
     return graph.merge(sum_class, reduced);
 }
 
+fn cancelSubtractions(graph: *Graph, outer_class: u32, left: OpNode, right: OpNode) !bool {
+    const reduced = if (left.lhs == right.lhs)
+        // (a - b) - (a - c) == c - b
+        try graph.addOp(.{ .op = .sub, .lhs = right.rhs, .rhs = left.rhs, .ty = left.ty, .existing = null })
+    else if (left.rhs == right.rhs)
+        // (a - b) - (c - b) == a - c
+        try graph.addOp(.{ .op = .sub, .lhs = left.lhs, .rhs = right.lhs, .ty = left.ty, .existing = null })
+    else
+        return false;
+    return graph.merge(outer_class, reduced orelse return false);
+}
+
 fn absorbPair(graph: *Graph, outer_class: u32, shared_class: u32, inner: OpNode) bool {
     const shared = graph.find(shared_class);
     if (graph.find(inner.lhs) != shared and graph.find(inner.rhs) != shared) return false;
@@ -432,6 +445,16 @@ fn saturate(graph: *Graph) !void {
                 try matchingOps(graph, sum.rhs, inner_op, sum.ty, &right);
                 for (left.items) |a| for (right.items) |b| {
                     changed = try cancelPair(graph, entry.class, sum.op, a, b) or changed;
+                    if (graph.hit_limit) break;
+                };
+            }
+            if (sum.op == .sub) {
+                left.clearRetainingCapacity();
+                right.clearRetainingCapacity();
+                try matchingOps(graph, sum.lhs, .sub, sum.ty, &left);
+                try matchingOps(graph, sum.rhs, .sub, sum.ty, &right);
+                for (left.items) |a| for (right.items) |b| {
+                    changed = try cancelSubtractions(graph, entry.class, a, b) or changed;
                     if (graph.hit_limit) break;
                 };
             }
@@ -693,6 +716,50 @@ test "egraph cancels a shared additive term" {
     const reduced = func.opcode(func.definingInst(replacement).?).arith;
     try std.testing.expectEqual(BinOp.sub, reduced.op);
     try std.testing.expectEqual(b, reduced.lhs);
+    try std.testing.expectEqual(c, reduced.rhs);
+}
+
+test "egraph cancels a shared subtraction minuend with reversed remainder" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } });
+    const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = c } });
+    const difference = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = ab, .rhs = ac } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(difference) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const reduced = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.sub, reduced.op);
+    try std.testing.expectEqual(c, reduced.lhs);
+    try std.testing.expectEqual(b, reduced.rhs);
+}
+
+test "egraph cancels a shared subtraction subtrahend" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } });
+    const cb = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = c, .rhs = b } });
+    const difference = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = ab, .rhs = cb } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(difference) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const reduced = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.sub, reduced.op);
+    try std.testing.expectEqual(a, reduced.lhs);
     try std.testing.expectEqual(c, reduced.rhs);
 }
 
