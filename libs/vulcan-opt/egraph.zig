@@ -282,6 +282,11 @@ fn factorPair(graph: *Graph, sum_class: u32, sum_op: BinOp, left: OpNode, right:
 }
 
 fn saturate(graph: *Graph) !void {
+    var left: std.ArrayList(OpNode) = .empty;
+    defer left.deinit(graph.allocator);
+    var right: std.ArrayList(OpNode) = .empty;
+    defer right.deinit(graph.allocator);
+
     var iter: usize = 0;
     while (iter < graph.limits.max_iters and !graph.hit_limit) : (iter += 1) {
         var changed = try graph.rebuild();
@@ -291,10 +296,8 @@ fn saturate(graph: *Graph) !void {
                 .op => |op| if (op.op == .add or op.op == .sub) canonical(graph, op) else continue,
                 .leaf => continue,
             };
-            var left: std.ArrayList(OpNode) = .empty;
-            defer left.deinit(graph.allocator);
-            var right: std.ArrayList(OpNode) = .empty;
-            defer right.deinit(graph.allocator);
+            left.clearRetainingCapacity();
+            right.clearRetainingCapacity();
             try matchingOps(graph, sum.lhs, .mul, sum.ty, &left);
             try matchingOps(graph, sum.rhs, .mul, sum.ty, &right);
             for (left.items) |a| for (right.items) |b| {
