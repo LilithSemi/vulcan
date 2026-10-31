@@ -173,6 +173,13 @@ fn isCommutative(op: BinOp) bool {
     };
 }
 
+fn isAssociative(op: BinOp) bool {
+    return switch (op) {
+        .add, .mul, .bit_and, .bit_or, .bit_xor => true,
+        else => false,
+    };
+}
+
 /// The operation that distributes over `outer`, if the factoring rule set has
 /// an exact integer identity for the pair.
 fn factorInner(outer: BinOp) ?BinOp {
@@ -207,6 +214,37 @@ fn isInteger(func: *const Function, value: Value) bool {
     };
 }
 
+/// Whether flattening an associative `outer` tree rooted at `value` finds at
+/// least two terms headed by `inner`. Saturation can rotate those terms next to
+/// one another and let the ordinary factoring rule inspect them. A fixed local
+/// stack keeps this allocation-free; overflowing it conservatively enables the
+/// bounded graph instead of missing an optimization in a very deep tree.
+fn hasNestedFactorCandidate(func: *const Function, value: Value, outer: BinOp, inner: BinOp) bool {
+    var pending: [64]Value = undefined;
+    var len: usize = 1;
+    var matches: u2 = 0;
+    pending[0] = value;
+    while (len != 0) {
+        len -= 1;
+        const current = pending[len];
+        const inst = func.definingInst(current) orelse continue;
+        const arith = switch (func.opcode(inst)) {
+            .arith => |arith| arith,
+            else => continue,
+        };
+        if (arith.op == outer) {
+            if (len + 2 > pending.len) return true;
+            pending[len] = arith.lhs;
+            pending[len + 1] = arith.rhs;
+            len += 2;
+        } else if (arith.op == inner) {
+            matches += 1;
+            if (matches == 2) return true;
+        }
+    }
+    return false;
+}
+
 /// Avoid graph construction for blocks that cannot match the current rule set.
 fn hasFactorCandidate(func: *const Function, block: Block) bool {
     for (func.blockInsts(block)) |inst| {
@@ -222,8 +260,12 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
             .arith => |arith| arith,
             else => null,
         } else null;
+        if (factorInner(sum.op)) |inner| {
+            if (isAssociative(sum.op)) {
+                if (func.instResult(inst)) |result| if (hasNestedFactorCandidate(func, result, sum.op, inner)) return true;
+            } else if (lhs != null and rhs != null and lhs.?.op == inner and rhs.?.op == inner) return true;
+        }
         if (lhs != null and rhs != null) {
-            if (factorInner(sum.op)) |inner| if (lhs.?.op == inner and rhs.?.op == inner) return true;
             if (cancellationInner(sum.op)) |inner| if (lhs.?.op == inner and rhs.?.op == inner) return true;
         }
         if (absorptionInner(sum.op)) |inner| {
@@ -334,6 +376,12 @@ fn absorbPair(graph: *Graph, outer_class: u32, shared_class: u32, inner: OpNode)
     return graph.merge(outer_class, shared);
 }
 
+fn associatePair(graph: *Graph, outer_class: u32, op: BinOp, nested: OpNode, other: u32) !bool {
+    const inner = try graph.addOp(.{ .op = op, .lhs = nested.rhs, .rhs = other, .ty = nested.ty, .existing = null }) orelse return false;
+    const rotated = try graph.addOp(.{ .op = op, .lhs = nested.lhs, .rhs = inner, .ty = nested.ty, .existing = null }) orelse return false;
+    return graph.merge(outer_class, rotated);
+}
+
 fn saturate(graph: *Graph) !void {
     var left: std.ArrayList(OpNode) = .empty;
     defer left.deinit(graph.allocator);
@@ -344,11 +392,29 @@ fn saturate(graph: *Graph) !void {
     while (iter < graph.limits.max_iters and !graph.hit_limit) : (iter += 1) {
         var changed = try graph.rebuild();
         const count = graph.nodes.items.len;
-        for (graph.nodes.items[0..count]) |entry| {
+        var node_index: usize = 0;
+        while (node_index < count) : (node_index += 1) {
+            // Rules append nodes and may reallocate the ArrayList. Fetch each
+            // original entry by index instead of retaining a slice into it.
+            const entry = graph.nodes.items[node_index];
             const sum = switch (entry.node) {
-                .op => |op| if (factorInner(op.op) != null or cancellationInner(op.op) != null or absorptionInner(op.op) != null) canonical(graph, op) else continue,
+                .op => |op| if (isAssociative(op.op) or factorInner(op.op) != null or cancellationInner(op.op) != null or absorptionInner(op.op) != null) canonical(graph, op) else continue,
                 .leaf => continue,
             };
+            if (isAssociative(sum.op)) {
+                left.clearRetainingCapacity();
+                try matchingOps(graph, sum.lhs, sum.op, sum.ty, &left);
+                for (left.items) |nested| {
+                    changed = try associatePair(graph, entry.class, sum.op, nested, sum.rhs) or changed;
+                    if (graph.hit_limit) break;
+                }
+                right.clearRetainingCapacity();
+                try matchingOps(graph, sum.rhs, sum.op, sum.ty, &right);
+                for (right.items) |nested| {
+                    changed = try associatePair(graph, entry.class, sum.op, nested, sum.lhs) or changed;
+                    if (graph.hit_limit) break;
+                }
+            }
             if (factorInner(sum.op)) |inner_op| {
                 left.clearRetainingCapacity();
                 right.clearRetainingCapacity();
@@ -649,6 +715,58 @@ test "egraph cancels a shared xor term" {
     const reduced = func.opcode(func.definingInst(replacement).?).arith;
     try std.testing.expectEqual(BinOp.bit_xor, reduced.op);
     try std.testing.expect((reduced.lhs == b and reduced.rhs == c) or (reduced.lhs == c and reduced.rhs == b));
+}
+
+test "egraph reassociates an add tree to expose factoring" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const d = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
+    const partial = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = ab, .rhs = d } });
+    const total = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = partial, .rhs = ac } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(total) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const outer = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.add, outer.op);
+    const product_value = if (outer.lhs == d) outer.rhs else outer.lhs;
+    try std.testing.expect(outer.lhs == d or outer.rhs == d);
+    const product = func.opcode(func.definingInst(product_value).?).arith;
+    try std.testing.expectEqual(BinOp.mul, product.op);
+    try std.testing.expect(product.lhs == a or product.rhs == a);
+}
+
+test "egraph reassociates products to expose a shared multiplier" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const x = try func.appendBlockParam(block, ty);
+    const y = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const abx = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = ab, .rhs = x } });
+    const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
+    const acy = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = ac, .rhs = y } });
+    const total = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = abx, .rhs = acy } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(total) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const product = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.mul, product.op);
+    try std.testing.expect(product.lhs == a or product.rhs == a);
 }
 
 test "egraph absorbs an or containing the other and operand" {
