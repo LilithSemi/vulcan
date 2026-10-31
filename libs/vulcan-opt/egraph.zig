@@ -1,6 +1,6 @@
 //! Bounded equality saturation for pure integer expressions. The pass imports
-//! block-local add and multiply trees, adds equivalent factored forms, and
-//! extracts the expression with the fewest arithmetic instructions.
+//! block-local integer trees, adds equivalent factored, cancelled, and absorbed
+//! forms, and extracts the expression with the fewest arithmetic instructions.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -192,6 +192,14 @@ fn cancellationInner(outer: BinOp) ?BinOp {
     };
 }
 
+fn absorptionInner(outer: BinOp) ?BinOp {
+    return switch (outer) {
+        .bit_and => .bit_or,
+        .bit_or => .bit_and,
+        else => null,
+    };
+}
+
 fn isInteger(func: *const Function, value: Value) bool {
     return switch (func.types.type_kind(func.valueType(value))) {
         .int, .bool => true,
@@ -203,21 +211,25 @@ fn isInteger(func: *const Function, value: Value) bool {
 fn hasFactorCandidate(func: *const Function, block: Block) bool {
     for (func.blockInsts(block)) |inst| {
         const sum = switch (func.opcode(inst)) {
-            .arith => |arith| if (factorInner(arith.op) != null or cancellationInner(arith.op) != null) arith else continue,
+            .arith => |arith| if (factorInner(arith.op) != null or cancellationInner(arith.op) != null or absorptionInner(arith.op) != null) arith else continue,
             else => continue,
         };
-        const lhs_inst = func.definingInst(sum.lhs) orelse continue;
-        const rhs_inst = func.definingInst(sum.rhs) orelse continue;
-        const lhs = switch (func.opcode(lhs_inst)) {
+        const lhs = if (func.definingInst(sum.lhs)) |lhs_inst| switch (func.opcode(lhs_inst)) {
             .arith => |arith| arith,
-            else => continue,
-        };
-        const rhs = switch (func.opcode(rhs_inst)) {
+            else => null,
+        } else null;
+        const rhs = if (func.definingInst(sum.rhs)) |rhs_inst| switch (func.opcode(rhs_inst)) {
             .arith => |arith| arith,
-            else => continue,
-        };
-        if (factorInner(sum.op)) |inner| if (lhs.op == inner and rhs.op == inner) return true;
-        if (cancellationInner(sum.op)) |inner| if (lhs.op == inner and rhs.op == inner) return true;
+            else => null,
+        } else null;
+        if (lhs != null and rhs != null) {
+            if (factorInner(sum.op)) |inner| if (lhs.?.op == inner and rhs.?.op == inner) return true;
+            if (cancellationInner(sum.op)) |inner| if (lhs.?.op == inner and rhs.?.op == inner) return true;
+        }
+        if (absorptionInner(sum.op)) |inner| {
+            if (lhs) |op| if (op.op == inner and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
+            if (rhs) |op| if (op.op == inner and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
+        }
     }
     return false;
 }
@@ -316,6 +328,12 @@ fn cancelPair(graph: *Graph, sum_class: u32, sum_op: BinOp, left: OpNode, right:
     return graph.merge(sum_class, reduced);
 }
 
+fn absorbPair(graph: *Graph, outer_class: u32, shared_class: u32, inner: OpNode) bool {
+    const shared = graph.find(shared_class);
+    if (graph.find(inner.lhs) != shared and graph.find(inner.rhs) != shared) return false;
+    return graph.merge(outer_class, shared);
+}
+
 fn saturate(graph: *Graph) !void {
     var left: std.ArrayList(OpNode) = .empty;
     defer left.deinit(graph.allocator);
@@ -328,7 +346,7 @@ fn saturate(graph: *Graph) !void {
         const count = graph.nodes.items.len;
         for (graph.nodes.items[0..count]) |entry| {
             const sum = switch (entry.node) {
-                .op => |op| if (factorInner(op.op) != null or cancellationInner(op.op) != null) canonical(graph, op) else continue,
+                .op => |op| if (factorInner(op.op) != null or cancellationInner(op.op) != null or absorptionInner(op.op) != null) canonical(graph, op) else continue,
                 .leaf => continue,
             };
             if (factorInner(sum.op)) |inner_op| {
@@ -350,6 +368,14 @@ fn saturate(graph: *Graph) !void {
                     changed = try cancelPair(graph, entry.class, sum.op, a, b) or changed;
                     if (graph.hit_limit) break;
                 };
+            }
+            if (absorptionInner(sum.op)) |inner_op| {
+                left.clearRetainingCapacity();
+                try matchingOps(graph, sum.lhs, inner_op, sum.ty, &left);
+                for (left.items) |inner| changed = absorbPair(graph, entry.class, sum.rhs, inner) or changed;
+                right.clearRetainingCapacity();
+                try matchingOps(graph, sum.rhs, inner_op, sum.ty, &right);
+                for (right.items) |inner| changed = absorbPair(graph, entry.class, sum.lhs, inner) or changed;
             }
             if (graph.hit_limit) break;
         }
@@ -623,6 +649,38 @@ test "egraph cancels a shared xor term" {
     const reduced = func.opcode(func.definingInst(replacement).?).arith;
     try std.testing.expectEqual(BinOp.bit_xor, reduced.op);
     try std.testing.expect((reduced.lhs == b and reduced.rhs == c) or (reduced.lhs == c and reduced.rhs == b));
+}
+
+test "egraph absorbs an or containing the other and operand" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const either = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_or, .lhs = a, .rhs = b } });
+    const both = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = either, .rhs = a } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(both) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    try std.testing.expectEqual(a, func.terminator(block).?.ret.values[0]);
+}
+
+test "egraph absorbs an and containing the other or operand" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const both = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } });
+    const either = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_or, .lhs = a, .rhs = both } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(either) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    try std.testing.expectEqual(a, func.terminator(block).?.ret.values[0]);
 }
 
 test "egraph obeys a hard node budget" {
