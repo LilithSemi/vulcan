@@ -35,6 +35,7 @@ const Node = union(enum) {
 const Entry = struct {
     class: u32,
     node: Node,
+    next_in_class: ?usize = null,
 };
 
 const OpKey = struct {
@@ -48,10 +49,11 @@ const Graph = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
     parents: std.ArrayList(u32) = .empty,
+    class_heads: std.ArrayList(?usize) = .empty,
+    class_tails: std.ArrayList(?usize) = .empty,
     nodes: std.ArrayList(Entry) = .empty,
     leaves: std.AutoHashMapUnmanaged(Value, u32) = .empty,
     ops: std.AutoHashMapUnmanaged(OpKey, usize) = .empty,
-    op_nodes: std.EnumArray(BinOp, std.ArrayList(usize)) = std.EnumArray(BinOp, std.ArrayList(usize)).initFill(.empty),
     match_left: std.ArrayList(OpNode) = .empty,
     match_right: std.ArrayList(OpNode) = .empty,
     ops_valid: bool = true,
@@ -59,20 +61,22 @@ const Graph = struct {
 
     fn deinit(self: *Graph) void {
         self.parents.deinit(self.allocator);
+        self.class_heads.deinit(self.allocator);
+        self.class_tails.deinit(self.allocator);
         self.nodes.deinit(self.allocator);
         self.leaves.deinit(self.allocator);
         self.ops.deinit(self.allocator);
-        inline for (std.meta.tags(BinOp)) |op| self.op_nodes.getPtr(op).deinit(self.allocator);
         self.match_left.deinit(self.allocator);
         self.match_right.deinit(self.allocator);
     }
 
     fn reset(self: *Graph) void {
         self.parents.clearRetainingCapacity();
+        self.class_heads.clearRetainingCapacity();
+        self.class_tails.clearRetainingCapacity();
         self.nodes.clearRetainingCapacity();
         self.leaves.clearRetainingCapacity();
         self.ops.clearRetainingCapacity();
-        inline for (std.meta.tags(BinOp)) |op| self.op_nodes.getPtr(op).clearRetainingCapacity();
         self.match_left.clearRetainingCapacity();
         self.match_right.clearRetainingCapacity();
         self.ops_valid = true;
@@ -96,6 +100,15 @@ const Graph = struct {
         const br = self.find(b);
         if (ar == br) return false;
         self.parents.items[br] = ar;
+        if (self.class_heads.items[br]) |br_head| {
+            if (self.class_heads.items[ar]) |ar_head| {
+                self.nodes.items[self.class_tails.items[br].?].next_in_class = ar_head;
+                self.class_heads.items[ar] = br_head;
+            } else {
+                self.class_heads.items[ar] = br_head;
+                self.class_tails.items[ar] = self.class_tails.items[br];
+            }
+        }
         self.ops_valid = false;
         return true;
     }
@@ -103,7 +116,15 @@ const Graph = struct {
     fn addClass(self: *Graph) !u32 {
         const class: u32 = @intCast(self.parents.items.len);
         try self.parents.append(self.allocator, class);
+        try self.class_heads.append(self.allocator, null);
+        try self.class_tails.append(self.allocator, null);
         return class;
+    }
+
+    fn attachNode(self: *Graph, class: u32, index: usize) void {
+        std.debug.assert(self.class_heads.items[class] == null);
+        self.class_heads.items[class] = index;
+        self.class_tails.items[class] = index;
     }
 
     fn addLeaf(self: *Graph, value: Value) !?u32 {
@@ -114,6 +135,7 @@ const Graph = struct {
         }
         const class = try self.addClass();
         try self.nodes.append(self.allocator, .{ .class = class, .node = .{ .leaf = value } });
+        self.attachNode(class, self.nodes.items.len - 1);
         try self.leaves.put(self.allocator, value, class);
         return class;
     }
@@ -142,7 +164,7 @@ const Graph = struct {
         const class = try self.addClass();
         try self.nodes.append(self.allocator, .{ .class = class, .node = .{ .op = node } });
         const index = self.nodes.items.len - 1;
-        try self.op_nodes.getPtr(node.op).append(self.allocator, index);
+        self.attachNode(class, index);
         try self.ops.put(self.allocator, key, index);
         return class;
     }
@@ -374,11 +396,16 @@ fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u
 
 fn matchingOps(graph: *Graph, class: u32, op: BinOp, ty: Type, output: *std.ArrayList(OpNode)) !void {
     const root = graph.find(class);
-    for (graph.op_nodes.get(op).items) |index| {
+    var current = graph.class_heads.items[root];
+    while (current) |index| {
         const entry = graph.nodes.items[index];
-        if (graph.find(entry.class) != root) continue;
-        const candidate = entry.node.op;
-        if (candidate.ty == ty) try output.append(graph.allocator, canonical(graph, candidate));
+        switch (entry.node) {
+            .leaf => {},
+            .op => |candidate| if (candidate.op == op and candidate.ty == ty) {
+                try output.append(graph.allocator, canonical(graph, candidate));
+            },
+        }
+        current = entry.next_in_class;
     }
 }
 
