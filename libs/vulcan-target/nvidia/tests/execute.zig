@@ -104,7 +104,12 @@ const Harness = struct {
     }
 
     fn deinit(self: *Harness) void {
-        self.runner.deinit();
+        // A hardware timeout leaves the channel in recovery_required. Checked
+        // teardown quiesces it before releasing mappings, so the original test
+        // error is never masked by the runner's unchecked-deinit guard.
+        self.runner.deinitChecked(1_000_000) catch |err| {
+            std.debug.panic("NVIDIA compute teardown failed: {t}", .{err});
+        };
     }
 
     /// Allocate a zeroed buffer visible to both the CPU and the GPU.
@@ -1581,13 +1586,22 @@ test "live: a kernel whose top register the hardware would otherwise keep comput
     // the kernel is using, so the answer changes. This runs the mutation on the silicon
     // instead of in the compiler, so no source change can make it pass by accident.
     buf.slice(i32)[0] = 0;
-    try h.runner.run(launch.kernel.code, .{
+    h.runner.run(launch.kernel.code, .{
         .grid = .{ 1, 1, 1 },
         .block = launch.kernel.launch.block,
         .register_count = naive,
         .cbuf0_va = h.params.va,
         .cbuf0_size = @max(launch.kernel.launch.param_bytes, 16),
-    });
+    }) catch |err| switch (err) {
+        // The intentionally invalid register window may either corrupt the
+        // result or strand the warp. A timeout is still a successful negative
+        // control, but the channel must be recovered before Harness teardown.
+        error.GridTimeout => {
+            try h.runner.recoverCompute(1_000_000);
+            return;
+        },
+        else => return err,
+    };
     try testing.expect(buf.read(i32, 0) != expected);
 }
 

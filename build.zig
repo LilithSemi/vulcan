@@ -679,7 +679,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nvidia", .module = nvidia_dep.module("nvidia") },
         },
     }) });
-    test_step.dependOn(&b.addRunArtifact(nvidia_execute).step);
+    const run_nvidia_execute = b.addRunArtifact(nvidia_execute);
+    test_step.dependOn(&run_nvidia_execute.step);
+    const nvidia_execute_step = b.step("test-nvidia-execute", "Run NVIDIA hardware execution tests");
+    nvidia_execute_step.dependOn(&run_nvidia_execute.step);
 
     // The 64-bit address carry chain. A global pointer add is an IADD3 plus an
     // IADD3.X that reads the carry, and every other pointer test in this
