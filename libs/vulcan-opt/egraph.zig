@@ -255,6 +255,13 @@ fn isAssociative(op: BinOp) bool {
     };
 }
 
+fn distributesOverLeftShift(op: BinOp) bool {
+    return switch (op) {
+        .add, .sub, .bit_and, .bit_or, .bit_xor => true,
+        else => false,
+    };
+}
+
 /// The operation that distributes over `outer`, if the factoring rule set has
 /// an exact integer identity for the pair.
 fn factorInner(outer: BinOp) ?BinOp {
@@ -372,6 +379,8 @@ fn hasFactorCandidateAt(func: *const Function, value: Value, sum: ir.function.Ar
         if (lhs != null and rhs != null and lhs.?.op == inner and rhs.?.op == inner) return true;
         if (isAssociative(sum.op) and hasNestedFactorCandidate(func, value, sum.op, inner)) return true;
     }
+    if (distributesOverLeftShift(sum.op) and lhs != null and rhs != null and
+        lhs.?.op == .shl and rhs.?.op == .shl and lhs.?.rhs == rhs.?.rhs) return true;
     if (lhs != null and rhs != null) {
         if (cancellationInner(sum.op)) |inner| if (lhs.?.op == inner and rhs.?.op == inner) return true;
         if (sum.op == .sub and lhs.?.op == .sub and rhs.?.op == .sub) return true;
@@ -421,7 +430,7 @@ fn hasFactorCandidateAt(func: *const Function, value: Value, sum: ir.function.Ar
 
 fn isEgraphOp(op: BinOp) bool {
     return switch (op) {
-        .add, .sub, .mul, .bit_and, .bit_or, .bit_xor => true,
+        .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl => true,
         else => false,
     };
 }
@@ -614,6 +623,13 @@ fn factorPair(graph: *Graph, sum_class: u32, sum_op: BinOp, inner_op: BinOp, lef
     const inner = try graph.addOp(.{ .op = sum_op, .lhs = operands.lhs_other, .rhs = operands.rhs_other, .ty = left.ty, .existing = null }) orelse return false;
     const product = try graph.addOp(.{ .op = inner_op, .lhs = operands.shared, .rhs = inner, .ty = left.ty, .existing = null }) orelse return false;
     return graph.merge(sum_class, product);
+}
+
+fn factorShiftPair(graph: *Graph, sum_class: u32, sum_op: BinOp, left: OpNode, right: OpNode) !?bool {
+    if (graph.find(left.rhs) != graph.find(right.rhs)) return null;
+    const inner = try graph.addOp(.{ .op = sum_op, .lhs = left.lhs, .rhs = right.lhs, .ty = left.ty, .existing = null }) orelse return false;
+    const shifted = try graph.addOp(.{ .op = .shl, .lhs = inner, .rhs = left.rhs, .ty = left.ty, .existing = null }) orelse return false;
+    return graph.merge(sum_class, shifted);
 }
 
 fn cancelPair(graph: *Graph, sum_class: u32, sum_op: BinOp, left: OpNode, right: OpNode) !?bool {
@@ -1005,6 +1021,19 @@ fn saturate(graph: *Graph) !void {
                 try matchingOps(graph, sum.rhs, inner_op, sum.ty, right);
                 for (left.items) |a| for (right.items) |b| {
                     if (try factorPair(graph, entry.class, sum.op, inner_op, a, b)) |pair_changed| {
+                        direct_match = true;
+                        changed = pair_changed or changed;
+                    }
+                    if (graph.hit_limit) break;
+                };
+            }
+            if (distributesOverLeftShift(sum.op) and classHasOp(graph, sum.lhs, .shl) and classHasOp(graph, sum.rhs, .shl)) {
+                left.clearRetainingCapacity();
+                right.clearRetainingCapacity();
+                try matchingOps(graph, sum.lhs, .shl, sum.ty, left);
+                try matchingOps(graph, sum.rhs, .shl, sum.ty, right);
+                for (left.items) |a| for (right.items) |b| {
+                    if (try factorShiftPair(graph, entry.class, sum.op, a, b)) |pair_changed| {
                         direct_match = true;
                         changed = pair_changed or changed;
                     }
@@ -1548,6 +1577,33 @@ test "egraph factors a shared multiplier from a returned expression" {
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
     try std.testing.expect(diags.ok());
+}
+
+test "egraph factors a shared left shift" {
+    const allocator = std.testing.allocator;
+    inline for ([_]BinOp{ .add, .sub, .bit_and, .bit_or, .bit_xor }) |outer_op| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const block = try func.appendBlock();
+        const a = try func.appendBlockParam(block, ty);
+        const b = try func.appendBlockParam(block, ty);
+        const amount = try func.appendBlockParam(block, ty);
+        const shifted_a = try func.appendInst(block, ty, .{ .arith = .{ .op = .shl, .lhs = a, .rhs = amount } });
+        const shifted_b = try func.appendInst(block, ty, .{ .arith = .{ .op = .shl, .lhs = b, .rhs = amount } });
+        const result = try func.appendInst(block, ty, .{ .arith = .{ .op = outer_op, .lhs = shifted_a, .rhs = shifted_b } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+
+        try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+        const replacement = func.terminator(block).?.ret.values[0];
+        const shifted = func.opcode(func.definingInst(replacement).?).arith;
+        try std.testing.expectEqual(BinOp.shl, shifted.op);
+        try std.testing.expectEqual(amount, shifted.rhs);
+        const inner = func.opcode(func.definingInst(shifted.lhs).?).arith;
+        try std.testing.expectEqual(outer_op, inner.op);
+        try std.testing.expectEqual(a, inner.lhs);
+        try std.testing.expectEqual(b, inner.rhs);
+    }
 }
 
 test "egraph chains direct factoring across an add tree" {
