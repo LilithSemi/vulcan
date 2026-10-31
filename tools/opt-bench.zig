@@ -11,6 +11,7 @@ const Function = ir.function.Function;
 const BenchFn = *const fn (std.mem.Allocator, *Function) anyerror!bool;
 
 const blocks: usize = 2048;
+const xor_cancel_blocks: usize = 64;
 const samples: usize = 9;
 
 pub fn main(init: std.process.Init) !void {
@@ -19,6 +20,8 @@ pub fn main(init: std.process.Init) !void {
     defer factor.deinit();
     var nested = try buildNestedWorkload(allocator, blocks);
     defer nested.deinit();
+    var xor_cancel = try buildXorCancelWorkload(allocator, xor_cancel_blocks);
+    defer xor_cancel.deinit();
     var rootless = try buildRootlessWorkload(allocator, blocks);
     defer rootless.deinit();
     var unrelated = try buildUnrelatedWorkload(allocator, blocks);
@@ -34,6 +37,7 @@ pub fn main(init: std.process.Init) !void {
     const factor_pipeline_ns = try measure(init.io, allocator, &factor, runPipeline);
     const nested_egraph_ns = try measure(init.io, allocator, &nested, runEgraph);
     const nested_pipeline_ns = try measure(init.io, allocator, &nested, runPipeline);
+    const xor_cancel_egraph_ns = try measure(init.io, allocator, &xor_cancel, runEgraph);
     const rootless_egraph_ns = try measure(init.io, allocator, &rootless, runEgraph);
     const unrelated_egraph_ns = try measure(init.io, allocator, &unrelated, runEgraph);
     const mixed_egraph_ns = try measure(init.io, allocator, &mixed, runEgraph);
@@ -43,6 +47,7 @@ pub fn main(init: std.process.Init) !void {
             "  factor early pipeline:  {d} ns/block\n" ++
             "  nested egraph:          {d} ns/block\n" ++
             "  nested early pipeline:  {d} ns/block\n" ++
+            "  xor cancel egraph:      {d} ns/block ({d} blocks)\n" ++
             "  rootless egraph:        {d} ns/block\n" ++
             "  unrelated egraph:       {d} ns/block\n" ++
             "  mixed egraph:           {d} ns/block\n",
@@ -53,6 +58,8 @@ pub fn main(init: std.process.Init) !void {
             factor_pipeline_ns / blocks,
             nested_egraph_ns / blocks,
             nested_pipeline_ns / blocks,
+            xor_cancel_egraph_ns / xor_cancel_blocks,
+            xor_cancel_blocks,
             rootless_egraph_ns / blocks,
             unrelated_egraph_ns / blocks,
             mixed_egraph_ns / blocks,
@@ -120,6 +127,23 @@ fn buildNestedWorkload(allocator: std.mem.Allocator, count: usize) !Function {
         const partial = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = ab, .rhs = ac } });
         const total = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = partial, .rhs = ad } });
         func.setTerminator(block, .{ .ret = ir.function.Ret.one(total) });
+    }
+    return func;
+}
+
+fn buildXorCancelWorkload(allocator: std.mem.Allocator, count: usize) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    for (0..count) |_| {
+        const block = try func.appendBlock();
+        const a = try func.appendBlockParam(block, ty);
+        const b = try func.appendBlockParam(block, ty);
+        const c = try func.appendBlockParam(block, ty);
+        const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = b } });
+        const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = c } });
+        const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = ab, .rhs = ac } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
     }
     return func;
 }
