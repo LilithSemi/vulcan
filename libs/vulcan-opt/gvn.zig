@@ -166,88 +166,89 @@ fn sub(canon: []const Value, v: Value) Value {
 /// Rewrite every value operand (in instructions, `if` edges, and terminators) to
 /// its canonical leader, so redundant definitions fall out of use.
 fn rewriteOperands(func: *Function, canon: []const Value) void {
-    for (0..func.instCount()) |i| {
-        const op = func.opcodeMut(@fromBackingInt(@intCast(i)));
-        switch (op.*) {
-            // An atomic's three operands are canonicalized like any other. This rewrites
-            // WHICH value each operand names; it never removes the atomic itself, which
-            // `keyOf` refuses to number.
-            .atomic_rmw => |*a| {
-                a.ptr = sub(canon, a.ptr);
-                a.value = sub(canon, a.value);
-                if (a.compare) |*c| c.* = sub(canon, c.*);
-            },
-            // A barrier carries no Value operand to canonicalize.
-            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
-            .arith => |*a| {
-                a.lhs = sub(canon, a.lhs);
-                a.rhs = sub(canon, a.rhs);
-            },
-            .arith_imm => |*a| a.lhs = sub(canon, a.lhs),
-            .icmp => |*c| {
-                c.lhs = sub(canon, c.lhs);
-                c.rhs = sub(canon, c.rhs);
-            },
-            .select => |*s| {
-                s.cond = sub(canon, s.cond);
-                s.then = sub(canon, s.then);
-                s.@"else" = sub(canon, s.@"else");
-            },
-            .extract => |*e| e.aggregate = sub(canon, e.aggregate),
-            .convert => |*cv| cv.value = sub(canon, cv.value),
-            .decode_low_float, .encode_low_float => |*cv| cv.value = sub(canon, cv.value),
-            .dequantize_nvfp4, .quantize_nvfp4 => |*cv| {
-                cv.value = sub(canon, cv.value);
-                cv.block_scale = sub(canon, cv.block_scale);
-                cv.global_scale = sub(canon, cv.global_scale);
-            },
-            .unary => |*u| u.value = sub(canon, u.value),
-            .load => |*l| {
-                l.ptr = sub(canon, l.ptr);
-                if (l.mask) |m| l.mask = sub(canon, m);
-            },
-            .store => |*st| {
-                st.value = sub(canon, st.value);
-                st.ptr = sub(canon, st.ptr);
-                if (st.mask) |m| st.mask = sub(canon, m);
-            },
-            .prefetch => |*pf| pf.ptr = sub(canon, pf.ptr),
-            .va_start => |*vs| vs.list = sub(canon, vs.list),
-            .va_arg => |*va| va.list = sub(canon, va.list),
-            .va_end => |*ve| ve.list = sub(canon, ve.list),
-            .dot => |*d| {
-                d.acc = sub(canon, d.acc);
-                d.a = sub(canon, d.a);
-                d.b = sub(canon, d.b);
-            },
-            .reduce => |*red| red.vector = sub(canon, red.vector),
-            .splat => |*sp| sp.scalar = sub(canon, sp.scalar),
-            .matmul => |*mm| {
-                mm.a = sub(canon, mm.a);
-                mm.b = sub(canon, mm.b);
-                mm.c = sub(canon, mm.c);
-            },
-            .struct_new => |sn| for (func.valueListMut(sn.fields)) |*f| {
-                f.* = sub(canon, f.*);
-            },
-            .call => |*c| {
-                for (func.valueListMut(c.args)) |*arg| arg.* = sub(canon, arg.*);
-                if (c.ret_dest) |d| c.ret_dest = sub(canon, d); // SM14 M4d-c: the struct-return destination is a call operand
-            },
-            .call_indirect => |*c| {
-                c.target = sub(canon, c.target);
-                for (func.valueListMut(c.args)) |*arg| arg.* = sub(canon, arg.*);
-                if (c.ret_dest) |d| c.ret_dest = sub(canon, d); // SM14 M4d-c
-            },
-            .@"if" => |*cf| {
-                cf.cond = sub(canon, cf.cond);
-                for (func.valueListMut(cf.then.args)) |*arg| arg.* = sub(canon, arg.*);
-                for (func.valueListMut(cf.@"else".args)) |*arg| arg.* = sub(canon, arg.*);
-            },
-        }
-    }
     for (0..func.blockCount()) |bi| {
-        const term = func.terminatorPtr(@fromBackingInt(@intCast(bi)));
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            const op = func.opcodeMut(inst);
+            switch (op.*) {
+                // An atomic's three operands are canonicalized like any other. This rewrites
+                // WHICH value each operand names; it never removes the atomic itself, which
+                // `keyOf` refuses to number.
+                .atomic_rmw => |*a| {
+                    a.ptr = sub(canon, a.ptr);
+                    a.value = sub(canon, a.value);
+                    if (a.compare) |*c| c.* = sub(canon, c.*);
+                },
+                // A barrier carries no Value operand to canonicalize.
+                .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
+                .arith => |*a| {
+                    a.lhs = sub(canon, a.lhs);
+                    a.rhs = sub(canon, a.rhs);
+                },
+                .arith_imm => |*a| a.lhs = sub(canon, a.lhs),
+                .icmp => |*c| {
+                    c.lhs = sub(canon, c.lhs);
+                    c.rhs = sub(canon, c.rhs);
+                },
+                .select => |*s| {
+                    s.cond = sub(canon, s.cond);
+                    s.then = sub(canon, s.then);
+                    s.@"else" = sub(canon, s.@"else");
+                },
+                .extract => |*e| e.aggregate = sub(canon, e.aggregate),
+                .convert => |*cv| cv.value = sub(canon, cv.value),
+                .decode_low_float, .encode_low_float => |*cv| cv.value = sub(canon, cv.value),
+                .dequantize_nvfp4, .quantize_nvfp4 => |*cv| {
+                    cv.value = sub(canon, cv.value);
+                    cv.block_scale = sub(canon, cv.block_scale);
+                    cv.global_scale = sub(canon, cv.global_scale);
+                },
+                .unary => |*u| u.value = sub(canon, u.value),
+                .load => |*l| {
+                    l.ptr = sub(canon, l.ptr);
+                    if (l.mask) |m| l.mask = sub(canon, m);
+                },
+                .store => |*st| {
+                    st.value = sub(canon, st.value);
+                    st.ptr = sub(canon, st.ptr);
+                    if (st.mask) |m| st.mask = sub(canon, m);
+                },
+                .prefetch => |*pf| pf.ptr = sub(canon, pf.ptr),
+                .va_start => |*vs| vs.list = sub(canon, vs.list),
+                .va_arg => |*va| va.list = sub(canon, va.list),
+                .va_end => |*ve| ve.list = sub(canon, ve.list),
+                .dot => |*d| {
+                    d.acc = sub(canon, d.acc);
+                    d.a = sub(canon, d.a);
+                    d.b = sub(canon, d.b);
+                },
+                .reduce => |*red| red.vector = sub(canon, red.vector),
+                .splat => |*sp| sp.scalar = sub(canon, sp.scalar),
+                .matmul => |*mm| {
+                    mm.a = sub(canon, mm.a);
+                    mm.b = sub(canon, mm.b);
+                    mm.c = sub(canon, mm.c);
+                },
+                .struct_new => |sn| for (func.valueListMut(sn.fields)) |*f| {
+                    f.* = sub(canon, f.*);
+                },
+                .call => |*c| {
+                    for (func.valueListMut(c.args)) |*arg| arg.* = sub(canon, arg.*);
+                    if (c.ret_dest) |d| c.ret_dest = sub(canon, d); // SM14 M4d-c: the struct-return destination is a call operand
+                },
+                .call_indirect => |*c| {
+                    c.target = sub(canon, c.target);
+                    for (func.valueListMut(c.args)) |*arg| arg.* = sub(canon, arg.*);
+                    if (c.ret_dest) |d| c.ret_dest = sub(canon, d); // SM14 M4d-c
+                },
+                .@"if" => |*cf| {
+                    cf.cond = sub(canon, cf.cond);
+                    for (func.valueListMut(cf.then.args)) |*arg| arg.* = sub(canon, arg.*);
+                    for (func.valueListMut(cf.@"else".args)) |*arg| arg.* = sub(canon, arg.*);
+                },
+            }
+        }
+        const term = func.terminatorPtr(block);
         if (term.*) |*t| switch (t.*) {
             .ret => |*r| for (r.values[0..r.count]) |*vv| {
                 vv.* = sub(canon, vv.*);
