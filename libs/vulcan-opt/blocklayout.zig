@@ -15,6 +15,7 @@ const ir = @import("vulcan-ir");
 const pass = @import("pass.zig");
 const cfg_mod = @import("cfg.zig");
 const dominators = @import("dominators.zig");
+const loops_mod = @import("loops.zig");
 
 const Function = ir.function.Function;
 const Block = ir.function.Block;
@@ -49,6 +50,8 @@ pub fn layout(allocator: std.mem.Allocator, func: *Function, profile: ?[]const u
     defer cfg.deinit(allocator);
     var doms = try dominators.compute(allocator, func);
     defer doms.deinit(allocator);
+    var loop_info = try loops_mod.analyzeFromCfg(allocator, &cfg, &doms);
+    defer loop_info.deinit(allocator);
 
     // Reverse postorder gives each reachable block an ordering used both for the structural tie-break
     // (prefer the RPO-earliest fall-through) and for picking the next trace seed. Unreachable blocks
@@ -61,7 +64,7 @@ pub fn layout(allocator: std.mem.Allocator, func: *Function, profile: ?[]const u
     @memset(rpo_rank, rpo_sentinel);
     for (rpo, 0..) |b, i| rpo_rank[b] = @intCast(i);
 
-    const order = try greedyTrace(allocator, &cfg, &doms, rpo, rpo_rank, profile);
+    const order = try greedyTrace(allocator, &cfg, &doms, &loop_info, rpo, rpo_rank, profile);
     defer allocator.free(order);
 
     // IDENTITY: when the computed order is already the current order the pass is a byte-identical
@@ -95,6 +98,7 @@ fn greedyTrace(
     allocator: std.mem.Allocator,
     cfg: *const cfg_mod.Cfg,
     doms: *const dominators.Dominators,
+    loop_info: *const loops_mod.LoopInfo,
     rpo: []const u32,
     rpo_rank: []const u32,
     profile: ?[]const u64,
@@ -127,7 +131,7 @@ fn greedyTrace(
         std.debug.assert(guard < n); // progress guarantee: bounded by the block count
 
         // Try to extend the current trace: pick the best unplaced, placeable successor of `last`.
-        const extend = bestSuccessor(cfg, doms, rpo_rank, placed, profile, last);
+        const extend = bestSuccessor(cfg, doms, loop_info, rpo_rank, placed, profile, last);
         if (extend) |s| {
             placed[s] = true;
             try order.append(allocator, s);
@@ -175,6 +179,7 @@ fn isPlaceable(doms: *const dominators.Dominators, placed: []const bool, b: u32)
 fn bestSuccessor(
     cfg: *const cfg_mod.Cfg,
     doms: *const dominators.Dominators,
+    loop_info: *const loops_mod.LoopInfo,
     rpo_rank: []const u32,
     placed: []const bool,
     profile: ?[]const u64,
@@ -184,6 +189,7 @@ fn bestSuccessor(
     var best_back: bool = true; // a back-edge candidate is worse than a forward one
     var best_weight: u64 = 0;
     var best_rank: u32 = std.math.maxInt(u32);
+    var best_loop_depth: usize = 0;
     for (cfg.successors(from)) |s| {
         if (placed[s]) continue;
         if (!isPlaceable(doms, placed, s)) continue;
@@ -192,6 +198,7 @@ fn bestSuccessor(
         const is_back = doms.dominates(s, from);
         const rank = rpo_rank[s];
         const weight: u64 = if (profile) |p| p[s] else 0;
+        const loop_depth = sharedLoopDepth(loop_info, from, s);
 
         const better = if (best == null)
             true
@@ -199,18 +206,30 @@ fn bestSuccessor(
             // Profile mode: highest execution count first, RPO rank as the tie-break.
             (weight > best_weight or (weight == best_weight and rank < best_rank))
         else
-            // Structural mode: forward edges before back-edges, then RPO-earliest.
+            // Structural mode: forward edges before back-edges, then keep a trace inside as many
+            // surrounding loops as possible. This places a loop body after its header instead of
+            // the cold exit, allowing the body edge to fall through. RPO rank breaks the tie.
             (@intFromBool(is_back) < @intFromBool(best_back) or
-                (is_back == best_back and rank < best_rank));
+                (is_back == best_back and (loop_depth > best_loop_depth or
+                    (loop_depth == best_loop_depth and rank < best_rank))));
 
         if (better) {
             best = s;
             best_back = is_back;
             best_weight = weight;
             best_rank = rank;
+            best_loop_depth = loop_depth;
         }
     }
     return best;
+}
+
+fn sharedLoopDepth(loop_info: *const loops_mod.LoopInfo, from: u32, successor: u32) usize {
+    var depth: usize = 0;
+    for (loop_info.loops) |*loop| {
+        if (loop.contains(from) and loop.contains(successor)) depth += 1;
+    }
+    return depth;
 }
 
 /// Validate that `order` is a valid dominance linearization: a permutation of `0..n` with the entry
@@ -289,6 +308,42 @@ test "blocklayout: reorders so a forward successor falls through" {
     const succs = cfg.successors(0);
     try testing.expect(succs[0] == 1 or succs[1] == 1);
     try testing.expectEqual(@as(i64, 2), blockConst(&func, @fromBackingInt(@intCast(1))).?);
+
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
+test "blocklayout: keeps a loop body adjacent to its header" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const exit = try func.appendBlock();
+    const body = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const i = try func.appendBlockParam(header, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, header, &.{zero});
+    const cmp = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(header, cmp, .{ .target = body }, .{ .target = exit });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(i) });
+    const next = try func.appendArithImm(body, i32_t, .add, i, 1);
+    try func.setJump(body, header, &.{next});
+
+    const changed = try layout(allocator, &func, null);
+    try testing.expect(changed);
+
+    var info = try loops_mod.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), info.loops.len);
+    const loop = info.loops[0];
+    try testing.expectEqual(@as(u32, 1), loop.header);
+    try testing.expect(loop.contains(2));
+    try testing.expect(!loop.contains(3));
 
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
