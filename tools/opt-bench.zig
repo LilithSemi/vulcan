@@ -30,6 +30,8 @@ pub fn main(init: std.process.Init) !void {
     defer bitwise_pair.deinit();
     var mixed_pair = try buildMixedPairWorkload(allocator, blocks);
     defer mixed_pair.deinit();
+    var cross_cancel = try buildCrossCancelWorkload(allocator, blocks);
+    defer cross_cancel.deinit();
     var rootless = try buildRootlessWorkload(allocator, blocks);
     defer rootless.deinit();
     var unrelated = try buildUnrelatedWorkload(allocator, blocks);
@@ -50,6 +52,7 @@ pub fn main(init: std.process.Init) !void {
     const idempotent_egraph_ns = try measure(init.io, allocator, &idempotent, runEgraph);
     const bitwise_pair_egraph_ns = try measure(init.io, allocator, &bitwise_pair, runEgraph);
     const mixed_pair_egraph_ns = try measure(init.io, allocator, &mixed_pair, runEgraph);
+    const cross_cancel_egraph_ns = try measure(init.io, allocator, &cross_cancel, runEgraph);
     const rootless_egraph_ns = try measure(init.io, allocator, &rootless, runEgraph);
     const unrelated_egraph_ns = try measure(init.io, allocator, &unrelated, runEgraph);
     const mixed_egraph_ns = try measure(init.io, allocator, &mixed, runEgraph);
@@ -64,6 +67,7 @@ pub fn main(init: std.process.Init) !void {
             "  idempotent egraph:      {d} ns/block\n" ++
             "  bitwise pair egraph:    {d} ns/block\n" ++
             "  mixed pair egraph:      {d} ns/block\n" ++
+            "  cross cancel egraph:    {d} ns/block\n" ++
             "  rootless egraph:        {d} ns/block\n" ++
             "  unrelated egraph:       {d} ns/block\n" ++
             "  mixed egraph:           {d} ns/block\n",
@@ -80,6 +84,7 @@ pub fn main(init: std.process.Init) !void {
             idempotent_egraph_ns / blocks,
             bitwise_pair_egraph_ns / blocks,
             mixed_pair_egraph_ns / blocks,
+            cross_cancel_egraph_ns / blocks,
             rootless_egraph_ns / blocks,
             unrelated_egraph_ns / blocks,
             mixed_egraph_ns / blocks,
@@ -225,6 +230,23 @@ fn buildMixedPairWorkload(allocator: std.mem.Allocator, count: usize) !Function 
         const sum = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
         const difference = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } });
         const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = difference } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    }
+    return func;
+}
+
+fn buildCrossCancelWorkload(allocator: std.mem.Allocator, count: usize) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    for (0..count) |_| {
+        const block = try func.appendBlock();
+        const a = try func.appendBlockParam(block, ty);
+        const b = try func.appendBlockParam(block, ty);
+        const c = try func.appendBlockParam(block, ty);
+        const difference = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } });
+        const sum = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = b, .rhs = c } });
+        const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = difference, .rhs = sum } });
         func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
     }
     return func;
