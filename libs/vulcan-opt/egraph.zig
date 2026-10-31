@@ -203,6 +203,11 @@ const Graph = struct {
             }
         }
     }
+
+    fn rebuildIfNeeded(self: *Graph) !bool {
+        if (self.ops_valid) return false;
+        return self.rebuild();
+    }
 };
 
 fn opKey(op: OpNode) OpKey {
@@ -746,7 +751,7 @@ fn saturate(graph: *Graph) !void {
 
     var iter: usize = 0;
     while (iter < graph.limits.max_iters and !graph.hit_limit) : (iter += 1) {
-        var changed = try graph.rebuild();
+        var changed = try graph.rebuildIfNeeded();
         const count = graph.nodes.items.len;
         var node_index: usize = 0;
         while (node_index < count) : (node_index += 1) {
@@ -864,7 +869,7 @@ fn saturate(graph: *Graph) !void {
         }
         if (!changed) break;
     }
-    _ = try graph.rebuild();
+    _ = try graph.rebuildIfNeeded();
 }
 
 const Extraction = struct {
