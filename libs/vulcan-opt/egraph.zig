@@ -301,6 +301,9 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
         } else if (sum.op == .bit_xor) {
             if (lhs) |op| if (op.op == .bit_xor and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
             if (rhs) |op| if (op.op == .bit_xor and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
+        } else if (sum.op == .bit_and or sum.op == .bit_or) {
+            if (lhs) |op| if (op.op == sum.op and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
+            if (rhs) |op| if (op.op == sum.op and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
         }
     }
     return false;
@@ -452,6 +455,27 @@ fn foldBitwiseArithmetic(graph: *Graph, outer_class: u32, outer_op: BinOp, disju
     return graph.merge(outer_class, replacement);
 }
 
+fn foldNestedIdempotent(graph: *Graph, outer_class: u32, outer: OpNode, matches: *std.ArrayList(OpNode)) !bool {
+    var changed = false;
+    matches.clearRetainingCapacity();
+    try matchingOps(graph, outer.lhs, outer.op, outer.ty, matches);
+    const rhs = graph.find(outer.rhs);
+    for (matches.items) |nested| {
+        if (graph.find(nested.lhs) == rhs or graph.find(nested.rhs) == rhs) {
+            changed = graph.merge(outer_class, outer.lhs) or changed;
+        }
+    }
+    matches.clearRetainingCapacity();
+    try matchingOps(graph, outer.rhs, outer.op, outer.ty, matches);
+    const lhs = graph.find(outer.lhs);
+    for (matches.items) |nested| {
+        if (graph.find(nested.lhs) == lhs or graph.find(nested.rhs) == lhs) {
+            changed = graph.merge(outer_class, outer.rhs) or changed;
+        }
+    }
+    return changed;
+}
+
 fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
     var changed = false;
     if (outer.op == .add) {
@@ -571,6 +595,9 @@ fn saturate(graph: *Graph) !void {
             }
             if (sum.op == .add or sum.op == .sub or sum.op == .bit_xor) {
                 changed = try cancelInverse(graph, entry.class, sum, &left, &right) or changed;
+            }
+            if (sum.op == .bit_and or sum.op == .bit_or) {
+                changed = try foldNestedIdempotent(graph, entry.class, sum, &left) or changed;
             }
             if (sum.op == .add or sum.op == .sub) {
                 left.clearRetainingCapacity();
@@ -1151,6 +1178,38 @@ test "egraph absorbs an and containing the other or operand" {
 
     try std.testing.expect(try runWithLimits(allocator, &func, .{}));
     try std.testing.expectEqual(a, func.terminator(block).?.ret.values[0]);
+}
+
+test "egraph removes a repeated nested and operand" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const both = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } });
+    const repeated = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = both } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(repeated) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    try std.testing.expectEqual(both, func.terminator(block).?.ret.values[0]);
+}
+
+test "egraph removes a repeated nested or operand" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const either = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_or, .lhs = a, .rhs = b } });
+    const repeated = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_or, .lhs = either, .rhs = b } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(repeated) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    try std.testing.expectEqual(either, func.terminator(block).?.ret.values[0]);
 }
 
 test "egraph obeys a hard node budget" {
