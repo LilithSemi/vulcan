@@ -14,7 +14,6 @@ const pass = @import("pass.zig");
 
 const Function = ir.function.Function;
 const Block = ir.function.Block;
-const Inst = ir.function.Inst;
 
 pub const pass_def = pass.Pass{ .name = "branchfold", .run = run };
 
@@ -25,10 +24,12 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     var consts = try allocator.alloc(?i64, func.valueCount());
     defer allocator.free(consts);
     @memset(consts, null);
-    for (0..func.instCount()) |i| {
-        const inst: Inst = @fromBackingInt(@intCast(i));
-        if (func.opcode(inst) == .iconst) {
-            if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            if (func.opcode(inst) == .iconst) {
+                if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
+            }
         }
     }
 
