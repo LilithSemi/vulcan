@@ -10,7 +10,6 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const pass = @import("pass.zig");
-const cfg_mod = @import("cfg.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -42,9 +41,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     const n = func.blockCount();
     if (n == 0) return false;
 
+    const cfg = try analyses.cfg();
     const doms = try analyses.dominators();
-    var cfg = try cfg_mod.build(allocator, func);
-    defer cfg.deinit(allocator);
     const rpo = try cfg.reversePostorder(allocator);
     defer allocator.free(rpo);
 
