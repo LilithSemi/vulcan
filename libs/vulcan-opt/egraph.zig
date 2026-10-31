@@ -273,6 +273,13 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
             if (lhs) |op| if (op.op == inner and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
             if (rhs) |op| if (op.op == inner and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
         }
+        if (sum.op == .add) {
+            if (lhs) |op| if (op.op == .sub and op.rhs == sum.rhs) return true;
+            if (rhs) |op| if (op.op == .sub and op.rhs == sum.lhs) return true;
+        } else if (sum.op == .sub) {
+            if (lhs) |op| if (op.op == .add and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
+            if (rhs) |op| if (op.op == .sub and op.lhs == sum.lhs) return true;
+        }
     }
     return false;
 }
@@ -395,6 +402,39 @@ fn associatePair(graph: *Graph, outer_class: u32, op: BinOp, nested: OpNode, oth
     return graph.merge(outer_class, rotated);
 }
 
+fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
+    var changed = false;
+    if (outer.op == .add) {
+        left.clearRetainingCapacity();
+        try matchingOps(graph, outer.lhs, .sub, outer.ty, left);
+        for (left.items) |nested| {
+            if (graph.find(nested.rhs) == graph.find(outer.rhs)) changed = graph.merge(outer_class, nested.lhs) or changed;
+        }
+        right.clearRetainingCapacity();
+        try matchingOps(graph, outer.rhs, .sub, outer.ty, right);
+        for (right.items) |nested| {
+            if (graph.find(nested.rhs) == graph.find(outer.lhs)) changed = graph.merge(outer_class, nested.lhs) or changed;
+        }
+    } else if (outer.op == .sub) {
+        left.clearRetainingCapacity();
+        try matchingOps(graph, outer.lhs, .add, outer.ty, left);
+        for (left.items) |nested| {
+            const rhs = graph.find(outer.rhs);
+            if (graph.find(nested.lhs) == rhs) {
+                changed = graph.merge(outer_class, nested.rhs) or changed;
+            } else if (graph.find(nested.rhs) == rhs) {
+                changed = graph.merge(outer_class, nested.lhs) or changed;
+            }
+        }
+        right.clearRetainingCapacity();
+        try matchingOps(graph, outer.rhs, .sub, outer.ty, right);
+        for (right.items) |nested| {
+            if (graph.find(nested.lhs) == graph.find(outer.lhs)) changed = graph.merge(outer_class, nested.rhs) or changed;
+        }
+    }
+    return changed;
+}
+
 fn saturate(graph: *Graph) !void {
     var left: std.ArrayList(OpNode) = .empty;
     defer left.deinit(graph.allocator);
@@ -457,6 +497,9 @@ fn saturate(graph: *Graph) !void {
                     changed = try cancelSubtractions(graph, entry.class, a, b) or changed;
                     if (graph.hit_limit) break;
                 };
+            }
+            if (sum.op == .add or sum.op == .sub) {
+                changed = try cancelInverse(graph, entry.class, sum, &left, &right) or changed;
             }
             if (absorptionInner(sum.op)) |inner_op| {
                 left.clearRetainingCapacity();
@@ -761,6 +804,54 @@ test "egraph cancels a shared subtraction subtrahend" {
     try std.testing.expectEqual(BinOp.sub, reduced.op);
     try std.testing.expectEqual(a, reduced.lhs);
     try std.testing.expectEqual(c, reduced.rhs);
+}
+
+test "egraph cancels add and subtract inverse pairs" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const difference = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } });
+    const restored = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = difference, .rhs = b } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(restored) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    try std.testing.expectEqual(a, func.terminator(block).?.ret.values[0]);
+}
+
+test "egraph cancels a nested add from either side of subtraction" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const sum = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    const restored = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = sum, .rhs = b } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(restored) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    try std.testing.expectEqual(a, func.terminator(block).?.ret.values[0]);
+}
+
+test "egraph cancels a nested subtraction from its minuend" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const difference = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } });
+    const restored = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = difference } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(restored) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    try std.testing.expectEqual(b, func.terminator(block).?.ret.values[0]);
 }
 
 test "egraph cancels a shared xor term" {
