@@ -41,6 +41,14 @@ fn log2Pow2(c: i64, bits: u16) ?u6 {
     return @intCast(k);
 }
 
+fn log2AbsPow2(c: i64, bits: u16) ?u6 {
+    const magnitude: u64 = @abs(c);
+    if (magnitude <= 1 or magnitude & (magnitude - 1) != 0) return null;
+    const k = @ctz(magnitude);
+    if (k == 0 or k >= bits) return null;
+    return @intCast(k);
+}
+
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
     var changed = try shiftPhase(allocator, func);
@@ -129,7 +137,8 @@ pub fn shiftPhase(allocator: std.mem.Allocator, func: *Function) pass.Error!bool
 
 const SignedPow2 = struct {
     x: Value,
-    divisor: i64,
+    magnitude: u64,
+    negative: bool,
     shift: u6,
     bits: u16,
     is_rem: bool,
@@ -155,11 +164,11 @@ fn signedPow2(func: *const Function, consts: []const ?i64, inst: ir.function.Ins
     if (op != .div and op != .rem) return null;
     const ty = intType(func, x) orelse return null;
     if (ty.signedness != .signed) return null;
-    const shift = log2Pow2(divisor, ty.bits) orelse return null;
-    return .{ .x = x, .divisor = divisor, .shift = shift, .bits = ty.bits, .is_rem = op == .rem };
+    const shift = log2AbsPow2(divisor, ty.bits) orelse return null;
+    return .{ .x = x, .magnitude = @abs(divisor), .negative = divisor < 0, .shift = shift, .bits = ty.bits, .is_rem = op == .rem };
 }
 
-/// Lower signed division by a positive power of two with a rounding bias. This
+/// Lower signed division by a power of two with a rounding bias. This
 /// avoids the generic division expansion while keeping C's round-toward-zero
 /// semantics for negative dividends.
 fn signedPow2Phase(allocator: std.mem.Allocator, func: *Function, consts: []const ?i64) pass.Error!bool {
@@ -187,13 +196,16 @@ fn signedPow2Phase(allocator: std.mem.Allocator, func: *Function, consts: []cons
             const result = func.instResult(inst).?;
             const builder = Builder{ .f = func, .o = &out, .a = allocator, .ty = func.valueType(result) };
             const sign = try builder.opImm(.shr, info.x, @intCast(info.bits - 1));
-            const bias = try builder.opImm(.bit_and, sign, info.divisor - 1);
+            const bias = try builder.opImm(.bit_and, sign, @intCast(info.magnitude - 1));
             const adjusted = try builder.op(.add, info.x, bias);
-            const quotient = try builder.opImm(.shr, adjusted, @as(i64, info.shift));
+            const positive_quotient = try builder.opImm(.shr, adjusted, @as(i64, info.shift));
             const replacement = if (info.is_rem) blk: {
-                const product = try builder.opImm(.shl, quotient, @as(i64, info.shift));
+                const product = try builder.opImm(.shl, positive_quotient, @as(i64, info.shift));
                 break :blk try builder.op(.sub, info.x, product);
-            } else quotient;
+            } else if (info.negative) blk: {
+                const zero = try builder.konst(0);
+                break :blk try builder.op(.sub, zero, positive_quotient);
+            } else positive_quotient;
             func.replaceAllUses(result, replacement);
             changed = true;
         }
@@ -667,7 +679,7 @@ test "unsigned x / 4 becomes x >> 2, x % 4 becomes x & 3" {
 
 test "signed division by a power of two uses a rounding bias" {
     const allocator = testing.allocator;
-    const divisors = [_]i64{ 2, 4, 8, 256 };
+    const divisors = [_]i64{ 2, 4, 8, 256, -2, -4, -8, -256 };
     const dividends = [_]i64{ 0, 1, -1, 7, -7, 8, -8, 255, -255, std.math.maxInt(i32), std.math.minInt(i32) };
     for (divisors) |divisor| {
         for (dividends) |dividend| {
