@@ -210,7 +210,7 @@ const Builder = struct {
         if (c.distinct_two) return phi; // a genuine merge of >=2 values: keep the block parameter
 
         const v: Value = c.same orelse try self.undefZero(slot);
-        self.func.replaceAllUses(phi, v);
+        self.func.replaceAllLiveUses(phi, v);
         self.repointCaches(phi, v);
         try self.dropParamAndEdgeArgs(blk, pidx);
         return v;
@@ -264,7 +264,7 @@ const Builder = struct {
     /// backend threads each one across every edge, the generated code. This runs to a fixpoint:
     /// collapsing one parameter can make a parameter that referenced it trivial, so it repeats until a
     /// full sweep collapses nothing. A parameter with no non-self operand (an unreachable self-cycle)
-    /// is left alone. `replaceAllUses` fixes every use, including the edge arguments feeding other
+    /// is left alone. `replaceAllLiveUses` fixes every use, including the edge arguments feeding other
     /// parameters, so a later sweep sees the exposed triviality.
     fn collapseTrivialPhis(self: *Builder) pass.Error!void {
         var changed = true;
@@ -280,7 +280,7 @@ const Builder = struct {
                         pi += 1; // a real merge, or an unreachable self-cycle: keep it
                         continue;
                     }
-                    self.func.replaceAllUses(param, c.same.?);
+                    self.func.replaceAllLiveUses(param, c.same.?);
                     try self.dropParamAndEdgeArgs(blk, pi);
                     changed = true;
                     // The parameter at `pi` is gone and the next one shifted into its place, so do
@@ -292,10 +292,10 @@ const Builder = struct {
 
     /// Repoint every cached reference to `from` (a value just folded into `to`, its defining
     /// instruction dropped and every use existing *at this moment* already fixed by
-    /// `replaceAllUses`) across both of `Builder`'s value caches: `entry_memo` (a block's resolved
+    /// `replaceAllLiveUses`) across both of `Builder`'s value caches: `entry_memo` (a block's resolved
     /// entry value, which `removeTrivialPhi` can collapse straight to a raw predecessor value) and
     /// `local_end` (Phase 1's snapshot of each block's last store, which can itself be a promotable
-    /// load's result). Neither cache is part of the IR, so `replaceAllUses` cannot see into it - a
+    /// load's result). Neither cache is part of the IR, so `replaceAllLiveUses` cannot see into it - a
     /// cache entry equal to `from` is only patched here. This matters because both caches are read
     /// lazily and repeatedly as `rewrite` walks blocks in index order: `readEntry`/`readEndOfBlock`
     /// can hand a cached value back out to build a *new* edge argument or replacement long after
@@ -448,7 +448,7 @@ const Builder = struct {
                             break :blk v;
                         };
                         const result = self.func.instResult(inst).?;
-                        self.func.replaceAllUses(result, val);
+                        self.func.replaceAllLiveUses(result, val);
                         // `local_end`/`entry_memo` may have snapshotted this very load's result
                         // (e.g. `store (load a_slot), r_slot`, Phase 1's `local_end[r_slot, block]`)
                         // before this promotion dropped it. Repoint so a later cache read (an
