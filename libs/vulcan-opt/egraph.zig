@@ -709,11 +709,12 @@ fn foldAddBitwiseDifference(graph: *Graph, outer_class: u32, addition: OpNode, b
     return graph.merge(outer_class, replacement);
 }
 
-fn foldXorCarryOrientation(graph: *Graph, outer_class: u32, exclusive_class: u32, carry_class: u32, ty: Type, exclusives: *std.ArrayList(OpNode), carries: *std.ArrayList(OpNode), intersections: *std.ArrayList(OpNode)) !bool {
+fn foldXorCarryOrientation(graph: *Graph, outer_class: u32, exclusive_class: u32, carry_class: u32, ty: Type, exclusives: *std.ArrayList(OpNode), carries: *std.ArrayList(OpNode), intersections: *std.ArrayList(OpNode)) !?bool {
     exclusives.clearRetainingCapacity();
     carries.clearRetainingCapacity();
     try matchingOps(graph, exclusive_class, .bit_xor, ty, exclusives);
     try matchingOps(graph, carry_class, .add, ty, carries);
+    var matched = false;
     var changed = false;
     for (exclusives.items) |exclusive| for (carries.items) |carry| {
         if (graph.find(carry.lhs) != graph.find(carry.rhs)) continue;
@@ -721,6 +722,7 @@ fn foldXorCarryOrientation(graph: *Graph, outer_class: u32, exclusive_class: u32
         try matchingOps(graph, carry.lhs, .bit_and, ty, intersections);
         for (intersections.items) |intersection| {
             if (!sameClassOperands(graph, exclusive, intersection)) continue;
+            matched = true;
             const replacement = try graph.addOp(.{
                 .op = .add,
                 .lhs = exclusive.lhs,
@@ -732,18 +734,25 @@ fn foldXorCarryOrientation(graph: *Graph, outer_class: u32, exclusive_class: u32
         }
         if (graph.hit_limit) break;
     };
-    return changed;
+    return if (matched) changed else null;
 }
 
-fn foldXorCarry(graph: *Graph, outer_class: u32, outer: OpNode, exclusives: *std.ArrayList(OpNode), carries: *std.ArrayList(OpNode), intersections: *std.ArrayList(OpNode)) !bool {
+fn foldXorCarry(graph: *Graph, outer_class: u32, outer: OpNode, exclusives: *std.ArrayList(OpNode), carries: *std.ArrayList(OpNode), intersections: *std.ArrayList(OpNode)) !?bool {
+    var matched = false;
     var changed = false;
     if (classHasOp(graph, outer.lhs, .bit_xor) and classHasOp(graph, outer.rhs, .add)) {
-        changed = try foldXorCarryOrientation(graph, outer_class, outer.lhs, outer.rhs, outer.ty, exclusives, carries, intersections) or changed;
+        if (try foldXorCarryOrientation(graph, outer_class, outer.lhs, outer.rhs, outer.ty, exclusives, carries, intersections)) |orientation_changed| {
+            matched = true;
+            changed = orientation_changed or changed;
+        }
     }
     if (!graph.hit_limit and classHasOp(graph, outer.rhs, .bit_xor) and classHasOp(graph, outer.lhs, .add)) {
-        changed = try foldXorCarryOrientation(graph, outer_class, outer.rhs, outer.lhs, outer.ty, exclusives, carries, intersections) or changed;
+        if (try foldXorCarryOrientation(graph, outer_class, outer.rhs, outer.lhs, outer.ty, exclusives, carries, intersections)) |orientation_changed| {
+            matched = true;
+            changed = orientation_changed or changed;
+        }
     }
-    return changed;
+    return if (matched) changed else null;
 }
 
 fn foldNestedIdempotent(graph: *Graph, outer_class: u32, outer: OpNode, matches: *std.ArrayList(OpNode)) !?bool {
@@ -1043,6 +1052,12 @@ fn saturate(graph: *Graph) !void {
                     changed = rule_changed or changed;
                 }
             }
+            if (sum.op == .add and graph.op_mask & opBit(.bit_xor) != 0) {
+                if (try foldXorCarry(graph, entry.class, sum, left, right, nested_matches)) |rule_changed| {
+                    direct_match = true;
+                    changed = rule_changed or changed;
+                }
+            }
             // A direct reduction already introduces the remaining associative expression. Let
             // the eager walk process that smaller expression instead of expanding this node first.
             if (!direct_match and isAssociative(sum.op) and classHasOp(graph, sum.lhs, sum.op)) {
@@ -1080,9 +1095,6 @@ fn saturate(graph: *Graph) !void {
                     changed = try cancelAddedSubtractions(graph, entry.class, a, b) or changed;
                     if (graph.hit_limit) break;
                 };
-            }
-            if (sum.op == .add and graph.op_mask & opBit(.bit_xor) != 0) {
-                changed = try foldXorCarry(graph, entry.class, sum, left, right, nested_matches) or changed;
             }
             if ((sum.op == .add or sum.op == .sub) and hasBitwiseArithmeticChildren(graph, sum)) {
                 left.clearRetainingCapacity();
