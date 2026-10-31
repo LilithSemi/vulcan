@@ -60,10 +60,12 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     var consts2 = try allocator.alloc(?i64, func.valueCount());
     defer allocator.free(consts2);
     @memset(consts2, null);
-    for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
-        if (func.opcode(inst) == .iconst) {
-            if (func.instResult(inst)) |r| consts2[@backingInt(r)] = func.opcode(inst).iconst;
+    for (0..func.blockCount()) |bi| {
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            if (func.opcode(inst) == .iconst) {
+                if (func.instResult(inst)) |r| consts2[@backingInt(r)] = func.opcode(inst).iconst;
+            }
         }
     }
     if (try signedPow2Phase(allocator, func, consts2)) changed = true;
@@ -79,56 +81,60 @@ pub fn shiftPhase(allocator: std.mem.Allocator, func: *Function) pass.Error!bool
     var consts = try allocator.alloc(?i64, func.valueCount());
     defer allocator.free(consts);
     @memset(consts, null);
-    for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
-        if (func.opcode(inst) == .iconst) {
-            if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
+    for (0..func.blockCount()) |bi| {
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            if (func.opcode(inst) == .iconst) {
+                if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
+            }
         }
     }
 
     var changed = false;
-    for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @fromBackingInt(@intCast(i));
-        // Extract (op, x, c) where `c` is the constant operand, or skip.
-        var op: BinOp = undefined;
-        var x: Value = undefined;
-        var c: i64 = undefined;
-        switch (func.opcode(inst)) {
-            .arith_imm => |a| {
-                op = a.op;
-                x = a.lhs;
-                c = a.imm;
-            },
-            .arith => |a| {
-                op = a.op;
-                if (a.op == .mul) { // commutative: either operand may be the constant
-                    if (consts[@backingInt(a.rhs)]) |cc| {
-                        x = a.lhs;
-                        c = cc;
-                    } else if (consts[@backingInt(a.lhs)]) |cc| {
-                        x = a.rhs;
-                        c = cc;
-                    } else continue;
-                } else if (a.op == .div or a.op == .rem) { // only the divisor (rhs)
+    for (0..func.blockCount()) |bi| {
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            // Extract (op, x, c) where `c` is the constant operand, or skip.
+            var op: BinOp = undefined;
+            var x: Value = undefined;
+            var c: i64 = undefined;
+            switch (func.opcode(inst)) {
+                .arith_imm => |a| {
+                    op = a.op;
                     x = a.lhs;
-                    c = consts[@backingInt(a.rhs)] orelse continue;
-                } else continue;
-            },
-            else => continue,
-        }
-        if (op != .mul and op != .div and op != .rem) continue;
-        const ty = intType(func, x) orelse continue;
-        const k = log2Pow2(c, ty.bits) orelse continue;
+                    c = a.imm;
+                },
+                .arith => |a| {
+                    op = a.op;
+                    if (a.op == .mul) { // commutative: either operand may be the constant
+                        if (consts[@backingInt(a.rhs)]) |cc| {
+                            x = a.lhs;
+                            c = cc;
+                        } else if (consts[@backingInt(a.lhs)]) |cc| {
+                            x = a.rhs;
+                            c = cc;
+                        } else continue;
+                    } else if (a.op == .div or a.op == .rem) { // only the divisor (rhs)
+                        x = a.lhs;
+                        c = consts[@backingInt(a.rhs)] orelse continue;
+                    } else continue;
+                },
+                else => continue,
+            }
+            if (op != .mul and op != .div and op != .rem) continue;
+            const ty = intType(func, x) orelse continue;
+            const k = log2Pow2(c, ty.bits) orelse continue;
 
-        const new: ?Opcode = switch (op) {
-            .mul => .{ .arith_imm = .{ .op = .shl, .lhs = x, .imm = @as(i64, k) } },
-            .div => if (ty.signedness == .unsigned) Opcode{ .arith_imm = .{ .op = .shr, .lhs = x, .imm = @as(i64, k) } } else null,
-            .rem => if (ty.signedness == .unsigned) Opcode{ .arith_imm = .{ .op = .bit_and, .lhs = x, .imm = @bitCast((@as(u64, 1) << k) - 1) } } else null,
-            else => null,
-        };
-        if (new) |n| {
-            func.opcodeMut(inst).* = n;
-            changed = true;
+            const new: ?Opcode = switch (op) {
+                .mul => .{ .arith_imm = .{ .op = .shl, .lhs = x, .imm = @as(i64, k) } },
+                .div => if (ty.signedness == .unsigned) Opcode{ .arith_imm = .{ .op = .shr, .lhs = x, .imm = @as(i64, k) } } else null,
+                .rem => if (ty.signedness == .unsigned) Opcode{ .arith_imm = .{ .op = .bit_and, .lhs = x, .imm = @bitCast((@as(u64, 1) << k) - 1) } } else null,
+                else => null,
+            };
+            if (new) |n| {
+                func.opcodeMut(inst).* = n;
+                changed = true;
+            }
         }
     }
 
@@ -701,6 +707,20 @@ test "non-power-of-two multiply is left alone" {
     const y = try func.appendArithImm(b, t, .mul, x, 3);
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
     try testing.expect(!try runOnce(allocator, &func));
+}
+
+test "strength reduction skips instructions removed from blocks" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const orphan = try func.createInst(t, .{ .arith_imm = .{ .op = .mul, .lhs = x, .imm = 8 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
+
+    try testing.expect(!try runOnce(allocator, &func));
+    try testing.expectEqual(BinOp.mul, func.opcode(func.definingInst(orphan).?).arith_imm.op);
 }
 
 test "arith form: x * (iconst 16) reduces via the constant operand" {
