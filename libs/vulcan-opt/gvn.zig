@@ -38,8 +38,11 @@ fn isCommutative(op: ir.function.BinOp) bool {
 }
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
-    const n = func.blockCount();
-    if (n == 0) return false;
+    // CSE needs at least two numberable expressions. Most tiny helpers do not
+    // reach that threshold, so avoid building CFG, dominator, RPO, defining-block,
+    // canonical-value, and hash-table state for them. On larger functions this
+    // scan normally stops after the first couple of instructions.
+    if (!hasDuplicateCandidate(func)) return false;
 
     const doms = try analyses.dominators();
     const rpo = try analyses.reversePostorder();
@@ -75,6 +78,36 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 
     if (changed) rewriteOperands(func, canon);
     return changed;
+}
+
+fn hasDuplicateCandidate(func: *const Function) bool {
+    var found_one = false;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (func.instResult(inst) == null) continue;
+            const numberable = switch (func.opcode(inst)) {
+                .fconst,
+                .fconst128,
+                .arith,
+                .arith_imm,
+                .icmp,
+                .select,
+                .convert,
+                .unary,
+                .extract,
+                .global_addr,
+                .dot,
+                .reduce,
+                .splat,
+                => true,
+                else => false,
+            };
+            if (!numberable) continue;
+            if (found_one) return true;
+            found_one = true;
+        }
+    }
+    return false;
 }
 
 /// Build the canonical key for `inst` (whose result is `result`), or null if the
@@ -271,6 +304,26 @@ test "cse reuses a redundant arithmetic expression" {
     const rdef = func.definingInst(r).?;
     try std.testing.expectEqual(e1, func.opcode(rdef).arith.lhs);
     try std.testing.expectEqual(e1, func.opcode(rdef).arith.rhs);
+}
+
+test "gvn skips analyses when fewer than two expressions can be numbered" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32_t);
+    const y = try func.appendInst(b, i32_t, .{ .arith_imm = .{ .op = .add, .lhs = x, .imm = 1 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+    try std.testing.expect(analyses.cfg_cache == null);
+    try std.testing.expect(analyses.rpo_cache == null);
+    try std.testing.expect(analyses.def_blocks == null);
+    try std.testing.expect(analyses.doms == null);
 }
 
 test "cse does not reuse across a non-dominating block" {
