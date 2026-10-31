@@ -946,11 +946,10 @@ fn saturate(graph: *Graph) !void {
     var iter: usize = 0;
     while (iter < graph.limits.max_iters and !graph.hit_limit) : (iter += 1) {
         var changed = try graph.rebuildIfNeeded();
-        const count = graph.nodes.items.len;
         var node_index: usize = 0;
-        while (node_index < count) : (node_index += 1) {
-            // Rules append nodes and may reallocate the ArrayList. Fetch each
-            // original entry by index instead of retaining a slice into it.
+        while (node_index < graph.nodes.items.len) : (node_index += 1) {
+            // Rules append nodes and may reallocate the ArrayList. Fetch each entry by index
+            // instead of retaining a slice, and process new nodes in the same saturation round.
             const entry = graph.nodes.items[node_index];
             const sum = switch (entry.node) {
                 .op => |op| if (isAssociative(op.op) or factorInner(op.op) != null or cancellationInner(op.op) != null or absorptionInner(op.op) != null) canonical(graph, op) else continue,
