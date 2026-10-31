@@ -281,6 +281,13 @@ fn isInteger(func: *const Function, value: Value) bool {
     };
 }
 
+fn hasOptimizableRoots(term: ir.function.Terminator) bool {
+    return switch (term) {
+        .ret => |ret| ret.count != 0,
+        .jump => |jump| jump.args.len != 0,
+    };
+}
+
 /// Whether flattening an associative `outer` tree rooted at `value` finds at
 /// least two terms headed by `inner`. Saturation can rotate those terms next to
 /// one another and let the ordinary factoring rule inspect them. A fixed local
@@ -959,6 +966,7 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         const term = func.terminator(block) orelse continue;
+        if (!hasOptimizableRoots(term)) continue;
         if (!hasFactorCandidate(func, block)) continue;
         graph.reset();
         if (classes_storage == null) {
@@ -1107,6 +1115,13 @@ fn expectAddedSubtractionCancellation(cancel_subtrahend: bool) !void {
         try std.testing.expectEqual(c, reduced.lhs);
         try std.testing.expectEqual(b, reduced.rhs);
     }
+}
+
+test "egraph recognizes terminators without optimizable roots" {
+    try std.testing.expect(!hasOptimizableRoots(.{ .ret = ir.function.Ret.none() }));
+    try std.testing.expect(hasOptimizableRoots(.{ .ret = ir.function.Ret.one(@fromBackingInt(0)) }));
+    try std.testing.expect(!hasOptimizableRoots(.{ .jump = .{ .target = @fromBackingInt(0), .args = .{ .start = 0, .len = 0 } } }));
+    try std.testing.expect(hasOptimizableRoots(.{ .jump = .{ .target = @fromBackingInt(0), .args = .{ .start = 0, .len = 1 } } }));
 }
 
 test "egraph hash-consing follows merged child classes" {
