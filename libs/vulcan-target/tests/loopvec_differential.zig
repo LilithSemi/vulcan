@@ -153,10 +153,56 @@ fn buildSumReductionI32(func: *Function) !void {
     func.setTerminator(done, .{ .ret = ir.function.Ret.one(rs) });
 }
 
+/// Frontend-shaped three-point stencil with a stored map result and XOR checksum reduction.
+fn buildStencil(func: *Function) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const latch = try func.appendBlock();
+    const done = try func.appendBlock();
+    const input = try func.appendBlockParam(entry, ptr_t);
+    const output = try func.appendBlockParam(entry, ptr_t);
+    const count = try func.appendBlockParam(entry, u32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const one = try func.appendInst(entry, u32_t, .{ .iconst = 1 });
+    try func.setJump(entry, header, &.{ one, zero });
+    const index = try func.appendBlockParam(header, u32_t);
+    const checksum = try func.appendBlockParam(header, i32_t);
+    const next = try func.appendArithImm(header, u32_t, .add, index, 1);
+    const cond = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = next, .rhs = count } });
+    try func.appendIf(header, cond, .{ .target = body }, .{ .target = done });
+
+    var values: [3]ir.function.Value = undefined;
+    for ([_]i64{ -1, 0, 1 }, 0..) |bias, lane| {
+        const neighbour = if (bias == 0) index else try func.appendArithImm(body, u32_t, .add, index, bias);
+        const wide = try func.appendInst(body, i64_t, .{ .convert = .{ .value = neighbour } });
+        const offset = try func.appendArithImm(body, i64_t, .shl, wide, 2);
+        const address = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = input, .rhs = offset } });
+        values[lane] = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = address } });
+    }
+    const doubled = try func.appendArithImm(body, i32_t, .shl, values[1], 1);
+    const partial = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = values[0], .rhs = doubled } });
+    const value = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = partial, .rhs = values[2] } });
+    const out_wide = try func.appendInst(body, i64_t, .{ .convert = .{ .value = index } });
+    const out_offset = try func.appendArithImm(body, i64_t, .shl, out_wide, 2);
+    const out_address = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = output, .rhs = out_offset } });
+    try func.appendStore(body, value, out_address);
+    const updated = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .bit_xor, .lhs = checksum, .rhs = value } });
+    try func.setJump(body, latch, &.{});
+    try func.setJump(latch, header, &.{ next, updated });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(checksum) });
+}
+
 const Builder = *const fn (*Function) anyerror!void;
 const SaxpyFn = *const fn (x: [*]f32, y: [*]f32, a: f32, n: i32) callconv(.c) void;
 const SumFn = *const fn (a: [*]f32, n: i32) callconv(.c) f32;
 const SumFnI32 = *const fn (a: [*]i32, n: i32) callconv(.c) i32;
+const StencilFn = *const fn (input: [*]const i32, output: [*]i32, n: u32) callconv(.c) i32;
 
 /// Transform: apply loopvec only, or the full microarch pipeline (so SLP widens the body too).
 const Mode = enum { loopvec_only, full };
@@ -313,6 +359,41 @@ test "loopvec differential: i32 sum reduction (vector accumulator), all trip cou
         var arr: [128]i32 = undefined;
         for (0..128) |k| arr[k] = @intCast((k % 7) + 1);
         try std.testing.expectEqual(f_o(&arr, n), f_t(&arr, n));
+    }
+}
+
+test "loopvec differential: stencil map plus xor reduction, all trip counts" {
+    if (comptime !hasJit()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const trip_counts = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 17, 100 };
+
+    var orig = Function.init(allocator);
+    defer orig.deinit();
+    try buildStencil(&orig);
+    var tuned = Function.init(allocator);
+    defer tuned.deinit();
+    try buildStencil(&tuned);
+    _ = try opt.microarch.optimize(allocator, &tuned, ampere());
+
+    var diags = try ir.verify.verify(allocator, &tuned, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+
+    var buf_o = try target.native.jitFunction(allocator, &orig);
+    defer buf_o.deinit();
+    var buf_t = try target.native.jitFunction(allocator, &tuned);
+    defer buf_t.deinit();
+    const f_o = buf_o.entry(StencilFn, 0);
+    const f_t = buf_t.entry(StencilFn, 0);
+
+    var input: [128]i32 = undefined;
+    for (0..128) |k| input[k] = @as(i32, @intCast((k * 17 + 3) % 101)) - 50;
+    for (trip_counts) |n| {
+        var out_o: [128]i32 = undefined;
+        @memset(&out_o, 0x13579);
+        var out_t = out_o;
+        try std.testing.expectEqual(f_o(&input, &out_o, n), f_t(&input, &out_t, n));
+        try std.testing.expectEqualSlices(i32, &out_o, &out_t);
     }
 }
 

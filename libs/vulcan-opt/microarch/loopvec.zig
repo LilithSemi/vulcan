@@ -2,8 +2,7 @@
 //! regenerating each array access as `base_i + m*stride` (the `arith_imm add base, CONST` form the SLP
 //! pass recognizes), and keeps the original loop as a scalar remainder. The subsequent SLP pass
 //! (`vectorize.runModel`) then fuses the V-wide body into vector loads/ops/stores. So this pass owns
-//! only the STRUCTURE and the strided-address analysis; SLP owns the arithmetic widening. See
-//! loop-vectorizer-spec in memory.
+//! only the structure and the strided-address analysis. SLP owns the arithmetic widening.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -23,7 +22,15 @@ pub const Error = std.mem.Allocator.Error;
 /// One contiguous (unit-stride) array access in the body: `addr = base + i*stride`, stride == the
 /// element's byte size. `addr_inst` is the `base + off` instruction (regenerated per copy);
 /// `scale_inst` is the `i*stride` computation (skipped when cloning, since addresses are regenerated).
-const ArrayAccess = struct { base: Value, stride: i64, addr_inst: Inst, scale_inst: Inst, is_store: bool };
+const ArrayAccess = struct { base: Value, stride: i64, offset: i64, addr_inst: Inst, scale_inst: Inst, is_store: bool };
+const AccessBase = struct { base: Value, stride: i64 };
+
+const MapReduction = struct {
+    accumulator: usize,
+    update_inst: Inst,
+    increment: Value,
+    op: BinOp,
+};
 
 const Plan = struct {
     header: Block,
@@ -31,12 +38,14 @@ const Plan = struct {
     latch: Block,
     preheader: Block,
     exit_cond: CmpOp,
+    exit_offset: i64,
     bound: Value,
     induction: usize,
     induction_alias: Value,
     induction_update: Inst,
     step: i64,
     accesses: []ArrayAccess, // owned
+    reduction: ?MapReduction,
     factor: u32, // V
 };
 
@@ -77,28 +86,114 @@ fn functionHasFastMath(func: *const Function) bool {
 fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error!void {
     const V = plan.factor;
     const ind_ty = func.valueType(func.blockParams(plan.header)[plan.induction]);
+    const reduction_ty = if (plan.reduction) |red| func.valueType(func.blockParams(plan.header)[red.accumulator]) else null;
+    const reduction_vec_ty = if (reduction_ty) |elem|
+        try func.types.intern(.{ .vector = .{ .len = @intCast(V), .elem = elem } })
+    else
+        null;
+    const bool_t = try func.types.intern(.bool);
+    const ind_int = switch (func.types.type_kind(ind_ty)) {
+        .int => |int| int,
+        else => unreachable,
+    };
+    const group_offset: ?i64 = std.math.add(i64, @as(i64, @intCast(V - 1)), plan.exit_offset) catch null;
+    const offset_fits = group_offset != null and group_offset.? >= 0 and ind_int.bits < 64 and
+        @as(u64, @intCast(group_offset.?)) < (@as(u64, 1) << @intCast(ind_int.bits));
+    const rotated = ind_int.signedness == .unsigned and offset_fits;
 
     const mainheader = try func.appendBlock();
-    const mainbody = try func.appendBlock();
+    const mainbody = if (rotated) mainheader else try func.appendBlock();
     const combine = try func.appendBlock();
     const mi = try func.appendBlockParam(mainheader, ind_ty);
+    const macc = if (reduction_vec_ty) |vec_ty|
+        try func.appendBlockParam(mainheader, vec_ty)
+    else
+        null;
 
     // Preheader -> main header, carrying the induction's initial value.
-    const init_i = func.blockArgs(func.terminator(plan.preheader).?.jump)[plan.induction];
-    try func.setJump(plan.preheader, mainheader, &.{init_i});
+    const pre_args = func.blockArgs(func.terminator(plan.preheader).?.jump);
+    const init_i = pre_args[plan.induction];
+    const init_acc = if (plan.reduction) |red| pre_args[red.accumulator] else null;
+    const vector_identity = if (plan.reduction) |red| identity: {
+        const scalar = try identityConst(func, plan.preheader, red.op, reduction_ty.?);
+        break :identity try func.appendSplat(plan.preheader, reduction_vec_ty.?, scalar);
+    } else null;
+    const threshold = if (ind_int.signedness == .unsigned and offset_fits)
+        try func.appendArithImm(plan.preheader, ind_ty, .sub, plan.bound, group_offset.?)
+    else
+        null;
+    if (threshold != null) {
+        const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const wide_bound = try func.appendInst(plan.preheader, u64_t, .{ .convert = .{ .value = plan.bound } });
+        const wide_highest = if (constOf(func, init_i)) |constant| constant: {
+            const mask = (@as(u64, 1) << @intCast(ind_int.bits)) - 1;
+            const init_bits = @as(u64, @bitCast(constant)) & mask;
+            const highest = init_bits + @as(u64, @intCast(group_offset.?));
+            break :constant try func.appendInst(plan.preheader, u64_t, .{ .iconst = @bitCast(highest) });
+        } else highest: {
+            const wide_i = try func.appendInst(plan.preheader, u64_t, .{ .convert = .{ .value = init_i } });
+            break :highest try func.appendArithImm(plan.preheader, u64_t, .add, wide_i, group_offset.?);
+        };
+        const reverse: CmpOp = if (plan.exit_cond == .lt) .gt else .ge;
+        const can_enter = try func.appendInst(plan.preheader, bool_t, .{ .icmp = .{ .op = reverse, .lhs = wide_bound, .rhs = wide_highest } });
+        if (vector_identity) |identity|
+            try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{ init_i, identity } }, .{ .target = plan.header, .args = pre_args })
+        else
+            try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{init_i} }, .{ .target = plan.header, .args = pre_args });
+    } else if (vector_identity) |identity| {
+        try func.setJump(plan.preheader, mainheader, &.{ init_i, identity });
+    } else {
+        try func.setJump(plan.preheader, mainheader, &.{init_i});
+    }
 
     // Main header: run a full group only while the highest index in it still passes the test.
-    const highest = try func.appendArithImm(mainheader, ind_ty, .add, mi, @as(i64, @intCast(V - 1)));
-    const bool_t = try func.types.intern(.bool);
-    const cont = try func.appendInst(mainheader, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = highest, .rhs = plan.bound } });
-    try func.appendIf(mainheader, cont, .{ .target = mainbody, .args = &.{mi} }, .{ .target = combine, .args = &.{mi} });
+    const cont = if (rotated)
+        null
+    else if (ind_int.signedness == .unsigned and ind_int.bits < 64 and group_offset != null) guard: {
+        // Compare in u64 so one bound check also proves both additions cannot wrap in the
+        // induction type. The old form needed a compare for the bound and one for each add.
+        const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const wide_i = try func.appendInst(mainheader, u64_t, .{ .convert = .{ .value = mi } });
+        // The bound is loop invariant. Widen it in the preheader instead of on every group.
+        const wide_bound = try func.appendInst(plan.preheader, u64_t, .{ .convert = .{ .value = plan.bound } });
+        const wide_highest = try func.appendArithImm(mainheader, u64_t, .add, wide_i, group_offset.?);
+        break :guard try func.appendInst(mainheader, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = wide_highest, .rhs = wide_bound } });
+    } else guard: {
+        const highest_lane = try func.appendArithImm(mainheader, ind_ty, .add, mi, @as(i64, @intCast(V - 1)));
+        const highest = if (plan.exit_offset == 0)
+            highest_lane
+        else
+            try func.appendArithImm(mainheader, ind_ty, .add, highest_lane, plan.exit_offset);
+        var guarded = try func.appendInst(mainheader, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = highest, .rhs = plan.bound } });
+        if (ind_int.signedness == .unsigned) {
+            const lane_nowrap = try func.appendInst(mainheader, bool_t, .{ .icmp = .{ .op = .ge, .lhs = highest_lane, .rhs = mi } });
+            guarded = try func.appendInst(mainheader, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = guarded, .rhs = lane_nowrap } });
+            if (plan.exit_offset > 0) {
+                const offset_nowrap = try func.appendInst(mainheader, bool_t, .{ .icmp = .{ .op = .ge, .lhs = highest, .rhs = highest_lane } });
+                guarded = try func.appendInst(mainheader, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = guarded, .rhs = offset_nowrap } });
+            }
+        }
+        break :guard guarded;
+    };
+    if (cont) |condition| {
+        if (macc) |acc|
+            try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{ mi, acc } }, .{ .target = combine, .args = &.{ mi, acc } })
+        else
+            try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{mi} }, .{ .target = combine, .args = &.{mi} });
+    }
 
     // Main body: V copies emitted OP-MAJOR (all V copies of each instruction adjacently), which is
     // the run of contiguous same-op instructions the SLP pass fuses into vectors. Per unique address,
     // base_i = base + bmi*stride computed once; copy m reads/writes base_i + m*stride. Each copy's
     // induction maps to bmi+m, so pure body computation may observe the raw index too. The original
     // address/scale/induction-update instructions are skipped when cloning.
-    const bmi = try func.appendBlockParam(mainbody, ind_ty);
+    const bmi = if (rotated) mi else try func.appendBlockParam(mainbody, ind_ty);
+    const bacc = if (rotated)
+        macc
+    else if (reduction_vec_ty) |vec_ty|
+        try func.appendBlockParam(mainbody, vec_ty)
+    else
+        null;
     const ind_update = plan.induction_update;
     const base_ty = func.valueType(plan.accesses[0].base);
 
@@ -113,7 +208,10 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     const i_alias = plan.induction_alias;
     var skip: std.AutoHashMapUnmanaged(Inst, void) = .empty;
     defer skip.deinit(allocator);
+    var access_bases: std.AutoHashMapUnmanaged(AccessBase, Value) = .empty;
+    defer access_bases.deinit(allocator);
     try skip.put(allocator, ind_update, {});
+    if (plan.reduction) |red| try skip.put(allocator, red.update_inst, {});
     for (vmaps, 0..) |*vm, m| {
         const lane_i = if (m == 0)
             bmi
@@ -126,8 +224,16 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         try skip.put(allocator, acc.scale_inst, {});
         const addr_res = func.instResult(acc.addr_inst).?;
         if (vmaps[0].contains(addr_res)) continue; // already handled via a shared address instruction
-        const scaled = try func.appendArithImm(mainbody, base_ty, .mul, bmi, acc.stride);
-        const base_i = try func.appendInst(mainbody, base_ty, .{ .arith = .{ .op = .add, .lhs = acc.base, .rhs = scaled } });
+        const entry = try access_bases.getOrPut(allocator, .{ .base = acc.base, .stride = acc.stride });
+        if (!entry.found_existing) {
+            const scaled = try func.appendArithImm(mainbody, base_ty, .mul, bmi, acc.stride);
+            entry.value_ptr.* = try func.appendInst(mainbody, base_ty, .{ .arith = .{ .op = .add, .lhs = acc.base, .rhs = scaled } });
+        }
+        const unadjusted = entry.value_ptr.*;
+        const base_i = if (acc.offset == 0)
+            unadjusted
+        else
+            try func.appendArithImm(mainbody, base_ty, .add, unadjusted, acc.offset);
         for (vmaps, 0..) |*vm, m| {
             const addr = try func.appendArithImm(mainbody, base_ty, .add, base_i, @as(i64, @intCast(m)) * acc.stride);
             try vm.put(allocator, addr_res, addr);
@@ -170,13 +276,39 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     }
 
     try func.cloneAttrs(value_pairs.items, inst_pairs.items);
+    const next_acc = if (plan.reduction) |red| acc: {
+        var increments: std.ArrayList(Value) = .empty;
+        defer increments.deinit(allocator);
+        for (vmaps) |*vm| try increments.append(allocator, vm.get(red.increment) orelse red.increment);
+        const group = try func.appendInst(mainbody, reduction_vec_ty.?, .{ .struct_new = .{ .fields = try func.internValues(increments.items) } });
+        break :acc try func.appendInst(mainbody, reduction_vec_ty.?, .{ .arith = .{ .op = red.op, .lhs = bacc.?, .rhs = group } });
+    } else null;
     const nmi = try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(V)));
-    try func.setJump(mainbody, mainheader, &.{nmi});
+    if (rotated) {
+        const next_cont = try func.appendInst(mainbody, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = nmi, .rhs = threshold.? } });
+        if (next_acc) |acc|
+            try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{ nmi, acc } }, .{ .target = combine, .args = &.{ nmi, acc } })
+        else
+            try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{nmi} }, .{ .target = combine, .args = &.{nmi} });
+    } else if (next_acc) |acc| {
+        try func.setJump(mainbody, mainheader, &.{ nmi, acc });
+    } else {
+        try func.setJump(mainbody, mainheader, &.{nmi});
+    }
 
-    // Combine: nothing to reduce for a map loop; fall into the ORIGINAL loop (remainder) at the current
-    // index. The original loop's header params were exactly [induction].
+    // Continue in the original loop at the current index and accumulator value.
     const cmi = try func.appendBlockParam(combine, ind_ty);
-    try func.setJump(combine, plan.header, &.{cmi});
+    if (plan.reduction) |red| {
+        const cacc = try func.appendBlockParam(combine, reduction_vec_ty.?);
+        const horizontal = try func.appendReduce(combine, red.op, cacc);
+        const scalar_acc = try func.appendInst(combine, reduction_ty.?, .{ .arith = .{ .op = red.op, .lhs = init_acc.?, .rhs = horizontal } });
+        var rem_args: [2]Value = undefined;
+        rem_args[plan.induction] = cmi;
+        rem_args[red.accumulator] = scalar_acc;
+        try func.setJump(combine, plan.header, &rem_args);
+    } else {
+        try func.setJump(combine, plan.header, &.{cmi});
+    }
 }
 
 fn rv(vmap: *const std.AutoHashMapUnmanaged(Value, Value), v: Value) Value {
@@ -278,28 +410,76 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     if (body_args.len != 0 and body_args.len != hparams.len) return null;
     if (body_args.len != 0) for (body_args, hparams) |arg, hp| if (arg != hp) return null;
 
-    // Phase 1: only the induction is carried (no reductions).
-    if (hparams.len != 1) return null;
+    // A map may carry only its induction, or an integer reduction accumulator whose per-lane
+    // increment is computed by the same body. The latter covers map+store+checksum loops without
+    // dropping the store as the reduction-only path would.
+    if (hparams.len != 1 and hparams.len != 2) return null;
     const cmp = switch (func.opcode(func.definingInst(cf.cond) orelse return null)) {
         .icmp => |c| c,
         else => return null,
     };
     if (cmp.op != .lt and cmp.op != .le) return null;
-    const induction = paramIndex(hparams, cmp.lhs) orelse return null;
+    var induction: ?usize = null;
+    var exit_offset: i64 = 0;
+    for (hparams, 0..) |param, index| {
+        if (cmp.lhs == param) {
+            induction = index;
+            break;
+        }
+        if (constAddend(func, cmp.lhs, param)) |offset| {
+            induction = index;
+            exit_offset = offset;
+            break;
+        }
+    }
+    const induction_index = induction orelse return null;
+    if (exit_offset < 0) return null;
     if (definedInLoop(func, loop, cmp.rhs)) return null;
     const bound = cmp.rhs;
 
     const bparams = func.blockParams(bodyb);
     if (body_args.len == 0 and bparams.len != 0) return null;
-    const i_alias = if (body_args.len == 0) hparams[induction] else bparams[induction];
+    const i_alias = if (body_args.len == 0) hparams[induction_index] else bparams[induction_index];
     const back_args = func.blockArgs(func.terminator(latchb).?.jump);
-    const step = constAddend(func, back_args[induction], i_alias) orelse return null;
+    const step = constAddend(func, back_args[induction_index], i_alias) orelse return null;
     if (step != 1) return null; // unit induction step: consecutive iterations touch consecutive elements
-    const ind_update = func.definingInst(back_args[induction]) orelse return null;
+    const ind_update = func.definingInst(back_args[induction_index]) orelse return null;
     if (latchb != bodyb) {
         const latch_insts = func.blockInsts(latchb);
-        if (latch_insts.len != 1 or latch_insts[0] != ind_update) return null;
+        if (latch_insts.len == 0) {
+            var in_header = false;
+            for (func.blockInsts(header)) |inst| if (inst == ind_update) {
+                in_header = true;
+                break;
+            };
+            if (!in_header) return null;
+        } else if (latch_insts.len != 1 or latch_insts[0] != ind_update) return null;
     }
+    const reduction: ?MapReduction = if (hparams.len == 2) red: {
+        const accumulator = 1 - induction_index;
+        const acc_alias = if (body_args.len == 0) hparams[accumulator] else bparams[accumulator];
+        const update_inst = func.definingInst(back_args[accumulator]) orelse return null;
+        const update = switch (func.opcode(update_inst)) {
+            .arith => |a| a,
+            else => return null,
+        };
+        const increment = if (update.lhs == acc_alias)
+            update.rhs
+        else if (update.rhs == acc_alias)
+            update.lhs
+        else
+            return null;
+        if (countUses(func, bodyb, acc_alias) != 1) return null;
+        const elem_kind = func.types.type_kind(func.valueType(acc_alias));
+        if (elem_kind != .int or byteSize(func, func.valueType(acc_alias)) * 8 != ELEM_BITS) return null;
+        if (!reorderable(func, back_args[accumulator], update.op, false)) return null;
+        break :red .{
+            .accumulator = accumulator,
+            .update_inst = update_inst,
+            .increment = increment,
+            .op = update.op,
+        };
+    } else null;
     // Every load/store address must be unit-stride contiguous; other ops must be pure compute.
     var accesses: std.ArrayList(ArrayAccess) = .empty;
     errdefer accesses.deinit(allocator);
@@ -317,7 +497,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
                 if (l.@"volatile") return bail(&accesses, allocator);
                 const sa = stridedAddress(func, l.ptr, i_alias) orelse return bail(&accesses, allocator);
                 if (sa.stride != byteSize(func, func.valueType(func.instResult(inst).?))) return bail(&accesses, allocator);
-                try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = false });
+                try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .offset = sa.offset, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = false });
             },
             .store => |s| {
                 // Same reasoning as the `load` arm above: V observable stores must not become one.
@@ -326,13 +506,18 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
                 if (s.@"volatile" or s.mask != null) return bail(&accesses, allocator);
                 const sa = stridedAddress(func, s.ptr, i_alias) orelse return bail(&accesses, allocator);
                 if (sa.stride != byteSize(func, func.valueType(s.value))) return bail(&accesses, allocator);
-                try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = true });
+                try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .offset = sa.offset, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = true });
             },
             .arith, .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .convert, .unary => {},
             else => return bail(&accesses, allocator), // call/alloca/dot/matmul/etc: not handled
         }
     }
     if (accesses.items.len == 0) return bail(&accesses, allocator);
+    if (reduction != null) {
+        var has_store = false;
+        for (accesses.items) |access| has_store = has_store or access.is_store;
+        if (!has_store) return bail(&accesses, allocator);
+    }
 
     return Plan{
         .header = header,
@@ -340,12 +525,14 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         .latch = latchb,
         .preheader = @fromBackingInt(@intCast(preheader)),
         .exit_cond = cmp.op,
+        .exit_offset = exit_offset,
         .bound = bound,
-        .induction = induction,
+        .induction = induction_index,
         .induction_alias = i_alias,
         .induction_update = ind_update,
         .step = step,
         .accesses = try accesses.toOwnedSlice(allocator),
+        .reduction = reduction,
         .factor = V,
     };
 }
@@ -360,7 +547,7 @@ fn paramIndex(params: []const Value, v: Value) ?usize {
     return null;
 }
 
-const Strided = struct { base: Value, stride: i64, addr_inst: Inst, scale_inst: Inst };
+const Strided = struct { base: Value, stride: i64, offset: i64, addr_inst: Inst, scale_inst: Inst };
 
 /// Decompose `addr` as `base + i_alias*stride` (base loop-invariant), or null.
 fn stridedAddress(func: *const Function, addr: Value, i_alias: Value) ?Strided {
@@ -369,32 +556,40 @@ fn stridedAddress(func: *const Function, addr: Value, i_alias: Value) ?Strided {
         .arith => |a| if (a.op == .add) a else return null,
         else => return null,
     };
-    if (scaleOf(func, add.rhs, i_alias)) |sc| return .{ .base = add.lhs, .stride = sc.stride, .addr_inst = addr_inst, .scale_inst = sc.inst };
-    if (scaleOf(func, add.lhs, i_alias)) |sc| return .{ .base = add.rhs, .stride = sc.stride, .addr_inst = addr_inst, .scale_inst = sc.inst };
+    if (scaleOf(func, add.rhs, i_alias)) |sc| return .{ .base = add.lhs, .stride = sc.stride, .offset = sc.offset, .addr_inst = addr_inst, .scale_inst = sc.inst };
+    if (scaleOf(func, add.lhs, i_alias)) |sc| return .{ .base = add.rhs, .stride = sc.stride, .offset = sc.offset, .addr_inst = addr_inst, .scale_inst = sc.inst };
     return null;
 }
 
 /// Recognize `v == i_alias * C` (via `mul` or `shl`), returning the constant stride and the inst.
-fn scaleOf(func: *const Function, v: Value, i_alias: Value) ?struct { stride: i64, inst: Inst } {
+fn scaleOf(func: *const Function, v: Value, i_alias: Value) ?struct { stride: i64, offset: i64, inst: Inst } {
     const di = func.definingInst(v) orelse return null;
     switch (func.opcode(di)) {
         .arith_imm => |a| {
-            if (!isInductionOrConvert(func, a.lhs, i_alias)) return null;
+            const index_offset = inductionOffset(func, a.lhs, i_alias) orelse return null;
             return switch (a.op) {
-                .mul => .{ .stride = a.imm, .inst = di },
-                .shl => .{ .stride = @as(i64, 1) << @intCast(a.imm), .inst = di },
+                .mul => .{ .stride = a.imm, .offset = std.math.mul(i64, index_offset, a.imm) catch return null, .inst = di },
+                .shl => blk: {
+                    if (a.imm < 0 or a.imm >= 63) break :blk null;
+                    const stride = @as(i64, 1) << @intCast(a.imm);
+                    break :blk .{ .stride = stride, .offset = std.math.mul(i64, index_offset, stride) catch return null, .inst = di };
+                },
                 else => null,
             };
         },
         .arith => |a| {
             if (a.op == .mul) {
-                if (isInductionOrConvert(func, a.lhs, i_alias)) {
-                    if (constOf(func, a.rhs)) |c| return .{ .stride = c, .inst = di };
-                } else if (isInductionOrConvert(func, a.rhs, i_alias)) {
-                    if (constOf(func, a.lhs)) |c| return .{ .stride = c, .inst = di };
+                if (inductionOffset(func, a.lhs, i_alias)) |index_offset| {
+                    if (constOf(func, a.rhs)) |c| return .{ .stride = c, .offset = std.math.mul(i64, index_offset, c) catch return null, .inst = di };
+                } else if (inductionOffset(func, a.rhs, i_alias)) |index_offset| {
+                    if (constOf(func, a.lhs)) |c| return .{ .stride = c, .offset = std.math.mul(i64, index_offset, c) catch return null, .inst = di };
                 }
-            } else if (a.op == .shl and isInductionOrConvert(func, a.lhs, i_alias)) {
-                if (constOf(func, a.rhs)) |c| return .{ .stride = @as(i64, 1) << @intCast(c), .inst = di };
+            } else if (a.op == .shl) {
+                if (inductionOffset(func, a.lhs, i_alias)) |index_offset| if (constOf(func, a.rhs)) |c| {
+                    if (c < 0 or c >= 63) return null;
+                    const stride = @as(i64, 1) << @intCast(c);
+                    return .{ .stride = stride, .offset = std.math.mul(i64, index_offset, stride) catch return null, .inst = di };
+                };
             }
             return null;
         },
@@ -402,15 +597,32 @@ fn scaleOf(func: *const Function, v: Value, i_alias: Value) ?struct { stride: i6
     }
 }
 
-/// C pointer arithmetic widens a 32-bit induction to pointer width before scaling it. That convert
-/// is still the same affine induction for address analysis; the cloned compute path retains any
-/// independent conversion that is used as data.
-fn isInductionOrConvert(func: *const Function, v: Value, i_alias: Value) bool {
-    if (v == i_alias) return true;
-    const inst = func.definingInst(v) orelse return false;
+/// The constant offset in `v == i_alias + offset`, through the integer-width conversion C pointer
+/// arithmetic inserts. This admits stencil neighbours such as `(i - 1) * 4` while preserving their
+/// byte displacement when the vector body regenerates addresses.
+fn inductionOffset(func: *const Function, v: Value, i_alias: Value) ?i64 {
+    if (v == i_alias) return 0;
+    const inst = func.definingInst(v) orelse return null;
     return switch (func.opcode(inst)) {
-        .convert => |c| c.value == i_alias,
-        else => false,
+        .convert => |c| inductionOffset(func, c.value, i_alias),
+        .arith_imm => |a| blk: {
+            const base = inductionOffset(func, a.lhs, i_alias) orelse break :blk null;
+            break :blk switch (a.op) {
+                .add => std.math.add(i64, base, a.imm) catch null,
+                .sub => std.math.sub(i64, base, a.imm) catch null,
+                else => null,
+            };
+        },
+        .arith => |a| blk: {
+            if (a.op == .add) {
+                if (inductionOffset(func, a.lhs, i_alias)) |base| if (constOf(func, a.rhs)) |c| break :blk std.math.add(i64, base, c) catch null;
+                if (inductionOffset(func, a.rhs, i_alias)) |base| if (constOf(func, a.lhs)) |c| break :blk std.math.add(i64, base, c) catch null;
+            } else if (a.op == .sub) {
+                if (inductionOffset(func, a.lhs, i_alias)) |base| if (constOf(func, a.rhs)) |c| break :blk std.math.sub(i64, base, c) catch null;
+            }
+            break :blk null;
+        },
+        else => null,
     };
 }
 
@@ -898,6 +1110,105 @@ test "frontend-shaped map loop may use the induction value as stored data" {
     func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 
     try testing.expect(try run(allocator, &func, registry.modelFor(.@"ampere-altra")));
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
+test "recognizes a frontend-shaped stencil map with xor reduction and affine neighbours" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const latch = try func.appendBlock();
+    const done = try func.appendBlock();
+    const input = try func.appendBlockParam(entry, ptr_t);
+    const output = try func.appendBlockParam(entry, ptr_t);
+    const count = try func.appendBlockParam(entry, u32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const one = try func.appendInst(entry, u32_t, .{ .iconst = 1 });
+    try func.setJump(entry, header, &.{ one, zero });
+
+    const index = try func.appendBlockParam(header, u32_t);
+    const checksum = try func.appendBlockParam(header, i32_t);
+    const next = try func.appendArithImm(header, u32_t, .add, index, 1);
+    const cond = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = next, .rhs = count } });
+    try func.appendIf(header, cond, .{ .target = body }, .{ .target = done });
+
+    var values: [3]Value = undefined;
+    for ([_]i64{ -1, 0, 1 }, 0..) |bias, lane| {
+        const neighbour = if (bias == 0) index else try func.appendArithImm(body, u32_t, .add, index, bias);
+        const wide = try func.appendInst(body, i64_t, .{ .convert = .{ .value = neighbour } });
+        const offset = try func.appendArithImm(body, i64_t, .shl, wide, 2);
+        const address = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = input, .rhs = offset } });
+        values[lane] = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = address } });
+    }
+    const doubled = try func.appendArithImm(body, i32_t, .shl, values[1], 1);
+    const left_center = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = values[0], .rhs = doubled } });
+    const value = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = left_center, .rhs = values[2] } });
+    const out_wide = try func.appendInst(body, i64_t, .{ .convert = .{ .value = index } });
+    const out_offset = try func.appendArithImm(body, i64_t, .shl, out_wide, 2);
+    const out_address = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = output, .rhs = out_offset } });
+    try func.appendStore(body, value, out_address);
+    const updated = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .bit_xor, .lhs = checksum, .rhs = value } });
+    try func.setJump(body, latch, &.{});
+    try func.setJump(latch, header, &.{ next, updated });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(checksum) });
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    const plan = (try recognize(allocator, &func, registry.modelFor(.@"ampere-altra"), &info.loops[0])) orelse return error.NotRecognized;
+    defer allocator.free(plan.accesses);
+    try testing.expectEqual(@as(i64, 1), plan.exit_offset);
+    try testing.expectEqual(BinOp.bit_xor, plan.reduction.?.op);
+    var saw_left = false;
+    var saw_center = false;
+    var saw_right = false;
+    for (plan.accesses) |access| {
+        saw_left = saw_left or access.offset == -4;
+        saw_center = saw_center or access.offset == 0;
+        saw_right = saw_right or access.offset == 4;
+    }
+    try testing.expect(saw_left and saw_center and saw_right);
+
+    try testing.expect(try run(allocator, &func, registry.modelFor(.@"ampere-altra")));
+    const vector_header: Block = @fromBackingInt(5);
+    var compares: usize = 0;
+    var boolean_ands: usize = 0;
+    var saw_wide_group_offset = false;
+    for (func.blockInsts(vector_header)) |inst| switch (func.opcode(inst)) {
+        .icmp => compares += 1,
+        .arith => |arith| if (arith.op == .bit_and) {
+            boolean_ands += 1;
+        },
+        .arith_imm => |arith| if (arith.op == .add and arith.imm == 4) {
+            const result = func.instResult(inst).?;
+            if (func.types.type_kind(func.valueType(result)) == .int) {
+                const int = func.types.type_kind(func.valueType(result)).int;
+                saw_wide_group_offset = int.signedness == .unsigned and int.bits == 64;
+            }
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), compares);
+    try testing.expectEqual(@as(usize, 0), boolean_ands);
+    try testing.expect(!saw_wide_group_offset);
+    const vector_body = vector_header;
+    var scaled_bases: usize = 0;
+    for (func.blockInsts(vector_body)) |inst| switch (func.opcode(inst)) {
+        .arith_imm => |arith| if (arith.op == .mul) {
+            scaled_bases += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), scaled_bases); // one each for input and output
     var diags = try ir.verify.verify(allocator, &func, .low);
     defer diags.deinit();
     try testing.expect(diags.ok());
