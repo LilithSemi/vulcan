@@ -1463,10 +1463,14 @@ pub const Function = struct {
 
     /// Replace every use of `from` with `to` across instruction operands, `if`
     /// edge arguments, and terminators (an SSA "replace all uses with").
-    /// Definitions are untouched. The caller handles any now-dead `from`.
+    /// Definitions and instructions no longer present in a block are untouched.
+    /// The caller handles any now-dead `from`.
     pub fn replaceAllUses(self: *Function, from: Value, to: Value) void {
-        for (0..self.instCount()) |i| self.replaceUsesInInst(@fromBackingInt(@intCast(i)), from, to);
-        for (0..self.blockCount()) |bi| self.replaceUsesInTerm(@fromBackingInt(@intCast(bi)), from, to);
+        for (0..self.blockCount()) |bi| {
+            const block: Block = @fromBackingInt(@intCast(bi));
+            for (self.blockInsts(block)) |inst| self.replaceUsesInInst(inst, from, to);
+            self.replaceUsesInTerm(block, from, to);
+        }
     }
 
     /// Replace uses of `from` with `to` in ONE block: its instructions, the edge arguments of a
