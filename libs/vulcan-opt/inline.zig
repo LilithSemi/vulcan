@@ -49,15 +49,24 @@ pub const Filter = struct {
 /// Inline every inlinable call in `caller`, repeatedly, up to a cap. Returns
 /// whether anything was inlined.
 pub fn run(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup) Error!bool {
-    return runFiltered(allocator, caller, lookup, null);
+    return runWithPolicy(allocator, caller, lookup, null, true);
+}
+
+/// Inline acyclic callees while keeping loop bodies as separate functions.
+pub fn runAcyclic(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup) Error!bool {
+    return runWithPolicy(allocator, caller, lookup, null, false);
 }
 
 /// Like `run`, but only inline call sites the `filter` permits (e.g. hot ones).
 pub fn runFiltered(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter) Error!bool {
+    return runWithPolicy(allocator, caller, lookup, filter, true);
+}
+
+fn runWithPolicy(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter, inline_cycles: bool) Error!bool {
     var changed = false;
     var budget: usize = 256; // guard against pathological expansion
     while (budget > 0) : (budget -= 1) {
-        if (!try inlineOne(allocator, caller, lookup, filter)) break;
+        if (!try inlineOne(allocator, caller, lookup, filter, inline_cycles)) break;
         changed = true;
     }
     return changed;
@@ -97,7 +106,7 @@ fn inlinable(callee: *const Function) bool {
 }
 
 /// Find and inline a single call, returning whether one was inlined.
-fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter) Error!bool {
+fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter, inline_cycles: bool) Error!bool {
     for (0..caller.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         for (caller.blockInsts(block), 0..) |inst, idx| {
@@ -109,7 +118,7 @@ fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, fi
                 try inlineCall(allocator, caller, @intCast(bi), idx, inst, callee); // single-block fast path
                 return true;
             }
-            if (inlinableMulti(callee)) {
+            if (inlinableMulti(callee) and (inline_cycles or !try hasCfgCycle(allocator, callee))) {
                 try inlineCallMulti(allocator, caller, @intCast(bi), idx, inst, callee);
                 return true;
             }
@@ -355,9 +364,8 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
     }
 }
 
-/// Whether `callee` (any number of blocks) can be inlined by the multi-block path. It must be a leaf
-/// with scalar parameter and result types and no aggregate ops. Control flow, stores, loops, and
-/// multiple returns are fine, since each `ret` turns into a jump to a continuation block.
+/// Whether `callee` can be inlined by the multi-block path. It must be a leaf with scalar parameter
+/// and result types and no aggregate ops. Each return becomes a jump to a continuation.
 fn inlinableMulti(callee: *const Function) bool {
     // SM12 T3: see `inlinable`'s matching guard - never inline a variadic-defining callee.
     if (callee.is_variadic) return false;
@@ -388,6 +396,34 @@ fn inlinableMulti(callee: *const Function) bool {
         };
     }
     return true;
+}
+
+fn hasCfgCycle(allocator: std.mem.Allocator, func: *const Function) Error!bool {
+    const block_count = func.blockCount();
+    const indegree = try allocator.alloc(u32, block_count);
+    defer allocator.free(indegree);
+    @memset(indegree, 0);
+
+    var succ_buf: [2]u32 = undefined;
+    for (0..block_count) |bi| {
+        for (successorsOf(func, @intCast(bi), &succ_buf)) |succ| indegree[succ] += 1;
+    }
+
+    var ready: std.ArrayList(u32) = .empty;
+    defer ready.deinit(allocator);
+    for (indegree, 0..) |degree, bi| {
+        if (degree == 0) try ready.append(allocator, @intCast(bi));
+    }
+    var visited: usize = 0;
+    while (ready.items.len != 0) {
+        const bi = ready.pop().?;
+        visited += 1;
+        for (successorsOf(func, bi, &succ_buf)) |succ| {
+            indegree[succ] -= 1;
+            if (indegree[succ] == 0) try ready.append(allocator, succ);
+        }
+    }
+    return visited != block_count;
 }
 
 /// The successor block indices of `b` (from its `if` exit instruction or its jump terminator).
@@ -877,6 +913,44 @@ test "inlines a multi-block, two-return callee (the call is replaced by cloned c
         }
     }
     try std.testing.expect(caller.blockCount() > 1); // control flow was cloned in
+}
+
+test "keeps a loop callee out of its caller" {
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i32k);
+        const bool_t = try callee.types.intern(.bool);
+        const entry = try callee.appendBlock();
+        const header = try callee.appendBlock();
+        const exit = try callee.appendBlock();
+        const body = try callee.appendBlock();
+        const limit = try callee.appendBlockParam(entry, t);
+        const index = try callee.appendBlockParam(header, t);
+        const result = try callee.appendBlockParam(exit, t);
+        const zero = try callee.appendInst(entry, t, .{ .iconst = 0 });
+        callee.setTerminator(entry, .{ .jump = .{ .target = header, .args = try callee.internValues(&.{zero}) } });
+        const cond = try callee.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = index, .rhs = limit } });
+        try callee.appendIf(header, cond, .{ .target = body, .args = &.{} }, .{ .target = exit, .args = &.{index} });
+        const next = try callee.appendArithImm(body, t, .add, index, 1);
+        callee.setTerminator(body, .{ .jump = .{ .target = header, .args = try callee.internValues(&.{next}) } });
+        callee.setTerminator(exit, .{ .ret = ir.function.Ret.one(result) });
+    }
+
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const t = try caller.types.intern(i32k);
+    const block = try caller.appendBlock();
+    const limit = try caller.appendBlockParam(block, t);
+    const call = try caller.appendCall(block, t, "count", &.{limit});
+    caller.setTerminator(block, .{ .ret = ir.function.Ret.one(call) });
+
+    var lookup_context = TestLookup{ .callee = &callee, .name = "count" };
+    try std.testing.expect(!try runAcyclic(allocator, &caller, .{ .context = &lookup_context, .func = TestLookup.get }));
+    try std.testing.expect(caller.opcode(caller.blockInsts(block)[0]) == .call);
 }
 
 test "inlined via_got global_addr keeps via_got=true (not reconstructed as false)" {
