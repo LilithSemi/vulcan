@@ -381,7 +381,7 @@ fn hasFactorCandidateAt(func: *const Function, value: Value, sum: ir.function.Ar
         if (rhs) |op| if (op.op == .sub and op.lhs == sum.lhs) return true;
         if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and (rhs.?.lhs == lhs.?.lhs or rhs.?.lhs == lhs.?.rhs)) return true;
         if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and sameValueOperands(lhs.?, rhs.?)) return true;
-        if (lhs != null and rhs != null and lhs.?.op == .bit_or and rhs.?.op == .bit_and and sameValueOperands(lhs.?, rhs.?)) return true;
+        if (lhs != null and rhs != null and lhs.?.op == .bit_or and (rhs.?.op == .bit_and or rhs.?.op == .bit_xor) and sameValueOperands(lhs.?, rhs.?)) return true;
     } else if (sum.op == .bit_xor) {
         if (lhs) |op| if (op.op == .bit_xor and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
         if (rhs) |op| if (op.op == .bit_xor and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
@@ -643,11 +643,16 @@ fn sameClassOperands(graph: *Graph, left: OpNode, right: OpNode) bool {
     return (ll == rl and lr == rr) or (ll == rr and lr == rl);
 }
 
-/// (a | b) + (a & b) == a + b and (a | b) - (a & b) == a ^ b for wrapping
-/// integers. Both replace a two-operation bitwise prefix plus the outer arithmetic with one op.
-fn foldBitwiseArithmetic(graph: *Graph, outer_class: u32, outer_op: BinOp, disjunction: OpNode, conjunction: OpNode) !bool {
-    if (!sameClassOperands(graph, disjunction, conjunction)) return false;
-    const replacement_op: BinOp = if (outer_op == .add) .add else .bit_xor;
+/// Arithmetic combinations of matching bitwise terms that reduce to one operation for wrapping
+/// integers: OR + AND == ADD, OR - AND == XOR, and OR - XOR == AND.
+fn foldBitwiseArithmetic(graph: *Graph, outer_class: u32, outer_op: BinOp, disjunction: OpNode, right: OpNode) !bool {
+    if (!sameClassOperands(graph, disjunction, right)) return false;
+    const replacement_op: BinOp = if (outer_op == .add)
+        .add
+    else if (right.op == .bit_and)
+        .bit_xor
+    else
+        .bit_and;
     const replacement = try graph.addOp(.{
         .op = replacement_op,
         .lhs = disjunction.lhs,
@@ -748,7 +753,8 @@ fn hasInverseChildren(graph: *Graph, outer: OpNode) bool {
 }
 
 fn hasBitwiseArithmeticChildren(graph: *Graph, outer: OpNode) bool {
-    const forward = classHasOp(graph, outer.lhs, .bit_or) and classHasOp(graph, outer.rhs, .bit_and);
+    const rhs_match = classHasOp(graph, outer.rhs, .bit_and) or (outer.op == .sub and classHasOp(graph, outer.rhs, .bit_xor));
+    const forward = classHasOp(graph, outer.lhs, .bit_or) and rhs_match;
     return forward or (outer.op == .add and classHasOp(graph, outer.rhs, .bit_or) and classHasOp(graph, outer.lhs, .bit_and));
 }
 
@@ -944,7 +950,14 @@ fn saturate(graph: *Graph) !void {
                     changed = try foldBitwiseArithmetic(graph, entry.class, sum.op, disjunction, conjunction) or changed;
                     if (graph.hit_limit) break;
                 };
-                if (sum.op == .add) {
+                if (sum.op == .sub) {
+                    right.clearRetainingCapacity();
+                    try matchingOps(graph, sum.rhs, .bit_xor, sum.ty, right);
+                    for (left.items) |disjunction| for (right.items) |exclusive| {
+                        changed = try foldBitwiseArithmetic(graph, entry.class, sum.op, disjunction, exclusive) or changed;
+                        if (graph.hit_limit) break;
+                    };
+                } else {
                     left.clearRetainingCapacity();
                     right.clearRetainingCapacity();
                     try matchingOps(graph, sum.rhs, .bit_or, sum.ty, left);
@@ -1566,6 +1579,26 @@ test "egraph reduces the difference of bitwise union and intersection" {
     const replacement = func.terminator(block).?.ret.values[0];
     const reduced = func.opcode(func.definingInst(replacement).?).arith;
     try std.testing.expectEqual(BinOp.bit_xor, reduced.op);
+    try std.testing.expect((reduced.lhs == a and reduced.rhs == b) or (reduced.lhs == b and reduced.rhs == a));
+}
+
+test "egraph reduces the difference of bitwise union and xor" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const either = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_or, .lhs = a, .rhs = b } });
+    const exclusive = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = b, .rhs = a } });
+    const difference = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = either, .rhs = exclusive } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(difference) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const reduced = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.bit_and, reduced.op);
     try std.testing.expect((reduced.lhs == a and reduced.rhs == b) or (reduced.lhs == b and reduced.rhs == a));
 }
 
