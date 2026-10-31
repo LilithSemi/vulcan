@@ -137,6 +137,7 @@ fn laneKind(func: *const Function, vector_value: Value) ?LaneKind {
         .vector => |vt| vt,
         else => return null,
     };
+    if (vec.len != 4) return null;
     return switch (func.types.type_kind(vec.elem)) {
         .float => |f| if (f == .f32) .f32 else null,
         .int => |i| if (i.bits == 32) .i32 else null,
@@ -146,12 +147,16 @@ fn laneKind(func: *const Function, vector_value: Value) ?LaneKind {
 
 /// Whether this backend's isel lowers `inst` (a `reduce` or `splat`) directly, so
 /// `expandVectorLanesExcept` must leave it alone. Add-reduce and every splat are native for the
-/// element kinds `laneKind` supports; the other reduce ops, and any unsupported element kind,
-/// still need the expansion (its `extract`/`struct_new` output goes through this same `laneKind`
-/// gate further down, so an unsupported element kind is rejected there instead, not here).
+/// element kinds `laneKind` supports; integer XOR reduction is native too. Other reduce ops, and
+/// any unsupported element kind, still need expansion (its `extract`/`struct_new` output goes
+/// through this same `laneKind` gate further down, so it is rejected there instead, not here).
 fn hasNativeVectorLaneOp(func: *const Function, inst: ir.function.Inst) bool {
     return switch (func.opcode(inst)) {
-        .reduce => |red| red.op == .add and laneKind(func, red.vector) != null,
+        .reduce => |red| switch (red.op) {
+            .add => laneKind(func, red.vector) != null,
+            .bit_xor => laneKind(func, red.vector) == .i32,
+            else => false,
+        },
         .splat => laneKind(func, func.instResult(inst).?) != null,
         else => false,
     };
@@ -774,9 +779,9 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
 
     _ = try ir.expand.expandNvFp4(allocator, &work);
     _ = try ir.expand.expandLowFloat(allocator, &work);
-    // Add-reduce and splat are lowered natively below (the `.reduce`/`.splat` isel arms), so keep
-    // those out of the expansion and only rewrite the reduce ops with no matching instruction
-    // (`mul`, `bit_and`, `bit_or`, `bit_xor`) or an unsupported element type.
+    // Add/XOR reductions and splats are lowered natively below (the `.reduce`/`.splat` isel arms),
+    // so keep those out of the expansion and only rewrite reduce ops with no matching instruction
+    // (`mul`, `bit_and`, `bit_or`) or an unsupported element type.
     _ = try ir.expand.expandVectorLanesExcept(allocator, &work, hasNativeVectorLaneOp);
 
     // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls before any
@@ -1074,11 +1079,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     var is_loop_header = try allocator.alloc(bool, nblocks);
     defer allocator.free(is_loop_header);
     @memset(is_loop_header, false);
-    if (fetch_align > 4) {
-        var li = try loops.analyze(allocator, func);
-        defer li.deinit(allocator);
-        for (li.loops) |l| is_loop_header[l.header] = true;
-    }
+    var li = try loops.analyze(allocator, func);
+    defer li.deinit(allocator);
+    for (li.loops) |l| is_loop_header[l.header] = true;
 
     if (frame > 0) try emitFrameImm(allocator, &code, true, sp, sp, frame);
     // Only a non-leaf saves lr: a leaf makes no call, so lr stays untouched over its body. The
@@ -1347,13 +1350,15 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             }
             switch (func.opcode(inst)) {
                 .iconst => |c| {
+                    const result = func.instResult(inst).?;
                     // A small constant used only as a compare's right operand, or as an add/sub's
                     // folded immediate operand, is emitted inline at that instruction, so skip
                     // materializing it into a register here.
                     if (foldsAsCmpImm(func, insts, inst_idx)) continue;
                     if (foldsAsAddSubImm(func, insts, inst_idx)) continue;
                     if (foldsAsLogicalImm(func, insts, inst_idx)) continue;
-                    const result = func.instResult(inst).?;
+                    if (foldsAsShiftImm(func, insts, inst_idx)) continue;
+                    if (foldsAsVectorShiftImmScalar(func, result)) continue;
                     const rd = ctx.resultReg(result);
                     if (regClass(func, result) == .fpr) {
                         // A float-typed integer constant (the frontend zero-inits float
@@ -1434,6 +1439,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // so the multiply is emitted exactly once (mirrors the icmp/if fusion
                     // above).
                     if (a.op == .mul and fusesIntoNextArith(func, insts, inst_idx)) continue;
+                    if ((a.op == .shl or a.op == .shr) and fusesIntoNextShiftAdd(func, insts, inst_idx, caps.fuse_shift_add)) continue;
                     const result = func.instResult(inst).?;
                     if ((a.op == .add or a.op == .sub) and inst_idx >= 1 and fusesIntoNextArith(func, insts, inst_idx - 1)) {
                         const mul = func.opcode(insts[inst_idx - 1]).arith;
@@ -1441,18 +1447,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try ctx.emitFusedArith(allocator, &code, result, a.op, a.lhs, a.rhs, mul, mul_result);
                         continue;
                     }
-                    // Shift-add fold: when the previous inst is the single-use, immediately-
-                    // preceding constant shift this add/sub consumes, emit ONE shifted-register
-                    // add/sub (`add xd, xn, xm, lsl #k`) on the shift's operand instead of a
-                    // separate shift + add. The shl's own materialization was skipped in the
-                    // `.arith_imm` arm under the SAME `fusesIntoNextShiftAdd` gate, so the shift
-                    // is emitted exactly once (mirrors the fma/icmp fusions). An add is at most
-                    // one of fma / shift-add / plain: the previous inst is a mul, a shl, or
-                    // neither, so this is checked after the fma case and before the plain form.
-                    if ((a.op == .add or a.op == .sub) and inst_idx >= 1 and fusesIntoNextShiftAdd(func, insts, inst_idx - 1, caps.fuse_shift_add)) {
-                        const shl = func.opcode(insts[inst_idx - 1]).arith_imm;
-                        const shl_result = func.instResult(insts[inst_idx - 1]).?;
-                        try ctx.emitShiftAdd(allocator, &code, result, a.op, a.lhs, a.rhs, shl, shl_result);
+                    // Fold an adjacent, single-use constant shift into this add/sub's shifted
+                    // register operand. The producer arm uses the same eligibility predicate.
+                    if ((a.op == .add or a.op == .sub or a.op == .bit_and or a.op == .bit_or or a.op == .bit_xor) and inst_idx >= 1 and fusesIntoNextShiftAdd(func, insts, inst_idx - 1, caps.fuse_shift_add)) {
+                        const shift = constantShift(func, insts[inst_idx - 1]).?;
+                        const shift_result = func.instResult(insts[inst_idx - 1]).?;
+                        try ctx.emitShiftAdd(allocator, &code, result, a.op, a.lhs, a.rhs, shift, shift_result);
                         continue;
                     }
                     // Arith-branch fold: this add/sub/and is the single-use operand of an
@@ -1480,6 +1480,20 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try storeResult(allocator, &code, ctx, result, rd);
                         continue;
                     }
+                    if (vectorShiftImmFold(func, a, result)) |f| {
+                        const rl = try ctx.loadOp(allocator, &code, f.base, fp_spill_op[0]);
+                        const rd = ctx.resultReg(result);
+                        try code.append(allocator, encode.shlVecI32Imm(rd, rl, @intCast(f.imm)));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
+                    if (shiftImmFold(func, a, result)) |f| {
+                        const rl = try ctx.loadOp(allocator, &code, f.base, spill_op[0]);
+                        const rd = ctx.resultReg(result);
+                        std.debug.assert(try tryShiftImm(allocator, &code, a.op, rd, rl, f.imm, f.signed, f.wide));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     try ctx.binary(allocator, &code, result, a.op, a.lhs, a.rhs);
                 },
                 .arith_imm => |a| {
@@ -1487,12 +1501,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // by the fold, so it claims no register and emits nothing (mirrors the mul/icmp
                     // fusion skips). `ctx.pos` still advances from `inst_idx`, so numbering holds.
                     if (fold.isDeadAdd(inst)) continue;
-                    // Skip a constant shift that folds into the next add/sub as a shifted-
-                    // register operand (the fused `add xd, xn, xm, lsl #k` is emitted at the
-                    // consumer in the `.arith` arm). Same `fusesIntoNextShiftAdd` gate as that
-                    // emit site, so the shift is never both skipped-and-unfused nor fused-and-
-                    // kept.
-                    if (a.op == .shl and fusesIntoNextShiftAdd(func, insts, inst_idx, caps.fuse_shift_add)) continue;
+                    // The consumer emits a constant shift folded into its shifted-register form.
+                    if ((a.op == .shl or a.op == .shr) and fusesIntoNextShiftAdd(func, insts, inst_idx, caps.fuse_shift_add)) continue;
                     // Arith-branch fold (immediate form): this add/sub of a u12 immediate is the
                     // single-use operand of an icmp eq/ne 0 feeding the next if. Skip it. `emitIf`
                     // emits the flag-setting `addsImm`/`subsImm` + `b.cc` under the SAME predicate.
@@ -1503,7 +1513,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const wide = isWide(func, result);
                     // Prefer the add/sub immediate form for a small constant; only fall back to
                     // materializing the constant in a scratch register and a register op otherwise.
-                    if (!try tryAddSubImm(allocator, &code, a.op, rd, rl, a.imm, wide) and
+                    if (!try tryShiftImm(allocator, &code, a.op, rd, rl, a.imm, isSignedInt(func, a.lhs), wide) and
+                        !try tryAddSubImm(allocator, &code, a.op, rd, rl, a.imm, wide) and
                         !try tryLogicalImm(allocator, &code, a.op, rd, rl, a.imm, wide))
                     {
                         // A sixty four bit operation takes the whole immediate. `loadConst` keeps the low
@@ -1529,7 +1540,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // immediately-following csel/fcsel and avoids materializing then re-testing a
                     // one-use boolean. Emit the compare at its original position so allocator
                     // transition moves before the select cannot clobber its operands.
-                    if (fusesIntoNextSelect(func, insts, inst_idx)) {
+                    if (cmpFeedsLaterSelect(func, insts, inst_idx)) {
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, spill_op[0]);
                         const wide = isWide(func, cmp.lhs);
                         if (cmpFoldImm(func, cmp.rhs)) |imm| {
@@ -1614,10 +1625,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try storeResult(allocator, &code, ctx, result, rd);
                         continue;
                     }
-                    const fused_cmp = if (inst_idx >= 1 and fusesIntoNextSelect(func, insts, inst_idx - 1))
-                        func.opcode(insts[inst_idx - 1]).icmp
-                    else
-                        null;
+                    const fused_cmp = fusedCmpForSelect(func, insts, inst_idx);
                     const c = if (fused_cmp == null)
                         try ctx.loadOp(allocator, &code, s.cond, spill_op[0]) // cond is a gpr bool
                     else
@@ -1898,21 +1906,30 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .reduce => |red| {
-                    // A horizontal reduce over a SIMD vector. Only `add` has a native path here:
+                    // A horizontal reduce over a SIMD vector. Add and integer XOR have native paths:
                     // integer add is one `addv` (all 4 lanes into a scalar S register), float add
                     // is `faddp` twice (there is no 4S-wide `faddv`). `mul`/`bit_and`/`bit_or`/
                     // `bit_xor` have no matching instruction on this core, so `expandVectorLanes`
                     // still rewrites those into extracts and a tree of scalar ops before isel runs,
                     // and this arm never sees them.
-                    switch (red.op) {
-                        .add => {},
-                        else => return error.Unsupported,
-                    }
                     if (!isVector(func, red.vector)) return error.Unsupported;
                     const elem = laneKind(func, red.vector) orelse return error.Unsupported;
                     const result = func.instResult(inst).?;
                     const src = try ctx.loadOp(allocator, &code, red.vector, fp_spill_op[0]);
                     const rd = ctx.resultReg(result);
+                    if (red.op == .bit_xor) {
+                        if (elem != .i32) return error.Unsupported;
+                        // Pair lanes 0^2 and 1^3, then XOR those pairs. Keeping both folds in
+                        // NEON needs only one final vector-to-GPR crossing.
+                        try code.append(allocator, encode.extVec(fp_spill_op[1], src, src, 8));
+                        try code.append(allocator, encode.eorVec(fp_spill_op[1], src, fp_spill_op[1]));
+                        try code.append(allocator, encode.extVec(fp_spill_op[0], fp_spill_op[1], fp_spill_op[1], 4));
+                        try code.append(allocator, encode.eorVec(fp_spill_op[1], fp_spill_op[1], fp_spill_op[0]));
+                        try code.append(allocator, encode.umovLane(rd, fp_spill_op[1], 0));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
+                    if (red.op != .add) return error.Unsupported;
                     switch (elem) {
                         .i32 => {
                             // `addv` leaves the sum in an S register (lane 0 of a V register), but
@@ -1936,6 +1953,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // Broadcast a scalar into every lane: one instruction, the same `dup` the
                     // `struct_new` arm above already uses for an all-same-field vector.
                     const result = func.instResult(inst).?;
+                    if (foldsAsVectorShiftImmSplat(func, result)) continue;
                     if (!isVector(func, result)) return error.Unsupported;
                     const elem = laneKind(func, result) orelse return error.Unsupported;
                     const rd = ctx.resultReg(result);
@@ -2017,7 +2035,16 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(target) });
                             try code.append(allocator, encode.b(0));
                         }
-                    } else try ctx.emitIf(allocator, &code, &fixups, cf, insts, inst_idx, next_block);
+                    } else try ctx.emitIf(
+                        allocator,
+                        &code,
+                        &fixups,
+                        cf,
+                        insts,
+                        inst_idx,
+                        next_block,
+                        is_loop_header[bi] or (next_block != null and is_loop_header[@backingInt(next_block.?)]),
+                    );
                     terminated = true;
                 },
                 .dot => |d| {
@@ -2170,7 +2197,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     try peephole.pairMemory(allocator, &code, block_start, fixups.items, relocs.items, lines.items);
 
     for (fixups.items) |f| {
-        const off: i28 = @intCast((@as(i64, @intCast(block_start[f.target])) - @as(i64, @intCast(f.at))) * 4);
+        var target = f.target;
+        for (0..nblocks) |_| {
+            const block: Block = @fromBackingInt(@intCast(target));
+            const forwarded = transparentForwardTarget(func, alloc, block) orelse break;
+            target = @backingInt(forwarded);
+        }
+        const off: i28 = @intCast((@as(i64, @intCast(block_start[target])) - @as(i64, @intCast(f.at))) * 4);
         code.items[f.at] = if (f.cond) |cond| encode.bcc(cond, @intCast(off)) else encode.b(off);
     }
 
@@ -2179,6 +2212,35 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         .relocs = try relocs.toOwnedSlice(allocator),
         .lines = try lines.toOwnedSlice(allocator),
     };
+}
+
+/// Return the destination of a split critical-edge block whose forwarding jump emits no code.
+/// Incoming branch fixups can target the destination directly while the dead forwarding branch
+/// stays in the code stream for any fall-through predecessor.
+fn transparentForwardTarget(func: *const Function, alloc: *const Allocation, block: Block) ?Block {
+    if (!alloc.edge_move_driven or func.blockParams(block).len != 0 or func.blockInsts(block).len != 0) return null;
+    const jump = switch (func.terminator(block) orelse return null) {
+        .jump => |jump| jump,
+        .ret => return null,
+    };
+    for (alloc.edge_moves) |set| {
+        if (set.pred == block and set.succ == jump.target and set.moves.len != 0) return null;
+    }
+
+    var first_pos: u32 = 0;
+    for (0..@backingInt(block)) |bi| {
+        first_pos += @as(u32, @intCast(func.blockInsts(@fromBackingInt(@intCast(bi))).len)) + 2;
+    }
+    for (alloc.actions.items) |action| {
+        if (action.at >= first_pos and action.at <= first_pos + 1) return null;
+    }
+    return jump.target;
+}
+
+fn resolveTransparentTarget(func: *const Function, alloc: *const Allocation, start: Block) Block {
+    var target = start;
+    for (0..func.blockCount()) |_| target = transparentForwardTarget(func, alloc, target) orelse return target;
+    return target;
 }
 
 const Terminator = ir.function.Terminator;
@@ -2417,21 +2479,8 @@ const Ctx = struct {
         try storeResult(allocator, code, self, result, rd);
     }
 
-    /// Emit the fused shifted-register add/sub for an integer `add`/`sub` (`op`, `lhs`,
-    /// `rhs`) whose single-use, immediately-preceding operand is the constant left shift
-    /// `arith_imm{.shl, b, k}` (`shl`, defining `shl_result`). See `fusesIntoNextShiftAdd`
-    /// for the shared eligibility check. Folds `a + (b << k)` / `a - (b << k)` into one
-    /// `add`/`sub xd, xn, xm, lsl #k`. Loads the add/sub's OTHER operand (`rn`, the addend
-    /// or minuend) and the shift's own operand `b` (`rm`) directly, since the shl's
-    /// materialization was skipped by the caller.
-    ///
-    /// `rn` is the add/sub's non-shl operand. For `.sub` the shl result is always the RHS
-    /// (subtrahend, guaranteed by the predicate), so `subShifted` computes `rn - (rm << k)`,
-    /// matching `a - (b << k)`. `.add` is commutative, so `rn` is whichever operand is not
-    /// the shift.
-    ///
-    /// Nothing runs between the (skipped) shl and this add/sub, so `b` still holds its value
-    /// here exactly as `emitFusedArith` relies on for the skipped product's operands.
+    /// Emit a fused shifted-register arithmetic operation. `fusesIntoNextShiftAdd` guarantees that the
+    /// immediately preceding shift is single-use and its amount fits this instruction form.
     fn emitShiftAdd(
         self: Ctx,
         allocator: std.mem.Allocator,
@@ -2440,21 +2489,27 @@ const Ctx = struct {
         op: ir.function.BinOp,
         lhs: Value,
         rhs: Value,
-        shl: ir.function.ArithImm,
-        shl_result: Value,
+        shift: ConstantShift,
+        shift_result: Value,
     ) Error!void {
-        const rn_val = if (lhs == shl_result) rhs else lhs; // the add/sub's non-shl operand
+        const rn_val = if (lhs == shift_result) rhs else lhs;
         const rn = try self.loadOp(allocator, code, rn_val, spill_op[0]);
-        const rm = try self.loadOp(allocator, code, shl.lhs, spill_op[1]);
+        const rm = try self.loadOp(allocator, code, shift.lhs, spill_op[1]);
         const rd = self.resultReg(result);
-        // The predicate range-checked `shl.imm` to 0..63 (64-bit) / 0..31 (32-bit), so it
-        // always fits the imm6 field.
-        const k: u6 = @intCast(shl.imm);
+        const k: u6 = @intCast(shift.imm);
         const wide = isWide(self.func, result);
+        const shift_type: encode.ShiftType = switch (shift.op) {
+            .shl => .lsl,
+            .shr => if (isSignedInt(self.func, shift.lhs)) .asr else .lsr,
+            else => unreachable,
+        };
         try code.append(allocator, switch (op) {
-            .add => if (wide) encode.addShifted64(rd, rn, rm, k) else encode.addShifted(rd, rn, rm, k),
-            .sub => if (wide) encode.subShifted64(rd, rn, rm, k) else encode.subShifted(rd, rn, rm, k),
-            else => unreachable, // the caller only routes .add/.sub here (see the switch above)
+            .add => if (wide) encode.addShiftedType64(rd, rn, rm, k, shift_type) else encode.addShiftedType(rd, rn, rm, k, shift_type),
+            .sub => if (wide) encode.subShiftedType64(rd, rn, rm, k, shift_type) else encode.subShiftedType(rd, rn, rm, k, shift_type),
+            .bit_and => encode.andrShifted(rd, rn, rm, k, shift_type, wide),
+            .bit_or => encode.orrShifted(rd, rn, rm, k, shift_type, wide),
+            .bit_xor => encode.eorShifted(rd, rn, rm, k, shift_type, wide),
+            else => unreachable,
         });
         try storeResult(allocator, code, self, result, rd);
     }
@@ -2487,6 +2542,7 @@ const Ctx = struct {
                     .bit_and => encode.andVec(rd, rl, rr),
                     .bit_or => encode.orrVec(rd, rl, rr),
                     .bit_xor => encode.eorVec(rd, rl, rr),
+                    .shl => encode.ushlVecI32(rd, rl, rr),
                     else => return error.Unsupported,
                 },
             });
@@ -2607,6 +2663,7 @@ const Ctx = struct {
         insts: []const ir.function.Inst,
         if_idx: usize,
         next_block: ?Block,
+        direct_fallthrough: bool,
     ) Error!void {
         // SETUP (shared by both layouts): emit the test that decides the branch and yield the branch
         // descriptor. Fused compare-and-branch: when the immediately-preceding instruction is a
@@ -2663,10 +2720,21 @@ const Ctx = struct {
         // takes the THEN-fall-through layout (elides one branch, both edges still reach the same block).
         const then_target = cf.then.target;
         const else_target = cf.@"else".target;
-        const then_next = next_block != null and then_target == next_block.?;
-        const else_next = next_block != null and else_target == next_block.?;
+        const then_next = next_block != null and resolveTransparentTarget(self.func, self.alloc, then_target) == next_block.?;
+        const else_next = next_block != null and resolveTransparentTarget(self.func, self.alloc, else_target) == next_block.?;
 
         if (then_next) {
+            // With no moves on the cold ELSE edge, branch there directly and let THEN fall through.
+            // This removes the local label plus unconditional branch from the hot loop-header shape.
+            if (direct_fallthrough and self.edgeMovesEmpty(cf.@"else")) switch (branch) {
+                .cc => |cond| {
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target), .cond = encode.invertCond(cond) });
+                    try code.append(allocator, encode.bcc(encode.invertCond(cond), 0));
+                    try self.emitMoves(allocator, code, cf.then);
+                    return;
+                },
+                else => {},
+            };
             // THEN falls through. Keep the not-inverted branch to the then-label, emit the ELSE-moves +
             // `b ELSE` inline, then the THEN-moves last and FALL THROUGH to THEN (elide the trailing
             // `b THEN`). The conditional's forward displacement targets the then-label as before.
@@ -2691,6 +2759,16 @@ const Ctx = struct {
         }
 
         if (else_next) {
+            // Symmetric move-free fast path: branch directly to THEN and let ELSE fall through.
+            if (direct_fallthrough and self.edgeMovesEmpty(cf.then)) switch (branch) {
+                .cc => |cond| {
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target), .cond = cond });
+                    try code.append(allocator, encode.bcc(cond, 0));
+                    try self.emitMoves(allocator, code, cf.@"else");
+                    return;
+                },
+                else => {},
+            };
             // ELSE falls through. INVERT the branch so it targets the else-label when the ELSE edge is
             // taken (bcc on invertCond, or `cbz` for the boolean path), emit the THEN-moves + `b THEN`
             // inline (the not-taken path), then the ELSE-moves last and FALL THROUGH to ELSE. The
@@ -2808,6 +2886,12 @@ const Ctx = struct {
                 .reg => {}, // already handled by the parallel move above
             }
         }
+    }
+
+    fn edgeMovesEmpty(self: Ctx, jump: ir.function.Jump) bool {
+        if (!self.alloc.edge_move_driven) return false;
+        const set = self.findEdgeMoves(self.block, jump.target) orelse return true;
+        return set.moves.len == 0;
     }
 
     /// Replay the precomputed, already-ordered edge moves for `pred -> succ` op-by-op. The shared
@@ -3295,6 +3379,120 @@ fn aarch64CopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Va
     return null;
 }
 
+/// AArch64 scalar integer and NEON ALU instructions permit Rd to alias Rn. If the left operand dies
+/// at the instruction, reusing its register keeps recurrence chains in place and avoids edge moves.
+fn aarch64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
+    _ = ctx;
+    const inst = func.definingInst(v) orelse return null;
+    if (isVector(func, v)) {
+        const arith = switch (func.opcode(inst)) {
+            .arith => |a| a,
+            else => return null,
+        };
+        return switch (laneKind(func, v) orelse return null) {
+            .f32 => switch (arith.op) {
+                .add, .sub, .mul, .div => arith.lhs,
+                else => null,
+            },
+            .i32 => switch (arith.op) {
+                .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl => arith.lhs,
+                else => null,
+            },
+        };
+    }
+    if (regClass(func, v) != .gpr) return null;
+    return switch (func.opcode(inst)) {
+        .arith => |a| switch (a.op) {
+            .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr => a.lhs,
+            else => null,
+        },
+        .arith_imm => |a| switch (a.op) {
+            .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => a.lhs,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// Report the operands read by an instruction after AArch64 immediate folding. This keeps folded
+/// constants out of live ranges, matching emission where they occupy instruction bits instead of a
+/// register.
+fn aarch64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, out: *[wimmer.max_fused_operands]Value) ?u8 {
+    _ = ctx;
+    switch (func.opcode(inst)) {
+        .arith => |arith| {
+            const result = func.instResult(inst) orelse return null;
+            if (addSubImmFold(func, arith)) |fold| {
+                out[0] = fold.base;
+                return 1;
+            }
+            if (logicalImmFold(func, arith, result)) |fold| {
+                out[0] = fold.base;
+                return 1;
+            }
+            if (vectorShiftImmFold(func, arith, result)) |fold| {
+                out[0] = fold.base;
+                return 1;
+            }
+            if (shiftImmFold(func, arith, result)) |fold| {
+                out[0] = fold.base;
+                return 1;
+            }
+        },
+        .icmp => |cmp| {
+            if (cmpFoldImm(func, cmp.rhs) != null) {
+                out[0] = cmp.lhs;
+                return 1;
+            }
+        },
+        .splat => {
+            const result = func.instResult(inst) orelse return null;
+            if (foldsAsVectorShiftImmSplat(func, result)) return 0;
+        },
+        else => {},
+    }
+    return null;
+}
+
+test "aarch64 allocation omits folded immediate operands" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const bool_t = try func.types.intern(.bool);
+    const block = try func.appendBlock();
+    const value = try func.appendBlockParam(block, i32_t);
+    const vector = try func.appendBlockParam(block, vec_t);
+    const add_imm = try func.appendInst(block, i32_t, .{ .iconst = 12 });
+    const added = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = value, .rhs = add_imm } });
+    const mask = try func.appendInst(block, i32_t, .{ .iconst = 255 });
+    const masked = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .bit_and, .lhs = value, .rhs = mask } });
+    const shift_imm = try func.appendInst(block, i32_t, .{ .iconst = 3 });
+    const shifted = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .shl, .lhs = value, .rhs = shift_imm } });
+    const cmp_imm = try func.appendInst(block, i32_t, .{ .iconst = 17 });
+    const compared = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = value, .rhs = cmp_imm } });
+    const product = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = added, .rhs = masked } });
+    const vector_shift_imm = try func.appendInst(block, i32_t, .{ .iconst = 3 });
+    const vector_count = try func.appendInst(block, vec_t, .{ .splat = .{ .scalar = vector_shift_imm } });
+    const vector_shifted = try func.appendInst(block, vec_t, .{ .arith = .{ .op = .shl, .lhs = vector, .rhs = vector_count } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(product) });
+
+    var operands: [wimmer.max_fused_operands]Value = undefined;
+    for ([_]Value{ added, masked, shifted, compared }) |result| {
+        const count = aarch64FusedOperands(&aarch64_reg_ctx, &func, func.definingInst(result).?, &operands).?;
+        try std.testing.expectEqual(@as(u8, 1), count);
+        try std.testing.expectEqual(value, operands[0]);
+    }
+    try std.testing.expect(aarch64FusedOperands(&aarch64_reg_ctx, &func, func.definingInst(product).?, &operands) == null);
+    const vector_count_ops = aarch64FusedOperands(&aarch64_reg_ctx, &func, func.definingInst(vector_count).?, &operands).?;
+    try std.testing.expectEqual(@as(u8, 0), vector_count_ops);
+    const vector_shift_ops = aarch64FusedOperands(&aarch64_reg_ctx, &func, func.definingInst(vector_shifted).?, &operands).?;
+    try std.testing.expectEqual(@as(u8, 1), vector_shift_ops);
+    try std.testing.expectEqual(vector, operands[0]);
+    try std.testing.expectEqual(vector, aarch64DestructiveSource(&aarch64_reg_ctx, &func, vector_shifted).?);
+}
+
 /// Build the per-function aarch64 `RegDescription` the shared Wimmer-Franz allocator consumes. The
 /// physical-register INDEX numbering is the register's own enum integer value: gpr class index n
 /// names x_n (x0..x30), fpr class index n names v_n (v0..v31), the two classes disambiguating the
@@ -3469,7 +3667,9 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
         .classOf = aarch64ClassOf,
         .useKind = aarch64UseKind,
         .copySource = aarch64CopySource,
+        .destructiveSource = aarch64DestructiveSource,
         .isNarrow = aarch64IsNarrow,
+        .fusedOperands = aarch64FusedOperands,
         .coalesce_block_params = true,
         .coalesce_spill_slots = true,
         .entry_fixed = entry_fixed,
@@ -3829,8 +4029,8 @@ fn forEachOperand(
             f(ctx, d.a, false);
             f(ctx, d.b, false);
         },
-        // A native add-reduce or splat reaches the allocator as `.reduce`/`.splat` (see the isel
-        // arms below), so this walk is load-bearing for them, matching `dot`'s walk above. The
+        // A native add/XOR reduction or splat reaches the allocator as `.reduce`/`.splat` (see the
+        // isel arms below), so this walk is load-bearing for them, matching `dot`'s walk above. The
         // other reduce ops are still expanded away before isel runs and never reach here.
         .reduce => |red| f(ctx, red.vector, false),
         .splat => |spv| f(ctx, spv.scalar, false),
@@ -3925,23 +4125,47 @@ fn fusesIntoNextIf(func: *const Function, insts: []const ir.function.Inst, idx: 
     return countUses(func, result) == 1;
 }
 
-/// Whether an integer `icmp` can feed the immediately-following scalar select through flags
-/// directly. The one-use requirement lets isel omit the boolean `cset`; vector conditions keep
-/// their mask value, and floating comparisons stay on their existing materialized path.
-fn fusesIntoNextSelect(func: *const Function, insts: []const ir.function.Inst, idx: usize) bool {
-    const cmp = switch (func.opcode(insts[idx])) {
-        .icmp => |c| c,
-        else => return false,
+/// The integer compare whose flags an ensuing scalar select can consume. Plain arithmetic between
+/// them preserves NZCV on AArch64, so an abs-shaped `icmp; sub; select` needs no boolean round trip.
+fn fusedCmpForSelect(func: *const Function, insts: []const ir.function.Inst, select_idx: usize) ?ir.function.Compare {
+    const select = switch (func.opcode(insts[select_idx])) {
+        .select => |value| value,
+        else => return null,
     };
-    if (isVector(func, cmp.lhs) or regClass(func, cmp.lhs) != .gpr) return false;
-    if (idx + 1 >= insts.len) return false;
-    const select = switch (func.opcode(insts[idx + 1])) {
-        .select => |s| s,
-        else => return false,
+    if (isVector(func, select.then)) return null;
+    const cmp_inst = func.definingInst(select.cond) orelse return null;
+    var idx = select_idx;
+    while (idx > 0) {
+        idx -= 1;
+        if (insts[idx] == cmp_inst) break;
+        switch (func.opcode(insts[idx])) {
+            .arith, .arith_imm => {},
+            else => return null,
+        }
+    } else return null;
+    const cmp = switch (func.opcode(cmp_inst)) {
+        .icmp => |value| value,
+        else => return null,
     };
-    const result = func.instResult(insts[idx]) orelse return false;
-    if (select.cond != result or isVector(func, select.then)) return false;
-    return countUses(func, result) == 1;
+    if (isVector(func, cmp.lhs) or regClass(func, cmp.lhs) != .gpr) return null;
+    if (countUses(func, select.cond) != 1) return null;
+    return cmp;
+}
+
+fn cmpFeedsLaterSelect(func: *const Function, insts: []const ir.function.Inst, cmp_idx: usize) bool {
+    const result = func.instResult(insts[cmp_idx]) orelse return false;
+    var idx = cmp_idx + 1;
+    while (idx < insts.len) : (idx += 1) {
+        switch (func.opcode(insts[idx])) {
+            .arith, .arith_imm => continue,
+            .select => {
+                const select = func.opcode(insts[idx]).select;
+                return select.cond == result and fusedCmpForSelect(func, insts, idx) != null;
+            },
+            else => return false,
+        }
+    }
+    return false;
 }
 
 /// Whether the `if` at `insts[if_idx]` folds a flag-setting arithmetic op into its branch: the
@@ -4095,55 +4319,43 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     return countUses(func, result) == 1;
 }
 
-/// Whether the constant left shift `arith_imm{.shl, b, k}` at `insts[idx]` fuses into an
-/// immediately-following integer `add`/`sub` that consumes its result, folding
-/// `a + (b << k)` / `a - (b << k)` into ONE shifted-register add/sub
-/// (`add xd, xn, xm, lsl #k`, see `Ctx.emitShiftAdd`). This is the ONE eligibility predicate
-/// shared by the shl-skip (in the `.arith_imm` arm) and the fused emit (in the `.arith`
-/// arm), so they never disagree (no dangling or doubled shift). It mirrors `fusesIntoNextArith`.
-/// `enabled` carries `caps.fuse_shift_add`, so a model without the fusion (or the flag off)
-/// falls back to the plain shift-then-add path at BOTH sites and stays byte-identical.
-///
-/// Conditions: integer / GPR operands only (a shifted-register add is a GPR-only ALU form,
-/// never fpr or vector). The shl result is SINGLE-USE (its only reader is this add/sub, so
-/// skipping the standalone shifted value is safe). The shift amount `k` fits the add's
-/// result width (0..63 for a 64-bit result, 0..31 for 32-bit, so the imm6 is
-/// architecturally valid) and is at least 1 (k == 0 is a degenerate shift left to the plain
-/// path). For `.sub` the shl result must be the RHS, the subtrahend: `subShifted` computes
-/// `rn - (rm << k)`, so `a - (b << k)` folds but `(b << k) - a` cannot and stays on the plain
-/// path. `.add` is commutative, so the shl result may be either operand.
-///
-/// The immediately-preceding + single-use conditions make skipping the shift register-safe:
-/// nothing runs between the shl and the add/sub, so the shl's operand `b` still holds its
-/// value there (loaded fresh at the add), exactly as `fusesIntoNextArith` relies on for the
-/// fused product's operands.
+const ConstantShift = struct { op: ir.function.BinOp, lhs: Value, imm: i64 };
+
+fn constantShift(func: *const Function, inst: ir.function.Inst) ?ConstantShift {
+    return switch (func.opcode(inst)) {
+        .arith_imm => |a| if (a.op == .shl or a.op == .shr) .{ .op = a.op, .lhs = a.lhs, .imm = a.imm } else null,
+        .arith => |a| blk: {
+            if (a.op != .shl and a.op != .shr) break :blk null;
+            const rhs = func.definingInst(a.rhs) orelse break :blk null;
+            if (func.opcode(rhs) != .iconst) break :blk null;
+            break :blk .{ .op = a.op, .lhs = a.lhs, .imm = func.opcode(rhs).iconst };
+        },
+        else => null,
+    };
+}
+
+/// Whether a constant shift at `insts[idx]` can become the shifted operand of the adjacent
+/// arithmetic operation. Both the producer skip and consumer emission share this predicate.
 fn fusesIntoNextShiftAdd(func: *const Function, insts: []const ir.function.Inst, idx: usize, enabled: bool) bool {
     if (!enabled) return false;
-    const shl = switch (func.opcode(insts[idx])) {
-        .arith_imm => |a| a,
-        else => return false,
-    };
-    if (shl.op != .shl) return false;
-    // Integer / GPR operands only: a shifted-register add/sub is a GPR ALU form. A vector or
-    // non-gpr class routes elsewhere.
-    if (isVector(func, shl.lhs) or regClass(func, shl.lhs) != .gpr) return false;
+    const shift = constantShift(func, insts[idx]) orelse return false;
+    if (isVector(func, shift.lhs) or regClass(func, shift.lhs) != .gpr) return false;
     if (idx + 1 >= insts.len) return false; // must be immediately followed by the add/sub
     const addsub = switch (func.opcode(insts[idx + 1])) {
         .arith => |a| a,
         else => return false,
     };
-    if (addsub.op != .add and addsub.op != .sub) return false;
+    if (addsub.op != .add and addsub.op != .sub and addsub.op != .bit_and and addsub.op != .bit_or and addsub.op != .bit_xor) return false;
     const result = func.instResult(insts[idx]) orelse return false;
     if (addsub.lhs != result and addsub.rhs != result) return false; // must consume the shl's result
-    // `.sub` folds only when the shl result is the subtrahend (rhs): subShifted computes
-    // rn - (rm << k), so `(b << k) - a` has no shifted form and stays on the plain path.
+    const consumer_result = func.instResult(insts[idx + 1]) orelse return false;
+    // Immediate forms take priority. Their iconst producer is deliberately not materialized,
+    // so a shifted-register form must not attempt to load that constant from a register.
+    if ((addsub.op == .add or addsub.op == .sub) and addSubImmFold(func, addsub) != null) return false;
+    if ((addsub.op == .bit_and or addsub.op == .bit_or or addsub.op == .bit_xor) and logicalImmFold(func, addsub, consumer_result) != null) return false;
     if (addsub.op == .sub and addsub.lhs == result) return false;
-    // `k` must fit the result width's imm6 range and be a real (at least 1) shift.
     const max_shift: i64 = if (isWide(func, result)) 63 else 31;
-    if (shl.imm < 1 or shl.imm > max_shift) return false;
-    // Single-use: the shifted value is read only by this add/sub. Since the shl immediately
-    // precedes it and is one of its operands, a total use-count of exactly 1 means this is
-    // the sole use, so skipping the materialization harms nothing.
+    if (shift.imm < 1 or shift.imm > max_shift) return false;
     return countUses(func, result) == 1;
 }
 
@@ -4182,6 +4394,7 @@ fn addSubImmFold(func: *const Function, a: ir.function.Arith) ?struct { base: Va
 }
 
 const LogicalImmFold = struct { base: Value, immediate: Value, imm: i64 };
+const ShiftImmFold = struct { base: Value, immediate: Value, imm: i64, signed: bool, wide: bool };
 
 fn logicalImmWord(op: ir.function.BinOp, imm: i64, wide: bool) ?u32 {
     const bits: u64 = @bitCast(imm);
@@ -4207,6 +4420,74 @@ fn logicalImmFold(func: *const Function, a: ir.function.Arith, result: Value) ?L
     if (logicalImmConst(func, a.rhs, a.op, wide)) |imm| return .{ .base = a.lhs, .immediate = a.rhs, .imm = imm };
     if (logicalImmConst(func, a.lhs, a.op, wide)) |imm| return .{ .base = a.rhs, .immediate = a.lhs, .imm = imm };
     return null;
+}
+
+fn shiftImmFold(func: *const Function, a: ir.function.Arith, result: Value) ?ShiftImmFold {
+    if (a.op != .shl and a.op != .shr) return null;
+    const def = func.definingInst(a.rhs) orelse return null;
+    if (func.opcode(def) != .iconst) return null;
+    const imm = func.opcode(def).iconst;
+    const wide = isWide(func, result);
+    const limit: i64 = if (wide) 64 else 32;
+    if (imm < 0 or imm >= limit) return null;
+    return .{
+        .base = a.lhs,
+        .immediate = a.rhs,
+        .imm = imm,
+        .signed = isSignedInt(func, a.lhs),
+        .wide = wide,
+    };
+}
+
+const VectorShiftImmFold = struct { base: Value, splat: Value, scalar: Value, imm: i64 };
+
+/// A vector left shift whose count is a splatted i32 constant encodable by NEON `shl #imm`.
+fn vectorShiftImmFold(func: *const Function, a: ir.function.Arith, result: Value) ?VectorShiftImmFold {
+    if (a.op != .shl or !isVector(func, result)) return null;
+    if (laneKind(func, result) != .i32) return null;
+    const splat_inst = func.definingInst(a.rhs) orelse return null;
+    const splat = switch (func.opcode(splat_inst)) {
+        .splat => |value| value,
+        else => return null,
+    };
+    const scalar_inst = func.definingInst(splat.scalar) orelse return null;
+    const imm = switch (func.opcode(scalar_inst)) {
+        .iconst => |value| value,
+        else => return null,
+    };
+    if (imm < 0 or imm >= 32) return null;
+    return .{ .base = a.lhs, .splat = a.rhs, .scalar = splat.scalar, .imm = imm };
+}
+
+fn foldsAsVectorShiftImmSplat(func: *const Function, value: Value) bool {
+    if (countUses(func, value) != 1) return false;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const arith = switch (func.opcode(inst)) {
+                .arith => |candidate| candidate,
+                else => continue,
+            };
+            const result = func.instResult(inst) orelse continue;
+            const fold = vectorShiftImmFold(func, arith, result) orelse continue;
+            if (fold.splat == value) return true;
+        }
+    }
+    return false;
+}
+
+fn foldsAsVectorShiftImmScalar(func: *const Function, value: Value) bool {
+    if (countUses(func, value) != 1) return false;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const result = func.instResult(inst) orelse continue;
+            const splat = switch (func.opcode(inst)) {
+                .splat => |candidate| candidate,
+                else => continue,
+            };
+            if (splat.scalar == value and foldsAsVectorShiftImmSplat(func, result)) return true;
+        }
+    }
+    return false;
 }
 
 /// Whether the `iconst` at `insts[inst_idx]` is consumed ONLY as the folded immediate of an add/sub,
@@ -4252,6 +4533,25 @@ fn foldsAsLogicalImm(func: *const Function, insts: []const ir.function.Inst, ins
             };
             const other_result = func.instResult(other) orelse continue;
             const fold = logicalImmFold(func, a, other_result) orelse continue;
+            if (fold.immediate == result) return true;
+        }
+    }
+    return false;
+}
+
+fn foldsAsShiftImm(func: *const Function, insts: []const ir.function.Inst, inst_idx: usize) bool {
+    const inst = insts[inst_idx];
+    if (func.opcode(inst) != .iconst) return false;
+    const result = func.instResult(inst) orelse return false;
+    if (countUses(func, result) != 1) return false;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |other| {
+            const a = switch (func.opcode(other)) {
+                .arith => |arith| arith,
+                else => continue,
+            };
+            const other_result = func.instResult(other) orelse continue;
+            const fold = shiftImmFold(func, a, other_result) orelse continue;
             if (fold.immediate == result) return true;
         }
     }
@@ -4331,6 +4631,27 @@ test "cross-block logical immediate skips constant materialization" {
     const fold = logicalImmFold(&func, func.opcode(func.definingInst(masked).?).arith, masked).?;
     try std.testing.expectEqual(x, fold.base);
     try std.testing.expectEqual(@as(i64, 0xff00ff00), fold.imm);
+}
+
+test "cross-block shift immediate skips constant materialization" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const amount = try func.appendInst(entry, ty, .{ .iconst = 7 });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const body = try func.appendBlock();
+    const x = try func.appendBlockParam(body, ty);
+    const shifted = try func.appendInst(body, ty, .{ .arith = .{ .op = .shl, .lhs = x, .rhs = amount } });
+    func.setTerminator(body, .{ .ret = ir.function.Ret.one(shifted) });
+
+    const insts = func.blockInsts(entry);
+    try std.testing.expect(foldsAsShiftImm(&func, insts, 0));
+    const fold = shiftImmFold(&func, func.opcode(func.definingInst(shifted).?).arith, shifted).?;
+    try std.testing.expectEqual(x, fold.base);
+    try std.testing.expectEqual(@as(i64, 7), fold.imm);
 }
 
 fn countUses(func: *const Function, v: Value) usize {
@@ -4847,6 +5168,29 @@ fn condForFloat(op: ir.function.CmpOp) encode.Cond {
 /// through a quotient scratch. `wide` selects the 64-bit (x-register) form for
 /// pointer/address arithmetic. The `sf` bit (31) is uniform across these A64
 /// data-processing encodings, so it composes with the 32-bit base.
+fn tryShiftImm(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    op: ir.function.BinOp,
+    rd: Reg,
+    rn: Reg,
+    imm: i64,
+    signed: bool,
+    wide: bool,
+) Error!bool {
+    if (op != .shl and op != .shr) return false;
+    const limit: i64 = if (wide) 64 else 32;
+    if (imm < 0 or imm >= limit) return false;
+    const shift: u6 = @intCast(imm);
+    const word = switch (op) {
+        .shl => encode.lslImm(rd, rn, shift, wide),
+        .shr => if (signed) encode.asrImm(rd, rn, shift, wide) else encode.lsrImm(rd, rn, shift, wide),
+        else => unreachable,
+    };
+    try code.append(allocator, word);
+    return true;
+}
+
 /// Emit an add/sub of a small constant in its IMMEDIATE form (`add rd, rn, #imm`), avoiding the
 /// materialize-then-register-add the general `arith_imm` path uses. Returns whether it emitted: only
 /// an add or sub whose constant fits the unsigned 12-bit immediate (after turning a negative constant
@@ -5023,6 +5367,25 @@ test "selects a straight-line arithmetic function" {
     try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
 }
 
+test "folds a constant shift into a logical operand" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const seven = try func.appendInst(b, t, .{ .iconst = 7 });
+    const shifted = try func.appendInst(b, t, .{ .arith = .{ .op = .shl, .lhs = x, .rhs = seven } });
+    const mixed = try func.appendInst(b, t, .{ .arith = .{ .op = .bit_xor, .lhs = x, .rhs = shifted } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(mixed) });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    try std.testing.expectEqual(@as(usize, 2), code.len);
+    try std.testing.expectEqual(encode.eorShifted(.x0, .x0, .x0, 7, .lsl, false), code[0]);
+    try std.testing.expectEqual(encode.ret(), code[1]);
+}
+
 test "single-use integer compare feeds csel through flags without cset" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
@@ -5035,7 +5398,8 @@ test "single-use integer compare feeds csel through flags without cset" {
     const then_value = try func.appendBlockParam(b, t);
     const else_value = try func.appendBlockParam(b, t);
     const cond = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = lhs, .rhs = rhs } });
-    const selected = try func.appendInst(b, t, .{ .select = .{ .cond = cond, .then = then_value, .@"else" = else_value } });
+    const adjusted = try func.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = then_value, .rhs = else_value } });
+    const selected = try func.appendInst(b, t, .{ .select = .{ .cond = cond, .then = adjusted, .@"else" = else_value } });
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(selected) });
 
     const code = try selectFunction(allocator, &func);
@@ -5076,6 +5440,32 @@ test "retargets a select through an empty return block" {
     try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
     try std.testing.expectEqual(@as(u32, 0), code[code.len - 2] & 0x1f);
     try std.testing.expectEqual(@as(u32, 0x1A800000), code[code.len - 2] & 0x7FE00C00);
+}
+
+test "i32 vector XOR reduction stays native through instruction selection" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const block = try func.appendBlock();
+    const vector = try func.appendBlockParam(block, vec_t);
+    const result = try func.appendReduce(block, .bit_xor, vector);
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var ext_count: usize = 0;
+    var eor_count: usize = 0;
+    var umov_count: usize = 0;
+    for (code) |word| {
+        if (word & 0xFFE08400 == 0x6E000000) ext_count += 1;
+        if (word & 0xFFE0FC00 == 0x6E201C00) eor_count += 1;
+        if (word & 0xFFE0FC00 == 0x0E003C00) umov_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), ext_count);
+    try std.testing.expectEqual(@as(usize, 2), eor_count);
+    try std.testing.expectEqual(@as(usize, 1), umov_count);
 }
 
 test "via_got global_addr lowers to adrp+ldr with got_pg/got_lo12 relocs (GOT-indirect)" {

@@ -178,9 +178,8 @@ test "codegen+disasm round-trip: integer add" {
     func.setTerminator(e, .{ .ret = ir.function.Ret.one(s) });
 
     try expectAsm(&func,
-        \\0000: 0b010002  add w2, w0, w1
-        \\0004: aa0203e0  mov x0, x2
-        \\0008: d65f03c0  ret
+        \\0000: 0b010000  add w0, w0, w1
+        \\0004: d65f03c0  ret
         \\
     );
 }
@@ -447,12 +446,12 @@ test "module disasm: linked functions get labels and a resolved, named call" {
     defer a.free(text);
 
     // The `bl` in main resolves back to helper and is annotated with its name. The displacement is
-    // -36 under the Wimmer allocator. Main's prologue fuses its link-register and callee-saved
+    // -32 under the Wimmer allocator. Main's prologue fuses its link-register and callee-saved
     // stores into stp pairs (the ldp/stp peephole). The shared allocator's frame lands the backward
     // branch to helper nine words back.
     try std.testing.expect(std.mem.indexOf(u8, text, "helper:\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "main:\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "bl .-36  <helper>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bl .-32  <helper>") != null);
 }
 
 /// A named function for `runModule`. The entry must be first.
@@ -5542,6 +5541,34 @@ fn countSubstr(haystack: []const u8, needle: []const u8) usize {
         i = at + needle.len;
     }
     return count;
+}
+
+test "aarch64 fallthrough: move-free critical backedge skips its forwarding block" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, t);
+    const loop = try func.appendBlock();
+    const done = try func.appendBlock();
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{zero});
+    const i = try func.appendBlockParam(loop, t);
+    const next = try func.appendArithImm(loop, t, .add, i, 1);
+    const again = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = next, .rhs = n } });
+    try func.appendIf(loop, again, .{ .target = loop, .args = &.{next} }, .{ .target = done, .args = &.{next} });
+    const result = try func.appendBlockParam(done, t);
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(result) });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expectEqual(@as(usize, 1), countSubstr(text, "  b ."));
+
+    for ([_]i32{ 1, 2, 7, 100 }) |value| try expectRun(allocator, &func, &.{value}, value);
 }
 
 test "aarch64 fallthrough: unconditional jump to the next block elides the branch" {

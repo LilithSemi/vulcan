@@ -873,6 +873,7 @@ test "scan: register pressure splits an interval into a reg segment then a slot 
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
+    desc.fusedOperands = null;
 
     // The pressure exceeds the pool, so `allocate` no longer bails: it splits and spills.
     var alloc = try wimmer.allocate(allocator, &func, &desc);
@@ -907,6 +908,7 @@ test "scan: a must_have_register use is never left in a spilled segment" {
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
+    desc.fusedOperands = null;
 
     var alloc = try wimmer.allocate(allocator, &func, &desc);
     defer alloc.deinit(allocator);
@@ -1547,6 +1549,7 @@ test "buildAllocation: a value split mid-successor-block gets an intra-block act
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
+    desc.fusedOperands = null;
 
     var alloc = try wimmer.allocate(allocator, &func, &desc);
     defer alloc.deinit(allocator);
