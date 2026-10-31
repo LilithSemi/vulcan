@@ -11,7 +11,7 @@ const Value = ir.function.Value;
 const BinOp = ir.function.BinOp;
 const CmpOp = ir.function.CmpOp;
 
-pub const pass_def = pass.Pass{ .name = "constfold", .run = run, .preserves_cfg = true };
+pub const pass_def = pass.Pass{ .name = "constfold", .run = run, .preserves_cfg = true, .preserves_value_defs = true };
 
 /// Wrap `v` to `bits` bits with `signedness`, returning the canonical `i64` an
 /// `iconst` of that type holds.

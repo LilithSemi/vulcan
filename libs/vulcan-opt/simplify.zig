@@ -26,7 +26,7 @@ const Function = ir.function.Function;
 const Value = ir.function.Value;
 const BinOp = ir.function.BinOp;
 
-pub const pass_def = pass.Pass{ .name = "simplify", .run = run, .preserves_cfg = true };
+pub const pass_def = pass.Pass{ .name = "simplify", .run = run, .preserves_cfg = true, .preserves_value_defs = true };
 
 /// For `a != b` where one operand is the constant 0 and the other is an integer widened from a
 /// boolean, the result is that boolean. Returns it as a `.value` simplification, else `.none`.

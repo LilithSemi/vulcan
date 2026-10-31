@@ -16,7 +16,7 @@ const Value = ir.function.Value;
 const Inst = ir.function.Inst;
 const Block = ir.function.Block;
 
-pub const pass_def = pass.Pass{ .name = "gvn", .run = run, .preserves_cfg = true };
+pub const pass_def = pass.Pass{ .name = "gvn", .run = run, .preserves_cfg = true, .preserves_value_defs = true };
 
 const ExprKind = enum(u8) { iconst, fconst, fconst128, arith, arith_imm, icmp, select, convert, unary, extract, global_addr, dot, reduce, splat };
 
@@ -49,15 +49,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     const canon = try allocator.alloc(Value, func.valueCount());
     defer allocator.free(canon);
     for (canon, 0..) |*c, i| c.* = @fromBackingInt(@intCast(i));
-    const def_block = try allocator.alloc(u32, func.valueCount());
-    defer allocator.free(def_block);
-    for (0..n) |bi| {
-        const block: Block = @fromBackingInt(@intCast(bi));
-        for (func.blockParams(block)) |p| def_block[@backingInt(p)] = @intCast(bi);
-        for (func.blockInsts(block)) |inst| {
-            if (func.instResult(inst)) |r| def_block[@backingInt(r)] = @intCast(bi);
-        }
-    }
+    const def_block = try analyses.definingBlocks();
 
     var table: std.AutoHashMapUnmanaged(Key, Value) = .empty;
     defer table.deinit(allocator);
