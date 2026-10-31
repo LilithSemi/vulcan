@@ -1,6 +1,6 @@
 //! Dominator analysis over a function's CFG. Block A dominates B when every path
-//! from entry to B passes through A. Iterative data-flow fixpoint. Exposes the
-//! full dominance relation and each block's immediate dominator (dominator tree).
+//! from entry to B passes through A. Immediate dominators use the Cooper-Harvey-
+//! Kennedy iteration, and tree intervals answer dominance queries in constant time.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -10,24 +10,27 @@ const Function = ir.function.Function;
 
 pub const Dominators = struct {
     n: usize,
-    /// `dom[b * n + a]` is true when block `a` dominates block `b`.
-    dom: []bool,
     /// The immediate dominator of each block (itself for the entry and for
     /// unreachable blocks).
     idom: []u32,
+    /// Preorder entry and exit positions in the dominator tree.
+    pre: []u32,
+    post: []u32,
     /// Whether each block is reachable from the entry. Unreachable blocks have a
     /// degenerate dominance relation (dominated by everything), so consumers that
     /// walk the CFG (e.g. loop detection) must exclude them via `isReachable`.
     reachable: []bool,
 
     pub fn deinit(self: *Dominators, allocator: std.mem.Allocator) void {
-        allocator.free(self.dom);
         allocator.free(self.idom);
+        allocator.free(self.pre);
+        allocator.free(self.post);
         allocator.free(self.reachable);
     }
 
     pub fn dominates(self: *const Dominators, a: usize, b: usize) bool {
-        return self.dom[b * self.n + a];
+        if (!self.reachable[a] or !self.reachable[b]) return a == b;
+        return self.pre[a] <= self.pre[b] and self.post[b] <= self.post[a];
     }
 
     pub fn isReachable(self: *const Dominators, b: usize) bool {
@@ -55,87 +58,98 @@ pub fn compute(allocator: std.mem.Allocator, func: *const Function) std.mem.Allo
 /// Compute dominators from an existing CFG. The caller owns the result.
 pub fn computeFromCfg(allocator: std.mem.Allocator, cfg: *const cfg_mod.Cfg) std.mem.Allocator.Error!Dominators {
     const n = cfg.blockCount();
-
-    // Reachability from the entry (block 0), by CFG traversal.
+    const rpo = try cfg.reversePostorder(allocator);
+    defer allocator.free(rpo);
     const reachable = try allocator.alloc(bool, n);
     errdefer allocator.free(reachable);
     @memset(reachable, false);
-    if (n > 0) {
-        reachable[0] = true;
-        var stack: std.ArrayList(u32) = .empty;
-        defer stack.deinit(allocator);
-        try stack.append(allocator, 0);
-        while (stack.pop()) |b| {
-            for (cfg.successors(b)) |s| {
-                if (!reachable[s]) {
-                    reachable[s] = true;
-                    try stack.append(allocator, s);
-                }
-            }
-        }
-    }
+    for (rpo) |block| reachable[block] = true;
 
-    const dom = try allocator.alloc(bool, n * n);
-    errdefer allocator.free(dom);
-    @memset(dom, true);
-    // The entry is dominated only by itself.
-    for (0..n) |a| dom[a] = (a == 0);
+    const rpo_index = try allocator.alloc(u32, n);
+    defer allocator.free(rpo_index);
+    @memset(rpo_index, std.math.maxInt(u32));
+    for (rpo, 0..) |block, index| rpo_index[block] = @intCast(index);
 
-    const tmp = try allocator.alloc(bool, n);
-    defer allocator.free(tmp);
-
+    const idom = try allocator.alloc(u32, n);
+    errdefer allocator.free(idom);
+    for (idom, 0..) |*parent, block| parent.* = @intCast(block);
+    if (rpo.len > 0) idom[rpo[0]] = rpo[0];
+    const unresolved = std.math.maxInt(u32);
+    for (rpo, 0..) |block, index| if (index != 0) {
+        idom[block] = unresolved;
+    };
     var changed = true;
     while (changed) {
         changed = false;
-        for (1..n) |b| {
-            if (cfg.predecessors(b).len == 0) continue; // unreachable
-            // dom(b) = {b} U (intersection of dom(p) over predecessors p).
-            for (0..n) |a| {
-                var all = true;
-                for (cfg.predecessors(b)) |p| {
-                    if (!dom[@as(usize, p) * n + a]) {
-                        all = false;
-                        break;
-                    }
-                }
-                tmp[a] = all;
+        for (rpo, 0..) |block, index| {
+            if (index == 0) continue;
+            var parent: ?u32 = null;
+            for (cfg.predecessors(block)) |pred| {
+                if (!reachable[pred]) continue;
+                if (idom[pred] == unresolved) continue;
+                parent = if (parent) |current| intersect(idom, rpo_index, pred, current) else pred;
             }
-            tmp[b] = true;
-            for (0..n) |a| {
-                if (dom[b * n + a] != tmp[a]) {
-                    dom[b * n + a] = tmp[a];
-                    changed = true;
-                }
+            const next = parent orelse continue;
+            if (idom[block] != next) {
+                idom[block] = next;
+                changed = true;
             }
         }
     }
 
-    // Immediate dominators: idom(b) is the strict dominator of b that every other
-    // strict dominator of b also dominates (the closest one).
-    const idom = try allocator.alloc(u32, n);
-    errdefer allocator.free(idom);
-    for (0..n) |b| {
-        idom[b] = @intCast(b); // entry and unreachable map to themselves
-        if (b == 0 or !reachable[b]) continue; // unreachable blocks have a degenerate dom relation
-        for (0..n) |d| {
-            if (d == b or !dom[b * n + d]) continue; // d must strictly dominate b
-            var lowest = true;
-            for (0..n) |o| {
-                if (o == b or o == d or !dom[b * n + o]) continue;
-                // Another strict dominator o that d does not dominate => d is not idom.
-                if (!dom[d * n + o]) {
-                    lowest = false;
-                    break;
-                }
-            }
-            if (lowest) {
-                idom[b] = @intCast(d);
-                break;
-            }
-        }
+    const pre = try allocator.alloc(u32, n);
+    errdefer allocator.free(pre);
+    const post = try allocator.alloc(u32, n);
+    errdefer allocator.free(post);
+    @memset(pre, 0);
+    @memset(post, 0);
+    try numberTree(allocator, idom, reachable, pre, post);
+    return .{ .n = n, .idom = idom, .pre = pre, .post = post, .reachable = reachable };
+}
+
+fn intersect(idom: []const u32, rpo_index: []const u32, a: u32, b: u32) u32 {
+    var left = a;
+    var right = b;
+    while (left != right) {
+        while (rpo_index[left] > rpo_index[right]) left = idom[left];
+        while (rpo_index[right] > rpo_index[left]) right = idom[right];
+    }
+    return left;
+}
+
+fn numberTree(allocator: std.mem.Allocator, idom: []const u32, reachable: []const bool, pre: []u32, post: []u32) std.mem.Allocator.Error!void {
+    if (idom.len == 0) return;
+    const children = try allocator.alloc(std.ArrayList(u32), idom.len);
+    defer {
+        for (children) |*list| list.deinit(allocator);
+        allocator.free(children);
+    }
+    for (children) |*list| list.* = .empty;
+    for (idom, 0..) |parent, block| {
+        if (block == 0 or !reachable[block]) continue;
+        try children[parent].append(allocator, @intCast(block));
     }
 
-    return .{ .n = n, .dom = dom, .idom = idom, .reachable = reachable };
+    const Frame = struct { block: u32, next_child: usize };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer stack.deinit(allocator);
+    var clock: u32 = 0;
+    pre[0] = clock;
+    clock += 1;
+    try stack.append(allocator, .{ .block = 0, .next_child = 0 });
+    while (stack.items.len > 0) {
+        const frame = &stack.items[stack.items.len - 1];
+        if (frame.next_child < children[frame.block].items.len) {
+            const child = children[frame.block].items[frame.next_child];
+            frame.next_child += 1;
+            pre[child] = clock;
+            clock += 1;
+            try stack.append(allocator, .{ .block = child, .next_child = 0 });
+        } else {
+            post[frame.block] = clock;
+            _ = stack.pop();
+        }
+    }
 }
 
 /// Post-dominator analysis: the mirror of `Dominators` over the reversed CFG. Block A
@@ -308,6 +322,15 @@ test "dominators of a diamond" {
     try std.testing.expectEqual(@as(u32, 0), doms.immediateDominator(1));
     try std.testing.expectEqual(@as(u32, 0), doms.immediateDominator(2));
     try std.testing.expectEqual(@as(u32, 0), doms.immediateDominator(3));
+}
+
+test "an empty function has an empty dominator tree" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    var doms = try compute(allocator, &func);
+    defer doms.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), doms.n);
 }
 
 test "unreachable blocks are flagged and map their idom to themselves" {
