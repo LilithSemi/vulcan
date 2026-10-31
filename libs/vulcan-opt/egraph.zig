@@ -804,7 +804,8 @@ fn mergeDouble(graph: *Graph, outer_class: u32, ty: Type, value: u32) !bool {
     return graph.merge(outer_class, doubled);
 }
 
-fn foldMixedAddSub(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
+fn foldMixedAddSub(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !?bool {
+    var matched = false;
     var changed = false;
     left.clearRetainingCapacity();
     right.clearRetainingCapacity();
@@ -812,10 +813,11 @@ fn foldMixedAddSub(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.Ar
     try matchingOps(graph, outer.rhs, .sub, outer.ty, right);
     for (left.items) |addition| for (right.items) |subtraction| {
         if (!sameClassOperands(graph, addition, subtraction)) continue;
+        matched = true;
         const repeated = if (outer.op == .add) subtraction.lhs else subtraction.rhs;
         changed = try mergeDouble(graph, outer_class, outer.ty, repeated) or changed;
     };
-    if (outer.op != .add or graph.hit_limit) return changed;
+    if (outer.op != .add or graph.hit_limit) return if (matched) changed else null;
 
     left.clearRetainingCapacity();
     right.clearRetainingCapacity();
@@ -823,9 +825,10 @@ fn foldMixedAddSub(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.Ar
     try matchingOps(graph, outer.rhs, .add, outer.ty, right);
     for (left.items) |subtraction| for (right.items) |addition| {
         if (!sameClassOperands(graph, subtraction, addition)) continue;
+        matched = true;
         changed = try mergeDouble(graph, outer_class, outer.ty, subtraction.lhs) or changed;
     };
-    return changed;
+    return if (matched) changed else null;
 }
 
 fn hasMixedAddSubChildren(graph: *Graph, outer: OpNode) bool {
@@ -1023,6 +1026,12 @@ fn saturate(graph: *Graph) !void {
                     changed = rule_changed or changed;
                 }
             }
+            if ((sum.op == .add or sum.op == .sub) and hasMixedAddSubChildren(graph, sum)) {
+                if (try foldMixedAddSub(graph, entry.class, sum, left, right)) |rule_changed| {
+                    direct_match = true;
+                    changed = rule_changed or changed;
+                }
+            }
             // A direct reduction already introduces the remaining associative expression. Let
             // the eager walk process that smaller expression instead of expanding this node first.
             if (!direct_match and isAssociative(sum.op) and classHasOp(graph, sum.lhs, sum.op)) {
@@ -1062,7 +1071,6 @@ fn saturate(graph: *Graph) !void {
                 };
             }
             if ((sum.op == .add or sum.op == .sub) and hasMixedAddSubChildren(graph, sum)) {
-                changed = try foldMixedAddSub(graph, entry.class, sum, left, right) or changed;
                 changed = try cancelCrossTerms(graph, entry.class, sum, left, right) or changed;
             }
             if (sum.op == .add and graph.op_mask & opBit(.bit_xor) != 0) {
