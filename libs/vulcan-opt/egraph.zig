@@ -297,36 +297,42 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
     return false;
 }
 
-fn classForValue(graph: *Graph, classes: []?u32, costs: []usize, value: Value) !?u32 {
+fn recordClass(allocator: std.mem.Allocator, classes: []?u32, costs: []usize, touched: *std.ArrayList(usize), value: Value, class: u32, cost: usize) !void {
+    const index = @backingInt(value);
+    if (classes[index] == null) try touched.append(allocator, index);
+    classes[index] = class;
+    costs[index] = cost;
+}
+
+fn classForValue(graph: *Graph, classes: []?u32, costs: []usize, touched: *std.ArrayList(usize), value: Value) !?u32 {
     const index = @backingInt(value);
     if (classes[index]) |class| return class;
     const class = try graph.addLeaf(value) orelse return null;
-    classes[index] = class;
-    costs[index] = 0;
+    try recordClass(graph.allocator, classes, costs, touched, value, class, 0);
     return class;
 }
 
-fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u32, costs: []usize) !void {
-    for (func.blockParams(block)) |param| _ = try classForValue(graph, classes, costs, param);
+fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u32, costs: []usize, touched: *std.ArrayList(usize)) !void {
+    for (func.blockParams(block)) |param| _ = try classForValue(graph, classes, costs, touched, param);
     for (func.blockInsts(block)) |inst| {
         const result = func.instResult(inst) orelse continue;
         if (!isInteger(func, result)) {
-            _ = try classForValue(graph, classes, costs, result);
+            _ = try classForValue(graph, classes, costs, touched, result);
             continue;
         }
         const arith = switch (func.opcode(inst)) {
             .arith => |arith| arith,
             else => {
-                _ = try classForValue(graph, classes, costs, result);
+                _ = try classForValue(graph, classes, costs, touched, result);
                 continue;
             },
         };
         if (arith.op != .add and arith.op != .sub and arith.op != .mul and arith.op != .bit_and and arith.op != .bit_or and arith.op != .bit_xor) {
-            _ = try classForValue(graph, classes, costs, result);
+            _ = try classForValue(graph, classes, costs, touched, result);
             continue;
         }
-        const lhs = try classForValue(graph, classes, costs, arith.lhs) orelse return;
-        const rhs = try classForValue(graph, classes, costs, arith.rhs) orelse return;
+        const lhs = try classForValue(graph, classes, costs, touched, arith.lhs) orelse return;
+        const rhs = try classForValue(graph, classes, costs, touched, arith.rhs) orelse return;
         const class = try graph.addOp(.{
             .op = arith.op,
             .lhs = lhs,
@@ -334,8 +340,7 @@ fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u
             .ty = func.valueType(result),
             .existing = result,
         }) orelse return;
-        classes[@backingInt(result)] = class;
-        costs[@backingInt(result)] = 1 + costs[@backingInt(arith.lhs)] + costs[@backingInt(arith.rhs)];
+        try recordClass(graph.allocator, classes, costs, touched, result, class, 1 + costs[@backingInt(arith.lhs)] + costs[@backingInt(arith.rhs)]);
     }
 }
 
@@ -676,6 +681,8 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
     defer if (classes_storage) |classes| allocator.free(classes);
     var costs_storage: ?[]usize = null;
     defer if (costs_storage) |costs| allocator.free(costs);
+    var touched: std.ArrayList(usize) = .empty;
+    defer touched.deinit(allocator);
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         const term = func.terminator(block) orelse continue;
@@ -686,14 +693,14 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
             const classes = try allocator.alloc(?u32, func.valueCount());
             errdefer allocator.free(classes);
             const costs = try allocator.alloc(usize, func.valueCount());
+            @memset(classes, null);
             classes_storage = classes;
             costs_storage = costs;
         }
         const classes = classes_storage.?;
-        @memset(classes, null);
         const original_costs = costs_storage.?;
-        @memset(original_costs, 0);
-        try importBlock(&graph, func, block, classes, original_costs);
+        std.debug.assert(touched.items.len == 0);
+        try importBlock(&graph, func, block, classes, original_costs, &touched);
         try saturate(&graph);
         var extraction = try extract(allocator, &graph);
         defer extraction.deinit(allocator);
@@ -715,6 +722,8 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
                 }
             },
         }
+        for (touched.items) |index| classes[index] = null;
+        touched.clearRetainingCapacity();
     }
     return changed;
 }
