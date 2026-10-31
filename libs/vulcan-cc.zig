@@ -31,6 +31,7 @@ pub const compileWithOpts = lower.compileWithOpts;
 /// target arch's ABI shape (SM12 T5) rather than the build host's. See `lower.compileForTarget`.
 pub const compileForTarget = lower.compileForTarget;
 pub const Module = lower.Module;
+pub const Function = lower.Function;
 /// A module-level data object (SM7 Task 2's globals walking skeleton) - see `lower.DataObject`.
 pub const DataObject = lower.DataObject;
 pub const DataKind = lower.DataKind;

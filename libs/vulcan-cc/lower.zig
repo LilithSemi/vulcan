@@ -30,7 +30,7 @@ const ctype = @import("ctype.zig");
 const consteval = @import("consteval.zig");
 const abi = @import("abi.zig");
 
-const Function = ir.function.Function;
+pub const Function = ir.function.Function;
 const Value = ir.function.Value;
 const Block = ir.function.Block;
 const Type = ir.types.Type;

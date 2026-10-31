@@ -60,6 +60,13 @@ const OptimizationLevel = enum {
             .off, .debug, .one, .size, .min_size => false,
         };
     }
+
+    fn inlinesCalls(self: OptimizationLevel) bool {
+        return switch (self) {
+            .two, .three, .fast => true,
+            .off, .debug, .one, .size, .min_size => false,
+        };
+    }
 };
 
 const Options = struct {
@@ -955,6 +962,8 @@ fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_op
     var mod = try cc.compileWithOpts(allocator, source, pp_opts);
     defer mod.deinit(allocator);
 
+    if (optimize.inlinesCalls()) try inlineTranslationUnit(allocator, &mod);
+
     var mfs: std.ArrayList(target.native.ModuleFunction) = .empty;
     for (mod.funcs) |*nf| {
         if (optimize.optimizes()) _ = try opt.optimizeEarly(allocator, &nf.func);
@@ -972,6 +981,19 @@ fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_op
     const data = try buildModuleData(allocator, mod.data);
 
     return target.native.writeObjectDataForModel(allocator, arch, mfs.items, data.items, model);
+}
+
+const ModuleLookup = struct {
+    fn get(context: *anyopaque, name: []const u8) ?*const cc.Function {
+        const mod: *const cc.Module = @ptrCast(@alignCast(context));
+        return mod.find(name);
+    }
+};
+
+/// Inline calls whose definitions are available in this translation unit.
+fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module) !void {
+    const lookup = opt.inlining.Lookup{ .context = mod, .func = ModuleLookup.get };
+    for (mod.funcs) |*named| _ = try opt.inlining.run(allocator, &named.func, lookup);
 }
 
 /// A synthetic object defining `__dso_handle` (a NULL `void *`), the per-DSO handle the
@@ -1234,9 +1256,10 @@ pub fn main(init: std.process.Init) !void {
         var w = std.Io.File.stdout().writer(io, &buf);
         // With an optimization level (`-O1`+), dump the IR the backend actually sees, not the raw
         // lowering: run the same pipeline the object path runs.
-        if (opts.optimize.optimizes()) for (mod.funcs) |*nf| {
-            _ = try opt.optimize(allocator, &nf.func);
-        };
+        if (opts.optimize.inlinesCalls()) try inlineTranslationUnit(allocator, &mod);
+        if (opts.optimize.optimizes()) {
+            for (mod.funcs) |*nf| _ = try opt.optimize(allocator, &nf.func);
+        }
         for (mod.funcs) |nf| try w.interface.print("; function {s}\n{f}\n", .{ nf.name, nf.func });
         try w.interface.flush();
         return;
@@ -1800,6 +1823,41 @@ test "optimization level gates microarchitecture transforms" {
     try std.testing.expect(OptimizationLevel.two.runsMicroarch());
     try std.testing.expect(OptimizationLevel.three.runsMicroarch());
     try std.testing.expect(!OptimizationLevel.size.runsMicroarch());
+}
+
+test "optimization level gates translation-unit inlining" {
+    try std.testing.expect(!OptimizationLevel.one.inlinesCalls());
+    try std.testing.expect(OptimizationLevel.two.inlinesCalls());
+    try std.testing.expect(OptimizationLevel.three.inlinesCalls());
+    try std.testing.expect(OptimizationLevel.fast.inlinesCalls());
+    try std.testing.expect(!OptimizationLevel.size.inlinesCalls());
+    try std.testing.expect(!OptimizationLevel.min_size.inlinesCalls());
+}
+
+test "translation-unit inlining removes a call to a local leaf" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\int add1(int x) { return x + 1; }
+        \\int main(void) { return add1(4); }
+    );
+    defer mod.deinit(allocator);
+    const main_func = mod.find("main") orelse return error.TestUnexpectedResult;
+    var calls_before: usize = 0;
+    for (0..main_func.blockCount()) |bi| {
+        for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (main_func.opcode(inst) == .call) calls_before += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls_before);
+
+    try inlineTranslationUnit(allocator, &mod);
+    var calls_after: usize = 0;
+    for (0..main_func.blockCount()) |bi| {
+        for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (main_func.opcode(inst) == .call) calls_after += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), calls_after);
 }
 
 test "pickModel: named part matching target -> model" {
