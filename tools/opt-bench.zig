@@ -22,6 +22,8 @@ pub fn main(init: std.process.Init) !void {
     defer nested.deinit();
     var xor_cancel = try buildXorCancelWorkload(allocator, xor_cancel_blocks);
     defer xor_cancel.deinit();
+    var xor_inverse = try buildXorInverseWorkload(allocator, blocks);
+    defer xor_inverse.deinit();
     var idempotent = try buildIdempotentWorkload(allocator, blocks);
     defer idempotent.deinit();
     var bitwise_pair = try buildBitwisePairWorkload(allocator, blocks);
@@ -42,6 +44,7 @@ pub fn main(init: std.process.Init) !void {
     const nested_egraph_ns = try measure(init.io, allocator, &nested, runEgraph);
     const nested_pipeline_ns = try measure(init.io, allocator, &nested, runPipeline);
     const xor_cancel_egraph_ns = try measure(init.io, allocator, &xor_cancel, runEgraph);
+    const xor_inverse_egraph_ns = try measure(init.io, allocator, &xor_inverse, runEgraph);
     const idempotent_egraph_ns = try measure(init.io, allocator, &idempotent, runEgraph);
     const bitwise_pair_egraph_ns = try measure(init.io, allocator, &bitwise_pair, runEgraph);
     const rootless_egraph_ns = try measure(init.io, allocator, &rootless, runEgraph);
@@ -54,6 +57,7 @@ pub fn main(init: std.process.Init) !void {
             "  nested egraph:          {d} ns/block\n" ++
             "  nested early pipeline:  {d} ns/block\n" ++
             "  xor cancel egraph:      {d} ns/block ({d} blocks)\n" ++
+            "  xor inverse egraph:     {d} ns/block\n" ++
             "  idempotent egraph:      {d} ns/block\n" ++
             "  bitwise pair egraph:    {d} ns/block\n" ++
             "  rootless egraph:        {d} ns/block\n" ++
@@ -68,6 +72,7 @@ pub fn main(init: std.process.Init) !void {
             nested_pipeline_ns / blocks,
             xor_cancel_egraph_ns / xor_cancel_blocks,
             xor_cancel_blocks,
+            xor_inverse_egraph_ns / blocks,
             idempotent_egraph_ns / blocks,
             bitwise_pair_egraph_ns / blocks,
             rootless_egraph_ns / blocks,
@@ -153,6 +158,21 @@ fn buildXorCancelWorkload(allocator: std.mem.Allocator, count: usize) !Function 
         const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = b } });
         const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = c } });
         const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = ab, .rhs = ac } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    }
+    return func;
+}
+
+fn buildXorInverseWorkload(allocator: std.mem.Allocator, count: usize) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    for (0..count) |_| {
+        const block = try func.appendBlock();
+        const a = try func.appendBlockParam(block, ty);
+        const b = try func.appendBlockParam(block, ty);
+        const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = b } });
+        const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = ab, .rhs = a } });
         func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
     }
     return func;
