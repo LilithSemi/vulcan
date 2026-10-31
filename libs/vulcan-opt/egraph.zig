@@ -851,45 +851,52 @@ fn hasBitwiseArithmeticChildren(graph: *Graph, outer: OpNode) bool {
     return forward or (outer.op == .add and classHasOp(graph, outer.rhs, .bit_or) and classHasOp(graph, outer.lhs, .bit_and));
 }
 
-fn emitCrossCancellation(graph: *Graph, outer_class: u32, ty: Type, subtraction: OpNode, addition: OpNode, subtract_outer: bool) !bool {
+fn emitCrossCancellation(graph: *Graph, outer_class: u32, ty: Type, subtraction: OpNode, addition: OpNode, subtract_outer: bool) !?bool {
     const cancelled = graph.find(if (subtract_outer) subtraction.lhs else subtraction.rhs);
     const other = if (graph.find(addition.lhs) == cancelled)
         addition.rhs
     else if (graph.find(addition.rhs) == cancelled)
         addition.lhs
     else
-        return false;
+        return null;
     const kept = if (subtract_outer) subtraction.rhs else subtraction.lhs;
     const replacement = try graph.addOp(.{ .op = .add, .lhs = kept, .rhs = other, .ty = ty, .existing = null }) orelse return false;
     return graph.merge(outer_class, replacement);
 }
 
-fn cancelCrossTerms(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
+fn cancelCrossTerms(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !?bool {
+    var matched = false;
     var changed = false;
     left.clearRetainingCapacity();
     right.clearRetainingCapacity();
     try matchingOps(graph, outer.lhs, if (outer.op == .add) .sub else .add, outer.ty, left);
     try matchingOps(graph, outer.rhs, if (outer.op == .add) .add else .sub, outer.ty, right);
     for (left.items) |a| for (right.items) |b| {
-        changed = try emitCrossCancellation(
+        if (try emitCrossCancellation(
             graph,
             outer_class,
             outer.ty,
             if (outer.op == .add) a else b,
             if (outer.op == .add) b else a,
             outer.op == .sub,
-        ) or changed;
+        )) |pair_changed| {
+            matched = true;
+            changed = pair_changed or changed;
+        }
     };
-    if (outer.op != .add or graph.hit_limit) return changed;
+    if (outer.op != .add or graph.hit_limit) return if (matched) changed else null;
 
     left.clearRetainingCapacity();
     right.clearRetainingCapacity();
     try matchingOps(graph, outer.lhs, .add, outer.ty, left);
     try matchingOps(graph, outer.rhs, .sub, outer.ty, right);
     for (left.items) |addition| for (right.items) |subtraction| {
-        changed = try emitCrossCancellation(graph, outer_class, outer.ty, subtraction, addition, false) or changed;
+        if (try emitCrossCancellation(graph, outer_class, outer.ty, subtraction, addition, false)) |pair_changed| {
+            matched = true;
+            changed = pair_changed or changed;
+        }
     };
-    return changed;
+    return if (matched) changed else null;
 }
 
 fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !?bool {
@@ -1031,6 +1038,10 @@ fn saturate(graph: *Graph) !void {
                     direct_match = true;
                     changed = rule_changed or changed;
                 }
+                if (try cancelCrossTerms(graph, entry.class, sum, left, right)) |rule_changed| {
+                    direct_match = true;
+                    changed = rule_changed or changed;
+                }
             }
             // A direct reduction already introduces the remaining associative expression. Let
             // the eager walk process that smaller expression instead of expanding this node first.
@@ -1069,9 +1080,6 @@ fn saturate(graph: *Graph) !void {
                     changed = try cancelAddedSubtractions(graph, entry.class, a, b) or changed;
                     if (graph.hit_limit) break;
                 };
-            }
-            if ((sum.op == .add or sum.op == .sub) and hasMixedAddSubChildren(graph, sum)) {
-                changed = try cancelCrossTerms(graph, entry.class, sum, left, right) or changed;
             }
             if (sum.op == .add and graph.op_mask & opBit(.bit_xor) != 0) {
                 changed = try foldXorCarry(graph, entry.class, sum, left, right, nested_matches) or changed;
