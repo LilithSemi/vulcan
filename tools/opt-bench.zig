@@ -12,6 +12,7 @@ const BenchFn = *const fn (std.mem.Allocator, *Function) anyerror!bool;
 
 const blocks: usize = 2048;
 const xor_cancel_blocks: usize = 64;
+const xor_carry_blocks: usize = 64;
 const samples: usize = 9;
 
 pub fn main(init: std.process.Init) !void {
@@ -24,6 +25,8 @@ pub fn main(init: std.process.Init) !void {
     defer xor_cancel.deinit();
     var xor_inverse = try buildXorInverseWorkload(allocator, blocks);
     defer xor_inverse.deinit();
+    var xor_carry = try buildXorCarryWorkload(allocator, xor_carry_blocks);
+    defer xor_carry.deinit();
     var idempotent = try buildIdempotentWorkload(allocator, blocks);
     defer idempotent.deinit();
     var bitwise_pair = try buildBitwisePairWorkload(allocator, blocks);
@@ -49,6 +52,7 @@ pub fn main(init: std.process.Init) !void {
     const nested_pipeline_ns = try measure(init.io, allocator, &nested, runPipeline);
     const xor_cancel_egraph_ns = try measure(init.io, allocator, &xor_cancel, runEgraph);
     const xor_inverse_egraph_ns = try measure(init.io, allocator, &xor_inverse, runEgraph);
+    const xor_carry_egraph_ns = try measure(init.io, allocator, &xor_carry, runEgraph);
     const idempotent_egraph_ns = try measure(init.io, allocator, &idempotent, runEgraph);
     const bitwise_pair_egraph_ns = try measure(init.io, allocator, &bitwise_pair, runEgraph);
     const mixed_pair_egraph_ns = try measure(init.io, allocator, &mixed_pair, runEgraph);
@@ -64,6 +68,7 @@ pub fn main(init: std.process.Init) !void {
             "  nested early pipeline:  {d} ns/block\n" ++
             "  xor cancel egraph:      {d} ns/block ({d} blocks)\n" ++
             "  xor inverse egraph:     {d} ns/block\n" ++
+            "  xor carry egraph:       {d} ns/block ({d} blocks)\n" ++
             "  idempotent egraph:      {d} ns/block\n" ++
             "  bitwise pair egraph:    {d} ns/block\n" ++
             "  mixed pair egraph:      {d} ns/block\n" ++
@@ -81,6 +86,8 @@ pub fn main(init: std.process.Init) !void {
             xor_cancel_egraph_ns / xor_cancel_blocks,
             xor_cancel_blocks,
             xor_inverse_egraph_ns / blocks,
+            xor_carry_egraph_ns / xor_carry_blocks,
+            xor_carry_blocks,
             idempotent_egraph_ns / blocks,
             bitwise_pair_egraph_ns / blocks,
             mixed_pair_egraph_ns / blocks,
@@ -183,6 +190,23 @@ fn buildXorInverseWorkload(allocator: std.mem.Allocator, count: usize) !Function
         const b = try func.appendBlockParam(block, ty);
         const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = b } });
         const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = ab, .rhs = a } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    }
+    return func;
+}
+
+fn buildXorCarryWorkload(allocator: std.mem.Allocator, count: usize) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    for (0..count) |_| {
+        const block = try func.appendBlock();
+        const a = try func.appendBlockParam(block, ty);
+        const b = try func.appendBlockParam(block, ty);
+        const exclusive = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = b } });
+        const intersection = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } });
+        const carry = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = intersection, .rhs = intersection } });
+        const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = exclusive, .rhs = carry } });
         func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
     }
     return func;
