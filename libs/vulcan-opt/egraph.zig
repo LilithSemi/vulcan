@@ -342,6 +342,10 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
         if (sum.op == .add) {
             if (lhs) |op| if (op.op == .sub and op.rhs == sum.rhs) return true;
             if (rhs) |op| if (op.op == .sub and op.rhs == sum.lhs) return true;
+            if (lhs != null and rhs != null) {
+                if (lhs.?.op == .sub and rhs.?.op == .add and (lhs.?.rhs == rhs.?.lhs or lhs.?.rhs == rhs.?.rhs)) return true;
+                if (lhs.?.op == .add and rhs.?.op == .sub and (rhs.?.rhs == lhs.?.lhs or rhs.?.rhs == lhs.?.rhs)) return true;
+            }
             if (lhs != null and rhs != null and
                 (((lhs.?.op == .add and rhs.?.op == .sub) or (lhs.?.op == .sub and rhs.?.op == .add)) and
                     sameValueOperands(lhs.?, rhs.?))) return true;
@@ -352,6 +356,7 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
         } else if (sum.op == .sub) {
             if (lhs) |op| if (op.op == .add and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
             if (rhs) |op| if (op.op == .sub and op.lhs == sum.lhs) return true;
+            if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and (rhs.?.lhs == lhs.?.lhs or rhs.?.lhs == lhs.?.rhs)) return true;
             if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and sameValueOperands(lhs.?, rhs.?)) return true;
             if (lhs != null and rhs != null and lhs.?.op == .bit_or and rhs.?.op == .bit_and and sameValueOperands(lhs.?, rhs.?)) return true;
         } else if (sum.op == .bit_xor) {
@@ -590,6 +595,47 @@ fn foldMixedAddSub(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.Ar
     return changed;
 }
 
+fn emitCrossCancellation(graph: *Graph, outer_class: u32, ty: Type, subtraction: OpNode, addition: OpNode, subtract_outer: bool) !bool {
+    const cancelled = graph.find(if (subtract_outer) subtraction.lhs else subtraction.rhs);
+    const other = if (graph.find(addition.lhs) == cancelled)
+        addition.rhs
+    else if (graph.find(addition.rhs) == cancelled)
+        addition.lhs
+    else
+        return false;
+    const kept = if (subtract_outer) subtraction.rhs else subtraction.lhs;
+    const replacement = try graph.addOp(.{ .op = .add, .lhs = kept, .rhs = other, .ty = ty, .existing = null }) orelse return false;
+    return graph.merge(outer_class, replacement);
+}
+
+fn cancelCrossTerms(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
+    var changed = false;
+    left.clearRetainingCapacity();
+    right.clearRetainingCapacity();
+    try matchingOps(graph, outer.lhs, if (outer.op == .add) .sub else .add, outer.ty, left);
+    try matchingOps(graph, outer.rhs, if (outer.op == .add) .add else .sub, outer.ty, right);
+    for (left.items) |a| for (right.items) |b| {
+        changed = try emitCrossCancellation(
+            graph,
+            outer_class,
+            outer.ty,
+            if (outer.op == .add) a else b,
+            if (outer.op == .add) b else a,
+            outer.op == .sub,
+        ) or changed;
+    };
+    if (outer.op != .add or graph.hit_limit) return changed;
+
+    left.clearRetainingCapacity();
+    right.clearRetainingCapacity();
+    try matchingOps(graph, outer.lhs, .add, outer.ty, left);
+    try matchingOps(graph, outer.rhs, .sub, outer.ty, right);
+    for (left.items) |addition| for (right.items) |subtraction| {
+        changed = try emitCrossCancellation(graph, outer_class, outer.ty, subtraction, addition, false) or changed;
+    };
+    return changed;
+}
+
 fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
     var changed = false;
     if (outer.op == .add) {
@@ -710,6 +756,7 @@ fn saturate(graph: *Graph) !void {
             }
             if (sum.op == .add or sum.op == .sub) {
                 changed = try foldMixedAddSub(graph, entry.class, sum, left, right) or changed;
+                changed = try cancelCrossTerms(graph, entry.class, sum, left, right) or changed;
             }
             if (sum.op == .bit_and or sum.op == .bit_or) {
                 changed = try foldNestedIdempotent(graph, entry.class, sum, left) or changed;
@@ -930,6 +977,35 @@ fn expectMixedAddSub(outer_op: BinOp, addition_on_left: bool, repeat_a: bool) !v
     try std.testing.expectEqual(BinOp.add, doubled.op);
     try std.testing.expectEqual(expected, doubled.lhs);
     try std.testing.expectEqual(expected, doubled.rhs);
+}
+
+fn expectCrossCancellation(outer_op: BinOp, subtraction_on_left: bool) !void {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const addition = if (outer_op == .add)
+        try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = c, .rhs = b } })
+    else
+        try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = b, .rhs = a } });
+    const subtraction = if (outer_op == .add)
+        try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } })
+    else
+        try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = b, .rhs = c } });
+    const lhs = if (subtraction_on_left) subtraction else addition;
+    const rhs = if (subtraction_on_left) addition else subtraction;
+    const combined = try func.appendInst(block, ty, .{ .arith = .{ .op = outer_op, .lhs = lhs, .rhs = rhs } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(combined) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const reduced = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.add, reduced.op);
+    try std.testing.expect((reduced.lhs == a and reduced.rhs == c) or (reduced.lhs == c and reduced.rhs == a));
 }
 
 test "egraph hash-consing follows merged child classes" {
@@ -1276,6 +1352,12 @@ test "egraph folds mixed addition and subtraction pairs" {
     try expectMixedAddSub(.add, true, true);
     try expectMixedAddSub(.add, false, true);
     try expectMixedAddSub(.sub, true, false);
+}
+
+test "egraph cancels cross terms between addition and subtraction" {
+    try expectCrossCancellation(.add, true);
+    try expectCrossCancellation(.add, false);
+    try expectCrossCancellation(.sub, false);
 }
 
 test "egraph reassociates an add tree to expose factoring" {
