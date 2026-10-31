@@ -2859,7 +2859,7 @@ test "replaceAllUses rewrites a detached instruction before it is installed" {
     const detached_inst = func.definingInst(detached).?;
 
     func.replaceAllUses(old, replacement);
-    try func.setBlockInsts(block, &.{ detached_inst });
+    try func.setBlockInsts(block, &.{detached_inst});
 
     const op = func.opcode(detached_inst).arith;
     try std.testing.expectEqual(replacement, op.lhs);
