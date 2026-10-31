@@ -61,6 +61,15 @@ const Graph = struct {
         self.ops.deinit(self.allocator);
     }
 
+    fn reset(self: *Graph) void {
+        self.parents.clearRetainingCapacity();
+        self.nodes.clearRetainingCapacity();
+        self.leaves.clearRetainingCapacity();
+        self.ops.clearRetainingCapacity();
+        self.ops_valid = true;
+        self.hit_limit = false;
+    }
+
     fn find(self: *Graph, class: u32) u32 {
         var root = class;
         while (self.parents.items[root] != root) root = self.parents.items[root];
@@ -683,12 +692,13 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
     defer if (costs_storage) |costs| allocator.free(costs);
     var touched: std.ArrayList(usize) = .empty;
     defer touched.deinit(allocator);
+    var graph = Graph{ .allocator = allocator, .limits = limits };
+    defer graph.deinit();
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         const term = func.terminator(block) orelse continue;
         if (!hasFactorCandidate(func, block)) continue;
-        var graph = Graph{ .allocator = allocator, .limits = limits };
-        defer graph.deinit();
+        graph.reset();
         if (classes_storage == null) {
             const classes = try allocator.alloc(?u32, func.valueCount());
             errdefer allocator.free(classes);
