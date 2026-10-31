@@ -109,6 +109,7 @@ const scratch_move: Reg = .x17; // GPR parallel-move cycle breaking
 const fp_spill_op = [_]Reg{ @as(Reg, @fromBackingInt(@intCast(24))), @as(Reg, @fromBackingInt(@intCast(25))) };
 const fp_spill_res: Reg = @fromBackingInt(@intCast(26));
 const fp_move: Reg = @fromBackingInt(@intCast(27));
+const fp_interleave_base: Reg = @fromBackingInt(@intCast(28));
 
 /// A value lives in either the general-register file (gpr) or the FP/SIMD file
 /// (fpr), decided by its type. The same numeric register index names x_n or v_n.
@@ -653,6 +654,54 @@ fn lineOf(func: *const Function, inst: ir.function.Inst) ?u32 {
         else => {},
     };
     return null;
+}
+
+/// Lane number of a backend-private four-way interleaved memory group. The loop vectorizer emits
+/// four adjacent ordinary vector loads/stores with this tag; keeping the operands as ordinary IR
+/// lets the shared allocator see every use while isel can collapse the group to one `ld4`/`st4`.
+fn interleaveLane(func: *const Function, inst: ir.function.Inst) ?u2 {
+    var it = func.attributesOf(.{ .inst = inst });
+    while (it.next()) |attr| switch (attr) {
+        .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.aarch64") and std.mem.eql(u8, c.key, "interleave4")) {
+            if (c.value == .int and c.value.int >= 0 and c.value.int < 4) return @intCast(c.value.int);
+        },
+        else => {},
+    };
+    return null;
+}
+
+fn interleaveScratch(lane: u2) Reg {
+    return @fromBackingInt(@backingInt(fp_interleave_base) + @as(u5, lane));
+}
+
+fn validInterleaveRun(func: *const Function, insts: []const ir.function.Inst, index: usize, load: bool) bool {
+    const lane = interleaveLane(func, insts[index]) orelse return false;
+    if (index < lane) return false;
+    const start = index - lane;
+    if (start + 4 > insts.len) return false;
+    var ptr: ?Value = null;
+    for (insts[start .. start + 4], 0..) |candidate, expected| {
+        if (interleaveLane(func, candidate) != @as(u2, @intCast(expected))) return false;
+        const candidate_ptr = if (load) switch (func.opcode(candidate)) {
+            .load => |mem| blk: {
+                if (mem.@"volatile" or mem.mask != null) return false;
+                const result = func.instResult(candidate) orelse return false;
+                if (laneKind(func, result) == null) return false;
+                break :blk mem.ptr;
+            },
+            else => return false,
+        } else switch (func.opcode(candidate)) {
+            .store => |mem| blk: {
+                if (mem.@"volatile" or mem.mask != null or laneKind(func, mem.value) == null) return false;
+                break :blk mem.ptr;
+            },
+            else => return false,
+        };
+        if (ptr) |first| {
+            if (candidate_ptr != first) return false;
+        } else ptr = candidate_ptr;
+    }
+    return true;
 }
 
 fn isLeaf(func: *const Function) bool {
@@ -1836,6 +1885,19 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // A masked load is per-lane predication (see `Load.mask`), which this backend
                     // has no form for. Reading every lane is a wrong answer, so refuse.
                     if (func.opcode(inst).load.mask != null) return error.Unsupported;
+                    if (interleaveLane(func, inst)) |lane| {
+                        if (!validInterleaveRun(func, insts, inst_idx, true)) return error.Unsupported;
+                        const result = func.instResult(inst).?;
+                        const mem = func.opcode(inst).load;
+                        if (lane == 0) {
+                            const base = try ctx.loadOp(allocator, &code, mem.ptr, spill_op[0]);
+                            try code.append(allocator, encode.ld4S4(fp_interleave_base, base));
+                        }
+                        const rd = ctx.resultReg(result);
+                        try code.append(allocator, encode.movVec(rd, interleaveScratch(lane)));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     // A folded load addresses `[base, #off]` directly: `baseOf` yields the fold base
                     // (the add's lhs) and `offOf` the displacement. Both are the raw ptr and 0 when
                     // unfolded, so the non-folding case is byte-identical.
@@ -1849,6 +1911,18 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // A masked store is per-lane predication (see `Store.mask`), which this backend
                     // has no form for. Writing every lane is a wrong answer, so refuse.
                     if (st.mask != null) return error.Unsupported;
+                    if (interleaveLane(func, inst)) |lane| {
+                        if (!validInterleaveRun(func, insts, inst_idx, false)) return error.Unsupported;
+                        if (lane != 0) continue;
+                        for (insts[inst_idx .. inst_idx + 4], 0..) |member, member_lane| {
+                            const value = func.opcode(member).store.value;
+                            const src = try ctx.loadOp(allocator, &code, value, fp_spill_op[0]);
+                            try code.append(allocator, encode.movVec(interleaveScratch(@intCast(member_lane)), src));
+                        }
+                        const base = try ctx.loadOp(allocator, &code, st.ptr, spill_op[1]);
+                        try code.append(allocator, encode.st4S4(fp_interleave_base, base));
+                        continue;
+                    }
                     const val = try ctx.loadOp(allocator, &code, st.value, if (regClass(func, st.value) == .fpr) fp_spill_op[0] else spill_op[0]);
                     const base = try ctx.loadOp(allocator, &code, fold.baseOf(func, inst), spill_op[1]);
                     try emitStore(allocator, &code, func, st.value, val, base, @intCast(fold.offOf(inst)), fp16);
@@ -5558,6 +5632,46 @@ test "i32 vector XOR reduction stays native through instruction selection" {
     try std.testing.expectEqual(@as(usize, 2), ext_count);
     try std.testing.expectEqual(@as(usize, 2), eor_count);
     try std.testing.expectEqual(@as(usize, 1), umov_count);
+}
+
+test "tagged four-way vector memory groups lower to one ld4 and st4" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const ptr_t = try func.types.ptrGlobal();
+    const block = try func.appendBlock();
+    const ptr = try func.appendBlockParam(block, ptr_t);
+    var fields: [4]Value = undefined;
+    for (&fields, 0..) |*field, lane| {
+        field.* = try func.appendInst(block, vec_t, .{ .load = .{ .ptr = ptr } });
+        try func.addAttr(.{ .inst = func.definingInst(field.*).? }, .{ .custom = .{
+            .namespace = "vulcan.aarch64",
+            .key = "interleave4",
+            .value = .{ .int = @intCast(lane) },
+        } });
+    }
+    for (fields, 0..) |field, lane| {
+        const store = try func.appendStmtRaw(block, .{ .store = .{ .value = field, .ptr = ptr } });
+        try func.addAttr(.{ .inst = store }, .{ .custom = .{
+            .namespace = "vulcan.aarch64",
+            .key = "interleave4",
+            .value = .{ .int = @intCast(lane) },
+        } });
+    }
+    func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var loads: usize = 0;
+    var stores: usize = 0;
+    for (code) |word| {
+        if (word & 0xFFFFFC00 == 0x4C400800) loads += 1;
+        if (word & 0xFFFFFC00 == 0x4C000800) stores += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), loads);
+    try std.testing.expectEqual(@as(usize, 1), stores);
 }
 
 test "via_got global_addr lowers to adrp+ldr with got_pg/got_lo12 relocs (GOT-indirect)" {
