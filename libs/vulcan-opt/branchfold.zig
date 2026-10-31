@@ -19,6 +19,7 @@ pub const pass_def = pass.Pass{ .name = "branchfold", .run = run };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
+    if (!hasCandidate(func)) return false;
 
     // Constant values, to spot a constant `if` condition.
     var consts = try allocator.alloc(?i64, func.valueCount());
@@ -62,6 +63,15 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         changed = true;
     }
     return changed;
+}
+
+fn hasCandidate(func: *const Function) bool {
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (func.opcode(inst) == .@"if") return true;
+        }
+    }
+    return false;
 }
 
 /// Whether two edges pass identical argument lists (so their only difference could be the target).
@@ -143,4 +153,19 @@ test "branchfold: a runtime condition is left alone" {
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();
     try testing.expect(!try run(allocator, &func, &analyses)); // nothing folded
+}
+
+test "branchfold: a function without a branch skips constant analysis" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const value = try func.appendBlockParam(entry, t);
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(value) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try testing.expect(!hasCandidate(&func));
+    try testing.expect(!try run(allocator, &func, &analyses));
 }
