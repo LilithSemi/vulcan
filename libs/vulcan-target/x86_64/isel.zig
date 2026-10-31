@@ -2943,8 +2943,30 @@ fn x86_64ClassOf(ctx: *const anyopaque, func: *const Function, v: Value) u16 {
 /// depends only on the operand's class. Both are the generic hook shape.
 fn x86_64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) wimmer.UseKind {
     _ = ctx;
-    _ = inst;
-    return if (isXmm(func, operand)) .should_have_register else .must_have_register;
+    // An xmm operand reloads from a slot through a scratch, so it never forces a register.
+    if (isXmm(func, operand)) return .should_have_register;
+
+    // A gp call argument past the first six is passed on the stack. `lowerDirectCall` stores it from
+    // its slot through a scratch, so it needs no register either. The gp index is counted over the
+    // call's own arguments, the way the emitter counts it, so the two stay in step. An indirect
+    // call's target is read through, and every other operand still needs a register.
+    const call_args = switch (func.opcode(inst)) {
+        .call => |c| c.args,
+        .call_indirect => |c| if (operand == c.target) return .must_have_register else c.args,
+        else => return .must_have_register,
+    };
+    var gp: usize = 0;
+    var stack_only = false;
+    for (func.valueList(call_args)) |arg| {
+        if (isXmm(func, arg)) continue;
+        // A value used at both a register and a stack index keeps the stricter kind.
+        if (arg == operand) {
+            if (gp < arg_regs.len) return .must_have_register;
+            stack_only = true;
+        }
+        gp += 1;
+    }
+    return if (stack_only) .should_have_register else .must_have_register;
 }
 
 /// `RegDescription.copySource` for x86_64: report the source value when `v`'s defining
@@ -4177,6 +4199,33 @@ test "a call_indirect that fits in the argument registers opens no stack window"
     try std.testing.expect(std.mem.indexOf(u8, text, "call r10") != null);
 }
 
+test "a gp stack argument stored from a slot goes through the scratch" {
+    // Six parameters are register args; six more values are computed from them and passed as the stack
+    // args, kept live across the call so at least one must sit in a slot at the call. A slot-resident
+    // stack arg reloads into the scratch (r10) and then stores to the argument window, the `.spill`
+    // path in `lowerDirectCall`. The companion running test in `tests/cases.zig` checks that the values
+    // reach the callee; this one pins the reload that delivers them.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    var a: [12]Value = undefined;
+    inline for (0..6) |i| a[i] = try func.appendArithImm(b, t, .add, x, @intCast((i + 1) * 10));
+    inline for (0..6) |i| a[6 + i] = try func.appendArithImm(b, t, .add, x, @intCast(i + 1));
+    var acc = try func.appendCall(b, t, "callee", &a);
+    inline for (0..6) |i| {
+        acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = a[6 + i] } });
+    }
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try @import("disasm.zig").format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mov r10, qword ptr [rsp + ") != null);
+}
+
 // ===========================================================================
 // Wimmer bridge gap #7: a live-range split whose two adjacent segments are
 // both spill slots. `wimmerGprTransition`/`wimmerXmmTransition` now build a
@@ -4184,16 +4233,20 @@ test "a call_indirect that fits in the argument registers opens no stack window"
 // `emitSplitActionX86` expands it into a reload-then-store pair through the
 // class scratch (gpr `move_scratch`/r11, xmm `xmm_scratch`/xmm15).
 //
-// A natural Wimmer allocation can never reach this shape on x86, for the
+// A natural Wimmer allocation rarely reaches this shape on x86, for the
 // same structural reason aarch64's isel documents at its own
 // `.slot_to_slot` tests. `x86_64UseKind` makes every operand use
-// `must_have_register` (see its doc comment above), and `spillCurrent`'s
-// only two call sites in the shared `wimmer.zig` (backend-independent
-// code, not aarch64- or x86-specific) either split a value at its own next
-// must-have use, which its next pop is then proven to resolve into a
-// register rather than a second self-spill, or fire only when
-// `current.start()` is not itself a use. So a placed value alternates
-// register, slot, register. Two adjacent slot segments never arise.
+// `must_have_register` bar a gp call argument past the sixth, which is
+// stack-passed and may read from a slot (see its doc comment above), and
+// `spillCurrent`'s only two call sites in the shared `wimmer.zig`
+// (backend-independent code, not aarch64- or x86-specific) either split a
+// value at its own next must-have use, which its next pop is then proven to
+// resolve into a register rather than a second self-spill, or fire only when
+// `current.start()` is not itself a use. The blocked-register path can also
+// demote a whole same-start interval to a slot, which is one segment, not an
+// adjacent pair. So a placed value almost always alternates register, slot,
+// register, and two adjacent slot segments are rare rather than impossible;
+// `emitSplitActionX86` handles them either way.
 // This was confirmed empirically against several x86 differential
 // candidates (see wimmer_diff.zig's own same-position cluster shape):
 // none ever produced a `walloc.actions` entry with both `src` and `dst` as

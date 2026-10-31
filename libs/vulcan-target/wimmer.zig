@@ -2238,6 +2238,66 @@ fn spillCurrent(
     }
 }
 
+/// Part of `allocateBlockedReg`'s refusal path. Every candidate register is held by an interval that
+/// starts at `p`, so none is evictable. A same-start occupant with no must-have use needs no register
+/// at `p`, since each of its uses may read from a slot. Demote the occupants of one placeable span to
+/// a slot, with no split, and return that span's base for `current`. Returns null when no span is held
+/// entirely by such occupants. A demoted interval leaves `active` as it takes its slot, because
+/// `active` holds only register-resident intervals.
+fn demoteForSpan(
+    current: *Interval,
+    active: *std.ArrayList(*Interval),
+    slots: []u32,
+    is_candidate: *const [max_phys_regs]bool,
+    block_pos: *const [max_phys_regs]u32,
+    limit: usize,
+) ?u16 {
+    const class_idx = current.class;
+    const p = current.start();
+
+    var freeable: [max_phys_regs]bool = undefined;
+    @memset(freeable[0..limit], false);
+    for (active.items) |it| {
+        if (it.class != class_idx or it.fixed_reg != null) continue;
+        if (it.start() != p or firstMustHaveUse(it) != null) continue;
+        const r = assignedReg(it);
+        var k: u16 = 0;
+        while (k < it.regs) : (k += 1) {
+            const rr = r +| k;
+            if (rr < limit) freeable[rr] = true;
+        }
+    }
+
+    var base: ?u16 = null;
+    for (0..limit) |b| {
+        // A fixed clobber at `p` on any register of the span, an entry-parameter pin for example,
+        // bars taking it for `current`, the same `block_pos[rr] <= p` test every other take path makes.
+        if (spanPlaceable(is_candidate, &freeable, limit, b, current.regs, current.reg_align) and
+            spanMin(block_pos, b, current.regs) > p)
+        {
+            base = @intCast(b);
+            break;
+        }
+    }
+    const chosen_base = base orelse return null;
+
+    var i: usize = 0;
+    while (i < active.items.len) {
+        const it = active.items[i];
+        if (it.class == class_idx and it.fixed_reg == null and it.start() == p and
+            firstMustHaveUse(it) == null and
+            spansOverlap(assignedReg(it), it.regs, chosen_base, current.regs))
+        {
+            it.location = .{ .slot = slots[class_idx] };
+            slots[class_idx] += 1;
+            _ = active.swapRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+    return chosen_base;
+}
+
 /// ALLOCATEBLOCKEDREG (Wimmer & Franz Fig 7). `current` could not get a free register, so either
 /// it, or an interval occupying a register, must be split. Compute `nextUsePos[r]` for every
 /// allocatable register `r` of `current`'s class: the earliest future use of whatever holds `r`,
@@ -2401,9 +2461,36 @@ fn allocateBlockedReg(
     }
 
     // No register is evictable: every candidate is held by a same-start same-class interval (e.g. more
-    // params than the pool). None can be split at `p`, so spill `current` instead. It belongs to that
-    // same-start group, so spilling it is valid and makes progress.
+    // params than the pool). None can be split at `p`.
     const reg = chosen orelse {
+        // Where `current` needs a register at its own start and lives one position, demote the
+        // same-start occupants that need no register here, the ones with no must-have use, to a slot
+        // and take the register one frees. A whole interval in a slot is what `spillCurrent` already
+        // produces, so nothing is split and the `pos > start` obstacle that made the group unevictable
+        // never arises. This runs only on the refusal path, so an allocation that compiles today is
+        // unchanged.
+        //
+        // The one-position restriction is load-bearing twice over. It means `current` needs no
+        // fixed-clobber split, since it ends at `p + 1`. And it is why `fixedClobberConflict`
+        // (`current.covers(c) and current.covers(c + 1)`, see its definition) records no call clobber
+        // at `p` for `current`: a one-position interval covers `p` but not `p + 1`. `demoteForSpan`
+        // still runs the `block_pos` test, so the demote refuses a register an entry-parameter pin
+        // holds at `p` rather than rest on that argument. Widen this gate and both halves move: the
+        // clobber handling here and the block test there have to be rechecked together.
+        if (firstMustHaveUse(current)) |u| {
+            if (u == current.start() and current.end() == current.start() + 1) {
+                if (demoteForSpan(current, active, slots, &is_candidate, &block_pos, limit)) |base| {
+                    current.location = .{ .reg = base };
+                    try active.append(allocator, current);
+                    return;
+                }
+            }
+        }
+        // A multi-position `current` reaching here still refuses, by design. It is a register call
+        // argument whose reload-at-use child spans more than one position, which a call with every
+        // argument also live across it builds. The one-position gate above declines it and
+        // `spillCurrent` bails, because demoting for it would need `current` split before its next
+        // clobber, the split the gate deliberately avoids. Left for a real case to justify the cost.
         try spillCurrent(allocator, current, unhandled, children, slots, class_idx, block_from);
         return;
     };

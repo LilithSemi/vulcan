@@ -1194,6 +1194,53 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
     try module2.addFunction(allocator, "helper", &helper2);
     try h.expectRunModule(io, allocator, &module2, &.{5}, 31, backend); // (5*5+1) + 5
 
+    // A call with twelve integer arguments: six in registers, six on the stack. The six stack-argument
+    // VALUES are kept live across the call, so they must survive the clobber and at least one lands in
+    // a slot, which the call then stores to the argument window through the scratch, the `.spill` path.
+    // The callee sums all twelve, so a stack argument delivered from the wrong slot, or not at all,
+    // changes the result. This checks the values a slot-resident stack argument delivers to the callee,
+    // which a correctly placed but mis-timed store would get wrong where a verifier could not see it.
+    var wide_callee = Function.init(allocator);
+    defer wide_callee.deinit();
+    {
+        const t = try h.i32type(&wide_callee);
+        const b = try wide_callee.appendBlock();
+        var p: [12]ir.function.Value = undefined;
+        for (&p) |*pp| pp.* = try wide_callee.appendBlockParam(b, t);
+        var acc = p[0];
+        inline for (1..12) |i| {
+            acc = try wide_callee.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = p[i] } });
+        }
+        wide_callee.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
+    }
+    var wide_main = Function.init(allocator);
+    defer wide_main.deinit();
+    {
+        const t = try h.i32type(&wide_main);
+        const b = try wide_main.appendBlock();
+        // One parameter, because the in-process runner passes `main` at most three arguments. All
+        // twelve call arguments are computed from it, so they are real values that can spill rather
+        // than constants the backend could rematerialize.
+        const x = try wide_main.appendBlockParam(b, t);
+        var a: [12]ir.function.Value = undefined;
+        inline for (0..6) |i| a[i] = try wide_main.appendArithImm(b, t, .add, x, @intCast((i + 1) * 10));
+        inline for (0..6) |i| a[6 + i] = try wide_main.appendArithImm(b, t, .add, x, @intCast(i + 1));
+        var acc = try wide_main.appendCall(b, t, "callee", &a);
+        inline for (0..6) |i| {
+            acc = try wide_main.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = a[6 + i] } });
+        }
+        wide_main.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
+    }
+    var wide_module: link.Module = .{};
+    defer wide_module.deinit(allocator);
+    try wide_module.addFunction(allocator, "main", &wide_main);
+    try wide_module.addFunction(allocator, "callee", &wide_callee);
+    // x = 10: register args a0..a5 = x + {10,20,30,40,50,60} summing to 270; stack args a6..a11 =
+    // x + {1,2,3,4,5,6} summing to 81. The callee sums all twelve (351); main adds the six stack-arg
+    // values again (81), so 432, whose low byte the harness compares is 176.
+    const wide_args = [_]i64{10};
+    try h.expectRunModule(io, allocator, &wide_module, &wide_args, 432, backend);
+
     // Float call arguments + float result + a float value live across the call:
     // main(x, y) = helper(x, y) + x, helper(a, b) = a + b. So main = (x + y) + x.
     var fhelper = Function.init(allocator);
