@@ -167,7 +167,21 @@ fn canonical(graph: *Graph, op: OpNode) OpNode {
 }
 
 fn isCommutative(op: BinOp) bool {
-    return op == .add or op == .mul;
+    return switch (op) {
+        .add, .mul, .bit_and, .bit_or, .bit_xor => true,
+        else => false,
+    };
+}
+
+/// The operation that distributes over `outer`, if the factoring rule set has
+/// an exact integer identity for the pair.
+fn factorInner(outer: BinOp) ?BinOp {
+    return switch (outer) {
+        .add, .sub => .mul,
+        .bit_or, .bit_xor => .bit_and,
+        .bit_and => .bit_or,
+        else => null,
+    };
 }
 
 fn isInteger(func: *const Function, value: Value) bool {
@@ -181,9 +195,10 @@ fn isInteger(func: *const Function, value: Value) bool {
 fn hasFactorCandidate(func: *const Function, block: Block) bool {
     for (func.blockInsts(block)) |inst| {
         const sum = switch (func.opcode(inst)) {
-            .arith => |arith| if (arith.op == .add or arith.op == .sub) arith else continue,
+            .arith => |arith| if (factorInner(arith.op) != null) arith else continue,
             else => continue,
         };
+        const inner_op = factorInner(sum.op).?;
         const lhs_inst = func.definingInst(sum.lhs) orelse continue;
         const rhs_inst = func.definingInst(sum.rhs) orelse continue;
         const lhs = switch (func.opcode(lhs_inst)) {
@@ -194,7 +209,7 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
             .arith => |arith| arith,
             else => continue,
         };
-        if (lhs.op == .mul and rhs.op == .mul) return true;
+        if (lhs.op == inner_op and rhs.op == inner_op) return true;
     }
     return false;
 }
@@ -223,7 +238,7 @@ fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u
                 continue;
             },
         };
-        if (arith.op != .add and arith.op != .sub and arith.op != .mul) {
+        if (arith.op != .add and arith.op != .sub and arith.op != .mul and arith.op != .bit_and and arith.op != .bit_or and arith.op != .bit_xor) {
             _ = try classForValue(graph, classes, costs, result);
             continue;
         }
@@ -254,7 +269,7 @@ fn matchingOps(graph: *Graph, class: u32, op: BinOp, ty: Type, output: *std.Arra
     }
 }
 
-fn factorPair(graph: *Graph, sum_class: u32, sum_op: BinOp, left: OpNode, right: OpNode) !bool {
+fn factorPair(graph: *Graph, sum_class: u32, sum_op: BinOp, inner_op: BinOp, left: OpNode, right: OpNode) !bool {
     var common: ?u32 = null;
     var lhs_other: u32 = undefined;
     var rhs_other: u32 = undefined;
@@ -277,7 +292,7 @@ fn factorPair(graph: *Graph, sum_class: u32, sum_op: BinOp, left: OpNode, right:
     }
     const shared = common orelse return false;
     const inner = try graph.addOp(.{ .op = sum_op, .lhs = lhs_other, .rhs = rhs_other, .ty = left.ty, .existing = null }) orelse return false;
-    const product = try graph.addOp(.{ .op = .mul, .lhs = shared, .rhs = inner, .ty = left.ty, .existing = null }) orelse return false;
+    const product = try graph.addOp(.{ .op = inner_op, .lhs = shared, .rhs = inner, .ty = left.ty, .existing = null }) orelse return false;
     return graph.merge(sum_class, product);
 }
 
@@ -293,15 +308,16 @@ fn saturate(graph: *Graph) !void {
         const count = graph.nodes.items.len;
         for (graph.nodes.items[0..count]) |entry| {
             const sum = switch (entry.node) {
-                .op => |op| if (op.op == .add or op.op == .sub) canonical(graph, op) else continue,
+                .op => |op| if (factorInner(op.op) != null) canonical(graph, op) else continue,
                 .leaf => continue,
             };
+            const inner_op = factorInner(sum.op).?;
             left.clearRetainingCapacity();
             right.clearRetainingCapacity();
-            try matchingOps(graph, sum.lhs, .mul, sum.ty, &left);
-            try matchingOps(graph, sum.rhs, .mul, sum.ty, &right);
+            try matchingOps(graph, sum.lhs, inner_op, sum.ty, &left);
+            try matchingOps(graph, sum.rhs, inner_op, sum.ty, &right);
             for (left.items) |a| for (right.items) |b| {
-                changed = try factorPair(graph, entry.class, sum.op, a, b) or changed;
+                changed = try factorPair(graph, entry.class, sum.op, inner_op, a, b) or changed;
                 if (graph.hit_limit) break;
             };
             if (graph.hit_limit) break;
@@ -504,6 +520,32 @@ test "egraph factors a shared multiplier from a subtraction" {
     try std.testing.expectEqual(BinOp.sub, inner.op);
     try std.testing.expectEqual(b, inner.lhs);
     try std.testing.expectEqual(c, inner.rhs);
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "egraph factors bitwise and across bitwise or" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } });
+    const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = c } });
+    const combined = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_or, .lhs = ab, .rhs = ac } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(combined) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const outer = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.bit_and, outer.op);
+    const inner_value = if (outer.lhs == a) outer.rhs else outer.lhs;
+    const inner = func.opcode(func.definingInst(inner_value).?).arith;
+    try std.testing.expectEqual(BinOp.bit_or, inner.op);
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
     try std.testing.expect(diags.ok());
