@@ -37,6 +37,31 @@ const InputSpec = union(enum) {
     lib: struct { name: []const u8, prefer_dynamic: bool },
 };
 
+const OptimizationLevel = enum {
+    off,
+    debug,
+    one,
+    two,
+    three,
+    size,
+    min_size,
+    fast,
+
+    fn optimizes(self: OptimizationLevel) bool {
+        return switch (self) {
+            .off, .debug => false,
+            .one, .two, .three, .size, .min_size, .fast => true,
+        };
+    }
+
+    fn runsMicroarch(self: OptimizationLevel) bool {
+        return switch (self) {
+            .two, .three, .fast => true,
+            .off, .debug, .one, .size, .min_size => false,
+        };
+    }
+};
+
 const Options = struct {
     /// Every positional or `-l` input, in command-line order. `-c`/`-E` still require
     /// exactly one `.c`/`.i` entry. The LINK path (the default when neither is given)
@@ -139,13 +164,7 @@ const Options = struct {
     /// so a plain link runs the mark-and-sweep pass without any extra flag. `--no-gc-sections`
     /// opts back out to the old keep-everything behavior. See the LINK step in `main`.
     gc_sections: bool = true,
-    /// Whether to run the IR optimization pipeline (`vulcan-opt`'s mem2reg, then the clean-up
-    /// passes) before code generation. Set by an `-O<n>` flag with a level of 1 or higher
-    /// (`-O1`/`-O2`/`-O3`/`-Os`/`-Ofast`). `-O0`, `-Og`, and NO `-O` flag leave it false, so
-    /// the output stays exactly what the un-optimized single-level pipeline produced before.
-    /// This mirrors clang, whose default is `-O0`. `./configure` builds pass `-O2`, so a real
-    /// autotools compile optimizes.
-    optimize: bool = false,
+    optimize: OptimizationLevel = .off,
 };
 
 /// Which autoconf-style version probe was requested. `main` answers these BEFORE running
@@ -375,11 +394,7 @@ fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (e
         } else if (std.mem.startsWith(u8, arg, "-march=")) {
             // ISA selection. VCC's ISA is fixed by -target, so accept and ignore.
         } else if (std.mem.startsWith(u8, arg, "-O")) {
-            // Optimization level. A level of 1 or higher (`-O1`/`-O2`/`-O3`/`-Os`/`-Ofast`)
-            // turns the IR optimization pipeline on. `-O0` and `-Og` leave it off, matching
-            // clang's default. The exact level does not further tune the pipeline yet, so all
-            // "on" levels run the same passes. Last flag on the line wins.
-            opts.optimize = optLevelEnablesOpt(arg["-O".len..]);
+            opts.optimize = parseOptimizationLevel(arg["-O".len..]);
         } else if (std.mem.eql(u8, arg, "--gc-sections")) {
             opts.gc_sections = true;
         } else if (std.mem.eql(u8, arg, "--no-gc-sections")) {
@@ -431,21 +446,19 @@ fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (e
     return opts;
 }
 
-/// Whether `arg` is a warning, optimization, debug, or standard-selection flag VCC
-/// recognizes but does not act on. `./configure`/`make` throw the full gcc flag surface at
-/// the compiler. Most of it (which warnings to print, which optimization level, how much
-/// debug info) has no effect on VCC's own single-level pipeline.
-/// Whether an `-O<level>` flag (the text after `-O`) turns the optimization pipeline on. A bare
-/// `-O` is gcc's `-O1`, so it counts. `-O0` and `-Og` (a debug-friendly build) stay off. Every
-/// other level (`-O1`/`-O2`/`-O3`/`-Os`/`-Oz`/`-Ofast`) turns it on. The exact level does not yet
-/// tune which passes run.
-fn optLevelEnablesOpt(level: []const u8) bool {
-    if (level.len == 0) return true; // bare -O is -O1
-    if (std.mem.eql(u8, level, "0")) return false;
-    if (std.mem.eql(u8, level, "g")) return false;
-    return true;
+fn parseOptimizationLevel(level: []const u8) OptimizationLevel {
+    if (level.len == 0 or std.mem.eql(u8, level, "1")) return .one;
+    if (std.mem.eql(u8, level, "0")) return .off;
+    if (std.mem.eql(u8, level, "g")) return .debug;
+    if (std.mem.eql(u8, level, "2")) return .two;
+    if (std.mem.eql(u8, level, "3")) return .three;
+    if (std.mem.eql(u8, level, "s")) return .size;
+    if (std.mem.eql(u8, level, "z")) return .min_size;
+    if (std.mem.eql(u8, level, "fast")) return .fast;
+    return .two;
 }
 
+/// Whether `arg` is a warning, debug, or standard-selection flag VCC accepts without action.
 fn isIgnoredFlag(arg: []const u8) bool {
     if (std.mem.startsWith(u8, arg, "-std=")) return true; // -std=gnu11, -std=c99, ...
     if (std.mem.startsWith(u8, arg, "-O")) return true; // -O, -O0.. -Ofast, -Os, -Og
@@ -921,7 +934,7 @@ fn buildModuleData(allocator: std.mem.Allocator, objs: []const cc.DataObject) st
 /// microarch model for `arch` (see `resolveModel`). It tunes both the IR layer and the
 /// backend for every function this call compiles. Used by both the `-c` path (a single
 /// source) and the link step (one call per `.c`/`.i` input, in command order).
-fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: bool) ![]u8 {
+fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel) ![]u8 {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
     var pp_opts = pp_base;
     pp_opts.filename = try filenameForPreproc(allocator, path);
@@ -942,15 +955,15 @@ fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, p
 /// `opt.optimizeLate` reduces a loop's addresses to loop-carried pointers, which changes the shape
 /// four microarch idiom recognizers match on, so it has to come after them. `opt.optimize` is the
 /// two halves back to back, for a caller with no microarch layer to fit in between.
-fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: bool) ![]u8 {
+fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel) ![]u8 {
     var mod = try cc.compileWithOpts(allocator, source, pp_opts);
     defer mod.deinit(allocator);
 
     var mfs: std.ArrayList(target.native.ModuleFunction) = .empty;
     for (mod.funcs) |*nf| {
-        if (optimize) _ = try opt.optimizeEarly(allocator, &nf.func);
-        if (model) |m| _ = try mm.optimize(allocator, &nf.func, m);
-        if (optimize) _ = try opt.optimizeLate(allocator, &nf.func);
+        if (optimize.optimizes()) _ = try opt.optimizeEarly(allocator, &nf.func);
+        if (optimize.runsMicroarch()) if (model) |m| _ = try mm.optimize(allocator, &nf.func, m);
+        if (optimize.optimizes()) _ = try opt.optimizeLate(allocator, &nf.func);
         try mfs.append(allocator, .{ .name = nf.name, .func = &nf.func });
     }
 
@@ -968,7 +981,7 @@ fn synthDsoHandleObject(allocator: std.mem.Allocator, pp_base: preproc.Options, 
     var pp_opts = pp_base;
     pp_opts.filename = "<vcc-dso-handle>";
     // Data only, no functions, so optimization has nothing to act on: pass it off.
-    return compileSourceToObject(allocator, "void *__dso_handle = 0;\n", pp_opts, arch, null, false);
+    return compileSourceToObject(allocator, "void *__dso_handle = 0;\n", pp_opts, arch, null, .off);
 }
 
 /// The `vcc` driver entry point: parse argv, then dispatch on mode. `-E` preprocesses and
@@ -1219,7 +1232,7 @@ pub fn main(init: std.process.Init) !void {
         var w = std.Io.File.stdout().writer(io, &buf);
         // With an optimization level (`-O1`+), dump the IR the backend actually sees, not the raw
         // lowering: run the same pipeline the object path runs.
-        if (opts.optimize) for (mod.funcs) |*nf| {
+        if (opts.optimize.optimizes()) for (mod.funcs) |*nf| {
             _ = try opt.optimize(allocator, &nf.func);
         };
         for (mod.funcs) |nf| try w.interface.print("; function {s}\n{f}\n", .{ nf.name, nf.func });
@@ -1755,6 +1768,36 @@ test "parseArgs: an unrelated -Wl, value leaves gc_sections at the default" {
     var it = SliceArgs{ .items = &.{ "-Wl,-z,now", "foo.c" } };
     const o = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expect(o.gc_sections);
+}
+
+test "parseArgs: optimization levels keep their policy" {
+    const Case = struct { arg: []const u8, expected: OptimizationLevel };
+    const cases = [_]Case{
+        .{ .arg = "-O0", .expected = .off },
+        .{ .arg = "-Og", .expected = .debug },
+        .{ .arg = "-O1", .expected = .one },
+        .{ .arg = "-O2", .expected = .two },
+        .{ .arg = "-O3", .expected = .three },
+        .{ .arg = "-Os", .expected = .size },
+        .{ .arg = "-Oz", .expected = .min_size },
+        .{ .arg = "-Ofast", .expected = .fast },
+    };
+
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var it = SliceArgs{ .items = &.{ case.arg, "foo.c" } };
+        const opts = try parseArgs(arena.allocator(), testErrw(), &it);
+        try std.testing.expectEqual(case.expected, opts.optimize);
+    }
+}
+
+test "optimization level gates microarchitecture transforms" {
+    try std.testing.expect(!OptimizationLevel.off.runsMicroarch());
+    try std.testing.expect(!OptimizationLevel.one.runsMicroarch());
+    try std.testing.expect(OptimizationLevel.two.runsMicroarch());
+    try std.testing.expect(OptimizationLevel.three.runsMicroarch());
+    try std.testing.expect(!OptimizationLevel.size.runsMicroarch());
 }
 
 test "pickModel: named part matching target -> model" {
