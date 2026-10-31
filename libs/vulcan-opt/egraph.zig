@@ -343,12 +343,16 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
             if (lhs) |op| if (op.op == .sub and op.rhs == sum.rhs) return true;
             if (rhs) |op| if (op.op == .sub and op.rhs == sum.lhs) return true;
             if (lhs != null and rhs != null and
+                (((lhs.?.op == .add and rhs.?.op == .sub) or (lhs.?.op == .sub and rhs.?.op == .add)) and
+                    sameValueOperands(lhs.?, rhs.?))) return true;
+            if (lhs != null and rhs != null and
                 ((lhs.?.op == .bit_or and rhs.?.op == .bit_and) or
                     (lhs.?.op == .bit_and and rhs.?.op == .bit_or)) and
                 sameValueOperands(lhs.?, rhs.?)) return true;
         } else if (sum.op == .sub) {
             if (lhs) |op| if (op.op == .add and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
             if (rhs) |op| if (op.op == .sub and op.lhs == sum.lhs) return true;
+            if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and sameValueOperands(lhs.?, rhs.?)) return true;
             if (lhs != null and rhs != null and lhs.?.op == .bit_or and rhs.?.op == .bit_and and sameValueOperands(lhs.?, rhs.?)) return true;
         } else if (sum.op == .bit_xor) {
             if (lhs) |op| if (op.op == .bit_xor and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
@@ -557,6 +561,35 @@ fn foldBitwisePairs(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.A
     return changed;
 }
 
+fn mergeDouble(graph: *Graph, outer_class: u32, ty: Type, value: u32) !bool {
+    const doubled = try graph.addOp(.{ .op = .add, .lhs = value, .rhs = value, .ty = ty, .existing = null }) orelse return false;
+    return graph.merge(outer_class, doubled);
+}
+
+fn foldMixedAddSub(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
+    var changed = false;
+    left.clearRetainingCapacity();
+    right.clearRetainingCapacity();
+    try matchingOps(graph, outer.lhs, .add, outer.ty, left);
+    try matchingOps(graph, outer.rhs, .sub, outer.ty, right);
+    for (left.items) |addition| for (right.items) |subtraction| {
+        if (!sameClassOperands(graph, addition, subtraction)) continue;
+        const repeated = if (outer.op == .add) subtraction.lhs else subtraction.rhs;
+        changed = try mergeDouble(graph, outer_class, outer.ty, repeated) or changed;
+    };
+    if (outer.op != .add or graph.hit_limit) return changed;
+
+    left.clearRetainingCapacity();
+    right.clearRetainingCapacity();
+    try matchingOps(graph, outer.lhs, .sub, outer.ty, left);
+    try matchingOps(graph, outer.rhs, .add, outer.ty, right);
+    for (left.items) |subtraction| for (right.items) |addition| {
+        if (!sameClassOperands(graph, subtraction, addition)) continue;
+        changed = try mergeDouble(graph, outer_class, outer.ty, subtraction.lhs) or changed;
+    };
+    return changed;
+}
+
 fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
     var changed = false;
     if (outer.op == .add) {
@@ -674,6 +707,9 @@ fn saturate(graph: *Graph) !void {
             }
             if (sum.op == .add or sum.op == .sub or sum.op == .bit_xor) {
                 changed = try cancelInverse(graph, entry.class, sum, left, right) or changed;
+            }
+            if (sum.op == .add or sum.op == .sub) {
+                changed = try foldMixedAddSub(graph, entry.class, sum, left, right) or changed;
             }
             if (sum.op == .bit_and or sum.op == .bit_or) {
                 changed = try foldNestedIdempotent(graph, entry.class, sum, left) or changed;
@@ -870,6 +906,30 @@ fn expectBitwisePair(outer_op: BinOp, left_op: BinOp, right_op: BinOp, expected:
     const reduced = func.opcode(func.definingInst(replacement).?).arith;
     try std.testing.expectEqual(expected, reduced.op);
     try std.testing.expect((reduced.lhs == a and reduced.rhs == b) or (reduced.lhs == b and reduced.rhs == a));
+}
+
+fn expectMixedAddSub(outer_op: BinOp, addition_on_left: bool, repeat_a: bool) !void {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const addition = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = b, .rhs = a } });
+    const subtraction = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } });
+    const lhs = if (addition_on_left) addition else subtraction;
+    const rhs = if (addition_on_left) subtraction else addition;
+    const combined = try func.appendInst(block, ty, .{ .arith = .{ .op = outer_op, .lhs = lhs, .rhs = rhs } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(combined) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const doubled = func.opcode(func.definingInst(replacement).?).arith;
+    const expected = if (repeat_a) a else b;
+    try std.testing.expectEqual(BinOp.add, doubled.op);
+    try std.testing.expectEqual(expected, doubled.lhs);
+    try std.testing.expectEqual(expected, doubled.rhs);
 }
 
 test "egraph hash-consing follows merged child classes" {
@@ -1210,6 +1270,12 @@ test "egraph folds and-or combinations of matching bitwise terms" {
     try expectBitwisePair(.bit_or, .bit_or, .bit_xor, .bit_or);
     try expectBitwisePair(.bit_and, .bit_and, .bit_or, .bit_and);
     try expectBitwisePair(.bit_and, .bit_or, .bit_xor, .bit_xor);
+}
+
+test "egraph folds mixed addition and subtraction pairs" {
+    try expectMixedAddSub(.add, true, true);
+    try expectMixedAddSub(.add, false, true);
+    try expectMixedAddSub(.sub, true, false);
 }
 
 test "egraph reassociates an add tree to expose factoring" {
