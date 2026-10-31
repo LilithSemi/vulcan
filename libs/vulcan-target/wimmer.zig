@@ -494,13 +494,15 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
     var late_reads: std.ArrayList(LateRead) = .empty;
     defer late_reads.deinit(allocator);
 
-    // Liveness bitsets, indexed `bi * nval + vi`. `defined`/`used` are the block-local gen/kill sets.
-    const defined = try allocator.alloc(bool, nblocks * nval);
+    // Liveness sets use one bit per value. Dense boolean matrices made every fixpoint edge scan
+    // one byte at a time and used eight times the storage needed for the same information.
+    const words_per_block = std.math.divCeil(usize, nval, 64) catch unreachable;
+    const defined = try allocator.alloc(u64, nblocks * words_per_block);
     defer allocator.free(defined);
-    const used = try allocator.alloc(bool, nblocks * nval);
+    const used = try allocator.alloc(u64, nblocks * words_per_block);
     defer allocator.free(used);
-    @memset(defined, false);
-    @memset(used, false);
+    @memset(defined, 0);
+    @memset(used, 0);
 
     // Successor lists, driving the liveness fixpoint (from `if` instructions and `jump` terminators).
     const succ = try allocator.alloc(std.ArrayList(u32), nblocks);
@@ -513,7 +515,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
         allocator: std.mem.Allocator,
         func: *const Function,
         desc: *const RegDescription,
-        used_row: []bool,
+        used_row: []u64,
         range_lists: []std.ArrayList(Range),
         use_lists: []std.ArrayList(UsePos),
         block_from: u32,
@@ -527,7 +529,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
 
         fn visit(self: *@This(), v: Value, is_edge_arg: bool) void {
             const vi = @backingInt(v);
-            self.used_row[vi] = true;
+            self.used_row[vi / 64] |= @as(u64, 1) << @intCast(vi % 64);
             const kind: UseKind = if (is_edge_arg)
                 // An edge argument feeds a successor block parameter through the parallel move the
                 // resolver realizes on the edge. That move can load from or store to a spill slot
@@ -579,7 +581,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             const pi = @backingInt(p);
             def_pos[pi] = pos;
             is_def[pi] = true;
-            defined[bi * nval + pi] = true;
+            defined[bi * words_per_block + pi / 64] |= @as(u64, 1) << @intCast(pi % 64);
         }
         pos += 1;
         for (func.blockInsts(block)) |inst| {
@@ -587,7 +589,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
                 .allocator = allocator,
                 .func = func,
                 .desc = desc,
-                .used_row = used[bi * nval ..][0..nval],
+                .used_row = used[bi * words_per_block ..][0..words_per_block],
                 .range_lists = range_lists,
                 .use_lists = use_lists,
                 .block_from = block_from[bi],
@@ -618,7 +620,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
                 const ri = @backingInt(r);
                 def_pos[ri] = pos;
                 is_def[ri] = true;
-                defined[bi * nval + ri] = true;
+                defined[bi * words_per_block + ri / 64] |= @as(u64, 1) << @intCast(ri % 64);
             }
             pos += 1;
         }
@@ -628,7 +630,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
                 .allocator = allocator,
                 .func = func,
                 .desc = desc,
-                .used_row = used[bi * nval ..][0..nval],
+                .used_row = used[bi * words_per_block ..][0..words_per_block],
                 .range_lists = range_lists,
                 .use_lists = use_lists,
                 .block_from = block_from[bi],
@@ -672,12 +674,12 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
     // loop pass. A block parameter is `defined` in its block, so it is never live-in from an edge.
     // The edge ARGUMENT that feeds it is `used` in the predecessor. The computation is monotonic,
     // so the fixpoint terminates. ---
-    const live_in = try allocator.alloc(bool, nblocks * nval);
+    const live_in = try allocator.alloc(u64, nblocks * words_per_block);
     defer allocator.free(live_in);
-    const live_out = try allocator.alloc(bool, nblocks * nval);
+    const live_out = try allocator.alloc(u64, nblocks * words_per_block);
     defer allocator.free(live_out);
-    @memset(live_in, false);
-    @memset(live_out, false);
+    @memset(live_in, 0);
+    @memset(live_out, 0);
     if (nblocks > 0 and nval > 0) {
         var changed = true;
         while (changed) {
@@ -686,17 +688,20 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             while (b > 0) {
                 b -= 1;
                 for (succ[b].items) |s| {
-                    for (0..nval) |v| {
-                        if (live_in[@as(usize, s) * nval + v] and !live_out[b * nval + v]) {
-                            live_out[b * nval + v] = true;
+                    for (0..words_per_block) |word_index| {
+                        const out_index = b * words_per_block + word_index;
+                        const next = live_out[out_index] | live_in[@as(usize, s) * words_per_block + word_index];
+                        if (next != live_out[out_index]) {
+                            live_out[out_index] = next;
                             changed = true;
                         }
                     }
                 }
-                for (0..nval) |v| {
-                    const new_in = (used[b * nval + v] or live_out[b * nval + v]) and !defined[b * nval + v];
-                    if (new_in and !live_in[b * nval + v]) {
-                        live_in[b * nval + v] = true;
+                for (0..words_per_block) |word_index| {
+                    const index = b * words_per_block + word_index;
+                    const next = live_in[index] | ((used[index] | live_out[index]) & ~defined[index]);
+                    if (next != live_in[index]) {
+                        live_in[index] = next;
                         changed = true;
                     }
                 }
@@ -706,9 +711,14 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
 
     // --- Pass B: every value live-out of a block is live across that whole block. ---
     for (0..nblocks) |bi| {
-        for (0..nval) |v| {
-            if (!live_out[bi * nval + v]) continue;
-            try range_lists[v].append(allocator, .{ .from = block_from[bi], .to = block_to[bi] });
+        for (0..words_per_block) |word_index| {
+            var word = live_out[bi * words_per_block + word_index];
+            while (word != 0) {
+                const bit: usize = @intCast(@ctz(word));
+                const value_index = word_index * 64 + bit;
+                if (value_index < nval) try range_lists[value_index].append(allocator, .{ .from = block_from[bi], .to = block_to[bi] });
+                word &= word - 1;
+            }
         }
     }
 
