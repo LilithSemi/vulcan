@@ -586,6 +586,7 @@ pub const ModelCaps = struct {
     /// `features.aarch64.fp16` (FEAT_FP16) is true (see `selectFunctionForModel`). When false the
     /// f16 lowering is byte-identical to the pre-FEAT_FP16 emulation.
     fp16: bool = false,
+    machine_model: peephole.MachineModel = .{},
     /// Fuse a compare into its consumer branch (CMP+Bcc becomes a single conditional branch on flags).
     /// Base-ISA on every aarch64 core, so true by default. Gates `fusesIntoNextIf` (see its doc
     /// comment). When false, it falls back to materializing the boolean with `cset` then testing it with
@@ -649,6 +650,7 @@ pub fn capsForModel(model: *const mm.Model) ModelCaps {
     return .{
         .fetch_align = model.fetch_align,
         .fp16 = model.arch == .aarch64 and model.features.aarch64.fp16,
+        .machine_model = .{ .issue_width = model.issue_width, .units = model.units },
         .fuse_cmp_branch = model.fuses(.cmp_branch),
         .fuse_arith_branch = model.fuses(.arith_branch),
         .fuse_shift_add = model.fuses(.shift_add),
@@ -2351,7 +2353,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     // BEFORE resolving fixups, so the branch-displacement loop below computes correct offsets
     // against the paired `code` and remapped `block_start`/`fixups`. A function with no fusable
     // pair is left byte-identical.
-    try peephole.pairMemory(allocator, &code, block_start, fixups.items, relocs.items, lines.items);
+    try peephole.pairMemoryForModel(allocator, &code, block_start, fixups.items, relocs.items, lines.items, caps.machine_model);
 
     for (fixups.items) |f| {
         var target = f.target;

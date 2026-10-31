@@ -12,6 +12,7 @@
 const std = @import("std");
 const encode = @import("encode.zig");
 const isel = @import("isel.zig");
+const mm = @import("vulcan-opt").microarch;
 const Reg = encode.Reg;
 
 /// The side-table row types the fusion pass remaps. Taken directly from the isel so a fusion
@@ -19,6 +20,63 @@ const Reg = encode.Reg;
 const Fixup = isel.Fixup;
 const Reloc = isel.Reloc;
 const LineEntry = isel.LineEntry;
+
+pub const MachineModel = struct {
+    issue_width: u8 = 1,
+    units: mm.Units = .{},
+};
+
+pub const MachineScore = struct {
+    cycles: u32,
+    instructions: u32,
+
+    pub fn accepts(candidate: MachineScore, baseline: MachineScore) bool {
+        if (candidate.cycles != baseline.cycles) return candidate.cycles < baseline.cycles;
+        return candidate.instructions <= baseline.instructions;
+    }
+};
+
+const MachineClass = enum { alu, muldiv, mem, branch, fpsimd };
+
+pub fn scoreWords(words: []const u32, model: MachineModel) MachineScore {
+    var demand: [@typeInfo(MachineClass).@"enum".field_names.len]u32 = @splat(0);
+    for (words) |word| demand[@backingInt(machineClass(word))] += 1;
+
+    var cycles = ceilDiv(@intCast(words.len), @max(1, model.issue_width));
+    inline for (0..demand.len) |index| {
+        const class: MachineClass = @fromBackingInt(@intCast(index));
+        cycles = @max(cycles, ceilDiv(demand[index], ports(model, class)));
+    }
+    return .{ .cycles = cycles, .instructions = @intCast(words.len) };
+}
+
+fn machineClass(word: u32) MachineClass {
+    if (decodeMem(word) != null or isPairMemory(word)) return .mem;
+    if (word & 0x7F000000 == 0x1B000000) return .muldiv;
+    if (word & 0x7C000000 == 0x14000000 or word & 0xFF000010 == 0x54000000) return .branch;
+    return .alu;
+}
+
+fn isPairMemory(word: u32) bool {
+    return switch (word & 0xFFC00000) {
+        0xA9400000, 0xA9000000, 0x29400000, 0x29000000 => true,
+        else => false,
+    };
+}
+
+fn ports(model: MachineModel, class: MachineClass) u32 {
+    return @max(1, switch (class) {
+        .alu => model.units.alu,
+        .muldiv => model.units.muldiv,
+        .mem => model.units.mem,
+        .branch => model.units.branch,
+        .fpsimd => model.units.fpsimd,
+    });
+}
+
+fn ceilDiv(numerator: u32, denominator: u32) u32 {
+    return (numerator + denominator - 1) / denominator;
+}
 
 /// The offset-form ldr/str encodings the aarch64 isel emits. Anything else is opaque to this
 /// peephole and decodes to null.
@@ -165,6 +223,18 @@ pub fn pairMemory(
     relocs: []Reloc, // .offset WORD indices, remapped in place
     lines: []LineEntry, // .offset BYTE offsets, remapped in place
 ) std.mem.Allocator.Error!void {
+    return pairMemoryForModel(allocator, words, block_start, fixups, relocs, lines, .{});
+}
+
+pub fn pairMemoryForModel(
+    allocator: std.mem.Allocator,
+    words: *std.ArrayList(u32),
+    block_start: []usize,
+    fixups: []Fixup,
+    relocs: []Reloc,
+    lines: []LineEntry,
+    model: MachineModel,
+) std.mem.Allocator.Error!void {
     const len = words.items.len;
 
     // Which word indices begin a block. A word is fusable-as-second only if it is NOT a block
@@ -199,13 +269,17 @@ pub fn pairMemory(
                 break :memory tryFuse(a, b);
             };
             if (fused) |word| {
-                removed_before[i] = removed;
-                removed += 1;
-                removed_before[i + 1] = removed; // deleted slot collapses onto the fused word
-                words.items[write] = word;
-                write += 1;
-                i += 2;
-                did_fuse = true;
+                const baseline = scoreWords(words.items[i .. i + 2], model);
+                const candidate = scoreWords(&.{word}, model);
+                if (candidate.accepts(baseline)) {
+                    removed_before[i] = removed;
+                    removed += 1;
+                    removed_before[i + 1] = removed; // deleted slot collapses onto the fused word
+                    words.items[write] = word;
+                    write += 1;
+                    i += 2;
+                    did_fuse = true;
+                }
             }
         }
         if (!did_fuse) {
@@ -242,6 +316,13 @@ pub fn pairMemory(
     }
 
     words.shrinkRetainingCapacity(write);
+}
+
+test "machine score rejects lower throughput rewrites" {
+    const model = MachineModel{ .issue_width = 2, .units = .{ .alu = 2, .mem = 1 } };
+    const arithmetic = scoreWords(&.{ encode.add(.x0, .x1, .x2), encode.add(.x3, .x4, .x5) }, model);
+    const memory = scoreWords(&.{ encode.ldrOff(.x0, .x1, 0), encode.ldrOff(.x2, .x1, 8) }, model);
+    try std.testing.expect(!memory.accepts(arithmetic));
 }
 
 test "decodeMem recognizes each ldr/str offset form and rejects a non-memory word" {
