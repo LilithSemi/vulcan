@@ -28,6 +28,8 @@ pub fn main(init: std.process.Init) !void {
     defer idempotent.deinit();
     var bitwise_pair = try buildBitwisePairWorkload(allocator, blocks);
     defer bitwise_pair.deinit();
+    var mixed_pair = try buildMixedPairWorkload(allocator, blocks);
+    defer mixed_pair.deinit();
     var rootless = try buildRootlessWorkload(allocator, blocks);
     defer rootless.deinit();
     var unrelated = try buildUnrelatedWorkload(allocator, blocks);
@@ -47,6 +49,7 @@ pub fn main(init: std.process.Init) !void {
     const xor_inverse_egraph_ns = try measure(init.io, allocator, &xor_inverse, runEgraph);
     const idempotent_egraph_ns = try measure(init.io, allocator, &idempotent, runEgraph);
     const bitwise_pair_egraph_ns = try measure(init.io, allocator, &bitwise_pair, runEgraph);
+    const mixed_pair_egraph_ns = try measure(init.io, allocator, &mixed_pair, runEgraph);
     const rootless_egraph_ns = try measure(init.io, allocator, &rootless, runEgraph);
     const unrelated_egraph_ns = try measure(init.io, allocator, &unrelated, runEgraph);
     const mixed_egraph_ns = try measure(init.io, allocator, &mixed, runEgraph);
@@ -60,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
             "  xor inverse egraph:     {d} ns/block\n" ++
             "  idempotent egraph:      {d} ns/block\n" ++
             "  bitwise pair egraph:    {d} ns/block\n" ++
+            "  mixed pair egraph:      {d} ns/block\n" ++
             "  rootless egraph:        {d} ns/block\n" ++
             "  unrelated egraph:       {d} ns/block\n" ++
             "  mixed egraph:           {d} ns/block\n",
@@ -75,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
             xor_inverse_egraph_ns / blocks,
             idempotent_egraph_ns / blocks,
             bitwise_pair_egraph_ns / blocks,
+            mixed_pair_egraph_ns / blocks,
             rootless_egraph_ns / blocks,
             unrelated_egraph_ns / blocks,
             mixed_egraph_ns / blocks,
@@ -204,6 +209,22 @@ fn buildBitwisePairWorkload(allocator: std.mem.Allocator, count: usize) !Functio
         const both = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } });
         const either = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_or, .lhs = a, .rhs = b } });
         const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = both, .rhs = either } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    }
+    return func;
+}
+
+fn buildMixedPairWorkload(allocator: std.mem.Allocator, count: usize) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    for (0..count) |_| {
+        const block = try func.appendBlock();
+        const a = try func.appendBlockParam(block, ty);
+        const b = try func.appendBlockParam(block, ty);
+        const sum = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+        const difference = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } });
+        const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = difference } });
         func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
     }
     return func;
