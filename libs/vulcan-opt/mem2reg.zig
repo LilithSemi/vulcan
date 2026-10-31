@@ -17,8 +17,6 @@ const Inst = ir.function.Inst;
 pub const pass_def = pass.Pass{ .name = "mem2reg", .run = run, .preserves_cfg = true };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
-    _ = analyses;
-
     const promotable = try findPromotable(allocator, func);
     defer allocator.free(promotable);
 
@@ -52,7 +50,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     var b = Builder{
         .allocator = allocator,
         .func = func,
-        .cfg = try cfg_mod.build(allocator, func),
+        .cfg = try analyses.cfg(),
         .slot_of_value = slot_of_value,
         .slot_elem = slot_elem.items,
         .num_slots = num_slots,
@@ -71,7 +69,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 const Builder = struct {
     allocator: std.mem.Allocator,
     func: *Function,
-    cfg: cfg_mod.Cfg,
+    cfg: *const cfg_mod.Cfg,
     slot_of_value: []const ?u32,
     slot_elem: []const ir.types.Type,
     num_slots: usize,
@@ -89,7 +87,6 @@ const Builder = struct {
     undef_zero: []?Value = &.{},
 
     fn deinit(self: *Builder) void {
-        self.cfg.deinit(self.allocator);
         self.allocator.free(self.local_end);
         self.allocator.free(self.writes);
         self.allocator.free(self.entry_memo);
@@ -496,9 +493,9 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
             if (@backingInt(v) < p.len) p[@backingInt(v)] = false;
         }
     }.hit;
-    for (0..func.instCount()) |i| {
-        const inst: Inst = @fromBackingInt(@intCast(i));
-        switch (func.opcode(inst)) {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
             // ld.ptr is the sanctioned use - UNLESS the load is `volatile` (SM9 Plan 2 Task 4):
             // a volatile access must observably hit memory, so its alloca cannot be promoted
             // to an SSA value and the load must stay in the IR.
@@ -592,7 +589,7 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
                 for (func.blockArgs(cf.then)) |arg| esc(promotable, arg);
                 for (func.blockArgs(cf.@"else")) |arg| esc(promotable, arg);
             },
-        }
+        };
     }
     for (0..func.blockCount()) |bi| {
         if (func.terminator(@fromBackingInt(@intCast(bi)))) |term| switch (term) {
@@ -679,6 +676,25 @@ test "single-block store then load forwards the stored value" {
 
     try testing.expect(try runOnce(allocator, &func));
     try testing.expectEqual(x, func.terminator(b).?.ret.values[0]); // load became x
+    try expectNoMemoryInsts(&func, b);
+}
+
+test "an orphaned address use does not block promotion" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
+    try func.appendStore(b, x, slot);
+    const y = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+    _ = try func.createInst(ptr_t, .{ .arith = .{ .op = .add, .lhs = slot, .rhs = x } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    try testing.expectEqual(x, func.terminator(b).?.ret.values[0]);
     try expectNoMemoryInsts(&func, b);
 }
 
