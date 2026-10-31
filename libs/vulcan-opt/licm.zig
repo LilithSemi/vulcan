@@ -114,7 +114,10 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 
     var changed = false;
     for (info.loops) |loop| {
-        const pre = loop.preheader orelse continue;
+        // A versioned loop's unique external predecessor may also branch to the scalar fallback,
+        // so it is not a canonical preheader. Every opcode accepted by `hoistable` is deliberately
+        // safe to speculate, making that guarded entry a valid insertion point for LICM.
+        const pre = loop.preheader orelse loop.entry orelse continue;
 
         // A value is invariant if it is defined outside the loop. Loop block
         // params stay variant. Loop instructions become invariant once proven.

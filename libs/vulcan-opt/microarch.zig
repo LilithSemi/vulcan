@@ -13,6 +13,7 @@ const simplify = @import("simplify.zig");
 const strength = @import("strength.zig");
 const immform = @import("immform.zig");
 const dce = @import("dce.zig");
+const licm = @import("licm.zig");
 
 const model_mod = @import("microarch/model.zig");
 const registry = @import("microarch/registry.zig");
@@ -95,6 +96,12 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
         false;
     const unrolled = try unroll.run(allocator, func, m);
     const vectorized = try vectorize.runModel(allocator, func, m);
+    // Loop versioning and SLP create invariant splats after the ordinary optimization pipeline.
+    // LICM understands guarded entries and hoists these non-trapping broadcasts before scheduling.
+    const late_cleaned = if (m.arch == .aarch64)
+        try pass.runToFixpoint(allocator, func, &.{ licm.pass_def, dce.pass_def }, 4)
+    else
+        false;
     // INT8 dot-product recognition runs after the general vectorizer (it needs the scalar reduction
     // loop intact) and before scheduling. It is internally gated on aarch64+dotprod, so non-aarch64
     // models are unaffected.
@@ -104,7 +111,7 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
     // `model.vpu()` (et-soc only), so it is a no-op for every other model.
     const matmuled = try matmul_recog.run(allocator, func, m);
     const prefetched = try prefetch.run(allocator, func, m);
-    return split or looped or iv_reduced or unrolled or vectorized or dotted or matmuled or prefetched;
+    return split or looped or iv_reduced or unrolled or vectorized or late_cleaned or dotted or matmuled or prefetched;
 }
 
 test {

@@ -17,6 +17,10 @@ pub const Loop = struct {
     body: []bool,
     /// The unique loop preheader, if the loop has one.
     preheader: ?u32,
+    /// The unique predecessor outside the loop, even when it also branches to a fallback. Safe
+    /// speculative motion may use this guarded entry; transforms that rewrite the entry edge must
+    /// continue to require `preheader`.
+    entry: ?u32,
 
     pub fn contains(self: *const Loop, block: usize) bool {
         return self.body[block];
@@ -72,7 +76,13 @@ pub fn analyzeFromCfg(allocator: std.mem.Allocator, cfg: *const cfg_mod.Cfg, dom
     while (it.next()) |entry| {
         const h = entry.key_ptr.*;
         const body = entry.value_ptr.*;
-        loops[i] = .{ .header = h, .body = body, .preheader = findPreheader(cfg, h, body) };
+        const entry_pred = findEntry(cfg, h, body);
+        loops[i] = .{
+            .header = h,
+            .body = body,
+            .preheader = if (entry_pred) |p| if (cfg.successors(p).len == 1) p else null else null,
+            .entry = entry_pred,
+        };
         i += 1;
     }
     return .{ .loops = loops };
@@ -98,16 +108,14 @@ fn addNaturalLoop(allocator: std.mem.Allocator, cfg: *const cfg_mod.Cfg, header:
 
 /// The preheader of a loop: a single predecessor of the header that is outside
 /// the loop and whose only successor is the header.
-fn findPreheader(cfg: *const cfg_mod.Cfg, header: u32, body: []const bool) ?u32 {
+fn findEntry(cfg: *const cfg_mod.Cfg, header: u32, body: []const bool) ?u32 {
     var pre: ?u32 = null;
     for (cfg.predecessors(header)) |p| {
         if (body[p]) continue; // a latch (loop-internal back-edge)
         if (pre != null) return null; // more than one entry into the loop
         pre = p;
     }
-    const p = pre orelse return null;
-    const succs = cfg.successors(p);
-    return if (succs.len == 1 and succs[0] == header) p else null;
+    return pre;
 }
 
 test "detects a natural loop and its preheader" {
@@ -142,4 +150,5 @@ test "detects a natural loop and its preheader" {
     try std.testing.expect(l.contains(1) and l.contains(2)); // loop + body
     try std.testing.expect(!l.contains(0) and !l.contains(3)); // entry, done outside
     try std.testing.expectEqual(@as(?u32, 0), l.preheader); // entry is the preheader
+    try std.testing.expectEqual(@as(?u32, 0), l.entry);
 }
