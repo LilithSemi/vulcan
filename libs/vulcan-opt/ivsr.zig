@@ -73,6 +73,7 @@ const Node = struct {
     kind: union(enum) {
         konst: i64,
         value: Value,
+        convert: Value,
         binary: struct { op: BinOp, lhs: u32, rhs: u32 },
     },
 };
@@ -181,11 +182,15 @@ const Pool = struct {
         return self.add(allocator, .{ .ty = ty, .kind = .{ .value = v } });
     }
 
+    fn convert(self: *Pool, allocator: std.mem.Allocator, ty: Type, v: Value) std.mem.Allocator.Error!u32 {
+        return self.add(allocator, .{ .ty = ty, .kind = .{ .convert = v } });
+    }
+
     /// The constant a node holds, or null when it is not a folded constant.
     fn constOf(self: *const Pool, index: u32) ?i64 {
         return switch (self.nodes.items[index].kind) {
             .konst => |c| c,
-            .value, .binary => null,
+            .value, .convert, .binary => null,
         };
     }
 };
@@ -422,6 +427,10 @@ fn termOf(allocator: std.mem.Allocator, ctx: *const LoopCtx, pool: *Pool, ty: Ty
             if (ctx.func.opcode(inst) == .iconst) return pool.konst(allocator, ty, ctx.func.opcode(inst).iconst);
         }
     }
+    const source = intInfo(ctx.func, ctx.func.valueType(named));
+    const target = intInfo(ctx.func, ty);
+    if (source != null and target != null and source.?.signedness == .unsigned and target.?.bits > source.?.bits)
+        return pool.convert(allocator, ty, named);
     return pool.value(allocator, ty, named);
 }
 
@@ -739,6 +748,7 @@ fn affineOf(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, inst: Inst
     return switch (func.opcode(inst)) {
         .arith => |a| try affineArith(allocator, ctx, pool, a.op, a.lhs, a.rhs, ty),
         .arith_imm => |a| try affineArithImm(allocator, ctx, pool, a.op, a.lhs, a.imm, ty),
+        .convert => |convert| try affineConvert(allocator, ctx, pool, convert.value, ty),
         // Everything else either reads memory, calls out, or is not linear in an induction
         // variable. No `else` prong: a new opcode must be classified deliberately, because an
         // `else` would silently answer "not affine" and hide the decision.
@@ -749,7 +759,6 @@ fn affineOf(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, inst: Inst
         .select,
         .struct_new,
         .extract,
-        .convert,
         .decode_low_float,
         .encode_low_float,
         .dequantize_nvfp4,
@@ -773,6 +782,26 @@ fn affineOf(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, inst: Inst
         .atomic_rmw,
         .@"if",
         => null,
+    };
+}
+
+/// Preserve an affine unsigned counter through an exact widening conversion. This is the common C
+/// address shape `(size_t)(unsigned_index) * stride`; narrowing and signed-source widening are not
+/// linear across wrap boundaries and remain deliberately unsupported.
+fn affineConvert(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, value: Value, ty: Type) pass.Error!?Affine {
+    const source = intInfo(ctx.func, ctx.func.valueType(value)) orelse return null;
+    const target = intInfo(ctx.func, ty) orelse return null;
+    if (source.signedness != .unsigned or target.bits <= source.bits) return null;
+    const old = ctx.affine[@backingInt(value)] orelse return null;
+    if (old.base != null) return null;
+    const scale = pool.constOf(old.scale) orelse return null;
+    const offset = pool.constOf(old.offset) orelse return null;
+    return .{
+        .biv = old.biv,
+        .scale = try pool.konst(allocator, ty, scale),
+        .offset = try pool.konst(allocator, ty, offset),
+        .scale_ty = ty,
+        .base = null,
     };
 }
 
@@ -1255,6 +1284,7 @@ fn emit(allocator: std.mem.Allocator, func: *Function, block: Block, pool: *Pool
     const result: Value = switch (node.kind) {
         .konst => |c| try func.appendInst(block, node.ty, .{ .iconst = c }),
         .value => |v| v,
+        .convert => |v| try func.appendInst(block, node.ty, .{ .convert = .{ .value = v } }),
         .binary => |b| blk: {
             const lhs = try emit(allocator, func, block, pool, b.lhs);
             if (pool.constOf(b.rhs)) |c| break :blk try func.appendArithImm(block, node.ty, b.op, lhs, c);
@@ -1435,6 +1465,37 @@ test "reduces an indexed address into a pointer induction variable that steps by
     // It starts at `p` itself, since `0*4` is zero: no add in the preheader either.
     const init_args = func.blockArgs(func.terminator(c.entry).?.jump);
     try testing.expectEqual(p, init_args[2]);
+
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
+test "reduces an address indexed through an unsigned widening conversion" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, u32_t);
+    const c = try buildCounted(&func, n, u32_t, entry);
+    const wide = try func.appendInst(c.body, i64_t, .{ .convert = .{ .value = c.bk } });
+    const off = try func.appendArithImm(c.body, i64_t, .shl, wide, 4);
+    const addr = try func.appendInst(c.body, ptr_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = off } });
+    const loaded = try func.appendInst(c.body, u32_t, .{ .load = .{ .ptr = addr } });
+    try closeCounted(&func, c, loaded);
+
+    try testing.expect(try runPass(allocator, &func));
+    const walker = func.blockParams(c.head)[2];
+    try testing.expectEqual(ptr_t, func.valueType(walker));
+    const args = func.blockArgs(func.terminator(c.body).?.jump);
+    const step = func.opcode(func.definingInst(args[2]).?).arith_imm;
+    try testing.expectEqual(ir.function.BinOp.add, step.op);
+    try testing.expectEqual(@as(i64, 16), step.imm);
+    try testing.expectEqual(walker, step.lhs);
 
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
