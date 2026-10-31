@@ -51,45 +51,59 @@ fn log2AbsPow2(c: i64, bits: u16) ?u6 {
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
-    var changed = try shiftPhase(allocator, func);
+    if (!hasCandidate(func)) return false;
 
-    // Second phase: replace division or remainder by a non-power-of-two constant with a
-    // magic-number multiply (Granlund-Montgomery). A narrower type WIDENS TO 64 BITS to do it,
+    const consts = try allocator.alloc(?i64, func.valueCount());
+    defer allocator.free(consts);
+    collectConstants(func, consts);
+
+    var changed = shiftPhaseWithConsts(func, consts);
+
+    // Later phases replace signed power-of-two division and division or remainder by a
+    // non-power-of-two constant with short arithmetic sequences or a magic-number multiply
+    // (Granlund-Montgomery). A narrower type WIDENS TO 64 BITS to do it,
     // because the `mulh` this emits is defined only on 64-bit operands, so a target with 32-bit
     // registers cannot take this phase at all and calls `shiftPhase` by itself.
-    var consts2 = try allocator.alloc(?i64, func.valueCount());
-    defer allocator.free(consts2);
-    @memset(consts2, null);
+    if (try signedPow2Phase(allocator, func, consts)) changed = true;
+    if (try magicPhase(allocator, func, consts)) changed = true;
+    return changed;
+}
+
+fn hasCandidate(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
-        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
-        for (func.blockInsts(block)) |inst| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
+            .arith => |a| if (a.op == .mul or a.op == .div or a.op == .rem) return true,
+            .arith_imm => |a| if (a.op == .mul or a.op == .div or a.op == .rem) return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
+fn collectConstants(func: *const Function, consts: []?i64) void {
+    @memset(consts, null);
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .iconst) {
-                if (func.instResult(inst)) |r| consts2[@backingInt(r)] = func.opcode(inst).iconst;
+                if (func.instResult(inst)) |result| consts[@backingInt(result)] = func.opcode(inst).iconst;
             }
         }
     }
-    if (try signedPow2Phase(allocator, func, consts2)) changed = true;
-    if (try magicPhase(allocator, func, consts2)) changed = true;
-    return changed;
 }
 
 /// Replace a multiply, divide or remainder by a constant POWER OF TWO with a shift or a mask, and
 /// report whether anything changed. Rewrites opcodes in place, so it adds no value and no type: a
 /// 32-bit target can run this where it cannot run the magic-number phase in `run`.
 pub fn shiftPhase(allocator: std.mem.Allocator, func: *Function) pass.Error!bool {
+    if (!hasCandidate(func)) return false;
     // Constant values (to spot a power-of-two operand of an `arith`).
-    var consts = try allocator.alloc(?i64, func.valueCount());
+    const consts = try allocator.alloc(?i64, func.valueCount());
     defer allocator.free(consts);
-    @memset(consts, null);
-    for (0..func.blockCount()) |bi| {
-        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
-        for (func.blockInsts(block)) |inst| {
-            if (func.opcode(inst) == .iconst) {
-                if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
-            }
-        }
-    }
+    collectConstants(func, consts);
+    return shiftPhaseWithConsts(func, consts);
+}
 
+fn shiftPhaseWithConsts(func: *Function, consts: []const ?i64) bool {
     var changed = false;
     for (0..func.blockCount()) |bi| {
         const block: ir.function.Block = @fromBackingInt(@intCast(bi));
@@ -706,6 +720,20 @@ test "non-power-of-two multiply is left alone" {
     const x = try func.appendBlockParam(b, t);
     const y = try func.appendArithImm(b, t, .mul, x, 3);
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+    try testing.expect(!try runOnce(allocator, &func));
+}
+
+test "a function without multiply or division skips strength analysis" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const y = try func.appendArithImm(b, t, .add, x, 3);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    try testing.expect(!hasCandidate(&func));
     try testing.expect(!try runOnce(allocator, &func));
 }
 
