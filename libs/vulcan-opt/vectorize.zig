@@ -126,12 +126,9 @@ pub fn runModel(allocator: std.mem.Allocator, func: *Function, model: *const mm.
     if (model.vector_bits < 2 * ELEM_BITS) return false;
     const lanes_full = model.vector_bits / ELEM_BITS;
     const lanes: u8 = @intCast(@min(lanes_full, @as(u16, MAX_LANES)));
-    // The integer (`<N x i32>`) path is produced ONLY for a model whose backend can lower it: the
-    // CORE-ET packed-integer (pi) ops, which the riscv64 backend selects for a vpu (et-soc) model
-    // (see riscv64/isel.zig). RVV (`v`) and NEON have no `<8 x i32>` lowering here, so they keep
-    // the f32-only path: an i32 vector there would reach isel as error.Unsupported. Same lane count
-    // as f32 (vector_bits/32 = 8 on et-soc), since the pi element is also 32 bits wide.
-    const allow_i32 = model.vpu();
+    // Both CORE-ET's packed-integer unit and AArch64 NEON lower integer vectors. The per-op gate
+    // below accounts for their different instruction sets.
+    const allow_i32 = model.vpu() or model.arch == .aarch64;
     return runLanesGated(allocator, func, lanes, allow_i32, model);
 }
 
@@ -160,6 +157,18 @@ fn piSupportsOp(op: BinOp) bool {
     return switch (op) {
         .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr => true,
         .div, .rem, .mulh => false,
+    };
+}
+
+fn modelSupportsI32Op(model: ?*const mm.Model, op: BinOp) bool {
+    const m = model orelse return piSupportsOp(op);
+    return switch (m.arch) {
+        .aarch64 => switch (op) {
+            .add, .sub, .mul, .bit_and, .bit_or, .bit_xor => true,
+            .div, .rem, .mulh, .shl, .shr => false,
+        },
+        .riscv64 => m.vpu() and piSupportsOp(op),
+        .x86_64, .nvidia => false,
     };
 }
 
@@ -204,7 +213,7 @@ fn vectorizeOne(
             // The integer path is off unless the caller allowed it (a vpu model) AND the shared op
             // is one the pi backend lowers. A value is never both f32 and i32, so this stays
             // mutually exclusive with the f32 path.
-            const is_i32 = allow_i32 and isScalarI32(func, head_res) and piSupportsOp(head.arith.op);
+            const is_i32 = allow_i32 and isScalarI32(func, head_res) and modelSupportsI32Op(model, head.arith.op);
             if (!is_f32 and !is_i32) continue;
             const head_ty = func.valueType(head_res);
             for (1..lanes) |k| {
@@ -1196,15 +1205,23 @@ test "runModel leaves an i32 group scalar under a non-vpu riscv64 model" {
     try std.testing.expect(!hasVectorArith(&func, 4));
 }
 
-test "runModel leaves an i32 group scalar under aarch64 (neon has no <8 x i32> pi lowering)" {
-    // ampere-altra is a vector-capable aarch64 (neon) part, so its f32 path is live, but the
-    // integer path is gated on a riscv64 vpu model. An i32 group must NOT be vectorized: neon has
-    // no `<8 x i32>` pi lowering in this backend, only et-soc does.
-    var func = try parallelIntOps(8, .add);
+test "runModel fuses supported i32 groups to <4 x i32> under aarch64 neon" {
+    for ([_]BinOp{ .add, .sub, .mul, .bit_and, .bit_or, .bit_xor }) |op| {
+        var func = try buildMemElementwiseInt(op, 4);
+        defer func.deinit();
+        const changed = try runModel(std.testing.allocator, &func, registry.modelFor(.@"ampere-altra"));
+        try std.testing.expect(changed);
+        try std.testing.expect(hasIntVectorArith(&func, 4));
+        try std.testing.expect(hasVectorLoad(&func));
+        try std.testing.expect(hasVectorStore(&func));
+    }
+}
+
+test "runModel leaves an i32 shift scalar under aarch64 neon" {
+    var func = try parallelIntOps(4, .shl);
     defer func.deinit();
     const changed = try runModel(std.testing.allocator, &func, registry.modelFor(.@"ampere-altra"));
     try std.testing.expect(!changed);
-    try std.testing.expect(!hasIntVectorArith(&func, 8));
     try std.testing.expect(!hasIntVectorArith(&func, 4));
 }
 
