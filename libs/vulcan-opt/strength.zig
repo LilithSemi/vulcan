@@ -1,13 +1,14 @@
 //! Strength reduction replaces an integer multiply, divide, or remainder by a constant power of two
 //! with a cheap shift or mask.
 //!   x * 2^k  -> x << k      any signedness, the low bits are identical
-//!   x /u 2^k -> x >> k      unsigned only, a logical shift. signed division rounds differently
+//!   x /u 2^k -> x >> k      unsigned, a logical shift
+//!   x /s 2^k -> (x + ((x >> (w-1)) & (2^k-1))) >> k
 //!   x %u 2^k -> x & (2^k-1) unsigned only
 //! This pays off most where division is slow or absent. On the NVIDIA GPU path it sidesteps the
 //! roughly 256-instruction `lowerdiv` expansion entirely. It handles both `arith_imm` and an `arith`
-//! with a constant operand, where DCE later cleans the now-dead constant. Signed div/rem by a power
-//! of two is not a plain shift, since it rounds toward zero rather than toward negative infinity, so
-//! it is left alone.
+//! with a constant operand, where DCE later cleans the now-dead constant. Signed division needs a
+//! bias before the arithmetic shift so negative values round toward zero. Signed remainder reuses
+//! that quotient as `x - q*2^k`.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -57,6 +58,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             if (func.instResult(inst)) |r| consts2[@backingInt(r)] = func.opcode(inst).iconst;
         }
     }
+    if (try signedPow2Phase(allocator, func, consts2)) changed = true;
     if (try magicPhase(allocator, func, consts2)) changed = true;
     return changed;
 }
@@ -122,6 +124,81 @@ pub fn shiftPhase(allocator: std.mem.Allocator, func: *Function) pass.Error!bool
         }
     }
 
+    return changed;
+}
+
+const SignedPow2 = struct {
+    x: Value,
+    divisor: i64,
+    shift: u6,
+    bits: u16,
+    is_rem: bool,
+};
+
+fn signedPow2(func: *const Function, consts: []const ?i64, inst: ir.function.Inst) ?SignedPow2 {
+    var op: BinOp = undefined;
+    var x: Value = undefined;
+    var divisor: i64 = undefined;
+    switch (func.opcode(inst)) {
+        .arith_imm => |a| {
+            op = a.op;
+            x = a.lhs;
+            divisor = a.imm;
+        },
+        .arith => |a| {
+            op = a.op;
+            x = a.lhs;
+            divisor = consts[@backingInt(a.rhs)] orelse return null;
+        },
+        else => return null,
+    }
+    if (op != .div and op != .rem) return null;
+    const ty = intType(func, x) orelse return null;
+    if (ty.signedness != .signed) return null;
+    const shift = log2Pow2(divisor, ty.bits) orelse return null;
+    return .{ .x = x, .divisor = divisor, .shift = shift, .bits = ty.bits, .is_rem = op == .rem };
+}
+
+/// Lower signed division by a positive power of two with a rounding bias. This
+/// avoids the generic division expansion while keeping C's round-toward-zero
+/// semantics for negative dividends.
+fn signedPow2Phase(allocator: std.mem.Allocator, func: *Function, consts: []const ?i64) pass.Error!bool {
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+        var has_candidate = false;
+        for (func.blockInsts(block)) |inst| {
+            if (signedPow2(func, consts, inst) != null) {
+                has_candidate = true;
+                break;
+            }
+        }
+        if (!has_candidate) continue;
+
+        var out: std.ArrayList(ir.function.Inst) = .empty;
+        defer out.deinit(allocator);
+        const original = try allocator.dupe(ir.function.Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        for (original) |inst| {
+            const info = signedPow2(func, consts, inst) orelse {
+                try out.append(allocator, inst);
+                continue;
+            };
+            const result = func.instResult(inst).?;
+            const builder = Builder{ .f = func, .o = &out, .a = allocator, .ty = func.valueType(result) };
+            const sign = try builder.opImm(.shr, info.x, @intCast(info.bits - 1));
+            const bias = try builder.opImm(.bit_and, sign, info.divisor - 1);
+            const adjusted = try builder.op(.add, info.x, bias);
+            const quotient = try builder.opImm(.shr, adjusted, @as(i64, info.shift));
+            const replacement = if (info.is_rem) blk: {
+                const product = try builder.opImm(.shl, quotient, @as(i64, info.shift));
+                break :blk try builder.op(.sub, info.x, product);
+            } else quotient;
+            func.replaceAllUses(result, replacement);
+            changed = true;
+        }
+        try func.setBlockInsts(block, out.items);
+    }
     return changed;
 }
 
@@ -497,6 +574,8 @@ fn applyOp(op: BinOp, l: i64, r: i64, info: anytype) i64 {
         .add => l +% r,
         .sub => l -% r,
         .mul => l *% r,
+        .bit_and => @bitCast(@as(u64, @bitCast(l)) & @as(u64, @bitCast(r))),
+        .shl => @bitCast(@as(u64, @bitCast(l)) << @intCast(@as(u64, @bitCast(r)) & 63)),
         .mulh => @truncate(@as(i128, l) * @as(i128, r) >> @intCast(info.bits)),
         .shr => switch (info.signedness) {
             .signed => l >> @intCast(@as(u64, @bitCast(r)) & 63),
@@ -586,17 +665,18 @@ test "unsigned x / 4 becomes x >> 2, x % 4 becomes x & 3" {
     try testing.expectEqual(@as(i64, 3), ri.imm);
 }
 
-test "signed division by a power of two is left alone (rounding differs)" {
+test "signed division by a power of two uses a rounding bias" {
     const allocator = testing.allocator;
-    var func = Function.init(allocator);
-    defer func.deinit();
-    const t = try intTy(&func, 32, .signed);
-    const b = try func.appendBlock();
-    const x = try func.appendBlockParam(b, t);
-    const q = try func.appendArithImm(b, t, .div, x, 4);
-    func.setTerminator(b, .{ .ret = ir.function.Ret.one(q) });
-    try testing.expect(!try runOnce(allocator, &func));
-    try testing.expectEqual(BinOp.div, func.opcode(func.definingInst(q).?).arith_imm.op);
+    const divisors = [_]i64{ 2, 4, 8, 256 };
+    const dividends = [_]i64{ 0, 1, -1, 7, -7, 8, -8, 255, -255, std.math.maxInt(i32), std.math.minInt(i32) };
+    for (divisors) |divisor| {
+        for (dividends) |dividend| {
+            const quotient: i32 = @truncate(try magicAtWidth(allocator, dividend, divisor, 32, .signed, false));
+            try testing.expectEqual(@as(i32, @intCast(@divTrunc(dividend, divisor))), quotient);
+            const remainder: i32 = @truncate(try magicAtWidth(allocator, dividend, divisor, 32, .signed, true));
+            try testing.expectEqual(@as(i32, @intCast(@rem(dividend, divisor))), remainder);
+        }
+    }
 }
 
 test "non-power-of-two multiply is left alone" {
