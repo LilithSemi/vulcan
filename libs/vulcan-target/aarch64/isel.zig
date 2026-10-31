@@ -1525,6 +1525,21 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // emits the fused `cmp; b.cc` on these operands, so the compare is
                     // emitted exactly once.
                     if (caps.fuse_cmp_branch and fusesIntoNextIf(func, insts, inst_idx)) continue;
+                    // Compare-to-select fusion keeps the flags produced here live for the
+                    // immediately-following csel/fcsel and avoids materializing then re-testing a
+                    // one-use boolean. Emit the compare at its original position so allocator
+                    // transition moves before the select cannot clobber its operands.
+                    if (fusesIntoNextSelect(func, insts, inst_idx)) {
+                        const rl = try ctx.loadOp(allocator, &code, cmp.lhs, spill_op[0]);
+                        const wide = isWide(func, cmp.lhs);
+                        if (cmpFoldImm(func, cmp.rhs)) |imm| {
+                            try code.append(allocator, if (wide) encode.subsImm64(.zr, rl, imm) else encode.subsImm(.zr, rl, imm));
+                        } else {
+                            const rr = try ctx.loadOp(allocator, &code, cmp.rhs, spill_op[1]);
+                            try code.append(allocator, if (wide) encode.cmp64(rl, rr) else encode.cmp(rl, rr));
+                        }
+                        continue;
+                    }
                     const result = func.instResult(inst).?;
                     if (isVector(func, cmp.lhs)) {
                         // Vectorized compare (widened FS): produce a per-lane MASK
@@ -1599,7 +1614,15 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try storeResult(allocator, &code, ctx, result, rd);
                         continue;
                     }
-                    const c = try ctx.loadOp(allocator, &code, s.cond, spill_op[0]); // cond is a gpr bool
+                    const fused_cmp = if (inst_idx >= 1 and fusesIntoNextSelect(func, insts, inst_idx - 1))
+                        func.opcode(insts[inst_idx - 1]).icmp
+                    else
+                        null;
+                    const c = if (fused_cmp == null)
+                        try ctx.loadOp(allocator, &code, s.cond, spill_op[0]) // cond is a gpr bool
+                    else
+                        undefined;
+                    const cc = if (fused_cmp) |cmp| condFor(cmp.op, isSignedInt(func, cmp.lhs)) else .ne;
                     if (regClass(func, result) == .fpr) {
                         // `fcsel` selects in the S/D view (32/64-bit); it has no 128-bit form, so it
                         // would narrow an f128 to its low 64 bits. The softfp pass does not lower a
@@ -1610,17 +1633,17 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         const tr = try ctx.loadOp(allocator, &code, s.then, fp_spill_op[0]);
                         const el = try ctx.loadOp(allocator, &code, s.@"else", fp_spill_op[1]);
                         const rd = ctx.resultReg(result);
-                        try code.append(allocator, encode.cmp(c, .zr));
+                        if (fused_cmp == null) try code.append(allocator, encode.cmp(c, .zr));
                         // Native f16 (fp16) selects in the H form. Emulation selects the S-held
                         // f32 widening (fkindOf yields `.single`, byte-identical to before).
-                        try code.append(allocator, encode.fcsel(rd, tr, el, .ne, fkindOf(func, result, fp16)));
+                        try code.append(allocator, encode.fcsel(rd, tr, el, cc, fkindOf(func, result, fp16)));
                         try storeResult(allocator, &code, ctx, result, rd);
                     } else {
                         const tr = try ctx.loadOp(allocator, &code, s.then, spill_op[1]);
                         const el = try ctx.loadOp(allocator, &code, s.@"else", scratch_imm);
                         const rd = ctx.resultReg(result);
-                        try code.append(allocator, encode.cmp(c, .zr));
-                        try code.append(allocator, encode.csel(rd, tr, el, .ne));
+                        if (fused_cmp == null) try code.append(allocator, encode.cmp(c, .zr));
+                        try code.append(allocator, encode.csel(rd, tr, el, cc));
                         try storeResult(allocator, &code, ctx, result, rd);
                     }
                 },
@@ -3898,6 +3921,25 @@ fn fusesIntoNextIf(func: *const Function, insts: []const ir.function.Inst, idx: 
     return countUses(func, result) == 1;
 }
 
+/// Whether an integer `icmp` can feed the immediately-following scalar select through flags
+/// directly. The one-use requirement lets isel omit the boolean `cset`; vector conditions keep
+/// their mask value, and floating comparisons stay on their existing materialized path.
+fn fusesIntoNextSelect(func: *const Function, insts: []const ir.function.Inst, idx: usize) bool {
+    const cmp = switch (func.opcode(insts[idx])) {
+        .icmp => |c| c,
+        else => return false,
+    };
+    if (isVector(func, cmp.lhs) or regClass(func, cmp.lhs) != .gpr) return false;
+    if (idx + 1 >= insts.len) return false;
+    const select = switch (func.opcode(insts[idx + 1])) {
+        .select => |s| s,
+        else => return false,
+    };
+    const result = func.instResult(insts[idx]) orelse return false;
+    if (select.cond != result or isVector(func, select.then)) return false;
+    return countUses(func, result) == 1;
+}
+
 /// Whether the `if` at `insts[if_idx]` folds a flag-setting arithmetic op into its branch: the
 /// arith at `if_idx-2` is a single-use `add`/`sub`/`bit_and` (register form) or `add`/`sub`
 /// (u12-immediate form) whose result is compared eq/ne against a literal `0` by the icmp at
@@ -4927,6 +4969,36 @@ test "selects a straight-line arithmetic function" {
     const rd_mask = ~@as(u32, 0x1f);
     try std.testing.expectEqual(encode.madd(.x0, .x0, .x1, .x0, false) & rd_mask, code[0] & rd_mask);
     try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
+}
+
+test "single-use integer compare feeds csel through flags without cset" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const b = try func.appendBlock();
+    const lhs = try func.appendBlockParam(b, t);
+    const rhs = try func.appendBlockParam(b, t);
+    const then_value = try func.appendBlockParam(b, t);
+    const else_value = try func.appendBlockParam(b, t);
+    const cond = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = lhs, .rhs = rhs } });
+    const selected = try func.appendInst(b, t, .{ .select = .{ .cond = cond, .then = then_value, .@"else" = else_value } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(selected) });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var csets: usize = 0;
+    var csels: usize = 0;
+    for (code) |word| {
+        if (word & 0x7FFF0FE0 == 0x1A9F07E0) csets += 1;
+        if (word & 0x7FE00C00 == 0x1A800000) {
+            csels += 1;
+            try std.testing.expectEqual(@as(u4, @backingInt(encode.Cond.lt)), @as(u4, @truncate(word >> 12)));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), csets);
+    try std.testing.expectEqual(@as(usize, 1), csels);
 }
 
 test "via_got global_addr lowers to adrp+ldr with got_pg/got_lo12 relocs (GOT-indirect)" {
