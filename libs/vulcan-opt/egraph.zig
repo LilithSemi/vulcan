@@ -610,19 +610,12 @@ fn saturate(graph: *Graph) !void {
 const Extraction = struct {
     costs: []usize,
     best: []?usize,
-
-    fn deinit(self: *Extraction, allocator: std.mem.Allocator) void {
-        allocator.free(self.costs);
-        allocator.free(self.best);
-    }
 };
 
-fn extract(allocator: std.mem.Allocator, graph: *Graph) !Extraction {
-    const costs = try allocator.alloc(usize, graph.parents.items.len);
-    errdefer allocator.free(costs);
+fn extract(graph: *Graph, costs: []usize, best: []?usize) Extraction {
+    std.debug.assert(costs.len == graph.parents.items.len);
+    std.debug.assert(best.len == graph.parents.items.len);
     @memset(costs, std.math.maxInt(usize));
-    const best = try allocator.alloc(?usize, graph.parents.items.len);
-    errdefer allocator.free(best);
     @memset(best, null);
 
     var changed = true;
@@ -694,6 +687,12 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
     defer touched.deinit(allocator);
     var graph = Graph{ .allocator = allocator, .limits = limits };
     defer graph.deinit();
+    var extraction_costs: std.ArrayList(usize) = .empty;
+    defer extraction_costs.deinit(allocator);
+    var extraction_best: std.ArrayList(?usize) = .empty;
+    defer extraction_best.deinit(allocator);
+    var memo_storage: std.ArrayList(?Value) = .empty;
+    defer memo_storage.deinit(allocator);
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         const term = func.terminator(block) orelse continue;
@@ -712,10 +711,11 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
         std.debug.assert(touched.items.len == 0);
         try importBlock(&graph, func, block, classes, original_costs, &touched);
         try saturate(&graph);
-        var extraction = try extract(allocator, &graph);
-        defer extraction.deinit(allocator);
-        const memo = try allocator.alloc(?Value, graph.parents.items.len);
-        defer allocator.free(memo);
+        try extraction_costs.resize(allocator, graph.parents.items.len);
+        try extraction_best.resize(allocator, graph.parents.items.len);
+        const extraction = extract(&graph, extraction_costs.items, extraction_best.items);
+        try memo_storage.resize(allocator, graph.parents.items.len);
+        const memo = memo_storage.items;
         @memset(memo, null);
 
         switch (term) {
