@@ -385,6 +385,7 @@ fn hasFactorCandidateAt(func: *const Function, value: Value, sum: ir.function.Ar
         if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and (rhs.?.lhs == lhs.?.lhs or rhs.?.lhs == lhs.?.rhs)) return true;
         if (lhs != null and rhs != null and lhs.?.op == .add and rhs.?.op == .sub and sameValueOperands(lhs.?, rhs.?)) return true;
         if (lhs != null and rhs != null and lhs.?.op == .bit_or and (rhs.?.op == .bit_and or rhs.?.op == .bit_xor) and sameValueOperands(lhs.?, rhs.?)) return true;
+        if (lhs != null and rhs != null and lhs.?.op == .add and (rhs.?.op == .bit_or or rhs.?.op == .bit_and) and sameValueOperands(lhs.?, rhs.?)) return true;
     } else if (sum.op == .bit_xor) {
         if (lhs) |op| if (op.op == .bit_xor and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
         if (rhs) |op| if (op.op == .bit_xor and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
@@ -663,6 +664,19 @@ fn foldBitwiseArithmetic(graph: *Graph, outer_class: u32, outer_op: BinOp, disju
         .lhs = disjunction.lhs,
         .rhs = disjunction.rhs,
         .ty = disjunction.ty,
+        .existing = null,
+    }) orelse return false;
+    return graph.merge(outer_class, replacement);
+}
+
+/// (a + b) - (a | b) == a & b and (a + b) - (a & b) == a | b.
+fn foldAddBitwiseDifference(graph: *Graph, outer_class: u32, addition: OpNode, bitwise: OpNode) !bool {
+    if (!sameClassOperands(graph, addition, bitwise)) return false;
+    const replacement = try graph.addOp(.{
+        .op = if (bitwise.op == .bit_or) .bit_and else .bit_or,
+        .lhs = addition.lhs,
+        .rhs = addition.rhs,
+        .ty = addition.ty,
         .existing = null,
     }) orelse return false;
     return graph.merge(outer_class, replacement);
@@ -975,6 +989,21 @@ fn saturate(graph: *Graph) !void {
                     };
                 }
             }
+            if (sum.op == .sub and classHasOp(graph, sum.lhs, .add) and
+                (classHasOp(graph, sum.rhs, .bit_or) or classHasOp(graph, sum.rhs, .bit_and)))
+            {
+                left.clearRetainingCapacity();
+                try matchingOps(graph, sum.lhs, .add, sum.ty, left);
+                for ([_]BinOp{ .bit_or, .bit_and }) |rhs_op| {
+                    right.clearRetainingCapacity();
+                    try matchingOps(graph, sum.rhs, rhs_op, sum.ty, right);
+                    for (left.items) |addition| for (right.items) |bitwise| {
+                        changed = try foldAddBitwiseDifference(graph, entry.class, addition, bitwise) or changed;
+                        if (graph.hit_limit) break;
+                    };
+                    if (graph.hit_limit) break;
+                }
+            }
             if (absorptionInner(sum.op)) |inner_op| {
                 if (classHasOp(graph, sum.lhs, inner_op)) {
                     left.clearRetainingCapacity();
@@ -1148,6 +1177,26 @@ fn expectBitwisePair(outer_op: BinOp, left_op: BinOp, right_op: BinOp, expected:
     const right = try func.appendInst(block, ty, .{ .arith = .{ .op = right_op, .lhs = b, .rhs = a } });
     const combined = try func.appendInst(block, ty, .{ .arith = .{ .op = outer_op, .lhs = left, .rhs = right } });
     func.setTerminator(block, .{ .ret = ir.function.Ret.one(combined) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const reduced = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(expected, reduced.op);
+    try std.testing.expect((reduced.lhs == a and reduced.rhs == b) or (reduced.lhs == b and reduced.rhs == a));
+}
+
+fn expectAddBitwiseDifference(rhs_op: BinOp, expected: BinOp) !void {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const sum = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    const bitwise = try func.appendInst(block, ty, .{ .arith = .{ .op = rhs_op, .lhs = b, .rhs = a } });
+    const difference = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = sum, .rhs = bitwise } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(difference) });
 
     try std.testing.expect(try runWithLimits(allocator, &func, .{}));
     const replacement = func.terminator(block).?.ret.values[0];
@@ -1607,6 +1656,11 @@ test "egraph reduces the difference of bitwise union and xor" {
     const reduced = func.opcode(func.definingInst(replacement).?).arith;
     try std.testing.expectEqual(BinOp.bit_and, reduced.op);
     try std.testing.expect((reduced.lhs == a and reduced.rhs == b) or (reduced.lhs == b and reduced.rhs == a));
+}
+
+test "egraph reduces addition minus matching bitwise terms" {
+    try expectAddBitwiseDifference(.bit_or, .bit_and);
+    try expectAddBitwiseDifference(.bit_and, .bit_or);
 }
 
 test "egraph folds xor combinations of matching bitwise terms" {
