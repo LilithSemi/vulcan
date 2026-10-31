@@ -291,6 +291,17 @@ fn decode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32, ctx: ?Context) 
         return sp(buf, a, true, rn(w));
     }
 
+    // Four-register structure load/store, 4x32-bit lanes. Register lists wrap modulo 32, though
+    // Vulcan's lowering deliberately starts at v28 and therefore prints v28-v31.
+    const struct4 = w & 0xFFFFFC00;
+    if (struct4 == 0x4C400800 or struct4 == 0x4C000800) {
+        const first = rd(w);
+        const last = (first + 3) & 31;
+        try buf.print(a, "{s} {{v{d}.4s-v{d}.4s}}, [", .{ if (struct4 == 0x4C400800) "ld4" else "st4", first, last });
+        try sp(buf, a, true, rn(w));
+        return buf.append(a, ']');
+    }
+
     // `mov` (register) is `orr Xd, xzr, Xm` with rn == 31; render it as a move.
     if (w & 0x7FE0FFE0 == 0x2A0003E0) {
         try buf.appendSlice(a, "mov ");

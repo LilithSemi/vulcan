@@ -837,6 +837,15 @@ pub fn strQ(rt: Reg, rn: Reg, off: u16) u32 {
     return 0x3D800000 | ((@as(u32, off) >> 4) << 10) | (n(rn) << 5) | n(rt);
 }
 
+/// `ld4 {vt.4s-v(t+3).4s}, [xn]` / `st4 ...`: deinterleave or interleave four streams of
+/// 32-bit lanes. The four vector registers are consecutive modulo 32, as required by A64.
+pub fn ld4S4(rt: Reg, rn: Reg) u32 {
+    return 0x4C400800 | (n(rn) << 5) | n(rt);
+}
+pub fn st4S4(rt: Reg, rn: Reg) u32 {
+    return 0x4C000800 | (n(rn) << 5) | n(rt);
+}
+
 /// NEON `fadd`/`fsub`/`fmul`/`fdiv` Vd.4S, Vn.4S, Vm.4S: lane-wise over 4 single-precision
 /// floats packed in a 128-bit register.
 pub fn faddVec(rd: Reg, rn: Reg, rm: Reg) u32 {
@@ -1484,6 +1493,22 @@ test "integer vector arithmetic encoders match the disassembler" {
         defer a.free(text);
         try std.testing.expectEqualStrings(case[1], text);
     }
+}
+
+test "four-way interleaved vector memory encoders match the disassembler" {
+    const disasm = @import("disasm.zig");
+    const a = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(u32, 0x4C4008BC), ld4S4(@fromBackingInt(28), .x5));
+    try std.testing.expectEqual(@as(u32, 0x4C0008BC), st4S4(@fromBackingInt(28), .x5));
+
+    const load = try disasm.one(a, ld4S4(@fromBackingInt(28), .x5));
+    defer a.free(load);
+    try std.testing.expectEqualStrings("ld4 {v28.4s-v31.4s}, [x5]", load);
+
+    const store = try disasm.one(a, st4S4(@fromBackingInt(28), .x5));
+    defer a.free(store);
+    try std.testing.expectEqualStrings("st4 {v28.4s-v31.4s}, [x5]", store);
 }
 
 test "ldp/stp offset-form encoders match known bytes" {
