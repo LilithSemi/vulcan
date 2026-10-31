@@ -16,6 +16,7 @@ const Inst = ir.function.Inst;
 const Opcode = ir.function.Opcode;
 const BinOp = ir.function.BinOp;
 const CmpOp = ir.function.CmpOp;
+const Type = ir.types.Type;
 
 pub const Error = std.mem.Allocator.Error;
 
@@ -47,7 +48,8 @@ const Plan = struct {
     accesses: []ArrayAccess, // owned
     reduction: ?MapReduction,
     factor: u32, // V
-    interleaved: bool,
+    /// Scalar element type of a vector induction carried through the widened loop.
+    index_elem_type: ?Type,
 };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const mm.Model) Error!bool {
@@ -97,10 +99,7 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         .int => |int| int,
         else => unreachable,
     };
-    const index_elem_ty = if (plan.interleaved)
-        try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = ind_int.bits } })
-    else
-        null;
+    const index_elem_ty = plan.index_elem_type;
     const index_vec_ty = if (index_elem_ty) |elem|
         try func.types.intern(.{ .vector = .{ .len = @intCast(V), .elem = elem } })
     else
@@ -299,7 +298,7 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         if (skip.contains(inst)) continue;
         if (func.instResult(inst)) |result| {
             if (vmaps[0].contains(result)) continue; // a pre-seeded address
-            if (plan.interleaved and func.opcode(inst) == .convert and func.opcode(inst).convert.value == i_alias and func.valueType(result) == index_elem_ty.?) {
+            if (index_elem_ty != null and func.opcode(inst) == .convert and func.opcode(inst).convert.value == i_alias and func.valueType(result) == index_elem_ty.?) {
                 for (vmaps, 0..) |*vm, lane| try vm.put(allocator, result, vector_indices[lane].?);
                 continue;
             }
@@ -591,6 +590,33 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         if (!has_store) return bail(&accesses, allocator);
     }
 
+    // Carry a same-width integer conversion as one vector induction value.
+    var index_elem_type: ?Type = null;
+    const induction_kind = func.types.type_kind(func.valueType(i_alias));
+    const induction_bits = switch (induction_kind) {
+        .int => |int| int.bits,
+        else => unreachable,
+    };
+    for (func.blockInsts(bodyb)) |inst| {
+        const conversion = switch (func.opcode(inst)) {
+            .convert => |cv| if (cv.value == i_alias) cv else continue,
+            else => continue,
+        };
+        _ = conversion;
+        const result = func.instResult(inst).?;
+        const result_int = switch (func.types.type_kind(func.valueType(result))) {
+            .int => |int| int,
+            else => continue,
+        };
+        if (result_int.bits == induction_bits) {
+            index_elem_type = func.valueType(result);
+            break;
+        }
+    }
+    // Retain the signed fallback for hand-built interleaved IR without an explicit conversion.
+    if (has_interleaved and index_elem_type == null)
+        index_elem_type = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = induction_bits } });
+
     return Plan{
         .header = header,
         .body = bodyb,
@@ -606,7 +632,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         .accesses = try accesses.toOwnedSlice(allocator),
         .reduction = reduction,
         .factor = V,
-        .interleaved = has_interleaved,
+        .index_elem_type = index_elem_type,
     };
 }
 
@@ -1168,6 +1194,7 @@ test "frontend-shaped map loop may use the induction value as stored data" {
     var func = Function.init(allocator);
     defer func.deinit();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const entry = try func.appendBlock();
@@ -1176,22 +1203,29 @@ test "frontend-shaped map loop may use the induction value as stored data" {
     const latch = try func.appendBlock();
     const done = try func.appendBlock();
     const out = try func.appendBlockParam(entry, ptr_t);
-    const n = try func.appendBlockParam(entry, i32_t);
-    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const n = try func.appendBlockParam(entry, u32_t);
+    const zero = try func.appendInst(entry, u32_t, .{ .iconst = 0 });
     try func.setJump(entry, loop, &.{zero});
-    const i = try func.appendBlockParam(loop, i32_t);
+    const i = try func.appendBlockParam(loop, u32_t);
     const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
     try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
-    const bi = try func.appendBlockParam(body, i32_t);
-    const off = try func.appendArithImm(body, i32_t, .mul, bi, 4);
+    const bi = try func.appendBlockParam(body, u32_t);
+    const off = try func.appendArithImm(body, u32_t, .mul, bi, 4);
     const addr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = out, .rhs = off } });
-    try func.appendStore(body, bi, addr);
+    const stored = try func.appendInst(body, i32_t, .{ .convert = .{ .value = bi } });
+    try func.appendStore(body, stored, addr);
     try func.setJump(body, latch, &.{});
-    const ni = try func.appendArithImm(latch, i32_t, .add, bi, 1);
+    const ni = try func.appendArithImm(latch, u32_t, .add, bi, 1);
     try func.setJump(latch, loop, &.{ni});
     func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 
-    try testing.expect(try run(allocator, &func, registry.modelFor(.@"ampere-altra")));
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    const plan = (try recognize(allocator, &func, registry.modelFor(.@"ampere-altra"), &info.loops[0])) orelse return error.NotRecognized;
+    defer allocator.free(plan.accesses);
+    try testing.expectEqual(i32_t, plan.index_elem_type.?);
+
+    try apply(allocator, &func, &plan);
     var diags = try ir.verify.verify(allocator, &func, .low);
     defer diags.deinit();
     try testing.expect(diags.ok());
