@@ -359,7 +359,7 @@ fn countMinLeadingZeros(a: Bits, w: u16) u16 {
 }
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
-    if (func.blockCount() == 0) return false;
+    if (!hasRewriteCandidate(func)) return false;
     const bits = try analyzeFromCfg(allocator, func, try analyses.cfg());
     defer allocator.free(bits);
 
@@ -402,6 +402,18 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         }
     }
     return changed;
+}
+
+fn hasRewriteCandidate(func: *const Function) bool {
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
+            .arith_imm => |a| if (a.op == .bit_and) return true,
+            .icmp => |c| if (c.op == .eq or c.op == .ne) return true,
+            .convert => return true,
+            else => {},
+        };
+    }
+    return false;
 }
 
 /// If `inst` is a widening convert `widen(narrow(s))` that recovers `s` unchanged, return `s`. The
@@ -456,6 +468,22 @@ fn runOnce(allocator: std.mem.Allocator, func: *Function) !bool {
 
 fn uintTy(func: *Function, bits: u16) !ir.types.Type {
     return func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = bits } });
+}
+
+test "a function without rewrite forms skips known-bits analysis" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try uintTy(&func, 64);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const sum = try func.appendArithImm(b, t, .add, x, 1);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try testing.expect(!try run(allocator, &func, &analyses));
+    try testing.expect(analyses.cfg_cache == null);
 }
 
 test "a mask that clears only already-zero bits is removed" {
