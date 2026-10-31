@@ -10,7 +10,7 @@ const opt = @import("vulcan-opt");
 const Function = ir.function.Function;
 const BenchFn = *const fn (std.mem.Allocator, *Function) anyerror!bool;
 
-const blocks: usize = 256;
+const blocks: usize = 2048;
 const samples: usize = 9;
 
 pub fn main(init: std.process.Init) !void {
