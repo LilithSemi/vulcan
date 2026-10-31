@@ -297,11 +297,18 @@ fn sameValueOperands(left: ir.function.Arith, right: ir.function.Arith) bool {
         (left.lhs == right.rhs and left.rhs == right.lhs);
 }
 
-fn bitwiseTriangleResult(left: BinOp, right: BinOp) ?BinOp {
-    if ((left == .bit_and and right == .bit_or) or (left == .bit_or and right == .bit_and)) return .bit_xor;
-    if ((left == .bit_or and right == .bit_xor) or (left == .bit_xor and right == .bit_or)) return .bit_and;
-    if ((left == .bit_and and right == .bit_xor) or (left == .bit_xor and right == .bit_and)) return .bit_or;
-    return null;
+fn bitwisePairResult(outer: BinOp, left: BinOp, right: BinOp) ?BinOp {
+    const and_or = (left == .bit_and and right == .bit_or) or (left == .bit_or and right == .bit_and);
+    const and_xor = (left == .bit_and and right == .bit_xor) or (left == .bit_xor and right == .bit_and);
+    const or_xor = (left == .bit_or and right == .bit_xor) or (left == .bit_xor and right == .bit_or);
+    return switch (outer) {
+        .bit_xor => if (and_or) .bit_xor else if (or_xor) .bit_and else if (and_xor) .bit_or else null,
+        .bit_or => if (and_or or and_xor or or_xor) .bit_or else null,
+        // AND and XOR are disjoint, so that last pair is zero. Constants are deliberately outside
+        // this e-graph; simplify/constfold handle them when one already exists.
+        .bit_and => if (and_or) .bit_and else if (or_xor) .bit_xor else null,
+        else => null,
+    };
 }
 
 /// Avoid graph construction for blocks that cannot match the current rule set.
@@ -346,10 +353,11 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
         } else if (sum.op == .bit_xor) {
             if (lhs) |op| if (op.op == .bit_xor and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
             if (rhs) |op| if (op.op == .bit_xor and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
-            if (lhs != null and rhs != null and bitwiseTriangleResult(lhs.?.op, rhs.?.op) != null and sameValueOperands(lhs.?, rhs.?)) return true;
+            if (lhs != null and rhs != null and bitwisePairResult(sum.op, lhs.?.op, rhs.?.op) != null and sameValueOperands(lhs.?, rhs.?)) return true;
         } else if (sum.op == .bit_and or sum.op == .bit_or) {
             if (lhs) |op| if (op.op == sum.op and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
             if (rhs) |op| if (op.op == sum.op and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
+            if (lhs != null and rhs != null and bitwisePairResult(sum.op, lhs.?.op, rhs.?.op) != null and sameValueOperands(lhs.?, rhs.?)) return true;
         }
     }
     return false;
@@ -524,26 +532,19 @@ fn foldNestedIdempotent(graph: *Graph, outer_class: u32, outer: OpNode, matches:
     return changed;
 }
 
-fn foldBitwiseTriangles(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
-    const Pair = struct { lhs: BinOp, rhs: BinOp, result: BinOp };
-    const pairs = [_]Pair{
-        .{ .lhs = .bit_and, .rhs = .bit_or, .result = .bit_xor },
-        .{ .lhs = .bit_or, .rhs = .bit_and, .result = .bit_xor },
-        .{ .lhs = .bit_or, .rhs = .bit_xor, .result = .bit_and },
-        .{ .lhs = .bit_xor, .rhs = .bit_or, .result = .bit_and },
-        .{ .lhs = .bit_and, .rhs = .bit_xor, .result = .bit_or },
-        .{ .lhs = .bit_xor, .rhs = .bit_and, .result = .bit_or },
-    };
+fn foldBitwisePairs(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
+    const bit_ops = [_]BinOp{ .bit_and, .bit_or, .bit_xor };
     var changed = false;
-    for (pairs) |pair| {
+    for (bit_ops) |lhs_op| for (bit_ops) |rhs_op| {
+        const result_op = bitwisePairResult(outer.op, lhs_op, rhs_op) orelse continue;
         left.clearRetainingCapacity();
         right.clearRetainingCapacity();
-        try matchingOps(graph, outer.lhs, pair.lhs, outer.ty, left);
-        try matchingOps(graph, outer.rhs, pair.rhs, outer.ty, right);
+        try matchingOps(graph, outer.lhs, lhs_op, outer.ty, left);
+        try matchingOps(graph, outer.rhs, rhs_op, outer.ty, right);
         for (left.items) |a| for (right.items) |b| {
             if (!sameClassOperands(graph, a, b)) continue;
             const replacement = try graph.addOp(.{
-                .op = pair.result,
+                .op = result_op,
                 .lhs = a.lhs,
                 .rhs = a.rhs,
                 .ty = a.ty,
@@ -552,7 +553,7 @@ fn foldBitwiseTriangles(graph: *Graph, outer_class: u32, outer: OpNode, left: *s
             changed = graph.merge(outer_class, replacement) or changed;
         };
         if (graph.hit_limit) break;
-    }
+    };
     return changed;
 }
 
@@ -677,8 +678,8 @@ fn saturate(graph: *Graph) !void {
             if (sum.op == .bit_and or sum.op == .bit_or) {
                 changed = try foldNestedIdempotent(graph, entry.class, sum, left) or changed;
             }
-            if (sum.op == .bit_xor) {
-                changed = try foldBitwiseTriangles(graph, entry.class, sum, left, right) or changed;
+            if (sum.op == .bit_and or sum.op == .bit_or or sum.op == .bit_xor) {
+                changed = try foldBitwisePairs(graph, entry.class, sum, left, right) or changed;
             }
             if (sum.op == .add or sum.op == .sub) {
                 left.clearRetainingCapacity();
@@ -851,7 +852,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     return runWithLimits(allocator, func, .{});
 }
 
-fn expectBitwiseTriangle(left_op: BinOp, right_op: BinOp, expected: BinOp) !void {
+fn expectBitwisePair(outer_op: BinOp, left_op: BinOp, right_op: BinOp, expected: BinOp) !void {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -861,7 +862,7 @@ fn expectBitwiseTriangle(left_op: BinOp, right_op: BinOp, expected: BinOp) !void
     const b = try func.appendBlockParam(block, ty);
     const left = try func.appendInst(block, ty, .{ .arith = .{ .op = left_op, .lhs = a, .rhs = b } });
     const right = try func.appendInst(block, ty, .{ .arith = .{ .op = right_op, .lhs = b, .rhs = a } });
-    const combined = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = left, .rhs = right } });
+    const combined = try func.appendInst(block, ty, .{ .arith = .{ .op = outer_op, .lhs = left, .rhs = right } });
     func.setTerminator(block, .{ .ret = ir.function.Ret.one(combined) });
 
     try std.testing.expect(try runWithLimits(allocator, &func, .{}));
@@ -1198,9 +1199,17 @@ test "egraph reduces the difference of bitwise union and intersection" {
 }
 
 test "egraph folds xor combinations of matching bitwise terms" {
-    try expectBitwiseTriangle(.bit_and, .bit_or, .bit_xor);
-    try expectBitwiseTriangle(.bit_or, .bit_xor, .bit_and);
-    try expectBitwiseTriangle(.bit_and, .bit_xor, .bit_or);
+    try expectBitwisePair(.bit_xor, .bit_and, .bit_or, .bit_xor);
+    try expectBitwisePair(.bit_xor, .bit_or, .bit_xor, .bit_and);
+    try expectBitwisePair(.bit_xor, .bit_and, .bit_xor, .bit_or);
+}
+
+test "egraph folds and-or combinations of matching bitwise terms" {
+    try expectBitwisePair(.bit_or, .bit_and, .bit_xor, .bit_or);
+    try expectBitwisePair(.bit_or, .bit_and, .bit_or, .bit_or);
+    try expectBitwisePair(.bit_or, .bit_or, .bit_xor, .bit_or);
+    try expectBitwisePair(.bit_and, .bit_and, .bit_or, .bit_and);
+    try expectBitwisePair(.bit_and, .bit_or, .bit_xor, .bit_xor);
 }
 
 test "egraph reassociates an add tree to expose factoring" {
