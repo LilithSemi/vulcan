@@ -56,12 +56,16 @@ fn isUnsigned(func: *const Function, v: Value) bool {
 /// pass suffices: in RPO every instruction operand is either a constant, a param, or an
 /// already-visited instruction result.
 fn analyze(allocator: std.mem.Allocator, func: *const Function) pass.Error![]Bits {
+    var cfg = try cfg_mod.build(allocator, func);
+    defer cfg.deinit(allocator);
+    return analyzeFromCfg(allocator, func, &cfg);
+}
+
+fn analyzeFromCfg(allocator: std.mem.Allocator, func: *const Function, cfg: *const cfg_mod.Cfg) pass.Error![]Bits {
     const bits = try allocator.alloc(Bits, func.valueCount());
     errdefer allocator.free(bits);
     @memset(bits, .{});
 
-    var cfg = try cfg_mod.build(allocator, func);
-    defer cfg.deinit(allocator);
     const rpo = try cfg.reversePostorder(allocator);
     defer allocator.free(rpo);
 
@@ -355,9 +359,8 @@ fn countMinLeadingZeros(a: Bits, w: u16) u16 {
 }
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
-    _ = analyses;
     if (func.blockCount() == 0) return false;
-    const bits = try analyze(allocator, func);
+    const bits = try analyzeFromCfg(allocator, func, try analyses.cfg());
     defer allocator.free(bits);
 
     var changed = false;
