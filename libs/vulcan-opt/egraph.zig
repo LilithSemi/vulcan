@@ -333,11 +333,14 @@ fn bitwisePairResult(outer: BinOp, left: BinOp, right: BinOp) ?BinOp {
     return switch (outer) {
         .bit_xor => if (and_or) .bit_xor else if (or_xor) .bit_and else if (and_xor) .bit_or else null,
         .bit_or => if (and_or or and_xor or or_xor) .bit_or else null,
-        // AND and XOR are disjoint, so that last pair is zero. Constants are deliberately outside
-        // this e-graph; simplify/constfold handle them when one already exists.
         .bit_and => if (and_or) .bit_and else if (or_xor) .bit_xor else null,
         else => null,
     };
+}
+
+fn isDisjointBitwisePair(outer: BinOp, left: BinOp, right: BinOp) bool {
+    return outer == .bit_and and
+        ((left == .bit_and and right == .bit_xor) or (left == .bit_xor and right == .bit_and));
 }
 
 fn hasFactorCandidateAt(func: *const Function, value: Value, sum: ir.function.Arith) bool {
@@ -389,7 +392,9 @@ fn hasFactorCandidateAt(func: *const Function, value: Value, sum: ir.function.Ar
     } else if (sum.op == .bit_and or sum.op == .bit_or) {
         if (lhs) |op| if (op.op == sum.op and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
         if (rhs) |op| if (op.op == sum.op and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
-        if (lhs != null and rhs != null and bitwisePairResult(sum.op, lhs.?.op, rhs.?.op) != null and sameValueOperands(lhs.?, rhs.?)) return true;
+        if (lhs != null and rhs != null and
+            (bitwisePairResult(sum.op, lhs.?.op, rhs.?.op) != null or isDisjointBitwisePair(sum.op, lhs.?.op, rhs.?.op)) and
+            sameValueOperands(lhs.?, rhs.?)) return true;
     }
     return false;
 }
@@ -688,7 +693,9 @@ fn foldBitwisePairs(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.A
     const bit_ops = [_]BinOp{ .bit_and, .bit_or, .bit_xor };
     var changed = false;
     for (bit_ops) |lhs_op| for (bit_ops) |rhs_op| {
-        const result_op = bitwisePairResult(outer.op, lhs_op, rhs_op) orelse continue;
+        const result_op = bitwisePairResult(outer.op, lhs_op, rhs_op);
+        const produces_zero = isDisjointBitwisePair(outer.op, lhs_op, rhs_op);
+        if (result_op == null and !produces_zero) continue;
         left.clearRetainingCapacity();
         right.clearRetainingCapacity();
         try matchingOps(graph, outer.lhs, lhs_op, outer.ty, left);
@@ -696,9 +703,9 @@ fn foldBitwisePairs(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.A
         for (left.items) |a| for (right.items) |b| {
             if (!sameClassOperands(graph, a, b)) continue;
             const replacement = try graph.addOp(.{
-                .op = result_op,
+                .op = if (produces_zero) .bit_xor else result_op.?,
                 .lhs = a.lhs,
-                .rhs = a.rhs,
+                .rhs = if (produces_zero) a.lhs else a.rhs,
                 .ty = a.ty,
                 .existing = null,
             }) orelse return changed;
@@ -1614,6 +1621,26 @@ test "egraph folds and-or combinations of matching bitwise terms" {
     try expectBitwisePair(.bit_or, .bit_or, .bit_xor, .bit_or);
     try expectBitwisePair(.bit_and, .bit_and, .bit_or, .bit_and);
     try expectBitwisePair(.bit_and, .bit_or, .bit_xor, .bit_xor);
+}
+
+test "egraph exposes zero from disjoint bitwise terms" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const both = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } });
+    const exclusive = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = b, .rhs = a } });
+    const disjoint = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = both, .rhs = exclusive } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(disjoint) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const zero = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.bit_xor, zero.op);
+    try std.testing.expectEqual(zero.lhs, zero.rhs);
 }
 
 test "egraph folds mixed addition and subtraction pairs" {
