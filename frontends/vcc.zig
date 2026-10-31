@@ -171,6 +171,8 @@ const Options = struct {
     /// so a plain link runs the mark-and-sweep pass without any extra flag. `--no-gc-sections`
     /// opts back out to the old keep-everything behavior. See the LINK step in `main`.
     gc_sections: bool = true,
+    /// `-ftime-report`: print per-stage compiler wall times to stderr.
+    time_report: bool = false,
     optimize: OptimizationLevel = .off,
 };
 
@@ -280,6 +282,8 @@ fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (e
             opts.preprocess_only = true;
         } else if (std.mem.eql(u8, arg, "-freproducible-compile")) {
             opts.reproducible = true;
+        } else if (std.mem.eql(u8, arg, "-ftime-report")) {
+            opts.time_report = true;
         } else if (std.mem.eql(u8, arg, "-I")) {
             const dir = it.next() orelse return fail(errw, "-I requires an argument", .{});
             try opts.includes.append(allocator, dir);
@@ -941,11 +945,11 @@ fn buildModuleData(allocator: std.mem.Allocator, objs: []const cc.DataObject) st
 /// microarch model for `arch` (see `resolveModel`). It tunes both the IR layer and the
 /// backend for every function this call compiles. Used by both the `-c` path (a single
 /// source) and the link step (one call per `.c`/`.i` input, in command order).
-fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel) ![]u8 {
+fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool) ![]u8 {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
     var pp_opts = pp_base;
     pp_opts.filename = try filenameForPreproc(allocator, path);
-    return compileSourceToObject(allocator, source, pp_opts, arch, model, optimize);
+    return compileSourceToObject(allocator, io, source, pp_opts, arch, model, optimize, time_report);
 }
 
 /// Compiles in-memory `source` (already-read text, `pp_opts` carrying its filename and
@@ -958,29 +962,67 @@ fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, p
 /// `opt.optimizeLate` reduces a loop's addresses to loop-carried pointers, which changes the shape
 /// four microarch idiom recognizers match on, so it has to come after them. `opt.optimize` is the
 /// two halves back to back, for a caller with no microarch layer to fit in between.
-fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel) ![]u8 {
+fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool) ![]u8 {
+    const frontend_start = std.Io.Timestamp.now(io, .awake);
     var mod = try cc.compileWithOpts(allocator, source, pp_opts);
     defer mod.deinit(allocator);
+    const frontend_end = std.Io.Timestamp.now(io, .awake);
 
+    const inline_start = frontend_end;
     if (optimize.inlinesCalls()) try inlineTranslationUnit(allocator, &mod);
+    const inline_end = std.Io.Timestamp.now(io, .awake);
 
-    var mfs: std.ArrayList(target.native.ModuleFunction) = .empty;
-    for (mod.funcs) |*nf| {
-        if (optimize.optimizes()) _ = try opt.optimizeEarly(allocator, &nf.func);
-        if (optimize.runsMicroarch()) {
-            if (model) |m| _ = try mm.optimizeTransforms(allocator, &nf.func, m);
-        }
-        if (optimize.optimizes()) _ = try opt.optimizeLate(allocator, &nf.func);
-        if (optimize.runsMicroarch()) {
-            if (model) |m| try mm.schedule.run(allocator, &nf.func, m);
-        }
-        if (optimize.optimizes()) _ = try opt.layout(allocator, &nf.func, null);
-        try mfs.append(allocator, .{ .name = nf.name, .func = &nf.func });
+    const early_start = inline_end;
+    if (optimize.optimizes()) {
+        for (mod.funcs) |*nf| _ = try opt.optimizeEarly(allocator, &nf.func);
     }
+    const early_end = std.Io.Timestamp.now(io, .awake);
+
+    const microarch_start = early_end;
+    if (optimize.runsMicroarch()) if (model) |m| {
+        for (mod.funcs) |*nf| _ = try mm.optimizeTransforms(allocator, &nf.func, m);
+    };
+    const microarch_end = std.Io.Timestamp.now(io, .awake);
+
+    const late_start = microarch_end;
+    if (optimize.optimizes()) {
+        for (mod.funcs) |*nf| _ = try opt.optimizeLate(allocator, &nf.func);
+    }
+    const late_end = std.Io.Timestamp.now(io, .awake);
+
+    const final_start = late_end;
+    for (mod.funcs) |*nf| {
+        if (optimize.runsMicroarch()) if (model) |m| try mm.schedule.run(allocator, &nf.func, m);
+        if (optimize.optimizes()) _ = try opt.layout(allocator, &nf.func, null);
+    }
+    const final_end = std.Io.Timestamp.now(io, .awake);
 
     const data = try buildModuleData(allocator, mod.data);
+    var mfs: std.ArrayList(target.native.ModuleFunction) = .empty;
+    for (mod.funcs) |*nf| try mfs.append(allocator, .{ .name = nf.name, .func = &nf.func });
+    const codegen_start = std.Io.Timestamp.now(io, .awake);
+    const object = try target.native.writeObjectDataForModel(allocator, arch, mfs.items, data.items, model);
+    const codegen_end = std.Io.Timestamp.now(io, .awake);
 
-    return target.native.writeObjectDataForModel(allocator, arch, mfs.items, data.items, model);
+    if (time_report) {
+        var buffer: [1024]u8 = undefined;
+        var writer = std.Io.File.stderr().writer(io, &buffer);
+        try writer.interface.print("vcc time (us): frontend={d} inline={d} early-opt={d} microarch={d} late-opt={d} schedule-layout={d} codegen={d}\n", .{
+            micros(frontend_start, frontend_end),
+            micros(inline_start, inline_end),
+            micros(early_start, early_end),
+            micros(microarch_start, microarch_end),
+            micros(late_start, late_end),
+            micros(final_start, final_end),
+            micros(codegen_start, codegen_end),
+        });
+        try writer.interface.flush();
+    }
+    return object;
+}
+
+fn micros(start: std.Io.Timestamp, end: std.Io.Timestamp) u64 {
+    return @intCast(start.durationTo(end).nanoseconds / std.time.ns_per_us);
 }
 
 const ModuleLookup = struct {
@@ -1001,11 +1043,11 @@ fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module) !void {
 /// normally supplies it. VCC links a minimal crt (`crt1.o` only), so the driver provides it
 /// instead. A whole-program (main-executable) handle is NULL, so the stored value is 0. This
 /// object holds data only, no functions, so it passes no microarch model through.
-fn synthDsoHandleObject(allocator: std.mem.Allocator, pp_base: preproc.Options, arch: link.Arch) ![]u8 {
+fn synthDsoHandleObject(allocator: std.mem.Allocator, io: std.Io, pp_base: preproc.Options, arch: link.Arch) ![]u8 {
     var pp_opts = pp_base;
     pp_opts.filename = "<vcc-dso-handle>";
     // Data only, no functions, so optimization has nothing to act on: pass it off.
-    return compileSourceToObject(allocator, "void *__dso_handle = 0;\n", pp_opts, arch, null, .off);
+    return compileSourceToObject(allocator, io, "void *__dso_handle = 0;\n", pp_opts, arch, null, .off, false);
 }
 
 /// The `vcc` driver entry point: parse argv, then dispatch on mode. `-E` preprocesses and
@@ -1228,7 +1270,7 @@ pub fn main(init: std.process.Init) !void {
     if (opts.compile_only) {
         const input = single_source.?;
         if (classifyExt(input) != .c) return fail(errw, "-c requires a .c/.i source file, got '{s}'", .{input});
-        const obj = try compileToObject(allocator, io, input, pp_base, arch, model, opts.optimize);
+        const obj = try compileToObject(allocator, io, input, pp_base, arch, model, opts.optimize, opts.time_report);
         const out = opts.output orelse try derivedOutputName(allocator, input);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = obj });
         if (opts.gen_depfile) {
@@ -1281,7 +1323,7 @@ pub fn main(init: std.process.Init) !void {
     for (opts.inputs.items) |spec| switch (spec) {
         .path => |p| switch (classifyExt(p)) {
             .c => {
-                const obj = try compileToObject(allocator, io, p, pp_base, arch, model, opts.optimize);
+                const obj = try compileToObject(allocator, io, p, pp_base, arch, model, opts.optimize, opts.time_report);
                 try dyn_inputs.append(allocator, .{ .object = obj });
                 try display_names.append(allocator, "");
             },
@@ -1364,7 +1406,7 @@ pub fn main(init: std.process.Init) !void {
             // supplies it. This is an always-included synthetic object, ahead of the user
             // inputs.
             if (add_libc) {
-                const dso = try synthDsoHandleObject(allocator, pp_base, arch);
+                const dso = try synthDsoHandleObject(allocator, io, pp_base, arch);
                 try autolinked.append(allocator, .{ .object = dso });
                 try autolinked_names.append(allocator, "<vcc-dso-handle>");
             }
@@ -1832,6 +1874,14 @@ test "optimization level gates translation-unit inlining" {
     try std.testing.expect(OptimizationLevel.fast.inlinesCalls());
     try std.testing.expect(!OptimizationLevel.size.inlinesCalls());
     try std.testing.expect(!OptimizationLevel.min_size.inlinesCalls());
+}
+
+test "parseArgs: -ftime-report enables stage timing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var it = SliceArgs{ .items = &.{ "-ftime-report", "foo.c" } };
+    const opts = try parseArgs(arena.allocator(), testErrw(), &it);
+    try std.testing.expect(opts.time_report);
 }
 
 test "translation-unit inlining removes a call to a local leaf" {
