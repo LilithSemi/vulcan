@@ -233,6 +233,10 @@ fn opBit(op: BinOp) u16 {
     return @as(u16, 1) << @intCast(@backingInt(op));
 }
 
+fn classHasOp(graph: *Graph, class: u32, op: BinOp) bool {
+    return graph.class_ops.items[graph.find(class)] & opBit(op) != 0;
+}
+
 fn isAssociative(op: BinOp) bool {
     return switch (op) {
         .add, .mul, .bit_and, .bit_or, .bit_xor => true,
@@ -609,6 +613,11 @@ fn foldMixedAddSub(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.Ar
     return changed;
 }
 
+fn hasMixedAddSubChildren(graph: *Graph, outer: OpNode) bool {
+    const add_sub = classHasOp(graph, outer.lhs, .add) and classHasOp(graph, outer.rhs, .sub);
+    return add_sub or (outer.op == .add and classHasOp(graph, outer.lhs, .sub) and classHasOp(graph, outer.rhs, .add));
+}
+
 fn emitCrossCancellation(graph: *Graph, outer_class: u32, ty: Type, subtraction: OpNode, addition: OpNode, subtract_outer: bool) !bool {
     const cancelled = graph.find(if (subtract_outer) subtraction.lhs else subtraction.rhs);
     const other = if (graph.find(addition.lhs) == cancelled)
@@ -768,7 +777,7 @@ fn saturate(graph: *Graph) !void {
             if (sum.op == .add or sum.op == .sub or sum.op == .bit_xor) {
                 changed = try cancelInverse(graph, entry.class, sum, left, right) or changed;
             }
-            if (sum.op == .add or sum.op == .sub) {
+            if ((sum.op == .add or sum.op == .sub) and hasMixedAddSubChildren(graph, sum)) {
                 changed = try foldMixedAddSub(graph, entry.class, sum, left, right) or changed;
                 changed = try cancelCrossTerms(graph, entry.class, sum, left, right) or changed;
             }
