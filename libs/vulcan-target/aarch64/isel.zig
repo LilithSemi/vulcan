@@ -2088,7 +2088,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                                 }
                             } else switch (ctx.locationAt(value)) {
                                 .slot => |slot| try code.append(allocator, encode.ldrOff(.x0, sp, @intCast(spill_base + slot * 16))),
-                                .reg => |src| if (src != .x0) try code.append(allocator, encode.mov(.x0, src)),
+                                .reg => |src| if (src != .x0 and
+                                    (isWide(func, value) or !canRetargetReturnValue(func, value) or !retargetLastGprResult(&code, src)))
+                                {
+                                    try code.append(allocator, encode.mov(.x0, src));
+                                },
                             }
                         },
                         else => {
@@ -4942,6 +4946,54 @@ fn loadConst64(allocator: std.mem.Allocator, code: *std.ArrayList(u32), rd: Reg,
     }
 }
 
+/// Retarget a single 32-bit ALU/select result immediately preceding a return into w0. Every matched
+/// encoding writes Rd in bits 4:0 and permits it to alias its inputs. The returned SSA producer is
+/// checked separately so a multi-instruction constant cannot retarget only its final movk.
+fn retargetLastGprResult(code: *std.ArrayList(u32), src: Reg) bool {
+    if (code.items.len == 0 or src == .zr) return false;
+    const word = code.items[code.items.len - 1];
+    if ((word & 0x1F) != @as(u32, @backingInt(src))) return false;
+    const top: u8 = @truncate(word >> 24);
+    const supported = switch (top) {
+        // add/sub register, logical register, add/sub immediate, logical immediate, bitfield,
+        // conditional select, and multiply-add families. Only 32-bit forms are listed.
+        0x0A,
+        0x0B,
+        0x11,
+        0x12,
+        0x13,
+        0x1A,
+        0x1B,
+        0x2A,
+        0x32,
+        0x4A,
+        0x4B,
+        0x51,
+        0x52,
+        0x53,
+        0x5A,
+        0x6A,
+        0x72,
+        => true,
+        else => false,
+    };
+    if (!supported) return false;
+    code.items[code.items.len - 1] = word & ~@as(u32, 0x1F);
+    return true;
+}
+
+fn canRetargetReturnValue(func: *const Function, value: Value) bool {
+    const inst = func.definingInst(value) orelse return false;
+    return switch (func.opcode(inst)) {
+        .arith => |arith| switch (arith.op) {
+            .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr => true,
+            .div, .rem, .mulh => false,
+        },
+        .arith_imm, .select, .icmp => true,
+        else => false,
+    };
+}
+
 /// Test/measurement hook only: runs the linearization on `func` and returns its `Liveness` so a
 /// test can inspect the computed split-liveness data (`use_positions`, `is_intra`). The caller owns
 /// the returned `Liveness` and must `deinit` it. Exists so tests can assert the liveness data
@@ -4999,6 +5051,31 @@ test "single-use integer compare feeds csel through flags without cset" {
     }
     try std.testing.expectEqual(@as(usize, 0), csets);
     try std.testing.expectEqual(@as(usize, 1), csels);
+}
+
+test "retargets a select through an empty return block" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const done = try func.appendBlock();
+    const value = try func.appendBlockParam(entry, t);
+    const limit = try func.appendBlockParam(entry, t);
+    const then_value = try func.appendInst(entry, t, .{ .iconst = 41 });
+    const else_value = try func.appendInst(entry, t, .{ .iconst = 43 });
+    const cond = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .le, .lhs = value, .rhs = limit } });
+    const selected = try func.appendInst(entry, t, .{ .select = .{ .cond = cond, .then = then_value, .@"else" = else_value } });
+    try func.setJump(entry, done, &.{});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(selected) });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    try std.testing.expect(code.len >= 2);
+    try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
+    try std.testing.expectEqual(@as(u32, 0), code[code.len - 2] & 0x1f);
+    try std.testing.expectEqual(@as(u32, 0x1A800000), code[code.len - 2] & 0x7FE00C00);
 }
 
 test "via_got global_addr lowers to adrp+ldr with got_pg/got_lo12 relocs (GOT-indirect)" {
