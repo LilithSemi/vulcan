@@ -889,18 +889,25 @@ fn cancelCrossTerms(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.A
     return changed;
 }
 
-fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
+fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !?bool {
+    var matched = false;
     var changed = false;
     if (outer.op == .add) {
         left.clearRetainingCapacity();
         try matchingOps(graph, outer.lhs, .sub, outer.ty, left);
         for (left.items) |nested| {
-            if (graph.find(nested.rhs) == graph.find(outer.rhs)) changed = graph.merge(outer_class, nested.lhs) or changed;
+            if (graph.find(nested.rhs) == graph.find(outer.rhs)) {
+                matched = true;
+                changed = graph.merge(outer_class, nested.lhs) or changed;
+            }
         }
         right.clearRetainingCapacity();
         try matchingOps(graph, outer.rhs, .sub, outer.ty, right);
         for (right.items) |nested| {
-            if (graph.find(nested.rhs) == graph.find(outer.lhs)) changed = graph.merge(outer_class, nested.lhs) or changed;
+            if (graph.find(nested.rhs) == graph.find(outer.lhs)) {
+                matched = true;
+                changed = graph.merge(outer_class, nested.lhs) or changed;
+            }
         }
     } else if (outer.op == .sub) {
         left.clearRetainingCapacity();
@@ -908,15 +915,20 @@ fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.Arra
         for (left.items) |nested| {
             const rhs = graph.find(outer.rhs);
             if (graph.find(nested.lhs) == rhs) {
+                matched = true;
                 changed = graph.merge(outer_class, nested.rhs) or changed;
             } else if (graph.find(nested.rhs) == rhs) {
+                matched = true;
                 changed = graph.merge(outer_class, nested.lhs) or changed;
             }
         }
         right.clearRetainingCapacity();
         try matchingOps(graph, outer.rhs, .sub, outer.ty, right);
         for (right.items) |nested| {
-            if (graph.find(nested.lhs) == graph.find(outer.lhs)) changed = graph.merge(outer_class, nested.rhs) or changed;
+            if (graph.find(nested.lhs) == graph.find(outer.lhs)) {
+                matched = true;
+                changed = graph.merge(outer_class, nested.rhs) or changed;
+            }
         }
     } else if (outer.op == .bit_xor) {
         left.clearRetainingCapacity();
@@ -924,8 +936,10 @@ fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.Arra
         for (left.items) |nested| {
             const rhs = graph.find(outer.rhs);
             if (graph.find(nested.lhs) == rhs) {
+                matched = true;
                 changed = graph.merge(outer_class, nested.rhs) or changed;
             } else if (graph.find(nested.rhs) == rhs) {
+                matched = true;
                 changed = graph.merge(outer_class, nested.lhs) or changed;
             }
         }
@@ -934,13 +948,15 @@ fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.Arra
         for (right.items) |nested| {
             const lhs = graph.find(outer.lhs);
             if (graph.find(nested.lhs) == lhs) {
+                matched = true;
                 changed = graph.merge(outer_class, nested.rhs) or changed;
             } else if (graph.find(nested.rhs) == lhs) {
+                matched = true;
                 changed = graph.merge(outer_class, nested.lhs) or changed;
             }
         }
     }
-    return changed;
+    return if (matched) changed else null;
 }
 
 fn saturate(graph: *Graph) !void {
@@ -1001,6 +1017,12 @@ fn saturate(graph: *Graph) !void {
                     changed = rule_changed or changed;
                 }
             }
+            if (hasInverseChildren(graph, sum)) {
+                if (try cancelInverse(graph, entry.class, sum, left, right)) |rule_changed| {
+                    direct_match = true;
+                    changed = rule_changed or changed;
+                }
+            }
             // A direct reduction already introduces the remaining associative expression. Let
             // the eager walk process that smaller expression instead of expanding this node first.
             if (!direct_match and isAssociative(sum.op) and classHasOp(graph, sum.lhs, sum.op)) {
@@ -1038,9 +1060,6 @@ fn saturate(graph: *Graph) !void {
                     changed = try cancelAddedSubtractions(graph, entry.class, a, b) or changed;
                     if (graph.hit_limit) break;
                 };
-            }
-            if (hasInverseChildren(graph, sum)) {
-                changed = try cancelInverse(graph, entry.class, sum, left, right) or changed;
             }
             if ((sum.op == .add or sum.op == .sub) and hasMixedAddSubChildren(graph, sum)) {
                 changed = try foldMixedAddSub(graph, entry.class, sum, left, right) or changed;
