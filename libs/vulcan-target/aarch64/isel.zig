@@ -3959,8 +3959,8 @@ fn addSubImmFold(func: *const Function, a: ir.function.Arith) ?struct { base: Va
     return null;
 }
 
-/// Whether the `iconst` at `insts[inst_idx]` is consumed ONLY as the folded immediate of an add/sub
-/// in the same block, so its register materialization can be skipped. Requires it to fit the add/sub
+/// Whether the `iconst` at `insts[inst_idx]` is consumed ONLY as the folded immediate of an add/sub,
+/// so its register materialization can be skipped. Requires it to fit the add/sub
 /// immediate, to have exactly one use, and that use to be a foldable operand (a `sub` LEFT operand is
 /// `c - x`, which does not fold).
 fn foldsAsAddSubImm(func: *const Function, insts: []const ir.function.Inst, inst_idx: usize) bool {
@@ -3969,18 +3969,20 @@ fn foldsAsAddSubImm(func: *const Function, insts: []const ir.function.Inst, inst
     const result = func.instResult(inst) orelse return false;
     if (addSubImmConst(func, result) == null) return false;
     if (countUses(func, result) != 1) return false;
-    for (insts) |other| {
-        const oa = switch (func.opcode(other)) {
-            .arith => |x| x,
-            else => continue,
-        };
-        if (oa.op != .add and oa.op != .sub) continue;
-        // The RIGHT operand is always the immediate candidate (`addSubImmFold` checks it first). The
-        // LEFT operand only becomes the immediate for a commutative `add`, and only when the RIGHT
-        // operand is NOT itself a constant (otherwise the right is the immediate and this left is the
-        // base register, which must stay materialized).
-        if (oa.rhs == result) return true;
-        if (oa.lhs == result) return oa.op == .add and addSubImmConst(func, oa.rhs) == null;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |other| {
+            const oa = switch (func.opcode(other)) {
+                .arith => |x| x,
+                else => continue,
+            };
+            if (oa.op != .add and oa.op != .sub) continue;
+            // The RIGHT operand is always the immediate candidate (`addSubImmFold` checks it first).
+            // The LEFT operand only becomes the immediate for a commutative `add`, and only when the
+            // RIGHT operand is NOT itself a constant (otherwise the right is the immediate and this
+            // left is the base register, which must stay materialized).
+            if (oa.rhs == result) return true;
+            if (oa.lhs == result) return oa.op == .add and addSubImmConst(func, oa.rhs) == null;
+        }
     }
     return false;
 }
@@ -3994,7 +3996,7 @@ fn cmpFoldImm(func: *const Function, v: Value) ?u12 {
 }
 
 /// Whether the `iconst` at `insts[inst_idx]` is consumed ONLY as the folded immediate right-hand
-/// operand of a compare in the same block, so its register materialization can be skipped: the
+/// operand of a compare, so its register materialization can be skipped: the
 /// compare emits it inline through `cmpFoldImm`. Requires the constant to fit the compare immediate
 /// and to have exactly one use, and that use to read it as the compare's `rhs` (a `lhs` constant is
 /// not folded, since the immediate compare form fixes the immediate on the right).
@@ -4004,13 +4006,35 @@ fn foldsAsCmpImm(func: *const Function, insts: []const ir.function.Inst, inst_id
     const result = func.instResult(inst) orelse return false;
     if (cmpFoldImm(func, result) == null) return false;
     if (countUses(func, result) != 1) return false;
-    for (insts) |other| {
-        if (func.opcode(other) != .icmp) continue;
-        const cmp = func.opcode(other).icmp;
-        if (cmp.lhs == result) return false; // read as the left operand: not folded
-        if (cmp.rhs == result) return true;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |other| {
+            if (func.opcode(other) != .icmp) continue;
+            const cmp = func.opcode(other).icmp;
+            if (cmp.lhs == result) return false; // read as the left operand: not folded
+            if (cmp.rhs == result) return true;
+        }
     }
     return false;
+}
+
+test "cross-block compare immediate skips constant materialization" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_ty = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const body = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, ty);
+    const bound = try func.appendInst(entry, ty, .{ .iconst = 64 });
+    try func.setJump(entry, body, &.{x});
+    const bx = try func.appendBlockParam(body, ty);
+    const cmp = try func.appendInst(body, bool_ty, .{ .icmp = .{ .op = .lt, .lhs = bx, .rhs = bound } });
+    func.setTerminator(body, .{ .ret = ir.function.Ret.one(cmp) });
+
+    const insts = func.blockInsts(entry);
+    try std.testing.expectEqual(@as(usize, 1), insts.len);
+    try std.testing.expect(foldsAsCmpImm(&func, insts, 0));
 }
 
 fn countUses(func: *const Function, v: Value) usize {
