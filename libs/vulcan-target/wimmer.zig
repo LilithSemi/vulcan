@@ -123,6 +123,11 @@ pub const RegDescription = struct {
     // a backend that does not opt in is unaffected. Only a case the backend lowers to an EXACT plain
     // copy is safe to report. A widening or narrowing that changes bits must NOT be reported.
     copySource: ?*const fn (ctx: *const anyopaque, func: *const Function, v: Value) ?Value = null,
+    // OPTIONAL destructive-operand coalescing hook. Return an operand that the instruction defining
+    // `v` may read from the same register it writes. When that operand dies at the instruction, the
+    // allocator may overlap both intervals. Unlike `copySource`, the instruction is still emitted;
+    // this only enables normal two-address-style register reuse on a three-address ISA.
+    destructiveSource: ?*const fn (ctx: *const anyopaque, func: *const Function, v: Value) ?Value = null,
     // OPTIONAL narrow-value predicate. Return true when value `v` survives a call clobber of a
     // register in its class's `narrow_preserved` set (i.e. it fits in the preserved low half). On
     // aarch64 this is a SCALAR float (not a 128-bit vector), which AAPCS64 preserves in v8..v15
@@ -259,6 +264,9 @@ pub const Interval = struct {
     // both on ONE register, which turns the copy into a no-op the backend elides. Null for a
     // non-copy value, and for every backend that does not set `RegDescription.copySource`.
     copy_src: ?Value = null,
+    // An input the defining instruction may safely alias with this result. The instruction remains
+    // real code; sharing merely chooses Rd == Rn when the input dies at the definition.
+    destructive_src: ?Value = null,
     // For a VALUE interval, true when the backend's `RegDescription.isNarrow` flagged this value as
     // one that survives a clobber of a `RegClass.narrow_preserved` register (e.g. a scalar float in
     // aarch64 v8..v15, whose low 64 bits AAPCS64 preserves across a call). A narrow value may stay
@@ -780,6 +788,12 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
                 if (desc.classOf(desc.ctx, func, s) == class) copy_src = s;
             }
         }
+        var destructive_src: ?Value = null;
+        if (desc.destructiveSource) |hook| {
+            if (hook(desc.ctx, func, value)) |s| {
+                if (desc.classOf(desc.ctx, func, s) == class) destructive_src = s;
+            }
+        }
         const narrow = if (desc.isNarrow) |hook| hook(desc.ctx, func, value) else false;
         // The register width is read ONCE here and carried on the interval, so every later site
         // (the scan, the splitter, the resolver, the verifier) reads one answer.
@@ -791,6 +805,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             .ranges = rs,
             .uses = us,
             .copy_src = copy_src,
+            .destructive_src = destructive_src,
             .narrow = narrow,
             .regs = width.regs,
             .reg_align = width.alignment,
@@ -1188,7 +1203,7 @@ fn tryAllocateFreeReg(
         if (it.class != class_idx) continue;
         if (sameValue(it, current)) continue;
         const r = assignedReg(it);
-        if (copyDiesAt(current, it)) {
+        if (copyDiesAt(current, it) or destructiveSourceDiesAt(current, it)) {
             if (r < limit and is_candidate[r]) coalesce_hint = r;
             continue;
         }
@@ -1284,12 +1299,25 @@ fn copyDiesAt(dst: *const Interval, src: *const Interval) bool {
     return src.end() == dst.start() + 1;
 }
 
+fn destructiveSourceDiesAt(dst: *const Interval, src: *const Interval) bool {
+    const destructive = dst.destructive_src orelse return false;
+    if (src.fixed_reg != null) return false;
+    const sv = src.value orelse return false;
+    if (destructive != sv) return false;
+    if (src.regs != dst.regs or src.reg_align != dst.reg_align) return false;
+    return src.end() == dst.start() + 1;
+}
+
 /// True iff the two intervals are a legitimate copy-coalesce pair: one is a copy destination, the
 /// other is its source that dies at the copy. Their only same-register overlap is the single copy
 /// position, which is a no-op move, so the verifier accepts them sharing one register. This is the
 /// coalescing analogue of `isEntryParamHintPair`.
 fn isCopyCoalescePair(a: *const Interval, b: *const Interval) bool {
     return copyDiesAt(a, b) or copyDiesAt(b, a);
+}
+
+fn isDestructiveCoalescePair(a: *const Interval, b: *const Interval) bool {
+    return destructiveSourceDiesAt(a, b) or destructiveSourceDiesAt(b, a);
 }
 
 /// True iff both intervals describe the same value (used to skip a value's own entry-param hint
@@ -3492,7 +3520,7 @@ pub fn verifyIntervals(allocator: std.mem.Allocator, intervals: []const Interval
                 // A coalesced copy destination and its source share one register span over the
                 // single copy position, a no-op move. That is their only overlap (the source dies at
                 // the copy), so it is not a conflict.
-                if (isCopyCoalescePair(ia, ib)) continue;
+                if (isCopyCoalescePair(ia, ib) or isDestructiveCoalescePair(ia, ib)) continue;
             }
             if (occupancyConflict(ia, ib)) |pos| {
                 try violations.append(allocator, .{ .kind = .reg_overlap, .a = i, .b = j, .pos = pos });
