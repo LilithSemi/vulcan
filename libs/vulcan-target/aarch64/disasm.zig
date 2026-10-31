@@ -913,9 +913,21 @@ fn fpDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
 
 /// NEON (128-bit vector) instructions. Returns whether it matched.
 fn vecDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
+    // mov vd.16b, vn.16b is the orr alias with identical inputs. Check it before the general
+    // three-register ORR decoder so canonical disassembly keeps the alias.
+    if (w & 0xFFE0FC00 == 0x4EA01C00 and rm(w) == rn(w)) {
+        try buf.print(a, "mov v{d}.16b, v{d}.16b", .{ rd(w), rn(w) });
+        return true;
+    }
     // Three-register 4S / 16B forms.
     const V3 = struct { match: u32, mnem: []const u8, b16: bool };
     const v3 = [_]V3{
+        .{ .match = 0x4EA08400, .mnem = "add", .b16 = false },
+        .{ .match = 0x6EA08400, .mnem = "sub", .b16 = false },
+        .{ .match = 0x4EA09C00, .mnem = "mul", .b16 = false },
+        .{ .match = 0x4E201C00, .mnem = "and", .b16 = true },
+        .{ .match = 0x4EA01C00, .mnem = "orr", .b16 = true },
+        .{ .match = 0x6E201C00, .mnem = "eor", .b16 = true },
         .{ .match = 0x4E20D400, .mnem = "fadd", .b16 = false },
         .{ .match = 0x4EA0D400, .mnem = "fsub", .b16 = false },
         .{ .match = 0x6E20DC00, .mnem = "fmul", .b16 = false },
@@ -949,11 +961,6 @@ fn vecDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
     }
     if (w & 0xFFFFFC00 == 0x7E30D800) {
         try buf.print(a, "faddp s{d}, v{d}.2s", .{ rd(w), rn(w) });
-        return true;
-    }
-    // mov vd.16b, vn.16b is orr with rm == rn.
-    if (w & 0xFFE0FC00 == 0x4EA01C00 and rm(w) == rn(w)) {
-        try buf.print(a, "mov v{d}.16b, v{d}.16b", .{ rd(w), rn(w) });
         return true;
     }
     if (w & 0xFFFFFC00 == 0x4E040C00) { // dup Vd.4S, Wn

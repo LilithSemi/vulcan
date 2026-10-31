@@ -73,6 +73,18 @@ pub fn mul(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x1B000000 | (n(rm) << 16) | (31 << 10) | (n(rn) << 5) | n(rd);
 }
 
+/// `madd wd, wn, wm, wa` and its 64-bit counterpart.
+pub fn madd(rd: Reg, rn: Reg, rm: Reg, ra: Reg, wide: bool) u32 {
+    return (if (wide) @as(u32, 1) << 31 else 0) |
+        0x1B000000 | (n(rm) << 16) | (n(ra) << 10) | (n(rn) << 5) | n(rd);
+}
+
+/// `msub wd, wn, wm, wa` computes `wa - wn * wm`.
+pub fn msubInt(rd: Reg, rn: Reg, rm: Reg, ra: Reg, wide: bool) u32 {
+    return (if (wide) @as(u32, 1) << 31 else 0) |
+        0x1B008000 | (n(rm) << 16) | (n(ra) << 10) | (n(rn) << 5) | n(rd);
+}
+
 /// `smulh xd, xn, xm` (high 64 bits of the signed 64x64 product). Ra (bits 14:10) is 31.
 pub fn smulh(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x9B407C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
@@ -108,6 +120,30 @@ pub fn orr(rd: Reg, rn: Reg, rm: Reg) u32 {
 /// `eor wd, wn, wm` (32-bit register bitwise exclusive-or).
 pub fn eor(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x4A000000 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn addVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4EA08400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn subVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6EA08400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn mulVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4EA09C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn andVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4E201C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn orrVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4EA01C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn eorVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6E201C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
 const LogicalImmediate = struct { n: u1, immr: u6, imms: u6 };
@@ -1304,6 +1340,37 @@ test "logical immediate encoders match the disassembler" {
     try std.testing.expect(andImm(.x0, .x1, 0, false) == null);
     try std.testing.expect(andImm(.x0, .x1, std.math.maxInt(u64), true) == null);
     try std.testing.expect(orrImm(.x0, .x1, 0x01234567, false) == null);
+}
+
+test "integer multiply-add encoders match the disassembler" {
+    const disasm = @import("disasm.zig");
+    const a = std.testing.allocator;
+
+    const add_text = try disasm.one(a, madd(.x0, .x1, .x2, .x3, false));
+    defer a.free(add_text);
+    try std.testing.expectEqualStrings("madd w0, w1, w2, w3", add_text);
+
+    const sub_text = try disasm.one(a, msubInt(.x4, .x5, .x6, .x7, true));
+    defer a.free(sub_text);
+    try std.testing.expectEqualStrings("msub x4, x5, x6, x7", sub_text);
+}
+
+test "integer vector arithmetic encoders match the disassembler" {
+    const disasm = @import("disasm.zig");
+    const a = std.testing.allocator;
+    const cases = .{
+        .{ addVecI32(.x0, .x1, .x2), "add v0.4s, v1.4s, v2.4s" },
+        .{ subVecI32(.x3, .x4, .x5), "sub v3.4s, v4.4s, v5.4s" },
+        .{ mulVecI32(.x6, .x7, .x8), "mul v6.4s, v7.4s, v8.4s" },
+        .{ andVec(.x9, .x10, .x11), "and v9.16b, v10.16b, v11.16b" },
+        .{ orrVec(.x12, .x13, .x14), "orr v12.16b, v13.16b, v14.16b" },
+        .{ eorVec(.x15, .x16, .x17), "eor v15.16b, v16.16b, v17.16b" },
+    };
+    inline for (cases) |case| {
+        const text = try disasm.one(a, case[0]);
+        defer a.free(text);
+        try std.testing.expectEqualStrings(case[1], text);
+    }
 }
 
 test "ldp/stp offset-form encoders match known bytes" {

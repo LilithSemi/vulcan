@@ -2286,16 +2286,26 @@ const Ctx = struct {
         rhs: Value,
     ) Error!void {
         if (isVector(self.func, result)) {
-            // NEON lane-wise arithmetic over a packed vector (currently <4 x f32> only).
             const rl = try self.loadOp(allocator, code, lhs, fp_spill_op[0]);
             const rr = try self.loadOp(allocator, code, rhs, fp_spill_op[1]);
             const rd = self.resultReg(result);
-            try code.append(allocator, switch (op) {
-                .add => encode.faddVec(rd, rl, rr),
-                .sub => encode.fsubVec(rd, rl, rr),
-                .mul => encode.fmulVec(rd, rl, rr),
-                .div => encode.fdivVec(rd, rl, rr),
-                else => return error.Unsupported,
+            try code.append(allocator, switch (laneKind(self.func, result) orelse return error.Unsupported) {
+                .f32 => switch (op) {
+                    .add => encode.faddVec(rd, rl, rr),
+                    .sub => encode.fsubVec(rd, rl, rr),
+                    .mul => encode.fmulVec(rd, rl, rr),
+                    .div => encode.fdivVec(rd, rl, rr),
+                    else => return error.Unsupported,
+                },
+                .i32 => switch (op) {
+                    .add => encode.addVecI32(rd, rl, rr),
+                    .sub => encode.subVecI32(rd, rl, rr),
+                    .mul => encode.mulVecI32(rd, rl, rr),
+                    .bit_and => encode.andVec(rd, rl, rr),
+                    .bit_or => encode.orrVec(rd, rl, rr),
+                    .bit_xor => encode.eorVec(rd, rl, rr),
+                    else => return error.Unsupported,
+                },
             });
             try storeResult(allocator, code, self, result, rd);
             return;
@@ -4756,10 +4766,10 @@ test "selects a straight-line arithmetic function" {
 
     const code = try selectFunction(allocator, &func);
     defer allocator.free(code);
-    // The first instruction multiplies the two parameters (x0, x1) into an
-    // allocator-chosen register. The function ends in ret.
+    // The post-allocation peephole combines the adjacent product-plus-x into one madd. Its
+    // destination remains allocator-selected, so compare every field except Rd.
     const rd_mask = ~@as(u32, 0x1f);
-    try std.testing.expectEqual(encode.mul(.x0, .x0, .x1) & rd_mask, code[0] & rd_mask);
+    try std.testing.expectEqual(encode.madd(.x0, .x0, .x1, .x0, false) & rd_mask, code[0] & rd_mask);
     try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
 }
 
