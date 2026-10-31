@@ -47,7 +47,7 @@ fn movable(op: ir.function.Opcode) bool {
 }
 
 /// Append the value operands an instruction reads into `buf`.
-fn collectOperands(
+pub fn collectOperands(
     allocator: std.mem.Allocator,
     func: *const Function,
     inst: Inst,

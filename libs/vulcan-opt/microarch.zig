@@ -32,6 +32,7 @@ pub const modelFor = registry.modelFor;
 pub const detectHost = registry.detectHost;
 pub const schedule = @import("microarch/schedule.zig");
 pub const cost = @import("microarch/cost.zig");
+pub const score = @import("microarch/score.zig");
 pub const unroll = @import("microarch/unroll.zig");
 pub const splitunroll = @import("microarch/splitunroll.zig");
 pub const loopvec = @import("microarch/loopvec.zig");
@@ -118,6 +119,7 @@ test {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(@import("microarch/schedule.zig"));
     std.testing.refAllDecls(@import("microarch/cost.zig"));
+    std.testing.refAllDecls(@import("microarch/score.zig"));
     std.testing.refAllDecls(@import("microarch/unroll.zig"));
     std.testing.refAllDecls(@import("microarch/prefetch.zig"));
     std.testing.refAllDecls(@import("microarch/dotprod.zig"));
