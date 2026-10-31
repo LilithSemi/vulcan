@@ -308,7 +308,103 @@ fn emitGprStackLoad(allocator: std.mem.Allocator, code: *std.ArrayList(u32), dst
 }
 
 const Move = struct { src: Reg, dst: Reg };
-pub const Fixup = struct { at: usize, target: u32 };
+pub const Fixup = struct { at: usize, target: u32, cond: ?encode.Cond = null };
+
+const DenseSwitch = struct {
+    value: Value,
+    targets: []Block,
+    dispatch: []Block,
+    default_target: Block,
+};
+
+fn forwardedTarget(func: *const Function, start: Block) Block {
+    var block = start;
+    for (0..func.blockCount()) |_| {
+        if (func.blockInsts(block).len != 0 or func.blockParams(block).len != 0) return block;
+        const term = func.terminator(block) orelse return block;
+        if (term != .jump or func.blockArgs(term.jump).len != 0) return block;
+        block = term.jump.target;
+    }
+    return start;
+}
+
+fn collectDenseSwitch(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    block: Block,
+    value: *?Value,
+    default_target: *?Block,
+    labels: *std.ArrayList(i64),
+    targets: *std.ArrayList(Block),
+    dispatch: *std.ArrayList(Block),
+) !bool {
+    const insts = func.blockInsts(block);
+    if (insts.len < 2) return false;
+    const if_op = func.opcode(insts[insts.len - 1]);
+    if (if_op != .@"if") return false;
+    const cmp_op = func.opcode(insts[insts.len - 2]);
+    if (cmp_op != .icmp or func.instResult(insts[insts.len - 2]) != if_op.@"if".cond) return false;
+    const cmp = cmp_op.icmp;
+    const constant_inst = func.definingInst(cmp.rhs) orelse return false;
+    const constant_op = func.opcode(constant_inst);
+    if (constant_op != .iconst) return false;
+    if (func.blockArgs(if_op.@"if".then).len != 0 or func.blockArgs(if_op.@"if".@"else").len != 0) return false;
+    if (value.*) |seen| {
+        if (seen != cmp.lhs) return false;
+    } else value.* = cmp.lhs;
+    try dispatch.append(allocator, block);
+
+    if (cmp.op == .eq) {
+        const fallback = forwardedTarget(func, if_op.@"if".@"else".target);
+        if (default_target.*) |seen| {
+            if (seen != fallback) return false;
+        } else default_target.* = fallback;
+        try labels.append(allocator, constant_op.iconst);
+        try targets.append(allocator, if_op.@"if".then.target);
+        return true;
+    }
+    if (cmp.op != .le) return false;
+    return try collectDenseSwitch(allocator, func, if_op.@"if".then.target, value, default_target, labels, targets, dispatch) and
+        try collectDenseSwitch(allocator, func, if_op.@"if".@"else".target, value, default_target, labels, targets, dispatch);
+}
+
+fn findDenseSwitches(allocator: std.mem.Allocator, func: *const Function, skip: []bool) ![]?DenseSwitch {
+    const plans = try allocator.alloc(?DenseSwitch, func.blockCount());
+    errdefer allocator.free(plans);
+    @memset(plans, null);
+    for (0..func.blockCount()) |bi| {
+        if (skip[bi]) continue;
+        var labels: std.ArrayList(i64) = .empty;
+        defer labels.deinit(allocator);
+        var targets: std.ArrayList(Block) = .empty;
+        defer targets.deinit(allocator);
+        var dispatch: std.ArrayList(Block) = .empty;
+        defer dispatch.deinit(allocator);
+        var value: ?Value = null;
+        var default_target: ?Block = null;
+        const root: Block = @fromBackingInt(@intCast(bi));
+        if (!try collectDenseSwitch(allocator, func, root, &value, &default_target, &labels, &targets, &dispatch)) continue;
+        if (labels.items.len < 8 or labels.items[0] != 0 or labels.items.len > 4096) continue;
+        var dense = true;
+        for (labels.items, 0..) |label, i| if (label != @as(i64, @intCast(i))) {
+            dense = false;
+            break;
+        };
+        if (!dense) continue;
+        const owned_targets = try allocator.dupe(Block, targets.items);
+        errdefer allocator.free(owned_targets);
+        const owned_dispatch = try allocator.dupe(Block, dispatch.items);
+        errdefer allocator.free(owned_dispatch);
+        plans[bi] = .{
+            .value = value.?,
+            .targets = owned_targets,
+            .dispatch = owned_dispatch,
+            .default_target = default_target.?,
+        };
+        for (dispatch.items[1..]) |child| skip[@backingInt(child)] = true;
+    }
+    return plans;
+}
 
 /// What an emitted relocation patches: a `bl`'s call target (the default), one
 /// half of a direct `global_addr`'s `adrp`+`add` pair (the page delta / the page-offset
@@ -936,6 +1032,42 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     defer fixups.deinit(allocator);
     var block_start = try allocator.alloc(usize, nblocks);
     defer allocator.free(block_start);
+    const skip_dispatch = try allocator.alloc(bool, nblocks);
+    defer allocator.free(skip_dispatch);
+    @memset(skip_dispatch, false);
+    const dense_switches = try findDenseSwitches(allocator, func, skip_dispatch);
+    defer {
+        for (dense_switches) |plan| if (plan) |p| {
+            allocator.free(p.targets);
+            allocator.free(p.dispatch);
+        };
+        allocator.free(dense_switches);
+    }
+
+    // A skipped dispatch block must not carry a register-allocation transition. The table jumps
+    // directly to the case body, so omitting such a transition would make that body read the old
+    // location. Keep the ordinary branch tree whenever Wimmer placed one on any bypassed block.
+    for (0..nblocks) |bi| {
+        if (dense_switches[bi]) |plan| {
+            var safe = true;
+            for (plan.dispatch[1..]) |dispatch_block| {
+                var pos_start: u32 = 0;
+                for (0..@backingInt(dispatch_block)) |prior| pos_start += @as(u32, @intCast(func.blockInsts(@fromBackingInt(@intCast(prior))).len)) + 2;
+                const pos_end = pos_start + @as(u32, @intCast(func.blockInsts(dispatch_block).len)) + 1;
+                for (alloc.actions.items) |action| if (action.at >= pos_start and action.at <= pos_end) {
+                    safe = false;
+                    break;
+                };
+                if (!safe) break;
+            }
+            if (!safe) {
+                for (plan.dispatch[1..]) |child| skip_dispatch[@backingInt(child)] = false;
+                allocator.free(plan.targets);
+                allocator.free(plan.dispatch);
+                dense_switches[bi] = null;
+            }
+        }
+    }
 
     // Loop-header alignment (a placement hint only, see the doc comment above): computed once,
     // up front, so the per-block loop below just checks a bit per block.
@@ -1150,6 +1282,15 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     for (0..nblocks) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         ctx.block = block; // the predecessor for any edge this block terminates in (edge-move keying)
+        if (skip_dispatch[bi]) {
+            block_start[bi] = code.items.len;
+            const skipped_end = pos + 1 + @as(u32, @intCast(func.blockInsts(block).len));
+            while (action_cursor < alloc.actions.items.len and alloc.actions.items[action_cursor].at <= skipped_end) {
+                action_cursor += 1;
+            }
+            pos = skipped_end + 1;
+            continue;
+        }
         // A neutralized (unreachable) block: `neutralizeUnreachable` emptied its params, instructions,
         // and terminator so downstream passes see only the reachable CFG. It carries no code and no
         // reachable branch targets it (valid SSA), so emit NOTHING. The shared Wimmer allocator still
@@ -1838,7 +1979,22 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // The block emitted immediately after this one, in array order. An `if` edge to it
                     // can fall through (elide its branch) instead of jumping around one instruction.
                     const next_block: ?Block = if (bi + 1 < nblocks) @fromBackingInt(@intCast(bi + 1)) else null;
-                    try ctx.emitIf(allocator, &code, &fixups, cf, insts, inst_idx, next_block);
+                    if (dense_switches[bi]) |plan| {
+                        const index = try ctx.loadOp(allocator, &code, plan.value, spill_op[0]);
+                        try code.append(allocator, encode.subsImm(.zr, index, @intCast(plan.targets.len - 1)));
+                        try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(plan.default_target), .cond = .hi });
+                        try code.append(allocator, encode.bcc(.hi, 0));
+                        const adr_at = code.items.len;
+                        try code.append(allocator, encode.adr(scratch_imm, 0));
+                        try code.append(allocator, encode.addShifted64(scratch_move, scratch_imm, index, 2));
+                        try code.append(allocator, encode.br(scratch_move));
+                        const table_at = code.items.len;
+                        code.items[adr_at] = encode.adr(scratch_imm, @intCast((@as(i64, @intCast(table_at)) - @as(i64, @intCast(adr_at))) * 4));
+                        for (plan.targets) |target| {
+                            try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(target) });
+                            try code.append(allocator, encode.b(0));
+                        }
+                    } else try ctx.emitIf(allocator, &code, &fixups, cf, insts, inst_idx, next_block);
                     terminated = true;
                 },
                 .dot => |d| {
@@ -1988,7 +2144,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
 
     for (fixups.items) |f| {
         const off: i28 = @intCast((@as(i64, @intCast(block_start[f.target])) - @as(i64, @intCast(f.at))) * 4);
-        code.items[f.at] = encode.b(off);
+        code.items[f.at] = if (f.cond) |cond| encode.bcc(cond, @intCast(off)) else encode.b(off);
     }
 
     return .{

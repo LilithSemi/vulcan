@@ -508,6 +508,19 @@ pub fn adrp(rd: Reg, imm: i21) u32 {
     return 0x90000000 | (immlo << 29) | (immhi << 5) | n(rd);
 }
 
+/// `adr xd, label`: form a PC-relative address within +/-1 MiB.
+pub fn adr(rd: Reg, imm: i21) u32 {
+    const bits: u21 = @bitCast(imm);
+    const immlo = @as(u32, bits & 0x3) << 29;
+    const immhi = @as(u32, bits >> 2) << 5;
+    return 0x10000000 | immlo | immhi | @as(u32, @backingInt(rd));
+}
+
+/// `br xn`: branch to the address held in a register.
+pub fn br(rn: Reg) u32 {
+    return 0xD61F0000 | (@as(u32, @backingInt(rn)) << 5);
+}
+
 /// `str wt, [xn, #off]` (32-bit store, `off` a multiple of 4).
 pub fn strW(rt: Reg, rn: Reg, off: u14) u32 {
     return 0xB9000000 | ((@as(u32, off) >> 2) << 10) | (n(rn) << 5) | n(rt);
