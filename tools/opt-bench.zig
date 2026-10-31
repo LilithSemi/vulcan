@@ -22,6 +22,8 @@ pub fn main(init: std.process.Init) !void {
     defer nested.deinit();
     var xor_cancel = try buildXorCancelWorkload(allocator, xor_cancel_blocks);
     defer xor_cancel.deinit();
+    var idempotent = try buildIdempotentWorkload(allocator, blocks);
+    defer idempotent.deinit();
     var rootless = try buildRootlessWorkload(allocator, blocks);
     defer rootless.deinit();
     var unrelated = try buildUnrelatedWorkload(allocator, blocks);
@@ -38,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
     const nested_egraph_ns = try measure(init.io, allocator, &nested, runEgraph);
     const nested_pipeline_ns = try measure(init.io, allocator, &nested, runPipeline);
     const xor_cancel_egraph_ns = try measure(init.io, allocator, &xor_cancel, runEgraph);
+    const idempotent_egraph_ns = try measure(init.io, allocator, &idempotent, runEgraph);
     const rootless_egraph_ns = try measure(init.io, allocator, &rootless, runEgraph);
     const unrelated_egraph_ns = try measure(init.io, allocator, &unrelated, runEgraph);
     const mixed_egraph_ns = try measure(init.io, allocator, &mixed, runEgraph);
@@ -48,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
             "  nested egraph:          {d} ns/block\n" ++
             "  nested early pipeline:  {d} ns/block\n" ++
             "  xor cancel egraph:      {d} ns/block ({d} blocks)\n" ++
+            "  idempotent egraph:      {d} ns/block\n" ++
             "  rootless egraph:        {d} ns/block\n" ++
             "  unrelated egraph:       {d} ns/block\n" ++
             "  mixed egraph:           {d} ns/block\n",
@@ -60,6 +64,7 @@ pub fn main(init: std.process.Init) !void {
             nested_pipeline_ns / blocks,
             xor_cancel_egraph_ns / xor_cancel_blocks,
             xor_cancel_blocks,
+            idempotent_egraph_ns / blocks,
             rootless_egraph_ns / blocks,
             unrelated_egraph_ns / blocks,
             mixed_egraph_ns / blocks,
@@ -143,6 +148,21 @@ fn buildXorCancelWorkload(allocator: std.mem.Allocator, count: usize) !Function 
         const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = b } });
         const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = c } });
         const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = ab, .rhs = ac } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    }
+    return func;
+}
+
+fn buildIdempotentWorkload(allocator: std.mem.Allocator, count: usize) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    for (0..count) |_| {
+        const block = try func.appendBlock();
+        const a = try func.appendBlockParam(block, ty);
+        const b = try func.appendBlockParam(block, ty);
+        const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } });
+        const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = ab, .rhs = a } });
         func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
     }
     return func;
