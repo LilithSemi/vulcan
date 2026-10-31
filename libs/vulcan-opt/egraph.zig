@@ -362,6 +362,7 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
             if (lhs != null and rhs != null) {
                 if (lhs.?.op == .sub and rhs.?.op == .add and (lhs.?.rhs == rhs.?.lhs or lhs.?.rhs == rhs.?.rhs)) return true;
                 if (lhs.?.op == .add and rhs.?.op == .sub and (rhs.?.rhs == lhs.?.lhs or rhs.?.rhs == lhs.?.rhs)) return true;
+                if (lhs.?.op == .sub and rhs.?.op == .sub and (lhs.?.rhs == rhs.?.lhs or lhs.?.lhs == rhs.?.rhs)) return true;
             }
             if (lhs != null and rhs != null and
                 (((lhs.?.op == .add and rhs.?.op == .sub) or (lhs.?.op == .sub and rhs.?.op == .add)) and
@@ -498,6 +499,18 @@ fn cancelSubtractions(graph: *Graph, outer_class: u32, left: OpNode, right: OpNo
     else if (left.rhs == right.rhs)
         // (a - b) - (c - b) == a - c
         try graph.addOp(.{ .op = .sub, .lhs = left.lhs, .rhs = right.lhs, .ty = left.ty, .existing = null })
+    else
+        return false;
+    return graph.merge(outer_class, reduced orelse return false);
+}
+
+fn cancelAddedSubtractions(graph: *Graph, outer_class: u32, left: OpNode, right: OpNode) !bool {
+    const reduced = if (graph.find(left.rhs) == graph.find(right.lhs))
+        // (a - b) + (b - c) == a - c
+        try graph.addOp(.{ .op = .sub, .lhs = left.lhs, .rhs = right.rhs, .ty = left.ty, .existing = null })
+    else if (graph.find(left.lhs) == graph.find(right.rhs))
+        // (a - b) + (c - a) == c - b
+        try graph.addOp(.{ .op = .sub, .lhs = right.lhs, .rhs = left.rhs, .ty = left.ty, .existing = null })
     else
         return false;
     return graph.merge(outer_class, reduced orelse return false);
@@ -792,6 +805,16 @@ fn saturate(graph: *Graph) !void {
                     if (graph.hit_limit) break;
                 };
             }
+            if (sum.op == .add and classHasOp(graph, sum.lhs, .sub) and classHasOp(graph, sum.rhs, .sub)) {
+                left.clearRetainingCapacity();
+                right.clearRetainingCapacity();
+                try matchingOps(graph, sum.lhs, .sub, sum.ty, left);
+                try matchingOps(graph, sum.rhs, .sub, sum.ty, right);
+                for (left.items) |a| for (right.items) |b| {
+                    changed = try cancelAddedSubtractions(graph, entry.class, a, b) or changed;
+                    if (graph.hit_limit) break;
+                };
+            }
             if (hasInverseChildren(graph, sum)) {
                 changed = try cancelInverse(graph, entry.class, sum, left, right) or changed;
             }
@@ -1051,6 +1074,36 @@ fn expectCrossCancellation(outer_op: BinOp, subtraction_on_left: bool) !void {
     const reduced = func.opcode(func.definingInst(replacement).?).arith;
     try std.testing.expectEqual(BinOp.add, reduced.op);
     try std.testing.expect((reduced.lhs == a and reduced.rhs == c) or (reduced.lhs == c and reduced.rhs == a));
+}
+
+fn expectAddedSubtractionCancellation(cancel_subtrahend: bool) !void {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const left = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } });
+    const right = if (cancel_subtrahend)
+        try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = b, .rhs = c } })
+    else
+        try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = c, .rhs = a } });
+    const combined = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = left, .rhs = right } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(combined) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const reduced = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.sub, reduced.op);
+    if (cancel_subtrahend) {
+        try std.testing.expectEqual(a, reduced.lhs);
+        try std.testing.expectEqual(c, reduced.rhs);
+    } else {
+        try std.testing.expectEqual(c, reduced.lhs);
+        try std.testing.expectEqual(b, reduced.rhs);
+    }
 }
 
 test "egraph hash-consing follows merged child classes" {
@@ -1403,6 +1456,11 @@ test "egraph cancels cross terms between addition and subtraction" {
     try expectCrossCancellation(.add, true);
     try expectCrossCancellation(.add, false);
     try expectCrossCancellation(.sub, false);
+}
+
+test "egraph cancels between added subtractions" {
+    try expectAddedSubtractionCancellation(true);
+    try expectAddedSubtractionCancellation(false);
 }
 
 test "egraph reassociates an add tree to expose factoring" {
