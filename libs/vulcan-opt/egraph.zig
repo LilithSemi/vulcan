@@ -52,6 +52,8 @@ const Graph = struct {
     leaves: std.AutoHashMapUnmanaged(Value, u32) = .empty,
     ops: std.AutoHashMapUnmanaged(OpKey, usize) = .empty,
     op_nodes: std.EnumArray(BinOp, std.ArrayList(usize)) = std.EnumArray(BinOp, std.ArrayList(usize)).initFill(.empty),
+    match_left: std.ArrayList(OpNode) = .empty,
+    match_right: std.ArrayList(OpNode) = .empty,
     ops_valid: bool = true,
     hit_limit: bool = false,
 
@@ -61,6 +63,8 @@ const Graph = struct {
         self.leaves.deinit(self.allocator);
         self.ops.deinit(self.allocator);
         inline for (std.meta.tags(BinOp)) |op| self.op_nodes.getPtr(op).deinit(self.allocator);
+        self.match_left.deinit(self.allocator);
+        self.match_right.deinit(self.allocator);
     }
 
     fn reset(self: *Graph) void {
@@ -69,6 +73,8 @@ const Graph = struct {
         self.leaves.clearRetainingCapacity();
         self.ops.clearRetainingCapacity();
         inline for (std.meta.tags(BinOp)) |op| self.op_nodes.getPtr(op).clearRetainingCapacity();
+        self.match_left.clearRetainingCapacity();
+        self.match_right.clearRetainingCapacity();
         self.ops_valid = true;
         self.hit_limit = false;
     }
@@ -533,10 +539,8 @@ fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.Arra
 }
 
 fn saturate(graph: *Graph) !void {
-    var left: std.ArrayList(OpNode) = .empty;
-    defer left.deinit(graph.allocator);
-    var right: std.ArrayList(OpNode) = .empty;
-    defer right.deinit(graph.allocator);
+    const left = &graph.match_left;
+    const right = &graph.match_right;
 
     var iter: usize = 0;
     while (iter < graph.limits.max_iters and !graph.hit_limit) : (iter += 1) {
@@ -553,13 +557,13 @@ fn saturate(graph: *Graph) !void {
             };
             if (isAssociative(sum.op)) {
                 left.clearRetainingCapacity();
-                try matchingOps(graph, sum.lhs, sum.op, sum.ty, &left);
+                try matchingOps(graph, sum.lhs, sum.op, sum.ty, left);
                 for (left.items) |nested| {
                     changed = try associatePair(graph, entry.class, sum.op, nested, sum.rhs) or changed;
                     if (graph.hit_limit) break;
                 }
                 right.clearRetainingCapacity();
-                try matchingOps(graph, sum.rhs, sum.op, sum.ty, &right);
+                try matchingOps(graph, sum.rhs, sum.op, sum.ty, right);
                 for (right.items) |nested| {
                     changed = try associatePair(graph, entry.class, sum.op, nested, sum.lhs) or changed;
                     if (graph.hit_limit) break;
@@ -568,8 +572,8 @@ fn saturate(graph: *Graph) !void {
             if (factorInner(sum.op)) |inner_op| {
                 left.clearRetainingCapacity();
                 right.clearRetainingCapacity();
-                try matchingOps(graph, sum.lhs, inner_op, sum.ty, &left);
-                try matchingOps(graph, sum.rhs, inner_op, sum.ty, &right);
+                try matchingOps(graph, sum.lhs, inner_op, sum.ty, left);
+                try matchingOps(graph, sum.rhs, inner_op, sum.ty, right);
                 for (left.items) |a| for (right.items) |b| {
                     changed = try factorPair(graph, entry.class, sum.op, inner_op, a, b) or changed;
                     if (graph.hit_limit) break;
@@ -578,8 +582,8 @@ fn saturate(graph: *Graph) !void {
             if (cancellationInner(sum.op)) |inner_op| {
                 left.clearRetainingCapacity();
                 right.clearRetainingCapacity();
-                try matchingOps(graph, sum.lhs, inner_op, sum.ty, &left);
-                try matchingOps(graph, sum.rhs, inner_op, sum.ty, &right);
+                try matchingOps(graph, sum.lhs, inner_op, sum.ty, left);
+                try matchingOps(graph, sum.rhs, inner_op, sum.ty, right);
                 for (left.items) |a| for (right.items) |b| {
                     changed = try cancelPair(graph, entry.class, sum.op, a, b) or changed;
                     if (graph.hit_limit) break;
@@ -588,24 +592,24 @@ fn saturate(graph: *Graph) !void {
             if (sum.op == .sub) {
                 left.clearRetainingCapacity();
                 right.clearRetainingCapacity();
-                try matchingOps(graph, sum.lhs, .sub, sum.ty, &left);
-                try matchingOps(graph, sum.rhs, .sub, sum.ty, &right);
+                try matchingOps(graph, sum.lhs, .sub, sum.ty, left);
+                try matchingOps(graph, sum.rhs, .sub, sum.ty, right);
                 for (left.items) |a| for (right.items) |b| {
                     changed = try cancelSubtractions(graph, entry.class, a, b) or changed;
                     if (graph.hit_limit) break;
                 };
             }
             if (sum.op == .add or sum.op == .sub or sum.op == .bit_xor) {
-                changed = try cancelInverse(graph, entry.class, sum, &left, &right) or changed;
+                changed = try cancelInverse(graph, entry.class, sum, left, right) or changed;
             }
             if (sum.op == .bit_and or sum.op == .bit_or) {
-                changed = try foldNestedIdempotent(graph, entry.class, sum, &left) or changed;
+                changed = try foldNestedIdempotent(graph, entry.class, sum, left) or changed;
             }
             if (sum.op == .add or sum.op == .sub) {
                 left.clearRetainingCapacity();
                 right.clearRetainingCapacity();
-                try matchingOps(graph, sum.lhs, .bit_or, sum.ty, &left);
-                try matchingOps(graph, sum.rhs, .bit_and, sum.ty, &right);
+                try matchingOps(graph, sum.lhs, .bit_or, sum.ty, left);
+                try matchingOps(graph, sum.rhs, .bit_and, sum.ty, right);
                 for (left.items) |disjunction| for (right.items) |conjunction| {
                     changed = try foldBitwiseArithmetic(graph, entry.class, sum.op, disjunction, conjunction) or changed;
                     if (graph.hit_limit) break;
@@ -613,8 +617,8 @@ fn saturate(graph: *Graph) !void {
                 if (sum.op == .add) {
                     left.clearRetainingCapacity();
                     right.clearRetainingCapacity();
-                    try matchingOps(graph, sum.rhs, .bit_or, sum.ty, &left);
-                    try matchingOps(graph, sum.lhs, .bit_and, sum.ty, &right);
+                    try matchingOps(graph, sum.rhs, .bit_or, sum.ty, left);
+                    try matchingOps(graph, sum.lhs, .bit_and, sum.ty, right);
                     for (left.items) |disjunction| for (right.items) |conjunction| {
                         changed = try foldBitwiseArithmetic(graph, entry.class, sum.op, disjunction, conjunction) or changed;
                         if (graph.hit_limit) break;
@@ -623,10 +627,10 @@ fn saturate(graph: *Graph) !void {
             }
             if (absorptionInner(sum.op)) |inner_op| {
                 left.clearRetainingCapacity();
-                try matchingOps(graph, sum.lhs, inner_op, sum.ty, &left);
+                try matchingOps(graph, sum.lhs, inner_op, sum.ty, left);
                 for (left.items) |inner| changed = absorbPair(graph, entry.class, sum.rhs, inner) or changed;
                 right.clearRetainingCapacity();
-                try matchingOps(graph, sum.rhs, inner_op, sum.ty, &right);
+                try matchingOps(graph, sum.rhs, inner_op, sum.ty, right);
                 for (right.items) |inner| changed = absorbPair(graph, entry.class, sum.lhs, inner) or changed;
             }
             if (graph.hit_limit) break;
