@@ -49,24 +49,30 @@ pub const Filter = struct {
 /// Inline every inlinable call in `caller`, repeatedly, up to a cap. Returns
 /// whether anything was inlined.
 pub fn run(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup) Error!bool {
-    return runWithPolicy(allocator, caller, lookup, null, true);
+    return runWithPolicy(allocator, caller, lookup, null, true, null);
 }
 
 /// Inline acyclic callees while keeping loop bodies as separate functions.
 pub fn runAcyclic(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup) Error!bool {
-    return runWithPolicy(allocator, caller, lookup, null, false);
+    return runWithPolicy(allocator, caller, lookup, null, false, null);
+}
+
+/// Inline small acyclic callees. Large control-flow graphs remain separate to bound code growth and
+/// register pressure in the caller.
+pub fn runSmallAcyclic(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup) Error!bool {
+    return runWithPolicy(allocator, caller, lookup, null, false, 32);
 }
 
 /// Like `run`, but only inline call sites the `filter` permits (e.g. hot ones).
 pub fn runFiltered(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter) Error!bool {
-    return runWithPolicy(allocator, caller, lookup, filter, true);
+    return runWithPolicy(allocator, caller, lookup, filter, true, null);
 }
 
-fn runWithPolicy(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter, inline_cycles: bool) Error!bool {
+fn runWithPolicy(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter, inline_cycles: bool, instruction_limit: ?usize) Error!bool {
     var changed = false;
     var budget: usize = 256; // guard against pathological expansion
     while (budget > 0) : (budget -= 1) {
-        if (!try inlineOne(allocator, caller, lookup, filter, inline_cycles)) break;
+        if (!try inlineOne(allocator, caller, lookup, filter, inline_cycles, instruction_limit)) break;
         changed = true;
     }
     return changed;
@@ -106,7 +112,7 @@ fn inlinable(callee: *const Function) bool {
 }
 
 /// Find and inline a single call, returning whether one was inlined.
-fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter, inline_cycles: bool) Error!bool {
+fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter, inline_cycles: bool, instruction_limit: ?usize) Error!bool {
     for (0..caller.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         for (caller.blockInsts(block), 0..) |inst, idx| {
@@ -114,6 +120,7 @@ fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, fi
             if (filter) |f| if (!f.allow(bi)) continue;
             const name = caller.symbolName(caller.opcode(inst).call.symbol);
             const callee = lookup.get(name) orelse continue;
+            if (instruction_limit) |limit| if (!withinInstructionLimit(callee, limit)) continue;
             if (inlinable(callee)) {
                 try inlineCall(allocator, caller, @intCast(bi), idx, inst, callee); // single-block fast path
                 return true;
@@ -126,6 +133,15 @@ fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, fi
         }
     }
     return false;
+}
+
+fn withinInstructionLimit(func: *const Function, limit: usize) bool {
+    var count: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        count += func.blockInsts(@fromBackingInt(@intCast(bi))).len;
+        if (count > limit) return false;
+    }
+    return true;
 }
 
 fn inlineCall(allocator: std.mem.Allocator, caller: *Function, bi: u32, call_idx: usize, call_inst: Inst, callee: *const Function) Error!void {
@@ -951,6 +967,20 @@ test "keeps a loop callee out of its caller" {
     var lookup_context = TestLookup{ .callee = &callee, .name = "count" };
     try std.testing.expect(!try runAcyclic(allocator, &caller, .{ .context = &lookup_context, .func = TestLookup.get }));
     try std.testing.expect(caller.opcode(caller.blockInsts(block)[0]) == .call);
+}
+
+test "small-call budget rejects a large acyclic callee" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    var value = try func.appendBlockParam(block, t);
+    for (0..33) |_| value = try func.appendArithImm(block, t, .add, value, 1);
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(value) });
+
+    try std.testing.expect(!withinInstructionLimit(&func, 32));
+    try std.testing.expect(withinInstructionLimit(&func, 33));
 }
 
 test "inlined via_got global_addr keeps via_got=true (not reconstructed as false)" {

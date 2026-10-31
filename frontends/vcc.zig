@@ -1063,7 +1063,7 @@ fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module, profile:
             if (counts.len != named.func.blockCount()) return error.MalformedProfile;
             _ = try opt.pgo.guidedInlineFunction(allocator, &named.func, lookup, counts, profileHotThreshold(counts));
         } else {
-            _ = try opt.inlining.runAcyclic(allocator, &named.func, lookup);
+            _ = try opt.inlining.runSmallAcyclic(allocator, &named.func, lookup);
         }
     }
 }
