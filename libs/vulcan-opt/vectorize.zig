@@ -86,7 +86,17 @@ fn runLanesGated(allocator: std.mem.Allocator, func: *Function, lanes: u8, allow
     var bi: usize = 0;
     while (bi < func.blockCount()) : (bi += 1) {
         const block: Block = @fromBackingInt(@intCast(bi));
-        while (try vectorizeOne(allocator, func, block, &vmap, lanes, allow_i32, model, &coalesced_loads, &coalesced)) changed = true;
+        while (true) {
+            if (try vectorizeImmediateOne(allocator, func, block, &vmap, lanes, allow_i32, model, &coalesced_loads, &coalesced)) {
+                changed = true;
+                continue;
+            }
+            if (try vectorizeOne(allocator, func, block, &vmap, lanes, allow_i32, model, &coalesced_loads, &coalesced)) {
+                changed = true;
+                continue;
+            }
+            break;
+        }
         // Store coalescing is a per-block scan run after this block's arith groups are fused, so the
         // stored values are the fused groups' result lanes (or hand-built extracts). It rewrites each
         // run of `lanes` contiguous scalar stores of one vector's lanes into a single wide store.
@@ -94,9 +104,179 @@ fn runLanesGated(allocator: std.mem.Allocator, func: *Function, lanes: u8, allow
             changed = true;
             coalesced = true;
         }
+        // A consumer may explicitly pack every extracted lane from one vector. Once SLP has
+        // exposed that shape, forward the original vector instead of lowering lane inserts.
+        if (foldIdentityVectorPacks(func, block)) {
+            changed = true;
+            coalesced = true;
+        }
+        // Once the stores no longer consume individual result lanes, recover a horizontal
+        // reduction from the remaining balanced scalar tree. This lets a target with a native
+        // reduction keep the value in SIMD registers instead of extracting every lane.
+        if (foldExtractXorReductions(func, block, lanes)) {
+            changed = true;
+            coalesced = true;
+        }
     }
     if (coalesced) try cleanup(allocator, func, &coalesced_loads);
     return changed;
+}
+
+/// Replace `struct_new(extract(v, 0), ..., extract(v, N - 1))` with `v`.
+fn foldIdentityVectorPacks(func: *Function, block: Block) bool {
+    var changed = false;
+    for (func.blockInsts(block)) |inst| {
+        const result = func.instResult(inst) orelse continue;
+        const opcode = func.opcode(inst);
+        if (opcode != .struct_new) continue;
+        const vector = switch (func.types.type_kind(func.valueType(result))) {
+            .vector => |vector| vector,
+            else => continue,
+        };
+        const fields = func.valueList(opcode.struct_new.fields);
+        if (fields.len != vector.len or fields.len == 0) continue;
+        var aggregate: ?Value = null;
+        for (fields, 0..) |field, lane| {
+            const field_inst = func.definingInst(field) orelse break;
+            const field_op = func.opcode(field_inst);
+            if (field_op != .extract or field_op.extract.index != lane) break;
+            if (aggregate) |value| {
+                if (field_op.extract.aggregate != value) break;
+            } else {
+                aggregate = field_op.extract.aggregate;
+            }
+        } else {
+            const source = aggregate.?;
+            if (func.valueType(source) != func.valueType(result)) continue;
+            func.replaceAllLiveUses(result, source);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+test "forwards an identity pack of vector extracts" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const block = try func.appendBlock();
+    const vector = try func.appendBlockParam(block, vec_t);
+    var fields: [4]Value = undefined;
+    for (&fields, 0..) |*field, lane| {
+        field.* = try func.appendInst(block, i32_t, .{ .extract = .{ .aggregate = vector, .index = @intCast(lane) } });
+    }
+    const rebuilt = try func.appendInst(block, vec_t, .{ .struct_new = .{ .fields = try func.internValues(&fields) } });
+    const lane = try func.appendInst(block, i32_t, .{ .extract = .{ .aggregate = rebuilt, .index = 2 } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(lane) });
+
+    try std.testing.expect(foldIdentityVectorPacks(&func, block));
+    try std.testing.expectEqual(vector, func.opcode(func.definingInst(lane).?).extract.aggregate);
+}
+
+const ExtractReduction = struct {
+    vector: ?Value = null,
+    lanes: u32 = 0,
+};
+
+fn matchExtractXor(func: *const Function, value: Value, lane_count: u8, remaining: *u8, match: *ExtractReduction) bool {
+    if (remaining.* == 0) return false;
+    remaining.* -= 1;
+    const inst = func.definingInst(value) orelse return false;
+    switch (func.opcode(inst)) {
+        .arith => |arith| {
+            if (arith.op != .bit_xor) return false;
+            return matchExtractXor(func, arith.lhs, lane_count, remaining, match) and
+                matchExtractXor(func, arith.rhs, lane_count, remaining, match);
+        },
+        .extract => |extract| {
+            if (extract.index >= lane_count) return false;
+            switch (func.types.type_kind(func.valueType(extract.aggregate))) {
+                .vector => |vector| if (vector.len != lane_count) return false,
+                else => return false,
+            }
+            if (match.vector) |vector| {
+                if (vector != extract.aggregate) return false;
+            } else {
+                match.vector = extract.aggregate;
+            }
+            const bit = @as(u32, 1) << @intCast(extract.index);
+            if (match.lanes & bit != 0) return false;
+            match.lanes |= bit;
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Turn an exact XOR tree of every lane from one vector back into a first-class reduction. SLP
+/// deliberately exposes extracted scalar results while it decides whether stores can be fused;
+/// after that decision the extracts obscure a substantially cheaper target operation.
+fn foldExtractXorReductions(func: *Function, block: Block, lanes: u8) bool {
+    var changed = false;
+    const insts = func.blockInsts(block);
+    var index = insts.len;
+    while (index > 0) {
+        index -= 1;
+        const inst = insts[index];
+        const result = func.instResult(inst) orelse continue;
+        const opcode = func.opcode(inst);
+        if (opcode != .arith or opcode.arith.op != .bit_xor) continue;
+
+        var match: ExtractReduction = .{};
+        var remaining: u8 = lanes * 2 - 1;
+        if (!matchExtractXor(func, result, lanes, &remaining, &match)) continue;
+        const all_lanes = (@as(u32, 1) << @intCast(lanes)) - 1;
+        if (match.lanes != all_lanes) continue;
+        func.opcodeMut(inst).* = .{ .reduce = .{ .vector = match.vector.?, .op = .bit_xor } };
+        changed = true;
+    }
+    return changed;
+}
+
+test "rebuilds a complete extracted XOR tree as a vector reduction" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const block = try func.appendBlock();
+    const vector = try func.appendBlockParam(block, vec_t);
+    var lane: [4]Value = undefined;
+    for (&lane, 0..) |*value, index| {
+        value.* = try func.appendInst(block, i32_t, .{ .extract = .{ .aggregate = vector, .index = @intCast(index) } });
+    }
+    const lo = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .bit_xor, .lhs = lane[0], .rhs = lane[1] } });
+    const hi = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .bit_xor, .lhs = lane[2], .rhs = lane[3] } });
+    const root = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .bit_xor, .lhs = lo, .rhs = hi } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(root) });
+
+    try std.testing.expect(foldExtractXorReductions(&func, block, 4));
+    const reduced = func.opcode(func.definingInst(root).?).reduce;
+    try std.testing.expectEqual(vector, reduced.vector);
+    try std.testing.expectEqual(ir.function.BinOp.bit_xor, reduced.op);
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "does not rebuild an incomplete extracted XOR tree" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const block = try func.appendBlock();
+    const vector = try func.appendBlockParam(block, vec_t);
+    const lane0 = try func.appendInst(block, i32_t, .{ .extract = .{ .aggregate = vector, .index = 0 } });
+    const lane1 = try func.appendInst(block, i32_t, .{ .extract = .{ .aggregate = vector, .index = 1 } });
+    const root = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .bit_xor, .lhs = lane0, .rhs = lane1 } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(root) });
+
+    try std.testing.expect(!foldExtractXorReductions(&func, block, 4));
+    try std.testing.expect(func.opcode(func.definingInst(root).?) == .arith);
 }
 
 /// The f32 element width this vectorizer fuses. The lane count is derived from the model's vector
@@ -164,12 +344,91 @@ fn modelSupportsI32Op(model: ?*const mm.Model, op: BinOp) bool {
     const m = model orelse return piSupportsOp(op);
     return switch (m.arch) {
         .aarch64 => switch (op) {
-            .add, .sub, .mul, .bit_and, .bit_or, .bit_xor => true,
-            .div, .rem, .mulh, .shl, .shr => false,
+            .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl => true,
+            .div, .rem, .mulh, .shr => false,
         },
         .riscv64 => m.vpu() and piSupportsOp(op),
         .x86_64, .nvidia => false,
     };
+}
+
+/// Fuse a run of scalar integer immediate operations into one vector operation with a broadcast
+/// immediate operand. `immform` runs before the microarchitecture pipeline, so common source forms
+/// such as four adjacent `x << 1` lanes reach SLP as `.arith_imm`, not `.arith`.
+fn vectorizeImmediateOne(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    block: Block,
+    vmap: *VMap,
+    lanes: u8,
+    allow_i32: bool,
+    model: ?*const mm.Model,
+    coalesced_loads: *CoalescedLoads,
+    coalesced: *bool,
+) Error!bool {
+    if (!allow_i32) return false;
+    const insts = func.blockInsts(block);
+    var pos: usize = 0;
+    var group: [MAX_LANES]Inst = undefined;
+    var op: BinOp = undefined;
+    var imm: i64 = 0;
+    var elem_t: ir.types.Type = undefined;
+    var selected_load: ?LoadRun = null;
+    var found = false;
+
+    scan: for (0..(if (insts.len >= lanes) insts.len - lanes + 1 else 0)) |g| {
+        const head = func.opcode(insts[g]);
+        if (head != .arith_imm) continue;
+        const head_result = func.instResult(insts[g]).?;
+        if (!isScalarI32(func, head_result) or !modelSupportsI32Op(model, head.arith_imm.op)) continue;
+        const head_ty = func.valueType(head_result);
+        var lhs: [MAX_LANES]Value = undefined;
+        var results: [MAX_LANES]Value = undefined;
+        for (0..lanes) |k| {
+            const candidate = func.opcode(insts[g + k]);
+            if (candidate != .arith_imm or candidate.arith_imm.op != head.arith_imm.op or candidate.arith_imm.imm != head.arith_imm.imm) continue :scan;
+            const result = func.instResult(insts[g + k]).?;
+            if (func.valueType(result) != head_ty) continue :scan;
+            lhs[k] = candidate.arith_imm.lhs;
+            results[k] = result;
+        }
+        const chained_lhs = chainVector(vmap, lhs[0..lanes]) != null;
+        const load_run = if (chained_lhs) null else analyzeLoadRun(func, block, lhs[0..lanes], g);
+        const result_store = resultsAreCoalesceableStores(func, block, results[0..lanes], lanes);
+        const result_chained = if (result_store) false else resultsChainIntoGroup(func, block, results[0..lanes], g + lanes - 1);
+        if (model) |m| {
+            const coalesced_ops: u8 = if (load_run != null) 1 else 0;
+            const chained_ops: u8 = if (chained_lhs) 1 else 0;
+            if (!cost.slpProfitableMem(m, head.arith_imm.op, false, lanes, 2, coalesced_ops, chained_ops, 1, result_store, result_chained)) continue :scan;
+        }
+        pos = g;
+        op = head.arith_imm.op;
+        imm = head.arith_imm.imm;
+        elem_t = head_ty;
+        for (0..lanes) |k| group[k] = insts[g + k];
+        selected_load = load_run;
+        found = true;
+        break;
+    }
+    if (!found) return false;
+
+    var lhs: [MAX_LANES]Value = undefined;
+    var results: [MAX_LANES]Value = undefined;
+    for (0..lanes) |k| {
+        lhs[k] = func.opcode(group[k]).arith_imm.lhs;
+        results[k] = func.instResult(group[k]).?;
+    }
+    const vt = try func.types.intern(.{ .vector = .{ .len = lanes, .elem = elem_t } });
+    const old_len = func.blockInsts(block).len;
+    const vlhs = try buildOperand(allocator, func, block, vt, vmap, lhs[0..lanes], selected_load, coalesced_loads, coalesced);
+    const scalar_imm = try func.appendInst(block, elem_t, .{ .iconst = imm });
+    const vimm = try func.appendInst(block, vt, .{ .splat = .{ .scalar = scalar_imm } });
+    const vresult = try func.appendInst(block, vt, .{ .arith = .{ .op = op, .lhs = vlhs, .rhs = vimm } });
+    var extracted: [MAX_LANES]Value = undefined;
+    try unpack(allocator, func, block, elem_t, vresult, extracted[0..lanes], vmap);
+    for (0..lanes) |k| func.replaceAllLiveUses(results[k], extracted[k]);
+    try splice(allocator, func, block, pos, old_len, lanes);
+    return true;
 }
 
 /// Find and fuse the first eligible group of `lanes` instructions in `block`. Returns true if
@@ -1206,7 +1465,7 @@ test "runModel leaves an i32 group scalar under a non-vpu riscv64 model" {
 }
 
 test "runModel fuses supported i32 groups to <4 x i32> under aarch64 neon" {
-    for ([_]BinOp{ .add, .sub, .mul, .bit_and, .bit_or, .bit_xor }) |op| {
+    for ([_]BinOp{ .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl }) |op| {
         var func = try buildMemElementwiseInt(op, 4);
         defer func.deinit();
         const changed = try runModel(std.testing.allocator, &func, registry.modelFor(.@"ampere-altra"));
@@ -1217,8 +1476,8 @@ test "runModel fuses supported i32 groups to <4 x i32> under aarch64 neon" {
     }
 }
 
-test "runModel leaves an i32 shift scalar under aarch64 neon" {
-    var func = try parallelIntOps(4, .shl);
+test "runModel leaves an i32 right shift scalar under aarch64 neon" {
+    var func = try parallelIntOps(4, .shr);
     defer func.deinit();
     const changed = try runModel(std.testing.allocator, &func, registry.modelFor(.@"ampere-altra"));
     try std.testing.expect(!changed);
@@ -1453,6 +1712,21 @@ test "coalescing fires on et-soc at 8 lanes: wide load + wide store for an i32 m
     try std.testing.expect(diags.ok());
 }
 
+test "aarch64 coalesces an immediate left-shift group through a splat" {
+    var func = try buildMemImmediateInt(.shl, 1, 4);
+    defer func.deinit();
+
+    try std.testing.expect(try runModel(std.testing.allocator, &func, registry.modelFor(.@"ampere-altra")));
+    try std.testing.expect(hasIntVectorArith(&func, 4));
+    try std.testing.expect(hasVectorLoad(&func));
+    try std.testing.expect(hasVectorStore(&func));
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(&func, .splat));
+
+    var diags = try ir.verify.verify(std.testing.allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
 /// i32 sibling of `buildMemElementwise` (no store-between variant), for the vpu integer path.
 fn buildMemElementwiseInt(op: BinOp, n: usize) !Function {
     var func = Function.init(std.testing.allocator);
@@ -1479,6 +1753,29 @@ fn buildMemElementwiseInt(op: BinOp, n: usize) !Function {
     for (0..n) |i| {
         const addr = try func.appendArithImm(block, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(block, cv[i], addr);
+    }
+    func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+fn buildMemImmediateInt(op: BinOp, imm: i64, n: usize) !Function {
+    var func = Function.init(std.testing.allocator);
+    errdefer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const block = try func.appendBlock();
+    const ptr_in = try func.appendBlockParam(block, ptr_t);
+    const ptr_out = try func.appendBlockParam(block, ptr_t);
+    var inputs: [8]Value = undefined;
+    for (0..n) |i| {
+        const addr = try func.appendArithImm(block, ptr_t, .add, ptr_in, @intCast(i * 4));
+        inputs[i] = try func.appendInst(block, i32_t, .{ .load = .{ .ptr = addr } });
+    }
+    var results: [8]Value = undefined;
+    for (0..n) |i| results[i] = try func.appendArithImm(block, i32_t, op, inputs[i], imm);
+    for (0..n) |i| {
+        const addr = try func.appendArithImm(block, ptr_t, .add, ptr_out, @intCast(i * 4));
+        try func.appendStore(block, results[i], addr);
     }
     func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
     return func;
