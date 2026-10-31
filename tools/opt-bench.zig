@@ -62,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
     const bitwise_pair_egraph_ns = try measure(init.io, allocator, &bitwise_pair, runEgraph);
     const bitwise_arithmetic_egraph_ns = try measure(init.io, allocator, &bitwise_arithmetic, runEgraph);
     const shared_dag_egraph_ns = try measure(init.io, allocator, &shared_dag, runEgraph);
+    const shared_dag_pipeline_ns = try measure(init.io, allocator, &shared_dag, runPipeline);
     const mixed_pair_egraph_ns = try measure(init.io, allocator, &mixed_pair, runEgraph);
     const cross_cancel_egraph_ns = try measure(init.io, allocator, &cross_cancel, runEgraph);
     const rootless_egraph_ns = try measure(init.io, allocator, &rootless, runEgraph);
@@ -80,6 +81,7 @@ pub fn main(init: std.process.Init) !void {
             "  bitwise pair egraph:    {d} ns/block\n" ++
             "  bitwise arith egraph:   {d} ns/block\n" ++
             "  shared dag egraph:      {d} ns/block ({d} blocks)\n" ++
+            "  shared dag pipeline:    {d} ns/block\n" ++
             "  mixed pair egraph:      {d} ns/block\n" ++
             "  cross cancel egraph:    {d} ns/block\n" ++
             "  rootless egraph:        {d} ns/block\n" ++
@@ -102,6 +104,7 @@ pub fn main(init: std.process.Init) !void {
             bitwise_arithmetic_egraph_ns / blocks,
             shared_dag_egraph_ns / shared_dag_blocks,
             shared_dag_blocks,
+            shared_dag_pipeline_ns / shared_dag_blocks,
             mixed_pair_egraph_ns / blocks,
             cross_cancel_egraph_ns / blocks,
             rootless_egraph_ns / blocks,
