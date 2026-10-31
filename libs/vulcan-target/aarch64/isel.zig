@@ -321,7 +321,29 @@ const DenseSwitch = struct {
     targets: []Block,
     dispatch: []Block,
     default_target: Block,
+    needs_bounds_check: bool,
 };
+
+/// Return the non-negative upper bound proved by `value = x & constant`. Bitwise AND cannot set a
+/// bit absent from a non-negative constant, so the numeric result is at most that constant. This is
+/// deliberately a local machine-selection proof: it only removes a switch bounds check when the
+/// defining instruction and literal are both still explicit in the final IR.
+fn maskedUpperBound(func: *const Function, value: Value) ?u64 {
+    const inst = func.definingInst(value) orelse return null;
+    const arith = switch (func.opcode(inst)) {
+        .arith => |a| if (a.op == .bit_and) a else return null,
+        else => return null,
+    };
+    for ([_]Value{ arith.lhs, arith.rhs }) |operand| {
+        const constant_inst = func.definingInst(operand) orelse continue;
+        const constant = switch (func.opcode(constant_inst)) {
+            .iconst => |c| c,
+            else => continue,
+        };
+        if (constant >= 0) return @intCast(constant);
+    }
+    return null;
+}
 
 fn forwardedTarget(func: *const Function, start: Block) Block {
     var block = start;
@@ -397,6 +419,14 @@ fn findDenseSwitches(allocator: std.mem.Allocator, func: *const Function, skip: 
             break;
         };
         if (!dense) continue;
+        var needs_bounds_check = true;
+        // The ordinary plan has entries 0..N-1 and branches out for every index >= N. When the
+        // selector is masked to at most N, append the default as entry N: all possible values are
+        // now represented and the hot dispatch needs no compare/conditional branch.
+        if (maskedUpperBound(func, value.?) == @as(?u64, @intCast(labels.items.len))) {
+            try targets.append(allocator, default_target.?);
+            needs_bounds_check = false;
+        }
         const owned_targets = try allocator.dupe(Block, targets.items);
         errdefer allocator.free(owned_targets);
         const owned_dispatch = try allocator.dupe(Block, dispatch.items);
@@ -406,6 +436,7 @@ fn findDenseSwitches(allocator: std.mem.Allocator, func: *const Function, skip: 
             .targets = owned_targets,
             .dispatch = owned_dispatch,
             .default_target = default_target.?,
+            .needs_bounds_check = needs_bounds_check,
         };
         for (dispatch.items[1..]) |child| skip[@backingInt(child)] = true;
     }
@@ -2146,9 +2177,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const next_block: ?Block = if (bi + 1 < nblocks) @fromBackingInt(@intCast(bi + 1)) else null;
                     if (dense_switches[bi]) |plan| {
                         const index = try ctx.loadOp(allocator, &code, plan.value, spill_op[0]);
-                        try code.append(allocator, encode.subsImm(.zr, index, @intCast(plan.targets.len - 1)));
-                        try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(plan.default_target), .cond = .hi });
-                        try code.append(allocator, encode.bcc(.hi, 0));
+                        if (plan.needs_bounds_check) {
+                            try code.append(allocator, encode.subsImm(.zr, index, @intCast(plan.targets.len - 1)));
+                            try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(plan.default_target), .cond = .hi });
+                            try code.append(allocator, encode.bcc(.hi, 0));
+                        }
                         const adr_at = code.items.len;
                         try code.append(allocator, encode.adr(scratch_imm, 0));
                         try code.append(allocator, encode.addShifted64(scratch_move, scratch_imm, index, 2));
@@ -5594,6 +5627,21 @@ test "selects a straight-line arithmetic function" {
     const rd_mask = ~@as(u32, 0x1f);
     try std.testing.expectEqual(encode.madd(.x0, .x0, .x1, .x0, false) & rd_mask, code[0] & rd_mask);
     try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
+}
+
+test "masked switch index proves its upper bound" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const fifteen = try func.appendInst(b, t, .{ .iconst = 15 });
+    const masked = try func.appendInst(b, t, .{ .arith = .{ .op = .bit_and, .lhs = x, .rhs = fifteen } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(masked) });
+
+    try std.testing.expectEqual(@as(?u64, 15), maskedUpperBound(&func, masked));
+    try std.testing.expectEqual(@as(?u64, null), maskedUpperBound(&func, x));
 }
 
 test "fuses a multiply with a large immediate add into madd" {
