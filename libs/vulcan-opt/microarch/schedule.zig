@@ -186,8 +186,32 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
         for (0..func.blockCount()) |bi| {
             const block: Block = @fromBackingInt(@intCast(bi));
             if (model.fuses(.shift_add)) restoreShiftAddPairs(func, block, model, uses);
-            if (model.arch == .aarch64) restoreMultiplyAddPairs(func, block, uses);
+            if (model.arch == .aarch64) {
+                restoreMultiplyAddPairs(func, block, uses);
+                restoreCompareBranchPairs(func, block, uses);
+            }
         }
+    }
+}
+
+/// Restore a single-use integer compare immediately before its `if`. The generic resource scheduler
+/// may issue the compare early, but AArch64 can keep the relation in NZCV and branch on it directly
+/// only when instruction selection sees the pair. Moving the pure compare later preserves its data
+/// dependencies and lets the machine layer replace `cmp; cset; cbz` with `cmp; b.cc`.
+fn restoreCompareBranchPairs(func: *Function, block: Block, uses: []const u32) void {
+    const insts = func.blockInstsMut(block).items;
+    var consumer_index: usize = 1;
+    while (consumer_index < insts.len) : (consumer_index += 1) {
+        const branch = switch (func.opcode(insts[consumer_index])) {
+            .@"if" => |cf| cf,
+            else => continue,
+        };
+        if (uses[@backingInt(branch.cond)] != 1) continue;
+        const compare = func.definingInst(branch.cond) orelse continue;
+        if (func.opcode(compare) != .icmp) continue;
+        const producer_index = std.mem.indexOfScalar(Inst, insts[0..consumer_index], compare) orelse continue;
+        if (producer_index + 1 == consumer_index) continue;
+        std.mem.rotate(Inst, insts[producer_index..consumer_index], 1);
     }
 }
 
@@ -828,6 +852,31 @@ test "aarch64 schedule restores scalar multiply-add adjacency for machine fusion
     const product_at = std.mem.indexOfScalar(Inst, order, func.definingInst(product).?).?;
     const next_at = std.mem.indexOfScalar(Inst, order, func.definingInst(next).?).?;
     try std.testing.expectEqual(product_at + 1, next_at);
+}
+
+test "aarch64 schedule restores compare adjacency for a fused branch" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const block = try func.appendBlock();
+    const x = try func.appendBlockParam(block, i32_t);
+    const y = try func.appendBlockParam(block, i32_t);
+    const compared = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = y } });
+    const independent = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+    try func.appendIf(block, compared, .{ .target = block, .args = &.{} }, .{ .target = block, .args = &.{} });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(independent) });
+
+    try run(allocator, &func, registry.modelFor(.@"ampere-altra"));
+    const order = func.blockInsts(block);
+    const compare_at = std.mem.indexOfScalar(Inst, order, func.definingInst(compared).?).?;
+    var branch_at: ?usize = null;
+    for (order, 0..) |inst, i| if (func.opcode(inst) == .@"if") {
+        branch_at = i;
+        break;
+    };
+    try std.testing.expectEqual(compare_at + 1, branch_at.?);
 }
 
 /// Builds an add (program-order first) and a mul (program-order second), both independent and both
