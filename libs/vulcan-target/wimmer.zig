@@ -1809,8 +1809,8 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     defer allocator.free(bounds.from);
     defer allocator.free(bounds.to);
 
-    // The worklist (`unhandled`) is a priority queue. It holds value intervals sorted ascending
-    // by start, popped from the front, with split children re-inserted in sorted position. Fixed
+    // The worklist (`unhandled`) is a priority queue. It holds value intervals sorted descending
+    // by start, popped from the end, with split children re-inserted in sorted position. Fixed
     // intervals never enter it. A CALL-CLOBBER fixed interval (`value == null`) is seeded into
     // `inactive`, since its first range is at a call, a hole at position 0. This lets
     // `tryAllocateFreeReg` and `allocateBlockedReg` see the clobber at every EARLIER position. An
@@ -1838,7 +1838,10 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
             try unhandled.append(allocator, iv);
         }
     }
+    // Sort in the historical order first, then reverse it. This keeps equal-start
+    // interval priority unchanged while making removal from the end constant time.
     std.mem.sort(*Interval, unhandled.items, {}, intervalStartLessThan);
+    std.mem.reverse(*Interval, unhandled.items);
 
     // Block-argument coalescing map. Empty (and unused) unless the backend opted in. It hints a
     // parameter toward an incoming argument's register so the edge move becomes a no-op.
@@ -1859,7 +1862,7 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     while (unhandled.items.len > 0) {
         iters += 1;
         std.debug.assert(iters <= iter_bound);
-        const current = unhandled.orderedRemove(0);
+        const current = unhandled.pop().?;
         const position = current.start();
 
         // Expire or deactivate active intervals. Ranges are half-open, so `end() <= position` means
@@ -2026,11 +2029,11 @@ fn firstMustHaveUse(it: *const Interval) ?u32 {
     return null;
 }
 
-/// Insert `iv` into the sorted worklist `list`, keeping it ascending by `start()` (a split child is
-/// placed after any interval that starts no later than it).
+/// Insert `iv` into the descending worklist. Equal-start intervals already in the list stay closer
+/// to the end and are popped first.
 fn insertSorted(allocator: std.mem.Allocator, list: *std.ArrayList(*Interval), iv: *Interval) Error!void {
     var idx: usize = 0;
-    while (idx < list.items.len and list.items[idx].start() <= iv.start()) : (idx += 1) {}
+    while (idx < list.items.len and list.items[idx].start() > iv.start()) : (idx += 1) {}
     try list.insert(allocator, idx, iv);
 }
 
