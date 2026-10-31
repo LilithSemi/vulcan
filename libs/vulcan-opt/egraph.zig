@@ -37,16 +37,28 @@ const Entry = struct {
     node: Node,
 };
 
+const OpKey = struct {
+    op: BinOp,
+    lhs: u32,
+    rhs: u32,
+    ty: Type,
+};
+
 const Graph = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
     parents: std.ArrayList(u32) = .empty,
     nodes: std.ArrayList(Entry) = .empty,
+    leaves: std.AutoHashMapUnmanaged(Value, u32) = .empty,
+    ops: std.AutoHashMapUnmanaged(OpKey, usize) = .empty,
+    ops_valid: bool = true,
     hit_limit: bool = false,
 
     fn deinit(self: *Graph) void {
         self.parents.deinit(self.allocator);
         self.nodes.deinit(self.allocator);
+        self.leaves.deinit(self.allocator);
+        self.ops.deinit(self.allocator);
     }
 
     fn find(self: *Graph, class: u32) u32 {
@@ -66,6 +78,7 @@ const Graph = struct {
         const br = self.find(b);
         if (ar == br) return false;
         self.parents.items[br] = ar;
+        self.ops_valid = false;
         return true;
     }
 
@@ -76,66 +89,74 @@ const Graph = struct {
     }
 
     fn addLeaf(self: *Graph, value: Value) !?u32 {
-        for (self.nodes.items) |entry| switch (entry.node) {
-            .leaf => |other| if (other == value) return self.find(entry.class),
-            .op => {},
-        };
+        if (self.leaves.get(value)) |class| return self.find(class);
         if (self.nodes.items.len >= self.limits.max_nodes) {
             self.hit_limit = true;
             return null;
         }
         const class = try self.addClass();
         try self.nodes.append(self.allocator, .{ .class = class, .node = .{ .leaf = value } });
+        try self.leaves.put(self.allocator, value, class);
         return class;
     }
 
     fn addOp(self: *Graph, raw: OpNode) !?u32 {
+        if (!self.ops_valid) _ = try self.rebuild();
         var node = raw;
         node.lhs = self.find(node.lhs);
         node.rhs = self.find(node.rhs);
         if (node.lhs > node.rhs) std.mem.swap(u32, &node.lhs, &node.rhs);
-        for (self.nodes.items) |*entry| switch (entry.node) {
-            .leaf => {},
-            .op => |*other| {
-                const lhs = self.find(other.lhs);
-                const rhs = self.find(other.rhs);
-                const lo = @min(lhs, rhs);
-                const hi = @max(lhs, rhs);
-                if (other.op == node.op and other.ty == node.ty and lo == node.lhs and hi == node.rhs) {
-                    if (other.existing == null) other.existing = node.existing;
-                    return self.find(entry.class);
-                }
-            },
-        };
+        const key = opKey(node);
+        if (self.ops.get(key)) |index| {
+            const entry = &self.nodes.items[index];
+            if (entry.node.op.existing == null) entry.node.op.existing = node.existing;
+            return self.find(entry.class);
+        }
         if (self.nodes.items.len >= self.limits.max_nodes) {
             self.hit_limit = true;
             return null;
         }
         const class = try self.addClass();
         try self.nodes.append(self.allocator, .{ .class = class, .node = .{ .op = node } });
+        try self.ops.put(self.allocator, key, self.nodes.items.len - 1);
         return class;
     }
 
-    fn rebuild(self: *Graph) bool {
+    fn rebuild(self: *Graph) !bool {
         var changed = false;
-        for (self.nodes.items, 0..) |left, i| {
-            const a = switch (left.node) {
-                .leaf => continue,
-                .op => |op| canonical(self, op),
+        while (true) {
+            var merged = false;
+            self.ops.clearRetainingCapacity();
+            for (self.nodes.items, 0..) |entry, index| switch (entry.node) {
+                .leaf => {},
+                .op => |raw| {
+                    const key = opKey(canonical(self, raw));
+                    const result = try self.ops.getOrPut(self.allocator, key);
+                    if (result.found_existing) {
+                        const prior = self.nodes.items[result.value_ptr.*];
+                        merged = self.merge(prior.class, entry.class) or merged;
+                    } else {
+                        result.value_ptr.* = index;
+                    }
+                },
             };
-            for (self.nodes.items[i + 1 ..]) |right| {
-                const b = switch (right.node) {
-                    .leaf => continue,
-                    .op => |op| canonical(self, op),
-                };
-                if (a.op == b.op and a.ty == b.ty and a.lhs == b.lhs and a.rhs == b.rhs) {
-                    changed = self.merge(left.class, right.class) or changed;
-                }
+            changed = changed or merged;
+            if (!merged) {
+                self.ops_valid = true;
+                return changed;
             }
         }
-        return changed;
     }
 };
+
+fn opKey(op: OpNode) OpKey {
+    return .{
+        .op = op.op,
+        .lhs = op.lhs,
+        .rhs = op.rhs,
+        .ty = op.ty,
+    };
+}
 
 fn canonical(graph: *Graph, op: OpNode) OpNode {
     var result = op;
@@ -259,7 +280,7 @@ fn factorPair(graph: *Graph, sum_class: u32, left: OpNode, right: OpNode) !bool 
 fn saturate(graph: *Graph) !void {
     var iter: usize = 0;
     while (iter < graph.limits.max_iters and !graph.hit_limit) : (iter += 1) {
-        var changed = graph.rebuild();
+        var changed = try graph.rebuild();
         const count = graph.nodes.items.len;
         for (graph.nodes.items[0..count]) |entry| {
             const sum = switch (entry.node) {
@@ -280,7 +301,7 @@ fn saturate(graph: *Graph) !void {
         }
         if (!changed) break;
     }
-    _ = graph.rebuild();
+    _ = try graph.rebuild();
 }
 
 const Extraction = struct {
@@ -399,6 +420,32 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
     return runWithLimits(allocator, func, .{});
+}
+
+test "egraph hash-consing follows merged child classes" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+
+    var graph = Graph{ .allocator = allocator, .limits = .{} };
+    defer graph.deinit();
+    const ca = (try graph.addLeaf(a)).?;
+    const cb = (try graph.addLeaf(b)).?;
+    const cc = (try graph.addLeaf(c)).?;
+    const ab = (try graph.addOp(.{ .op = .mul, .lhs = ca, .rhs = cb, .ty = ty, .existing = null })).?;
+    const ac = (try graph.addOp(.{ .op = .mul, .lhs = ca, .rhs = cc, .ty = ty, .existing = null })).?;
+    try std.testing.expect(graph.merge(cb, cc));
+    try std.testing.expect(try graph.rebuild());
+    try std.testing.expectEqual(graph.find(ab), graph.find(ac));
+
+    const node_count = graph.nodes.items.len;
+    _ = try graph.addOp(.{ .op = .mul, .lhs = ca, .rhs = cb, .ty = ty, .existing = null });
+    try std.testing.expectEqual(node_count, graph.nodes.items.len);
 }
 
 test "egraph factors a shared multiplier from a returned expression" {
