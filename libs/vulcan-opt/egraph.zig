@@ -608,8 +608,8 @@ fn commonOperands(left: OpNode, right: OpNode) ?CommonOperands {
     return .{ .shared = common orelse return null, .lhs_other = lhs_other, .rhs_other = rhs_other };
 }
 
-fn factorPair(graph: *Graph, sum_class: u32, sum_op: BinOp, inner_op: BinOp, left: OpNode, right: OpNode) !bool {
-    const operands = commonOperands(left, right) orelse return false;
+fn factorPair(graph: *Graph, sum_class: u32, sum_op: BinOp, inner_op: BinOp, left: OpNode, right: OpNode) !?bool {
+    const operands = commonOperands(left, right) orelse return null;
     const inner = try graph.addOp(.{ .op = sum_op, .lhs = operands.lhs_other, .rhs = operands.rhs_other, .ty = left.ty, .existing = null }) orelse return false;
     const product = try graph.addOp(.{ .op = inner_op, .lhs = operands.shared, .rhs = inner, .ty = left.ty, .existing = null }) orelse return false;
     return graph.merge(sum_class, product);
@@ -955,22 +955,7 @@ fn saturate(graph: *Graph) !void {
                 .op => |op| if (isAssociative(op.op) or factorInner(op.op) != null or cancellationInner(op.op) != null or absorptionInner(op.op) != null) canonical(graph, op) else continue,
                 .leaf => continue,
             };
-            if (isAssociative(sum.op) and classHasOp(graph, sum.lhs, sum.op)) {
-                left.clearRetainingCapacity();
-                try matchingOps(graph, sum.lhs, sum.op, sum.ty, left);
-                for (left.items) |nested| {
-                    changed = try associatePair(graph, entry.class, sum.op, nested, sum.rhs) or changed;
-                    if (graph.hit_limit) break;
-                }
-            }
-            if (isAssociative(sum.op) and classHasOp(graph, sum.rhs, sum.op)) {
-                right.clearRetainingCapacity();
-                try matchingOps(graph, sum.rhs, sum.op, sum.ty, right);
-                for (right.items) |nested| {
-                    changed = try associatePair(graph, entry.class, sum.op, nested, sum.lhs) or changed;
-                    if (graph.hit_limit) break;
-                }
-            }
+            var factored = false;
             if (factorInner(sum.op)) |inner_op| factor: {
                 if (!classHasOp(graph, sum.lhs, inner_op) or !classHasOp(graph, sum.rhs, inner_op)) break :factor;
                 left.clearRetainingCapacity();
@@ -978,9 +963,30 @@ fn saturate(graph: *Graph) !void {
                 try matchingOps(graph, sum.lhs, inner_op, sum.ty, left);
                 try matchingOps(graph, sum.rhs, inner_op, sum.ty, right);
                 for (left.items) |a| for (right.items) |b| {
-                    changed = try factorPair(graph, entry.class, sum.op, inner_op, a, b) or changed;
+                    if (try factorPair(graph, entry.class, sum.op, inner_op, a, b)) |pair_changed| {
+                        factored = true;
+                        changed = pair_changed or changed;
+                    }
                     if (graph.hit_limit) break;
                 };
+            }
+            // A direct factor match already introduces the inner associative expression. Let the
+            // eager walk process that smaller expression instead of expanding this node first.
+            if (!factored and isAssociative(sum.op) and classHasOp(graph, sum.lhs, sum.op)) {
+                left.clearRetainingCapacity();
+                try matchingOps(graph, sum.lhs, sum.op, sum.ty, left);
+                for (left.items) |nested| {
+                    changed = try associatePair(graph, entry.class, sum.op, nested, sum.rhs) or changed;
+                    if (graph.hit_limit) break;
+                }
+            }
+            if (!factored and isAssociative(sum.op) and classHasOp(graph, sum.rhs, sum.op)) {
+                right.clearRetainingCapacity();
+                try matchingOps(graph, sum.rhs, sum.op, sum.ty, right);
+                for (right.items) |nested| {
+                    changed = try associatePair(graph, entry.class, sum.op, nested, sum.lhs) or changed;
+                    if (graph.hit_limit) break;
+                }
             }
             if (cancellationInner(sum.op)) |inner_op| cancellation: {
                 if (!classHasOp(graph, sum.lhs, inner_op) or !classHasOp(graph, sum.rhs, inner_op)) break :cancellation;
@@ -1457,6 +1463,35 @@ test "egraph factors a shared multiplier from a returned expression" {
     const inner_value = if (product.lhs == a) product.rhs else product.lhs;
     const inner = func.opcode(func.definingInst(inner_value).?).arith;
     try std.testing.expectEqual(BinOp.add, inner.op);
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "egraph chains direct factoring across an add tree" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const d = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
+    const ad = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = d } });
+    const partial = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = ab, .rhs = ac } });
+    const total = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = partial, .rhs = ad } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(total) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const product = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.mul, product.op);
+    const sum_value = if (product.lhs == a) product.rhs else product.lhs;
+    try std.testing.expect(product.lhs == a or product.rhs == a);
+    try std.testing.expectEqual(BinOp.add, func.opcode(func.definingInst(sum_value).?).arith.op);
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
     try std.testing.expect(diags.ok());
