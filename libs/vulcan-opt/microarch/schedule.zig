@@ -186,28 +186,58 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
         for (0..func.blockCount()) |bi| {
             const block: Block = @fromBackingInt(@intCast(bi));
             if (model.fuses(.shift_add)) restoreShiftAddPairs(func, block, model, uses);
-            if (model.arch == .aarch64) restoreVectorMultiplyAddPairs(func, block, uses);
+            if (model.arch == .aarch64) restoreMultiplyAddPairs(func, block, uses);
         }
     }
 }
 
 /// The resource scheduler separates independent multiplies to cover their latency. AArch64's
-/// vector MLA/FMLA selection instead needs each single-use product adjacent to its add, so restore
-/// those pairs after scoreboarding. Moving a pure producer later preserves every dependency and
-/// reduces two instructions to one in isel.
-fn restoreVectorMultiplyAddPairs(func: *Function, block: Block, uses: []const u32) void {
+/// MLA/FMLA selection and post-allocation integer MADD peephole instead need each single-use product
+/// adjacent to its add, so restore those pairs after scoreboarding. This is the handoff from the IR
+/// resource schedule to the stricter machine rewrite: moving a pure producer later preserves every
+/// dependency, and the machine layer only accepts the pair when it can replace two instructions by
+/// one exact target instruction.
+fn restoreMultiplyAddPairs(func: *Function, block: Block, uses: []const u32) void {
+    const Consumer = struct {
+        op: ir.function.BinOp,
+        candidates: [2]Value,
+        candidate_count: usize,
+    };
     const insts = func.blockInstsMut(block).items;
     var consumer_index: usize = 1;
     while (consumer_index < insts.len) : (consumer_index += 1) {
-        const consumer = switch (func.opcode(insts[consumer_index])) {
-            .arith => |arith| arith,
+        const consumer: Consumer = switch (func.opcode(insts[consumer_index])) {
+            .arith => |arith| .{ .op = arith.op, .candidates = [2]Value{ arith.lhs, arith.rhs }, .candidate_count = @as(usize, 2) },
+            // A large immediate must be materialized in a register. AArch64 isel can place that
+            // materialization before the multiply and select MADD, saving one instruction. Small
+            // immediates already use ADD-immediate and do not improve by becoming MOV+MADD.
+            .arith_imm => |arith| if (arith.op == .add and (arith.imm < -4095 or arith.imm > 4095))
+                .{ .op = arith.op, .candidates = [2]Value{ arith.lhs, arith.lhs }, .candidate_count = @as(usize, 1) }
+            else
+                continue,
             else => continue,
         };
         if (consumer.op != .add and consumer.op != .sub) continue;
         const result = func.instResult(insts[consumer_index]) orelse continue;
-        if (func.types.type_kind(func.valueType(result)) != .vector) continue;
+        const result_kind = func.types.type_kind(func.valueType(result));
+        const scalar_integer = switch (result_kind) {
+            .int => true,
+            else => false,
+        };
+        const scalar_float = switch (result_kind) {
+            .float => true,
+            else => false,
+        };
+        const vector = switch (result_kind) {
+            .vector => true,
+            else => false,
+        };
+        if (!scalar_integer and !scalar_float and !vector) continue;
+        // Integer MSUB is not part of the strict post-allocation rewrite yet. Scalar floating-point
+        // and vector selection both support their legal subtract orientations directly in isel.
+        if (scalar_integer and consumer.op != .add) continue;
 
-        for ([_]Value{ consumer.lhs, consumer.rhs }) |product| {
+        for (consumer.candidates[0..consumer.candidate_count]) |product| {
             if (uses[@backingInt(product)] != 1) continue;
             const producer = func.definingInst(product) orelse continue;
             const multiply = switch (func.opcode(producer)) {
@@ -594,8 +624,9 @@ test "scheduler keeps a single-use shift beside its fused add" {
     const shift_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(shifted).?).?;
     const independent_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(independent).?).?;
     const sum_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(sum).?).?;
+    const result_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(result).?).?;
     try std.testing.expectEqual(shift_index + 1, sum_index);
-    try std.testing.expect(independent_index < shift_index);
+    try std.testing.expectEqual(independent_index + 1, result_index);
 }
 
 test "scheduler restores a constant right shift beside its fused add" {
@@ -619,8 +650,9 @@ test "scheduler restores a constant right shift beside its fused add" {
     const shift_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(shifted).?).?;
     const independent_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(independent).?).?;
     const sum_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(sum).?).?;
+    const result_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(result).?).?;
     try std.testing.expectEqual(shift_index + 1, sum_index);
-    try std.testing.expect(independent_index < shift_index);
+    try std.testing.expectEqual(independent_index + 1, result_index);
 }
 
 test "scheduler keeps a single-use shift beside its fused xor" {
@@ -643,8 +675,9 @@ test "scheduler keeps a single-use shift beside its fused xor" {
     const shift_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(shifted).?).?;
     const independent_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(independent).?).?;
     const mixed_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(mixed).?).?;
+    const result_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(result).?).?;
     try std.testing.expectEqual(shift_index + 1, mixed_index);
-    try std.testing.expect(independent_index < shift_index);
+    try std.testing.expectEqual(independent_index + 1, result_index);
 }
 
 test "scheduler leaves a shift with two users available to both" {
@@ -771,6 +804,30 @@ test "priority follows the model latency: the higher-latency independent op sche
     try expectEqualSlices(Inst, &.{
         func.definingInst(mul).?, func.definingInst(add).?, func.definingInst(use).?,
     }, func.blockInsts(block));
+}
+
+test "aarch64 schedule restores scalar multiply-add adjacency for machine fusion" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const state = try func.appendBlockParam(block, i32_t);
+    const multiplier = try func.appendBlockParam(block, i32_t);
+    const index = try func.appendBlockParam(block, i32_t);
+    const product = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = state, .rhs = multiplier } });
+    const mask = try func.appendInst(block, i32_t, .{ .iconst = 15 });
+    const masked = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .bit_and, .lhs = index, .rhs = mask } });
+    const increment = try func.appendInst(block, i32_t, .{ .iconst = 1013904223 });
+    const next = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = product, .rhs = increment } });
+    const result = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .bit_xor, .lhs = next, .rhs = masked } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+
+    try run(allocator, &func, registry.modelFor(.@"ampere-altra"));
+    const order = func.blockInsts(block);
+    const product_at = std.mem.indexOfScalar(Inst, order, func.definingInst(product).?).?;
+    const next_at = std.mem.indexOfScalar(Inst, order, func.definingInst(next).?).?;
+    try std.testing.expectEqual(product_at + 1, next_at);
 }
 
 /// Builds an add (program-order first) and a mul (program-order second), both independent and both

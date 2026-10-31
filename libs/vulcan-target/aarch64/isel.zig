@@ -1499,7 +1499,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // predicate and emits the fused fmadd/fmsub/fnmsub on these operands,
                     // so the multiply is emitted exactly once (mirrors the icmp/if fusion
                     // above).
-                    if (a.op == .mul and fusesIntoNextArith(func, insts, inst_idx)) continue;
+                    if (a.op == .mul and (fusesIntoNextArith(func, insts, inst_idx) or fusesIntegerMulIntoNextImmAdd(func, insts, inst_idx))) continue;
                     if ((a.op == .shl or a.op == .shr) and fusesIntoNextShiftAdd(func, insts, inst_idx, caps.fuse_shift_add)) continue;
                     const result = func.instResult(inst).?;
                     if ((a.op == .shl or a.op == .shr) and foldsAsBitfieldExtractSource(func, result)) continue;
@@ -1578,6 +1578,19 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // emits the flag-setting `addsImm`/`subsImm` + `b.cc` under the SAME predicate.
                     if (isArithBranchProducer(func, insts, inst_idx, caps.fuse_arith_branch and caps.fuse_cmp_branch)) continue;
                     const result = func.instResult(inst).?;
+                    if (inst_idx >= 1 and fusesIntegerMulIntoNextImmAdd(func, insts, inst_idx - 1)) {
+                        const mul = func.opcode(insts[inst_idx - 1]).arith;
+                        const rn = try ctx.loadOp(allocator, &code, mul.lhs, spill_op[0]);
+                        const rm = try ctx.loadOp(allocator, &code, mul.rhs, spill_op[1]);
+                        if (isWide(func, result))
+                            try loadConst64(allocator, &code, scratch_imm, @bitCast(a.imm))
+                        else
+                            try loadConst(allocator, &code, scratch_imm, a.imm);
+                        const rd = ctx.resultReg(result);
+                        try code.append(allocator, encode.madd(rd, rn, rm, scratch_imm, isWide(func, result)));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     const rl = try ctx.loadOp(allocator, &code, a.lhs, spill_op[0]);
                     const rd = ctx.resultReg(result);
                     const wide = isWide(func, result);
@@ -4456,6 +4469,26 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     return countUses(func, result) == 1;
 }
 
+/// Whether a scalar integer multiply folds into the immediately following large-immediate add.
+/// The immediate must be outside ADD-immediate's range: the unfused form then already materializes
+/// it and emits MUL+ADD, while the fused form materializes it before one MADD and is strictly one
+/// machine instruction smaller. The product must be single-use so skipping it is exact.
+fn fusesIntegerMulIntoNextImmAdd(func: *const Function, insts: []const ir.function.Inst, idx: usize) bool {
+    const mul = switch (func.opcode(insts[idx])) {
+        .arith => |a| a,
+        else => return false,
+    };
+    if (mul.op != .mul or isVector(func, mul.lhs) or regClass(func, mul.lhs) != .gpr) return false;
+    if (idx + 1 >= insts.len) return false;
+    const add = switch (func.opcode(insts[idx + 1])) {
+        .arith_imm => |a| a,
+        else => return false,
+    };
+    if (add.op != .add or (add.imm >= -4095 and add.imm <= 4095)) return false;
+    const product = func.instResult(insts[idx]) orelse return false;
+    return add.lhs == product and countUses(func, product) == 1;
+}
+
 const ConstantShift = struct { op: ir.function.BinOp, lhs: Value, imm: i64 };
 
 fn constantShift(func: *const Function, inst: ir.function.Inst) ?ConstantShift {
@@ -5560,6 +5593,26 @@ test "selects a straight-line arithmetic function" {
     // destination remains allocator-selected, so compare every field except Rd.
     const rd_mask = ~@as(u32, 0x1f);
     try std.testing.expectEqual(encode.madd(.x0, .x0, .x1, .x0, false) & rd_mask, code[0] & rd_mask);
+    try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
+}
+
+test "fuses a multiply with a large immediate add into madd" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const y = try func.appendBlockParam(b, t);
+    const product = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+    const sum = try func.appendInst(b, t, .{ .arith_imm = .{ .op = .add, .lhs = product, .imm = 1013904223 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    // movz + movk materialize the accumulator before one MADD; no standalone MUL/ADD remains.
+    const operand_mask: u32 = ~(@as(u32, 0x1f) | (@as(u32, 0x1f) << 5) | (@as(u32, 0x1f) << 10) | (@as(u32, 0x1f) << 16));
+    try std.testing.expectEqual(encode.madd(.x0, .x1, .x2, .x3, false) & operand_mask, code[2] & operand_mask);
     try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
 }
 
