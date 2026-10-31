@@ -255,6 +255,20 @@ pub fn build(b: *std.Build) void {
             run_uarch_bench.addPassthruArgs();
             const run_uarch_bench_step = b.step("run-uarch-bench", "Benchmark the microarch optimizer: -- [--model <tag> | --list | --custom]");
             run_uarch_bench_step.dependOn(&run_uarch_bench.step);
+
+            const opt_bench_cli = b.addExecutable(.{ .name = "vulcan-opt-bench", .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/opt-bench.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "vulcan-ir", .module = vulcan_ir },
+                    .{ .name = "vulcan-opt", .module = vulcan_opt },
+                },
+            }) });
+            b.installArtifact(opt_bench_cli);
+            const run_opt_bench = b.addRunArtifact(opt_bench_cli);
+            const run_opt_bench_step = b.step("run-opt-bench", "Benchmark target-independent optimizer compile time");
+            run_opt_bench_step.dependOn(&run_opt_bench.step);
         }
     }
 
