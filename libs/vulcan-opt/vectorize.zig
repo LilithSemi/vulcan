@@ -316,7 +316,9 @@ fn vectorizeOne(
 
     // Redirect every downstream use of the scalar results to the extracted lanes. When those uses
     // are contiguous stores, the later `coalesceStores` scan collapses them to one wide store.
-    for (0..lanes) |k| func.replaceAllUses(c[k], x[k]);
+    // The scalar group and appended replacement sequence are both still in this block until the
+    // splice below, so detached instructions from older transforms cannot be future consumers.
+    for (0..lanes) |k| func.replaceAllLiveUses(c[k], x[k]);
 
     // Move the appended sequence to the group's position and drop the now-dead scalar ops.
     try splice(allocator, func, block, pos, old_len, lanes);
