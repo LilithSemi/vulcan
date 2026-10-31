@@ -1887,15 +1887,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (func.opcode(inst).load.mask != null) return error.Unsupported;
                     if (interleaveLane(func, inst)) |lane| {
                         if (!validInterleaveRun(func, insts, inst_idx, true)) return error.Unsupported;
-                        const result = func.instResult(inst).?;
                         const mem = func.opcode(inst).load;
                         if (lane == 0) {
                             const base = try ctx.loadOp(allocator, &code, mem.ptr, spill_op[0]);
                             try code.append(allocator, encode.ld4S4(fp_interleave_base, base));
                         }
-                        const rd = ctx.resultReg(result);
-                        try code.append(allocator, encode.movVec(rd, interleaveScratch(lane)));
-                        try storeResult(allocator, &code, ctx, result, rd);
                         continue;
                     }
                     // A folded load addresses `[base, #off]` directly: `baseOf` yields the fold base
@@ -1914,13 +1910,31 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (interleaveLane(func, inst)) |lane| {
                         if (!validInterleaveRun(func, insts, inst_idx, false)) return error.Unsupported;
                         if (lane != 0) continue;
+                        var direct: [4]Reg = undefined;
+                        var consecutive = true;
                         for (insts[inst_idx .. inst_idx + 4], 0..) |member, member_lane| {
                             const value = func.opcode(member).store.value;
-                            const src = try ctx.loadOp(allocator, &code, value, fp_spill_op[0]);
-                            try code.append(allocator, encode.movVec(interleaveScratch(@intCast(member_lane)), src));
+                            direct[member_lane] = switch (ctx.locationAt(value)) {
+                                .reg => |reg| reg,
+                                .slot => blk: {
+                                    consecutive = false;
+                                    break :blk fp_spill_op[0];
+                                },
+                            };
+                            if (member_lane != 0 and @backingInt(direct[member_lane]) != @backingInt(direct[0]) + member_lane)
+                                consecutive = false;
                         }
                         const base = try ctx.loadOp(allocator, &code, st.ptr, spill_op[1]);
-                        try code.append(allocator, encode.st4S4(fp_interleave_base, base));
+                        if (consecutive) {
+                            try code.append(allocator, encode.st4S4(direct[0], base));
+                        } else {
+                            for (insts[inst_idx .. inst_idx + 4], 0..) |member, member_lane| {
+                                const value = func.opcode(member).store.value;
+                                const src = try ctx.loadOp(allocator, &code, value, fp_spill_op[0]);
+                                try code.append(allocator, encode.movVec(interleaveScratch(@intCast(member_lane)), src));
+                            }
+                            try code.append(allocator, encode.st4S4(fp_interleave_base, base));
+                        }
                         continue;
                     }
                     const val = try ctx.loadOp(allocator, &code, st.value, if (regClass(func, st.value) == .fpr) fp_spill_op[0] else spill_op[0]);
@@ -2389,6 +2403,9 @@ const Ctx = struct {
     /// The register holding `v` at the current position: its assigned register, or reload a
     /// spilled value into `scratch` (a register of `v`'s class). A SIMD vector reloads all 128 bits.
     fn loadOp(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), v: Value, scratch: Reg) Error!Reg {
+        if (self.func.definingInst(v)) |inst| if (interleaveLane(self.func, inst)) |lane| {
+            if (self.func.opcode(inst) == .load) return interleaveScratch(lane);
+        };
         switch (self.locationAt(v)) {
             .reg => |r| return r,
             .slot => |slot| {

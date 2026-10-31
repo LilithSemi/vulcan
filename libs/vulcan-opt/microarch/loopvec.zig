@@ -47,6 +47,7 @@ const Plan = struct {
     accesses: []ArrayAccess, // owned
     reduction: ?MapReduction,
     factor: u32, // V
+    interleaved: bool,
 };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const mm.Model) Error!bool {
@@ -96,6 +97,14 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         .int => |int| int,
         else => unreachable,
     };
+    const index_elem_ty = if (plan.interleaved)
+        try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = ind_int.bits } })
+    else
+        null;
+    const index_vec_ty = if (index_elem_ty) |elem|
+        try func.types.intern(.{ .vector = .{ .len = @intCast(V), .elem = elem } })
+    else
+        null;
     const group_offset: ?i64 = std.math.add(i64, @as(i64, @intCast(V - 1)), plan.exit_offset) catch null;
     const offset_fits = group_offset != null and group_offset.? >= 0 and ind_int.bits < 64 and
         @as(u64, @intCast(group_offset.?)) < (@as(u64, 1) << @intCast(ind_int.bits));
@@ -105,14 +114,29 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     const mainbody = if (rotated) mainheader else try func.appendBlock();
     const combine = try func.appendBlock();
     const mi = try func.appendBlockParam(mainheader, ind_ty);
+    const mvi = if (index_vec_ty) |vec_ty| try func.appendBlockParam(mainheader, vec_ty) else null;
     const macc = if (reduction_vec_ty) |vec_ty|
         try func.appendBlockParam(mainheader, vec_ty)
     else
         null;
 
     // Preheader -> main header, carrying the induction's initial value.
-    const pre_args = func.blockArgs(func.terminator(plan.preheader).?.jump);
+    const pre_args = try allocator.dupe(Value, func.blockArgs(func.terminator(plan.preheader).?.jump));
+    defer allocator.free(pre_args);
     const init_i = pre_args[plan.induction];
+    const init_vi = if (index_vec_ty) |vec_ty| init: {
+        const scalar = try func.appendInst(plan.preheader, index_elem_ty.?, .{ .convert = .{ .value = init_i } });
+        var lanes: [MAX_LANES]Value = undefined;
+        for (lanes[0..V], 0..) |*lane, index| lane.* = if (index == 0)
+            scalar
+        else
+            try func.appendArithImm(plan.preheader, index_elem_ty.?, .add, scalar, @intCast(index));
+        break :init try func.appendInst(plan.preheader, vec_ty, .{ .struct_new = .{ .fields = try func.internValues(lanes[0..V]) } });
+    } else null;
+    const index_step = if (index_vec_ty) |vec_ty| step: {
+        const scalar = try func.appendInst(plan.preheader, index_elem_ty.?, .{ .iconst = @intCast(V) });
+        break :step try func.appendSplat(plan.preheader, vec_ty, scalar);
+    } else null;
     const init_acc = if (plan.reduction) |red| pre_args[red.accumulator] else null;
     const vector_identity = if (plan.reduction) |red| identity: {
         const scalar = try identityConst(func, plan.preheader, red.op, reduction_ty.?);
@@ -136,10 +160,14 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         };
         const reverse: CmpOp = if (plan.exit_cond == .lt) .gt else .ge;
         const can_enter = try func.appendInst(plan.preheader, bool_t, .{ .icmp = .{ .op = reverse, .lhs = wide_bound, .rhs = wide_highest } });
-        if (vector_identity) |identity|
+        if (init_vi) |vi|
+            try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{ init_i, vi } }, .{ .target = plan.header, .args = pre_args })
+        else if (vector_identity) |identity|
             try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{ init_i, identity } }, .{ .target = plan.header, .args = pre_args })
         else
             try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{init_i} }, .{ .target = plan.header, .args = pre_args });
+    } else if (init_vi) |vi| {
+        try func.setJump(plan.preheader, mainheader, &.{ init_i, vi });
     } else if (vector_identity) |identity| {
         try func.setJump(plan.preheader, mainheader, &.{ init_i, identity });
     } else {
@@ -176,7 +204,9 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         break :guard guarded;
     };
     if (cont) |condition| {
-        if (macc) |acc|
+        if (mvi) |vi|
+            try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{ mi, vi } }, .{ .target = combine, .args = &.{mi} })
+        else if (macc) |acc|
             try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{ mi, acc } }, .{ .target = combine, .args = &.{ mi, acc } })
         else
             try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{mi} }, .{ .target = combine, .args = &.{mi} });
@@ -188,6 +218,12 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     // induction maps to bmi+m, so pure body computation may observe the raw index too. The original
     // address/scale/induction-update instructions are skipped when cloning.
     const bmi = if (rotated) mi else try func.appendBlockParam(mainbody, ind_ty);
+    const bvi = if (rotated)
+        mvi
+    else if (index_vec_ty) |vec_ty|
+        try func.appendBlockParam(mainbody, vec_ty)
+    else
+        null;
     const bacc = if (rotated)
         macc
     else if (reduction_vec_ty) |vec_ty|
@@ -212,6 +248,10 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     defer access_bases.deinit(allocator);
     try skip.put(allocator, ind_update, {});
     if (plan.reduction) |red| try skip.put(allocator, red.update_inst, {});
+    var vector_indices: [MAX_LANES]?Value = @splat(null);
+    if (bvi) |vector_index| for (vector_indices[0..V], 0..) |*lane, index| {
+        lane.* = try func.appendInst(mainbody, index_elem_ty.?, .{ .extract = .{ .aggregate = vector_index, .index = @intCast(index) } });
+    };
     for (vmaps, 0..) |*vm, m| {
         const lane_i = if (m == 0)
             bmi
@@ -259,6 +299,10 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         if (skip.contains(inst)) continue;
         if (func.instResult(inst)) |result| {
             if (vmaps[0].contains(result)) continue; // a pre-seeded address
+            if (plan.interleaved and func.opcode(inst) == .convert and func.opcode(inst).convert.value == i_alias and func.valueType(result) == index_elem_ty.?) {
+                for (vmaps, 0..) |*vm, lane| try vm.put(allocator, result, vector_indices[lane].?);
+                continue;
+            }
             for (vmaps) |*vm| {
                 const op = try remapOp(func, func.opcode(inst), vm, allocator);
                 const clone = try func.appendInst(mainbody, func.valueType(result), op);
@@ -284,12 +328,17 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         break :acc try func.appendInst(mainbody, reduction_vec_ty.?, .{ .arith = .{ .op = red.op, .lhs = bacc.?, .rhs = group } });
     } else null;
     const nmi = try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(V)));
+    const next_vi = if (bvi) |vi| try func.appendInst(mainbody, index_vec_ty.?, .{ .arith = .{ .op = .add, .lhs = vi, .rhs = index_step.? } }) else null;
     if (rotated) {
         const next_cont = try func.appendInst(mainbody, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = nmi, .rhs = threshold.? } });
-        if (next_acc) |acc|
+        if (next_vi) |vi|
+            try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{ nmi, vi } }, .{ .target = combine, .args = &.{nmi} })
+        else if (next_acc) |acc|
             try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{ nmi, acc } }, .{ .target = combine, .args = &.{ nmi, acc } })
         else
             try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{nmi} }, .{ .target = combine, .args = &.{nmi} });
+    } else if (next_vi) |vi| {
+        try func.setJump(mainbody, mainheader, &.{ nmi, vi });
     } else if (next_acc) |acc| {
         try func.setJump(mainbody, mainheader, &.{ nmi, acc });
     } else {
@@ -496,7 +545,9 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
                 // after, and that pass refuses a tagged load on its own.
                 if (l.@"volatile") return bail(&accesses, allocator);
                 const sa = stridedAddress(func, l.ptr, i_alias) orelse return bail(&accesses, allocator);
-                if (sa.stride != byteSize(func, func.valueType(func.instResult(inst).?))) return bail(&accesses, allocator);
+                const elem_bytes = byteSize(func, func.valueType(func.instResult(inst).?));
+                const interleaved = model.arch == .aarch64 and elem_bytes == 4 and sa.stride == 16;
+                if (sa.stride != elem_bytes and !interleaved) return bail(&accesses, allocator);
                 try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .offset = sa.offset, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = false });
             },
             .store => |s| {
@@ -505,7 +556,9 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
                 // and a masked lane writes nothing.
                 if (s.@"volatile" or s.mask != null) return bail(&accesses, allocator);
                 const sa = stridedAddress(func, s.ptr, i_alias) orelse return bail(&accesses, allocator);
-                if (sa.stride != byteSize(func, func.valueType(s.value))) return bail(&accesses, allocator);
+                const elem_bytes = byteSize(func, func.valueType(s.value));
+                const interleaved = model.arch == .aarch64 and elem_bytes == 4 and sa.stride == 16;
+                if (sa.stride != elem_bytes and !interleaved) return bail(&accesses, allocator);
                 try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .offset = sa.offset, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = true });
             },
             .arith, .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .convert, .unary => {},
@@ -513,6 +566,25 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         }
     }
     if (accesses.items.len == 0) return bail(&accesses, allocator);
+    var interleaved_base: ?Value = null;
+    var interleaved_loads: u4 = 0;
+    var interleaved_stores: u4 = 0;
+    var has_interleaved = false;
+    for (accesses.items) |access| {
+        if (access.stride == 4) continue;
+        has_interleaved = true;
+        if (access.stride != 16 or access.offset < 0 or access.offset >= 16 or @rem(access.offset, 4) != 0)
+            return bail(&accesses, allocator);
+        if (interleaved_base) |base| {
+            if (access.base != base) return bail(&accesses, allocator);
+        } else interleaved_base = access.base;
+        const bit: u4 = @as(u4, 1) << @intCast(@divExact(access.offset, 4));
+        if (access.is_store) interleaved_stores |= bit else interleaved_loads |= bit;
+    }
+    // Native ld4/st4 vectorization is worthwhile only for a complete four-field record. Keeping
+    // partial records out avoids the scalar lane-pack fallback that is slower than the original.
+    if (has_interleaved and (interleaved_loads != 0b1111 or interleaved_stores != 0b1111 or reduction != null))
+        return bail(&accesses, allocator);
     if (reduction != null) {
         var has_store = false;
         for (accesses.items) |access| has_store = has_store or access.is_store;
@@ -534,6 +606,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         .accesses = try accesses.toOwnedSlice(allocator),
         .reduction = reduction,
         .factor = V,
+        .interleaved = has_interleaved,
     };
 }
 
@@ -552,6 +625,15 @@ const Strided = struct { base: Value, stride: i64, offset: i64, addr_inst: Inst,
 /// Decompose `addr` as `base + i_alias*stride` (base loop-invariant), or null.
 fn stridedAddress(func: *const Function, addr: Value, i_alias: Value) ?Strided {
     const addr_inst = func.definingInst(addr) orelse return null;
+    if (func.opcode(addr_inst) == .arith_imm) {
+        const field = func.opcode(addr_inst).arith_imm;
+        if (field.op == .add) {
+            var inner = stridedAddress(func, field.lhs, i_alias) orelse return null;
+            inner.offset = std.math.add(i64, inner.offset, field.imm) catch return null;
+            inner.addr_inst = addr_inst;
+            return inner;
+        }
+    }
     const add = switch (func.opcode(addr_inst)) {
         .arith => |a| if (a.op == .add) a else return null,
         else => return null,

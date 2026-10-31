@@ -44,6 +44,7 @@ const AddrParts = struct { base: Value, off: i64 };
 const LoadRun = struct {
     ptr0: Value,
     loads: [MAX_LANES]Inst,
+    interleave_lane: ?u2 = null,
 };
 
 /// Vectorize every eligible group in `func` at the NEON/SSE/RVV width (4). Returns true if
@@ -86,6 +87,12 @@ fn runLanesGated(allocator: std.mem.Allocator, func: *Function, lanes: u8, allow
     var bi: usize = 0;
     while (bi < func.blockCount()) : (bi += 1) {
         const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            const result = func.instResult(inst) orelse continue;
+            const opcode = func.opcode(inst);
+            if (opcode == .extract and opcode.extract.index < lanes)
+                try vmap.put(allocator, result, .{ .vec = opcode.extract.aggregate, .lane = @intCast(opcode.extract.index) });
+        }
         while (true) {
             if (try vectorizeImmediateOne(allocator, func, block, &vmap, lanes, allow_i32, model, &coalesced_loads, &coalesced)) {
                 changed = true;
@@ -100,7 +107,11 @@ fn runLanesGated(allocator: std.mem.Allocator, func: *Function, lanes: u8, allow
         // Store coalescing is a per-block scan run after this block's arith groups are fused, so the
         // stored values are the fused groups' result lanes (or hand-built extracts). It rewrites each
         // run of `lanes` contiguous scalar stores of one vector's lanes into a single wide store.
-        if (try coalesceStores(allocator, func, block, &vmap, lanes)) {
+        if (try coalesceStores(allocator, func, block, &vmap, lanes, model != null and model.?.arch == .aarch64)) {
+            changed = true;
+            coalesced = true;
+        }
+        if (try groupInterleavedMemory(allocator, func, block)) {
             changed = true;
             coalesced = true;
         }
@@ -120,6 +131,78 @@ fn runLanesGated(allocator: std.mem.Allocator, func: *Function, lanes: u8, allow
     }
     if (coalesced) try cleanup(allocator, func, &coalesced_loads);
     return changed;
+}
+
+fn interleaveLane(func: *const Function, inst: Inst) ?u2 {
+    var it = func.attributesOf(.{ .inst = inst });
+    while (it.next()) |attr| switch (attr) {
+        .custom => |custom| if (std.mem.eql(u8, custom.namespace, "vulcan.aarch64") and std.mem.eql(u8, custom.key, "interleave4")) {
+            if (custom.value == .int and custom.value.int >= 0 and custom.value.int < 4) return @intCast(custom.value.int);
+        },
+        else => {},
+    };
+    return null;
+}
+
+/// Put the four backend-private structure loads and stores next to one another. The AArch64
+/// selector deliberately accepts only complete adjacent groups, so malformed or partial groups are
+/// left unchanged and rejected rather than silently acquiring ordinary wide-load semantics.
+fn groupInterleavedMemory(allocator: std.mem.Allocator, func: *Function, block: Block) Error!bool {
+    var loads: [4]?Inst = @splat(null);
+    var stores: [4]?Inst = @splat(null);
+    var load_count: usize = 0;
+    var store_count: usize = 0;
+    var common_ptr: ?Value = null;
+    for (func.blockInsts(block)) |inst| {
+        const lane = interleaveLane(func, inst) orelse continue;
+        const ptr = switch (func.opcode(inst)) {
+            .load => |load| blk: {
+                if (loads[lane] != null) return false;
+                loads[lane] = inst;
+                load_count += 1;
+                break :blk load.ptr;
+            },
+            .store => |store| blk: {
+                if (stores[lane] != null) return false;
+                stores[lane] = inst;
+                store_count += 1;
+                break :blk store.ptr;
+            },
+            else => return false,
+        };
+        if (common_ptr) |expected| {
+            if (ptr != expected) return false;
+        } else common_ptr = ptr;
+    }
+    if (load_count == 0 and store_count == 0) return false;
+    if (load_count != 4 or store_count != 4) return false;
+
+    const old = func.blockInsts(block);
+    var rebuilt: std.ArrayList(Inst) = .empty;
+    defer rebuilt.deinit(allocator);
+    var emitted_loads = false;
+    var emitted_stores = false;
+    for (old) |inst| {
+        const tagged = interleaveLane(func, inst) != null;
+        if (tagged and func.opcode(inst) == .load) {
+            if (!emitted_loads) {
+                for (loads) |member| try rebuilt.append(allocator, member.?);
+                emitted_loads = true;
+            }
+            continue;
+        }
+        if (tagged and func.opcode(inst) == .store) continue;
+        if (!emitted_stores and func.opcode(inst) == .@"if") {
+            for (stores) |member| try rebuilt.append(allocator, member.?);
+            emitted_stores = true;
+        }
+        try rebuilt.append(allocator, inst);
+    }
+    if (!emitted_stores) for (stores) |member| try rebuilt.append(allocator, member.?);
+    const dst = func.blockInstsMut(block);
+    dst.clearRetainingCapacity();
+    try dst.appendSlice(allocator, rebuilt.items);
+    return true;
 }
 
 /// Replace `struct_new(extract(v, 0), ..., extract(v, N - 1))` with `v`.
@@ -393,8 +476,8 @@ fn vectorizeImmediateOne(
             results[k] = result;
         }
         const chained_lhs = chainVector(vmap, lhs[0..lanes]) != null;
-        const load_run = if (chained_lhs) null else analyzeLoadRun(func, block, lhs[0..lanes], g);
-        const result_store = resultsAreCoalesceableStores(func, block, results[0..lanes], lanes);
+        const load_run = if (chained_lhs) null else analyzeLoadRun(func, block, lhs[0..lanes], g, model != null and model.?.arch == .aarch64);
+        const result_store = resultsAreCoalesceableStores(func, block, results[0..lanes], lanes, model != null and model.?.arch == .aarch64);
         const result_chained = if (result_store) false else resultsChainIntoGroup(func, block, results[0..lanes], g + lanes - 1);
         if (model) |m| {
             const coalesced_ops: u8 = if (load_run != null) 1 else 0;
@@ -504,9 +587,10 @@ fn vectorizeOne(
             // else a pack. These classifications feed the profitability price AND drive emission.
             const chain_a = chainVector(vmap, ca[0..lanes]) != null;
             const chain_b = if (a_eq_b) chain_a else chainVector(vmap, cb[0..lanes]) != null;
-            const run_a = if (chain_a) null else analyzeLoadRun(func, block, ca[0..lanes], g);
-            const run_b = if (a_eq_b) run_a else if (chain_b) null else analyzeLoadRun(func, block, cb[0..lanes], g);
-            const result_store = resultsAreCoalesceableStores(func, block, cc[0..lanes], lanes);
+            const allow_interleaved = model != null and model.?.arch == .aarch64;
+            const run_a = if (chain_a) null else analyzeLoadRun(func, block, ca[0..lanes], g, allow_interleaved);
+            const run_b = if (a_eq_b) run_a else if (chain_b) null else analyzeLoadRun(func, block, cb[0..lanes], g, allow_interleaved);
+            const result_store = resultsAreCoalesceableStores(func, block, cc[0..lanes], lanes, allow_interleaved);
             // Result-chaining credit: when the group's result is NOT stored, its lanes may instead
             // feed a fusable consumer group (e.g. the SAXPY mul feeding the add), staying in a vector
             // register so the chain-reuse vmap elides the extracts. This is the producer-side analogue
@@ -544,7 +628,11 @@ fn vectorizeOne(
                     (if (splat_a) @as(u8, 1) else 0)
                 else
                     (if (splat_a) @as(u8, 1) else 0) + (if (splat_b) @as(u8, 1) else 0);
-                if (!cost.slpProfitableMem(m, head.arith.op, is_f32, lanes, distinct, coalesced_ops, chained_ops, splat_ops, result_store, result_chained)) continue :scan;
+                const profitable = cost.slpProfitableMem(m, head.arith.op, is_f32, lanes, distinct, coalesced_ops, chained_ops, splat_ops, result_store, result_chained);
+                const continues_interleaved = m.arch == .aarch64 and result_chained and
+                    ((chain_a and chainIsInterleaved(func, vmap, ca[0..lanes])) or
+                        (chain_b and chainIsInterleaved(func, vmap, cb[0..lanes])));
+                if (!profitable and !continues_interleaved) continue :scan;
             }
             pos = g;
             op = head.arith.op;
@@ -613,11 +701,27 @@ fn buildOperand(
         // One wide load from the run's base address replaces `lanes` scalar loads + a pack. Record
         // each replaced load's result so `cleanup` removes it once its scalar uses are gone.
         const v = try func.appendInst(block, vt, .{ .load = .{ .ptr = r.ptr0 } });
+        if (r.interleave_lane) |lane| try func.addAttr(.{ .inst = func.definingInst(v).? }, .{ .custom = .{
+            .namespace = "vulcan.aarch64",
+            .key = "interleave4",
+            .value = .{ .int = lane },
+        } });
         for (0..scalars.len) |k| try coalesced_loads.put(allocator, func.instResult(r.loads[k]).?, {});
+        for (scalars, 0..) |scalar, lane| try vmap.put(allocator, scalar, .{ .vec = v, .lane = @intCast(lane) });
         coalesced.* = true;
         return v;
     }
-    return pack(func, block, vt, scalars);
+    if (allSame(scalars)) {
+        for (func.blockInsts(block)) |inst| {
+            const result = func.instResult(inst) orelse continue;
+            const opcode = func.opcode(inst);
+            if (opcode == .splat and opcode.splat.scalar == scalars[0] and func.valueType(result) == vt) return result;
+        }
+        return func.appendSplat(block, vt, scalars[0]);
+    }
+    const v = try pack(func, block, vt, scalars);
+    for (scalars, 0..) |scalar, lane| try vmap.put(allocator, scalar, .{ .vec = v, .lane = @intCast(lane) });
+    return v;
 }
 
 /// Whether every scalar in `scalars` is the same value (a splat: one broadcast, not a pack).
@@ -635,6 +739,12 @@ fn chainVector(vmap: *const VMap, scalars: []const Value) ?Value {
         if (lk.vec != l0.vec or lk.lane != k) return null;
     }
     return l0.vec;
+}
+
+fn chainIsInterleaved(func: *const Function, vmap: *const VMap, scalars: []const Value) bool {
+    const vector = chainVector(vmap, scalars) orelse return false;
+    const inst = func.definingInst(vector) orelse return false;
+    return interleaveLane(func, inst) != null;
 }
 
 /// Pack scalars into a vector with a `struct_new` (lowered to one insert per lane). A pure
@@ -672,7 +782,8 @@ fn addrParts(func: *const Function, ptr: Value) AddrParts {
     if (func.definingInst(ptr)) |inst| {
         const opcode = func.opcode(inst);
         if (opcode == .arith_imm and opcode.arith_imm.op == .add) {
-            return .{ .base = opcode.arith_imm.lhs, .off = opcode.arith_imm.imm };
+            const inner = addrParts(func, opcode.arith_imm.lhs);
+            return .{ .base = inner.base, .off = std.math.add(i64, inner.off, opcode.arith_imm.imm) catch return .{ .base = ptr, .off = 0 } };
         }
     }
     return .{ .base = ptr, .off = 0 };
@@ -749,13 +860,14 @@ fn hasWriteBetween(func: *const Function, block: Block, lo: usize, hi: usize) bo
 /// `group_pos` (so the single wide load, which executes at `group_pos`, sees the same memory each
 /// scalar load saw). Any failure returns null and the caller packs, which is always correct. A miss
 /// is a missed optimization; a false positive would be a miscompile, so every condition is exact.
-fn analyzeLoadRun(func: *const Function, block: Block, scalars: []const Value, group_pos: usize) ?LoadRun {
+fn analyzeLoadRun(func: *const Function, block: Block, scalars: []const Value, group_pos: usize, allow_interleaved: bool) ?LoadRun {
     std.debug.assert(scalars.len >= 2 and scalars.len <= MAX_LANES);
     var loads: [MAX_LANES]Inst = undefined;
     var min_pos: usize = std.math.maxInt(usize);
     var base0: Value = undefined;
     var off0: i64 = undefined;
     var ptr0: Value = undefined;
+    var run_step: i64 = ELEM_BYTES;
     for (scalars, 0..) |s, k| {
         const inst = func.definingInst(s) orelse return null;
         if (func.opcode(inst) != .load) return null;
@@ -782,15 +894,22 @@ fn analyzeLoadRun(func: *const Function, block: Block, scalars: []const Value, g
             ptr0 = func.opcode(inst).load.ptr;
         } else {
             if (parts.base != base0) return null;
-            // Lane k must sit exactly one element above lane k-1: base + off0 + k*ELEM_BYTES. This
-            // also rules out a repeated address (a splat), whose offsets would not be distinct.
-            if (parts.off != off0 + @as(i64, @intCast(k)) * ELEM_BYTES) return null;
+            if (k == 1) {
+                run_step = parts.off - off0;
+                if (run_step != ELEM_BYTES and !(allow_interleaved and run_step == 16)) return null;
+            }
+            if (parts.off != off0 + @as(i64, @intCast(k)) * run_step) return null;
         }
     }
     // A load's result is defined before it is used, so every load precedes the group; guard anyway.
     if (min_pos >= group_pos) return null;
     if (hasWriteBetween(func, block, min_pos, group_pos)) return null;
-    return .{ .ptr0 = ptr0, .loads = loads };
+    const interleaved = allow_interleaved and scalars.len == 4 and run_step == 16 and off0 >= 0 and off0 < 16 and @rem(off0, 4) == 0;
+    return .{
+        .ptr0 = if (interleaved) base0 else ptr0,
+        .loads = loads,
+        .interleave_lane = if (interleaved) @intCast(@divExact(off0, 4)) else null,
+    };
 }
 
 /// Whether the group's `lanes` scalar results are each consumed by exactly one store, those stores
@@ -798,12 +917,13 @@ fn analyzeLoadRun(func: *const Function, block: Block, scalars: []const Value, g
 /// the earliest and latest of them. A pre-vectorization predictor used only to PRICE the group (the
 /// actual rewrite is `coalesceStores`, which runs on the post-fusion extracts). Conservative: any
 /// non-store memory op, or a store not part of this run, inside the window forbids coalescing.
-fn resultsAreCoalesceableStores(func: *const Function, block: Block, results: []const Value, lanes: u8) bool {
+fn resultsAreCoalesceableStores(func: *const Function, block: Block, results: []const Value, lanes: u8, allow_interleaved: bool) bool {
     std.debug.assert(results.len == lanes);
     const insts = func.blockInsts(block);
     var positions: [MAX_LANES]usize = undefined;
     var base0: Value = undefined;
     var off0: i64 = undefined;
+    var step: i64 = ELEM_BYTES;
     for (results, 0..) |res, k| {
         // The unique store whose value is this result. Two stores of one result, or none, disqualify.
         var store_pos: ?usize = null;
@@ -822,7 +942,9 @@ fn resultsAreCoalesceableStores(func: *const Function, block: Block, results: []
             off0 = parts.off;
         } else {
             if (parts.base != base0) return false;
-            if (parts.off != off0 + @as(i64, @intCast(k)) * ELEM_BYTES) return false;
+            if (k == 1) step = parts.off - off0;
+            if (step != ELEM_BYTES and !(allow_interleaved and lanes == 4 and step == 16)) return false;
+            if (parts.off != off0 + @as(i64, @intCast(k)) * step) return false;
         }
     }
     var lo = positions[0];
@@ -1083,16 +1205,16 @@ fn laneOfValue(func: *const Function, vmap: *const VMap, v: Value) ?LaneOf {
 /// Runs after this block's arith groups are fused, so a group's result lanes are the extracts feeding
 /// the stores. Conservative: the run must be barrier-free (no load/call/if or foreign store between
 /// its stores), lane-ordered, and exactly contiguous, or it is left as scalar stores.
-fn coalesceStores(allocator: std.mem.Allocator, func: *Function, block: Block, vmap: *const VMap, lanes: u8) Error!bool {
+fn coalesceStores(allocator: std.mem.Allocator, func: *Function, block: Block, vmap: *const VMap, lanes: u8, allow_interleaved: bool) Error!bool {
     var changed = false;
     // Re-scan from the top after each rewrite: removing stores shifts positions, and a block may hold
     // more than one store run (multiple SLP groups). Bounded by the store count, so it terminates.
-    while (try coalesceStoreRun(allocator, func, block, vmap, lanes)) changed = true;
+    while (try coalesceStoreRun(allocator, func, block, vmap, lanes, allow_interleaved)) changed = true;
     return changed;
 }
 
 /// Find and coalesce the first eligible store run in `block`. Returns true if it rewrote one.
-fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block, vmap: *const VMap, lanes: u8) Error!bool {
+fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block, vmap: *const VMap, lanes: u8, allow_interleaved: bool) Error!bool {
     const insts = func.blockInsts(block);
     var start: usize = 0;
     while (start < insts.len) : (start += 1) {
@@ -1173,6 +1295,7 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
         var vec: Value = undefined;
         var base0: Value = undefined;
         var off0: i64 = undefined;
+        var step: i64 = ELEM_BYTES;
         var ok = true;
         for (0..lanes) |j| {
             const st = func.opcode(insts[store_positions[j]]).store;
@@ -1190,7 +1313,9 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
                 base0 = parts.base;
                 off0 = parts.off;
             } else {
-                if (lane.vec != vec or parts.base != base0 or parts.off != off0 + @as(i64, @intCast(j)) * ELEM_BYTES) {
+                if (j == 1) step = parts.off - off0;
+                const valid_step = step == ELEM_BYTES or (allow_interleaved and lanes == 4 and step == 16);
+                if (lane.vec != vec or parts.base != base0 or !valid_step or parts.off != off0 + @as(i64, @intCast(j)) * step) {
                     ok = false;
                     break;
                 }
@@ -1200,7 +1325,13 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
         // Rewrite store 0 in place to store the whole vector to its (lane-0) address, and drop the
         // other `lanes-1` scalar stores. Their now-dead extracts fall to `cleanup`.
         const st0 = func.opcode(insts[store_positions[0]]).store;
-        func.opcodeMut(insts[store_positions[0]]).* = .{ .store = .{ .value = vec, .ptr = st0.ptr, .@"volatile" = st0.@"volatile" } };
+        const interleaved = step == 16 and off0 >= 0 and off0 < 16 and @rem(off0, 4) == 0;
+        func.opcodeMut(insts[store_positions[0]]).* = .{ .store = .{ .value = vec, .ptr = if (interleaved) base0 else st0.ptr, .@"volatile" = st0.@"volatile" } };
+        if (interleaved) try func.addAttr(.{ .inst = insts[store_positions[0]] }, .{ .custom = .{
+            .namespace = "vulcan.aarch64",
+            .key = "interleave4",
+            .value = .{ .int = @intCast(@divExact(off0, 4)) },
+        } });
         var drop: [MAX_LANES]Inst = undefined;
         for (1..lanes) |j| drop[j - 1] = insts[store_positions[j]];
         try removeInsts(allocator, func, block, drop[0 .. lanes - 1]);
