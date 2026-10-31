@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
+const dce = @import("../dce.zig");
 const mm = @import("model.zig");
 
 const Function = ir.function.Function;
@@ -176,9 +177,56 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
         try simtSchedule(allocator, func);
         return;
     }
-    for (0..func.blockCount()) |bi| {
-        try scheduleBlock(allocator, func, @fromBackingInt(@intCast(bi)), model);
+    for (0..func.blockCount()) |bi| try scheduleBlock(allocator, func, @fromBackingInt(@intCast(bi)), model);
+
+    if (model.fuses(.shift_add)) {
+        const uses = try allocator.alloc(u32, func.valueCount());
+        defer allocator.free(uses);
+        dce.countUses(func, uses);
+        for (0..func.blockCount()) |bi| {
+            restoreShiftAddPairs(func, @fromBackingInt(@intCast(bi)), model, uses);
+        }
     }
+}
+
+fn restoreShiftAddPairs(func: *Function, block: Block, model: *const Model, uses: []const u32) void {
+    const insts = func.blockInstsMut(block).items;
+    var consumer_index: usize = 1;
+    while (consumer_index < insts.len) : (consumer_index += 1) {
+        const addsub = switch (func.opcode(insts[consumer_index])) {
+            .arith => |a| a,
+            else => continue,
+        };
+        if (addsub.op != .add and addsub.op != .sub) continue;
+
+        const candidates = [2]Value{ addsub.rhs, addsub.lhs };
+        const candidate_count: usize = if (addsub.op == .add) 2 else 1;
+        for (candidates[0..candidate_count]) |shifted| {
+            if (uses[@backingInt(shifted)] != 1) continue;
+            const producer = func.definingInst(shifted) orelse continue;
+            const shift = switch (func.opcode(producer)) {
+                .arith_imm => |a| a,
+                else => continue,
+            };
+            if (shift.op != .shl or !supportsShiftAdd(func, model, shifted, shift.imm, addsub.op)) continue;
+            const producer_index = std.mem.indexOfScalar(Inst, insts[0..consumer_index], producer) orelse continue;
+            if (producer_index + 1 == consumer_index) break;
+            std.mem.rotate(Inst, insts[producer_index..consumer_index], 1);
+            break;
+        }
+    }
+}
+
+fn supportsShiftAdd(func: *const Function, model: *const Model, result: Value, shift: i64, op: ir.function.BinOp) bool {
+    const bits = switch (func.types.type_kind(func.valueType(result))) {
+        .int => |int| int.bits,
+        else => return false,
+    };
+    return switch (model.arch) {
+        .aarch64 => shift >= 1 and shift < (if (bits > 32) @as(i64, 64) else 32),
+        .riscv64 => op == .add and bits == 64 and shift >= 1 and shift <= 3,
+        else => false,
+    };
 }
 
 /// Whether `op` writes memory, so a load must not be hoisted across it. A block holding one
@@ -478,6 +526,55 @@ fn scheduleBlock(allocator: std.mem.Allocator, func: *Function, block: Block, mo
     }
 
     try func.setBlockInsts(block, order.items);
+}
+
+test "scheduler keeps a single-use shift beside its fused add" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const x = try func.appendBlockParam(block, i32_t);
+    const y = try func.appendBlockParam(block, i32_t);
+    const shifted = try func.appendArithImm(block, i32_t, .shl, x, 1);
+    const independent = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = y, .rhs = y } });
+    const sum = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = shifted } });
+    const result = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = independent } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+
+    try run(allocator, &func, registry.modelFor(.@"ampere-altra"));
+
+    const insts = func.blockInsts(block);
+    const shift_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(shifted).?).?;
+    const independent_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(independent).?).?;
+    const sum_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(sum).?).?;
+    try std.testing.expectEqual(shift_index + 1, sum_index);
+    try std.testing.expect(independent_index < shift_index);
+}
+
+test "scheduler leaves a shift with two users available to both" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const x = try func.appendBlockParam(block, i32_t);
+    const y = try func.appendBlockParam(block, i32_t);
+    const shifted = try func.appendArithImm(block, i32_t, .shl, x, 1);
+    const independent = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = y, .rhs = y } });
+    const sum = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = shifted } });
+    const second = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .bit_xor, .lhs = shifted, .rhs = independent } });
+    const result = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = second } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+
+    try run(allocator, &func, registry.modelFor(.@"ampere-altra"));
+
+    const insts = func.blockInsts(block);
+    const shift_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(shifted).?).?;
+    const independent_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(independent).?).?;
+    const sum_index = std.mem.indexOfScalar(Inst, insts, func.definingInst(sum).?).?;
+    try std.testing.expect(shift_index < independent_index);
+    try std.testing.expect(independent_index < sum_index);
 }
 
 const registry = @import("registry.zig");
