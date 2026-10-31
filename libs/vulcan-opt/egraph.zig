@@ -63,6 +63,8 @@ const Graph = struct {
     ops: std.AutoHashMapUnmanaged(OpKey, usize) = .empty,
     match_left: std.ArrayList(OpNode) = .empty,
     match_right: std.ArrayList(OpNode) = .empty,
+    match_inner: std.ArrayList(OpNode) = .empty,
+    op_mask: u16 = 0,
     ops_valid: bool = true,
     hit_limit: bool = false,
 
@@ -74,6 +76,7 @@ const Graph = struct {
         self.ops.deinit(self.allocator);
         self.match_left.deinit(self.allocator);
         self.match_right.deinit(self.allocator);
+        self.match_inner.deinit(self.allocator);
     }
 
     fn reset(self: *Graph) void {
@@ -84,6 +87,8 @@ const Graph = struct {
         self.ops.clearRetainingCapacity();
         self.match_left.clearRetainingCapacity();
         self.match_right.clearRetainingCapacity();
+        self.match_inner.clearRetainingCapacity();
+        self.op_mask = 0;
         self.ops_valid = true;
         self.hit_limit = false;
     }
@@ -174,6 +179,7 @@ const Graph = struct {
         try self.nodes.append(self.allocator, .{ .class = class, .node = .{ .op = node } });
         const index = self.nodes.items.len - 1;
         self.attachNode(class, index);
+        self.op_mask |= opBit(node.op);
         try self.ops.put(self.allocator, key, index);
         return class;
     }
@@ -326,6 +332,16 @@ fn sameValueOperands(left: ir.function.Arith, right: ir.function.Arith) bool {
         (left.lhs == right.rhs and left.rhs == right.lhs);
 }
 
+fn isXorCarryCandidate(func: *const Function, exclusive: ir.function.Arith, carry: ir.function.Arith) bool {
+    if (exclusive.op != .bit_xor or carry.op != .add or carry.lhs != carry.rhs) return false;
+    const intersection_inst = func.definingInst(carry.lhs) orelse return false;
+    const intersection = switch (func.opcode(intersection_inst)) {
+        .arith => |arith| if (arith.op == .bit_and) arith else return false,
+        else => return false,
+    };
+    return sameValueOperands(exclusive, intersection);
+}
+
 fn bitwisePairResult(outer: BinOp, left: BinOp, right: BinOp) ?BinOp {
     const and_or = (left == .bit_and and right == .bit_or) or (left == .bit_or and right == .bit_and);
     const and_xor = (left == .bit_and and right == .bit_xor) or (left == .bit_xor and right == .bit_and);
@@ -368,6 +384,7 @@ fn hasFactorCandidateAt(func: *const Function, value: Value, sum: ir.function.Ar
         if (lhs) |op| if (op.op == .sub and op.rhs == sum.rhs) return true;
         if (rhs) |op| if (op.op == .sub and op.rhs == sum.lhs) return true;
         if (lhs != null and rhs != null) {
+            if (isXorCarryCandidate(func, lhs.?, rhs.?) or isXorCarryCandidate(func, rhs.?, lhs.?)) return true;
             if (lhs.?.op == .sub and rhs.?.op == .add and (lhs.?.rhs == rhs.?.lhs or lhs.?.rhs == rhs.?.rhs)) return true;
             if (lhs.?.op == .add and rhs.?.op == .sub and (rhs.?.rhs == lhs.?.lhs or rhs.?.rhs == lhs.?.rhs)) return true;
             if (lhs.?.op == .sub and rhs.?.op == .sub and (lhs.?.rhs == rhs.?.lhs or lhs.?.lhs == rhs.?.rhs)) return true;
@@ -692,6 +709,43 @@ fn foldAddBitwiseDifference(graph: *Graph, outer_class: u32, addition: OpNode, b
     return graph.merge(outer_class, replacement);
 }
 
+fn foldXorCarryOrientation(graph: *Graph, outer_class: u32, exclusive_class: u32, carry_class: u32, ty: Type, exclusives: *std.ArrayList(OpNode), carries: *std.ArrayList(OpNode), intersections: *std.ArrayList(OpNode)) !bool {
+    exclusives.clearRetainingCapacity();
+    carries.clearRetainingCapacity();
+    try matchingOps(graph, exclusive_class, .bit_xor, ty, exclusives);
+    try matchingOps(graph, carry_class, .add, ty, carries);
+    var changed = false;
+    for (exclusives.items) |exclusive| for (carries.items) |carry| {
+        if (graph.find(carry.lhs) != graph.find(carry.rhs)) continue;
+        intersections.clearRetainingCapacity();
+        try matchingOps(graph, carry.lhs, .bit_and, ty, intersections);
+        for (intersections.items) |intersection| {
+            if (!sameClassOperands(graph, exclusive, intersection)) continue;
+            const replacement = try graph.addOp(.{
+                .op = .add,
+                .lhs = exclusive.lhs,
+                .rhs = exclusive.rhs,
+                .ty = ty,
+                .existing = null,
+            }) orelse return changed;
+            changed = graph.merge(outer_class, replacement) or changed;
+        }
+        if (graph.hit_limit) break;
+    };
+    return changed;
+}
+
+fn foldXorCarry(graph: *Graph, outer_class: u32, outer: OpNode, exclusives: *std.ArrayList(OpNode), carries: *std.ArrayList(OpNode), intersections: *std.ArrayList(OpNode)) !bool {
+    var changed = false;
+    if (classHasOp(graph, outer.lhs, .bit_xor) and classHasOp(graph, outer.rhs, .add)) {
+        changed = try foldXorCarryOrientation(graph, outer_class, outer.lhs, outer.rhs, outer.ty, exclusives, carries, intersections) or changed;
+    }
+    if (!graph.hit_limit and classHasOp(graph, outer.rhs, .bit_xor) and classHasOp(graph, outer.lhs, .add)) {
+        changed = try foldXorCarryOrientation(graph, outer_class, outer.rhs, outer.lhs, outer.ty, exclusives, carries, intersections) or changed;
+    }
+    return changed;
+}
+
 fn foldNestedIdempotent(graph: *Graph, outer_class: u32, outer: OpNode, matches: *std.ArrayList(OpNode)) !bool {
     var changed = false;
     matches.clearRetainingCapacity();
@@ -887,6 +941,7 @@ fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.Arra
 fn saturate(graph: *Graph) !void {
     const left = &graph.match_left;
     const right = &graph.match_right;
+    const nested_matches = &graph.match_inner;
 
     var iter: usize = 0;
     while (iter < graph.limits.max_iters and !graph.hit_limit) : (iter += 1) {
@@ -965,6 +1020,9 @@ fn saturate(graph: *Graph) !void {
             if ((sum.op == .add or sum.op == .sub) and hasMixedAddSubChildren(graph, sum)) {
                 changed = try foldMixedAddSub(graph, entry.class, sum, left, right) or changed;
                 changed = try cancelCrossTerms(graph, entry.class, sum, left, right) or changed;
+            }
+            if (sum.op == .add and graph.op_mask & opBit(.bit_xor) != 0) {
+                changed = try foldXorCarry(graph, entry.class, sum, left, right, nested_matches) or changed;
             }
             if (sum.op == .bit_and or sum.op == .bit_or) {
                 changed = try foldNestedIdempotent(graph, entry.class, sum, left) or changed;
@@ -1219,6 +1277,29 @@ fn expectAddBitwiseDifference(rhs_op: BinOp, expected: BinOp) !void {
     const replacement = func.terminator(block).?.ret.values[0];
     const reduced = func.opcode(func.definingInst(replacement).?).arith;
     try std.testing.expectEqual(expected, reduced.op);
+    try std.testing.expect((reduced.lhs == a and reduced.rhs == b) or (reduced.lhs == b and reduced.rhs == a));
+}
+
+fn expectXorCarry(exclusive_on_left: bool) !void {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const intersection = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } });
+    const carry = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = intersection, .rhs = intersection } });
+    const exclusive = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = b, .rhs = a } });
+    const lhs = if (exclusive_on_left) exclusive else carry;
+    const rhs = if (exclusive_on_left) carry else exclusive;
+    const combined = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = lhs, .rhs = rhs } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(combined) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const reduced = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.add, reduced.op);
     try std.testing.expect((reduced.lhs == a and reduced.rhs == b) or (reduced.lhs == b and reduced.rhs == a));
 }
 
@@ -1702,6 +1783,11 @@ test "egraph reduces addition minus xor to doubled intersection" {
     const intersection = func.opcode(func.definingInst(doubled.lhs).?).arith;
     try std.testing.expectEqual(BinOp.bit_and, intersection.op);
     try std.testing.expect((intersection.lhs == a and intersection.rhs == b) or (intersection.lhs == b and intersection.rhs == a));
+}
+
+test "egraph recomposes xor and carry into addition" {
+    try expectXorCarry(true);
+    try expectXorCarry(false);
 }
 
 test "egraph folds xor combinations of matching bitwise terms" {
