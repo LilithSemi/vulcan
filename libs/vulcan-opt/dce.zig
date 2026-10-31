@@ -1,5 +1,7 @@
-//! Dead-code elimination: remove pure instructions whose result is never used,
-//! iterating to a fixpoint (removing one dead value can make its operands dead).
+//! Dead-code elimination: remove pure instructions whose result is never used.
+//! A worklist propagates liveness loss through operand edges, so dead dependency
+//! chains need one use-count pass and one compaction pass rather than repeated
+//! whole-function scans.
 //! Impure instructions (loads, stores, calls, `if`) are always kept.
 
 const std = @import("std");
@@ -125,30 +127,93 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     _ = analyses;
     const uses = try allocator.alloc(u32, func.valueCount());
     defer allocator.free(uses);
+    countUses(func, uses);
+
+    const dead = try allocator.alloc(bool, func.instCount());
+    defer allocator.free(dead);
+    @memset(dead, false);
+
+    var work: std.ArrayList(ir.function.Value) = .empty;
+    defer work.deinit(allocator);
+    for (0..func.blockCount()) |bi| {
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            if (!isPure(func.opcode(inst))) continue;
+            const result = func.instResult(inst) orelse continue;
+            if (uses[@backingInt(result)] == 0) try work.append(allocator, result);
+        }
+    }
+
+    while (work.pop()) |value| {
+        const inst = func.definingInst(value) orelse continue;
+        const inst_index = @backingInt(inst);
+        if (dead[inst_index]) continue;
+        dead[inst_index] = true;
+        try releaseOperands(allocator, func, func.opcode(inst), uses, &work);
+    }
 
     var changed = false;
-    while (true) {
-        countUses(func, uses);
-        var removed = false;
-        for (0..func.blockCount()) |bi| {
-            const insts = func.blockInstsMut(@fromBackingInt(@intCast(bi)));
-            var w: usize = 0;
-            for (insts.items) |inst| {
-                const dead = isPure(func.opcode(inst)) and
-                    if (func.instResult(inst)) |r| uses[@backingInt(r)] == 0 else false;
-                if (dead) {
-                    removed = true;
-                    continue;
-                }
-                insts.items[w] = inst;
-                w += 1;
+    for (0..func.blockCount()) |bi| {
+        const insts = func.blockInstsMut(@fromBackingInt(@intCast(bi)));
+        var w: usize = 0;
+        for (insts.items) |inst| {
+            if (dead[@backingInt(inst)]) {
+                changed = true;
+                continue;
             }
-            insts.shrinkRetainingCapacity(w);
+            insts.items[w] = inst;
+            w += 1;
         }
-        if (!removed) break;
-        changed = true;
+        insts.shrinkRetainingCapacity(w);
     }
     return changed;
+}
+
+fn releaseOperands(allocator: std.mem.Allocator, func: *const Function, op: ir.function.Opcode, uses: []u32, work: *std.ArrayList(ir.function.Value)) !void {
+    switch (op) {
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+        .arith => |a| {
+            try releaseOperand(allocator, func, a.lhs, uses, work);
+            try releaseOperand(allocator, func, a.rhs, uses, work);
+        },
+        .arith_imm => |a| try releaseOperand(allocator, func, a.lhs, uses, work),
+        .icmp => |c| {
+            try releaseOperand(allocator, func, c.lhs, uses, work);
+            try releaseOperand(allocator, func, c.rhs, uses, work);
+        },
+        .select => |s| {
+            try releaseOperand(allocator, func, s.cond, uses, work);
+            try releaseOperand(allocator, func, s.then, uses, work);
+            try releaseOperand(allocator, func, s.@"else", uses, work);
+        },
+        .struct_new => |s| for (func.valueList(s.fields)) |field| try releaseOperand(allocator, func, field, uses, work),
+        .extract => |e| try releaseOperand(allocator, func, e.aggregate, uses, work),
+        .convert => |c| try releaseOperand(allocator, func, c.value, uses, work),
+        .decode_low_float, .encode_low_float => |c| try releaseOperand(allocator, func, c.value, uses, work),
+        .dequantize_nvfp4, .quantize_nvfp4 => |c| {
+            try releaseOperand(allocator, func, c.value, uses, work);
+            try releaseOperand(allocator, func, c.block_scale, uses, work);
+            try releaseOperand(allocator, func, c.global_scale, uses, work);
+        },
+        .unary => |u| try releaseOperand(allocator, func, u.value, uses, work),
+        .dot => |d| {
+            try releaseOperand(allocator, func, d.acc, uses, work);
+            try releaseOperand(allocator, func, d.a, uses, work);
+            try releaseOperand(allocator, func, d.b, uses, work);
+        },
+        .reduce => |r| try releaseOperand(allocator, func, r.vector, uses, work),
+        .splat => |s| try releaseOperand(allocator, func, s.scalar, uses, work),
+        else => unreachable,
+    }
+}
+
+fn releaseOperand(allocator: std.mem.Allocator, func: *const Function, value: ir.function.Value, uses: []u32, work: *std.ArrayList(ir.function.Value)) !void {
+    const index = @backingInt(value);
+    std.debug.assert(uses[index] > 0);
+    uses[index] -= 1;
+    if (uses[index] != 0) return;
+    const inst = func.definingInst(value) orelse return;
+    if (isPure(func.opcode(inst))) try work.append(allocator, value);
 }
 
 test "removes a chain of dead pure instructions" {
