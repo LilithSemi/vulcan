@@ -944,12 +944,8 @@ fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, p
 /// Compiles in-memory `source` (already-read text, `pp_opts` carrying its filename and
 /// predefines) to a relocatable object. Split from `compileToObject` so the driver can
 /// also compile a SYNTHETIC source string it never read from disk (see
-/// `synthDsoHandleObject`). When `optimize` is set, the target-independent optimization
-/// pipeline (`opt.optimize`: mem2reg, then the clean-up passes) runs over each function's IR
-/// FIRST, so its allocas become register-resident SSA values. `model`, when set, then runs
-/// `mm.optimize` (the microarch layer, which needs that mem2reg'd form to do anything) over the
-/// same IR, and is handed to `writeObjectDataForModel` so the backend tunes its own choices
-/// (instruction selection, scheduling) for it too.
+/// `synthDsoHandleObject`). The target-independent and model-driven transforms run before final
+/// scheduling and block layout. The backend also receives `model` for its instruction choices.
 ///
 /// The target-independent pipeline runs in TWO halves with the microarch layer between them.
 /// `opt.optimizeLate` reduces a loop's addresses to loop-carried pointers, which changes the shape
@@ -962,8 +958,14 @@ fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_op
     var mfs: std.ArrayList(target.native.ModuleFunction) = .empty;
     for (mod.funcs) |*nf| {
         if (optimize.optimizes()) _ = try opt.optimizeEarly(allocator, &nf.func);
-        if (optimize.runsMicroarch()) if (model) |m| _ = try mm.optimize(allocator, &nf.func, m);
+        if (optimize.runsMicroarch()) {
+            if (model) |m| _ = try mm.optimizeTransforms(allocator, &nf.func, m);
+        }
         if (optimize.optimizes()) _ = try opt.optimizeLate(allocator, &nf.func);
+        if (optimize.runsMicroarch()) {
+            if (model) |m| try mm.schedule.run(allocator, &nf.func, m);
+        }
+        if (optimize.optimizes()) _ = try opt.layout(allocator, &nf.func, null);
         try mfs.append(allocator, .{ .name = nf.name, .func = &nf.func });
     }
 

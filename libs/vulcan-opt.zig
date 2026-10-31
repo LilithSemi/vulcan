@@ -69,33 +69,28 @@ pub const late_pipeline = [_]pass.Pass{
     dce.pass_def,
 };
 
-/// Optimize `func` in place: the default pipeline, then the late one. Returns whether anything
-/// changed. A caller that runs `microarch.optimize` over the same function calls the two halves
-/// separately instead, with the microarch layer in between.
+/// Optimize `func` in place and lay out its blocks after both cleanup pipelines.
 pub fn optimize(allocator: std.mem.Allocator, func: *ir.function.Function) pass.Error!bool {
     const early = try optimizeEarly(allocator, func);
     const late = try optimizeLate(allocator, func);
-    return early or late;
+    const laid_out = try layout(allocator, func, null);
+    return early or late or laid_out;
 }
 
-/// The default pipeline to a fixpoint, then block layout. This is the whole of `optimize` except
-/// the late pipeline, and it leaves every loop in the shape the microarch idiom recognizers read.
+/// The default pipeline to a fixpoint. It leaves every loop in the shape the microarchitecture
+/// idiom recognizers read.
 pub fn optimizeEarly(allocator: std.mem.Allocator, func: *ir.function.Function) pass.Error!bool {
-    const optimized = try pass.runToFixpoint(allocator, func, &default_pipeline, 16);
-    // Block layout is a ONE-SHOT run after the pipeline fixpoint, not an iterated pass: it computes a
-    // single fall-through-friendly linearization and permutes the blocks into it once. It is
-    // dominance-respecting by construction and falls back to the original order if unsure, so it is
-    // always safe on the machine-backend path.
-    const laid_out = try blocklayout.layout(allocator, func, null);
-    return optimized or laid_out;
+    return pass.runToFixpoint(allocator, func, &default_pipeline, 16);
 }
 
-/// The late pipeline to a fixpoint. Safe to run after `microarch.optimize`: it adds no block and
-/// moves none, so the layout `optimizeEarly` settled still holds. It does append to the preheader
-/// and the latch of each loop it reduces, which `microarch.schedule` has by then already ordered,
-/// so those few instructions land unscheduled at the end of their blocks.
+/// The late pipeline to a fixpoint.
 pub fn optimizeLate(allocator: std.mem.Allocator, func: *ir.function.Function) pass.Error!bool {
     return pass.runToFixpoint(allocator, func, &late_pipeline, 16);
+}
+
+/// Lay out blocks after every CFG-changing and instruction-scheduling pass has finished.
+pub fn layout(allocator: std.mem.Allocator, func: *ir.function.Function, profile: ?[]const u64) pass.Error!bool {
+    return blocklayout.layout(allocator, func, profile);
 }
 
 test {
