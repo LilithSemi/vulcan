@@ -407,38 +407,66 @@ fn isEgraphOp(op: BinOp) bool {
     };
 }
 
-fn hasFactorCandidateFromRoot(func: *const Function, root: Value) bool {
+const ReachableExpressions = struct {
+    values: [512]Value = undefined,
+    len: usize = 0,
+    candidate: bool = false,
+    complete: bool = true,
+
+    fn reset(self: *ReachableExpressions) void {
+        self.len = 0;
+        self.candidate = false;
+        self.complete = true;
+    }
+};
+
+fn collectReachableFromRoot(func: *const Function, root: Value, reachable: *ReachableExpressions) void {
     var pending: [64]Value = undefined;
     var len: usize = 1;
     pending[0] = root;
     while (len != 0) {
         len -= 1;
         const value = pending[len];
+        if (reachable.len == reachable.values.len) {
+            reachable.complete = false;
+            reachable.candidate = true;
+            return;
+        }
+        reachable.values[reachable.len] = value;
+        reachable.len += 1;
         const inst = func.definingInst(value) orelse continue;
         const arith = switch (func.opcode(inst)) {
             .arith => |arith| if (isEgraphOp(arith.op)) arith else continue,
             else => continue,
         };
-        if ((factorInner(arith.op) != null or cancellationInner(arith.op) != null or absorptionInner(arith.op) != null) and
-            hasFactorCandidateAt(func, value, arith)) return true;
-        if (len + 2 > pending.len) return true;
+        if (!reachable.candidate and
+            (factorInner(arith.op) != null or cancellationInner(arith.op) != null or absorptionInner(arith.op) != null) and
+            hasFactorCandidateAt(func, value, arith)) reachable.candidate = true;
+        if (len + 2 > pending.len) {
+            reachable.complete = false;
+            reachable.candidate = true;
+            return;
+        }
         pending[len] = arith.lhs;
         pending[len + 1] = arith.rhs;
         len += 2;
     }
-    return false;
 }
 
 /// Avoid graph construction unless an outgoing expression can match the current rule set.
-fn hasFactorCandidate(func: *const Function, term: ir.function.Terminator) bool {
-    return switch (term) {
+fn collectReachableExpressions(func: *const Function, term: ir.function.Terminator, reachable: *ReachableExpressions) bool {
+    reachable.reset();
+    switch (term) {
         .ret => |ret| for (ret.slice()) |root| {
-            if (hasFactorCandidateFromRoot(func, root)) break true;
-        } else false,
+            collectReachableFromRoot(func, root, reachable);
+            if (!reachable.complete) break;
+        },
         .jump => |jump| for (func.valueList(jump.args)) |root| {
-            if (hasFactorCandidateFromRoot(func, root)) break true;
-        } else false,
-    };
+            collectReachableFromRoot(func, root, reachable);
+            if (!reachable.complete) break;
+        },
+    }
+    return reachable.candidate;
 }
 
 fn markReachableValue(allocator: std.mem.Allocator, classes: []?u32, touched: *std.ArrayList(usize), value: Value) !bool {
@@ -447,38 +475,6 @@ fn markReachableValue(allocator: std.mem.Allocator, classes: []?u32, touched: *s
     classes[index] = reachable_marker;
     try touched.append(allocator, index);
     return true;
-}
-
-fn markReachableFromRoot(allocator: std.mem.Allocator, func: *const Function, root: Value, classes: []?u32, touched: *std.ArrayList(usize)) !bool {
-    var pending: [512]Value = undefined;
-    var len: usize = 1;
-    pending[0] = root;
-    while (len != 0) {
-        len -= 1;
-        const value = pending[len];
-        if (!try markReachableValue(allocator, classes, touched, value)) continue;
-        const inst = func.definingInst(value) orelse continue;
-        const arith = switch (func.opcode(inst)) {
-            .arith => |arith| if (isEgraphOp(arith.op)) arith else continue,
-            else => continue,
-        };
-        if (len + 2 > pending.len) return false;
-        pending[len] = arith.lhs;
-        pending[len + 1] = arith.rhs;
-        len += 2;
-    }
-    return true;
-}
-
-fn markReachableRoots(allocator: std.mem.Allocator, func: *const Function, term: ir.function.Terminator, classes: []?u32, touched: *std.ArrayList(usize)) !bool {
-    return switch (term) {
-        .ret => |ret| for (ret.slice()) |root| {
-            if (!try markReachableFromRoot(allocator, func, root, classes, touched)) break false;
-        } else true,
-        .jump => |jump| for (func.valueList(jump.args)) |root| {
-            if (!try markReachableFromRoot(allocator, func, root, classes, touched)) break false;
-        } else true,
-    };
 }
 
 fn markWholeBlock(allocator: std.mem.Allocator, func: *const Function, block: Block, classes: []?u32, touched: *std.ArrayList(usize)) !void {
@@ -1110,11 +1106,12 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
     defer extraction_best.deinit(allocator);
     var memo_storage: std.ArrayList(?Value) = .empty;
     defer memo_storage.deinit(allocator);
+    var reachable: ReachableExpressions = .{};
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         const term = func.terminator(block) orelse continue;
         if (!hasOptimizableRoots(term)) continue;
-        if (!hasFactorCandidate(func, term)) continue;
+        if (!collectReachableExpressions(func, term, &reachable)) continue;
         graph.reset();
         if (classes_storage == null) {
             const classes = try allocator.alloc(?u32, func.valueCount());
@@ -1127,7 +1124,11 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
         const classes = classes_storage.?;
         const original_costs = costs_storage.?;
         std.debug.assert(touched.items.len == 0);
-        if (!try markReachableRoots(allocator, func, term, classes, &touched)) {
+        if (reachable.complete) {
+            for (reachable.values[0..reachable.len]) |value| {
+                _ = try markReachableValue(allocator, classes, &touched, value);
+            }
+        } else {
             try markWholeBlock(allocator, func, block, classes, &touched);
         }
         try importBlock(&graph, func, block, classes, original_costs, &touched);
@@ -1308,8 +1309,9 @@ test "egraph candidate discovery follows outgoing expressions" {
     const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
     const sum = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = ab, .rhs = ac } });
 
-    try std.testing.expect(!hasFactorCandidate(&func, .{ .ret = ir.function.Ret.one(a) }));
-    try std.testing.expect(hasFactorCandidate(&func, .{ .ret = ir.function.Ret.one(sum) }));
+    var reachable: ReachableExpressions = .{};
+    try std.testing.expect(!collectReachableExpressions(&func, .{ .ret = ir.function.Ret.one(a) }, &reachable));
+    try std.testing.expect(collectReachableExpressions(&func, .{ .ret = ir.function.Ret.one(sum) }, &reachable));
 }
 
 test "egraph hash-consing follows merged child classes" {
