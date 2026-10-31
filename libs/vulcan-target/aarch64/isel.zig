@@ -1211,6 +1211,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // materializing it into a register here.
                     if (foldsAsCmpImm(func, insts, inst_idx)) continue;
                     if (foldsAsAddSubImm(func, insts, inst_idx)) continue;
+                    if (foldsAsLogicalImm(func, insts, inst_idx)) continue;
                     const result = func.instResult(inst).?;
                     const rd = ctx.resultReg(result);
                     if (regClass(func, result) == .fpr) {
@@ -1331,6 +1332,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try storeResult(allocator, &code, ctx, result, rd);
                         continue;
                     }
+                    if (logicalImmFold(func, a, result)) |f| {
+                        const rl = try ctx.loadOp(allocator, &code, f.base, spill_op[0]);
+                        const rd = ctx.resultReg(result);
+                        std.debug.assert(try tryLogicalImm(allocator, &code, a.op, rd, rl, f.imm, isWide(func, result)));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     try ctx.binary(allocator, &code, result, a.op, a.lhs, a.rhs);
                 },
                 .arith_imm => |a| {
@@ -1354,7 +1362,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const wide = isWide(func, result);
                     // Prefer the add/sub immediate form for a small constant; only fall back to
                     // materializing the constant in a scratch register and a register op otherwise.
-                    if (!try tryAddSubImm(allocator, &code, a.op, rd, rl, a.imm, wide)) {
+                    if (!try tryAddSubImm(allocator, &code, a.op, rd, rl, a.imm, wide) and
+                        !try tryLogicalImm(allocator, &code, a.op, rd, rl, a.imm, wide))
+                    {
                         // A sixty four bit operation takes the whole immediate. `loadConst` keeps the low
                         // word only, which is right for a `w` register and silently wrong here: a mask of
                         // a bit above the low word came out as zero, and a negative immediate came out
@@ -3959,6 +3969,34 @@ fn addSubImmFold(func: *const Function, a: ir.function.Arith) ?struct { base: Va
     return null;
 }
 
+const LogicalImmFold = struct { base: Value, immediate: Value, imm: i64 };
+
+fn logicalImmWord(op: ir.function.BinOp, imm: i64, wide: bool) ?u32 {
+    const bits: u64 = @bitCast(imm);
+    return switch (op) {
+        .bit_and => encode.andImm(.x0, .x0, bits, wide),
+        .bit_or => encode.orrImm(.x0, .x0, bits, wide),
+        .bit_xor => encode.eorImm(.x0, .x0, bits, wide),
+        else => null,
+    };
+}
+
+fn logicalImmConst(func: *const Function, value: Value, op: ir.function.BinOp, wide: bool) ?i64 {
+    const def = func.definingInst(value) orelse return null;
+    if (func.opcode(def) != .iconst) return null;
+    const imm = func.opcode(def).iconst;
+    return if (logicalImmWord(op, imm, wide) != null) imm else null;
+}
+
+/// A commutative and/or/xor whose constant operand is an encodable A64 bitmask immediate.
+fn logicalImmFold(func: *const Function, a: ir.function.Arith, result: Value) ?LogicalImmFold {
+    if (a.op != .bit_and and a.op != .bit_or and a.op != .bit_xor) return null;
+    const wide = isWide(func, result);
+    if (logicalImmConst(func, a.rhs, a.op, wide)) |imm| return .{ .base = a.lhs, .immediate = a.rhs, .imm = imm };
+    if (logicalImmConst(func, a.lhs, a.op, wide)) |imm| return .{ .base = a.rhs, .immediate = a.lhs, .imm = imm };
+    return null;
+}
+
 /// Whether the `iconst` at `insts[inst_idx]` is consumed ONLY as the folded immediate of an add/sub,
 /// so its register materialization can be skipped. Requires it to fit the add/sub
 /// immediate, to have exactly one use, and that use to be a foldable operand (a `sub` LEFT operand is
@@ -3982,6 +4020,27 @@ fn foldsAsAddSubImm(func: *const Function, insts: []const ir.function.Inst, inst
             // left is the base register, which must stay materialized).
             if (oa.rhs == result) return true;
             if (oa.lhs == result) return oa.op == .add and addSubImmConst(func, oa.rhs) == null;
+        }
+    }
+    return false;
+}
+
+/// Whether an integer constant has one use and that use emits it in an A64 logical-immediate
+/// instruction, allowing the constant's register materialization to disappear.
+fn foldsAsLogicalImm(func: *const Function, insts: []const ir.function.Inst, inst_idx: usize) bool {
+    const inst = insts[inst_idx];
+    if (func.opcode(inst) != .iconst) return false;
+    const result = func.instResult(inst) orelse return false;
+    if (countUses(func, result) != 1) return false;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |other| {
+            const a = switch (func.opcode(other)) {
+                .arith => |arith| arith,
+                else => continue,
+            };
+            const other_result = func.instResult(other) orelse continue;
+            const fold = logicalImmFold(func, a, other_result) orelse continue;
+            if (fold.immediate == result) return true;
         }
     }
     return false;
@@ -4035,6 +4094,31 @@ test "cross-block compare immediate skips constant materialization" {
     const insts = func.blockInsts(entry);
     try std.testing.expectEqual(@as(usize, 1), insts.len);
     try std.testing.expect(foldsAsCmpImm(&func, insts, 0));
+}
+
+test "cross-block logical immediate skips constant materialization" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+
+    const entry = try func.appendBlock();
+    const mask = try func.appendInst(entry, ty, .{ .iconst = 0xff00ff00 });
+    const arbitrary = try func.appendInst(entry, ty, .{ .iconst = 0x12345678 });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const body = try func.appendBlock();
+    const x = try func.appendBlockParam(body, ty);
+    const masked = try func.appendInst(body, ty, .{ .arith = .{ .op = .bit_and, .lhs = x, .rhs = mask } });
+    _ = try func.appendInst(body, ty, .{ .arith = .{ .op = .bit_xor, .lhs = x, .rhs = arbitrary } });
+    func.setTerminator(body, .{ .ret = ir.function.Ret.one(masked) });
+
+    const entry_insts = func.blockInsts(entry);
+    try std.testing.expect(foldsAsLogicalImm(&func, entry_insts, 0));
+    try std.testing.expect(!foldsAsLogicalImm(&func, entry_insts, 1));
+    const fold = logicalImmFold(&func, func.opcode(func.definingInst(masked).?).arith, masked).?;
+    try std.testing.expectEqual(x, fold.base);
+    try std.testing.expectEqual(@as(i64, 0xff00ff00), fold.imm);
 }
 
 fn countUses(func: *const Function, v: Value) usize {
@@ -4566,6 +4650,18 @@ fn tryAddSubImm(allocator: std.mem.Allocator, code: *std.ArrayList(u32), op: ir.
         .sub => if (wide) encode.subImm64(rd, rn, u) else encode.subImm(rd, rn, u),
         else => unreachable,
     });
+    return true;
+}
+
+fn tryLogicalImm(allocator: std.mem.Allocator, code: *std.ArrayList(u32), op: ir.function.BinOp, rd: Reg, rn: Reg, imm: i64, wide: bool) Error!bool {
+    const bits: u64 = @bitCast(imm);
+    const word = switch (op) {
+        .bit_and => encode.andImm(rd, rn, bits, wide),
+        .bit_or => encode.orrImm(rd, rn, bits, wide),
+        .bit_xor => encode.eorImm(rd, rn, bits, wide),
+        else => null,
+    } orelse return false;
+    try code.append(allocator, word);
     return true;
 }
 

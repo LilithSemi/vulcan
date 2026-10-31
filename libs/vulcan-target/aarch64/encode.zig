@@ -110,6 +110,76 @@ pub fn eor(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x4A000000 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
+const LogicalImmediate = struct { n: u1, immr: u6, imms: u6 };
+
+fn rotateRight(value: u64, amount: u6, width: u7) u64 {
+    const mask: u64 = if (width == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(width)) - 1;
+    const shift: u6 = @intCast(amount % width);
+    if (shift == 0) return value & mask;
+    return ((value >> shift) | (value << @intCast(width - shift))) & mask;
+}
+
+/// Encode an A64 logical immediate. Such an immediate is a rotated, non-empty run of ones in a
+/// power-of-two element, replicated across the 32- or 64-bit operand. Brute-forcing the at most
+/// 63 run lengths and 64 rotations keeps this small and is compile-time work in instruction
+/// selection, not generated code.
+fn logicalImmediate(value: u64, wide: bool) ?LogicalImmediate {
+    const width: u7 = if (wide) 64 else 32;
+    const width_mask: u64 = if (wide) std.math.maxInt(u64) else std.math.maxInt(u32);
+    const wanted = value & width_mask;
+    if (wanted == 0 or wanted == width_mask) return null;
+
+    var element_width: u7 = 2;
+    while (element_width <= width) : (element_width *= 2) {
+        const element_mask: u64 = if (element_width == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(element_width)) - 1;
+        const element = wanted & element_mask;
+        var replicated: u64 = 0;
+        var offset: u7 = 0;
+        while (offset < width) : (offset += element_width) replicated |= element << @intCast(offset);
+        if (replicated != wanted or element == 0 or element == element_mask) continue;
+
+        var ones: u7 = 1;
+        while (ones < element_width) : (ones += 1) {
+            const run = (@as(u64, 1) << @intCast(ones)) - 1;
+            var rotation: u7 = 0;
+            while (rotation < element_width) : (rotation += 1) {
+                if (rotateRight(run, @intCast(rotation), element_width) != element) continue;
+                const prefix = ~(@as(u64, element_width) * 2 - 1) & 0x3f;
+                return .{
+                    .n = if (element_width == 64) 1 else 0,
+                    .immr = @intCast(rotation),
+                    .imms = @intCast(prefix | (ones - 1)),
+                };
+            }
+        }
+    }
+    return null;
+}
+
+fn logicalImm(opc: u2, rd: Reg, rn: Reg, value: u64, wide: bool) ?u32 {
+    const imm = logicalImmediate(value, wide) orelse return null;
+    return (if (wide) @as(u32, 1) << 31 else 0) |
+        (@as(u32, opc) << 29) |
+        0x12000000 |
+        (@as(u32, imm.n) << 22) |
+        (@as(u32, imm.immr) << 16) |
+        (@as(u32, imm.imms) << 10) |
+        (n(rn) << 5) |
+        n(rd);
+}
+
+pub fn andImm(rd: Reg, rn: Reg, value: u64, wide: bool) ?u32 {
+    return logicalImm(0, rd, rn, value, wide);
+}
+
+pub fn orrImm(rd: Reg, rn: Reg, value: u64, wide: bool) ?u32 {
+    return logicalImm(1, rd, rn, value, wide);
+}
+
+pub fn eorImm(rd: Reg, rn: Reg, value: u64, wide: bool) ?u32 {
+    return logicalImm(2, rd, rn, value, wide);
+}
+
 /// `mov xd, xm` (64-bit register move), i.e. `orr xd, xzr, xm`. Always copies the
 /// full register. 32-bit values carry zero in their high half (w-form ops
 /// zero-extend), so this is also correct for them, and it preserves 64-bit values
@@ -1210,6 +1280,30 @@ test "flag-setting S-form encoders (subs/adds/ands + immediate) match the disass
     const d5 = try disasm.one(a, addsImm64(.x8, .x8, 1));
     defer a.free(d5);
     try std.testing.expectEqualStrings("adds x8, x8, #1", d5);
+}
+
+test "logical immediate encoders match the disassembler" {
+    const disasm = @import("disasm.zig");
+    const a = std.testing.allocator;
+
+    const and_word = andImm(.x0, .x1, 0xff00ff00, false).?;
+    const and_text = try disasm.one(a, and_word);
+    defer a.free(and_text);
+    try std.testing.expectEqualStrings("and w0, w1, #0xff00ff00", and_text);
+
+    const orr_word = orrImm(.x2, .x3, 0x00ff00ff00ff00ff, true).?;
+    const orr_text = try disasm.one(a, orr_word);
+    defer a.free(orr_text);
+    try std.testing.expectEqualStrings("orr x2, x3, #0xff00ff00ff00ff", orr_text);
+
+    const eor_word = eorImm(.x4, .x5, 0x80000001, false).?;
+    const eor_text = try disasm.one(a, eor_word);
+    defer a.free(eor_text);
+    try std.testing.expectEqualStrings("eor w4, w5, #0x80000001", eor_text);
+
+    try std.testing.expect(andImm(.x0, .x1, 0, false) == null);
+    try std.testing.expect(andImm(.x0, .x1, std.math.maxInt(u64), true) == null);
+    try std.testing.expect(orrImm(.x0, .x1, 0x01234567, false) == null);
 }
 
 test "ldp/stp offset-form encoders match known bytes" {
