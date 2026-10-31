@@ -1463,9 +1463,16 @@ pub const Function = struct {
 
     /// Replace every use of `from` with `to` across instruction operands, `if`
     /// edge arguments, and terminators (an SSA "replace all uses with").
-    /// Definitions and instructions no longer present in a block are untouched.
-    /// The caller handles any now-dead `from`.
+    /// Definitions are untouched. The caller handles any now-dead `from`.
     pub fn replaceAllUses(self: *Function, from: Value, to: Value) void {
+        for (0..self.instCount()) |i| self.replaceUsesInInst(@fromBackingInt(@intCast(i)), from, to);
+        for (0..self.blockCount()) |bi| self.replaceUsesInTerm(@fromBackingInt(@intCast(bi)), from, to);
+    }
+
+    /// Replace uses of `from` with `to` in instructions currently present in a
+    /// block and in block terminators. Use this only when detached instructions
+    /// cannot later be reattached.
+    pub fn replaceAllLiveUses(self: *Function, from: Value, to: Value) void {
         for (0..self.blockCount()) |bi| {
             const block: Block = @fromBackingInt(@intCast(bi));
             for (self.blockInsts(block)) |inst| self.replaceUsesInInst(inst, from, to);
@@ -2838,6 +2845,25 @@ test "arith records its operator and operands" {
     try std.testing.expectEqual(BinOp.add, op.arith.op);
     try std.testing.expectEqual(a, op.arith.lhs);
     try std.testing.expectEqual(b, op.arith.rhs);
+}
+
+test "replaceAllUses rewrites a detached instruction before it is installed" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const old = try func.appendInst(block, i32_t, .{ .iconst = 1 });
+    const replacement = try func.appendInst(block, i32_t, .{ .iconst = 2 });
+    const detached = try func.createInst(i32_t, .{ .arith = .{ .op = .add, .lhs = old, .rhs = old } });
+    const detached_inst = func.definingInst(detached).?;
+
+    func.replaceAllUses(old, replacement);
+    try func.setBlockInsts(block, &.{ detached_inst });
+
+    const op = func.opcode(detached_inst).arith;
+    try std.testing.expectEqual(replacement, op.lhs);
+    try std.testing.expectEqual(replacement, op.rhs);
 }
 
 test "a block can be terminated with a return" {
