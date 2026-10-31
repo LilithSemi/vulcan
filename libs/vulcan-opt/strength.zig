@@ -1,6 +1,7 @@
-//! Strength reduction replaces an integer multiply, divide, or remainder by a constant power of two
-//! with a cheap shift or mask.
+//! Strength reduction replaces integer operations by constants with cheaper shifts, masks, and
+//! short arithmetic sequences.
 //!   x * 2^k  -> x << k      any signedness, the low bits are identical
+//!   x * (2^k + 1) -> x + (x << k)
 //!   x /u 2^k -> x >> k      unsigned, a logical shift
 //!   x /s 2^k -> (x + ((x >> (w-1)) & (2^k-1))) >> k
 //!   x %u 2^k -> x & (2^k-1) unsigned only
@@ -66,6 +67,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     // registers cannot take this phase at all and calls `shiftPhase` by itself.
     if (try signedPow2Phase(allocator, func, consts)) changed = true;
     if (try magicPhase(allocator, func, consts)) changed = true;
+    if (try nearPowerMulPhase(allocator, func, consts)) changed = true;
     return changed;
 }
 
@@ -152,6 +154,75 @@ fn shiftPhaseWithConsts(func: *Function, consts: []const ?i64) bool {
         }
     }
 
+    return changed;
+}
+
+const NearPowerMul = struct {
+    x: Value,
+    shift: u6,
+};
+
+fn nearPowerMul(func: *const Function, consts: []const ?i64, inst: ir.function.Inst) ?NearPowerMul {
+    var x: Value = undefined;
+    const c = switch (func.opcode(inst)) {
+        .arith_imm => |a| blk: {
+            if (a.op != .mul) return null;
+            x = a.lhs;
+            break :blk a.imm;
+        },
+        .arith => |a| blk: {
+            if (a.op != .mul) return null;
+            const rhs_index = @backingInt(a.rhs);
+            if (rhs_index < consts.len and consts[rhs_index] != null) {
+                x = a.lhs;
+                break :blk consts[rhs_index].?;
+            }
+            const lhs_index = @backingInt(a.lhs);
+            if (lhs_index < consts.len and consts[lhs_index] != null) {
+                x = a.rhs;
+                break :blk consts[lhs_index].?;
+            }
+            return null;
+        },
+        else => return null,
+    };
+    if (c <= 2) return null;
+    const ty = intType(func, x) orelse return null;
+    const shift = log2Pow2(c - 1, ty.bits) orelse return null;
+    return .{ .x = x, .shift = shift };
+}
+
+fn nearPowerMulPhase(allocator: std.mem.Allocator, func: *Function, consts: []const ?i64) pass.Error!bool {
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+        var has_candidate = false;
+        for (func.blockInsts(block)) |inst| {
+            if (nearPowerMul(func, consts, inst) != null) {
+                has_candidate = true;
+                break;
+            }
+        }
+        if (!has_candidate) continue;
+
+        var out: std.ArrayList(ir.function.Inst) = .empty;
+        defer out.deinit(allocator);
+        const original = try allocator.dupe(ir.function.Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        for (original) |inst| {
+            const info = nearPowerMul(func, consts, inst) orelse {
+                try out.append(allocator, inst);
+                continue;
+            };
+            const result = func.instResult(inst).?;
+            const builder = Builder{ .f = func, .o = &out, .a = allocator, .ty = func.valueType(result) };
+            const shifted = try builder.opImm(.shl, info.x, info.shift);
+            func.opcodeMut(inst).* = .{ .arith = .{ .op = .add, .lhs = info.x, .rhs = shifted } };
+            try out.append(allocator, inst);
+            changed = true;
+        }
+        try func.setBlockInsts(block, out.items);
+    }
     return changed;
 }
 
@@ -711,7 +782,7 @@ test "signed division by a power of two uses a rounding bias" {
     }
 }
 
-test "non-power-of-two multiply is left alone" {
+test "x * 3 becomes x + (x << 1)" {
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -719,6 +790,30 @@ test "non-power-of-two multiply is left alone" {
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
     const y = try func.appendArithImm(b, t, .mul, x, 3);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    const add = func.opcode(func.definingInst(y).?).arith;
+    try testing.expectEqual(BinOp.add, add.op);
+    try testing.expectEqual(x, add.lhs);
+    const shift = func.opcode(func.definingInst(add.rhs).?).arith_imm;
+    try testing.expectEqual(BinOp.shl, shift.op);
+    try testing.expectEqual(x, shift.lhs);
+    try testing.expectEqual(@as(i64, 1), shift.imm);
+
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
+test "x * 7 is left alone" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const y = try func.appendArithImm(b, t, .mul, x, 7);
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
     try testing.expect(!try runOnce(allocator, &func));
 }
