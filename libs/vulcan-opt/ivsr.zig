@@ -1210,7 +1210,9 @@ fn applyPlan(allocator: std.mem.Allocator, func: *Function, ctx: *LoopCtx, pool:
     // One new header parameter per reduction, then the old value's readers move to it. The header
     // dominates every block of the loop, so the parameter is in scope wherever the old value was.
     for (plan) |*r| r.param = try func.appendBlockParam(ctx.header, r.ty);
-    for (plan) |*r| func.replaceAllUses(r.old, r.param);
+    // The plan is built exclusively from instructions still in loop blocks and this pass never
+    // reattaches orphaned instructions, so skip historical instruction storage during RAUW.
+    for (plan) |*r| func.replaceAllLiveUses(r.old, r.param);
 
     // Every rider becomes `keeper.param + diff`, an `arith_imm.add` in place of whatever it used to
     // compute. Its result value is untouched, so every existing use keeps reading it; only what
