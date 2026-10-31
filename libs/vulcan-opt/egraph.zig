@@ -618,6 +618,20 @@ fn hasMixedAddSubChildren(graph: *Graph, outer: OpNode) bool {
     return add_sub or (outer.op == .add and classHasOp(graph, outer.lhs, .sub) and classHasOp(graph, outer.rhs, .add));
 }
 
+fn hasInverseChildren(graph: *Graph, outer: OpNode) bool {
+    return switch (outer.op) {
+        .add => classHasOp(graph, outer.lhs, .sub) or classHasOp(graph, outer.rhs, .sub),
+        .sub => classHasOp(graph, outer.lhs, .add) or classHasOp(graph, outer.rhs, .sub),
+        .bit_xor => classHasOp(graph, outer.lhs, .bit_xor) or classHasOp(graph, outer.rhs, .bit_xor),
+        else => false,
+    };
+}
+
+fn hasBitwiseArithmeticChildren(graph: *Graph, outer: OpNode) bool {
+    const forward = classHasOp(graph, outer.lhs, .bit_or) and classHasOp(graph, outer.rhs, .bit_and);
+    return forward or (outer.op == .add and classHasOp(graph, outer.rhs, .bit_or) and classHasOp(graph, outer.lhs, .bit_and));
+}
+
 fn emitCrossCancellation(graph: *Graph, outer_class: u32, ty: Type, subtraction: OpNode, addition: OpNode, subtract_outer: bool) !bool {
     const cancelled = graph.find(if (subtract_outer) subtraction.lhs else subtraction.rhs);
     const other = if (graph.find(addition.lhs) == cancelled)
@@ -730,13 +744,15 @@ fn saturate(graph: *Graph) !void {
                 .op => |op| if (isAssociative(op.op) or factorInner(op.op) != null or cancellationInner(op.op) != null or absorptionInner(op.op) != null) canonical(graph, op) else continue,
                 .leaf => continue,
             };
-            if (isAssociative(sum.op)) {
+            if (isAssociative(sum.op) and classHasOp(graph, sum.lhs, sum.op)) {
                 left.clearRetainingCapacity();
                 try matchingOps(graph, sum.lhs, sum.op, sum.ty, left);
                 for (left.items) |nested| {
                     changed = try associatePair(graph, entry.class, sum.op, nested, sum.rhs) or changed;
                     if (graph.hit_limit) break;
                 }
+            }
+            if (isAssociative(sum.op) and classHasOp(graph, sum.rhs, sum.op)) {
                 right.clearRetainingCapacity();
                 try matchingOps(graph, sum.rhs, sum.op, sum.ty, right);
                 for (right.items) |nested| {
@@ -744,7 +760,8 @@ fn saturate(graph: *Graph) !void {
                     if (graph.hit_limit) break;
                 }
             }
-            if (factorInner(sum.op)) |inner_op| {
+            if (factorInner(sum.op)) |inner_op| factor: {
+                if (!classHasOp(graph, sum.lhs, inner_op) or !classHasOp(graph, sum.rhs, inner_op)) break :factor;
                 left.clearRetainingCapacity();
                 right.clearRetainingCapacity();
                 try matchingOps(graph, sum.lhs, inner_op, sum.ty, left);
@@ -754,7 +771,8 @@ fn saturate(graph: *Graph) !void {
                     if (graph.hit_limit) break;
                 };
             }
-            if (cancellationInner(sum.op)) |inner_op| {
+            if (cancellationInner(sum.op)) |inner_op| cancellation: {
+                if (!classHasOp(graph, sum.lhs, inner_op) or !classHasOp(graph, sum.rhs, inner_op)) break :cancellation;
                 left.clearRetainingCapacity();
                 right.clearRetainingCapacity();
                 try matchingOps(graph, sum.lhs, inner_op, sum.ty, left);
@@ -764,7 +782,7 @@ fn saturate(graph: *Graph) !void {
                     if (graph.hit_limit) break;
                 };
             }
-            if (sum.op == .sub) {
+            if (sum.op == .sub and classHasOp(graph, sum.lhs, .sub) and classHasOp(graph, sum.rhs, .sub)) {
                 left.clearRetainingCapacity();
                 right.clearRetainingCapacity();
                 try matchingOps(graph, sum.lhs, .sub, sum.ty, left);
@@ -774,7 +792,7 @@ fn saturate(graph: *Graph) !void {
                     if (graph.hit_limit) break;
                 };
             }
-            if (sum.op == .add or sum.op == .sub or sum.op == .bit_xor) {
+            if (hasInverseChildren(graph, sum)) {
                 changed = try cancelInverse(graph, entry.class, sum, left, right) or changed;
             }
             if ((sum.op == .add or sum.op == .sub) and hasMixedAddSubChildren(graph, sum)) {
@@ -787,7 +805,7 @@ fn saturate(graph: *Graph) !void {
             if (sum.op == .bit_and or sum.op == .bit_or or sum.op == .bit_xor) {
                 changed = try foldBitwisePairs(graph, entry.class, sum, left, right) or changed;
             }
-            if (sum.op == .add or sum.op == .sub) {
+            if ((sum.op == .add or sum.op == .sub) and hasBitwiseArithmeticChildren(graph, sum)) {
                 left.clearRetainingCapacity();
                 right.clearRetainingCapacity();
                 try matchingOps(graph, sum.lhs, .bit_or, sum.ty, left);
@@ -808,12 +826,16 @@ fn saturate(graph: *Graph) !void {
                 }
             }
             if (absorptionInner(sum.op)) |inner_op| {
-                left.clearRetainingCapacity();
-                try matchingOps(graph, sum.lhs, inner_op, sum.ty, left);
-                for (left.items) |inner| changed = absorbPair(graph, entry.class, sum.rhs, inner) or changed;
-                right.clearRetainingCapacity();
-                try matchingOps(graph, sum.rhs, inner_op, sum.ty, right);
-                for (right.items) |inner| changed = absorbPair(graph, entry.class, sum.lhs, inner) or changed;
+                if (classHasOp(graph, sum.lhs, inner_op)) {
+                    left.clearRetainingCapacity();
+                    try matchingOps(graph, sum.lhs, inner_op, sum.ty, left);
+                    for (left.items) |inner| changed = absorbPair(graph, entry.class, sum.rhs, inner) or changed;
+                }
+                if (classHasOp(graph, sum.rhs, inner_op)) {
+                    right.clearRetainingCapacity();
+                    try matchingOps(graph, sum.rhs, inner_op, sum.ty, right);
+                    for (right.items) |inner| changed = absorbPair(graph, entry.class, sum.lhs, inner) or changed;
+                }
             }
             if (graph.hit_limit) break;
         }
