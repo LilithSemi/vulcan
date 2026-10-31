@@ -119,7 +119,12 @@ const Graph = struct {
     }
 
     fn addOp(self: *Graph, raw: OpNode) !?u32 {
-        if (!self.ops_valid) _ = try self.rebuild();
+        // Rebuild is deliberately deferred to the saturation iteration boundary. After a merge,
+        // stale keys can only cause a missed lookup: canonicalization below never produces the
+        // losing root again, so it cannot falsely match an entry whose children changed. A miss
+        // may add a duplicate node, which the next rebuild congruence-merges. This is the bounded
+        // "rebuilding" technique used by equality-saturation engines, avoiding a whole-graph
+        // rebuild after every individual rule merge.
         var node = raw;
         node.lhs = self.find(node.lhs);
         node.rhs = self.find(node.rhs);
