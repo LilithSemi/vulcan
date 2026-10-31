@@ -289,6 +289,9 @@ fn hasFactorCandidate(func: *const Function, block: Block) bool {
             if (lhs) |op| if (op.op == .add and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
             if (rhs) |op| if (op.op == .sub and op.lhs == sum.lhs) return true;
             if (lhs != null and rhs != null and lhs.?.op == .bit_or and rhs.?.op == .bit_and and sameValueOperands(lhs.?, rhs.?)) return true;
+        } else if (sum.op == .bit_xor) {
+            if (lhs) |op| if (op.op == .bit_xor and (op.lhs == sum.rhs or op.rhs == sum.rhs)) return true;
+            if (rhs) |op| if (op.op == .bit_xor and (op.lhs == sum.lhs or op.rhs == sum.lhs)) return true;
         }
     }
     return false;
@@ -464,6 +467,27 @@ fn cancelInverse(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.Arra
         for (right.items) |nested| {
             if (graph.find(nested.lhs) == graph.find(outer.lhs)) changed = graph.merge(outer_class, nested.rhs) or changed;
         }
+    } else if (outer.op == .bit_xor) {
+        left.clearRetainingCapacity();
+        try matchingOps(graph, outer.lhs, .bit_xor, outer.ty, left);
+        for (left.items) |nested| {
+            const rhs = graph.find(outer.rhs);
+            if (graph.find(nested.lhs) == rhs) {
+                changed = graph.merge(outer_class, nested.rhs) or changed;
+            } else if (graph.find(nested.rhs) == rhs) {
+                changed = graph.merge(outer_class, nested.lhs) or changed;
+            }
+        }
+        right.clearRetainingCapacity();
+        try matchingOps(graph, outer.rhs, .bit_xor, outer.ty, right);
+        for (right.items) |nested| {
+            const lhs = graph.find(outer.lhs);
+            if (graph.find(nested.lhs) == lhs) {
+                changed = graph.merge(outer_class, nested.rhs) or changed;
+            } else if (graph.find(nested.rhs) == lhs) {
+                changed = graph.merge(outer_class, nested.lhs) or changed;
+            }
+        }
     }
     return changed;
 }
@@ -531,7 +555,7 @@ fn saturate(graph: *Graph) !void {
                     if (graph.hit_limit) break;
                 };
             }
-            if (sum.op == .add or sum.op == .sub) {
+            if (sum.op == .add or sum.op == .sub or sum.op == .bit_xor) {
                 changed = try cancelInverse(graph, entry.class, sum, &left, &right) or changed;
             }
             if (sum.op == .add or sum.op == .sub) {
@@ -926,6 +950,22 @@ test "egraph cancels a shared xor term" {
     const reduced = func.opcode(func.definingInst(replacement).?).arith;
     try std.testing.expectEqual(BinOp.bit_xor, reduced.op);
     try std.testing.expect((reduced.lhs == b and reduced.rhs == c) or (reduced.lhs == c and reduced.rhs == b));
+}
+
+test "egraph cancels an xor term nested on either side" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = b } });
+    const restored = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = ab } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(restored) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    try std.testing.expectEqual(b, func.terminator(block).?.ret.values[0]);
 }
 
 test "egraph reduces the sum of bitwise union and intersection" {
