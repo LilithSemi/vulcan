@@ -31,6 +31,8 @@ pub fn main(init: std.process.Init) !void {
     defer idempotent.deinit();
     var bitwise_pair = try buildBitwisePairWorkload(allocator, blocks);
     defer bitwise_pair.deinit();
+    var bitwise_arithmetic = try buildBitwiseArithmeticWorkload(allocator, blocks);
+    defer bitwise_arithmetic.deinit();
     var mixed_pair = try buildMixedPairWorkload(allocator, blocks);
     defer mixed_pair.deinit();
     var cross_cancel = try buildCrossCancelWorkload(allocator, blocks);
@@ -55,6 +57,7 @@ pub fn main(init: std.process.Init) !void {
     const xor_carry_egraph_ns = try measure(init.io, allocator, &xor_carry, runEgraph);
     const idempotent_egraph_ns = try measure(init.io, allocator, &idempotent, runEgraph);
     const bitwise_pair_egraph_ns = try measure(init.io, allocator, &bitwise_pair, runEgraph);
+    const bitwise_arithmetic_egraph_ns = try measure(init.io, allocator, &bitwise_arithmetic, runEgraph);
     const mixed_pair_egraph_ns = try measure(init.io, allocator, &mixed_pair, runEgraph);
     const cross_cancel_egraph_ns = try measure(init.io, allocator, &cross_cancel, runEgraph);
     const rootless_egraph_ns = try measure(init.io, allocator, &rootless, runEgraph);
@@ -71,6 +74,7 @@ pub fn main(init: std.process.Init) !void {
             "  xor carry egraph:       {d} ns/block ({d} blocks)\n" ++
             "  idempotent egraph:      {d} ns/block\n" ++
             "  bitwise pair egraph:    {d} ns/block\n" ++
+            "  bitwise arith egraph:   {d} ns/block\n" ++
             "  mixed pair egraph:      {d} ns/block\n" ++
             "  cross cancel egraph:    {d} ns/block\n" ++
             "  rootless egraph:        {d} ns/block\n" ++
@@ -90,6 +94,7 @@ pub fn main(init: std.process.Init) !void {
             xor_carry_blocks,
             idempotent_egraph_ns / blocks,
             bitwise_pair_egraph_ns / blocks,
+            bitwise_arithmetic_egraph_ns / blocks,
             mixed_pair_egraph_ns / blocks,
             cross_cancel_egraph_ns / blocks,
             rootless_egraph_ns / blocks,
@@ -238,6 +243,22 @@ fn buildBitwisePairWorkload(allocator: std.mem.Allocator, count: usize) !Functio
         const both = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } });
         const either = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_or, .lhs = a, .rhs = b } });
         const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = both, .rhs = either } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    }
+    return func;
+}
+
+fn buildBitwiseArithmeticWorkload(allocator: std.mem.Allocator, count: usize) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    for (0..count) |_| {
+        const block = try func.appendBlock();
+        const a = try func.appendBlockParam(block, ty);
+        const b = try func.appendBlockParam(block, ty);
+        const either = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_or, .lhs = a, .rhs = b } });
+        const both = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } });
+        const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = either, .rhs = both } });
         func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
     }
     return func;
