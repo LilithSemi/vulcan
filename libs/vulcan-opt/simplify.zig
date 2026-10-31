@@ -57,6 +57,12 @@ fn isInt(func: *const Function, v: Value) bool {
 
 const Simplified = union(enum) { none, value: Value, constant: i64 };
 
+fn canonical(replacements: []const Value, value: Value) Value {
+    var current = value;
+    while (replacements[@backingInt(current)] != current) current = replacements[@backingInt(current)];
+    return current;
+}
+
 /// The identity for `lhs op rhs`, given each operand's constant value if known (`lc`/`rc`) and
 /// whether `lhs` and `rhs` are the same SSA value (`same`). For `arith_imm`, `rhs` is null and the
 /// immediate is passed as `rc`. Only identities that hold for every value of the variable operand.
@@ -104,75 +110,94 @@ fn simplify(op: BinOp, lhs: Value, rhs: ?Value, lc: ?i64, rc: ?i64, same: bool) 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
 
-    // Map each value defined by an `iconst` to its constant (to spot 0/1 operands). Iterate LIVE
-    // block instructions, not the whole instruction pool: an instruction a prior pass replaced and
-    // dce dropped is gone from its block but still sits in the pool, and re-processing it below
-    // would re-fire a no-op `replaceAllUses` and report a spurious change forever, so the pipeline
-    // fixpoint would never converge.
-    var consts = try allocator.alloc(?i64, func.valueCount());
+    // Map each value defined by a LIVE `iconst` to its constant. Instructions
+    // removed from blocks remain in the pool and must not participate.
+    const consts = try allocator.alloc(?i64, func.valueCount());
     defer allocator.free(consts);
     @memset(consts, null);
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             if (func.opcode(inst) == .iconst) {
-                if (func.instResult(inst)) |r| consts[@backingInt(r)] = func.opcode(inst).iconst;
+                if (func.instResult(inst)) |result| consts[@backingInt(result)] = func.opcode(inst).iconst;
             }
         }
     }
 
+    // Batch value identities into one final operand traversal. The previous
+    // replaceAllUses call per identity made N simplifications scan N instructions.
+    const replacements = try allocator.alloc(Value, func.valueCount());
+    defer allocator.free(replacements);
+    for (replacements, 0..) |*replacement, index| replacement.* = @fromBackingInt(@intCast(index));
+
     var changed = false;
+    var has_replacements = false;
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const result = func.instResult(inst) orelse continue;
-            if (consts[@backingInt(result)] != null) continue; // already a constant
+            if (consts[@backingInt(result)] != null) continue;
 
-            // `select` folds for any type since it just picks an existing value. A constant condition
-            // resolves to one arm, and identical arms collapse to that value.
+            // `select` folds for any type since it just picks an existing value.
             if (func.opcode(inst) == .select) {
                 const sel = func.opcode(inst).select;
-                const repl: ?Value = if (sel.then == sel.@"else")
-                    sel.then // select(c, x, x) -> x
-                else if (consts[@backingInt(sel.cond)]) |cv|
-                    (if (cv != 0) sel.then else sel.@"else") // select(const, a, b) -> a / b
+                const cond = canonical(replacements, sel.cond);
+                const then_value = canonical(replacements, sel.then);
+                const else_value = canonical(replacements, sel.@"else");
+                const replacement: ?Value = if (then_value == else_value)
+                    then_value
+                else if (consts[@backingInt(cond)]) |value|
+                    (if (value != 0) then_value else else_value)
                 else
                     null;
-                if (repl) |v| {
-                    func.replaceAllUses(result, v);
+                if (replacement) |value| {
+                    replacements[@backingInt(result)] = value;
+                    has_replacements = true;
                     changed = true;
                 }
                 continue;
             }
 
-            if (!isInt(func, result)) continue; // the identities below are integer-only
-            const s: Simplified = switch (func.opcode(inst)) {
-                .arith => |a| simplify(a.op, a.lhs, a.rhs, consts[@backingInt(a.lhs)], consts[@backingInt(a.rhs)], a.lhs == a.rhs),
-                .arith_imm => |a| simplify(a.op, a.lhs, null, consts[@backingInt(a.lhs)], a.imm, false),
-                // A comparison of a value with itself is constant (icmp is integer, so no NaN caveat).
-                .icmp => |c| if (c.lhs == c.rhs) Simplified{ .constant = switch (c.op) {
-                    .eq, .le, .ge => @as(i64, 1),
-                    .ne, .lt, .gt => @as(i64, 0),
-                } }
-                // `(convert-to-int b) != 0` recovers the boolean `b`: a bool widens to 0 or 1, so it is
-                // non-zero exactly when `b` is true. This kills the round trip the frontend emits for
-                // `if (cond)` (`cond` is already a boolean icmp), so the consumer branch fuses with the
-                // original compare instead of materializing the boolean and testing it against zero.
-                else if (c.op == .ne) boolRoundTrip(func, c.lhs, consts[@backingInt(c.lhs)], c.rhs, consts[@backingInt(c.rhs)]) else .none,
+            if (!isInt(func, result)) continue;
+            const simplified: Simplified = switch (func.opcode(inst)) {
+                .arith => |arith| blk: {
+                    const lhs = canonical(replacements, arith.lhs);
+                    const rhs = canonical(replacements, arith.rhs);
+                    break :blk simplify(arith.op, lhs, rhs, consts[@backingInt(lhs)], consts[@backingInt(rhs)], lhs == rhs);
+                },
+                .arith_imm => |arith| blk: {
+                    const lhs = canonical(replacements, arith.lhs);
+                    break :blk simplify(arith.op, lhs, null, consts[@backingInt(lhs)], arith.imm, false);
+                },
+                .icmp => |cmp| blk: {
+                    const lhs = canonical(replacements, cmp.lhs);
+                    const rhs = canonical(replacements, cmp.rhs);
+                    if (lhs == rhs) break :blk .{ .constant = switch (cmp.op) {
+                        .eq, .le, .ge => @as(i64, 1),
+                        .ne, .lt, .gt => @as(i64, 0),
+                    } };
+                    // `(convert-to-int b) != 0` recovers the boolean `b`.
+                    break :blk if (cmp.op == .ne)
+                        boolRoundTrip(func, lhs, consts[@backingInt(lhs)], rhs, consts[@backingInt(rhs)])
+                    else
+                        .none;
+                },
                 else => .none,
             };
-            switch (s) {
+            switch (simplified) {
                 .none => {},
-                .value => |v| {
-                    func.replaceAllUses(result, v); // the defining instruction is now dead (DCE removes it)
+                .value => |value| {
+                    replacements[@backingInt(result)] = canonical(replacements, value);
+                    has_replacements = true;
                     changed = true;
                 },
-                .constant => |c| {
-                    func.opcodeMut(inst).* = .{ .iconst = c };
-                    consts[@backingInt(result)] = c;
+                .constant => |value| {
+                    func.opcodeMut(inst).* = .{ .iconst = value };
+                    consts[@backingInt(result)] = value;
                     changed = true;
                 },
             }
         }
     }
+    if (has_replacements) func.rewriteAllUses(replacements);
     return changed;
 }
 
@@ -241,6 +266,19 @@ test "arith_imm: x * 1 simplifies to x, x & x to x" {
 
     try testing.expect(try runOnce(allocator, &func));
     // x*1 -> x turns `anded` into x & x, and x & x -> x, so the return is x.
+    try testing.expectEqual(s.x, func.terminator(s.b).?.ret.values[0]);
+}
+
+test "a long identity chain is collapsed in one batched rewrite" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const s = try oneParam(&func);
+    var value = s.x;
+    for (0..256) |_| value = try func.appendArithImm(s.b, s.t, .add, value, 0);
+    func.setTerminator(s.b, .{ .ret = ir.function.Ret.one(value) });
+
+    try testing.expect(try runOnce(allocator, &func));
     try testing.expectEqual(s.x, func.terminator(s.b).?.ret.values[0]);
 }
 
