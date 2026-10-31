@@ -988,6 +988,11 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
     if (optimize.runsMicroarch()) if (model) |m| {
         for (mod.funcs) |*nf| _ = try mm.optimizeTransforms(allocator, &nf.func, m);
     };
+    // Larger acyclic callees are worthwhile at loop call sites, but clone them only after the
+    // LICM-bearing early and microarchitecture pipelines. Cloning a large switch before LICM would
+    // hoist every case constant into the loop entry, creating needless live ranges and register
+    // pressure. The late pipeline performs scalar cleanup without LICM.
+    if (optimize.inlinesCalls() and profile == null) try inlineHotLoopCalls(allocator, &mod);
     const microarch_end = std.Io.Timestamp.now(io, .awake);
 
     const late_start = microarch_end;
@@ -1066,6 +1071,11 @@ fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module, profile:
             _ = try opt.inlining.runSmallAcyclic(allocator, &named.func, lookup);
         }
     }
+}
+
+fn inlineHotLoopCalls(allocator: std.mem.Allocator, mod: *cc.Module) !void {
+    const lookup = opt.inlining.Lookup{ .context = mod, .func = ModuleLookup.get };
+    for (mod.funcs) |*named| _ = try opt.inlining.runLoopAcyclic(allocator, &named.func, lookup);
 }
 
 fn profileHotThreshold(counts: []const u64) u64 {
@@ -1985,6 +1995,33 @@ test "translation-unit inlining removes a call to a local leaf" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), calls_after);
+}
+
+test "translation-unit inlining gives loop calls a larger growth budget" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\int classify(int x) {
+        \\  switch (x & 15) {
+        \\    case 0: return x + 1; case 1: return x + 2; case 2: return x + 3;
+        \\    case 3: return x + 4; case 4: return x + 5; case 5: return x + 6;
+        \\    case 6: return x + 7; case 7: return x + 8; case 8: return x + 9;
+        \\    case 9: return x + 10; case 10: return x + 11; case 11: return x + 12;
+        \\    case 12: return x + 13; case 13: return x + 14; case 14: return x + 15;
+        \\    default: return x + 16;
+        \\  }
+        \\}
+        \\int main(void) { int sum = 0; for (int i = 0; i < 100; ++i) sum += classify(i); return sum; }
+    );
+    defer mod.deinit(allocator);
+    const main_func = mod.find("main") orelse return error.TestUnexpectedResult;
+
+    try inlineTranslationUnit(allocator, &mod, null);
+    try inlineHotLoopCalls(allocator, &mod);
+    for (0..main_func.blockCount()) |bi| {
+        for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            try std.testing.expect(main_func.opcode(inst) != .call);
+        }
+    }
 }
 
 test "profile-guided translation-unit inlining keeps a cold call" {

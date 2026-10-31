@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
+const loops = @import("loops.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -61,6 +62,25 @@ pub fn runAcyclic(allocator: std.mem.Allocator, caller: *Function, lookup: Looku
 /// register pressure in the caller.
 pub fn runSmallAcyclic(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup) Error!bool {
     return runWithPolicy(allocator, caller, lookup, null, false, 32);
+}
+
+/// Inline a larger acyclic callee when its call site is inside a natural loop. A call paid on every
+/// iteration has a much larger dynamic cost than a cold call, so it earns a larger code-growth
+/// budget than `runSmallAcyclic`. Loop membership is recomputed after every inline because the
+/// multi-block path appends cloned blocks and invalidates the analysis. The small total expansion
+/// budget prevents several loop call sites from multiplying a large dispatch tree without bound.
+pub fn runLoopAcyclic(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup) Error!bool {
+    var changed = false;
+    var expansion_budget: usize = 512;
+    while (expansion_budget > 0) {
+        var info = try loops.analyze(allocator, caller);
+        defer info.deinit(allocator);
+
+        const inlined_size = try inlineOneInLoops(allocator, caller, lookup, &info, @min(expansion_budget, 256)) orelse break;
+        expansion_budget -= inlined_size;
+        changed = true;
+    }
+    return changed;
 }
 
 /// Like `run`, but only inline call sites the `filter` permits (e.g. hot ones).
@@ -142,6 +162,48 @@ fn withinInstructionLimit(func: *const Function, limit: usize) bool {
         if (count > limit) return false;
     }
     return true;
+}
+
+fn instructionCount(func: *const Function) usize {
+    var count: usize = 0;
+    for (0..func.blockCount()) |bi| count += func.blockInsts(@fromBackingInt(@intCast(bi))).len;
+    return count;
+}
+
+fn blockInLoop(info: *const loops.LoopInfo, block: usize) bool {
+    for (info.loops) |*loop| if (loop.contains(block)) return true;
+    return false;
+}
+
+/// Inline one bounded, acyclic leaf called from a loop and return its instruction count. Keeping
+/// this to one mutation per analysis makes every loop-membership lookup valid.
+fn inlineOneInLoops(
+    allocator: std.mem.Allocator,
+    caller: *Function,
+    lookup: Lookup,
+    info: *const loops.LoopInfo,
+    instruction_limit: usize,
+) Error!?usize {
+    for (0..caller.blockCount()) |bi| {
+        if (!blockInLoop(info, bi)) continue;
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (caller.blockInsts(block), 0..) |inst, idx| {
+            if (caller.opcode(inst) != .call) continue;
+            const name = caller.symbolName(caller.opcode(inst).call.symbol);
+            const callee = lookup.get(name) orelse continue;
+            const size = instructionCount(callee);
+            if (size == 0 or size > instruction_limit) continue;
+            if (inlinable(callee)) {
+                try inlineCall(allocator, caller, @intCast(bi), idx, inst, callee);
+                return size;
+            }
+            if (inlinableMulti(callee) and !try hasCfgCycle(allocator, callee)) {
+                try inlineCallMulti(allocator, caller, @intCast(bi), idx, inst, callee);
+                return size;
+            }
+        }
+    }
+    return null;
 }
 
 fn inlineCall(allocator: std.mem.Allocator, caller: *Function, bi: u32, call_idx: usize, call_inst: Inst, callee: *const Function) Error!void {
