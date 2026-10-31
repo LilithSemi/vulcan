@@ -26,12 +26,14 @@ pub const Profile = struct {
     allocator: std.mem.Allocator,
     names: std.ArrayList([]u8) = .empty,
     counts: std.ArrayList([]u64) = .empty,
+    index: std.StringHashMapUnmanaged(usize) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Profile {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *Profile) void {
+        self.index.deinit(self.allocator);
         for (self.names.items) |n| self.allocator.free(n);
         for (self.counts.items) |c| self.allocator.free(c);
         self.names.deinit(self.allocator);
@@ -40,20 +42,22 @@ pub const Profile = struct {
 
     /// Record `counts` (copied) for the function `name` (copied).
     pub fn add(self: *Profile, name: []const u8, counts: []const u64) Error!void {
+        if (self.index.contains(name)) return error.MalformedProfile;
         const n = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(n);
         const c = try self.allocator.dupe(u64, counts);
         errdefer self.allocator.free(c);
+        const index = self.names.items.len;
         try self.names.append(self.allocator, n);
         errdefer _ = self.names.pop();
         try self.counts.append(self.allocator, c);
+        errdefer _ = self.counts.pop();
+        try self.index.put(self.allocator, n, index);
     }
 
     pub fn get(self: *const Profile, name: []const u8) ?[]const u64 {
-        for (self.names.items, 0..) |n, i| {
-            if (std.mem.eql(u8, n, name)) return self.counts.items[i];
-        }
-        return null;
+        const index = self.index.get(name) orelse return null;
+        return self.counts.items[index];
     }
 };
 
@@ -203,6 +207,7 @@ test "profile round-trips through its binary format" {
     try std.testing.expectEqualSlices(u64, &.{ 1000, 0, 999 }, back.get("hot").?);
     try std.testing.expectEqualSlices(u64, &.{5}, back.get("cold").?);
     try std.testing.expect(back.get("missing") == null);
+    try std.testing.expectError(error.MalformedProfile, p.add("hot", &.{1}));
     try std.testing.expectError(error.MalformedProfile, decode(allocator, "\x01\x00\x00\x00"));
     try std.testing.expectError(error.MalformedProfile, decode(allocator, "\x00\x00\x00\x00trailing"));
 }
