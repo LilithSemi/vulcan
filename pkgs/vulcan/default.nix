@@ -8,6 +8,8 @@
   lld,
   binutils,
   etsoc-sysemu,
+  llvmPackages,
+  gcc,
 }:
 let
   inherit (stdenv) targetPlatform hostPlatform;
@@ -47,6 +49,8 @@ stdenv.mkDerivation (finalAttrs: {
         zig
         lld
         binutils
+        llvmPackages.clang
+        gcc
       ];
     };
 
