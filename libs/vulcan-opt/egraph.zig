@@ -1,0 +1,443 @@
+//! Bounded equality saturation for pure integer expressions. The pass imports
+//! block-local add and multiply trees, adds equivalent factored forms, and
+//! extracts the expression with the fewest arithmetic instructions.
+
+const std = @import("std");
+const ir = @import("vulcan-ir");
+const pass = @import("pass.zig");
+
+const BinOp = ir.function.BinOp;
+const Block = ir.function.Block;
+const Function = ir.function.Function;
+const Type = ir.types.Type;
+const Value = ir.function.Value;
+
+pub const pass_def = pass.Pass{ .name = "egraph", .run = run, .preserves_cfg = true };
+
+pub const Limits = struct {
+    max_nodes: usize = 512,
+    max_iters: usize = 6,
+};
+
+const OpNode = struct {
+    op: BinOp,
+    lhs: u32,
+    rhs: u32,
+    ty: Type,
+    existing: ?Value,
+};
+
+const Node = union(enum) {
+    leaf: Value,
+    op: OpNode,
+};
+
+const Entry = struct {
+    class: u32,
+    node: Node,
+};
+
+const Graph = struct {
+    allocator: std.mem.Allocator,
+    limits: Limits,
+    parents: std.ArrayList(u32) = .empty,
+    nodes: std.ArrayList(Entry) = .empty,
+    hit_limit: bool = false,
+
+    fn deinit(self: *Graph) void {
+        self.parents.deinit(self.allocator);
+        self.nodes.deinit(self.allocator);
+    }
+
+    fn find(self: *Graph, class: u32) u32 {
+        var root = class;
+        while (self.parents.items[root] != root) root = self.parents.items[root];
+        var current = class;
+        while (self.parents.items[current] != current) {
+            const next = self.parents.items[current];
+            self.parents.items[current] = root;
+            current = next;
+        }
+        return root;
+    }
+
+    fn merge(self: *Graph, a: u32, b: u32) bool {
+        const ar = self.find(a);
+        const br = self.find(b);
+        if (ar == br) return false;
+        self.parents.items[br] = ar;
+        return true;
+    }
+
+    fn addClass(self: *Graph) !u32 {
+        const class: u32 = @intCast(self.parents.items.len);
+        try self.parents.append(self.allocator, class);
+        return class;
+    }
+
+    fn addLeaf(self: *Graph, value: Value) !?u32 {
+        for (self.nodes.items) |entry| switch (entry.node) {
+            .leaf => |other| if (other == value) return self.find(entry.class),
+            .op => {},
+        };
+        if (self.nodes.items.len >= self.limits.max_nodes) {
+            self.hit_limit = true;
+            return null;
+        }
+        const class = try self.addClass();
+        try self.nodes.append(self.allocator, .{ .class = class, .node = .{ .leaf = value } });
+        return class;
+    }
+
+    fn addOp(self: *Graph, raw: OpNode) !?u32 {
+        var node = raw;
+        node.lhs = self.find(node.lhs);
+        node.rhs = self.find(node.rhs);
+        if (node.lhs > node.rhs) std.mem.swap(u32, &node.lhs, &node.rhs);
+        for (self.nodes.items) |*entry| switch (entry.node) {
+            .leaf => {},
+            .op => |*other| {
+                const lhs = self.find(other.lhs);
+                const rhs = self.find(other.rhs);
+                const lo = @min(lhs, rhs);
+                const hi = @max(lhs, rhs);
+                if (other.op == node.op and other.ty == node.ty and lo == node.lhs and hi == node.rhs) {
+                    if (other.existing == null) other.existing = node.existing;
+                    return self.find(entry.class);
+                }
+            },
+        };
+        if (self.nodes.items.len >= self.limits.max_nodes) {
+            self.hit_limit = true;
+            return null;
+        }
+        const class = try self.addClass();
+        try self.nodes.append(self.allocator, .{ .class = class, .node = .{ .op = node } });
+        return class;
+    }
+
+    fn rebuild(self: *Graph) bool {
+        var changed = false;
+        for (self.nodes.items, 0..) |left, i| {
+            const a = switch (left.node) {
+                .leaf => continue,
+                .op => |op| canonical(self, op),
+            };
+            for (self.nodes.items[i + 1 ..]) |right| {
+                const b = switch (right.node) {
+                    .leaf => continue,
+                    .op => |op| canonical(self, op),
+                };
+                if (a.op == b.op and a.ty == b.ty and a.lhs == b.lhs and a.rhs == b.rhs) {
+                    changed = self.merge(left.class, right.class) or changed;
+                }
+            }
+        }
+        return changed;
+    }
+};
+
+fn canonical(graph: *Graph, op: OpNode) OpNode {
+    var result = op;
+    result.lhs = graph.find(result.lhs);
+    result.rhs = graph.find(result.rhs);
+    if (result.lhs > result.rhs) std.mem.swap(u32, &result.lhs, &result.rhs);
+    return result;
+}
+
+fn isInteger(func: *const Function, value: Value) bool {
+    return switch (func.types.type_kind(func.valueType(value))) {
+        .int, .bool => true,
+        else => false,
+    };
+}
+
+/// Avoid graph construction for blocks that cannot match the current rule set.
+fn hasFactorCandidate(func: *const Function, block: Block) bool {
+    for (func.blockInsts(block)) |inst| {
+        const sum = switch (func.opcode(inst)) {
+            .arith => |arith| if (arith.op == .add) arith else continue,
+            else => continue,
+        };
+        const lhs_inst = func.definingInst(sum.lhs) orelse continue;
+        const rhs_inst = func.definingInst(sum.rhs) orelse continue;
+        const lhs = switch (func.opcode(lhs_inst)) {
+            .arith => |arith| arith,
+            else => continue,
+        };
+        const rhs = switch (func.opcode(rhs_inst)) {
+            .arith => |arith| arith,
+            else => continue,
+        };
+        if (lhs.op == .mul and rhs.op == .mul) return true;
+    }
+    return false;
+}
+
+fn classForValue(graph: *Graph, classes: []?u32, costs: []usize, value: Value) !?u32 {
+    const index = @backingInt(value);
+    if (classes[index]) |class| return class;
+    const class = try graph.addLeaf(value) orelse return null;
+    classes[index] = class;
+    costs[index] = 0;
+    return class;
+}
+
+fn importBlock(graph: *Graph, func: *const Function, block: Block, classes: []?u32, costs: []usize) !void {
+    for (func.blockParams(block)) |param| _ = try classForValue(graph, classes, costs, param);
+    for (func.blockInsts(block)) |inst| {
+        const result = func.instResult(inst) orelse continue;
+        if (!isInteger(func, result)) {
+            _ = try classForValue(graph, classes, costs, result);
+            continue;
+        }
+        const arith = switch (func.opcode(inst)) {
+            .arith => |arith| arith,
+            else => {
+                _ = try classForValue(graph, classes, costs, result);
+                continue;
+            },
+        };
+        if (arith.op != .add and arith.op != .mul) {
+            _ = try classForValue(graph, classes, costs, result);
+            continue;
+        }
+        const lhs = try classForValue(graph, classes, costs, arith.lhs) orelse return;
+        const rhs = try classForValue(graph, classes, costs, arith.rhs) orelse return;
+        const class = try graph.addOp(.{
+            .op = arith.op,
+            .lhs = lhs,
+            .rhs = rhs,
+            .ty = func.valueType(result),
+            .existing = result,
+        }) orelse return;
+        classes[@backingInt(result)] = class;
+        costs[@backingInt(result)] = 1 + costs[@backingInt(arith.lhs)] + costs[@backingInt(arith.rhs)];
+    }
+}
+
+fn matchingOps(graph: *Graph, class: u32, op: BinOp, ty: Type, output: *std.ArrayList(OpNode)) !void {
+    const root = graph.find(class);
+    for (graph.nodes.items) |entry| {
+        if (graph.find(entry.class) != root) continue;
+        switch (entry.node) {
+            .leaf => {},
+            .op => |candidate| if (candidate.op == op and candidate.ty == ty) {
+                try output.append(graph.allocator, canonical(graph, candidate));
+            },
+        }
+    }
+}
+
+fn factorPair(graph: *Graph, sum_class: u32, left: OpNode, right: OpNode) !bool {
+    var common: ?u32 = null;
+    var lhs_other: u32 = undefined;
+    var rhs_other: u32 = undefined;
+    if (left.lhs == right.lhs) {
+        common = left.lhs;
+        lhs_other = left.rhs;
+        rhs_other = right.rhs;
+    } else if (left.lhs == right.rhs) {
+        common = left.lhs;
+        lhs_other = left.rhs;
+        rhs_other = right.lhs;
+    } else if (left.rhs == right.lhs) {
+        common = left.rhs;
+        lhs_other = left.lhs;
+        rhs_other = right.rhs;
+    } else if (left.rhs == right.rhs) {
+        common = left.rhs;
+        lhs_other = left.lhs;
+        rhs_other = right.lhs;
+    }
+    const shared = common orelse return false;
+    const inner = try graph.addOp(.{ .op = .add, .lhs = lhs_other, .rhs = rhs_other, .ty = left.ty, .existing = null }) orelse return false;
+    const product = try graph.addOp(.{ .op = .mul, .lhs = shared, .rhs = inner, .ty = left.ty, .existing = null }) orelse return false;
+    return graph.merge(sum_class, product);
+}
+
+fn saturate(graph: *Graph) !void {
+    var iter: usize = 0;
+    while (iter < graph.limits.max_iters and !graph.hit_limit) : (iter += 1) {
+        var changed = graph.rebuild();
+        const count = graph.nodes.items.len;
+        for (graph.nodes.items[0..count]) |entry| {
+            const sum = switch (entry.node) {
+                .op => |op| if (op.op == .add) canonical(graph, op) else continue,
+                .leaf => continue,
+            };
+            var left: std.ArrayList(OpNode) = .empty;
+            defer left.deinit(graph.allocator);
+            var right: std.ArrayList(OpNode) = .empty;
+            defer right.deinit(graph.allocator);
+            try matchingOps(graph, sum.lhs, .mul, sum.ty, &left);
+            try matchingOps(graph, sum.rhs, .mul, sum.ty, &right);
+            for (left.items) |a| for (right.items) |b| {
+                changed = try factorPair(graph, entry.class, a, b) or changed;
+                if (graph.hit_limit) break;
+            };
+            if (graph.hit_limit) break;
+        }
+        if (!changed) break;
+    }
+    _ = graph.rebuild();
+}
+
+const Extraction = struct {
+    costs: []usize,
+    best: []?usize,
+
+    fn deinit(self: *Extraction, allocator: std.mem.Allocator) void {
+        allocator.free(self.costs);
+        allocator.free(self.best);
+    }
+};
+
+fn extract(allocator: std.mem.Allocator, graph: *Graph) !Extraction {
+    const costs = try allocator.alloc(usize, graph.parents.items.len);
+    errdefer allocator.free(costs);
+    @memset(costs, std.math.maxInt(usize));
+    const best = try allocator.alloc(?usize, graph.parents.items.len);
+    errdefer allocator.free(best);
+    @memset(best, null);
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (graph.nodes.items, 0..) |entry, index| {
+            const root = graph.find(entry.class);
+            const cost = switch (entry.node) {
+                .leaf => 0,
+                .op => |raw| blk: {
+                    const op = canonical(graph, raw);
+                    const lhs = costs[graph.find(op.lhs)];
+                    const rhs = costs[graph.find(op.rhs)];
+                    if (lhs == std.math.maxInt(usize) or rhs == std.math.maxInt(usize)) continue;
+                    break :blk 1 + lhs + rhs;
+                },
+            };
+            if (cost < costs[root]) {
+                costs[root] = cost;
+                best[root] = index;
+                changed = true;
+            }
+        }
+    }
+    return .{ .costs = costs, .best = best };
+}
+
+fn materialize(graph: *Graph, extraction: *const Extraction, func: *Function, block: Block, class: u32, memo: []?Value) !Value {
+    const root = graph.find(class);
+    if (memo[root]) |value| return value;
+    const index = extraction.best[root] orelse unreachable;
+    const value = switch (graph.nodes.items[index].node) {
+        .leaf => |leaf| leaf,
+        .op => |raw| blk: {
+            const op = canonical(graph, raw);
+            const lhs = try materialize(graph, extraction, func, block, op.lhs, memo);
+            const rhs = try materialize(graph, extraction, func, block, op.rhs, memo);
+            if (op.existing) |existing| {
+                const existing_op = func.opcode(func.definingInst(existing).?).arith;
+                if ((existing_op.lhs == lhs and existing_op.rhs == rhs) or
+                    (existing_op.lhs == rhs and existing_op.rhs == lhs)) break :blk existing;
+            }
+            break :blk try func.appendInst(block, op.ty, .{ .arith = .{ .op = op.op, .lhs = lhs, .rhs = rhs } });
+        },
+    };
+    memo[root] = value;
+    return value;
+}
+
+fn optimizeRoot(graph: *Graph, extraction: *const Extraction, func: *Function, block: Block, classes: []const ?u32, original_costs: []const usize, root_value: Value, memo: []?Value) !?Value {
+    const class = classes[@backingInt(root_value)] orelse return null;
+    const root = graph.find(class);
+    if (extraction.costs[root] >= original_costs[@backingInt(root_value)]) return null;
+    return try materialize(graph, extraction, func, block, root, memo);
+}
+
+pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limits) pass.Error!bool {
+    if (limits.max_nodes == 0 or limits.max_iters == 0) return false;
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const term = func.terminator(block) orelse continue;
+        if (!hasFactorCandidate(func, block)) continue;
+        var graph = Graph{ .allocator = allocator, .limits = limits };
+        defer graph.deinit();
+        const classes = try allocator.alloc(?u32, func.valueCount());
+        defer allocator.free(classes);
+        @memset(classes, null);
+        const original_costs = try allocator.alloc(usize, func.valueCount());
+        defer allocator.free(original_costs);
+        @memset(original_costs, 0);
+        try importBlock(&graph, func, block, classes, original_costs);
+        try saturate(&graph);
+        var extraction = try extract(allocator, &graph);
+        defer extraction.deinit(allocator);
+        const memo = try allocator.alloc(?Value, graph.parents.items.len);
+        defer allocator.free(memo);
+        @memset(memo, null);
+
+        switch (term) {
+            .ret => |ret| for (ret.slice(), 0..) |value, index| {
+                if (try optimizeRoot(&graph, &extraction, func, block, classes, original_costs, value, memo)) |replacement| {
+                    func.terminatorPtr(block).*.?.ret.values[index] = replacement;
+                    changed = true;
+                }
+            },
+            .jump => |jump| for (func.valueListMut(jump.args)) |*value| {
+                if (try optimizeRoot(&graph, &extraction, func, block, classes, original_costs, value.*, memo)) |replacement| {
+                    value.* = replacement;
+                    changed = true;
+                }
+            },
+        }
+    }
+    return changed;
+}
+
+pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    _ = analyses;
+    return runWithLimits(allocator, func, .{});
+}
+
+test "egraph factors a shared multiplier from a returned expression" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const c = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
+    const sum = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = ab, .rhs = ac } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(sum) });
+
+    try std.testing.expect(try runWithLimits(allocator, &func, .{}));
+    const replacement = func.terminator(block).?.ret.values[0];
+    const product = func.opcode(func.definingInst(replacement).?).arith;
+    try std.testing.expectEqual(BinOp.mul, product.op);
+    const inner_value = if (product.lhs == a) product.rhs else product.lhs;
+    const inner = func.opcode(func.definingInst(inner_value).?).arith;
+    try std.testing.expectEqual(BinOp.add, inner.op);
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "egraph obeys a hard node budget" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const a = try func.appendBlockParam(block, ty);
+    const b = try func.appendBlockParam(block, ty);
+    const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = a } });
+    const sum = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = ab, .rhs = ac } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(sum) });
+    try std.testing.expect(!try runWithLimits(allocator, &func, .{ .max_nodes = 1 }));
+}
