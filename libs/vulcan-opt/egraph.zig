@@ -746,13 +746,15 @@ fn foldXorCarry(graph: *Graph, outer_class: u32, outer: OpNode, exclusives: *std
     return changed;
 }
 
-fn foldNestedIdempotent(graph: *Graph, outer_class: u32, outer: OpNode, matches: *std.ArrayList(OpNode)) !bool {
+fn foldNestedIdempotent(graph: *Graph, outer_class: u32, outer: OpNode, matches: *std.ArrayList(OpNode)) !?bool {
+    var matched = false;
     var changed = false;
     matches.clearRetainingCapacity();
     try matchingOps(graph, outer.lhs, outer.op, outer.ty, matches);
     const rhs = graph.find(outer.rhs);
     for (matches.items) |nested| {
         if (graph.find(nested.lhs) == rhs or graph.find(nested.rhs) == rhs) {
+            matched = true;
             changed = graph.merge(outer_class, outer.lhs) or changed;
         }
     }
@@ -761,10 +763,11 @@ fn foldNestedIdempotent(graph: *Graph, outer_class: u32, outer: OpNode, matches:
     const lhs = graph.find(outer.lhs);
     for (matches.items) |nested| {
         if (graph.find(nested.lhs) == lhs or graph.find(nested.rhs) == lhs) {
+            matched = true;
             changed = graph.merge(outer_class, outer.rhs) or changed;
         }
     }
-    return changed;
+    return if (matched) changed else null;
 }
 
 fn foldBitwisePairs(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
@@ -984,6 +987,12 @@ fn saturate(graph: *Graph) !void {
                     if (graph.hit_limit) break;
                 };
             }
+            if (sum.op == .bit_and or sum.op == .bit_or) {
+                if (try foldNestedIdempotent(graph, entry.class, sum, left)) |rule_changed| {
+                    direct_match = true;
+                    changed = rule_changed or changed;
+                }
+            }
             // A direct reduction already introduces the remaining associative expression. Let
             // the eager walk process that smaller expression instead of expanding this node first.
             if (!direct_match and isAssociative(sum.op) and classHasOp(graph, sum.lhs, sum.op)) {
@@ -1031,9 +1040,6 @@ fn saturate(graph: *Graph) !void {
             }
             if (sum.op == .add and graph.op_mask & opBit(.bit_xor) != 0) {
                 changed = try foldXorCarry(graph, entry.class, sum, left, right, nested_matches) or changed;
-            }
-            if (sum.op == .bit_and or sum.op == .bit_or) {
-                changed = try foldNestedIdempotent(graph, entry.class, sum, left) or changed;
             }
             if (sum.op == .bit_and or sum.op == .bit_or or sum.op == .bit_xor) {
                 changed = try foldBitwisePairs(graph, entry.class, sum, left, right) or changed;
