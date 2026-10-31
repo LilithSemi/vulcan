@@ -17,6 +17,7 @@ const Inst = ir.function.Inst;
 pub const pass_def = pass.Pass{ .name = "mem2reg", .run = run, .preserves_cfg = true };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    if (!hasLiveAlloca(func)) return false;
     const promotable = try findPromotable(allocator, func);
     defer allocator.free(promotable);
 
@@ -60,6 +61,15 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     try b.rewrite();
     try b.collapseTrivialPhis();
     return true;
+}
+
+fn hasLiveAlloca(func: *const Function) bool {
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (func.opcode(inst) == .alloca) return true;
+        }
+    }
+    return false;
 }
 
 /// SSA construction over the promotable slots, adapted from Braun et al. "Simple and Efficient
@@ -677,6 +687,8 @@ test "single-block store then load forwards the stored value" {
     try testing.expect(try runOnce(allocator, &func));
     try testing.expectEqual(x, func.terminator(b).?.ret.values[0]); // load became x
     try expectNoMemoryInsts(&func, b);
+    try testing.expect(!hasLiveAlloca(&func));
+    try testing.expect(!try runOnce(allocator, &func));
 }
 
 test "an orphaned address use does not block promotion" {
