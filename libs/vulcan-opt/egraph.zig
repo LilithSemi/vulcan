@@ -615,8 +615,8 @@ fn factorPair(graph: *Graph, sum_class: u32, sum_op: BinOp, inner_op: BinOp, lef
     return graph.merge(sum_class, product);
 }
 
-fn cancelPair(graph: *Graph, sum_class: u32, sum_op: BinOp, left: OpNode, right: OpNode) !bool {
-    const operands = commonOperands(left, right) orelse return false;
+fn cancelPair(graph: *Graph, sum_class: u32, sum_op: BinOp, left: OpNode, right: OpNode) !?bool {
+    const operands = commonOperands(left, right) orelse return null;
     const reduced = try graph.addOp(.{ .op = sum_op, .lhs = operands.lhs_other, .rhs = operands.rhs_other, .ty = left.ty, .existing = null }) orelse return false;
     return graph.merge(sum_class, reduced);
 }
@@ -955,7 +955,7 @@ fn saturate(graph: *Graph) !void {
                 .op => |op| if (isAssociative(op.op) or factorInner(op.op) != null or cancellationInner(op.op) != null or absorptionInner(op.op) != null) canonical(graph, op) else continue,
                 .leaf => continue,
             };
-            var factored = false;
+            var direct_match = false;
             if (factorInner(sum.op)) |inner_op| factor: {
                 if (!classHasOp(graph, sum.lhs, inner_op) or !classHasOp(graph, sum.rhs, inner_op)) break :factor;
                 left.clearRetainingCapacity();
@@ -964,29 +964,11 @@ fn saturate(graph: *Graph) !void {
                 try matchingOps(graph, sum.rhs, inner_op, sum.ty, right);
                 for (left.items) |a| for (right.items) |b| {
                     if (try factorPair(graph, entry.class, sum.op, inner_op, a, b)) |pair_changed| {
-                        factored = true;
+                        direct_match = true;
                         changed = pair_changed or changed;
                     }
                     if (graph.hit_limit) break;
                 };
-            }
-            // A direct factor match already introduces the inner associative expression. Let the
-            // eager walk process that smaller expression instead of expanding this node first.
-            if (!factored and isAssociative(sum.op) and classHasOp(graph, sum.lhs, sum.op)) {
-                left.clearRetainingCapacity();
-                try matchingOps(graph, sum.lhs, sum.op, sum.ty, left);
-                for (left.items) |nested| {
-                    changed = try associatePair(graph, entry.class, sum.op, nested, sum.rhs) or changed;
-                    if (graph.hit_limit) break;
-                }
-            }
-            if (!factored and isAssociative(sum.op) and classHasOp(graph, sum.rhs, sum.op)) {
-                right.clearRetainingCapacity();
-                try matchingOps(graph, sum.rhs, sum.op, sum.ty, right);
-                for (right.items) |nested| {
-                    changed = try associatePair(graph, entry.class, sum.op, nested, sum.lhs) or changed;
-                    if (graph.hit_limit) break;
-                }
             }
             if (cancellationInner(sum.op)) |inner_op| cancellation: {
                 if (!classHasOp(graph, sum.lhs, inner_op) or !classHasOp(graph, sum.rhs, inner_op)) break :cancellation;
@@ -995,9 +977,30 @@ fn saturate(graph: *Graph) !void {
                 try matchingOps(graph, sum.lhs, inner_op, sum.ty, left);
                 try matchingOps(graph, sum.rhs, inner_op, sum.ty, right);
                 for (left.items) |a| for (right.items) |b| {
-                    changed = try cancelPair(graph, entry.class, sum.op, a, b) or changed;
+                    if (try cancelPair(graph, entry.class, sum.op, a, b)) |pair_changed| {
+                        direct_match = true;
+                        changed = pair_changed or changed;
+                    }
                     if (graph.hit_limit) break;
                 };
+            }
+            // A direct reduction already introduces the remaining associative expression. Let
+            // the eager walk process that smaller expression instead of expanding this node first.
+            if (!direct_match and isAssociative(sum.op) and classHasOp(graph, sum.lhs, sum.op)) {
+                left.clearRetainingCapacity();
+                try matchingOps(graph, sum.lhs, sum.op, sum.ty, left);
+                for (left.items) |nested| {
+                    changed = try associatePair(graph, entry.class, sum.op, nested, sum.rhs) or changed;
+                    if (graph.hit_limit) break;
+                }
+            }
+            if (!direct_match and isAssociative(sum.op) and classHasOp(graph, sum.rhs, sum.op)) {
+                right.clearRetainingCapacity();
+                try matchingOps(graph, sum.rhs, sum.op, sum.ty, right);
+                for (right.items) |nested| {
+                    changed = try associatePair(graph, entry.class, sum.op, nested, sum.lhs) or changed;
+                    if (graph.hit_limit) break;
+                }
             }
             if (sum.op == .sub and classHasOp(graph, sum.lhs, .sub) and classHasOp(graph, sum.rhs, .sub)) {
                 left.clearRetainingCapacity();
