@@ -13,6 +13,7 @@ const BenchFn = *const fn (std.mem.Allocator, *Function) anyerror!bool;
 const blocks: usize = 2048;
 const xor_cancel_blocks: usize = 64;
 const xor_carry_blocks: usize = 64;
+const shared_dag_blocks: usize = 256;
 const samples: usize = 9;
 
 pub fn main(init: std.process.Init) !void {
@@ -33,6 +34,8 @@ pub fn main(init: std.process.Init) !void {
     defer bitwise_pair.deinit();
     var bitwise_arithmetic = try buildBitwiseArithmeticWorkload(allocator, blocks);
     defer bitwise_arithmetic.deinit();
+    var shared_dag = try buildSharedDagWorkload(allocator, shared_dag_blocks);
+    defer shared_dag.deinit();
     var mixed_pair = try buildMixedPairWorkload(allocator, blocks);
     defer mixed_pair.deinit();
     var cross_cancel = try buildCrossCancelWorkload(allocator, blocks);
@@ -58,6 +61,7 @@ pub fn main(init: std.process.Init) !void {
     const idempotent_egraph_ns = try measure(init.io, allocator, &idempotent, runEgraph);
     const bitwise_pair_egraph_ns = try measure(init.io, allocator, &bitwise_pair, runEgraph);
     const bitwise_arithmetic_egraph_ns = try measure(init.io, allocator, &bitwise_arithmetic, runEgraph);
+    const shared_dag_egraph_ns = try measure(init.io, allocator, &shared_dag, runEgraph);
     const mixed_pair_egraph_ns = try measure(init.io, allocator, &mixed_pair, runEgraph);
     const cross_cancel_egraph_ns = try measure(init.io, allocator, &cross_cancel, runEgraph);
     const rootless_egraph_ns = try measure(init.io, allocator, &rootless, runEgraph);
@@ -75,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
             "  idempotent egraph:      {d} ns/block\n" ++
             "  bitwise pair egraph:    {d} ns/block\n" ++
             "  bitwise arith egraph:   {d} ns/block\n" ++
+            "  shared dag egraph:      {d} ns/block ({d} blocks)\n" ++
             "  mixed pair egraph:      {d} ns/block\n" ++
             "  cross cancel egraph:    {d} ns/block\n" ++
             "  rootless egraph:        {d} ns/block\n" ++
@@ -95,6 +100,8 @@ pub fn main(init: std.process.Init) !void {
             idempotent_egraph_ns / blocks,
             bitwise_pair_egraph_ns / blocks,
             bitwise_arithmetic_egraph_ns / blocks,
+            shared_dag_egraph_ns / shared_dag_blocks,
+            shared_dag_blocks,
             mixed_pair_egraph_ns / blocks,
             cross_cancel_egraph_ns / blocks,
             rootless_egraph_ns / blocks,
@@ -260,6 +267,24 @@ fn buildBitwiseArithmeticWorkload(allocator: std.mem.Allocator, count: usize) !F
         const both = try func.appendInst(block, ty, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } });
         const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = either, .rhs = both } });
         func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+    }
+    return func;
+}
+
+fn buildSharedDagWorkload(allocator: std.mem.Allocator, count: usize) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    for (0..count) |_| {
+        const block = try func.appendBlock();
+        const a = try func.appendBlockParam(block, ty);
+        const b = try func.appendBlockParam(block, ty);
+        const c = try func.appendBlockParam(block, ty);
+        const ab = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+        const ac = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
+        var shared = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = ab, .rhs = ac } });
+        for (0..9) |_| shared = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = shared, .rhs = shared } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.one(shared) });
     }
     return func;
 }
