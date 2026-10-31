@@ -770,8 +770,9 @@ fn foldNestedIdempotent(graph: *Graph, outer_class: u32, outer: OpNode, matches:
     return if (matched) changed else null;
 }
 
-fn foldBitwisePairs(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !bool {
+fn foldBitwisePairs(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.ArrayList(OpNode), right: *std.ArrayList(OpNode)) !?bool {
     const bit_ops = [_]BinOp{ .bit_and, .bit_or, .bit_xor };
+    var matched = false;
     var changed = false;
     for (bit_ops) |lhs_op| for (bit_ops) |rhs_op| {
         const result_op = bitwisePairResult(outer.op, lhs_op, rhs_op);
@@ -783,6 +784,7 @@ fn foldBitwisePairs(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.A
         try matchingOps(graph, outer.rhs, rhs_op, outer.ty, right);
         for (left.items) |a| for (right.items) |b| {
             if (!sameClassOperands(graph, a, b)) continue;
+            matched = true;
             const replacement = try graph.addOp(.{
                 .op = if (produces_zero) .bit_xor else result_op.?,
                 .lhs = a.lhs,
@@ -794,7 +796,7 @@ fn foldBitwisePairs(graph: *Graph, outer_class: u32, outer: OpNode, left: *std.A
         };
         if (graph.hit_limit) break;
     };
-    return changed;
+    return if (matched) changed else null;
 }
 
 fn mergeDouble(graph: *Graph, outer_class: u32, ty: Type, value: u32) !bool {
@@ -993,6 +995,12 @@ fn saturate(graph: *Graph) !void {
                     changed = rule_changed or changed;
                 }
             }
+            if (sum.op == .bit_and or sum.op == .bit_or or sum.op == .bit_xor) {
+                if (try foldBitwisePairs(graph, entry.class, sum, left, right)) |rule_changed| {
+                    direct_match = true;
+                    changed = rule_changed or changed;
+                }
+            }
             // A direct reduction already introduces the remaining associative expression. Let
             // the eager walk process that smaller expression instead of expanding this node first.
             if (!direct_match and isAssociative(sum.op) and classHasOp(graph, sum.lhs, sum.op)) {
@@ -1040,9 +1048,6 @@ fn saturate(graph: *Graph) !void {
             }
             if (sum.op == .add and graph.op_mask & opBit(.bit_xor) != 0) {
                 changed = try foldXorCarry(graph, entry.class, sum, left, right, nested_matches) or changed;
-            }
-            if (sum.op == .bit_and or sum.op == .bit_or or sum.op == .bit_xor) {
-                changed = try foldBitwisePairs(graph, entry.class, sum, left, right) or changed;
             }
             if ((sum.op == .add or sum.op == .sub) and hasBitwiseArithmeticChildren(graph, sum)) {
                 left.clearRetainingCapacity();
