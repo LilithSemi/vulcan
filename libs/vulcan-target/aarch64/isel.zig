@@ -508,7 +508,14 @@ const EdgeMove = struct {
 /// into this backend's `Location` space). Keyed by the block pair so emission can find
 /// the moves for the edge it is currently lowering (the block being emitted plus the jump target,
 /// including the forwarding blocks `splitCriticalEdges` inserted).
-const EdgeMoveSet = struct { pred: Block, succ: Block, moves: []EdgeMove };
+const EdgeMoveSet = struct {
+    pred: Block,
+    succ: Block,
+    moves: []EdgeMove,
+    consumed: bool = false,
+};
+
+const MatchingEdgeMoves = struct { lhs: *EdgeMoveSet, rhs: *EdgeMoveSet };
 
 /// A store or reload the emitter must insert at a split boundary. `at` is the instruction position
 /// the action lands before (the position at which the pool was exhausted for a tail split). `store`
@@ -2513,7 +2520,7 @@ fn transparentForwardTarget(func: *const Function, alloc: *const Allocation, blo
         .ret => return null,
     };
     for (alloc.edge_moves) |set| {
-        if (set.pred == block and set.succ == jump.target and set.moves.len != 0) return null;
+        if (set.pred == block and set.succ == jump.target and !set.consumed and set.moves.len != 0) return null;
     }
 
     var first_pos: u32 = 0;
@@ -3027,17 +3034,31 @@ const Ctx = struct {
         // takes the THEN-fall-through layout (elides one branch, both edges still reach the same block).
         const then_target = cf.then.target;
         const else_target = cf.@"else".target;
+        // A compare has already captured the branch condition in NZCV. If both outcomes carry the
+        // same ordered shuffle, execute it once here. A64 moves and spill traffic preserve NZCV.
+        // The candidate strictly removes one shuffle and can expose a direct fallthrough, so its
+        // machine instruction and branch scores cannot exceed the original layout.
+        const matching_moves = switch (branch) {
+            .cc => self.matchingEdgeMoves(cf.then, cf.@"else"),
+            else => null,
+        };
+        if (matching_moves) |sets| {
+            try self.emitEdgeMoves(allocator, code, sets.lhs.pred, sets.lhs.succ);
+            sets.lhs.consumed = true;
+            sets.rhs.consumed = true;
+        }
+        const common_moves = matching_moves != null;
         const then_next = next_block != null and resolveTransparentTarget(self.func, self.alloc, then_target) == next_block.?;
         const else_next = next_block != null and resolveTransparentTarget(self.func, self.alloc, else_target) == next_block.?;
 
         if (then_next) {
             // With no moves on the cold ELSE edge, branch there directly and let THEN fall through.
             // This removes the local label plus unconditional branch from the hot loop-header shape.
-            if (direct_fallthrough and self.edgeMovesEmpty(cf.@"else")) switch (branch) {
+            if ((direct_fallthrough or common_moves) and (common_moves or self.edgeMovesEmpty(cf.@"else"))) switch (branch) {
                 .cc => |cond| {
                     try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target), .cond = encode.invertCond(cond) });
                     try code.append(allocator, encode.bcc(encode.invertCond(cond), 0));
-                    try self.emitMoves(allocator, code, cf.then);
+                    if (!common_moves) try self.emitMoves(allocator, code, cf.then);
                     return;
                 },
                 else => {},
@@ -3051,7 +3072,7 @@ const Ctx = struct {
                 .reg => |reg| encode.cbnz(reg, 0),
                 .reg_eqz => |reg| encode.cbz(reg, 0),
             });
-            try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves on the else path
+            if (!common_moves) try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves on the else path
             try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target) });
             try code.append(allocator, encode.b(0));
             const then_at = code.items.len;
@@ -3061,17 +3082,17 @@ const Ctx = struct {
                 .reg => |reg| encode.cbnz(reg, disp),
                 .reg_eqz => |reg| encode.cbz(reg, disp),
             };
-            try self.emitMoves(allocator, code, cf.then); // THEN-moves, then fall through to THEN
+            if (!common_moves) try self.emitMoves(allocator, code, cf.then); // THEN-moves, then fall through to THEN
             return;
         }
 
         if (else_next) {
             // Symmetric move-free fast path: branch directly to THEN and let ELSE fall through.
-            if (direct_fallthrough and self.edgeMovesEmpty(cf.then)) switch (branch) {
+            if ((direct_fallthrough or common_moves) and (common_moves or self.edgeMovesEmpty(cf.then))) switch (branch) {
                 .cc => |cond| {
                     try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target), .cond = cond });
                     try code.append(allocator, encode.bcc(cond, 0));
-                    try self.emitMoves(allocator, code, cf.@"else");
+                    if (!common_moves) try self.emitMoves(allocator, code, cf.@"else");
                     return;
                 },
                 else => {},
@@ -3086,7 +3107,7 @@ const Ctx = struct {
                 .reg => |reg| encode.cbz(reg, 0),
                 .reg_eqz => |reg| encode.cbnz(reg, 0),
             });
-            try self.emitMoves(allocator, code, cf.then); // THEN-moves on the then (not-taken) path
+            if (!common_moves) try self.emitMoves(allocator, code, cf.then); // THEN-moves on the then (not-taken) path
             try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target) });
             try code.append(allocator, encode.b(0));
             const else_at = code.items.len;
@@ -3096,7 +3117,7 @@ const Ctx = struct {
                 .reg => |reg| encode.cbz(reg, disp),
                 .reg_eqz => |reg| encode.cbnz(reg, disp),
             };
-            try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves, then fall through to ELSE
+            if (!common_moves) try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves, then fall through to ELSE
             return;
         }
 
@@ -3107,7 +3128,7 @@ const Ctx = struct {
             .reg => |reg| encode.cbnz(reg, 0),
             .reg_eqz => |reg| encode.cbz(reg, 0),
         });
-        try self.emitMoves(allocator, code, cf.@"else");
+        if (!common_moves) try self.emitMoves(allocator, code, cf.@"else");
         try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target) });
         try code.append(allocator, encode.b(0));
         const then_at = code.items.len;
@@ -3117,7 +3138,7 @@ const Ctx = struct {
             .reg => |reg| encode.cbnz(reg, disp),
             .reg_eqz => |reg| encode.cbz(reg, disp),
         };
-        try self.emitMoves(allocator, code, cf.then);
+        if (!common_moves) try self.emitMoves(allocator, code, cf.then);
         try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target) });
         try code.append(allocator, encode.b(0));
     }
@@ -3198,7 +3219,31 @@ const Ctx = struct {
     fn edgeMovesEmpty(self: Ctx, jump: ir.function.Jump) bool {
         if (!self.alloc.edge_move_driven) return false;
         const set = self.findEdgeMoves(self.block, jump.target) orelse return true;
-        return set.moves.len == 0;
+        return set.consumed or set.moves.len == 0;
+    }
+
+    fn matchingEdgeMoves(self: Ctx, lhs: ir.function.Jump, rhs: ir.function.Jump) ?MatchingEdgeMoves {
+        if (!self.alloc.edge_move_driven) return null;
+        const lhs_set = self.edgeOrForwardMoves(lhs) orelse return null;
+        const rhs_set = self.edgeOrForwardMoves(rhs) orelse return null;
+        if (lhs_set.consumed or rhs_set.consumed or lhs_set.moves.len == 0 or lhs_set.moves.len != rhs_set.moves.len) return null;
+        for (lhs_set.moves, rhs_set.moves) |a, b| {
+            if (!std.meta.eql(a, b)) return null;
+        }
+        return .{ .lhs = lhs_set, .rhs = rhs_set };
+    }
+
+    /// Find moves on an edge or on the empty forwarding block inserted to split that edge.
+    fn edgeOrForwardMoves(self: Ctx, jump: ir.function.Jump) ?*EdgeMoveSet {
+        if (self.findEdgeMoves(self.block, jump.target)) |set| {
+            if (set.moves.len != 0) return set;
+        }
+        if (self.func.blockParams(jump.target).len != 0 or self.func.blockInsts(jump.target).len != 0) return null;
+        const forwarding = switch (self.func.terminator(jump.target) orelse return null) {
+            .jump => |forwarding| forwarding,
+            .ret => return null,
+        };
+        return self.findEdgeMoves(jump.target, forwarding.target);
     }
 
     /// Replay the precomputed, already-ordered edge moves for `pred -> succ` op-by-op. The shared
@@ -3208,6 +3253,7 @@ const Ctx = struct {
     /// nothing is emitted for it. No reordering here would break that resolution.
     fn emitEdgeMoves(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), pred: Block, succ: Block) Error!void {
         const set = self.findEdgeMoves(pred, succ) orelse return;
+        if (set.consumed) return;
         const edge_start = code.items.len;
         for (set.moves) |m| {
             const move_at = code.items.len;
@@ -3226,7 +3272,7 @@ const Ctx = struct {
     }
 
     /// The precomputed move set for the edge `pred -> succ`, or null when the edge needs no shuffle.
-    fn findEdgeMoves(self: Ctx, pred: Block, succ: Block) ?*const EdgeMoveSet {
+    fn findEdgeMoves(self: Ctx, pred: Block, succ: Block) ?*EdgeMoveSet {
         for (self.alloc.edge_moves) |*set| {
             if (set.pred == pred and set.succ == succ) return set;
         }
@@ -6512,6 +6558,51 @@ test "emitSplitAction .slot_to_slot round-trips a full 128-bit vector through th
     try std.testing.expectEqual(@as(usize, 2), code.items.len);
     try std.testing.expectEqual(encode.ldrQ(fp_move, sp, 0 * 16), code.items[0]);
     try std.testing.expectEqual(encode.strQ(fp_move, sp, 7 * 16), code.items[1]);
+}
+
+test "matching edge moves cross critical-edge forwarding blocks" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const bool_t = try func.types.intern(.bool);
+    const pred = try func.appendBlock();
+    const left = try func.appendBlock();
+    const right = try func.appendBlock();
+    const left_target = try func.appendBlock();
+    const right_target = try func.appendBlock();
+    const cond = try func.appendBlockParam(pred, bool_t);
+    try func.appendIf(pred, cond, .{ .target = left }, .{ .target = right });
+    try func.setJump(left, left_target, &.{});
+    try func.setJump(right, right_target, &.{});
+    func.setTerminator(left_target, .{ .ret = ir.function.Ret.one(cond) });
+    func.setTerminator(right_target, .{ .ret = ir.function.Ret.one(cond) });
+
+    var left_moves = [_]EdgeMove{.{ .src = .{ .reg = .x1 }, .dst = .{ .reg = .x2 }, .class = 0 }};
+    var right_moves = left_moves;
+    var sets = [_]EdgeMoveSet{
+        .{ .pred = left, .succ = left_target, .moves = &left_moves },
+        .{ .pred = right, .succ = right_target, .moves = &right_moves },
+    };
+    var allocation = Allocation{ .edge_moves = &sets, .edge_move_driven = true };
+    var alloca_off: std.AutoHashMapUnmanaged(Value, u32) = .empty;
+    var coalescable: std.ArrayList(usize) = .empty;
+    var dead_source: std.ArrayList(usize) = .empty;
+    const ctx = Ctx{
+        .func = &func,
+        .alloc = &allocation,
+        .spill_base = 0,
+        .alloca_base = 0,
+        .alloca_off = &alloca_off,
+        .coalescable_edge_moves = &coalescable,
+        .dead_source_edge_moves = &dead_source,
+        .block = pred,
+    };
+    const branch = func.opcode(func.blockInsts(pred)[0]).@"if";
+    const matching = ctx.matchingEdgeMoves(branch.then, branch.@"else").?;
+    try std.testing.expect(matching.lhs == &sets[0]);
+    try std.testing.expect(matching.rhs == &sets[1]);
+    matching.lhs.consumed = true;
+    try std.testing.expectEqual(left_target, resolveTransparentTarget(&func, &allocation, left));
 }
 
 test "a barrier is rejected, not dropped like a prefetch" {

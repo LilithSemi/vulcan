@@ -68,7 +68,6 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 
         const header_params = try allocator.dupe(Value, func.blockParams(header));
         defer allocator.free(header_params);
-        if (header_params.len > 1) continue;
         if (func.blockArgs(latch_jump).len != header_params.len) continue;
         if (!operandAvailableAtLatch(header_params, def_blocks, loop.header, compare.lhs) or
             !operandAvailableAtLatch(header_params, def_blocks, loop.header, compare.rhs)) continue;
