@@ -238,12 +238,48 @@ fn buildPackedVector(
                 lhs[lane] = arith.lhs;
                 rhs[lane] = arith.rhs;
             }
+            if (first.op == .add) {
+                const shifted = uniformShiftOf(func, lhs[0..scalars.len], rhs[0..scalars.len]) orelse
+                    uniformShiftOf(func, rhs[0..scalars.len], lhs[0..scalars.len]);
+                if (shifted) |match| {
+                    const vector_base = try buildPackedVector(allocator, func, block, match.base, vector_t, group_pos, model, coalesced_loads, coalesced);
+                    const elem_t = func.valueType(match.base[0]);
+                    if (match.shift >= 0 and match.shift < 31 and model != null and cost.vectorMulProfitableOverShiftAdd(model.?)) {
+                        const multiplier = (@as(i64, 1) << @intCast(match.shift)) + 1;
+                        const immediate = try func.appendInst(block, elem_t, .{ .iconst = multiplier });
+                        const vector_imm = try func.appendSplat(block, vector_t, immediate);
+                        break :blk try func.appendInst(block, vector_t, .{ .arith = .{ .op = .mul, .lhs = vector_base, .rhs = vector_imm } });
+                    }
+                    const immediate = try func.appendInst(block, elem_t, .{ .iconst = match.shift });
+                    const vector_imm = try func.appendSplat(block, vector_t, immediate);
+                    const vector_shift = try func.appendInst(block, vector_t, .{ .arith = .{ .op = .shl, .lhs = vector_base, .rhs = vector_imm } });
+                    break :blk try func.appendInst(block, vector_t, .{ .arith = .{ .op = .add, .lhs = vector_base, .rhs = vector_shift } });
+                }
+            }
             const vector_lhs = try buildPackedVector(allocator, func, block, lhs[0..scalars.len], vector_t, group_pos, model, coalesced_loads, coalesced);
             const vector_rhs = try buildPackedVector(allocator, func, block, rhs[0..scalars.len], vector_t, group_pos, model, coalesced_loads, coalesced);
             break :blk try func.appendInst(block, vector_t, .{ .arith = .{ .op = first.op, .lhs = vector_lhs, .rhs = vector_rhs } });
         },
         else => unreachable,
     };
+}
+
+const ShiftMatch = struct { base: []const Value, shift: i64 };
+
+fn uniformShiftOf(func: *const Function, base: []const Value, shifted: []const Value) ?ShiftMatch {
+    var amount: ?i64 = null;
+    for (base, shifted) |source, candidate| {
+        const inst = func.definingInst(candidate) orelse return null;
+        const arith = switch (func.opcode(inst)) {
+            .arith_imm => |op| op,
+            else => return null,
+        };
+        if (arith.op != .shl or arith.lhs != source) return null;
+        if (amount) |expected| {
+            if (arith.imm != expected) return null;
+        } else amount = arith.imm;
+    }
+    return .{ .base = base, .shift = amount.? };
 }
 
 fn foldArithmeticVectorPacks(
@@ -975,27 +1011,40 @@ fn allSame(scalars: []const Value) bool {
 
 const Progression = struct { base: Value, step: i64 };
 
+const AffineScalar = struct { root: Value, offset: i64 };
+
+fn affineScalar(func: *const Function, value: Value, depth: u8) AffineScalar {
+    if (depth < 8) if (func.definingInst(value)) |inst| switch (func.opcode(inst)) {
+        .arith_imm => |arith| if (arith.op == .add) {
+            const inner = affineScalar(func, arith.lhs, depth + 1);
+            return .{
+                .root = inner.root,
+                .offset = std.math.add(i64, inner.offset, arith.imm) catch return .{ .root = value, .offset = 0 },
+            };
+        },
+        else => {},
+    };
+    return .{ .root = value, .offset = 0 };
+}
+
 /// Recognize `[base, base + step, ..., base + (N - 1) * step]` before it becomes a lane-insert
-/// pack. The vector form is one broadcast plus one add, and its constant offset vector can hoist.
+/// pack. The first lane may itself have an offset from the common root, as in
+/// `[root + 4*step, root + 5*step, ...]` from a second unrolled group. The vector form is one
+/// broadcast plus one add, and its constant offset vector can hoist.
 fn arithmeticProgression(func: *const Function, scalars: []const Value) ?Progression {
     if (scalars.len < 2) return null;
-    const base = scalars[0];
-    const second_inst = func.definingInst(scalars[1]) orelse return null;
-    const second = switch (func.opcode(second_inst)) {
-        .arith_imm => |arith| if (arith.op == .add and arith.lhs == base) arith else return null,
-        else => return null,
-    };
-    const step = second.imm;
+    const first = affineScalar(func, scalars[0], 0);
+    const second = affineScalar(func, scalars[1], 0);
+    if (first.root != second.root) return null;
+    const step = std.math.sub(i64, second.offset, first.offset) catch return null;
     for (scalars[2..], 2..) |scalar, lane| {
-        const expected = std.math.mul(i64, step, @intCast(lane)) catch return null;
-        const inst = func.definingInst(scalar) orelse return null;
-        const arith = switch (func.opcode(inst)) {
-            .arith_imm => |candidate| candidate,
-            else => return null,
-        };
-        if (arith.op != .add or arith.lhs != base or arith.imm != expected) return null;
+        const parts = affineScalar(func, scalar, 0);
+        if (parts.root != first.root) return null;
+        const delta = std.math.mul(i64, step, @intCast(lane)) catch return null;
+        const expected = std.math.add(i64, first.offset, delta) catch return null;
+        if (parts.offset != expected) return null;
     }
-    return .{ .base = base, .step = step };
+    return .{ .base = scalars[0], .step = step };
 }
 
 test "recognizes scalar induction lanes as an arithmetic progression" {
@@ -1011,6 +1060,21 @@ test "recognizes scalar induction lanes as an arithmetic progression" {
         lane.* = try func.appendArithImm(block, i32_t, .add, base, @as(i64, @intCast(index)) * 17);
     const progression = arithmeticProgression(&func, &lanes).?;
     try std.testing.expectEqual(base, progression.base);
+    try std.testing.expectEqual(@as(i64, 17), progression.step);
+}
+
+test "recognizes a later affine induction group" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const root = try func.appendBlockParam(block, i32_t);
+    var lanes: [4]Value = undefined;
+    for (&lanes, 4..) |*lane, index|
+        lane.* = try func.appendArithImm(block, i32_t, .add, root, @as(i64, @intCast(index)) * 17);
+    const progression = arithmeticProgression(&func, &lanes).?;
+    try std.testing.expectEqual(lanes[0], progression.base);
     try std.testing.expectEqual(@as(i64, 17), progression.step);
 }
 

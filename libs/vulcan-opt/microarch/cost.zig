@@ -72,6 +72,15 @@ fn opWeight(model: *const Model, op: BinOp, elem_is_float: bool) f64 {
     return @floatFromInt(model.throughput(arithOpcode(op), elem_is_float));
 }
 
+/// Whether one SIMD multiply is cheaper in steady-state issue cost than the equivalent
+/// `x + (x << shift)` chain. Integer vectors execute on the SIMD pipes, so use the model's SIMD
+/// throughput row rather than its scalar integer MulDiv row.
+pub fn vectorMulProfitableOverShiftAdd(model: *const Model) bool {
+    const multiply = opWeight(model, .mul, true);
+    const shift_add = opWeight(model, .shl, false) + opWeight(model, .add, false);
+    return multiply < shift_add;
+}
+
 /// The functional-unit class the scalar form of this op contends for. Float arith runs on the
 /// FP/SIMD unit (its port count, e.g. 2 on ampere / 1 on et-soc), integer arith on the model's own
 /// binding (alu for add-class, muldiv for mul-class). This is why a float and an integer add on the
@@ -263,6 +272,10 @@ test "ampere reduction score accepts two independent accumulators" {
     const model = registry.modelFor(.@"ampere-altra");
     try std.testing.expect(reductionGroupsProfitable(model, .add, 2, 2));
     try std.testing.expect(reductionLoopCost(model, .add, 2, 2) < reductionLoopCost(model, .add, 2, 1));
+}
+
+test "ampere SIMD score prefers multiply over shift-add" {
+    try std.testing.expect(vectorMulProfitableOverShiftAdd(registry.modelFor(.@"ampere-altra")));
 }
 
 test "et-soc SLP stays profitable: the single-issue core serializes the scalar ops" {

@@ -632,7 +632,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         index_elem_type = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = induction_bits } });
 
     const parallel_reduction = reduction == null or
-        (reduction.?.op == .add and cost.reductionGroupsProfitable(model, reduction.?.op, @intCast(accesses.items.len), 2));
+        cost.reductionGroupsProfitable(model, reduction.?.op, @intCast(accesses.items.len), 2);
     const groups: u32 = if (model.arch == .aarch64 and parallel_reduction and accesses.items.len <= 2 and V * 2 <= MAX_LANES) 2 else 1;
     return Plan{
         .header = header,
@@ -1465,6 +1465,7 @@ test "recognizes a reduction-only loop with a computed increment" {
     try testing.expectEqual(BinOp.bit_xor, plan.reduction.?.op);
     try testing.expectEqual(increment, plan.reduction.?.increment);
     try testing.expectEqual(i32_t, plan.index_elem_type.?);
+    try testing.expectEqual(@as(u32, 2), plan.groups);
 
     try apply(allocator, &func, &plan);
     var diags = try ir.verify.verify(allocator, &func, .low);
