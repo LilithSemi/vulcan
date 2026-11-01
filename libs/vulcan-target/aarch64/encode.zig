@@ -95,6 +95,16 @@ pub fn umulh(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x9BC07C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
+/// `smull xd, wn, wm`, the `smaddl` alias with XZR as the addend.
+pub fn smull(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x9B207C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// `umull xd, wn, wm`, the `umaddl` alias with XZR as the addend.
+pub fn umull(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x9BA07C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
 /// `sbfm xd, xn, #immr, #imms` (64-bit signed bitfield move). `sxtb`/`sxth`/`sxtw` are the aliases
 /// `sbfm xd, xn, #0, #{7,15,31}`, used here to sign-extend a narrower value held in an x register.
 pub fn sbfm(rd: Reg, rn: Reg, immr: u6, imms: u6) u32 {
@@ -1222,6 +1232,11 @@ test "known A64 encodings" {
 test "smulh / umulh encoding (high half of a 64x64 product)" {
     try std.testing.expectEqual(@as(u32, 0x9b4a7d28), smulh(.x8, .x9, .x10));
     try std.testing.expectEqual(@as(u32, 0x9bca7d28), umulh(.x8, .x9, .x10));
+}
+
+test "smull / umull encoding (widening 32-bit product)" {
+    try std.testing.expectEqual(@as(u32, 0x9B297CEC), smull(.x12, .x7, .x9));
+    try std.testing.expectEqual(@as(u32, 0x9BA97CEC), umull(.x12, .x7, .x9));
 }
 
 test "sbfm / ubfm encoding (sign/zero-extend a narrower value)" {

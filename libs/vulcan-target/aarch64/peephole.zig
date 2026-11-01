@@ -360,6 +360,105 @@ pub fn tryCoalesceResultMove(producer: u32, move: u32) ?u32 {
     return producer & ~@as(u32, 0x1F) | destination;
 }
 
+const NarrowMagic = struct { words: [2]u32 };
+
+fn tryNarrowUnsignedMagic(words: []const u32) ?NarrowMagic {
+    if (words.len < 4) return null;
+    const extend = words[0];
+    if (extend & 0xFFFFFC00 != 0xD3407C00) return null;
+    const product = words[1];
+    if (product & 0xFFE0FC00 != 0x9B007C00) return null;
+
+    const wide_value: u5 = @truncate(extend);
+    const source: u5 = @truncate(extend >> 5);
+    const product_dest: u5 = @truncate(product);
+    const product_lhs: u5 = @truncate(product >> 5);
+    const multiplier: u5 = @truncate(product >> 16);
+    if (wide_value != product_dest or wide_value != product_lhs) return null;
+
+    const first_shift = decodeLsr64(words[2]) orelse return null;
+    const second_shift = decodeLsr64(words[3]) orelse return null;
+    if (first_shift.reg != product_dest or first_shift.shift != 32) return null;
+    if (second_shift.reg != product_dest or second_shift.shift == 0 or second_shift.shift > 31) return null;
+
+    const rd: Reg = @fromBackingInt(product_dest);
+    return .{ .words = .{
+        encode.umull(rd, @fromBackingInt(source), @fromBackingInt(multiplier)),
+        encode.lsrImm(rd, rd, 32 + second_shift.shift, true),
+    } };
+}
+
+fn decodeLsr64(word: u32) ?struct { reg: u5, shift: u6 } {
+    if (word & 0xFFC0FC00 != 0xD340FC00) return null;
+    const rd: u5 = @truncate(word);
+    const rn: u5 = @truncate(word >> 5);
+    if (rd != rn) return null;
+    return .{ .reg = rd, .shift = @truncate(word >> 16) };
+}
+
+fn narrowUnsignedMagic(
+    allocator: std.mem.Allocator,
+    words: *std.ArrayList(u32),
+    block_start: []usize,
+    fixups: []Fixup,
+    relocs: []Reloc,
+    lines: []LineEntry,
+    model: MachineModel,
+) std.mem.Allocator.Error!void {
+    const len = words.items.len;
+    var is_block_start = try allocator.alloc(bool, len);
+    defer allocator.free(is_block_start);
+    @memset(is_block_start, false);
+    for (block_start) |start| if (start < len) {
+        is_block_start[start] = true;
+    };
+
+    var removed_before = try allocator.alloc(u32, len + 1);
+    defer allocator.free(removed_before);
+    var write: usize = 0;
+    var removed: u32 = 0;
+    var i: usize = 0;
+    while (i < len) {
+        const rewrite = if (i + 3 < len and !is_block_start[i + 1] and !is_block_start[i + 2] and !is_block_start[i + 3])
+            tryNarrowUnsignedMagic(words.items[i..])
+        else
+            null;
+        if (rewrite) |candidate| {
+            if (scoreWords(&candidate.words, model).accepts(scoreWords(words.items[i .. i + 4], model))) {
+                removed_before[i] = removed;
+                words.items[write] = candidate.words[0];
+                write += 1;
+                removed_before[i + 1] = removed;
+                words.items[write] = candidate.words[1];
+                write += 1;
+                removed += 1;
+                removed_before[i + 2] = removed;
+                removed += 1;
+                removed_before[i + 3] = removed;
+                i += 4;
+                continue;
+            }
+        }
+        removed_before[i] = removed;
+        words.items[write] = words.items[i];
+        write += 1;
+        i += 1;
+    }
+    removed_before[len] = removed;
+
+    for (block_start) |*start| start.* -= removed_before[start.*];
+    for (fixups) |*fixup| {
+        if (fixup.table_base) |base| fixup.table_base = base - removed_before[base];
+        fixup.at -= removed_before[fixup.at];
+    }
+    for (relocs) |*reloc| reloc.offset -= removed_before[reloc.offset];
+    for (lines) |*line| {
+        const word = line.offset / 4;
+        line.offset = @intCast((word - removed_before[word]) * 4);
+    }
+    words.shrinkRetainingCapacity(write);
+}
+
 /// Fuse adjacent ldr/str pairs into ldp/stp in `words`, updating the side tables to the new
 /// layout. Only fuses IMMEDIATELY-ADJACENT words where both decode as mem, `tryFuse` succeeds,
 /// AND the SECOND word is not a block start (control flow must not be able to enter between the
@@ -404,6 +503,7 @@ pub fn pairMemoryForModelWithMoves(
     coalescable_result_moves: []const usize,
     model: MachineModel,
 ) std.mem.Allocator.Error!void {
+    try narrowUnsignedMagic(allocator, words, block_start, fixups, relocs, lines, model);
     const len = words.items.len;
 
     // Which word indices begin a block. A word is fusable-as-second only if it is NOT a block
@@ -543,6 +643,23 @@ test "machine score classifies packed switch loads as memory" {
     const byte = scoreWords(&.{encode.ldrbReg(.x17, .x16, .x20)}, model);
 
     try std.testing.expectEqual(word, byte);
+}
+
+test "rewrites widened unsigned magic division" {
+    const rd: Reg = .x12;
+    const source: Reg = .x7;
+    const multiplier: Reg = .x9;
+    const rewrite = tryNarrowUnsignedMagic(&.{
+        encode.ubfm(rd, source, 0, 31),
+        encode.mul(rd, rd, multiplier) | (@as(u32, 1) << 31),
+        encode.lsrImm(rd, rd, 32, true),
+        encode.lsrImm(rd, rd, 2, true),
+    }).?;
+
+    try std.testing.expectEqualSlices(u32, &.{
+        encode.umull(rd, source, multiplier),
+        encode.lsrImm(rd, rd, 34, true),
+    }, &rewrite.words);
 }
 
 test "decodeMem recognizes each ldr/str offset form and rejects a non-memory word" {
