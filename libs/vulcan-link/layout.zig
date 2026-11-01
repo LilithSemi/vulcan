@@ -118,11 +118,11 @@ fn sectionPresent(sec: *const ObjSection) bool {
     return sec.size > 0;
 }
 
-/// The default alignment applied to the location counter before a section is placed:
-/// an instruction (text-class) section is 4-byte aligned, everything else 8-byte aligned.
-/// The class comes from the section flags, so the alignment matches the old per-class rule.
+/// The alignment applied before a section is placed. The class supplies the historical
+/// minimum, while a stricter input `sh_addralign` survives the script layout.
 fn defaultAlign(sec: *const ObjSection) u64 {
-    return if (classForSection(sec) == .text) 4 else 8;
+    const class_alignment: u64 = if (classForSection(sec) == .text) 4 else 8;
+    return @max(class_alignment, sec.alignment);
 }
 
 /// Round `v` up to a multiple of `a`, tolerating `a == 0` (a no-op) so a script's

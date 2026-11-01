@@ -186,6 +186,9 @@ pub const ObjSymbol = struct {
 pub const ObjSection = struct {
     name: []const u8,
     flags: u64,
+    /// The section address alignment from `sh_addralign`. ELF permits zero to mean no
+    /// constraint; the parser normalizes it to one so placement can use it directly.
+    alignment: u64 = 1,
     /// The file bytes of this section. Empty for a NOBITS section (`is_nobits`).
     /// `size` still gives its true in-memory extent.
     bytes: []const u8 = &.{},
@@ -348,6 +351,12 @@ pub fn alignUp(v: u64, a: u64) u64 {
     return std.mem.alignForward(u64, v, a);
 }
 
+fn sectionAlignment(raw: u64) Error!u64 {
+    const alignment = if (raw == 0) 1 else raw;
+    if ((alignment & (alignment - 1)) != 0) return error.MalformedObject;
+    return alignment;
+}
+
 /// `base + index*stride`, rejecting the overflow that would otherwise wrap a bounds
 /// check on attacker-controlled ELF offset/size fields into an out-of-bounds access.
 pub fn tableOffset(base: u64, index: u64, stride: u64) Error!u64 {
@@ -451,6 +460,7 @@ fn parseObject64(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
         const flags = try rdInt(u64, buf, hdr + 8);
         const sh_off = try rdInt(u64, buf, hdr + 24);
         const sh_size = try rdInt(u64, buf, hdr + 32);
+        const alignment = try sectionAlignment(try rdInt(u64, buf, hdr + 48));
         const class = sectionClass(typ, flags);
         if (class != .ignore) {
             const is_nobits = class == .nobits;
@@ -459,6 +469,7 @@ fn parseObject64(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
             try sections.append(allocator, .{
                 .name = if (shstrtab.len == 0) "" else try strAt(shstrtab, sh_name),
                 .flags = flags,
+                .alignment = alignment,
                 .bytes = bytes,
                 .size = sh_size,
                 .is_nobits = is_nobits,
@@ -632,6 +643,7 @@ fn parseObject32(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
         const flags: u64 = try rdInt(u32, buf, hdr + 8);
         const sh_off = try rdInt(u32, buf, hdr + 16);
         const sh_size = try rdInt(u32, buf, hdr + 20);
+        const alignment = try sectionAlignment(try rdInt(u32, buf, hdr + 32));
         const class = sectionClass(typ, flags);
         if (class != .ignore) {
             const is_nobits = class == .nobits;
@@ -640,6 +652,7 @@ fn parseObject32(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
             try sections.append(allocator, .{
                 .name = if (shstrtab.len == 0) "" else try strAt(shstrtab, sh_name),
                 .flags = flags,
+                .alignment = alignment,
                 .bytes = bytes,
                 .size = sh_size,
                 .is_nobits = is_nobits,

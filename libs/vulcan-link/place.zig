@@ -3,8 +3,9 @@
 //! packs each object's arbitrary named `ObjSection`s into four concatenated regions
 //! (text, then rodata, then data, then bss), builds the single loadable segment, and
 //! resolves the defined symbols. The per-architecture differences it takes as inputs:
-//! an `ArchDesc` of the per-class alignments (text is 4 on riscv64/aarch64, 16 on the
-//! x86 backends), and an optional `StubHook` for riscv64's extern-stub/GOT region, the
+//! an `ArchDesc` of the minimum per-class alignments (text is 4 on riscv64/aarch64, 16
+//! on the x86 backends), each input section's stricter `sh_addralign`, and an optional
+//! `StubHook` for riscv64's extern-stub/GOT region, the
 //! one placement piece no other backend has.
 //!
 //! It fills the `section_places` map (one place per (object, section)). Two same-class
@@ -156,22 +157,22 @@ pub fn computeDefaultPlacement(
             const present = sz > 0;
             const off = switch (kind) {
                 .text => blk: {
-                    const o = alignUp(text_total, desc.text_align);
+                    const o = alignUp(text_total, @max(desc.text_align, sec.alignment));
                     text_total = o + sz;
                     break :blk o;
                 },
                 .rodata => blk: {
-                    const o = alignUp(rodata_total, desc.ro_align);
+                    const o = alignUp(rodata_total, @max(desc.ro_align, sec.alignment));
                     rodata_total = o + sz;
                     break :blk o;
                 },
                 .data => blk: {
-                    const o = alignUp(data_total, desc.rw_align);
+                    const o = alignUp(data_total, @max(desc.rw_align, sec.alignment));
                     data_total = o + sz;
                     break :blk o;
                 },
                 .bss => blk: {
-                    const o = alignUp(bss_total, desc.bss_align);
+                    const o = alignUp(bss_total, @max(desc.bss_align, sec.alignment));
                     bss_total = o + sz;
                     break :blk o;
                 },

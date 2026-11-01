@@ -1171,7 +1171,7 @@ test "linkObjects: a cross-section call resolves the callee to its OWN same-clas
     std.mem.writeInt(i64, rela[16..24], -4, .little); // r_addend
 
     const writeShdr = struct {
-        fn f(b: []u8, sh: u64, idx: u16, name: u32, typ: u32, flags: u64, off: u64, size: u64, link: u32, info: u32) void {
+        fn f(b: []u8, sh: u64, idx: u16, name: u32, typ: u32, flags: u64, off: u64, size: u64, link: u32, info: u32, alignment: u64) void {
             const e = b[@intCast(sh + @as(u64, idx) * 64)..][0..64];
             std.mem.writeInt(u32, e[0..4], name, .little);
             std.mem.writeInt(u32, e[4..8], typ, .little);
@@ -1181,30 +1181,30 @@ test "linkObjects: a cross-section call resolves the callee to its OWN same-clas
             std.mem.writeInt(u64, e[32..40], size, .little);
             std.mem.writeInt(u32, e[40..44], link, .little);
             std.mem.writeInt(u32, e[44..48], info, .little);
-            std.mem.writeInt(u64, e[48..56], 1, .little); // sh_addralign
+            std.mem.writeInt(u64, e[48..56], alignment, .little); // sh_addralign
             std.mem.writeInt(u64, e[56..64], 0, .little); // sh_entsize
         }
     }.f;
     const XF = elf.SHF_ALLOC | elf.SHF_EXECINSTR;
-    writeShdr(buf, shoff, 0, 0, 0, 0, 0, 0, 0, 0); // NULL
-    writeShdr(buf, shoff, 1, 1, elf.SHT_PROGBITS, XF, text_a_off, text_a_size, 0, 0); // .text.a
-    writeShdr(buf, shoff, 2, 9, elf.SHT_PROGBITS, XF, text_b_off, text_b_size, 0, 0); // .text.b
-    writeShdr(buf, shoff, 3, 17, elf.SHT_SYMTAB, 0, symtab_off, symtab_size, 4, 1); // .symtab -> .strtab
-    writeShdr(buf, shoff, 4, 25, 3, 0, strtab_off, strtab.len, 0, 0); // .strtab
-    writeShdr(buf, shoff, 5, 33, elf.SHT_RELA, 0, rela_off, rela_size, 3, 1); // .rela.text.a -> symtab, target .text.a
-    writeShdr(buf, shoff, 6, 46, 3, 0, shstrtab_off, shstrtab.len, 0, 0); // .shstrtab
+    writeShdr(buf, shoff, 0, 0, 0, 0, 0, 0, 0, 0, 1); // NULL
+    writeShdr(buf, shoff, 1, 1, elf.SHT_PROGBITS, XF, text_a_off, text_a_size, 0, 0, 1); // .text.a
+    writeShdr(buf, shoff, 2, 9, elf.SHT_PROGBITS, XF, text_b_off, text_b_size, 0, 0, 32); // .text.b
+    writeShdr(buf, shoff, 3, 17, elf.SHT_SYMTAB, 0, symtab_off, symtab_size, 4, 1, 1); // .symtab -> .strtab
+    writeShdr(buf, shoff, 4, 25, 3, 0, strtab_off, strtab.len, 0, 0, 1); // .strtab
+    writeShdr(buf, shoff, 5, 33, elf.SHT_RELA, 0, rela_off, rela_size, 3, 1, 1); // .rela.text.a -> symtab, target .text.a
+    writeShdr(buf, shoff, 6, 46, 3, 0, shstrtab_off, shstrtab.len, 0, 0, 1); // .shstrtab
 
     const base: u64 = 0x400000;
     var image = try linkObjects(allocator, &.{buf}, base);
     defer image.deinit(allocator);
 
     // The two exec sections land in section-header order, `.text.a` first at `base`,
-    // `.text.b` next at the 16-byte-aligned end of `.text.a` (x86-64 text alignment). So
-    // `func_a` is at `base` and `func_b` at `base + 16`, each in its OWN section.
+    // `.text.b` next at the stricter 32-byte-aligned end of `.text.a`. So
+    // `func_a` is at `base` and `func_b` at `base + 32`, each in its OWN section.
     const func_a = image.addressOf("func_a") orelse return error.UndefinedSymbol;
     const func_b = image.addressOf("func_b") orelse return error.UndefinedSymbol;
     try std.testing.expectEqual(base, func_a);
-    const text_b_start = base + elf.alignUp(text_a_size, 16);
+    const text_b_start = base + elf.alignUp(text_a_size, 32);
     try std.testing.expectEqual(text_b_start, func_b);
     // `func_b` resolves inside `.text.b`'s placed range, distinct from `.text.a`'s range
     // (this is the last-wins gap the old model had: it would have folded both to `base`).
