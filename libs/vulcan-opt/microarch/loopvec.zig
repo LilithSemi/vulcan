@@ -161,12 +161,16 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         };
         const reverse: CmpOp = if (plan.exit_cond == .lt) .gt else .ge;
         const can_enter = try func.appendInst(plan.preheader, bool_t, .{ .icmp = .{ .op = reverse, .lhs = wide_bound, .rhs = wide_highest } });
-        if (init_vi) |vi|
+        if (init_vi != null and vector_identity != null)
+            try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{ init_i, init_vi.?, vector_identity.? } }, .{ .target = plan.header, .args = pre_args })
+        else if (init_vi) |vi|
             try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{ init_i, vi } }, .{ .target = plan.header, .args = pre_args })
         else if (vector_identity) |identity|
             try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{ init_i, identity } }, .{ .target = plan.header, .args = pre_args })
         else
             try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{init_i} }, .{ .target = plan.header, .args = pre_args });
+    } else if (init_vi != null and vector_identity != null) {
+        try func.setJump(plan.preheader, mainheader, &.{ init_i, init_vi.?, vector_identity.? });
     } else if (init_vi) |vi| {
         try func.setJump(plan.preheader, mainheader, &.{ init_i, vi });
     } else if (vector_identity) |identity| {
@@ -205,7 +209,9 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         break :guard guarded;
     };
     if (cont) |condition| {
-        if (mvi) |vi|
+        if (mvi != null and macc != null)
+            try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{ mi, mvi.?, macc.? } }, .{ .target = combine, .args = &.{ mi, macc.? } })
+        else if (mvi) |vi|
             try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{ mi, vi } }, .{ .target = combine, .args = &.{mi} })
         else if (macc) |acc|
             try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{ mi, acc } }, .{ .target = combine, .args = &.{ mi, acc } })
@@ -341,12 +347,16 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     const next_vi = if (bvi) |vi| try func.appendInst(mainbody, index_vec_ty.?, .{ .arith = .{ .op = .add, .lhs = vi, .rhs = index_step.? } }) else null;
     if (rotated) {
         const next_cont = try func.appendInst(mainbody, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = nmi, .rhs = threshold.? } });
-        if (next_vi) |vi|
+        if (next_vi != null and next_acc != null)
+            try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{ nmi, next_vi.?, next_acc.? } }, .{ .target = combine, .args = &.{ nmi, next_acc.? } })
+        else if (next_vi) |vi|
             try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{ nmi, vi } }, .{ .target = combine, .args = &.{nmi} })
         else if (next_acc) |acc|
             try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{ nmi, acc } }, .{ .target = combine, .args = &.{ nmi, acc } })
         else
             try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{nmi} }, .{ .target = combine, .args = &.{nmi} });
+    } else if (next_vi != null and next_acc != null) {
+        try func.setJump(mainbody, mainheader, &.{ nmi, next_vi.?, next_acc.? });
     } else if (next_vi) |vi| {
         try func.setJump(mainbody, mainheader, &.{ nmi, vi });
     } else if (next_acc) |acc| {
@@ -595,12 +605,6 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     // partial records out avoids the scalar lane-pack fallback that is slower than the original.
     if (has_interleaved and (interleaved_loads != 0b1111 or interleaved_stores != 0b1111 or reduction != null))
         return bail(&accesses, allocator);
-    if (reduction != null) {
-        var has_store = false;
-        for (accesses.items) |access| has_store = has_store or access.is_store;
-        if (!has_store) return bail(&accesses, allocator);
-    }
-
     // Carry a same-width integer conversion as one vector induction value.
     var index_elem_type: ?Type = null;
     const induction_kind = func.types.type_kind(func.valueType(i_alias));
@@ -1410,6 +1414,61 @@ fn buildIntReduction(func: *Function, extra_store: bool) !void {
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, ns });
     func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+}
+
+test "recognizes a reduction-only loop with a computed increment" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const left = try func.appendBlockParam(entry, ptr_t);
+    const right = try func.appendBlockParam(entry, ptr_t);
+    const count = try func.appendBlockParam(entry, u32_t);
+    const zero_i = try func.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const zero_sum = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, header, &.{ zero_i, zero_sum });
+
+    const index = try func.appendBlockParam(header, u32_t);
+    const checksum = try func.appendBlockParam(header, i32_t);
+    const cond = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = index, .rhs = count } });
+    try func.appendIf(header, cond, .{ .target = body, .args = &.{ index, checksum } }, .{ .target = done });
+
+    const body_index = try func.appendBlockParam(body, u32_t);
+    const body_checksum = try func.appendBlockParam(body, i32_t);
+    const offset = try func.appendArithImm(body, u32_t, .mul, body_index, 4);
+    const left_address = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = left, .rhs = offset } });
+    const right_address = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = right, .rhs = offset } });
+    const left_value = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = left_address } });
+    const right_value = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = right_address } });
+    const product = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .mul, .lhs = left_value, .rhs = right_value } });
+    const signed_index = try func.appendInst(body, i32_t, .{ .convert = .{ .value = body_index } });
+    const index_term = try func.appendArithImm(body, i32_t, .mul, signed_index, 17);
+    const increment = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = product, .rhs = index_term } });
+    const next_checksum = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .bit_xor, .lhs = body_checksum, .rhs = increment } });
+    const next_index = try func.appendArithImm(body, u32_t, .add, body_index, 1);
+    try func.setJump(body, header, &.{ next_index, next_checksum });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(checksum) });
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    const plan = (try recognize(allocator, &func, registry.modelFor(.@"ampere-altra"), &info.loops[0])) orelse return error.NotRecognized;
+    defer allocator.free(plan.accesses);
+    try testing.expectEqual(@as(usize, 2), plan.accesses.len);
+    try testing.expectEqual(BinOp.bit_xor, plan.reduction.?.op);
+    try testing.expectEqual(increment, plan.reduction.?.increment);
+    try testing.expectEqual(i32_t, plan.index_elem_type.?);
+
+    try apply(allocator, &func, &plan);
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
 }
 
 test "a reduction body with a second memory effect is declined" {
