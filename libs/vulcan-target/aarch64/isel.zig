@@ -321,6 +321,8 @@ pub const Fixup = struct {
     /// Word index used as the base of a dense-switch offset table. Null identifies an ordinary
     /// branch fixup. A table row stores `(target - table_base)` in instruction words.
     table_base: ?usize = null,
+    /// Byte lane within a packed dense-switch table word. Null selects one full word per row.
+    table_byte_shift: ?u5 = null,
 };
 
 const DenseSwitch = struct {
@@ -930,7 +932,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // emission seams and ARE threaded: the differential corpus proved the fusions execution-equivalent
     // under the Wimmer allocation, and alignment/f16 only change placement/encoding of an already-
     // correct allocation.
-    var compiled = try emitFromAllocation(allocator, &work, caps, &alloc, &fold);
+    var compiled = try emitBestFromAllocation(allocator, &work, caps, &alloc, &fold);
     errdefer compiled.deinit(allocator);
 
     // Every `Reloc.symbol` is a BORROWED slice into the emitting function's symbol storage. The
@@ -1056,7 +1058,23 @@ fn emitStructRetStore(allocator: std.mem.Allocator, code: *std.ArrayList(u32), p
 /// (`fetch_align`, `fp16`). An inert `.{}` reproduces `selectFunction`'s output exactly. `nblocks`
 /// and `leaf` are recomputed from `func` (identical to the values `compileFunction` passed to
 /// `allocate`), so the extraction is byte-identical for every existing caller.
-fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, alloc: *Allocation, fold: *const addrfold.Analysis) Error!Compiled {
+const EmitError = Error || error{CompactTableOverflow};
+
+/// Prefer packed dense-switch tables, then repeat emission with full-width rows if final block
+/// placement needs an offset larger than one byte. Allocation is unchanged by either attempt.
+fn emitBestFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, alloc: *Allocation, fold: *const addrfold.Analysis) Error!Compiled {
+    return emitFromAllocation(allocator, func, caps, alloc, fold, true) catch |err| switch (err) {
+        error.CompactTableOverflow => emitFromAllocation(allocator, func, caps, alloc, fold, false) catch |retry_err| switch (retry_err) {
+            error.CompactTableOverflow => unreachable,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unsupported => return error.Unsupported,
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => return error.Unsupported,
+    };
+}
+
+fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, alloc: *Allocation, fold: *const addrfold.Analysis, compact_switch_tables: bool) EmitError!Compiled {
     const fetch_align = caps.fetch_align;
     // Native half arithmetic (FEAT_FP16) vs the base-ISA emulation, gated on the model feature.
     // `fp16 == false` (every non-model caller) keeps the emulation, byte-identical to before this
@@ -2196,14 +2214,23 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         }
                         const adr_at = code.items.len;
                         try code.append(allocator, encode.adr(scratch_imm, 0));
-                        try code.append(allocator, encode.ldrWReg(scratch_move, scratch_imm, index));
+                        try code.append(allocator, if (compact_switch_tables)
+                            encode.ldrbReg(scratch_move, scratch_imm, index)
+                        else
+                            encode.ldrWReg(scratch_move, scratch_imm, index));
                         try code.append(allocator, encode.addShifted64(scratch_move, scratch_imm, scratch_move, 2));
                         try code.append(allocator, encode.br(scratch_move));
                         const table_at = code.items.len;
                         code.items[adr_at] = encode.adr(scratch_imm, @intCast((@as(i64, @intCast(table_at)) - @as(i64, @intCast(adr_at))) * 4));
-                        for (plan.targets) |target| {
-                            try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(target), .table_base = table_at });
-                            try code.append(allocator, 0);
+                        for (plan.targets, 0..) |target, target_index| {
+                            const row_at = if (compact_switch_tables) table_at + target_index / 4 else code.items.len;
+                            try fixups.append(allocator, .{
+                                .at = row_at,
+                                .target = @backingInt(target),
+                                .table_base = table_at,
+                                .table_byte_shift = if (compact_switch_tables) @intCast((target_index % 4) * 8) else null,
+                            });
+                            if (!compact_switch_tables or target_index % 4 == 0) try code.append(allocator, 0);
                         }
                     } else try ctx.emitIf(
                         allocator,
@@ -2385,8 +2412,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         if (f.table_base) |table_base| {
             std.debug.assert(block_start[target] >= table_base);
             const word_delta = block_start[target] - table_base;
-            if (word_delta > std.math.maxInt(u32)) return error.Unsupported;
-            code.items[f.at] = @intCast(word_delta);
+            if (f.table_byte_shift) |shift| {
+                if (word_delta > std.math.maxInt(u8)) return error.CompactTableOverflow;
+                code.items[f.at] |= @as(u32, @intCast(word_delta)) << shift;
+            } else {
+                if (word_delta > std.math.maxInt(u32)) return error.Unsupported;
+                code.items[f.at] = @intCast(word_delta);
+            }
             continue;
         }
         const off: i28 = @intCast((@as(i64, @intCast(block_start[target])) - @as(i64, @intCast(f.at))) * 4);
@@ -3957,7 +3989,7 @@ pub fn compileFunctionWimmerAbi(allocator: std.mem.Allocator, func: *Function, c
     // The Wimmer differential path never folds addresses, so it emits through the empty analysis and
     // stays byte-identical to the pre-fold emission. `caps` carries only the calling convention (the
     // differential callers pass the default AAPCS64; a native-execution caller passes the host ABI).
-    return emitFromAllocation(allocator, func, caps, &alloc, &empty_fold);
+    return emitBestFromAllocation(allocator, func, caps, &alloc, &empty_fold);
 }
 
 /// The aarch64 (uniform 16-byte) spill-slot index for a Wimmer per-class slot: GPR (class 0) slots
