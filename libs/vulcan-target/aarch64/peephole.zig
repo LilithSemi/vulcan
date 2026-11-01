@@ -94,7 +94,7 @@ pub fn scoreWords(words: []const u32, model: MachineModel) MachineScore {
 }
 
 fn machineClass(word: u32) MachineClass {
-    if (decodeMem(word) != null or isPairMemory(word) or isRegisterMemory(word)) return .mem;
+    if (decodeMem(word) != null or isPairMemory(word) or decodeStruct4(word) != null or isRegisterMemory(word)) return .mem;
     if (isDivide(word)) return .div;
     if (word & 0x7F000000 == 0x1B000000) return .mul;
     if (word & 0x7C000000 == 0x14000000 or word & 0xFF000010 == 0x54000000) return .branch;
@@ -103,8 +103,8 @@ fn machineClass(word: u32) MachineClass {
 }
 
 const RegisterDeps = struct {
-    reads: [4]?u7 = @splat(null),
-    writes: [3]?u7 = @splat(null),
+    reads: [5]?u7 = @splat(null),
+    writes: [5]?u7 = @splat(null),
 };
 
 fn dependencies(word: u32, class: MachineClass) RegisterDeps {
@@ -113,8 +113,8 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
             fpReg(mem.rt)
         else
             gpReg(mem.rt);
-        if (isLoad(mem.kind)) return .{ .reads = .{ gpReg(mem.rn), null, null, null }, .writes = .{ data, null, null } };
-        return .{ .reads = .{ gpReg(mem.rn), data, null, null } };
+        if (isLoad(mem.kind)) return .{ .reads = .{ gpReg(mem.rn), null, null, null, null }, .writes = .{ data, null, null, null, null } };
+        return .{ .reads = .{ gpReg(mem.rn), data, null, null, null } };
     }
     if (decodePairMemory(word)) |pair| {
         const load = word & 0x00400000 != 0;
@@ -123,20 +123,34 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
         const rn: u5 = @truncate(word >> 5);
         const data1 = if (pair.simd) fpReg(rt1) else gpReg(rt1);
         const data2 = if (pair.simd) fpReg(rt2) else gpReg(rt2);
-        if (load) return .{ .reads = .{ gpReg(rn), null, null, null }, .writes = .{ data1, data2, if (pair.writeback) gpReg(rn) else null } };
-        return .{ .reads = .{ gpReg(rn), data1, data2, null }, .writes = .{ if (pair.writeback) gpReg(rn) else null, null, null } };
+        if (load) return .{ .reads = .{ gpReg(rn), null, null, null, null }, .writes = .{ data1, data2, if (pair.writeback) gpReg(rn) else null, null, null } };
+        return .{ .reads = .{ gpReg(rn), data1, data2, null, null }, .writes = .{ if (pair.writeback) gpReg(rn) else null, null, null, null, null } };
+    }
+    if (decodeStruct4(word)) |structure| {
+        const r0 = fpReg(structure.rt);
+        const r1 = fpReg(structure.rt +% 1);
+        const r2 = fpReg(structure.rt +% 2);
+        const r3 = fpReg(structure.rt +% 3);
+        if (structure.load) return .{
+            .reads = .{ gpReg(structure.rn), null, null, null, null },
+            .writes = .{ r0, r1, r2, r3, if (structure.writeback) gpReg(structure.rn) else null },
+        };
+        return .{
+            .reads = .{ gpReg(structure.rn), r0, r1, r2, r3 },
+            .writes = .{ if (structure.writeback) gpReg(structure.rn) else null, null, null, null, null },
+        };
     }
     if (isRegisterMemory(word)) {
         const rt: u5 = @truncate(word);
         const rn: u5 = @truncate(word >> 5);
         const rm: u5 = @truncate(word >> 16);
-        return .{ .reads = .{ gpReg(rn), gpReg(rm), null, null }, .writes = .{ gpReg(rt), null, null } };
+        return .{ .reads = .{ gpReg(rn), gpReg(rm), null, null, null }, .writes = .{ gpReg(rt), null, null, null, null } };
     }
     if (class == .mul) {
         const ra: u5 = @truncate(word >> 10);
         return .{
-            .reads = .{ gpReg(@truncate(word >> 5)), gpReg(@truncate(word >> 16)), gpReg(ra), null },
-            .writes = .{ gpReg(@truncate(word)), null, null },
+            .reads = .{ gpReg(@truncate(word >> 5)), gpReg(@truncate(word >> 16)), gpReg(ra), null, null },
+            .writes = .{ gpReg(@truncate(word)), null, null, null, null },
         };
     }
     if (class == .div or isRegisterAlu(word)) {
@@ -146,26 +160,27 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
                 gpReg(@truncate(word >> 16)),
                 if (readsFlags(word)) nzcvReg() else null,
                 null,
+                null,
             },
-            .writes = .{ gpReg(@truncate(word)), null, null },
+            .writes = .{ gpReg(@truncate(word)), null, null, null, null },
         };
         if (writesFlags(word)) result.writes[1] = nzcvReg();
         return result;
     }
     if (isImmediateAlu(word)) {
         var result = RegisterDeps{
-            .reads = .{ gpReg(@truncate(word >> 5)), null, null, null },
-            .writes = .{ gpReg(@truncate(word)), null, null },
+            .reads = .{ gpReg(@truncate(word >> 5)), null, null, null, null },
+            .writes = .{ gpReg(@truncate(word)), null, null, null, null },
         };
         if (writesFlags(word)) result.writes[1] = nzcvReg();
         return result;
     }
     if (isMoveWide(word)) return .{
-        .reads = .{ gpReg(@truncate(word)), null, null, null },
-        .writes = .{ gpReg(@truncate(word)), null, null },
+        .reads = .{ gpReg(@truncate(word)), null, null, null, null },
+        .writes = .{ gpReg(@truncate(word)), null, null, null, null },
     };
     if (vectorDependencies(word)) |result| return result;
-    if (isConditionalBranch(word)) return .{ .reads = .{ nzcvReg(), null, null, null } };
+    if (isConditionalBranch(word)) return .{ .reads = .{ nzcvReg(), null, null, null, null } };
     return .{};
 }
 
@@ -240,29 +255,30 @@ fn vectorDependencies(word: u32) ?RegisterDeps {
                 fpReg(@truncate(word >> 16)),
                 if (accumulates) fpReg(@truncate(word)) else null,
                 null,
+                null,
             },
-            .writes = .{ fpReg(@truncate(word)), null, null },
+            .writes = .{ fpReg(@truncate(word)), null, null, null, null },
         },
         0x4E000400, // DUP Vd.4S, Vn.S[index]
         0x5E000400, // DUP Sd, Vn.S[index]
         => return .{
-            .reads = .{ fpReg(@truncate(word >> 5)), null, null, null },
-            .writes = .{ fpReg(@truncate(word)), null, null },
+            .reads = .{ fpReg(@truncate(word >> 5)), null, null, null, null },
+            .writes = .{ fpReg(@truncate(word)), null, null, null, null },
         },
         0x6E000400, // INS Vd.S[index], Vn.S[0]
         => return .{
-            .reads = .{ fpReg(@truncate(word >> 5)), fpReg(@truncate(word)), null, null },
-            .writes = .{ fpReg(@truncate(word)), null, null },
+            .reads = .{ fpReg(@truncate(word >> 5)), fpReg(@truncate(word)), null, null, null },
+            .writes = .{ fpReg(@truncate(word)), null, null, null, null },
         },
         else => {},
     }
     if (word & 0xFFFFFC00 == 0x4E040C00) return .{
-        .reads = .{ gpReg(@truncate(word >> 5)), null, null, null },
-        .writes = .{ fpReg(@truncate(word)), null, null },
+        .reads = .{ gpReg(@truncate(word >> 5)), null, null, null, null },
+        .writes = .{ fpReg(@truncate(word)), null, null, null, null },
     };
     if (word & 0xFF00FC00 == 0x4F005400) return .{
-        .reads = .{ fpReg(@truncate(word >> 5)), null, null, null },
-        .writes = .{ fpReg(@truncate(word)), null, null },
+        .reads = .{ fpReg(@truncate(word >> 5)), null, null, null, null },
+        .writes = .{ fpReg(@truncate(word)), null, null, null, null },
     };
     return null;
 }
@@ -282,6 +298,28 @@ fn isDivide(word: u32) bool {
 }
 
 const PairMemory = struct { simd: bool, writeback: bool = false };
+
+const Struct4 = struct {
+    load: bool,
+    writeback: bool,
+    rt: u5,
+    rn: u5,
+};
+
+fn decodeStruct4(word: u32) ?Struct4 {
+    const form = word & 0xFFFFFC00;
+    const load = switch (form) {
+        0x4C400800, 0x4CDF0800 => true,
+        0x4C000800, 0x4C9F0800 => false,
+        else => return null,
+    };
+    return .{
+        .load = load,
+        .writeback = form == 0x4CDF0800 or form == 0x4C9F0800,
+        .rt = @truncate(word),
+        .rn = @truncate(word >> 5),
+    };
+}
 
 fn decodePairMemory(word: u32) ?PairMemory {
     return switch (word & 0xFFC00000) {
@@ -439,6 +477,23 @@ fn tryPostIndexQ(pair_word: u32, add_word: u32) ?u32 {
         encode.ldpPostQ(first, second, base_reg, 32)
     else
         encode.stpPostQ(first, second, base_reg, 32);
+}
+
+const Struct4Update = struct { temporary: u5, base: u5 };
+
+fn decodeStruct4Update(add_word: u32) ?Struct4Update {
+    if (add_word & 0xFFC00000 != 0x91000000) return null;
+    if ((add_word >> 10) & 0xFFF != 64) return null;
+    const temporary: u5 = @truncate(add_word);
+    const base: u5 = @truncate(add_word >> 5);
+    if (temporary == base or temporary == 31 or base == 31) return null;
+    return .{ .temporary = temporary, .base = base };
+}
+
+fn isStruct4UpdateMove(word: u32, update: Struct4Update) bool {
+    if (word & 0xFFE0FFE0 != 0xAA0003E0) return false;
+    return @as(u5, @truncate(word)) == update.base and
+        @as(u5, @truncate(word >> 16)) == update.temporary;
 }
 
 /// Fuse an adjacent integer `mul` and register `add` when the add consumes the product exactly
@@ -836,6 +891,66 @@ pub fn pairMemoryForModelWithMoveProofs(
         if (!candidate.accepts(baseline)) continue;
         for (rewrite.at[0..rewrite.len], rewrite.words[0..rewrite.len]) |at, word| words.items[at] = word;
         removed_distant[move_at] = true;
+    }
+
+    // A four-stream structure loop may materialize its next address early as `tmp = base + 64`,
+    // store through the old base, then copy `tmp` back into `base`. A post-index ST4 performs the
+    // same update at the store. The two scans prove that `tmp` is otherwise dead, that `base` is not
+    // changed before the store, and that neither value is observed between the store and the move.
+    for (0..len) |add_at| {
+        if (removed_distant[add_at] or is_data[add_at]) continue;
+        const update = decodeStruct4Update(words.items[add_at]) orelse continue;
+        const base = update.base;
+        const temporary = update.temporary;
+        var store_at = add_at + 1;
+        while (store_at < len and store_at - add_at <= 16) : (store_at += 1) {
+            if (removed_distant[store_at]) continue;
+            if (is_block_start[store_at] or is_data[store_at]) break;
+            const structure = decodeStruct4(words.items[store_at]);
+            if (structure != null and !structure.?.load and !structure.?.writeback and structure.?.rn == update.base) {
+                var move_at = store_at + 1;
+                while (move_at < len and move_at - store_at <= 8) : (move_at += 1) {
+                    if (removed_distant[move_at]) continue;
+                    if (is_block_start[move_at] or is_data[move_at]) break;
+                    if (isStruct4UpdateMove(words.items[move_at], update)) {
+                        var baseline_words: [25]u32 = undefined;
+                        var candidate_words: [23]u32 = undefined;
+                        var baseline_len: usize = 0;
+                        var candidate_len: usize = 0;
+                        for (add_at..move_at + 1) |at| {
+                            if (removed_distant[at]) continue;
+                            baseline_words[baseline_len] = words.items[at];
+                            baseline_len += 1;
+                            if (at == add_at or at == move_at) continue;
+                            candidate_words[candidate_len] = if (at == store_at)
+                                encode.st4S4Post(@fromBackingInt(structure.?.rt), @fromBackingInt(structure.?.rn))
+                            else
+                                words.items[at];
+                            candidate_len += 1;
+                        }
+                        const baseline = scoreWords(baseline_words[0..baseline_len], model);
+                        const candidate = scoreWords(candidate_words[0..candidate_len], model);
+                        if (candidate.accepts(baseline)) {
+                            words.items[store_at] = encode.st4S4Post(@fromBackingInt(structure.?.rt), @fromBackingInt(structure.?.rn));
+                            removed_distant[add_at] = true;
+                            removed_distant[move_at] = true;
+                        }
+                        break;
+                    }
+                    const class = machineClass(words.items[move_at]);
+                    if (class == .branch) break;
+                    const deps = dependencies(words.items[move_at], class);
+                    if (containsReg(deps.reads, base) or containsReg(deps.writes, base) or
+                        containsReg(deps.reads, temporary) or containsReg(deps.writes, temporary)) break;
+                }
+                break;
+            }
+            const class = machineClass(words.items[store_at]);
+            if (class == .branch) break;
+            const deps = dependencies(words.items[store_at], class);
+            if (containsReg(deps.reads, temporary) or containsReg(deps.writes, temporary) or
+                containsReg(deps.writes, base)) break;
+        }
     }
 
     // Normalize two interleaved Q-load streams before looking for their pointer updates. Keeping
@@ -1484,6 +1599,42 @@ test "pairMemory combines q stores with a carried pointer update" {
         encode.stpPostQ(.x0, .x1, .x2, 32),
         encode.add(.x3, .x4, .x5),
     }, words.items);
+}
+
+test "pairMemory folds a temporary structure pointer into post-index st4" {
+    const allocator = std.testing.allocator;
+    var words = try wordsFrom(allocator, &.{
+        encode.addImm64(.x4, .x5, 64),
+        encode.add(.x6, .x7, .x8),
+        encode.st4S4(@fromBackingInt(28), .x5),
+        encode.cmp(.x9, .x10),
+        encode.mov(.x5, .x4),
+    });
+    defer words.deinit(allocator);
+
+    try pairMemory(allocator, &words, &.{}, &.{}, &.{}, &.{});
+
+    try std.testing.expectEqualSlices(u32, &.{
+        encode.add(.x6, .x7, .x8),
+        encode.st4S4Post(@fromBackingInt(28), .x5),
+        encode.cmp(.x9, .x10),
+    }, words.items);
+}
+
+test "pairMemory keeps a structure update when the old base is observed after st4" {
+    const allocator = std.testing.allocator;
+    const original = [_]u32{
+        encode.addImm64(.x4, .x5, 64),
+        encode.st4S4(@fromBackingInt(28), .x5),
+        encode.add(.x6, .x5, .x7),
+        encode.mov(.x5, .x4),
+    };
+    var words = try wordsFrom(allocator, &original);
+    defer words.deinit(allocator);
+
+    try pairMemory(allocator, &words, &.{}, &.{}, &.{}, &.{});
+
+    try std.testing.expectEqualSlices(u32, &original, words.items);
 }
 
 test "pairMemory post-indexes two interleaved q-load streams" {

@@ -922,6 +922,12 @@ pub fn st4S4(rt: Reg, rn: Reg) u32 {
     return 0x4C000800 | (n(rn) << 5) | n(rt);
 }
 
+/// `st4 {vt.4s-v(t+3).4s}, [xn], #64`: interleave four streams and advance the base by one
+/// complete 4x128-bit structure group.
+pub fn st4S4Post(rt: Reg, rn: Reg) u32 {
+    return 0x4C9F0800 | (n(rn) << 5) | n(rt);
+}
+
 /// NEON `fadd`/`fsub`/`fmul`/`fdiv` Vd.4S, Vn.4S, Vm.4S: lane-wise over 4 single-precision
 /// floats packed in a 128-bit register.
 pub fn faddVec(rd: Reg, rn: Reg, rm: Reg) u32 {
@@ -1584,6 +1590,7 @@ test "four-way interleaved vector memory encoders match the disassembler" {
 
     try std.testing.expectEqual(@as(u32, 0x4C4008BC), ld4S4(@fromBackingInt(28), .x5));
     try std.testing.expectEqual(@as(u32, 0x4C0008BC), st4S4(@fromBackingInt(28), .x5));
+    try std.testing.expectEqual(@as(u32, 0x4C9F08BC), st4S4Post(@fromBackingInt(28), .x5));
 
     const load = try disasm.one(a, ld4S4(@fromBackingInt(28), .x5));
     defer a.free(load);
