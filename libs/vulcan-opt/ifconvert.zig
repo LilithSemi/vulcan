@@ -16,8 +16,17 @@ const Inst = ir.function.Inst;
 const max_speculated_insts = 8;
 
 pub const pass_def = pass.Pass{ .name = "ifconvert", .run = run };
+pub const model_pass_def = pass.Pass{ .name = "ifconvert-model", .run = runModel };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    return runWithBudget(allocator, func, analyses, max_speculated_insts);
+}
+
+fn runModel(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    return runWithBudget(allocator, func, analyses, 16);
+}
+
+fn runWithBudget(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses, budget: usize) pass.Error!bool {
     const graph = try analyses.cfg();
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
@@ -47,7 +56,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         const else_args = func.blockArgs(else_jump);
         if (params.len == 0 or then_args.len != params.len or else_args.len != params.len) continue;
         if (!cheapArm(func, then_block) or !cheapArm(func, else_block)) continue;
-        if (func.blockInsts(then_block).len + func.blockInsts(else_block).len + params.len > max_speculated_insts) continue;
+        if (func.blockInsts(then_block).len + func.blockInsts(else_block).len + params.len > budget) continue;
 
         try convertDiamond(allocator, func, block, then_block, else_block, merge, cf.cond, params, then_args, else_args);
         return true;
@@ -201,4 +210,36 @@ test "ifconvert refuses a potentially trapping arm" {
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();
     try testing.expect(!try run(allocator, &func, &analyses));
+}
+
+test "model ifconvert admits a wider pure diamond" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_block = try func.appendBlock();
+    const else_block = try func.appendBlock();
+    const merge = try func.appendBlock();
+    const cond = try func.appendBlockParam(entry, bool_t);
+    const x = try func.appendBlockParam(entry, i32_t);
+    const result = try func.appendBlockParam(merge, i32_t);
+    try func.appendIf(entry, cond, .{ .target = then_block }, .{ .target = else_block });
+
+    var then_value = x;
+    var else_value = x;
+    for (0..5) |_| {
+        then_value = try func.appendInst(then_block, i32_t, .{ .arith_imm = .{ .op = .add, .lhs = then_value, .imm = 1 } });
+        else_value = try func.appendInst(else_block, i32_t, .{ .arith_imm = .{ .op = .sub, .lhs = else_value, .imm = 1 } });
+    }
+    try func.setJump(then_block, merge, &.{then_value});
+    try func.setJump(else_block, merge, &.{else_value});
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(result) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try testing.expect(!try run(allocator, &func, &analyses));
+    try testing.expect(try runModel(allocator, &func, &analyses));
+    try testing.expect(func.terminator(entry).? == .jump);
 }
