@@ -16,8 +16,10 @@ const Value = ir.function.Value;
 const Inst = ir.function.Inst;
 const Block = ir.function.Block;
 const BinOp = ir.function.BinOp;
+const max_hoisted_literals_per_loop = 8;
 
 pub const pass_def = pass.Pass{ .name = "licm", .run = run, .preserves_cfg = true };
+pub const constants_pass_def = pass.Pass{ .name = "licm-constants", .run = runConstants, .preserves_cfg = true };
 
 /// An instruction to hoist, with the loop block it currently lives in.
 const Hoist = struct { inst: Inst, from: u32 };
@@ -96,6 +98,14 @@ fn operandsInvariant(func: *const Function, inst: Inst, invariant: []const bool)
 }
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    return runFiltered(allocator, func, analyses, false);
+}
+
+fn runConstants(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    return runFiltered(allocator, func, analyses, true);
+}
+
+fn runFiltered(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses, constants_only: bool) pass.Error!bool {
     const info = try analyses.loops();
     if (info.loops.len == 0) return false;
 
@@ -130,8 +140,10 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             for (0..func.blockCount()) |bi| {
                 if (!loop.contains(bi)) continue;
                 for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+                    if (constants_only and to_hoist.items.len >= max_hoisted_literals_per_loop) break;
                     const result = func.instResult(inst) orelse continue;
                     if (invariant[@backingInt(result)]) continue; // already hoisted/invariant
+                    if (constants_only and !literal(func.opcode(inst))) continue;
                     if (!hoistable(func.opcode(inst))) continue;
                     if (!operandsInvariant(func, inst, invariant)) continue;
                     invariant[@backingInt(result)] = true;
@@ -163,6 +175,13 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         changed = true;
     }
     return changed;
+}
+
+fn literal(opcode: ir.function.Opcode) bool {
+    return switch (opcode) {
+        .iconst, .fconst, .fconst128, .global_addr => true,
+        else => false,
+    };
 }
 
 fn isHoisted(list: []const Hoist, inst: Inst) bool {
@@ -239,6 +258,37 @@ test "hoists a loop-invariant product to the preheader" {
     // The invariant `x * y` left the body and landed in the preheader (entry).
     try std.testing.expectEqual(entry_before + 1, func.blockInsts(entry).len);
     try std.testing.expectEqual(body_before - 1, func.blockInsts(body).len);
+}
+
+test "constant-only LICM bounds loop register pressure" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, header, &.{zero});
+    const i = try func.appendBlockParam(header, i32_t);
+    const cond = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(header, cond, .{ .target = body, .args = &.{i} }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    for (0..10) |value| _ = try func.appendInst(body, i32_t, .{ .iconst = @intCast(value) });
+    const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, header, &.{next});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(i) });
+
+    const entry_before = func.blockInsts(entry).len;
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try runConstants(allocator, &func, &analyses));
+    try std.testing.expectEqual(entry_before + max_hoisted_literals_per_loop, func.blockInsts(entry).len);
+    try std.testing.expectEqual(@as(usize, 3), func.blockInsts(body).len);
 }
 
 test "does not hoist a loop-variant value" {

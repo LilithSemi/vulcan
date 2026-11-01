@@ -992,8 +992,12 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
     // Larger acyclic callees are worthwhile at loop call sites, but clone them only after the
     // LICM-bearing early and microarchitecture pipelines. Cloning a large switch before LICM would
     // hoist every case constant into the loop entry, creating needless live ranges and register
-    // pressure. The late pipeline performs scalar cleanup without LICM.
+    // pressure. A scored constant-only LICM follows the inline, then the late pipeline performs
+    // scalar cleanup.
     if (optimize.inlinesCalls() and profile == null) try inlineHotLoopCalls(allocator, &mod);
+    if (optimize.runsMicroarch()) if (model) |m| {
+        for (mod.funcs) |*nf| _ = try mm.optimizePostInline(allocator, &nf.func, m);
+    };
     const microarch_end = std.Io.Timestamp.now(io, .awake);
 
     const late_start = microarch_end;

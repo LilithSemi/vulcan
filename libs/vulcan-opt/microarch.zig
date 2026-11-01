@@ -117,6 +117,15 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
     return split or looped or iv_reduced or unrolled or vectorized or late_cleaned or dotted or matmuled or prefetched;
 }
 
+/// Hoist safe constants exposed by late inlining when the target score accepts the result.
+pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Function, m: *const Model) pass.Error!bool {
+    var gate = try score.IRGate.init(allocator, func, m);
+    defer gate.deinit();
+    const changed = try pass.run(allocator, gate.candidateFunction(), &.{ licm.constants_pass_def, dce.pass_def });
+    if (!changed) return false;
+    return gate.commit(func);
+}
+
 test {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(@import("microarch/schedule.zig"));
