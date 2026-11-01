@@ -56,7 +56,9 @@ const MachineClass = enum { alu, mul, div, mem, branch, fpsimd };
 pub fn scoreWords(words: []const u32, model: MachineModel) MachineScore {
     var demand: [@typeInfo(MachineClass).@"enum".field_names.len]u32 = @splat(0);
     var total_demand: u32 = 0;
-    var ready: [64]u32 = @splat(0);
+    // x0..x30, v0..v31, and NZCV each own a scoreboard slot. NZCV must not alias v31:
+    // compare-to-branch and compare-to-select chains are real machine dependencies.
+    var ready: [65]u32 = @splat(0);
     var critical_path: u32 = 0;
     for (words) |word| {
         const class = machineClass(word);
@@ -101,8 +103,8 @@ fn machineClass(word: u32) MachineClass {
 }
 
 const RegisterDeps = struct {
-    reads: [4]?u6 = @splat(null),
-    writes: [2]?u6 = @splat(null),
+    reads: [4]?u7 = @splat(null),
+    writes: [2]?u7 = @splat(null),
 };
 
 fn dependencies(word: u32, class: MachineClass) RegisterDeps {
@@ -135,27 +137,46 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
             .writes = .{ gpReg(@truncate(word)), null },
         };
     }
-    if (class == .div or isRegisterAlu(word)) return .{
-        .reads = .{ gpReg(@truncate(word >> 5)), gpReg(@truncate(word >> 16)), null, null },
-        .writes = .{ gpReg(@truncate(word)), null },
-    };
-    if (isImmediateAlu(word)) return .{
-        .reads = .{ gpReg(@truncate(word >> 5)), null, null, null },
-        .writes = .{ gpReg(@truncate(word)), null },
-    };
+    if (class == .div or isRegisterAlu(word)) {
+        var result = RegisterDeps{
+            .reads = .{
+                gpReg(@truncate(word >> 5)),
+                gpReg(@truncate(word >> 16)),
+                if (readsFlags(word)) nzcvReg() else null,
+                null,
+            },
+            .writes = .{ gpReg(@truncate(word)), null },
+        };
+        if (writesFlags(word)) result.writes[1] = nzcvReg();
+        return result;
+    }
+    if (isImmediateAlu(word)) {
+        var result = RegisterDeps{
+            .reads = .{ gpReg(@truncate(word >> 5)), null, null, null },
+            .writes = .{ gpReg(@truncate(word)), null },
+        };
+        if (writesFlags(word)) result.writes[1] = nzcvReg();
+        return result;
+    }
     if (isMoveWide(word)) return .{
         .reads = .{ gpReg(@truncate(word)), null, null, null },
         .writes = .{ gpReg(@truncate(word)), null },
     };
+    if (vectorDependencies(word)) |result| return result;
+    if (isConditionalBranch(word)) return .{ .reads = .{ nzcvReg(), null, null, null } };
     return .{};
 }
 
-fn gpReg(reg: u5) ?u6 {
+fn gpReg(reg: u5) ?u7 {
     return if (reg == 31) null else reg;
 }
 
-fn fpReg(reg: u5) u6 {
-    return 32 + @as(u6, reg);
+fn fpReg(reg: u5) u7 {
+    return 32 + @as(u7, reg);
+}
+
+fn nzcvReg() u7 {
+    return 64;
 }
 
 fn isRegisterAlu(word: u32) bool {
@@ -169,6 +190,79 @@ fn isImmediateAlu(word: u32) bool {
     return word & 0x1F000000 == 0x11000000 or // add/sub immediate, including flag-setting forms
         word & 0x1F800000 == 0x12000000 or // logical immediate
         word & 0x1F800000 == 0x13000000; // bitfield
+}
+
+fn isConditionalBranch(word: u32) bool {
+    return word & 0xFF000010 == 0x54000000;
+}
+
+fn readsFlags(word: u32) bool {
+    // Integer conditional select family: CSEL, CSINC, CSINV and CSNEG (including CNEG).
+    return word & 0x1FE00000 == 0x1A800000;
+}
+
+fn writesFlags(word: u32) bool {
+    if ((word & 0x1F000000) == 0x0B000000 or (word & 0x1F000000) == 0x11000000)
+        return word & 0x20000000 != 0; // ADDS/SUBS, register or immediate
+    if ((word & 0x1F000000) == 0x0A000000 or (word & 0x1F800000) == 0x12000000)
+        return word & 0x60000000 == 0x60000000; // ANDS, register or immediate
+    return false;
+}
+
+fn vectorDependencies(word: u32) ?RegisterDeps {
+    const form = word & 0xFFE0FC00;
+    const accumulates = switch (form) {
+        0x4EA09400, // MLA Vd.4S, Vn.4S, Vm.4S
+        0x4E809400, // SDOT Vd.4S, Vn.16B, Vm.16B
+        0x6E809400, // UDOT Vd.4S, Vn.16B, Vm.16B
+        0x6E601C00, // BSL Vd.16B, Vn.16B, Vm.16B
+        => true,
+        else => false,
+    };
+    switch (form) {
+        0x4EA08400, // ADD Vd.4S, Vn.4S, Vm.4S
+        0x6EA08400, // SUB Vd.4S, Vn.4S, Vm.4S
+        0x4EA09C00, // MUL Vd.4S, Vn.4S, Vm.4S
+        0x4EA09400,
+        0x4E201C00, // AND Vd.16B, Vn.16B, Vm.16B
+        0x4EA01C00, // ORR/MOV Vd.16B, Vn.16B, Vm.16B
+        0x6E201C00, // EOR Vd.16B, Vn.16B, Vm.16B
+        0x6EA04400, // USHL Vd.4S, Vn.4S, Vm.4S
+        0x4EA04400, // SSHL Vd.4S, Vn.4S, Vm.4S
+        0x4E809400,
+        0x6E809400,
+        0x6E601C00,
+        => return .{
+            .reads = .{
+                fpReg(@truncate(word >> 5)),
+                fpReg(@truncate(word >> 16)),
+                if (accumulates) fpReg(@truncate(word)) else null,
+                null,
+            },
+            .writes = .{ fpReg(@truncate(word)), null },
+        },
+        0x4E000400, // DUP Vd.4S, Vn.S[index]
+        0x5E000400, // DUP Sd, Vn.S[index]
+        => return .{
+            .reads = .{ fpReg(@truncate(word >> 5)), null, null, null },
+            .writes = .{ fpReg(@truncate(word)), null },
+        },
+        0x6E000400, // INS Vd.S[index], Vn.S[0]
+        => return .{
+            .reads = .{ fpReg(@truncate(word >> 5)), fpReg(@truncate(word)), null, null },
+            .writes = .{ fpReg(@truncate(word)), null },
+        },
+        else => {},
+    }
+    if (word & 0xFFFFFC00 == 0x4E040C00) return .{
+        .reads = .{ gpReg(@truncate(word >> 5)), null, null, null },
+        .writes = .{ fpReg(@truncate(word)), null },
+    };
+    if (word & 0xFF00FC00 == 0x4F005400) return .{
+        .reads = .{ fpReg(@truncate(word >> 5)), null, null, null },
+        .writes = .{ fpReg(@truncate(word)), null },
+    };
+    return null;
 }
 
 fn isMoveWide(word: u32) bool {
@@ -828,6 +922,31 @@ test "machine score tracks immediate producer dependencies" {
     const score = scoreWords(&.{ encode.subImm(.x1, .x0, 1), encode.csinc(.x2, .x1, .x0, .eq, false) }, model);
 
     try std.testing.expectEqual(@as(u32, 2), score.critical_path);
+}
+
+test "machine score tracks NZCV from compare through conditional branch" {
+    const model = MachineModel{ .issue_width = 4, .latency = .{ .alu = 2, .branch = 1 } };
+    const score = scoreWords(&.{ encode.cmp(.x0, .x1), encode.bcc(.eq, 0) }, model);
+    try std.testing.expectEqual(@as(u32, 3), score.critical_path);
+}
+
+test "machine score tracks vector load and arithmetic chains" {
+    const model = MachineModel{ .issue_width = 4, .latency = .{ .mem = 3, .fpsimd = 2 } };
+    const score = scoreWords(&.{
+        encode.ldrQ(.x0, .x1, 0),
+        encode.addVecI32(.x2, .x0, .x3),
+        encode.eorVec(.x4, .x2, .x5),
+    }, model);
+    try std.testing.expectEqual(@as(u32, 7), score.critical_path);
+}
+
+test "machine score keeps vector accumulate dependencies" {
+    const model = MachineModel{ .issue_width = 4, .latency = .{ .fpsimd = 3 } };
+    const score = scoreWords(&.{
+        encode.mlaVecI32(.x0, .x1, .x2),
+        encode.mlaVecI32(.x0, .x3, .x4),
+    }, model);
+    try std.testing.expectEqual(@as(u32, 6), score.critical_path);
 }
 
 test "machine score charges non-pipelined divide throughput" {
