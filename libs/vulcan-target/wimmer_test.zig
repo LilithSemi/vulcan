@@ -136,11 +136,10 @@ test "aarch64 description: a non-leaf function with a call records a call-clobbe
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
 
-    // Non-leaf GPR pool is the callee-saved x19..x28 PLUS the caller-saved temporaries x9..x12.
-    // These are clobbered at every call, so the allocator only uses them for values that do not
-    // live across a call, short-lived temporaries. This relieves the register pressure of a wide
-    // argument list. 10 + 4 = 14.
-    try std.testing.expectEqual(@as(usize, 14), desc.classes[0].allocatable.len);
+    // Non-leaf GPR pool is x0..x7, x9..x12, and callee-saved x19..x28. The caller-saved registers
+    // are clobbered at every call, so the allocator uses them only for values that do not span one.
+    try std.testing.expectEqual(@as(usize, 22), desc.classes[0].allocatable.len);
+    for (0..8) |idx| try std.testing.expect(contains(desc.classes[0].allocatable, @intCast(idx)));
     for (19..29) |idx| try std.testing.expect(contains(desc.classes[0].allocatable, @intCast(idx)));
     for (9..13) |idx| try std.testing.expect(contains(desc.classes[0].allocatable, @intCast(idx)));
     // Non-leaf FPR pool is the callee-saved v8..v15.

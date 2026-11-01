@@ -3740,7 +3740,7 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
     }
 
     // Allocatable pools, mirroring `allocate`'s pool-building loop EXACTLY. GPR: caller-saved
-    // temporaries x9..x12 + unused integer arg registers (leaf) or callee-saved x19..x28 (non-leaf).
+    // temporaries and unused integer argument registers plus callee-saved x19..x28.
     // FPR: caller-saved v16..v23 + unused FP arg registers (leaf) or callee-saved v8..v15 (non-leaf).
     var gpr_alloc: std.ArrayList(u16) = .empty;
     errdefer gpr_alloc.deinit(allocator);
@@ -3760,15 +3760,15 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
         for (16..24) |r| try fpr_alloc.append(allocator, @intCast(r));
         for (@min(n_fpr, 8)..8) |r| try fpr_alloc.append(allocator, @intCast(r));
     } else {
-        for (19..29) |r| try gpr_alloc.append(allocator, @intCast(r)); // callee-saved x19..x28
-        // ALSO offer the caller-saved temporaries x9..x12 to a non-leaf function. Every call
-        // clobbers them (they are in the per-call clobber list below), so the allocator can only
-        // place a value there when it does NOT live across a call. It works for a short-lived temporary, such
-        // as the address arithmetic feeding a WIDE call's arguments. Without them a non-leaf
-        // function had only 10 GPRs, too few for a call that already pins 8 argument values, which
-        // is the "too many live params" wall a `fprintf(f, fmt, a0..a8)` hits. x13..x17 stay out:
+        // Offer caller-saved x0..x7 and x9..x12 to a non-leaf function. Fixed intervals reserve
+        // live entry parameters and every call-clobber interval prevents a value from surviving a
+        // call in these registers, so values that die before a call can use the whole caller-saved
+        // bank safely. This is important after LICM hoists constants across a hot loop but not across
+        // its trailing call. x13..x17 stay out:
         // they are the isel's fixed reload/immediate/move scratch (see their `const` definitions).
+        for (0..8) |r| try gpr_alloc.append(allocator, @intCast(r)); // argument/result regs x0..x7
         for (9..13) |r| try gpr_alloc.append(allocator, @intCast(r)); // caller-saved temps x9..x12
+        for (19..29) |r| try gpr_alloc.append(allocator, @intCast(r)); // callee-saved x19..x28
         for (8..16) |r| try fpr_alloc.append(allocator, @intCast(r)); // callee-saved v8..v15
         // ALSO offer the caller-saved temporaries v16..v23 to a non-leaf function, mirroring the
         // GPR widening above. Every call clobbers them, so the allocator can only place a value
