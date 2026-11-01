@@ -4723,7 +4723,7 @@ fn cnegProducerForLaterSelect(func: *const Function, insts: []const ir.function.
 }
 
 fn cnegZeroForLaterSelect(func: *const Function, insts: []const ir.function.Inst, zero: Value, model: peephole.MachineModel) bool {
-    if (!isConstZero(func, zero) or countUses(func, zero) != 2) return false;
+    if (!isConstZero(func, zero)) return false;
     for (insts, 0..) |inst, idx| {
         const select = switch (func.opcode(inst)) {
             .select => |value| value,
@@ -4733,7 +4733,10 @@ fn cnegZeroForLaterSelect(func: *const Function, insts: []const ir.function.Inst
         const value = cnegSelectValue(func, select, cmp) orelse continue;
         const neg_inst = func.definingInst(select.then).?;
         const neg = func.opcode(neg_inst).arith;
-        if (cmp.rhs == zero and neg.lhs == zero)
+        const compare_use = cmp.rhs == zero;
+        const negate_use = neg.lhs == zero;
+        const expected_uses = @as(u32, @intFromBool(compare_use)) + @as(u32, @intFromBool(negate_use));
+        if (expected_uses != 0 and countUses(func, zero) == expected_uses)
             return machinePrefersCneg(model, isWide(func, value));
     }
     return false;
@@ -6178,9 +6181,10 @@ test "selects signed absolute value with conditional negate" {
     const bool_t = try func.types.intern(.bool);
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
-    const zero = try func.appendInst(b, t, .{ .iconst = 0 });
-    const negative = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = zero } });
-    const negated = try func.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = x } });
+    const compare_zero = try func.appendInst(b, t, .{ .iconst = 0 });
+    const negate_zero = try func.appendInst(b, t, .{ .iconst = 0 });
+    const negative = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = compare_zero } });
+    const negated = try func.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = negate_zero, .rhs = x } });
     const absolute = try func.appendInst(b, t, .{ .select = .{ .cond = negative, .then = negated, .@"else" = x } });
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(absolute) });
 
