@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
+const opt = @import("vulcan-opt");
 const isel = @import("isel.zig");
 const link = @import("link.zig");
 const dwarf = @import("../dwarf.zig");
@@ -280,6 +281,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
     var data_pending: std.ArrayList(DataR) = .empty;
 
     const caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
+    const text_alignment: u64 = @max(4, caps.fetch_align);
     for (module.functions.items) |entry| {
         var compiled = try isel.compileFunction(allocator, entry.func, caps);
         defer compiled.deinit(allocator);
@@ -292,7 +294,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
             .flags = SHF_ALLOC | SHF_EXECINSTR,
             .bytes = code,
             .size = code.len,
-            .addralign = 4,
+            .addralign = text_alignment,
         });
         try reloc_lists.append(a, .empty);
         // A `static` function has internal linkage. So does a `.`-prefixed compiler-local
@@ -374,6 +376,7 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
     var text_off: u64 = 0;
 
     const caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
+    const text_alignment: u64 = @max(4, caps.fetch_align);
     for (module.functions.items) |entry| {
         var compiled = try isel.compileFunction(allocator, entry.func, caps);
         defer compiled.deinit(allocator);
@@ -386,7 +389,7 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
             .flags = SHF_ALLOC | SHF_EXECINSTR,
             .bytes = code,
             .size = code.len,
-            .addralign = 4,
+            .addralign = text_alignment,
         });
         try reloc_lists.append(a, .empty);
         const binding: object_emit.Binding = if (entry.func.is_local or std.mem.startsWith(u8, entry.name, ".")) .local else .global;
@@ -518,6 +521,33 @@ test "writes an ELF64 AArch64 relocatable header" {
     try std.testing.expectEqual(@as(u8, 2), bytes[4]); // ELFCLASS64
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, bytes[16..18], .little)); // ET_REL
     try std.testing.expectEqual(@as(u16, 183), std.mem.readInt(u16, bytes[18..20], .little)); // EM_AARCH64
+}
+
+test "model tuned function sections preserve fetch alignment" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const entry = try func.appendBlock();
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    var module: link.Module = .{ .model = opt.microarch.modelFor(.@"ampere-altra") };
+    defer module.deinit(allocator);
+    try module.addFunction(allocator, "aligned", &func);
+
+    const bytes = try writeModule(allocator, &module);
+    defer allocator.free(bytes);
+    const shoff = std.mem.readInt(u64, bytes[40..48], .little);
+    const shentsize = std.mem.readInt(u16, bytes[58..60], .little);
+    const shnum = std.mem.readInt(u16, bytes[60..62], .little);
+    var found_text = false;
+    for (0..shnum) |index| {
+        const off: usize = @intCast(shoff + index * shentsize);
+        const flags = std.mem.readInt(u64, bytes[off + 8 ..][0..8], .little);
+        if ((flags & SHF_EXECINSTR) == 0) continue;
+        found_text = true;
+        try std.testing.expectEqual(@as(u64, 32), std.mem.readInt(u64, bytes[off + 48 ..][0..8], .little));
+    }
+    try std.testing.expect(found_text);
 }
 
 test "readelf accepts the emitted AArch64 object (cross-check)" {
