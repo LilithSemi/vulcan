@@ -187,11 +187,113 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
             const block: Block = @fromBackingInt(@intCast(bi));
             if (model.fuses(.shift_add)) restoreShiftAddPairs(func, block, model, uses);
             if (model.arch == .aarch64) {
+                restoreVectorLoadPairs(func, block);
                 restoreMultiplyAddPairs(func, block, uses);
                 restoreCompareBranchPairs(func, block, uses);
             }
         }
     }
+}
+
+const AffineAddress = struct { root: Value, offset: i64 };
+
+fn affineAddress(func: *const Function, value: Value, depth: u8) AffineAddress {
+    if (depth < 8) if (func.definingInst(value)) |inst| switch (func.opcode(inst)) {
+        .arith_imm => |arith| if (arith.op == .add) {
+            const inner = affineAddress(func, arith.lhs, depth + 1);
+            return .{
+                .root = inner.root,
+                .offset = std.math.add(i64, inner.offset, arith.imm) catch return .{ .root = value, .offset = 0 },
+            };
+        },
+        else => {},
+    };
+    return .{ .root = value, .offset = 0 };
+}
+
+fn vectorBytes(func: *const Function, value: Value) ?i64 {
+    const vector = switch (func.types.type_kind(func.valueType(value))) {
+        .vector => |vector| vector,
+        else => return null,
+    };
+    const elem_bytes: i64 = switch (func.types.type_kind(vector.elem)) {
+        .int => |int| @intCast((int.bits + 7) / 8),
+        .float => |float| switch (float) {
+            .f16 => 2,
+            .f32 => 4,
+            .f64 => 8,
+            .f128 => 16,
+        },
+        else => return null,
+    };
+    return std.math.mul(i64, elem_bytes, vector.len) catch null;
+}
+
+/// Put two consecutive vector loads beside each other so the strict post-allocation pass can turn
+/// them into one `ldp`. The second address must already be available and only pure value ops may be
+/// crossed. This deliberately increases the two loaded values' overlap: AArch64 has ample SIMD
+/// registers here, and the machine scorer still gets the final word on whether the physical pair
+/// improves the selected stream.
+fn restoreVectorLoadPairs(func: *Function, block: Block) void {
+    const insts = func.blockInstsMut(block).items;
+    var first_index: usize = 0;
+    while (first_index + 2 < insts.len) : (first_index += 1) {
+        const first = switch (func.opcode(insts[first_index])) {
+            .load => |load| load,
+            else => continue,
+        };
+        const first_result = func.instResult(insts[first_index]) orelse continue;
+        const bytes = vectorBytes(func, first_result) orelse continue;
+        if (first.@"volatile" or first.mask != null or func.isByteOrderTagged(insts[first_index])) continue;
+        const first_address = affineAddress(func, first.ptr, 0);
+
+        var second_index = first_index + 1;
+        while (second_index < insts.len and second_index - first_index <= 12) : (second_index += 1) {
+            const second = switch (func.opcode(insts[second_index])) {
+                .load => |load| load,
+                else => |op| if (movable(op)) continue else break,
+            };
+            const second_result = func.instResult(insts[second_index]) orelse break;
+            if (vectorBytes(func, second_result) != bytes or second.@"volatile" or second.mask != null or func.isByteOrderTagged(insts[second_index])) break;
+            const second_address = affineAddress(func, second.ptr, 0);
+            const distance = std.math.sub(i64, second_address.offset, first_address.offset) catch break;
+            if (second_address.root != first_address.root or distance != bytes) break;
+            if (func.definingInst(second.ptr)) |address_inst| {
+                const address_index = std.mem.indexOfScalar(Inst, insts, address_inst) orelse break;
+                if (address_index > first_index) break;
+            }
+
+            const load_inst = insts[second_index];
+            std.mem.copyBackwards(Inst, insts[first_index + 2 .. second_index + 1], insts[first_index + 1 .. second_index]);
+            insts[first_index + 1] = load_inst;
+            first_index += 1;
+            break;
+        }
+    }
+}
+
+test "aarch64 restores an affine vector load pair for machine fusion" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const block = try func.appendBlock();
+    const base = try func.appendBlockParam(block, ptr_t);
+    const ptr0 = try func.appendArithImm(block, ptr_t, .add, base, 0);
+    const ptr1 = try func.appendArithImm(block, ptr_t, .add, base, 16);
+    const first = try func.appendInst(block, vec_t, .{ .load = .{ .ptr = ptr0 } });
+    _ = try func.appendInst(block, vec_t, .{ .arith = .{ .op = .add, .lhs = first, .rhs = first } });
+    const second = try func.appendInst(block, vec_t, .{ .load = .{ .ptr = ptr1 } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(second) });
+
+    restoreVectorLoadPairs(&func, block);
+
+    const insts = func.blockInsts(block);
+    const first_at = std.mem.indexOfScalar(Inst, insts, func.definingInst(first).?).?;
+    const second_at = std.mem.indexOfScalar(Inst, insts, func.definingInst(second).?).?;
+    try std.testing.expectEqual(first_at + 1, second_at);
 }
 
 /// Restore a single-use integer compare immediately before its `if`. The generic resource scheduler
