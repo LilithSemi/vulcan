@@ -55,10 +55,14 @@ const Plan = struct {
     carry_addresses: bool,
 };
 
-fn carriedArgs(storage: []Value, index: Value, vector_index: ?Value, accumulators: []const ?Value, pointers: []const Value) []const Value {
+fn carriedArgs(storage: []Value, index: Value, remaining: ?Value, vector_index: ?Value, accumulators: []const ?Value, pointers: []const Value) []const Value {
     var len: usize = 0;
     storage[len] = index;
     len += 1;
+    if (remaining) |value| {
+        storage[len] = value;
+        len += 1;
+    }
     if (vector_index) |value| {
         storage[len] = value;
         len += 1;
@@ -141,11 +145,13 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     const offset_fits = group_offset != null and group_offset.? >= 0 and ind_int.bits < 64 and
         @as(u64, @intCast(group_offset.?)) < (@as(u64, 1) << @intCast(ind_int.bits));
     const rotated = ind_int.signedness == .unsigned and offset_fits;
+    const countdown = rotated and plan.carry_addresses;
 
     const mainheader = try func.appendBlock();
     const mainbody = if (rotated) mainheader else try func.appendBlock();
     const combine = try func.appendBlock();
     const mi = try func.appendBlockParam(mainheader, ind_ty);
+    const mremaining = if (countdown) try func.appendBlockParam(mainheader, ind_ty) else null;
     const mvi = if (index_vec_ty) |vec_ty| try func.appendBlockParam(mainheader, vec_ty) else null;
     var maccs: [2]?Value = @splat(null);
     if (reduction_vec_ty) |vec_ty| {
@@ -191,9 +197,27 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         try func.appendArithImm(plan.preheader, ind_ty, .sub, plan.bound, group_offset.?)
     else
         null;
-    const carried_storage_a = try allocator.alloc(Value, 4 + pointer_families.items.len);
+    const countdown_values = if (countdown) countdown_values: {
+        const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const wide_threshold = try func.appendInst(plan.preheader, u64_t, .{ .convert = .{ .value = threshold.? } });
+        const wide_init = try func.appendInst(plan.preheader, u64_t, .{ .convert = .{ .value = init_i } });
+        const distance = try func.appendInst(plan.preheader, u64_t, .{ .arith = .{ .op = .sub, .lhs = wide_threshold, .rhs = wide_init } });
+        const rounding: i64 = @intCast(if (plan.exit_cond == .lt) U - 1 else U);
+        const rounded = try func.appendArithImm(plan.preheader, u64_t, .add, distance, rounding);
+        const shift: i64 = @intCast(std.math.log2_int(u32, U));
+        const groups_wide = try func.appendArithImm(plan.preheader, u64_t, .shr, rounded, shift);
+        const groups = try func.appendInst(plan.preheader, ind_ty, .{ .convert = .{ .value = groups_wide } });
+        const advance = try func.appendArithImm(plan.preheader, u64_t, .shl, groups_wide, shift);
+        const final_wide = try func.appendInst(plan.preheader, u64_t, .{ .arith = .{ .op = .add, .lhs = wide_init, .rhs = advance } });
+        const final_index = try func.appendInst(plan.preheader, ind_ty, .{ .convert = .{ .value = final_wide } });
+        const zero = try func.appendInst(plan.preheader, ind_ty, .{ .iconst = 0 });
+        break :countdown_values .{ .groups = groups, .final_index = final_index, .zero = zero };
+    } else null;
+    const loop_index = if (countdown_values) |values| values.final_index else init_i;
+    const initial_remaining = if (countdown_values) |values| values.groups else null;
+    const carried_storage_a = try allocator.alloc(Value, 5 + pointer_families.items.len);
     defer allocator.free(carried_storage_a);
-    const carried_storage_b = try allocator.alloc(Value, 4 + pointer_families.items.len);
+    const carried_storage_b = try allocator.alloc(Value, 5 + pointer_families.items.len);
     defer allocator.free(carried_storage_b);
     if (threshold != null) {
         const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
@@ -209,10 +233,10 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         };
         const reverse: CmpOp = if (plan.exit_cond == .lt) .gt else .ge;
         const can_enter = try func.appendInst(plan.preheader, bool_t, .{ .icmp = .{ .op = reverse, .lhs = wide_bound, .rhs = wide_highest } });
-        const enter_args = carriedArgs(carried_storage_a, init_i, init_vi, &initial_accs, initial_ptrs);
+        const enter_args = carriedArgs(carried_storage_a, loop_index, initial_remaining, init_vi, &initial_accs, initial_ptrs);
         try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = enter_args }, .{ .target = plan.header, .args = pre_args });
     } else {
-        try func.setJump(plan.preheader, mainheader, carriedArgs(carried_storage_a, init_i, init_vi, &initial_accs, initial_ptrs));
+        try func.setJump(plan.preheader, mainheader, carriedArgs(carried_storage_a, loop_index, initial_remaining, init_vi, &initial_accs, initial_ptrs));
     }
 
     // Main header: run a full group only while the highest index in it still passes the test.
@@ -245,7 +269,7 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         break :guard guarded;
     };
     if (cont) |condition| {
-        try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = carriedArgs(carried_storage_a, mi, mvi, &maccs, mptrs) }, .{ .target = combine, .args = carriedArgs(carried_storage_b, mi, null, &maccs, &.{}) });
+        try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = carriedArgs(carried_storage_a, mi, mremaining, mvi, &maccs, mptrs) }, .{ .target = combine, .args = carriedArgs(carried_storage_b, mi, null, null, &maccs, &.{}) });
     }
 
     // Main body: U copies emitted operation-major in V-wide groups, which gives the SLP pass one or more
@@ -389,17 +413,21 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         const increment_vector = try func.appendInst(mainbody, reduction_vec_ty.?, .{ .struct_new = .{ .fields = try func.internValues(increments[0..V]) } });
         next_accs[group_index] = try func.appendInst(mainbody, reduction_vec_ty.?, .{ .arith = .{ .op = red.op, .lhs = baccs[group_index].?, .rhs = increment_vector } });
     };
-    const nmi = try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(U)));
+    const nmi = if (countdown) bmi else try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(U)));
     const next_vi = if (bvi) |vi| try func.appendInst(mainbody, index_vec_ty.?, .{ .arith = .{ .op = .add, .lhs = vi, .rhs = index_step.? } }) else null;
     const next_ptrs = try allocator.alloc(Value, pointer_families.items.len);
     defer allocator.free(next_ptrs);
     for (pointer_families.items, bptrs, next_ptrs) |family, pointer, *next|
         next.* = try func.appendArithImm(mainbody, func.valueType(family.base), .add, pointer, @as(i64, @intCast(U)) * family.stride);
-    if (rotated) {
+    if (countdown) {
+        const next_remaining = try func.appendArithImm(mainbody, ind_ty, .sub, mremaining.?, 1);
+        const next_cont = try func.appendInst(mainbody, bool_t, .{ .icmp = .{ .op = .ne, .lhs = next_remaining, .rhs = countdown_values.?.zero } });
+        try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = carriedArgs(carried_storage_a, nmi, next_remaining, next_vi, &next_accs, next_ptrs) }, .{ .target = combine, .args = carriedArgs(carried_storage_b, nmi, null, null, &next_accs, &.{}) });
+    } else if (rotated) {
         const next_cont = try func.appendInst(mainbody, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = nmi, .rhs = threshold.? } });
-        try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = carriedArgs(carried_storage_a, nmi, next_vi, &next_accs, next_ptrs) }, .{ .target = combine, .args = carriedArgs(carried_storage_b, nmi, null, &next_accs, &.{}) });
+        try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = carriedArgs(carried_storage_a, nmi, null, next_vi, &next_accs, next_ptrs) }, .{ .target = combine, .args = carriedArgs(carried_storage_b, nmi, null, null, &next_accs, &.{}) });
     } else {
-        try func.setJump(mainbody, mainheader, carriedArgs(carried_storage_a, nmi, next_vi, &next_accs, next_ptrs));
+        try func.setJump(mainbody, mainheader, carriedArgs(carried_storage_a, nmi, null, next_vi, &next_accs, next_ptrs));
     }
 
     // Continue in the original loop at the current index and accumulator value.
@@ -1392,23 +1420,28 @@ test "recognizes a frontend-shaped stencil map with xor reduction and affine nei
     const vector_header: Block = @fromBackingInt(5);
     var compares: usize = 0;
     var boolean_ands: usize = 0;
+    var countdown_decrements: usize = 0;
     var saw_wide_group_offset = false;
     for (func.blockInsts(vector_header)) |inst| switch (func.opcode(inst)) {
         .icmp => compares += 1,
         .arith => |arith| if (arith.op == .bit_and) {
             boolean_ands += 1;
         },
-        .arith_imm => |arith| if (arith.op == .add and arith.imm == 4) {
-            const result = func.instResult(inst).?;
-            if (func.types.type_kind(func.valueType(result)) == .int) {
-                const int = func.types.type_kind(func.valueType(result)).int;
-                saw_wide_group_offset = int.signedness == .unsigned and int.bits == 64;
+        .arith_imm => |arith| {
+            if (arith.op == .sub and arith.imm == 1) countdown_decrements += 1;
+            if (arith.op == .add and arith.imm == 4) {
+                const result = func.instResult(inst).?;
+                if (func.types.type_kind(func.valueType(result)) == .int) {
+                    const int = func.types.type_kind(func.valueType(result)).int;
+                    saw_wide_group_offset = int.signedness == .unsigned and int.bits == 64;
+                }
             }
         },
         else => {},
     };
     try testing.expectEqual(@as(usize, 1), compares);
     try testing.expectEqual(@as(usize, 0), boolean_ands);
+    try testing.expectEqual(@as(usize, 1), countdown_decrements);
     try testing.expect(!saw_wide_group_offset);
     const vector_body = vector_header;
     var scaled_bases: usize = 0;
