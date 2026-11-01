@@ -177,6 +177,44 @@ fn sse66Packed(op: u8, dst: Xmm, src: Xmm) Inst {
 pub fn punpcklqdq(dst: Xmm, src: Xmm) Inst {
     return sse66Packed(0x6C, dst, src);
 }
+pub fn paddd(dst: Xmm, src: Xmm) Inst {
+    return sse66Packed(0xFE, dst, src);
+}
+pub fn psubd(dst: Xmm, src: Xmm) Inst {
+    return sse66Packed(0xFA, dst, src);
+}
+pub fn pand(dst: Xmm, src: Xmm) Inst {
+    return sse66Packed(0xDB, dst, src);
+}
+pub fn por(dst: Xmm, src: Xmm) Inst {
+    return sse66Packed(0xEB, dst, src);
+}
+pub fn pxor(dst: Xmm, src: Xmm) Inst {
+    return sse66Packed(0xEF, dst, src);
+}
+
+fn sse66ShiftImm(digit: u3, dst: Xmm, imm: u8) Inst {
+    const reg = xn(dst);
+    const mod: u8 = 0xC0 | (@as(u8, digit) << 3) | (reg & 7);
+    if (reg >= 8) return Inst.of(&.{ 0x66, 0x41, 0x0F, 0x72, mod, imm });
+    return Inst.of(&.{ 0x66, 0x0F, 0x72, mod, imm });
+}
+
+pub fn pslldImm(dst: Xmm, imm: u8) Inst {
+    return sse66ShiftImm(6, dst, imm);
+}
+pub fn psrldImm(dst: Xmm, imm: u8) Inst {
+    return sse66ShiftImm(2, dst, imm);
+}
+pub fn psradImm(dst: Xmm, imm: u8) Inst {
+    return sse66ShiftImm(4, dst, imm);
+}
+
+test "SSE2 packed i32 arithmetic and shifts" {
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x45, 0x0F, 0xFE, 0xCA }, paddd(.xmm9, .xmm10).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x45, 0x0F, 0xEF, 0xCA }, pxor(.xmm9, .xmm10).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x41, 0x0F, 0x72, 0xF1, 0x03 }, pslldImm(.xmm9, 3).slice());
+}
 /// Packed bitwise `andps`/`andnps`/`orps dst, src` (0F 54/55/56 /r). andnps computes
 /// `dst = (NOT dst) AND src`. All three are SSE1, so every x86-64 CPU has them.
 pub fn andps(dst: Xmm, src: Xmm) Inst {

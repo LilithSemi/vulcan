@@ -1872,12 +1872,39 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 // op1. A spilled result computes into xmm_scratch, which also
                 // breaks the rd==rr alias.
                 const vec = isVector(func, result);
+                const int_vec = vec and switch (func.types.type_kind(func.valueType(result))) {
+                    .vector => |vector| func.types.type_kind(vector.elem) == .int,
+                    else => false,
+                };
                 const dbl = isDouble(func, result);
                 const rl = try ctx.useXmm(allocator, a.lhs, xmm_op0);
-                const rr = try ctx.useXmm(allocator, a.rhs, xmm_op1);
                 const work = try ctx.dstXmm(result, xmm_scratch);
+                if (int_vec and (a.op == .shl or a.op == .shr)) {
+                    if (vectorSplatInt(func, a.rhs)) |amount| {
+                        if (amount >= 0 and amount <= 31) {
+                            if (work != rl) try ctx.put(allocator, encode.movupsRR(work, rl));
+                            try ctx.put(allocator, if (a.op == .shl)
+                                encode.pslldImm(work, @intCast(amount))
+                            else if (vectorSigned(func, result))
+                                encode.psradImm(work, @intCast(amount))
+                            else
+                                encode.psrldImm(work, @intCast(amount)));
+                            try ctx.storeXmm(allocator, result, work);
+                            return;
+                        }
+                    }
+                }
+                const rr = try ctx.useXmm(allocator, a.rhs, xmm_op1);
                 const op = struct {
-                    fn e(o: ir.function.BinOp, v: bool, d: bool, dst: Xmm, src: Xmm) Error!encode.Inst {
+                    fn e(o: ir.function.BinOp, v: bool, iv: bool, d: bool, dst: Xmm, src: Xmm) Error!encode.Inst {
+                        if (iv) return switch (o) {
+                            .add => encode.paddd(dst, src),
+                            .sub => encode.psubd(dst, src),
+                            .bit_and => encode.pand(dst, src),
+                            .bit_or => encode.por(dst, src),
+                            .bit_xor => encode.pxor(dst, src),
+                            else => error.Unsupported,
+                        };
                         return switch (o) {
                             .add => if (v) encode.addps(dst, src) else if (d) encode.addsd(dst, src) else encode.addss(dst, src),
                             .sub => if (v) encode.subps(dst, src) else if (d) encode.subsd(dst, src) else encode.subss(dst, src),
@@ -1888,14 +1915,14 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     }
                 }.e;
                 if (work == rl) {
-                    try ctx.put(allocator, try op(a.op, vec, dbl, work, rr));
+                    try ctx.put(allocator, try op(a.op, vec, int_vec, dbl, work, rr));
                 } else if (work == rr) {
                     try ctx.put(allocator, encode.movupsRR(xmm_scratch, rl));
-                    try ctx.put(allocator, try op(a.op, vec, dbl, xmm_scratch, rr));
+                    try ctx.put(allocator, try op(a.op, vec, int_vec, dbl, xmm_scratch, rr));
                     try ctx.put(allocator, encode.movupsRR(work, xmm_scratch));
                 } else {
                     try ctx.put(allocator, encode.movupsRR(work, rl));
-                    try ctx.put(allocator, try op(a.op, vec, dbl, work, rr));
+                    try ctx.put(allocator, try op(a.op, vec, int_vec, dbl, work, rr));
                 }
                 // An f16 op runs in the scalar-single (f32) form. Then its
                 // result is rounded to nearest-even half, so the register
@@ -2885,6 +2912,36 @@ fn isSigned(func: *const Function, v: Value) bool {
         .int => |i| i.signedness == .signed,
         else => true,
     };
+}
+
+fn vectorSigned(func: *const Function, value: Value) bool {
+    const vector = switch (func.types.type_kind(func.valueType(value))) {
+        .vector => |vector| vector,
+        else => return false,
+    };
+    return switch (func.types.type_kind(vector.elem)) {
+        .int => |int| int.signedness == .signed,
+        else => false,
+    };
+}
+
+fn vectorSplatInt(func: *const Function, value: Value) ?i64 {
+    const inst = func.definingInst(value) orelse return null;
+    const fields = switch (func.opcode(inst)) {
+        .struct_new => |struct_new| func.valueList(struct_new.fields),
+        else => return null,
+    };
+    if (fields.len == 0) return null;
+    const first_inst = func.definingInst(fields[0]) orelse return null;
+    const first = switch (func.opcode(first_inst)) {
+        .iconst => |constant| constant,
+        else => return null,
+    };
+    for (fields[1..]) |field| {
+        const field_inst = func.definingInst(field) orelse return null;
+        if (func.opcode(field_inst) != .iconst or func.opcode(field_inst).iconst != first) return null;
+    }
+    return first;
 }
 
 // ===========================================================================
