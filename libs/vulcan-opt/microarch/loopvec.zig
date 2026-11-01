@@ -272,7 +272,7 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         }
     }
     for (vmaps, 0..) |*vm, m| {
-        const lane_i = if (m == 0)
+        const lane_i = vector_indices[m] orelse if (m == 0)
             bmi
         else
             try func.appendArithImm(mainbody, ind_ty, .add, bmi, @intCast(m));
@@ -627,6 +627,20 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
             break;
         }
     }
+    // A raw induction used by body arithmetic is itself a vector chain. Carry it through the main
+    // loop so SLP can reuse the lanes instead of rebuilding each group with a scalar broadcast and
+    // offsets. Address-generation uses are regenerated separately below, and the latch increment is
+    // replaced by the wide step, so neither one alone justifies the extra vector loop parameter.
+    if (model.arch == .aarch64 and index_elem_type == null) body_use: for (func.blockInsts(bodyb)) |inst| {
+        if (inst == ind_update) continue;
+        for (accesses.items) |access| {
+            if (inst == access.addr_inst or inst == access.scale_inst) continue :body_use;
+        }
+        if (usesValue(func, inst, i_alias)) {
+            index_elem_type = func.valueType(i_alias);
+            break;
+        }
+    };
     // Retain the signed fallback for hand-built interleaved IR without an explicit conversion.
     if (has_interleaved and index_elem_type == null)
         index_elem_type = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = induction_bits } });

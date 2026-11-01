@@ -138,7 +138,7 @@ fn runLanesGated(allocator: std.mem.Allocator, func: *Function, lanes: u8, allow
 
 fn canBuildPackedVector(func: *const Function, block: Block, scalars: []const Value, group_pos: usize, model: ?*const mm.Model, depth: u8, saw_load: *bool) bool {
     if (depth > 8) return false;
-    if (allSame(scalars) or arithmeticProgression(func, scalars) != null) return true;
+    if (allSame(scalars) or extractedVector(func, scalars) != null or arithmeticProgression(func, scalars) != null) return true;
     if (analyzeLoadRun(func, block, scalars, group_pos, model != null and model.?.arch == .aarch64) != null) {
         saw_load.* = true;
         return true;
@@ -196,6 +196,7 @@ fn buildPackedVector(
     coalesced: *bool,
 ) Error!Value {
     if (allSame(scalars)) return func.appendSplat(block, vector_t, scalars[0]);
+    if (extractedVector(func, scalars)) |vector| return vector;
     if (arithmeticProgression(func, scalars)) |progression| {
         const elem_t = func.valueType(progression.base);
         const base = try func.appendSplat(block, vector_t, progression.base);
@@ -264,7 +265,45 @@ fn buildPackedVector(
     };
 }
 
+fn extractedVector(func: *const Function, scalars: []const Value) ?Value {
+    var vector: ?Value = null;
+    for (scalars, 0..) |scalar, lane| {
+        const inst = func.definingInst(scalar) orelse return null;
+        const extract = switch (func.opcode(inst)) {
+            .extract => |extract| extract,
+            else => return null,
+        };
+        if (extract.index != lane) return null;
+        if (vector) |expected| {
+            if (extract.aggregate != expected) return null;
+        } else vector = extract.aggregate;
+    }
+    return vector;
+}
+
 const ShiftMatch = struct { base: []const Value, shift: i64 };
+
+const VectorShiftMatch = struct { base: Value, shift: i64 };
+
+fn vectorShiftOf(func: *const Function, base: Value, shifted: Value) ?VectorShiftMatch {
+    const inst = func.definingInst(shifted) orelse return null;
+    const arith = switch (func.opcode(inst)) {
+        .arith => |arith| arith,
+        else => return null,
+    };
+    if (arith.op != .shl or arith.lhs != base) return null;
+    const splat_inst = func.definingInst(arith.rhs) orelse return null;
+    const scalar = switch (func.opcode(splat_inst)) {
+        .splat => |splat| splat.scalar,
+        else => return null,
+    };
+    const constant_inst = func.definingInst(scalar) orelse return null;
+    const shift = switch (func.opcode(constant_inst)) {
+        .iconst => |constant| constant,
+        else => return null,
+    };
+    return .{ .base = base, .shift = shift };
+}
 
 fn uniformShiftOf(func: *const Function, base: []const Value, shifted: []const Value) ?ShiftMatch {
     var amount: ?i64 = null;
@@ -928,10 +967,32 @@ fn vectorizeOne(
     const old_len = func.blockInsts(block).len; // boundary between old and appended insts
 
     const va = try buildOperand(allocator, func, block, vt, vmap, a[0..lanes], sel_a, coalesced_loads, coalesced);
-    // When both sides are the same operand vector, build it once and reuse it (avoids a second
-    // identical pack or wide load for `a*a`-shaped groups).
-    const vb = if (sel_a_eq_b) va else try buildOperand(allocator, func, block, vt, vmap, b[0..lanes], sel_b, coalesced_loads, coalesced);
-    const vc = try func.appendInst(block, vt, .{ .arith = .{ .op = op, .lhs = va, .rhs = vb } });
+    const shifted_candidate = if (op == .add and model != null and cost.vectorMulProfitableOverShiftAdd(model.?))
+        uniformShiftOf(func, a[0..lanes], b[0..lanes]) orelse uniformShiftOf(func, b[0..lanes], a[0..lanes])
+    else
+        null;
+    const shifted = if (shifted_candidate) |match| if (match.shift >= 0 and match.shift < 31) match else null else null;
+    const vc = if (shifted) |match| strength: {
+        const base = try buildOperand(allocator, func, block, vt, vmap, match.base, null, coalesced_loads, coalesced);
+        const multiplier = (@as(i64, 1) << @intCast(match.shift)) + 1;
+        const scalar = try func.appendInst(block, elem_t, .{ .iconst = multiplier });
+        const vector = try func.appendSplat(block, vt, scalar);
+        break :strength try func.appendInst(block, vt, .{ .arith = .{ .op = .mul, .lhs = base, .rhs = vector } });
+    } else normal: {
+        // When both sides are the same operand vector, build it once and reuse it (avoids a second
+        // identical pack or wide load for `a*a`-shaped groups).
+        const vb = if (sel_a_eq_b) va else try buildOperand(allocator, func, block, vt, vmap, b[0..lanes], sel_b, coalesced_loads, coalesced);
+        if (op == .add and model != null and cost.vectorMulProfitableOverShiftAdd(model.?)) {
+            const packed_shift = vectorShiftOf(func, va, vb) orelse vectorShiftOf(func, vb, va);
+            if (packed_shift) |match| if (match.shift >= 0 and match.shift < 31) {
+                const multiplier = (@as(i64, 1) << @intCast(match.shift)) + 1;
+                const scalar = try func.appendInst(block, elem_t, .{ .iconst = multiplier });
+                const vector = try func.appendSplat(block, vt, scalar);
+                break :normal try func.appendInst(block, vt, .{ .arith = .{ .op = .mul, .lhs = match.base, .rhs = vector } });
+            };
+        }
+        break :normal try func.appendInst(block, vt, .{ .arith = .{ .op = op, .lhs = va, .rhs = vb } });
+    };
     var x: [MAX_LANES]Value = undefined;
     try unpack(allocator, func, block, elem_t, vc, x[0..lanes], vmap);
 
