@@ -541,6 +541,12 @@ fn narrowUnsignedMagic(
     for (block_start) |start| if (start < len) {
         is_block_start[start] = true;
     };
+    var is_data = try allocator.alloc(bool, len);
+    defer allocator.free(is_data);
+    @memset(is_data, false);
+    for (fixups) |fixup| {
+        if (fixup.table_base != null) is_data[fixup.at] = true;
+    }
 
     var removed_before = try allocator.alloc(u32, len + 1);
     defer allocator.free(removed_before);
@@ -548,7 +554,8 @@ fn narrowUnsignedMagic(
     var removed: u32 = 0;
     var i: usize = 0;
     while (i < len) {
-        const rewrite = if (i + 3 < len and !is_block_start[i + 1] and !is_block_start[i + 2] and !is_block_start[i + 3])
+        const rewrite = if (i + 3 < len and !is_data[i] and !is_data[i + 1] and !is_data[i + 2] and !is_data[i + 3] and
+            !is_block_start[i + 1] and !is_block_start[i + 2] and !is_block_start[i + 3])
             tryNarrowUnsignedMagic(words.items[i..])
         else
             null;
@@ -665,6 +672,12 @@ pub fn pairMemoryForModelWithMoveProofs(
         std.debug.assert(bs <= len);
         if (bs < len) is_block_start[bs] = true; // a block start == len emits nothing to fuse into
     }
+    var is_data = try allocator.alloc(bool, len);
+    defer allocator.free(is_data);
+    @memset(is_data, false);
+    for (fixups) |fixup| {
+        if (fixup.table_base != null) is_data[fixup.at] = true;
+    }
     var is_coalescable_result_move = try allocator.alloc(bool, len);
     defer allocator.free(is_coalescable_result_move);
     @memset(is_coalescable_result_move, false);
@@ -727,7 +740,7 @@ pub fn pairMemoryForModelWithMoveProofs(
         // Memory and multiply-add pairs cannot cross a block start. A proven result move may cross
         // a coincident, unentered start because `hasOnlyFallthroughEntry` rules out another path.
         // Never chain a third word into the same pair (i += 2).
-        if (i + 1 < len and !removed_distant[i + 1]) {
+        if (i + 1 < len and !removed_distant[i + 1] and !is_data[i] and !is_data[i + 1]) {
             const result_entry_safe = !is_block_start[i + 1] or hasOnlyFallthroughEntry(i + 1, block_start, fixups);
             const result_proven = is_coalescable_result_move[i + 1] or has_dead_source[i + 1];
             const fused = (if (result_entry_safe and result_proven) tryCoalesceResultMove(words.items[i], words.items[i + 1]) else null) orelse
@@ -853,6 +866,26 @@ test "rewrites widened unsigned magic division" {
         encode.umull(rd, source, multiplier),
         encode.lsrImm(rd, rd, 34, true),
     }, &rewrite.words);
+}
+
+test "machine rewrites leave dense switch data untouched" {
+    const alloc = std.testing.allocator;
+    const original = [_]u32{
+        encode.ubfm(.x12, .x7, 0, 31),
+        encode.mul(.x12, .x12, .x9) | (@as(u32, 1) << 31),
+        encode.lsrImm(.x12, .x12, 32, true),
+        encode.lsrImm(.x12, .x12, 2, true),
+        encode.ldrOff(.x0, .x2, 0),
+        encode.ldrOff(.x1, .x2, 8),
+    };
+    var words = try wordsFrom(alloc, &original);
+    defer words.deinit(alloc);
+    var fixups: [original.len]Fixup = undefined;
+    for (&fixups, 0..) |*fixup, at| fixup.* = .{ .at = at, .target = 0, .table_base = 0 };
+
+    try pairMemory(alloc, &words, &.{}, &fixups, &.{}, &.{});
+
+    try std.testing.expectEqualSlices(u32, &original, words.items);
 }
 
 test "decodeMem recognizes each ldr/str offset form and rejects a non-memory word" {
