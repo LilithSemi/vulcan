@@ -604,7 +604,10 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     // partial records out avoids the scalar lane-pack fallback that is slower than the original.
     if (has_interleaved and (interleaved_loads != 0b1111 or interleaved_stores != 0b1111 or reduction != null))
         return bail(&accesses, allocator);
-    // Carry a same-width integer conversion as one vector induction value.
+    // Carry a same-width integer conversion as one vector induction value only when something
+    // besides the regenerated address chain consumes it. Pointer lowering commonly inserts a
+    // same-width signedness conversion before its scale; carrying that dead-after-rewrite value
+    // adds one SIMD loop dependency for no result.
     var index_elem_type: ?Type = null;
     const induction_kind = func.types.type_kind(func.valueType(i_alias));
     const induction_bits = switch (induction_kind) {
@@ -622,7 +625,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
             .int => |int| int,
             else => continue,
         };
-        if (result_int.bits == induction_bits) {
+        if (result_int.bits == induction_bits and hasNonAddressUse(func, bodyb, result, accesses.items)) {
             index_elem_type = func.valueType(result);
             break;
         }
@@ -635,6 +638,10 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         if (inst == ind_update) continue;
         for (accesses.items) |access| {
             if (inst == access.addr_inst or inst == access.scale_inst) continue :body_use;
+        }
+        if (func.opcode(inst) == .convert and func.opcode(inst).convert.value == i_alias) {
+            const result = func.instResult(inst).?;
+            if (!hasNonAddressUse(func, bodyb, result, accesses.items)) continue;
         }
         if (usesValue(func, inst, i_alias)) {
             index_elem_type = func.valueType(i_alias);
@@ -666,6 +673,16 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         .groups = groups,
         .index_elem_type = index_elem_type,
     };
+}
+
+fn hasNonAddressUse(func: *const Function, body: Block, value: Value, accesses: []const ArrayAccess) bool {
+    use_scan: for (func.blockInsts(body)) |inst| {
+        for (accesses) |access| {
+            if (inst == access.addr_inst or inst == access.scale_inst) continue :use_scan;
+        }
+        if (usesValue(func, inst, value)) return true;
+    }
+    return false;
 }
 
 fn bail(accesses: *std.ArrayList(ArrayAccess), allocator: std.mem.Allocator) ?Plan {
