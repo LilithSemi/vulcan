@@ -333,12 +333,76 @@ fn magicPhase(allocator: std.mem.Allocator, func: *Function, consts: []const ?i6
             const a = func.opcode(inst).arith;
             const ty = intType(func, a.lhs).?;
             const result = func.instResult(inst).?;
-            const value = try emitMagic(func, &out, allocator, a.lhs, d, ty, a.op == .rem);
+            const value = if (ty.signedness == .signed and d > 0 and knownNonNegativeAtBlock(func, block, a.lhs, consts))
+                try emitUnsignedMagicFromSigned(func, &out, allocator, a.lhs, @intCast(d), ty, a.op == .rem)
+            else
+                try emitMagic(func, &out, allocator, a.lhs, d, ty, a.op == .rem);
             func.replaceAllUses(result, value);
         }
         try func.setBlockInsts(block, out.items);
     }
     return changed;
+}
+
+fn knownNonNegativeAtBlock(func: *const Function, target: ir.function.Block, value: Value, consts: []const ?i64) bool {
+    var incoming: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+            .@"if" => |cf| {
+                if (cf.then.target == target) {
+                    incoming += 1;
+                    if (!conditionProvesNonNegative(func, cf.cond, value, consts, true)) return false;
+                }
+                if (cf.@"else".target == target) {
+                    incoming += 1;
+                    if (!conditionProvesNonNegative(func, cf.cond, value, consts, false)) return false;
+                }
+            },
+            else => {},
+        };
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |jump| if (jump.target == target) return false,
+            .ret => {},
+        };
+    }
+    return incoming > 0;
+}
+
+fn conditionProvesNonNegative(func: *const Function, condition: Value, value: Value, consts: []const ?i64, taking_true: bool) bool {
+    const condition_inst = func.definingInst(condition) orelse return false;
+    const cmp = switch (func.opcode(condition_inst)) {
+        .icmp => |cmp| cmp,
+        else => return false,
+    };
+    if (intType(func, value).?.signedness != .signed) return false;
+
+    var op = cmp.op;
+    var bound: i64 = undefined;
+    if (cmp.lhs == value) {
+        bound = consts[@backingInt(cmp.rhs)] orelse return false;
+    } else if (cmp.rhs == value) {
+        bound = consts[@backingInt(cmp.lhs)] orelse return false;
+        op = switch (op) {
+            .eq => .eq,
+            .ne => .ne,
+            .lt => .gt,
+            .le => .ge,
+            .gt => .lt,
+            .ge => .le,
+        };
+    } else return false;
+
+    return if (taking_true) switch (op) {
+        .eq => bound >= 0,
+        .gt => bound >= -1,
+        .ge => bound >= 0,
+        .ne, .lt, .le => false,
+    } else switch (op) {
+        .lt => bound >= 0,
+        .le => bound >= -1,
+        .eq, .ne, .gt, .ge => false,
+    };
 }
 
 /// The constant divisor of `inst` if it is an 8/16/32/64-bit `div`/`rem` by a non-power-of-two
@@ -391,6 +455,28 @@ fn emitMagic(func: *Function, out: *std.ArrayList(ir.function.Inst), allocator: 
     const dc = try rb.konst(d);
     const qd = try rb.op(.mul, q, dc);
     return rb.op(.sub, x, qd);
+}
+
+fn emitUnsignedMagicFromSigned(func: *Function, out: *std.ArrayList(ir.function.Inst), allocator: std.mem.Allocator, x: Value, d: u64, ty: IntTy, is_rem: bool) pass.Error!Value {
+    const signed_t = func.valueType(x);
+    const unsigned_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = ty.bits } });
+    const signed_builder = Builder{ .f = func, .o = out, .a = allocator, .ty = signed_t };
+    const unsigned_builder = Builder{ .f = func, .o = out, .a = allocator, .ty = unsigned_t };
+    const xu = try signed_builder.conv(unsigned_t, x);
+    const q = if (ty.bits == 64)
+        try emitUnsignedQuotient(unsigned_builder, xu, d, 64)
+    else blk: {
+        const compute_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const compute_builder = Builder{ .f = func, .o = out, .a = allocator, .ty = compute_t };
+        const xw = try unsigned_builder.conv(compute_t, xu);
+        const qw = try emitWideUnsigned(compute_builder, xw, d, @intCast(ty.bits));
+        break :blk try unsigned_builder.conv(unsigned_t, qw);
+    };
+    const signed_q = try unsigned_builder.conv(signed_t, q);
+    if (!is_rem) return signed_q;
+    const divisor = try signed_builder.konst(@intCast(d));
+    const product = try signed_builder.op(.mul, signed_q, divisor);
+    return signed_builder.op(.sub, x, product);
 }
 
 /// A small emit helper binding the function, output list, allocator, and result type.
@@ -631,6 +717,37 @@ test "signed 64-bit magic division matches real division across divisors and div
     for (divisors) |d| {
         for (dividends) |x| try expectDivS(allocator, x, d);
     }
+}
+
+test "positive branch uses unsigned magic for signed division" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try intTy(&func, 32, .signed);
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const positive = try func.appendBlock();
+    const other = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, i32_t);
+    const hundred = try func.appendInst(entry, i32_t, .{ .iconst = 100 });
+    const condition = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = hundred } });
+    try func.appendIf(entry, condition, .{ .target = positive }, .{ .target = other });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const five = try func.appendInst(positive, i32_t, .{ .iconst = 5 });
+    const quotient = try func.appendInst(positive, i32_t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = five } });
+    func.setTerminator(positive, .{ .ret = ir.function.Ret.one(quotient) });
+    func.setTerminator(other, .{ .ret = ir.function.Ret.one(x) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    var found_unsigned = false;
+    for (func.blockInsts(positive)) |inst| if (func.instResult(inst)) |result| {
+        found_unsigned = switch (func.types.type_kind(func.valueType(result))) {
+            .int => |int| int.signedness == .unsigned,
+            else => false,
+        } or found_unsigned;
+    };
+    try testing.expect(found_unsigned);
 }
 
 fn intTy(func: *Function, bits: u16, signedness: std.builtin.Signedness) !ir.types.Type {
