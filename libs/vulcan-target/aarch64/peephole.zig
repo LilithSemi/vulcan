@@ -24,37 +24,147 @@ const LineEntry = isel.LineEntry;
 pub const MachineModel = struct {
     issue_width: u8 = 1,
     units: mm.Units = .{},
+    latency: Timing = .{},
+    throughput: Timing = .{},
+};
+
+pub const Timing = struct {
+    alu: u8 = 1,
+    mul: u8 = 1,
+    div: u8 = 1,
+    mem: u8 = 1,
+    branch: u8 = 1,
+    fpsimd: u8 = 1,
 };
 
 pub const MachineScore = struct {
     cycles: u32,
+    critical_path: u32,
     instructions: u32,
+    idle_slots: u32,
 
     pub fn accepts(candidate: MachineScore, baseline: MachineScore) bool {
         if (candidate.cycles != baseline.cycles) return candidate.cycles < baseline.cycles;
-        return candidate.instructions <= baseline.instructions;
+        if (candidate.critical_path != baseline.critical_path) return candidate.critical_path < baseline.critical_path;
+        if (candidate.instructions != baseline.instructions) return candidate.instructions < baseline.instructions;
+        return candidate.idle_slots <= baseline.idle_slots;
     }
 };
 
-const MachineClass = enum { alu, muldiv, mem, branch, fpsimd };
+const MachineClass = enum { alu, mul, div, mem, branch, fpsimd };
 
 pub fn scoreWords(words: []const u32, model: MachineModel) MachineScore {
     var demand: [@typeInfo(MachineClass).@"enum".field_names.len]u32 = @splat(0);
-    for (words) |word| demand[@backingInt(machineClass(word))] += 1;
+    var total_demand: u32 = 0;
+    var ready: [64]u32 = @splat(0);
+    var critical_path: u32 = 0;
+    for (words) |word| {
+        const class = machineClass(word);
+        const weight = timing(model.throughput, class);
+        demand[@backingInt(class)] += weight;
+        total_demand += weight;
 
-    var cycles = ceilDiv(@intCast(words.len), @max(1, model.issue_width));
+        const registers = dependencies(word, class);
+        var starts_at: u32 = 0;
+        for (registers.reads) |reg| {
+            if (reg) |r| starts_at = @max(starts_at, ready[r]);
+        }
+        const finishes_at = starts_at + timing(model.latency, class);
+        for (registers.writes) |reg| {
+            if (reg) |r| ready[r] = finishes_at;
+        }
+        critical_path = @max(critical_path, finishes_at);
+    }
+
+    const width: u32 = @max(1, model.issue_width);
+    var resource_cycles = ceilDiv(total_demand, width);
     inline for (0..demand.len) |index| {
         const class: MachineClass = @fromBackingInt(@intCast(index));
-        cycles = @max(cycles, ceilDiv(demand[index], ports(model, class)));
+        resource_cycles = @max(resource_cycles, ceilDiv(demand[index], ports(model, class)));
     }
-    return .{ .cycles = cycles, .instructions = @intCast(words.len) };
+    const cycles = @max(critical_path, resource_cycles);
+    return .{
+        .cycles = cycles,
+        .critical_path = critical_path,
+        .instructions = @intCast(words.len),
+        .idle_slots = cycles * width -| total_demand,
+    };
 }
 
 fn machineClass(word: u32) MachineClass {
-    if (decodeMem(word) != null or isPairMemory(word)) return .mem;
-    if (word & 0x7F000000 == 0x1B000000) return .muldiv;
+    if (decodeMem(word) != null or isPairMemory(word) or isRegisterMemory(word)) return .mem;
+    if (isDivide(word)) return .div;
+    if (word & 0x7F000000 == 0x1B000000) return .mul;
     if (word & 0x7C000000 == 0x14000000 or word & 0xFF000010 == 0x54000000) return .branch;
+    if (word & 0x0E000000 == 0x0E000000 or word & 0x1F000000 == 0x1E000000) return .fpsimd;
     return .alu;
+}
+
+const RegisterDeps = struct {
+    reads: [4]?u6 = @splat(null),
+    writes: [2]?u6 = @splat(null),
+};
+
+fn dependencies(word: u32, class: MachineClass) RegisterDeps {
+    if (decodeMem(word)) |mem| {
+        const data = if (mem.kind == .ldr_s or mem.kind == .str_s or mem.kind == .ldr_d or mem.kind == .str_d or mem.kind == .ldr_q or mem.kind == .str_q)
+            fpReg(mem.rt)
+        else
+            gpReg(mem.rt);
+        if (isLoad(mem.kind)) return .{ .reads = .{ gpReg(mem.rn), null, null, null }, .writes = .{ data, null } };
+        return .{ .reads = .{ gpReg(mem.rn), data, null, null } };
+    }
+    if (isPairMemory(word)) {
+        const load = word & 0x00400000 != 0;
+        const rt1: u5 = @truncate(word);
+        const rt2: u5 = @truncate(word >> 10);
+        const rn: u5 = @truncate(word >> 5);
+        if (load) return .{ .reads = .{ gpReg(rn), null, null, null }, .writes = .{ gpReg(rt1), gpReg(rt2) } };
+        return .{ .reads = .{ gpReg(rn), gpReg(rt1), gpReg(rt2), null } };
+    }
+    if (isRegisterMemory(word)) {
+        const rt: u5 = @truncate(word);
+        const rn: u5 = @truncate(word >> 5);
+        const rm: u5 = @truncate(word >> 16);
+        return .{ .reads = .{ gpReg(rn), gpReg(rm), null, null }, .writes = .{ gpReg(rt), null } };
+    }
+    if (class == .mul) {
+        const ra: u5 = @truncate(word >> 10);
+        return .{
+            .reads = .{ gpReg(@truncate(word >> 5)), gpReg(@truncate(word >> 16)), gpReg(ra), null },
+            .writes = .{ gpReg(@truncate(word)), null },
+        };
+    }
+    if (class == .div or isRegisterAlu(word)) return .{
+        .reads = .{ gpReg(@truncate(word >> 5)), gpReg(@truncate(word >> 16)), null, null },
+        .writes = .{ gpReg(@truncate(word)), null },
+    };
+    return .{};
+}
+
+fn gpReg(reg: u5) ?u6 {
+    return if (reg == 31) null else reg;
+}
+
+fn fpReg(reg: u5) u6 {
+    return 32 + @as(u6, reg);
+}
+
+fn isRegisterAlu(word: u32) bool {
+    return switch (word & 0x1F000000) {
+        0x0A000000, 0x0B000000, 0x1A000000 => true,
+        else => false,
+    };
+}
+
+fn isRegisterMemory(word: u32) bool {
+    const form = word & 0xFFE0FC00;
+    return form == 0xB8607800 or form == 0x38606800;
+}
+
+fn isDivide(word: u32) bool {
+    const form = word & 0x7FE0FC00;
+    return form == 0x1AC00C00 or form == 0x1AC00800;
 }
 
 fn isPairMemory(word: u32) bool {
@@ -67,11 +177,22 @@ fn isPairMemory(word: u32) bool {
 fn ports(model: MachineModel, class: MachineClass) u32 {
     return @max(1, switch (class) {
         .alu => model.units.alu,
-        .muldiv => model.units.muldiv,
+        .mul, .div => model.units.muldiv,
         .mem => model.units.mem,
         .branch => model.units.branch,
         .fpsimd => model.units.fpsimd,
     });
+}
+
+fn timing(values: Timing, class: MachineClass) u32 {
+    return switch (class) {
+        .alu => values.alu,
+        .mul => values.mul,
+        .div => values.div,
+        .mem => values.mem,
+        .branch => values.branch,
+        .fpsimd => values.fpsimd,
+    };
 }
 
 fn ceilDiv(numerator: u32, denominator: u32) u32 {
@@ -370,6 +491,41 @@ test "machine score rejects lower throughput rewrites" {
     const arithmetic = scoreWords(&.{ encode.add(.x0, .x1, .x2), encode.add(.x3, .x4, .x5) }, model);
     const memory = scoreWords(&.{ encode.ldrOff(.x0, .x1, 0), encode.ldrOff(.x2, .x1, 8) }, model);
     try std.testing.expect(!memory.accepts(arithmetic));
+}
+
+test "machine score tracks register dependency latency" {
+    const model = MachineModel{
+        .issue_width = 2,
+        .units = .{ .alu = 2, .muldiv = 1 },
+        .latency = .{ .mul = 4 },
+    };
+    const dependent = scoreWords(&.{ encode.mul(.x3, .x0, .x1), encode.add(.x4, .x3, .x2) }, model);
+    const independent = scoreWords(&.{ encode.mul(.x3, .x0, .x1), encode.add(.x4, .x5, .x2) }, model);
+
+    try std.testing.expectEqual(@as(u32, 5), dependent.critical_path);
+    try std.testing.expectEqual(@as(u32, 4), independent.critical_path);
+    try std.testing.expect(independent.accepts(dependent));
+}
+
+test "machine score charges non-pipelined divide throughput" {
+    const model = MachineModel{
+        .issue_width = 4,
+        .units = .{ .alu = 3, .muldiv = 1 },
+        .latency = .{ .div = 18 },
+        .throughput = .{ .div = 18 },
+    };
+    const score = scoreWords(&.{ encode.sdiv(.x0, .x1, .x2), encode.udiv(.x3, .x4, .x5) }, model);
+
+    try std.testing.expectEqual(@as(u32, 36), score.cycles);
+    try std.testing.expectEqual(@as(u32, 18), score.critical_path);
+}
+
+test "machine score classifies packed switch loads as memory" {
+    const model = MachineModel{ .issue_width = 2, .units = .{ .alu = 2, .mem = 1 }, .latency = .{ .mem = 4 } };
+    const word = scoreWords(&.{encode.ldrWReg(.x17, .x16, .x20)}, model);
+    const byte = scoreWords(&.{encode.ldrbReg(.x17, .x16, .x20)}, model);
+
+    try std.testing.expectEqual(word, byte);
 }
 
 test "decodeMem recognizes each ldr/str offset form and rejects a non-memory word" {

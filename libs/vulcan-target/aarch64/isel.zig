@@ -659,11 +659,41 @@ pub fn capsForModel(model: *const mm.Model) ModelCaps {
     return .{
         .fetch_align = model.fetch_align,
         .fp16 = model.arch == .aarch64 and model.features.aarch64.fp16,
-        .machine_model = .{ .issue_width = model.issue_width, .units = model.units },
+        .machine_model = machineModelFor(model),
         .fuse_cmp_branch = model.fuses(.cmp_branch),
         .fuse_arith_branch = model.fuses(.arith_branch),
         .fuse_shift_add = model.fuses(.shift_add),
         .fuse_addr_hi_lo = model.fuses(.addr_hi_lo),
+    };
+}
+
+fn machineModelFor(model: *const mm.Model) peephole.MachineModel {
+    const lhs: Value = undefined;
+    const rhs: Value = undefined;
+    const add: ir.function.Opcode = .{ .arith = .{ .op = .add, .lhs = lhs, .rhs = rhs } };
+    const mul: ir.function.Opcode = .{ .arith = .{ .op = .mul, .lhs = lhs, .rhs = rhs } };
+    const div: ir.function.Opcode = .{ .arith = .{ .op = .div, .lhs = lhs, .rhs = rhs } };
+    const load: ir.function.Opcode = .{ .load = .{ .ptr = lhs } };
+    const branch: ir.function.Opcode = .{ .@"if" = .{ .cond = lhs, .then = undefined, .@"else" = undefined } };
+    return .{
+        .issue_width = model.issue_width,
+        .units = model.units,
+        .latency = .{
+            .alu = @intCast(model.latency(add)),
+            .mul = @intCast(model.latency(mul)),
+            .div = @intCast(model.latency(div)),
+            .mem = @intCast(model.latency(load)),
+            .branch = @intCast(model.latency(branch)),
+            .fpsimd = @intCast(model.latency(mul)),
+        },
+        .throughput = .{
+            .alu = @intCast(model.throughput(add, false)),
+            .mul = @intCast(model.throughput(mul, false)),
+            .div = @intCast(model.throughput(div, false)),
+            .mem = @intCast(model.throughput(load, false)),
+            .branch = @intCast(model.throughput(branch, false)),
+            .fpsimd = @intCast(model.throughput(mul, true)),
+        },
     };
 }
 
