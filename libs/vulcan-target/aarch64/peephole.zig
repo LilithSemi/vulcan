@@ -360,6 +360,17 @@ pub fn tryCoalesceResultMove(producer: u32, move: u32) ?u32 {
     return producer & ~@as(u32, 0x1F) | destination;
 }
 
+/// A move that coincides with an IR block start can still be physically inside its predecessor when
+/// empty blocks share a code offset. No branch or dense-switch row may enter at that offset before a
+/// producer from the fallthrough path is rewritten across it.
+fn hasOnlyFallthroughEntry(move_at: usize, block_start: []const usize, fixups: []const Fixup) bool {
+    for (block_start, 0..) |start, block_index| {
+        if (start != move_at) continue;
+        for (fixups) |fixup| if (fixup.target == block_index) return false;
+    }
+    return true;
+}
+
 const NarrowMagic = struct { words: [2]u32 };
 
 fn tryNarrowUnsignedMagic(words: []const u32) ?NarrowMagic {
@@ -404,6 +415,7 @@ fn narrowUnsignedMagic(
     relocs: []Reloc,
     lines: []LineEntry,
     coalescable_result_moves: []usize,
+    dead_source_result_moves: []usize,
     model: MachineModel,
 ) std.mem.Allocator.Error!void {
     const len = words.items.len;
@@ -454,6 +466,7 @@ fn narrowUnsignedMagic(
     }
     for (relocs) |*reloc| reloc.offset -= removed_before[reloc.offset];
     for (coalescable_result_moves) |*move| move.* -= removed_before[move.*];
+    for (dead_source_result_moves) |*move| move.* -= removed_before[move.*];
     for (lines) |*line| {
         const word = line.offset / 4;
         line.offset = @intCast((word - removed_before[word]) * 4);
@@ -505,9 +518,25 @@ pub fn pairMemoryForModelWithMoves(
     coalescable_result_moves: []const usize,
     model: MachineModel,
 ) std.mem.Allocator.Error!void {
+    return pairMemoryForModelWithMoveProofs(allocator, words, block_start, fixups, relocs, lines, coalescable_result_moves, &.{}, model);
+}
+
+pub fn pairMemoryForModelWithMoveProofs(
+    allocator: std.mem.Allocator,
+    words: *std.ArrayList(u32),
+    block_start: []usize,
+    fixups: []Fixup,
+    relocs: []Reloc,
+    lines: []LineEntry,
+    coalescable_result_moves: []const usize,
+    dead_source_result_moves: []const usize,
+    model: MachineModel,
+) std.mem.Allocator.Error!void {
     const remapped_result_moves = try allocator.dupe(usize, coalescable_result_moves);
     defer allocator.free(remapped_result_moves);
-    try narrowUnsignedMagic(allocator, words, block_start, fixups, relocs, lines, remapped_result_moves, model);
+    const remapped_dead_source_moves = try allocator.dupe(usize, dead_source_result_moves);
+    defer allocator.free(remapped_dead_source_moves);
+    try narrowUnsignedMagic(allocator, words, block_start, fixups, relocs, lines, remapped_result_moves, remapped_dead_source_moves, model);
     const len = words.items.len;
 
     // Which word indices begin a block. A word is fusable-as-second only if it is NOT a block
@@ -526,6 +555,13 @@ pub fn pairMemoryForModelWithMoves(
         std.debug.assert(at < len);
         is_coalescable_result_move[at] = true;
     }
+    var has_dead_source = try allocator.alloc(bool, len);
+    defer allocator.free(has_dead_source);
+    @memset(has_dead_source, false);
+    for (remapped_dead_source_moves) |at| {
+        std.debug.assert(at < len);
+        has_dead_source[at] = true;
+    }
 
     // `removed_before[w]` = number of words deleted with index strictly before `w`, with the twist
     // that a deleted word's own slot records the count INCLUDING its own deletion. That makes a
@@ -540,11 +576,15 @@ pub fn pairMemoryForModelWithMoves(
     var i: usize = 0;
     while (i < len) {
         var did_fuse = false;
-        // A pair needs a following word that is not a block start. Never chain a third word into
-        // the same pair (i += 2).
-        if (i + 1 < len and !is_block_start[i + 1]) {
-            const fused = (if (is_coalescable_result_move[i + 1]) tryCoalesceResultMove(words.items[i], words.items[i + 1]) else null) orelse
-                tryFuseMulAdd(words.items[i], words.items[i + 1]) orelse memory: {
+        // Memory and multiply-add pairs cannot cross a block start. A proven result move may cross
+        // a coincident, unentered start because `hasOnlyFallthroughEntry` rules out another path.
+        // Never chain a third word into the same pair (i += 2).
+        if (i + 1 < len) {
+            const result_entry_safe = !is_block_start[i + 1] or hasOnlyFallthroughEntry(i + 1, block_start, fixups);
+            const result_proven = is_coalescable_result_move[i + 1] or has_dead_source[i + 1];
+            const fused = (if (result_entry_safe and result_proven) tryCoalesceResultMove(words.items[i], words.items[i + 1]) else null) orelse
+                (if (!is_block_start[i + 1]) tryFuseMulAdd(words.items[i], words.items[i + 1]) else null) orelse memory: {
+                if (is_block_start[i + 1]) break :memory null;
                 const a = decodeMem(words.items[i]) orelse break :memory null;
                 const b = decodeMem(words.items[i + 1]) orelse break :memory null;
                 break :memory tryFuse(a, b);
@@ -753,6 +793,41 @@ test "pairMemory coalesces an ALU result move and remaps following control flow"
     try std.testing.expectEqualSlices(u32, &.{ encode.add(.x21, .x21, .x20), encode.b(0), encode.ret() }, words.items);
     try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, &block_start);
     try std.testing.expectEqual(@as(usize, 1), fixups[0].at);
+}
+
+test "dead result move crosses an unentered coincident block start" {
+    const alloc = std.testing.allocator;
+    var words = try wordsFrom(alloc, &.{
+        encode.csel(.x9, .x10, .x22, .gt),
+        encode.mov(.x10, .x9),
+        encode.b(0),
+        encode.ret(),
+    });
+    defer words.deinit(alloc);
+    var block_start = [_]usize{ 0, 1, 3 };
+    var fixups = [_]Fixup{.{ .at = 2, .target = 2 }};
+
+    try pairMemoryForModelWithMoveProofs(alloc, &words, &block_start, &fixups, &.{}, &.{}, &.{}, &.{1}, .{});
+
+    try std.testing.expectEqualSlices(u32, &.{ encode.csel(.x10, .x10, .x22, .gt), encode.b(0), encode.ret() }, words.items);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0, 2 }, &block_start);
+}
+
+test "dead result move keeps a directly entered block start" {
+    const alloc = std.testing.allocator;
+    var words = try wordsFrom(alloc, &.{
+        encode.b(0),
+        encode.csel(.x9, .x10, .x22, .gt),
+        encode.mov(.x10, .x9),
+        encode.ret(),
+    });
+    defer words.deinit(alloc);
+    var block_start = [_]usize{ 0, 1, 2 };
+    var fixups = [_]Fixup{.{ .at = 0, .target = 2 }};
+
+    try pairMemoryForModelWithMoveProofs(alloc, &words, &block_start, &fixups, &.{}, &.{}, &.{}, &.{2}, .{});
+
+    try std.testing.expectEqualSlices(u32, &.{ encode.b(0), encode.csel(.x9, .x10, .x22, .gt), encode.mov(.x10, .x9), encode.ret() }, words.items);
 }
 
 test "magic rewrite remaps a later proven result move" {

@@ -496,7 +496,13 @@ const Segment = struct { from: u32, loc: Location };
 /// already ORDERED these into a valid parallel-move sequence (every source read before it is
 /// overwritten, cycles broken and slot-to-slot shuffles routed through the class scratch), so the
 /// emitter replays them op-by-op with no reordering.
-const EdgeMove = struct { src: Location, dst: Location, class: u16, coalesce_result: bool = false };
+const EdgeMove = struct {
+    src: Location,
+    dst: Location,
+    class: u16,
+    coalesce_result: bool = false,
+    source_dead: bool = false,
+};
 
 /// The ordered move list on one control-flow edge `pred -> succ` (translated from `wimmer.EdgeMoves`
 /// into this backend's `Location` space). Keyed by the block pair so emission can find
@@ -1412,6 +1418,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
 
     var coalescable_edge_moves: std.ArrayList(usize) = .empty;
     defer coalescable_edge_moves.deinit(allocator);
+    var dead_source_edge_moves: std.ArrayList(usize) = .empty;
+    defer dead_source_edge_moves.deinit(allocator);
     var ctx = Ctx{
         .func = func,
         .alloc = alloc,
@@ -1425,6 +1433,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         .fuse_cmp_branch = caps.fuse_cmp_branch,
         .fuse_arith_branch = caps.fuse_arith_branch,
         .coalescable_edge_moves = &coalescable_edge_moves,
+        .dead_source_edge_moves = &dead_source_edge_moves,
         .pos = 0,
     };
 
@@ -2452,7 +2461,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     // BEFORE resolving fixups, so the branch-displacement loop below computes correct offsets
     // against the paired `code` and remapped `block_start`/`fixups`. A function with no fusable
     // pair is left byte-identical.
-    try peephole.pairMemoryForModelWithMoves(
+    try peephole.pairMemoryForModelWithMoveProofs(
         allocator,
         &code,
         block_start,
@@ -2460,6 +2469,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         relocs.items,
         lines.items,
         coalescable_edge_moves.items,
+        dead_source_edge_moves.items,
         caps.machine_model,
     );
 
@@ -2561,6 +2571,9 @@ const Ctx = struct {
     /// preceding ALU result into these destinations because the allocator proved the SSA source dies
     /// on this edge.
     coalescable_edge_moves: *std.ArrayList(usize),
+    /// Edge moves whose source dies at the successor. The machine pass adds adjacency and entry
+    /// proofs before it retargets a producer that IR forwarding separated from its result move.
+    dead_source_edge_moves: *std.ArrayList(usize),
     /// The current instruction position, mirrored from the allocator's `linearize` numbering and
     /// advanced by the emission loop. `locationAt` reads it to pick a split value's active segment.
     pos: u32 = 0,
@@ -3203,6 +3216,11 @@ const Ctx = struct {
                 m.src == .reg and m.dst == .reg)
             {
                 try self.coalescable_edge_moves.append(allocator, move_at);
+            }
+            if (m.source_dead and m.class == 0 and move_at == edge_start and code.items.len == move_at + 1 and
+                m.src == .reg and m.dst == .reg)
+            {
+                try self.dead_source_edge_moves.append(allocator, move_at);
             }
         }
     }
@@ -4224,6 +4242,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
                 .dst = translateLoc(wm.dst, wm.class, gpr_slots),
                 .class = wm.class,
                 .coalesce_result = wm.coalesce_result,
+                .source_dead = wm.source_dead,
             };
         }
         try edge_sets.append(allocator, .{ .pred = wem.pred, .succ = wem.succ, .moves = moves });

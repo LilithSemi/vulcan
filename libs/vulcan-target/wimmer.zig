@@ -944,7 +944,11 @@ pub const Move = struct {
     dst: Location,
     class: u16,
     value: Value,
+    /// The move immediately follows this value's defining instruction in the predecessor IR.
     coalesce_result: bool = false,
+    /// The source value has no live range at the successor entry. Backends may combine this with
+    /// machine-level adjacency and entry proofs to retarget a producer across an empty block.
+    source_dead: bool = false,
 };
 
 /// An intra-block spill, reload, or move the resolver emits at position `at`. A same-position
@@ -3128,6 +3132,7 @@ fn addEdgeMoves(
                 .class = desc.classOf(desc.ctx, func, p),
                 .value = p,
                 .coalesce_result = !live.liveAt(a, ss) and last_result == a,
+                .source_dead = !live.liveAt(a, ss),
             });
         }
     }
@@ -3294,6 +3299,7 @@ fn orderClassMoves(
         try out.append(allocator, .{ .src = m0.src, .dst = cycle_loc, .class = class_idx, .value = m0.value });
         m0.src = cycle_loc;
         m0.coalesce_result = false;
+        m0.source_dead = false;
     }
     std.debug.assert(!scratch_busy and !scratch2_busy);
 
