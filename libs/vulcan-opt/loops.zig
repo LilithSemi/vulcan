@@ -76,7 +76,7 @@ pub fn analyzeFromCfg(allocator: std.mem.Allocator, cfg: *const cfg_mod.Cfg, dom
     while (it.next()) |entry| {
         const h = entry.key_ptr.*;
         const body = entry.value_ptr.*;
-        const entry_pred = findEntry(cfg, h, body);
+        const entry_pred = findEntry(cfg, doms, h, body);
         loops[i] = .{
             .header = h,
             .body = body,
@@ -108,9 +108,10 @@ fn addNaturalLoop(allocator: std.mem.Allocator, cfg: *const cfg_mod.Cfg, header:
 
 /// The preheader of a loop: a single predecessor of the header that is outside
 /// the loop and whose only successor is the header.
-fn findEntry(cfg: *const cfg_mod.Cfg, header: u32, body: []const bool) ?u32 {
+fn findEntry(cfg: *const cfg_mod.Cfg, doms: *const dominators.Dominators, header: u32, body: []const bool) ?u32 {
     var pre: ?u32 = null;
     for (cfg.predecessors(header)) |p| {
+        if (!doms.isReachable(p)) continue;
         if (body[p]) continue; // a latch (loop-internal back-edge)
         if (pre != null) return null; // more than one entry into the loop
         pre = p;
@@ -129,6 +130,7 @@ test "detects a natural loop and its preheader" {
     const loop = try func.appendBlock();
     const body = try func.appendBlock();
     const done = try func.appendBlock();
+    const dead = try func.appendBlock();
     const n = try func.appendBlockParam(entry, i32_t);
     const i = try func.appendBlockParam(loop, i32_t);
     // entry -> loop(0), loop: if i<n -> body else done, body -> loop(i+1), done: ret
@@ -140,6 +142,9 @@ test "detects a natural loop and its preheader" {
     const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{next});
     func.setTerminator(done, .{ .ret = ir.function.Ret.one(i) });
+    // A detached forwarding block is not a second loop entry. Jump threading leaves blocks in this
+    // shape because the IR has no block deletion.
+    try func.setJump(dead, loop, &.{zero});
 
     var info = try analyze(allocator, &func);
     defer info.deinit(allocator);
@@ -148,7 +153,7 @@ test "detects a natural loop and its preheader" {
     const l = info.loops[0];
     try std.testing.expectEqual(@as(u32, 1), l.header); // loop block
     try std.testing.expect(l.contains(1) and l.contains(2)); // loop + body
-    try std.testing.expect(!l.contains(0) and !l.contains(3)); // entry, done outside
+    try std.testing.expect(!l.contains(0) and !l.contains(3) and !l.contains(4)); // entry, done, dead outside
     try std.testing.expectEqual(@as(?u32, 0), l.preheader); // entry is the preheader
     try std.testing.expectEqual(@as(?u32, 0), l.entry);
 }
