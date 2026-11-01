@@ -939,7 +939,13 @@ pub const Segment = struct { from: u32, loc: Location };
 /// slot-to-slot routing steps. Each of these routes one specific value's bits through the class
 /// scratch. aarch64 and riscv64 emit their vector moves at a fixed width, so they ignore this
 /// field.
-pub const Move = struct { src: Location, dst: Location, class: u16, value: Value };
+pub const Move = struct {
+    src: Location,
+    dst: Location,
+    class: u16,
+    value: Value,
+    coalesce_result: bool = false,
+};
 
 /// An intra-block spill, reload, or move the resolver emits at position `at`. A same-position
 /// CLUSTER of these is a parallel move: all sources read from the pre-instruction state, and all
@@ -1165,7 +1171,7 @@ fn tryAllocateFreeReg(
     inactive: []const *Interval,
     desc: *const RegDescription,
     limit: usize,
-    param_hint: ?u16,
+    param_hints: []const u16,
 ) ?u16 {
     const class_idx = current.class;
     const class = desc.classes[class_idx];
@@ -1243,7 +1249,6 @@ fn tryAllocateFreeReg(
     // The candidate now is a BASE register, and its span is free only as long as its most
     // constrained register. For the one-register default this is exactly the old per-register scan,
     // in the same ascending order, so the pick is byte-identical.
-    const pref_hint = coalesce_hint orelse param_hint orelse hint;
     var best_free: u32 = 0;
     for (0..limit) |b| {
         if (!spanPlaceable(&is_candidate, null, limit, b, current.regs, current.reg_align)) continue;
@@ -1258,10 +1263,24 @@ fn tryAllocateFreeReg(
     }
     if (best_free == 0) return null;
     var chosen: ?u16 = null;
-    if (pref_hint) |h| {
+    if (coalesce_hint) |h| {
         if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
             spanMin(&free_until, h, current.regs) == best_free) chosen = h;
     }
+    if (chosen == null) {
+        for (param_hints) |h| {
+            if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
+                spanMin(&free_until, h, current.regs) == best_free)
+            {
+                chosen = h;
+                break;
+            }
+        }
+    }
+    if (chosen == null) if (hint) |h| {
+        if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
+            spanMin(&free_until, h, current.regs) == best_free) chosen = h;
+    };
     if (chosen == null) {
         for (0..limit) |b| {
             if (!spanPlaceable(&is_candidate, null, limit, b, current.regs, current.reg_align)) continue;
@@ -1363,73 +1382,103 @@ fn placedRegOf(intervals: []const Interval, children: []const *Interval, v: Valu
     return best;
 }
 
-/// Maps each block-parameter value to the incoming ARGUMENT values its predecessors pass for it, one
-/// per in-edge. Built only when `coalesce_block_params` is on, and read to seed a parameter's
-/// register hint from an argument that is already placed.
-const ParamArgs = std.AutoHashMapUnmanaged(Value, std.ArrayListUnmanaged(Value));
+const ValueRelations = std.AutoHashMapUnmanaged(Value, std.ArrayListUnmanaged(Value));
+
+/// Both directions of every block-parameter relation. `param_args` lets a parameter reuse an
+/// already-placed incoming argument's register. `arg_params` handles block layouts where the merge
+/// block is numbered before its predecessors: a later argument can then reuse the already-placed
+/// successor parameter's register.
+const ParamRelations = struct {
+    param_args: ValueRelations = .empty,
+    arg_params: ValueRelations = .empty,
+
+    fn deinit(self: *ParamRelations, allocator: std.mem.Allocator) void {
+        freeValueRelations(allocator, &self.param_args);
+        freeValueRelations(allocator, &self.arg_params);
+    }
+};
+
+fn addValueRelation(allocator: std.mem.Allocator, map: *ValueRelations, key: Value, related: Value) Error!void {
+    const gop = try map.getOrPut(allocator, key);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(allocator, related);
+}
 
 /// Record, for edge `edge`, that each successor parameter receives the argument at the same index.
 /// An arity mismatch is an IR invariant break, so this skips it defensively rather than pairing a
 /// parameter with the wrong argument.
-fn addParamArgEdge(allocator: std.mem.Allocator, func: *const Function, map: *ParamArgs, edge: Jump) Error!void {
+fn addParamArgEdge(allocator: std.mem.Allocator, func: *const Function, relations: *ParamRelations, edge: Jump) Error!void {
     const params = func.blockParams(edge.target);
     const args = func.blockArgs(edge);
     if (params.len != args.len) return;
     for (params, args) |p, a| {
-        const gop = try map.getOrPut(allocator, p);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(allocator, a);
+        try addValueRelation(allocator, &relations.param_args, p, a);
+        try addValueRelation(allocator, &relations.arg_params, a, p);
     }
 }
 
-/// Build the block-parameter to incoming-argument map by walking every edge (both `if` arms and each
-/// `jump`). The caller owns the result and frees it with `freeParamArgs`.
-fn buildParamArgs(allocator: std.mem.Allocator, func: *const Function) Error!ParamArgs {
-    var map: ParamArgs = .empty;
-    errdefer freeParamArgs(allocator, &map);
+/// Build both directions of the block-parameter relations by walking every edge.
+fn buildParamRelations(allocator: std.mem.Allocator, func: *const Function) Error!ParamRelations {
+    var relations: ParamRelations = .{};
+    errdefer relations.deinit(allocator);
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
-                try addParamArgEdge(allocator, func, &map, cf.then);
-                try addParamArgEdge(allocator, func, &map, cf.@"else");
+                try addParamArgEdge(allocator, func, &relations, cf.then);
+                try addParamArgEdge(allocator, func, &relations, cf.@"else");
             }
         }
         if (func.terminator(block)) |term| switch (term) {
-            .jump => |j| try addParamArgEdge(allocator, func, &map, j),
+            .jump => |j| try addParamArgEdge(allocator, func, &relations, j),
             .ret => {},
         };
     }
-    return map;
+    return relations;
 }
 
-/// Free the per-parameter argument lists and the map itself.
-fn freeParamArgs(allocator: std.mem.Allocator, map: *ParamArgs) void {
+fn freeValueRelations(allocator: std.mem.Allocator, map: *ValueRelations) void {
     var it = map.valueIterator();
     while (it.next()) |list| list.deinit(allocator);
     map.deinit(allocator);
 }
 
-/// The register to hint block parameter `current` toward: the register of the FIRST of its incoming
-/// arguments that is already placed in a register. The scan processes intervals by ascending start,
-/// so an argument from an earlier predecessor is already placed and yields a hint, while a not-yet-
-/// placed argument (for example one on a loop back-edge) is simply skipped. A parameter and its
-/// argument never interfere, so this is a pure preference. Null when `current` is not a parameter, or
-/// no incoming argument is placed yet.
+/// Fill `out` with the distinct registers already assigned to incoming arguments of block parameter
+/// `current`, in edge order. The scan processes intervals by ascending start, so arguments from
+/// earlier predecessors are available while a not-yet-placed argument, such as one on a loop
+/// back-edge, is skipped. The free-register scan tries every returned register. This matters when
+/// the first incoming register is fixed, outside the allocation pool, or blocked across the
+/// parameter's lifetime but a later incoming register is placeable.
 ///
-/// THE OTHER DIRECTION WAS TRIED AND DROPPED. Hinting a back-edge ARGUMENT toward the register of the
-/// parameter it feeds looks like the missing half, and it is measurably worthless: by the time the
-/// carried value is computed, its parameter's register holds a mid-chain value of a NEIGHBOURING
-/// carried chain, so the hint is never placeable. Measured on the NVIDIA four-accumulator loop
-/// kernel: identical SASS, identical runtime, and no test could tell the two apart.
-fn computeParamHint(map: *const ParamArgs, intervals: []const Interval, children: []const *Interval, current: *const Interval) ?u16 {
-    const v = current.value orelse return null;
-    const list = map.getPtr(v) orelse return null;
-    for (list.items) |arg| {
-        if (placedRegOf(intervals, children, arg)) |r| return r;
+fn computeParamHints(
+    relations: *const ParamRelations,
+    intervals: []const Interval,
+    children: []const *Interval,
+    current: *const Interval,
+    out: *[max_phys_regs]u16,
+) []const u16 {
+    const v = current.value orelse return out[0..0];
+    var len: usize = 0;
+    const maps = [_]*const ValueRelations{ &relations.param_args, &relations.arg_params };
+    for (maps) |map| {
+        const list = map.getPtr(v) orelse continue;
+        for (list.items) |related| {
+            const r = placedRegOf(intervals, children, related) orelse continue;
+            var seen = false;
+            for (out[0..len]) |existing| {
+                if (existing == r) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen and len < out.len) {
+                out[len] = r;
+                len += 1;
+            }
+        }
     }
-    return null;
+    return out[0..len];
 }
 
 // ===========================================================================
@@ -1883,8 +1932,8 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
 
     // Block-argument coalescing map. Empty (and unused) unless the backend opted in. It hints a
     // parameter toward an incoming argument's register so the edge move becomes a no-op.
-    var param_args: ParamArgs = if (desc.coalesce_block_params) try buildParamArgs(allocator, func) else .empty;
-    defer freeParamArgs(allocator, &param_args);
+    var param_relations: ParamRelations = if (desc.coalesce_block_params) try buildParamRelations(allocator, func) else .{};
+    defer param_relations.deinit(allocator);
 
     // The scan is a worklist loop. Every split child starts strictly after the interval it came
     // from, so the total interval count is bounded by (values x positions). The guard asserts that
@@ -1939,11 +1988,12 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
         // A value interval: take a free register covering its whole lifetime, or fall back to the
         // blocked-register path that splits and spills to make room. A block-parameter hint (from an
         // already-placed incoming argument) biases the free-register pick toward eliding the edge move.
-        const param_hint: ?u16 = if (desc.coalesce_block_params)
-            computeParamHint(&param_args, intervals, children.items, current)
+        var param_hint_buf: [max_phys_regs]u16 = undefined;
+        const param_hints: []const u16 = if (desc.coalesce_block_params)
+            computeParamHints(&param_relations, intervals, children.items, current, &param_hint_buf)
         else
-            null;
-        if (tryAllocateFreeReg(current, active.items, inactive.items, desc, limit, param_hint)) |reg| {
+            param_hint_buf[0..0];
+        if (tryAllocateFreeReg(current, active.items, inactive.items, desc, limit, param_hints)) |reg| {
             current.location = .{ .reg = reg };
             try active.append(allocator, current);
         } else {
@@ -3070,7 +3120,15 @@ fn addEdgeMoves(
         if (!locEql(from, to)) {
             // The move transfers the parameter's bits (same IR type as the argument), so `p` names the
             // width for a width-aware backend.
-            try raw.append(allocator, .{ .src = from, .dst = to, .class = desc.classOf(desc.ctx, func, p), .value = p });
+            const insts = func.blockInsts(pred);
+            const last_result = if (insts.len > 0) func.instResult(insts[insts.len - 1]) else null;
+            try raw.append(allocator, .{
+                .src = from,
+                .dst = to,
+                .class = desc.classOf(desc.ctx, func, p),
+                .value = p,
+                .coalesce_result = !live.liveAt(a, ss) and last_result == a,
+            });
         }
     }
 
@@ -3235,6 +3293,7 @@ fn orderClassMoves(
         // m0.src may be a slot under a conflict, making this a load rather than a reg move.
         try out.append(allocator, .{ .src = m0.src, .dst = cycle_loc, .class = class_idx, .value = m0.value });
         m0.src = cycle_loc;
+        m0.coalesce_result = false;
     }
     std.debug.assert(!scratch_busy and !scratch2_busy);
 

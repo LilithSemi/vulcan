@@ -487,7 +487,7 @@ const Segment = struct { from: u32, loc: Location };
 /// already ORDERED these into a valid parallel-move sequence (every source read before it is
 /// overwritten, cycles broken and slot-to-slot shuffles routed through the class scratch), so the
 /// emitter replays them op-by-op with no reordering.
-const EdgeMove = struct { src: Location, dst: Location, class: u16 };
+const EdgeMove = struct { src: Location, dst: Location, class: u16, coalesce_result: bool = false };
 
 /// The ordered move list on one control-flow edge `pred -> succ` (translated from `wimmer.EdgeMoves`
 /// into this backend's `Location` space). Keyed by the block pair so emission can find
@@ -1355,6 +1355,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         }
     }
 
+    var coalescable_edge_moves: std.ArrayList(usize) = .empty;
+    defer coalescable_edge_moves.deinit(allocator);
     var ctx = Ctx{
         .func = func,
         .alloc = alloc,
@@ -1367,6 +1369,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         .fp16 = fp16,
         .fuse_cmp_branch = caps.fuse_cmp_branch,
         .fuse_arith_branch = caps.fuse_arith_branch,
+        .coalescable_edge_moves = &coalescable_edge_moves,
         .pos = 0,
     };
 
@@ -2353,7 +2356,16 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     // BEFORE resolving fixups, so the branch-displacement loop below computes correct offsets
     // against the paired `code` and remapped `block_start`/`fixups`. A function with no fusable
     // pair is left byte-identical.
-    try peephole.pairMemoryForModel(allocator, &code, block_start, fixups.items, relocs.items, lines.items, caps.machine_model);
+    try peephole.pairMemoryForModelWithMoves(
+        allocator,
+        &code,
+        block_start,
+        fixups.items,
+        relocs.items,
+        lines.items,
+        coalescable_edge_moves.items,
+        caps.machine_model,
+    );
 
     for (fixups.items) |f| {
         var target = f.target;
@@ -2437,6 +2449,10 @@ const Ctx = struct {
     /// check in `emitFromAllocation` (both gate `fusesArithIntoBranch`), so the two never disagree
     /// on whether a given arith/icmp/if triple folds (else a dangling or doubled arith).
     fuse_arith_branch: bool = true,
+    /// Word indices of proven edge-result moves. The machine peephole may forward the immediately
+    /// preceding ALU result into these destinations because the allocator proved the SSA source dies
+    /// on this edge.
+    coalescable_edge_moves: *std.ArrayList(usize),
     /// The current instruction position, mirrored from the allocator's `linearize` numbering and
     /// advanced by the emission loop. `locationAt` reads it to pick a split value's active segment.
     pos: u32 = 0,
@@ -3071,7 +3087,16 @@ const Ctx = struct {
     /// nothing is emitted for it. No reordering here would break that resolution.
     fn emitEdgeMoves(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), pred: Block, succ: Block) Error!void {
         const set = self.findEdgeMoves(pred, succ) orelse return;
-        for (set.moves) |m| try self.emitEdgeMove(allocator, code, m);
+        const edge_start = code.items.len;
+        for (set.moves) |m| {
+            const move_at = code.items.len;
+            try self.emitEdgeMove(allocator, code, m);
+            if (m.coalesce_result and m.class == 0 and move_at == edge_start and code.items.len == move_at + 1 and
+                m.src == .reg and m.dst == .reg)
+            {
+                try self.coalescable_edge_moves.append(allocator, move_at);
+            }
+        }
     }
 
     /// The precomputed move set for the edge `pred -> succ`, or null when the edge needs no shuffle.
@@ -4090,6 +4115,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
                 .src = translateLoc(wm.src, wm.class, gpr_slots),
                 .dst = translateLoc(wm.dst, wm.class, gpr_slots),
                 .class = wm.class,
+                .coalesce_result = wm.coalesce_result,
             };
         }
         try edge_sets.append(allocator, .{ .pred = wem.pred, .succ = wem.succ, .moves = moves });

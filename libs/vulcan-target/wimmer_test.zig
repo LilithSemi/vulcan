@@ -1617,6 +1617,51 @@ test "resolve: a split CFG (diamond) allocates with consistent, valid edge moves
 
     // Every produced edge move list is internally valid.
     try expectAllEdgesValid(allocator, &alloc);
+
+    // The first incoming value is the fixed entry parameter in x0, which is outside the free pool.
+    // The allocator must continue to the second incoming value and place the merge parameter in the
+    // register that already holds `xp1`. The bb->m edge then needs no move.
+    const xp1_reg = soleSegmentReg(&alloc, xp1) orelse return error.MissingSegment;
+    const r_reg = soleSegmentReg(&alloc, r) orelse return error.MissingSegment;
+    try std.testing.expectEqual(xp1_reg, r_reg);
+    for (alloc.edge_moves) |em| try std.testing.expect(em.pred != bb or em.succ != m);
+}
+
+test "resolve: edge arguments reuse an earlier merge parameter register" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+    const bool_t = try func.types.intern(.bool);
+
+    // Number the merge before its predecessors, as switch lowering does. The merge parameter is
+    // allocated before either arm result, so coalescing must hint each later argument toward it.
+    const entry = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, t);
+    const merge = try func.appendBlock();
+    const result = try func.appendBlockParam(merge, t);
+    const then_block = try func.appendBlock();
+    const else_block = try func.appendBlock();
+    const cond = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = x } });
+    try func.appendIf(entry, cond, .{ .target = then_block }, .{ .target = else_block });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(result) });
+    const then_value = try func.appendArithImm(then_block, t, .add, x, 1);
+    try func.setJump(then_block, merge, &.{then_value});
+    const else_value = try func.appendArithImm(else_block, t, .add, x, 2);
+    try func.setJump(else_block, merge, &.{else_value});
+
+    var desc = try aarch64.aarch64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+
+    var alloc = try wimmer.allocate(allocator, &func, &desc);
+    defer alloc.deinit(allocator);
+
+    const result_reg = soleSegmentReg(&alloc, result) orelse return error.MissingSegment;
+    try std.testing.expectEqual(result_reg, soleSegmentReg(&alloc, then_value) orelse return error.MissingSegment);
+    try std.testing.expectEqual(result_reg, soleSegmentReg(&alloc, else_value) orelse return error.MissingSegment);
+    for (alloc.edge_moves) |em| {
+        try std.testing.expect(em.succ != merge);
+    }
 }
 
 // ---------------------------------------------------------------------------

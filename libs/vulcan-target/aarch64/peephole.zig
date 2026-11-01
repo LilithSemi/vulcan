@@ -204,6 +204,31 @@ pub fn tryFuseMulAdd(mul_word: u32, add_word: u32) ?u32 {
     return encode.madd(rd, rn, rm, ra, mul_wide);
 }
 
+/// Fold `producer tmp; mov dst,tmp` into `producer dst`. The accepted producer families all write
+/// only Rd and permit Rd to alias any input register. This is especially useful on CFG edges where
+/// linear-scan liveness keeps an input live through mutually exclusive sibling blocks and therefore
+/// cannot coalesce the result with the successor parameter during allocation.
+pub fn tryCoalesceResultMove(producer: u32, move: u32) ?u32 {
+    const move_class = move & 0xFFE0FFE0;
+    if (move_class != 0xAA0003E0 and move_class != 0x2A0003E0) return null;
+
+    const source: u5 = @truncate(move >> 16);
+    const destination: u5 = @truncate(move);
+    const producer_destination: u5 = @truncate(producer);
+    if (source == 31 or destination == 31 or producer_destination != source) return null;
+
+    const rewritable = producer & 0x1F200000 == 0x0B000000 or // add/sub shifted register
+        producer & 0x1F000000 == 0x0A000000 or // logical shifted register
+        producer & 0x1F000000 == 0x11000000 or // add/sub immediate
+        producer & 0x1F800000 == 0x12000000 or // logical immediate
+        producer & 0x1F800000 == 0x13000000 or // bitfield
+        producer & 0x1FE00000 == 0x1A800000 or // conditional select
+        producer & 0x1F000000 == 0x1B000000; // multiply-add family
+    if (!rewritable) return null;
+
+    return producer & ~@as(u32, 0x1F) | destination;
+}
+
 /// Fuse adjacent ldr/str pairs into ldp/stp in `words`, updating the side tables to the new
 /// layout. Only fuses IMMEDIATELY-ADJACENT words where both decode as mem, `tryFuse` succeeds,
 /// AND the SECOND word is not a block start (control flow must not be able to enter between the
@@ -235,6 +260,19 @@ pub fn pairMemoryForModel(
     lines: []LineEntry,
     model: MachineModel,
 ) std.mem.Allocator.Error!void {
+    return pairMemoryForModelWithMoves(allocator, words, block_start, fixups, relocs, lines, &.{}, model);
+}
+
+pub fn pairMemoryForModelWithMoves(
+    allocator: std.mem.Allocator,
+    words: *std.ArrayList(u32),
+    block_start: []usize,
+    fixups: []Fixup,
+    relocs: []Reloc,
+    lines: []LineEntry,
+    coalescable_result_moves: []const usize,
+    model: MachineModel,
+) std.mem.Allocator.Error!void {
     const len = words.items.len;
 
     // Which word indices begin a block. A word is fusable-as-second only if it is NOT a block
@@ -245,6 +283,13 @@ pub fn pairMemoryForModel(
     for (block_start) |bs| {
         std.debug.assert(bs <= len);
         if (bs < len) is_block_start[bs] = true; // a block start == len emits nothing to fuse into
+    }
+    var is_coalescable_result_move = try allocator.alloc(bool, len);
+    defer allocator.free(is_coalescable_result_move);
+    @memset(is_coalescable_result_move, false);
+    for (coalescable_result_moves) |at| {
+        std.debug.assert(at < len);
+        is_coalescable_result_move[at] = true;
     }
 
     // `removed_before[w]` = number of words deleted with index strictly before `w`, with the twist
@@ -263,7 +308,8 @@ pub fn pairMemoryForModel(
         // A pair needs a following word that is not a block start. Never chain a third word into
         // the same pair (i += 2).
         if (i + 1 < len and !is_block_start[i + 1]) {
-            const fused = tryFuseMulAdd(words.items[i], words.items[i + 1]) orelse memory: {
+            const fused = (if (is_coalescable_result_move[i + 1]) tryCoalesceResultMove(words.items[i], words.items[i + 1]) else null) orelse
+                tryFuseMulAdd(words.items[i], words.items[i + 1]) orelse memory: {
                 const a = decodeMem(words.items[i]) orelse break :memory null;
                 const b = decodeMem(words.items[i + 1]) orelse break :memory null;
                 break :memory tryFuse(a, b);
@@ -380,6 +426,38 @@ test "tryFuseMulAdd rejects width mismatch and a doubled product" {
     const mul_word = encode.mul(.x4, .x1, .x2);
     try std.testing.expectEqual(@as(?u32, null), tryFuseMulAdd(mul_word, encode.add64(.x5, .x4, .x3)));
     try std.testing.expectEqual(@as(?u32, null), tryFuseMulAdd(mul_word, encode.add(.x5, .x4, .x4)));
+}
+
+test "tryCoalesceResultMove forwards scalar ALU results into the move destination" {
+    try std.testing.expectEqual(
+        encode.subShifted(.x21, .x21, .x21, 3),
+        tryCoalesceResultMove(encode.subShifted(.x24, .x21, .x21, 3), encode.mov(.x21, .x24)).?,
+    );
+    try std.testing.expectEqual(
+        encode.csel(.x21, .x20, .x25, .lt),
+        tryCoalesceResultMove(encode.csel(.x24, .x20, .x25, .lt), encode.mov(.x21, .x24)).?,
+    );
+    try std.testing.expectEqual(@as(?u32, null), tryCoalesceResultMove(encode.ldrW(.x24, .x20, 0), encode.mov(.x21, .x24)));
+    try std.testing.expectEqual(@as(?u32, null), tryCoalesceResultMove(encode.add(.x23, .x20, .x22), encode.mov(.x21, .x24)));
+}
+
+test "pairMemory coalesces an ALU result move and remaps following control flow" {
+    const alloc = std.testing.allocator;
+    var words = try wordsFrom(alloc, &.{
+        encode.add(.x24, .x21, .x20),
+        encode.mov(.x21, .x24),
+        encode.b(0),
+        encode.ret(),
+    });
+    defer words.deinit(alloc);
+    var block_start = [_]usize{ 0, 3 };
+    var fixups = [_]Fixup{.{ .at = 2, .target = 1 }};
+
+    try pairMemoryForModelWithMoves(alloc, &words, &block_start, &fixups, &.{}, &.{}, &.{1}, .{});
+
+    try std.testing.expectEqualSlices(u32, &.{ encode.add(.x21, .x21, .x20), encode.b(0), encode.ret() }, words.items);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, &block_start);
+    try std.testing.expectEqual(@as(usize, 1), fixups[0].at);
 }
 
 test "pairMemory also fuses multiply-add and remaps side tables" {
