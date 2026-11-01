@@ -1,9 +1,8 @@
 //! Jump threading. Two transforms, run together:
 //!
-//! 1. Identity forwarding: an empty block that does nothing but pass its own parameters straight to a
-//!    single successor is a pure detour, so every edge into it is redirected to that successor. These
-//!    forwarding blocks are what critical-edge splitting and structured lowering leave behind, and
-//!    removing them shortens branch chains and helps fallthrough.
+//! 1. Empty-block forwarding: an empty block that jumps to one successor is a pure detour. Incoming
+//!    edge arguments replace its parameters in the outgoing arguments, while captured values pass
+//!    through unchanged. These blocks come from critical-edge splitting and structured lowering.
 //!
 //! 2. Implied-condition threading (non-duplicating): a block B whose `@"if"(cond)` outcome is already
 //!    KNOWN on an incoming edge P->B is threaded straight to the successor that outcome selects, so
@@ -21,6 +20,7 @@ const ir = @import("vulcan-ir");
 const pass = @import("pass.zig");
 const cfg_mod = @import("cfg.zig");
 const dom = @import("dominators.zig");
+const dce = @import("dce.zig");
 
 const Function = ir.function.Function;
 const Block = ir.function.Block;
@@ -63,7 +63,6 @@ const Budget = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
-    _ = analyses;
     if (func.blockCount() == 0) return false;
     const candidates = findCandidates(func);
     if (!candidates.has_if and !candidates.has_forwarder) return false;
@@ -85,8 +84,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         }
     }
 
-    // Then the identity forwarder rewrite (the original transform).
-    if (try forwardIdentity(allocator, func)) changed = true;
+    if (changed) analyses.invalidate();
+    if (try forwardEmpty(allocator, func, analyses)) changed = true;
     return changed;
 }
 
@@ -97,49 +96,128 @@ fn findCandidates(func: *const Function) Candidates {
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         if (endsInIf(func, block) != null) result.has_if = true;
-        if (identityForwardTarget(func, block) != null) result.has_forwarder = true;
+        if (emptyForwardJump(func, block) != null) result.has_forwarder = true;
         if (result.has_if and result.has_forwarder) break;
     }
     return result;
 }
 
-/// Redirect every out-edge that lands on a pure identity forwarder to the forwarder's target.
-fn forwardIdentity(allocator: std.mem.Allocator, func: *Function) pass.Error!bool {
+/// Redirect edges through empty blocks and compose their outgoing arguments.
+fn forwardEmpty(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     const n = func.blockCount();
-
-    // forward_to[b] = the successor to which block b is a pure identity forwarder, else null.
-    const forward_to = try allocator.alloc(?Block, n);
-    defer allocator.free(forward_to);
-    for (0..n) |bi| forward_to[bi] = identityForwardTarget(func, @fromBackingInt(@intCast(bi)));
-
     var changed = false;
-    for (0..n) |bi| {
+    var step: usize = 0;
+    while (step < n * 4 + 4) : (step += 1) {
+        const graph = try analyses.cfg();
+        const doms = try analyses.dominators();
+        const def_blocks = try analyses.definingBlocks();
+        if (!try forwardOne(allocator, func, graph, doms, def_blocks)) break;
+        changed = true;
+        analyses.invalidate();
+    }
+    return changed;
+}
+
+fn forwardOne(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    graph: *const cfg_mod.Cfg,
+    doms: *const dom.Dominators,
+    def_blocks: []const u32,
+) pass.Error!bool {
+    for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
-        // Redirect this block's out-edges that land on a forwarder to the forwarder's target.
         for (func.blockInsts(block)) |inst| {
-            switch (func.opcode(inst)) {
-                .@"if" => |cf| {
-                    if (retarget(forward_to, cf.then.target)) |dest| {
-                        func.opcodeMut(inst).@"if".then.target = dest;
-                        changed = true;
-                    }
-                    if (retarget(forward_to, cf.@"else".target)) |dest| {
-                        func.opcodeMut(inst).@"if".@"else".target = dest;
-                        changed = true;
-                    }
-                },
-                else => {},
-            }
+            if (func.opcode(inst) != .@"if") continue;
+            const op = func.opcodeMut(inst);
+            if (try forwardEdge(allocator, func, graph, doms, def_blocks, block, &op.@"if".then)) return true;
+            if (try forwardEdge(allocator, func, graph, doms, def_blocks, block, &op.@"if".@"else")) return true;
         }
-        if (func.terminator(block)) |term| switch (term) {
-            .jump => |jmp| if (retarget(forward_to, jmp.target)) |dest| {
-                func.terminatorPtr(block).*.?.jump.target = dest;
-                changed = true;
-            },
+        if (func.terminatorPtr(block).*) |*term| switch (term.*) {
+            .jump => |*jump| if (try forwardEdge(allocator, func, graph, doms, def_blocks, block, jump)) return true,
             .ret => {},
         };
     }
-    return changed;
+    return false;
+}
+
+fn forwardEdge(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    graph: *const cfg_mod.Cfg,
+    doms: *const dom.Dominators,
+    def_blocks: []const u32,
+    source: Block,
+    edge: *Jump,
+) pass.Error!bool {
+    const forwarder = edge.target;
+    const outgoing = emptyForwardJump(func, forwarder) orelse return false;
+    if (outgoing.target == source) return false;
+    const params = try allocator.dupe(Value, func.blockParams(forwarder));
+    defer allocator.free(params);
+    const original_param_count = params.len;
+    const incoming = try allocator.dupe(Value, func.blockArgs(edge.*));
+    defer allocator.free(incoming);
+    if (params.len != incoming.len) return false;
+    const outgoing_args = try allocator.dupe(Value, func.blockArgs(outgoing));
+    defer allocator.free(outgoing_args);
+
+    var direct_args: std.ArrayList(Value) = .empty;
+    defer direct_args.deinit(allocator);
+    var detached_args: std.ArrayList(Value) = .empty;
+    defer detached_args.deinit(allocator);
+    var captures: std.ArrayList(Value) = .empty;
+    defer captures.deinit(allocator);
+    var has_capture = false;
+    for (outgoing_args) |value| {
+        const index = std.mem.indexOfScalar(Value, params, value);
+        if (index) |i| {
+            try direct_args.append(allocator, incoming[i]);
+        } else {
+            has_capture = true;
+            if (!doms.isReachable(@backingInt(source)) or
+                !doms.dominates(def_blocks[@backingInt(value)], @backingInt(source))) return false;
+            try direct_args.append(allocator, value);
+            try captures.append(allocator, value);
+        }
+    }
+    const predecessors = graph.predecessors(@backingInt(forwarder));
+    const sole_predecessor = predecessors.len == 1 and predecessors[0] == @backingInt(source);
+    if (has_capture and !sole_predecessor) return false;
+    if (!sole_predecessor and params.len != 0) {
+        const uses = try allocator.alloc(u32, func.valueCount());
+        defer allocator.free(uses);
+        @memset(uses, 0);
+        dce.countUses(func, uses);
+        for (params) |param| {
+            var forwarding_uses: u32 = 0;
+            for (outgoing_args) |value| if (value == param) {
+                forwarding_uses += 1;
+            };
+            if (uses[@backingInt(param)] != forwarding_uses) return false;
+        }
+    }
+    if (sole_predecessor) {
+        for (captures.items) |value| {
+            _ = try func.appendBlockParam(forwarder, func.valueType(value));
+        }
+        for (params, incoming) |param, argument| func.replaceAllUses(param, argument);
+        var capture_index: usize = 0;
+        const all_params = func.blockParams(forwarder);
+        const original_params = all_params[0..original_param_count];
+        for (outgoing_args) |value| {
+            if (std.mem.indexOfScalar(Value, original_params, value) != null) {
+                const index = std.mem.indexOfScalar(Value, params, value).?;
+                try detached_args.append(allocator, original_params[index]);
+            } else {
+                try detached_args.append(allocator, all_params[original_param_count + capture_index]);
+                capture_index += 1;
+            }
+        }
+        func.terminatorPtr(forwarder).*.?.jump.args = try func.internValues(detached_args.items);
+    }
+    edge.* = .{ .target = outgoing.target, .args = try func.internValues(direct_args.items) };
+    return true;
 }
 
 /// Find the first predecessor edge P->B (over every block B that ends in an `@"if"`) whose branch
@@ -555,23 +633,7 @@ fn endsInIf(func: *const Function, block: Block) ?Inst {
     };
 }
 
-/// The final destination for an edge into `target`: follows a chain of identity forwarders (bounded
-/// by the block count to avoid looping on a forwarder cycle), or null if `target` is not a forwarder.
-fn retarget(forward_to: []const ?Block, target: Block) ?Block {
-    var dest = forward_to[@backingInt(target)] orelse return null;
-    var steps: usize = 0;
-    while (steps < forward_to.len) : (steps += 1) {
-        const next = forward_to[@backingInt(dest)] orelse return dest;
-        if (next == dest) return dest; // self-forwarder guard (should not arise)
-        dest = next;
-    }
-    return dest;
-}
-
-/// If `block` is a pure identity forwarder (not the entry, no instructions, terminated by a jump to a
-/// different block whose arguments are exactly this block's parameters in order), return that
-/// successor. Otherwise null.
-fn identityForwardTarget(func: *const Function, block: Block) ?Block {
+fn emptyForwardJump(func: *const Function, block: Block) ?Jump {
     if (@backingInt(block) == 0) return null; // never redirect away from the entry
     if (func.blockInsts(block).len != 0) return null; // must do nothing but forward
     const term = func.terminator(block) orelse return null;
@@ -580,10 +642,7 @@ fn identityForwardTarget(func: *const Function, block: Block) ?Block {
         .ret => return null,
     };
     if (jmp.target == block) return null; // a self-loop is not a forwarder
-    const params = func.blockParams(block);
-    const args = func.blockArgs(jmp);
-    if (!std.mem.eql(ir.function.Value, params, args)) return null; // only the identity case
-    return jmp.target;
+    return jmp;
 }
 
 const testing = std.testing;
@@ -749,6 +808,35 @@ test "an if edge into a forwarding block is redirected" {
     const cf = func.opcode(func.blockInsts(entry)[0]).@"if";
     try testing.expectEqual(dest, cf.then.target); // then edge threaded past mid
     try testing.expectEqual(other, cf.@"else".target); // else edge unchanged
+}
+
+test "an empty block forwards a captured value" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try i32Ty(&func);
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const mid = try func.appendBlock();
+    const other = try func.appendBlock();
+    const dest = try func.appendBlock();
+    const condition = try func.appendBlockParam(entry, bool_t);
+    const x = try func.appendBlockParam(entry, t);
+    const mid_param = try func.appendBlockParam(mid, t);
+    const other_param = try func.appendBlockParam(other, t);
+    _ = try func.appendBlockParam(dest, t);
+    const selected = try func.appendArithImm(entry, t, .add, x, 7);
+    try func.appendIf(entry, condition, .{ .target = mid, .args = &.{x} }, .{ .target = other, .args = &.{x} });
+    try func.setJump(mid, dest, &.{selected});
+    func.setTerminator(other, .{ .ret = ir.function.Ret.one(other_param) });
+    func.setTerminator(dest, .{ .ret = ir.function.Ret.one(mid_param) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    const then_edge = func.opcode(func.blockInsts(entry)[1]).@"if".then;
+    try testing.expectEqual(dest, then_edge.target);
+    try testing.expectEqual(selected, func.blockArgs(then_edge)[0]);
+    try testing.expectEqual(x, func.terminator(dest).?.ret.slice()[0]);
+    try verifyClean(allocator, &func);
 }
 
 test "a block that computes something is not a forwarder" {
