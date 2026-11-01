@@ -22,8 +22,8 @@ pub const Score = struct {
 
     pub fn accepts(candidate: Score, baseline: Score) bool {
         if (candidate.cycles != baseline.cycles) return candidate.cycles < baseline.cycles;
-        if (candidate.peak_live != baseline.peak_live) return candidate.peak_live < baseline.peak_live;
         if (candidate.instructions != baseline.instructions) return candidate.instructions < baseline.instructions;
+        if (candidate.peak_live != baseline.peak_live) return candidate.peak_live < baseline.peak_live;
         return candidate.idle_slots <= baseline.idle_slots;
     }
 };
@@ -91,7 +91,118 @@ pub fn function(allocator: std.mem.Allocator, func: *const Function, model: *con
             .ret => {},
         };
     }
+    result.peak_live = @max(result.peak_live, try cfgPeakLive(allocator, func, &graph));
     return result;
+}
+
+fn cfgPeakLive(allocator: std.mem.Allocator, func: *const Function, graph: *const cfg_mod.Cfg) std.mem.Allocator.Error!u32 {
+    const block_count = func.blockCount();
+    const value_count = func.valueCount();
+    const cells = block_count * value_count;
+    const defined = try allocator.alloc(bool, cells);
+    defer allocator.free(defined);
+    const used = try allocator.alloc(bool, cells);
+    defer allocator.free(used);
+    const live_in = try allocator.alloc(bool, cells);
+    defer allocator.free(live_in);
+    const live_out = try allocator.alloc(bool, cells);
+    defer allocator.free(live_out);
+    @memset(defined, false);
+    @memset(used, false);
+    @memset(live_in, false);
+    @memset(live_out, false);
+
+    var operands: std.ArrayList(Value) = .empty;
+    defer operands.deinit(allocator);
+    for (0..block_count) |bi| {
+        const block_id: Block = @fromBackingInt(@intCast(bi));
+        const base = bi * value_count;
+        for (func.blockParams(block_id)) |parameter| defined[base + @backingInt(parameter)] = true;
+        for (func.blockInsts(block_id)) |inst| {
+            try schedule.collectOperands(allocator, func, inst, &operands);
+            for (operands.items) |operand| {
+                const at = base + @backingInt(operand);
+                if (!defined[at]) used[at] = true;
+            }
+            if (func.instResult(inst)) |result| defined[base + @backingInt(result)] = true;
+        }
+        if (func.terminator(block_id)) |term| switch (term) {
+            .ret => |ret| for (ret.slice()) |operand| {
+                const at = base + @backingInt(operand);
+                if (!defined[at]) used[at] = true;
+            },
+            .jump => |jump| for (func.blockArgs(jump)) |operand| {
+                const at = base + @backingInt(operand);
+                if (!defined[at]) used[at] = true;
+            },
+        };
+    }
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var bi = block_count;
+        while (bi > 0) {
+            bi -= 1;
+            const base = bi * value_count;
+            for (0..value_count) |vi| {
+                var new_out = false;
+                for (graph.successors(bi)) |successor| {
+                    if (live_in[@as(usize, successor) * value_count + vi]) {
+                        new_out = true;
+                        break;
+                    }
+                }
+                const new_in = used[base + vi] or (new_out and !defined[base + vi]);
+                if (live_out[base + vi] != new_out or live_in[base + vi] != new_in) changed = true;
+                live_out[base + vi] = new_out;
+                live_in[base + vi] = new_in;
+            }
+        }
+    }
+
+    const live = try allocator.alloc(bool, value_count);
+    defer allocator.free(live);
+    var peak: u32 = 0;
+    for (0..block_count) |bi| {
+        const block_id: Block = @fromBackingInt(@intCast(bi));
+        const base = bi * value_count;
+        @memcpy(live, live_out[base..][0..value_count]);
+        var count: u32 = 0;
+        for (live) |is_live| count += @intFromBool(is_live);
+        peak = @max(peak, count);
+
+        if (func.terminator(block_id)) |term| switch (term) {
+            .ret => |ret| for (ret.slice()) |operand| markLive(live, operand, &count),
+            .jump => |jump| for (func.blockArgs(jump)) |operand| markLive(live, operand, &count),
+        };
+        peak = @max(peak, count);
+
+        const insts = func.blockInsts(block_id);
+        var index = insts.len;
+        while (index > 0) {
+            index -= 1;
+            const inst = insts[index];
+            if (func.instResult(inst)) |result| {
+                const at = @backingInt(result);
+                if (live[at]) {
+                    live[at] = false;
+                    count -= 1;
+                }
+            }
+            try schedule.collectOperands(allocator, func, inst, &operands);
+            for (operands.items) |operand| markLive(live, operand, &count);
+            peak = @max(peak, count);
+        }
+    }
+    return peak;
+}
+
+fn markLive(live: []bool, value: Value, count: *u32) void {
+    const at = @backingInt(value);
+    if (live[at]) return;
+    live[at] = true;
+    count.* += 1;
 }
 
 fn executionWeight(graph: *const cfg_mod.Cfg, doms: *const dominators.Dominators, loop_info: *const loops.LoopInfo, block_id: usize) u64 {
@@ -268,10 +379,31 @@ test "score prefers lower cycles before instruction count" {
     try std.testing.expect(!(Score{ .cycles = 9, .instructions = 2, .peak_live = 1 }).accepts(baseline));
 }
 
-test "score uses pressure and size to break cycle ties" {
+test "score uses size then pressure to break cycle ties" {
     const baseline = Score{ .cycles = 8, .instructions = 6, .peak_live = 4 };
-    try std.testing.expect((Score{ .cycles = 8, .instructions = 8, .peak_live = 3 }).accepts(baseline));
     try std.testing.expect((Score{ .cycles = 8, .instructions = 5, .peak_live = 4 }).accepts(baseline));
+    try std.testing.expect(!(Score{ .cycles = 8, .instructions = 8, .peak_live = 3 }).accepts(baseline));
+    try std.testing.expect((Score{ .cycles = 8, .instructions = 6, .peak_live = 3 }).accepts(baseline));
+}
+
+test "score counts values live through an otherwise empty block" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const middle = try func.appendBlock();
+    const done = try func.appendBlock();
+    const lhs = try func.appendInst(entry, i32_t, .{ .iconst = 11 });
+    const rhs = try func.appendInst(entry, i32_t, .{ .iconst = 17 });
+    try func.setJump(entry, middle, &.{});
+    try func.setJump(middle, done, &.{});
+    const sum = try func.appendInst(done, i32_t, .{ .arith = .{ .op = .add, .lhs = lhs, .rhs = rhs } });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(sum) });
+
+    const result = try function(allocator, &func, registry.modelFor(.@"ampere-altra"));
+    try std.testing.expect(result.peak_live >= 2);
 }
 
 test "IR gate commits a faster candidate" {
