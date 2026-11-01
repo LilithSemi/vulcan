@@ -403,6 +403,7 @@ fn narrowUnsignedMagic(
     fixups: []Fixup,
     relocs: []Reloc,
     lines: []LineEntry,
+    coalescable_result_moves: []usize,
     model: MachineModel,
 ) std.mem.Allocator.Error!void {
     const len = words.items.len;
@@ -452,6 +453,7 @@ fn narrowUnsignedMagic(
         fixup.at -= removed_before[fixup.at];
     }
     for (relocs) |*reloc| reloc.offset -= removed_before[reloc.offset];
+    for (coalescable_result_moves) |*move| move.* -= removed_before[move.*];
     for (lines) |*line| {
         const word = line.offset / 4;
         line.offset = @intCast((word - removed_before[word]) * 4);
@@ -503,7 +505,9 @@ pub fn pairMemoryForModelWithMoves(
     coalescable_result_moves: []const usize,
     model: MachineModel,
 ) std.mem.Allocator.Error!void {
-    try narrowUnsignedMagic(allocator, words, block_start, fixups, relocs, lines, model);
+    const remapped_result_moves = try allocator.dupe(usize, coalescable_result_moves);
+    defer allocator.free(remapped_result_moves);
+    try narrowUnsignedMagic(allocator, words, block_start, fixups, relocs, lines, remapped_result_moves, model);
     const len = words.items.len;
 
     // Which word indices begin a block. A word is fusable-as-second only if it is NOT a block
@@ -518,7 +522,7 @@ pub fn pairMemoryForModelWithMoves(
     var is_coalescable_result_move = try allocator.alloc(bool, len);
     defer allocator.free(is_coalescable_result_move);
     @memset(is_coalescable_result_move, false);
-    for (coalescable_result_moves) |at| {
+    for (remapped_result_moves) |at| {
         std.debug.assert(at < len);
         is_coalescable_result_move[at] = true;
     }
@@ -749,6 +753,35 @@ test "pairMemory coalesces an ALU result move and remaps following control flow"
     try std.testing.expectEqualSlices(u32, &.{ encode.add(.x21, .x21, .x20), encode.b(0), encode.ret() }, words.items);
     try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, &block_start);
     try std.testing.expectEqual(@as(usize, 1), fixups[0].at);
+}
+
+test "magic rewrite remaps a later proven result move" {
+    const alloc = std.testing.allocator;
+    var words = try wordsFrom(alloc, &.{
+        encode.ubfm(.x12, .x7, 0, 31),
+        encode.mul(.x12, .x12, .x9) | (@as(u32, 1) << 31),
+        encode.lsrImm(.x12, .x12, 32, true),
+        encode.lsrImm(.x12, .x12, 2, true),
+        encode.add(.x24, .x21, .x20),
+        encode.mov(.x21, .x24),
+        encode.b(0),
+        encode.ret(),
+    });
+    defer words.deinit(alloc);
+    var block_start = [_]usize{ 0, 7 };
+    var fixups = [_]Fixup{.{ .at = 6, .target = 1 }};
+
+    try pairMemoryForModelWithMoves(alloc, &words, &block_start, &fixups, &.{}, &.{}, &.{5}, .{});
+
+    try std.testing.expectEqualSlices(u32, &.{
+        encode.umull(.x12, .x7, .x9),
+        encode.lsrImm(.x12, .x12, 34, true),
+        encode.add(.x21, .x21, .x20),
+        encode.b(0),
+        encode.ret(),
+    }, words.items);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4 }, &block_start);
+    try std.testing.expectEqual(@as(usize, 3), fixups[0].at);
 }
 
 test "pairMemory also fuses multiply-add and remaps side tables" {
