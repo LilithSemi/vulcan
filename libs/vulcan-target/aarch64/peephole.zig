@@ -116,13 +116,15 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
         if (isLoad(mem.kind)) return .{ .reads = .{ gpReg(mem.rn), null, null, null }, .writes = .{ data, null } };
         return .{ .reads = .{ gpReg(mem.rn), data, null, null } };
     }
-    if (isPairMemory(word)) {
+    if (decodePairMemory(word)) |pair| {
         const load = word & 0x00400000 != 0;
         const rt1: u5 = @truncate(word);
         const rt2: u5 = @truncate(word >> 10);
         const rn: u5 = @truncate(word >> 5);
-        if (load) return .{ .reads = .{ gpReg(rn), null, null, null }, .writes = .{ gpReg(rt1), gpReg(rt2) } };
-        return .{ .reads = .{ gpReg(rn), gpReg(rt1), gpReg(rt2), null } };
+        const data1 = if (pair.simd) fpReg(rt1) else gpReg(rt1);
+        const data2 = if (pair.simd) fpReg(rt2) else gpReg(rt2);
+        if (load) return .{ .reads = .{ gpReg(rn), null, null, null }, .writes = .{ data1, data2 } };
+        return .{ .reads = .{ gpReg(rn), data1, data2, null } };
     }
     if (isRegisterMemory(word)) {
         const rt: u5 = @truncate(word);
@@ -279,11 +281,18 @@ fn isDivide(word: u32) bool {
     return form == 0x1AC00C00 or form == 0x1AC00800;
 }
 
-fn isPairMemory(word: u32) bool {
+const PairMemory = struct { simd: bool };
+
+fn decodePairMemory(word: u32) ?PairMemory {
     return switch (word & 0xFFC00000) {
-        0xA9400000, 0xA9000000, 0x29400000, 0x29000000 => true,
-        else => false,
+        0xA9400000, 0xA9000000, 0x29400000, 0x29000000 => .{ .simd = false },
+        0xAD400000, 0xAD000000 => .{ .simd = true },
+        else => null,
     };
+}
+
+fn isPairMemory(word: u32) bool {
+    return decodePairMemory(word) != null;
 }
 
 fn ports(model: MachineModel, class: MachineClass) u32 {
@@ -967,6 +976,16 @@ test "machine score tracks vector load and arithmetic chains" {
         encode.eorVec(.x4, .x2, .x5),
     }, model);
     try std.testing.expectEqual(@as(u32, 7), score.critical_path);
+}
+
+test "machine score tracks SIMD pair loads as memory dependencies" {
+    const model = MachineModel{ .issue_width = 4, .latency = .{ .mem = 4, .fpsimd = 2 } };
+    const score = scoreWords(&.{
+        encode.ldpOffQ(.x0, .x2, .x1, 0),
+        encode.addVecI32(.x3, .x0, .x4),
+    }, model);
+
+    try std.testing.expectEqual(@as(u32, 6), score.critical_path);
 }
 
 test "machine score keeps vector accumulate dependencies" {
