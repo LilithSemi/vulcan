@@ -70,6 +70,7 @@ pub const late_pipeline = [_]pass.Pass{
     simplify.pass_def,
     strength.pass_def,
     immform.pass_def,
+    gvn.pass_def,
     dce.pass_def,
 };
 
