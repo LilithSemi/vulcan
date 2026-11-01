@@ -5,6 +5,9 @@ const ir = @import("vulcan-ir");
 const mm = @import("model.zig");
 const schedule = @import("schedule.zig");
 const registry = @import("registry.zig");
+const cfg_mod = @import("../cfg.zig");
+const dominators = @import("../dominators.zig");
+const loops = @import("../loops.zig");
 
 const Function = ir.function.Function;
 const Block = ir.function.Block;
@@ -62,15 +65,43 @@ pub const IRGate = struct {
 };
 
 pub fn function(allocator: std.mem.Allocator, func: *const Function, model: *const mm.Model) std.mem.Allocator.Error!Score {
+    var graph = try cfg_mod.build(allocator, func);
+    defer graph.deinit(allocator);
+    var doms = try dominators.computeFromCfg(allocator, &graph);
+    defer doms.deinit(allocator);
+    var loop_info = try loops.analyzeFromCfg(allocator, &graph, &doms);
+    defer loop_info.deinit(allocator);
+
     var result: Score = .{};
     for (0..func.blockCount()) |bi| {
         const block_result = try block(allocator, func, @fromBackingInt(@intCast(bi)), model);
-        result.cycles += block_result.cycles;
-        result.instructions += block_result.instructions;
+        const weight = executionWeight(&graph, &doms, &loop_info, bi);
+        result.cycles += block_result.cycles * weight;
+        result.instructions += block_result.instructions * weight;
         result.peak_live = @max(result.peak_live, block_result.peak_live);
-        result.idle_slots += block_result.idle_slots;
+        result.idle_slots += block_result.idle_slots * weight;
     }
     return result;
+}
+
+fn executionWeight(graph: *const cfg_mod.Cfg, doms: *const dominators.Dominators, loop_info: *const loops.LoopInfo, block_id: usize) u64 {
+    var weight: u64 = 1;
+    for (loop_info.loops) |loop| {
+        if (!loop.contains(block_id)) continue;
+        var found_latch = false;
+        var dominates_every_latch = true;
+        for (0..graph.blockCount()) |candidate| {
+            if (!loop.contains(candidate)) continue;
+            for (graph.successors(candidate)) |successor| {
+                if (successor != loop.header) continue;
+                found_latch = true;
+                if (!doms.dominates(@intCast(block_id), candidate)) dominates_every_latch = false;
+            }
+        }
+        if (found_latch and dominates_every_latch)
+            weight = std.math.mul(u64, weight, 8) catch std.math.maxInt(u64);
+    }
+    return weight;
 }
 
 pub fn block(allocator: std.mem.Allocator, func: *const Function, block_id: Block, model: *const mm.Model) std.mem.Allocator.Error!Score {
@@ -80,6 +111,7 @@ pub fn block(allocator: std.mem.Allocator, func: *const Function, block_id: Bloc
     const class_count = @typeInfo(UnitClass).@"enum".field_names.len;
     var demand: [class_count]u64 = @splat(0);
     var total_demand: u64 = 0;
+    var result_instruction_count: u64 = 0;
     var critical_path: u64 = 0;
 
     const ready = try allocator.alloc(u64, func.valueCount());
@@ -92,6 +124,9 @@ pub fn block(allocator: std.mem.Allocator, func: *const Function, block_id: Bloc
     const last_use = try allocator.alloc(usize, func.valueCount());
     defer allocator.free(last_use);
     @memset(last_use, 0);
+    const live_in = try allocator.alloc(bool, func.valueCount());
+    defer allocator.free(live_in);
+    @memset(live_in, false);
 
     var operands: std.ArrayList(Value) = .empty;
     defer operands.deinit(allocator);
@@ -101,12 +136,17 @@ pub fn block(allocator: std.mem.Allocator, func: *const Function, block_id: Bloc
         var starts_at: u64 = 0;
         for (operands.items) |operand| {
             starts_at = @max(starts_at, ready[@backingInt(operand)]);
-            if (def_at[@backingInt(operand)] != std.math.maxInt(usize))
+            if (def_at[@backingInt(operand)] != std.math.maxInt(usize)) {
                 last_use[@backingInt(operand)] = index;
+            } else {
+                live_in[@backingInt(operand)] = true;
+                last_use[@backingInt(operand)] = index;
+            }
         }
 
         const opcode = func.opcode(inst);
-        const latency: u64 = model.latency(opcode);
+        const micro_ops = estimatedInstructions(func, inst, model);
+        const latency: u64 = model.latency(opcode) + micro_ops - 1;
         const finishes_at = starts_at + latency;
         critical_path = @max(critical_path, finishes_at);
         if (func.instResult(inst)) |result| {
@@ -115,9 +155,10 @@ pub fn block(allocator: std.mem.Allocator, func: *const Function, block_id: Bloc
             last_use[@backingInt(result)] = index;
         }
 
-        const weight: u64 = model.throughput(opcode, elementIsFloat(func, inst));
+        const weight: u64 = model.throughput(opcode, elementIsFloat(func, inst)) + micro_ops - 1;
         demand[@backingInt(model.unitOf(opcode))] += weight;
         total_demand += weight;
+        result_instruction_count += micro_ops;
     }
 
     const width: u64 = @max(1, model.issue_width);
@@ -132,6 +173,12 @@ pub fn block(allocator: std.mem.Allocator, func: *const Function, block_id: Bloc
     const ends = try allocator.alloc(u32, insts.len);
     defer allocator.free(ends);
     @memset(ends, 0);
+    var live: u32 = 0;
+    for (live_in, 0..) |is_live, value_index| {
+        if (!is_live) continue;
+        live += 1;
+        ends[last_use[value_index]] += 1;
+    }
     for (insts, 0..) |inst, index| {
         if (func.instResult(inst)) |result| {
             const end = last_use[@backingInt(result)];
@@ -139,8 +186,7 @@ pub fn block(allocator: std.mem.Allocator, func: *const Function, block_id: Bloc
         }
     }
 
-    var live: u32 = 0;
-    var peak_live: u32 = 0;
+    var peak_live: u32 = live;
     for (insts, 0..) |inst, index| {
         if (func.instResult(inst)) |result| {
             if (last_use[@backingInt(result)] > index) live += 1;
@@ -152,10 +198,37 @@ pub fn block(allocator: std.mem.Allocator, func: *const Function, block_id: Bloc
     const cycles = @max(critical_path, resource_cycles);
     return .{
         .cycles = cycles,
-        .instructions = insts.len,
+        .instructions = result_instruction_count,
         .peak_live = peak_live,
         .idle_slots = cycles * width -| total_demand,
     };
+}
+
+fn estimatedInstructions(func: *const Function, inst: ir.function.Inst, model: *const mm.Model) u64 {
+    if (model.arch != .aarch64) return 1;
+    const opcode = func.opcode(inst);
+    return switch (opcode) {
+        .iconst => |value| constantInstructions(func, inst, value),
+        .arith_imm => |arith| if ((arith.op == .add or arith.op == .sub) and
+            (arith.imm < -4095 or arith.imm > 4095))
+            1 + constantInstructions(func, inst, arith.imm)
+        else
+            1,
+        else => 1,
+    };
+}
+
+fn constantInstructions(func: *const Function, inst: ir.function.Inst, value: i64) u64 {
+    const result = func.instResult(inst) orelse return 1;
+    const bits = switch (func.types.type_kind(func.valueType(result))) {
+        .int => |int| int.bits,
+        else => return 1,
+    };
+    const raw: u64 = @bitCast(value);
+    if (bits <= 32) return 1 + @as(u64, @intFromBool(@as(u16, @truncate(raw >> 16)) != 0));
+    var count: u64 = 1;
+    inline for (1..4) |part| count += @as(u64, @intFromBool(@as(u16, @truncate(raw >> (part * 16))) != 0));
+    return count;
 }
 
 fn ceilDiv(numerator: u64, denominator: anytype) u64 {
@@ -227,4 +300,31 @@ test "IR gate keeps the baseline when a candidate is slower" {
 
     try std.testing.expect(!try gate.commit(&func));
     try std.testing.expectEqual(ir.function.BinOp.add, func.opcode(func.definingInst(sum).?).arith.op);
+}
+
+test "IR gate accepts hoisting an expanded immediate from a loop" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const pass = @import("../pass.zig");
+    const loopimm = @import("loopimm.zig");
+
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_ty = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const done = try func.appendBlock();
+    const seed = try func.appendInst(entry, ty, .{ .iconst = 1 });
+    try func.setJump(entry, header, &.{seed});
+    const state = try func.appendBlockParam(header, ty);
+    const next = try func.appendInst(header, ty, .{ .arith_imm = .{ .op = .add, .lhs = state, .imm = 1013904223 } });
+    const keep_going = try func.appendInst(header, bool_ty, .{ .icmp = .{ .op = .ne, .lhs = next, .rhs = state } });
+    try func.appendIf(header, keep_going, .{ .target = header, .args = &.{next} }, .{ .target = done });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(next) });
+
+    var gate = try IRGate.init(allocator, &func, registry.modelFor(.@"ampere-altra"));
+    defer gate.deinit();
+    try std.testing.expect(try pass.run(allocator, gate.candidateFunction(), &.{loopimm.pass_def}));
+    try std.testing.expect(try gate.commit(&func));
+    try std.testing.expect(func.opcode(func.definingInst(next).?) == .arith);
 }

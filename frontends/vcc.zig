@@ -1004,6 +1004,9 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
     if (optimize.optimizes()) {
         for (mod.funcs) |*nf| _ = try opt.optimizeLate(allocator, &nf.func);
     }
+    if (optimize.runsMicroarch()) if (model) |m| {
+        for (mod.funcs) |*nf| _ = try mm.optimizePreSelection(allocator, &nf.func, m);
+    };
     const late_end = std.Io.Timestamp.now(io, .awake);
 
     const final_start = late_end;

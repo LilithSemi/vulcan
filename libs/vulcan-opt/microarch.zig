@@ -14,6 +14,7 @@ const immform = @import("immform.zig");
 const dce = @import("dce.zig");
 const licm = @import("licm.zig");
 const ifconvert = @import("ifconvert.zig");
+const loopimm = @import("microarch/loopimm.zig");
 
 const model_mod = @import("microarch/model.zig");
 const registry = @import("microarch/registry.zig");
@@ -134,12 +135,23 @@ pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Funct
     return gate.commit(func);
 }
 
+/// Apply target-aware IR rewrites after generic canonicalization and before instruction selection.
+pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Function, m: *const Model) pass.Error!bool {
+    if (m.arch != .aarch64) return false;
+    var gate = try score.IRGate.init(allocator, func, m);
+    defer gate.deinit();
+    const changed = try pass.run(allocator, gate.candidateFunction(), &.{ loopimm.pass_def, dce.pass_def });
+    if (!changed) return false;
+    return gate.commit(func);
+}
+
 test {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(@import("microarch/schedule.zig"));
     std.testing.refAllDecls(@import("microarch/cost.zig"));
     std.testing.refAllDecls(@import("microarch/score.zig"));
     std.testing.refAllDecls(@import("microarch/unroll.zig"));
+    std.testing.refAllDecls(@import("microarch/loopimm.zig"));
     std.testing.refAllDecls(@import("microarch/prefetch.zig"));
     std.testing.refAllDecls(@import("microarch/dotprod.zig"));
     std.testing.refAllDecls(@import("microarch/matmul_recog.zig"));
