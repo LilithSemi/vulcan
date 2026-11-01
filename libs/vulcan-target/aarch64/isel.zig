@@ -318,6 +318,9 @@ pub const Fixup = struct {
     at: usize,
     target: u32,
     cond: ?encode.Cond = null,
+    /// Word index named by an `adr` placeholder. Unlike a branch fixup, this names emitted code
+    /// directly instead of an IR block.
+    adr_target: ?usize = null,
     /// Word index used as the base of a dense-switch offset table. Null identifies an ordinary
     /// branch fixup. A table row stores `(target - table_base)` in instruction words.
     table_base: ?usize = null,
@@ -332,6 +335,107 @@ const DenseSwitch = struct {
     default_target: Block,
     needs_bounds_check: bool,
 };
+
+const HoistedDenseSwitch = struct {
+    dispatch: usize,
+    entry: usize,
+};
+
+fn loopHasCall(func: *const Function, natural_loop: *const loops.Loop) bool {
+    for (0..func.blockCount()) |bi| {
+        if (!natural_loop.contains(bi)) continue;
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
+            .call, .call_indirect => return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
+fn uniquePredecessor(func: *const Function, target: usize) ?usize {
+    var predecessor: ?usize = null;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        var reaches_target = false;
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+            .@"if" => |cf| {
+                reaches_target = @backingInt(cf.then.target) == target or @backingInt(cf.@"else".target) == target;
+            },
+            else => {},
+        };
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |jump| reaches_target = reaches_target or @backingInt(jump.target) == target,
+            .ret => {},
+        };
+        if (!reaches_target) continue;
+        if (predecessor != null) return null;
+        predecessor = bi;
+    }
+    return predecessor;
+}
+
+fn visibleLoopEntry(func: *const Function, alloc: *const Allocation, start: usize) ?usize {
+    var entry = start;
+    for (0..func.blockCount()) |_| {
+        const block: Block = @fromBackingInt(@intCast(entry));
+        if (transparentForwardTarget(func, alloc, block) == null) return entry;
+        entry = uniquePredecessor(func, entry) orelse return null;
+    }
+    return null;
+}
+
+/// Select one loop-resident dense switch whose table base can live in the otherwise-unused x15.
+/// The smallest containing natural loop wins, which keeps the base live over the shortest region.
+/// An ADR is safe to speculate at a guarded entry even when that entry can also bypass the loop.
+fn findHoistedDenseSwitch(
+    func: *const Function,
+    plans: []const ?DenseSwitch,
+    skip_dispatch: []const bool,
+    loop_info: *const loops.LoopInfo,
+    alloc: *const Allocation,
+    compact_switch_tables: bool,
+    model: peephole.MachineModel,
+) ?HoistedDenseSwitch {
+    if (alloc.spill_count != 0) return null;
+
+    var best: ?HoistedDenseSwitch = null;
+    var best_size: usize = std.math.maxInt(usize);
+    var best_header: u32 = std.math.maxInt(u32);
+    for (plans, 0..) |maybe_plan, dispatch| {
+        if (maybe_plan == null) continue;
+        const baseline = [_]u32{
+            encode.adr(scratch_imm, 0),
+            if (compact_switch_tables)
+                encode.ldrbReg(scratch_move, scratch_imm, .x0)
+            else
+                encode.ldrWReg(scratch_move, scratch_imm, .x0),
+            encode.addShifted64(scratch_move, scratch_imm, scratch_move, 2),
+            encode.br(scratch_move),
+        };
+        const candidate = [_]u32{
+            if (compact_switch_tables)
+                encode.ldrbReg(scratch_move, spill_res, .x0)
+            else
+                encode.ldrWReg(scratch_move, spill_res, .x0),
+            encode.addShifted64(scratch_move, spill_res, scratch_move, 2),
+            encode.br(scratch_move),
+        };
+        if (!peephole.scoreWords(&candidate, model).accepts(peephole.scoreWords(&baseline, model))) continue;
+
+        for (loop_info.loops) |*natural_loop| {
+            const split_entry = natural_loop.entry orelse continue;
+            const entry = visibleLoopEntry(func, alloc, split_entry) orelse continue;
+            if (!natural_loop.contains(dispatch) or skip_dispatch[entry] or loopHasCall(func, natural_loop)) continue;
+            var size: usize = 0;
+            for (natural_loop.body) |inside| size += @intFromBool(inside);
+            if (size > best_size or (size == best_size and natural_loop.header >= best_header)) continue;
+            best = .{ .dispatch = dispatch, .entry = entry };
+            best_size = size;
+            best_header = natural_loop.header;
+        }
+    }
+    return best;
+}
 
 /// Return the non-negative upper bound proved by `value = x & constant`. Bitwise AND cannot set a
 /// bit absent from a non-negative constant, so the numeric result is at most that constant. This is
@@ -1244,6 +1348,17 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     var li = try loops.analyze(allocator, func);
     defer li.deinit(allocator);
     for (li.loops) |l| is_loop_header[l.header] = true;
+    const hoisted_dense_switch = findHoistedDenseSwitch(
+        func,
+        dense_switches,
+        skip_dispatch,
+        &li,
+        alloc,
+        compact_switch_tables,
+        caps.machine_model,
+    );
+    var hoisted_dense_switch_adr: ?usize = null;
+    var hoisted_dense_switch_table: ?usize = null;
 
     if (frame > 0) try emitFrameImm(allocator, &code, true, sp, sp, frame);
     // Only a non-leaf saves lr: a leaf makes no call, so lr stays untouched over its body. The
@@ -2279,6 +2394,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
                 },
                 .@"if" => |cf| {
+                    if (hoisted_dense_switch) |hoisted| {
+                        if (hoisted.entry == bi) {
+                            std.debug.assert(hoisted_dense_switch_adr == null);
+                            hoisted_dense_switch_adr = code.items.len;
+                            try code.append(allocator, encode.adr(spill_res, 0));
+                        }
+                    }
                     // The block emitted immediately after this one, in array order. An `if` edge to it
                     // can fall through (elide its branch) instead of jumping around one instruction.
                     const next_block: ?Block = if (bi + 1 < nblocks) @fromBackingInt(@intCast(bi + 1)) else null;
@@ -2289,16 +2411,22 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(plan.default_target), .cond = .hi });
                             try code.append(allocator, encode.bcc(.hi, 0));
                         }
+                        const hoisted = if (hoisted_dense_switch) |choice| choice.dispatch == bi else false;
+                        const table_base = if (hoisted) spill_res else scratch_imm;
                         const adr_at = code.items.len;
-                        try code.append(allocator, encode.adr(scratch_imm, 0));
+                        if (!hoisted) try code.append(allocator, encode.adr(table_base, 0));
                         try code.append(allocator, if (compact_switch_tables)
-                            encode.ldrbReg(scratch_move, scratch_imm, index)
+                            encode.ldrbReg(scratch_move, table_base, index)
                         else
-                            encode.ldrWReg(scratch_move, scratch_imm, index));
-                        try code.append(allocator, encode.addShifted64(scratch_move, scratch_imm, scratch_move, 2));
+                            encode.ldrWReg(scratch_move, table_base, index));
+                        try code.append(allocator, encode.addShifted64(scratch_move, table_base, scratch_move, 2));
                         try code.append(allocator, encode.br(scratch_move));
                         const table_at = code.items.len;
-                        code.items[adr_at] = encode.adr(scratch_imm, @intCast((@as(i64, @intCast(table_at)) - @as(i64, @intCast(adr_at))) * 4));
+                        if (hoisted) {
+                            hoisted_dense_switch_table = table_at;
+                        } else {
+                            code.items[adr_at] = encode.adr(table_base, @intCast((@as(i64, @intCast(table_at)) - @as(i64, @intCast(adr_at))) * 4));
+                        }
                         for (plan.targets, 0..) |target, target_index| {
                             const row_at = if (compact_switch_tables) table_at + target_index / 4 else code.items.len;
                             try fixups.append(allocator, .{
@@ -2365,6 +2493,15 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             std.debug.assert(act.at == ctx.pos); // only terminator-position actions remain here
             try emitSplitAction(allocator, &code, func, spill_base, act);
             action_cursor += 1;
+        }
+        if (!terminated) {
+            if (hoisted_dense_switch) |hoisted| {
+                if (hoisted.entry == bi) {
+                    std.debug.assert(hoisted_dense_switch_adr == null);
+                    hoisted_dense_switch_adr = code.items.len;
+                    try code.append(allocator, encode.adr(spill_res, 0));
+                }
+            }
         }
         if (!terminated) {
             switch (func.terminator(block) orelse Terminator{ .ret = ir.function.Ret.none() }) {
@@ -2464,6 +2601,14 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     // numbering bug that would silently drop a store/reload. Fail loudly instead of miscompiling.
     std.debug.assert(action_cursor == alloc.actions.items.len);
 
+    if (hoisted_dense_switch != null) {
+        try fixups.append(allocator, .{
+            .at = hoisted_dense_switch_adr.?,
+            .target = 0,
+            .adr_target = hoisted_dense_switch_table.?,
+        });
+    }
+
     // Fuse adjacent ldr/str pairs into ldp/stp and remap the side tables to the shrunk layout
     // BEFORE resolving fixups, so the branch-displacement loop below computes correct offsets
     // against the paired `code` and remapped `block_start`/`fixups`. A function with no fusable
@@ -2481,6 +2626,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     );
 
     for (fixups.items) |f| {
+        if (f.adr_target) |adr_target| {
+            const off = (@as(i64, @intCast(adr_target)) - @as(i64, @intCast(f.at))) * 4;
+            code.items[f.at] = encode.adr(spill_res, @intCast(off));
+            continue;
+        }
         var target = f.target;
         for (0..nblocks) |_| {
             const block: Block = @fromBackingInt(@intCast(target));
@@ -6609,6 +6759,25 @@ test "matching edge moves cross critical-edge forwarding blocks" {
     try std.testing.expect(matching.rhs == &sets[1]);
     matching.lhs.consumed = true;
     try std.testing.expectEqual(left_target, resolveTransparentTarget(&func, &allocation, left));
+}
+
+test "a hoisted loop value is placed before a transparent split entry" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const bool_t = try func.types.intern(.bool);
+    const pred = try func.appendBlock();
+    const done = try func.appendBlock();
+    const header = try func.appendBlock();
+    const split_entry = try func.appendBlock();
+    const cond = try func.appendBlockParam(pred, bool_t);
+    try func.appendIf(pred, cond, .{ .target = split_entry }, .{ .target = done });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(cond) });
+    func.setTerminator(header, .{ .ret = ir.function.Ret.one(cond) });
+    try func.setJump(split_entry, header, &.{});
+
+    const allocation = Allocation{ .edge_move_driven = true };
+    try std.testing.expectEqual(@as(?usize, @backingInt(pred)), visibleLoopEntry(&func, &allocation, @backingInt(split_entry)));
 }
 
 test "a scratch-routed edge cycle suppresses dead-source proofs" {

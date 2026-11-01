@@ -480,7 +480,9 @@ fn moveRunHasCycle(words: []const u32, move_indices: []const usize) bool {
 fn hasOnlyFallthroughEntry(move_at: usize, block_start: []const usize, fixups: []const Fixup) bool {
     for (block_start, 0..) |start, block_index| {
         if (start != move_at) continue;
-        for (fixups) |fixup| if (fixup.target == block_index) return false;
+        for (fixups) |fixup| {
+            if (fixup.adr_target == null and fixup.target == block_index) return false;
+        }
     }
     return true;
 }
@@ -576,6 +578,7 @@ fn narrowUnsignedMagic(
     for (block_start) |*start| start.* -= removed_before[start.*];
     for (fixups) |*fixup| {
         if (fixup.table_base) |base| fixup.table_base = base - removed_before[base];
+        if (fixup.adr_target) |target| fixup.adr_target = target - removed_before[target];
         fixup.at -= removed_before[fixup.at];
     }
     for (relocs) |*reloc| reloc.offset -= removed_before[reloc.offset];
@@ -768,6 +771,7 @@ pub fn pairMemoryForModelWithMoveProofs(
     }
     for (fixups) |*f| {
         if (f.table_base) |base| f.table_base = base - removed_before[base];
+        if (f.adr_target) |target| f.adr_target = target - removed_before[target];
         f.at -= removed_before[f.at];
         std.debug.assert(f.at < write);
     }
