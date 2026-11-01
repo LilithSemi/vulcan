@@ -31,10 +31,10 @@ fn nonTrapping(op: BinOp) bool {
 /// Whether an instruction may be hoisted out of a loop if it is invariant.
 fn hoistable(opcode: ir.function.Opcode) bool {
     return switch (opcode) {
-        .iconst, .fconst, .fconst128, .icmp, .select, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .extract, .global_addr, .dot, .reduce, .splat => true,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary, .extract, .global_addr, .dot, .reduce, .splat => true,
         .arith => |a| nonTrapping(a.op),
         .arith_imm => |a| nonTrapping(a.op),
-        .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => false,
+        .alloca, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => false,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
         // An atomic must run once per iteration, exactly like the store it contains.
@@ -62,6 +62,9 @@ fn operandsInvariant(func: *const Function, inst: Inst, invariant: []const bool)
         .arith_imm => |a| inv(invariant, a.lhs),
         .icmp => |c| inv(invariant, c.lhs) and inv(invariant, c.rhs),
         .select => |s| inv(invariant, s.cond) and inv(invariant, s.then) and inv(invariant, s.@"else"),
+        .struct_new => |s| for (func.valueList(s.fields)) |field| {
+            if (!inv(invariant, field)) break false;
+        } else true,
         .convert => |cv| inv(invariant, cv.value),
         .decode_low_float, .encode_low_float => |cv| inv(invariant, cv.value),
         .dequantize_nvfp4, .quantize_nvfp4 => |cv| inv(invariant, cv.value) and inv(invariant, cv.block_scale) and inv(invariant, cv.global_scale),
@@ -80,7 +83,6 @@ fn operandsInvariant(func: *const Function, inst: Inst, invariant: []const bool)
         // them. The switch is exhaustive with no `else` prong for the reason above: an
         // `else` answers "not invariant" for a newly added opcode and silently disarms that
         // opcode's own `hoistable` entry.
-        .struct_new,
         .alloca,
         .call,
         .call_indirect,
@@ -358,7 +360,7 @@ test "does not hoist a loop-variant value" {
     try std.testing.expect(!try run(allocator, &func, &analyses));
 }
 
-test "hoists a loop-invariant splat and a loop-invariant reduce over it to the preheader" {
+test "hoists loop-invariant vector construction and reduction to the preheader" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -382,6 +384,7 @@ test "hoists a loop-invariant splat and a loop-invariant reduce over it to the p
     // Both `x`'s splat and the reduce over it are loop-invariant: `x` comes from entry.
     const vec = try func.appendSplat(body, v4i32, x);
     _ = try func.appendReduce(body, .add, vec);
+    _ = try func.appendInst(body, v4i32, .{ .struct_new = .{ .fields = try func.internValues(&.{ x, x, x, x }) } });
     const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{next});
     func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
@@ -394,8 +397,8 @@ test "hoists a loop-invariant splat and a loop-invariant reduce over it to the p
     try std.testing.expect(try run(allocator, &func, &analyses));
 
     // Both the splat and the reduce left the body and landed in the preheader (entry).
-    try std.testing.expectEqual(entry_before + 2, func.blockInsts(entry).len);
-    try std.testing.expectEqual(body_before - 2, func.blockInsts(body).len);
+    try std.testing.expectEqual(entry_before + 3, func.blockInsts(entry).len);
+    try std.testing.expectEqual(body_before - 3, func.blockInsts(body).len);
 }
 
 test "does not hoist a splat of the loop induction variable" {
