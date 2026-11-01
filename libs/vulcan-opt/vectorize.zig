@@ -115,6 +115,9 @@ fn runLanesGated(allocator: std.mem.Allocator, func: *Function, lanes: u8, allow
             changed = true;
             coalesced = true;
         }
+        if (try foldArithmeticVectorPacks(allocator, func, block, lanes, allow_i32, model, &coalesced_loads, &coalesced)) {
+            changed = true;
+        }
         // A consumer may explicitly pack every extracted lane from one vector. Once SLP has
         // exposed that shape, forward the original vector instead of lowering lane inserts.
         if (foldIdentityVectorPacks(func, block)) {
@@ -131,6 +134,211 @@ fn runLanesGated(allocator: std.mem.Allocator, func: *Function, lanes: u8, allow
     }
     if (coalesced) try cleanup(allocator, func, &coalesced_loads);
     return changed;
+}
+
+fn canBuildPackedVector(func: *const Function, block: Block, scalars: []const Value, group_pos: usize, model: ?*const mm.Model, depth: u8, saw_load: *bool) bool {
+    if (depth > 8) return false;
+    if (allSame(scalars) or arithmeticProgression(func, scalars) != null) return true;
+    if (analyzeLoadRun(func, block, scalars, group_pos, model != null and model.?.arch == .aarch64) != null) {
+        saw_load.* = true;
+        return true;
+    }
+
+    const first_inst = func.definingInst(scalars[0]) orelse return false;
+    switch (func.opcode(first_inst)) {
+        .arith_imm => |first| {
+            if (!modelSupportsI32Op(model, first.op)) return false;
+            var lhs: [MAX_LANES]Value = undefined;
+            lhs[0] = first.lhs;
+            for (scalars[1..], 1..) |scalar, lane| {
+                const inst = func.definingInst(scalar) orelse return false;
+                const candidate = switch (func.opcode(inst)) {
+                    .arith_imm => |arith| arith,
+                    else => return false,
+                };
+                if (candidate.op != first.op or candidate.imm != first.imm) return false;
+                lhs[lane] = candidate.lhs;
+            }
+            return canBuildPackedVector(func, block, lhs[0..scalars.len], group_pos, model, depth + 1, saw_load);
+        },
+        .arith => |first| {
+            if (!modelSupportsI32Op(model, first.op)) return false;
+            var lhs: [MAX_LANES]Value = undefined;
+            var rhs: [MAX_LANES]Value = undefined;
+            lhs[0] = first.lhs;
+            rhs[0] = first.rhs;
+            for (scalars[1..], 1..) |scalar, lane| {
+                const inst = func.definingInst(scalar) orelse return false;
+                const candidate = switch (func.opcode(inst)) {
+                    .arith => |arith| arith,
+                    else => return false,
+                };
+                if (candidate.op != first.op) return false;
+                lhs[lane] = candidate.lhs;
+                rhs[lane] = candidate.rhs;
+            }
+            return canBuildPackedVector(func, block, lhs[0..scalars.len], group_pos, model, depth + 1, saw_load) and
+                canBuildPackedVector(func, block, rhs[0..scalars.len], group_pos, model, depth + 1, saw_load);
+        },
+        else => return false,
+    }
+}
+
+fn buildPackedVector(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    block: Block,
+    scalars: []const Value,
+    vector_t: ir.types.Type,
+    group_pos: usize,
+    model: ?*const mm.Model,
+    coalesced_loads: *CoalescedLoads,
+    coalesced: *bool,
+) Error!Value {
+    if (allSame(scalars)) return func.appendSplat(block, vector_t, scalars[0]);
+    if (arithmeticProgression(func, scalars)) |progression| {
+        const elem_t = func.valueType(progression.base);
+        const base = try func.appendSplat(block, vector_t, progression.base);
+        var offsets: [MAX_LANES]Value = undefined;
+        for (offsets[0..scalars.len], 0..) |*offset, lane| {
+            const immediate = std.math.mul(i64, progression.step, @intCast(lane)) catch unreachable;
+            offset.* = try func.appendInst(block, elem_t, .{ .iconst = immediate });
+        }
+        const offset_vector = try pack(func, block, vector_t, offsets[0..scalars.len]);
+        return func.appendInst(block, vector_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset_vector } });
+    }
+    if (analyzeLoadRun(func, block, scalars, group_pos, model != null and model.?.arch == .aarch64)) |load_run| {
+        const vector = try func.appendInst(block, vector_t, .{ .load = .{ .ptr = load_run.ptr0 } });
+        if (load_run.interleave_lane) |lane| try func.addAttr(.{ .inst = func.definingInst(vector).? }, .{ .custom = .{
+            .namespace = "vulcan.aarch64",
+            .key = "interleave4",
+            .value = .{ .int = lane },
+        } });
+        for (0..scalars.len) |lane| try coalesced_loads.put(allocator, func.instResult(load_run.loads[lane]).?, {});
+        coalesced.* = true;
+        return vector;
+    }
+
+    const first_inst = func.definingInst(scalars[0]).?;
+    return switch (func.opcode(first_inst)) {
+        .arith_imm => |first| blk: {
+            var lhs: [MAX_LANES]Value = undefined;
+            for (scalars, 0..) |scalar, lane| lhs[lane] = func.opcode(func.definingInst(scalar).?).arith_imm.lhs;
+            const vector_lhs = try buildPackedVector(allocator, func, block, lhs[0..scalars.len], vector_t, group_pos, model, coalesced_loads, coalesced);
+            const elem_t = func.valueType(scalars[0]);
+            const immediate = try func.appendInst(block, elem_t, .{ .iconst = first.imm });
+            const vector_imm = try func.appendSplat(block, vector_t, immediate);
+            break :blk try func.appendInst(block, vector_t, .{ .arith = .{ .op = first.op, .lhs = vector_lhs, .rhs = vector_imm } });
+        },
+        .arith => |first| blk: {
+            var lhs: [MAX_LANES]Value = undefined;
+            var rhs: [MAX_LANES]Value = undefined;
+            for (scalars, 0..) |scalar, lane| {
+                const arith = func.opcode(func.definingInst(scalar).?).arith;
+                lhs[lane] = arith.lhs;
+                rhs[lane] = arith.rhs;
+            }
+            const vector_lhs = try buildPackedVector(allocator, func, block, lhs[0..scalars.len], vector_t, group_pos, model, coalesced_loads, coalesced);
+            const vector_rhs = try buildPackedVector(allocator, func, block, rhs[0..scalars.len], vector_t, group_pos, model, coalesced_loads, coalesced);
+            break :blk try func.appendInst(block, vector_t, .{ .arith = .{ .op = first.op, .lhs = vector_lhs, .rhs = vector_rhs } });
+        },
+        else => unreachable,
+    };
+}
+
+fn foldArithmeticVectorPacks(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    block: Block,
+    lanes: u8,
+    allow_i32: bool,
+    model: ?*const mm.Model,
+    coalesced_loads: *CoalescedLoads,
+    coalesced: *bool,
+) Error!bool {
+    if (!allow_i32) return false;
+    var changed = false;
+    while (true) {
+        const insts = func.blockInsts(block);
+        var selected: ?struct { inst: Inst, pos: usize, fields: [MAX_LANES]Value, vector_t: ir.types.Type } = null;
+        for (insts, 0..) |inst, pos| {
+            const opcode = func.opcode(inst);
+            if (opcode != .struct_new) continue;
+            var after_control = false;
+            for (insts[0..pos]) |prior| {
+                if (func.opcode(prior) == .@"if") {
+                    after_control = true;
+                    break;
+                }
+            }
+            if (after_control) continue;
+            const fields = func.valueList(opcode.struct_new.fields);
+            if (fields.len != lanes) continue;
+            const result = func.instResult(inst) orelse continue;
+            const vector = switch (func.types.type_kind(func.valueType(result))) {
+                .vector => |candidate| candidate,
+                else => continue,
+            };
+            if (vector.len != lanes or !isScalarI32(func, fields[0])) continue;
+            var copied: [MAX_LANES]Value = undefined;
+            @memcpy(copied[0..lanes], fields);
+            var saw_load = false;
+            if (!canBuildPackedVector(func, block, copied[0..lanes], pos, model, 0, &saw_load) or !saw_load) continue;
+            selected = .{ .inst = inst, .pos = pos, .fields = copied, .vector_t = func.valueType(result) };
+            break;
+        }
+        const pack_info = selected orelse break;
+        const old_len = func.blockInsts(block).len;
+        const vector = try buildPackedVector(allocator, func, block, pack_info.fields[0..lanes], pack_info.vector_t, pack_info.pos, model, coalesced_loads, coalesced);
+        const old_result = func.instResult(pack_info.inst).?;
+        func.replaceAllLiveUses(old_result, vector);
+
+        const all = func.blockInstsMut(block);
+        var rebuilt: std.ArrayList(Inst) = .empty;
+        defer rebuilt.deinit(allocator);
+        try rebuilt.appendSlice(allocator, all.items[0..pack_info.pos]);
+        try rebuilt.appendSlice(allocator, all.items[old_len..]);
+        try rebuilt.appendSlice(allocator, all.items[pack_info.pos + 1 .. old_len]);
+        all.clearRetainingCapacity();
+        try all.appendSlice(allocator, rebuilt.items);
+        changed = true;
+    }
+    return changed;
+}
+
+test "folds packed affine loads into vector arithmetic" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const block = try func.appendBlock();
+    const ptr = try func.appendBlockParam(block, ptr_t);
+    const induction = try func.appendBlockParam(block, i32_t);
+    var fields: [4]Value = undefined;
+    for (&fields, 0..) |*field, lane| {
+        const address = try func.appendArithImm(block, ptr_t, .add, ptr, @intCast(lane * 4));
+        const loaded = try func.appendInst(block, i32_t, .{ .load = .{ .ptr = address } });
+        const index = if (lane == 0)
+            induction
+        else
+            try func.appendArithImm(block, i32_t, .add, induction, @intCast(lane));
+        const scaled = try func.appendArithImm(block, i32_t, .mul, index, 17);
+        field.* = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = loaded, .rhs = scaled } });
+    }
+    const packed_value = try func.appendInst(block, vec_t, .{ .struct_new = .{ .fields = try func.internValues(&fields) } });
+    const reduced = try func.appendInst(block, i32_t, .{ .reduce = .{ .vector = packed_value, .op = .bit_xor } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(reduced) });
+
+    try std.testing.expect(try runModel(allocator, &func, registry.modelFor(.@"ampere-altra")));
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(&func, .load));
+    try std.testing.expect(hasVectorLoad(&func));
+    try std.testing.expect(hasIntVectorArith(&func, 4));
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
 }
 
 fn interleaveLane(func: *const Function, inst: Inst) ?u2 {
