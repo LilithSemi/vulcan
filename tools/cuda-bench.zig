@@ -168,6 +168,12 @@ fn buildVectorMix(allocator: std.mem.Allocator) !Function {
     const out = try func.appendBlockParam(block, ptr_t);
     const a = try func.appendBlockParam(block, ptr_t);
     const b = try func.appendBlockParam(block, ptr_t);
+    // These parameters are pointers to u32, so their language-level contract guarantees the
+    // alignment required by one B32 transaction. Without the IR fact, the NVIDIA backend must
+    // conservatively preserve an arbitrary byte address with four U8 accesses.
+    try func.addAttr(.{ .value = out }, .{ .@"align" = @alignOf(u32) });
+    try func.addAttr(.{ .value = a }, .{ .@"align" = @alignOf(u32) });
+    try func.addAttr(.{ .value = b }, .{ .@"align" = @alignOf(u32) });
     const gid = try func.appendBlockParam(block, u32_t);
     try gpu.attrs.setBuiltin(&func, gid, .global_id_x);
     try gpu.attrs.setLocalSize(&func, .{ 256, 1, 1 });
