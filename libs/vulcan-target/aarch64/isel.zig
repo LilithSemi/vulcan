@@ -318,6 +318,7 @@ pub const Fixup = struct {
     at: usize,
     target: u32,
     cond: ?encode.Cond = null,
+    test_reg: ?struct { reg: Reg, nonzero: bool } = null,
     /// Word index named by an `adr` placeholder. Unlike a branch fixup, this names emitted code
     /// directly instead of an IR block.
     adr_target: ?usize = null,
@@ -2722,7 +2723,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             continue;
         }
         const off: i28 = @intCast((@as(i64, @intCast(block_start[target])) - @as(i64, @intCast(f.at))) * 4);
-        code.items[f.at] = if (f.cond) |cond| encode.bcc(cond, @intCast(off)) else encode.b(off);
+        code.items[f.at] = if (f.cond) |cond|
+            encode.bcc(cond, @intCast(off))
+        else if (f.test_reg) |test_reg|
+            if (test_reg.nonzero) encode.cbnz(test_reg.reg, @intCast(off)) else encode.cbz(test_reg.reg, @intCast(off))
+        else
+            encode.b(off);
     }
 
     return .{
@@ -3285,7 +3291,20 @@ const Ctx = struct {
                     try code.append(allocator, encode.bcc(encode.invertCond(cond), 0));
                     return;
                 },
-                else => {},
+                .reg => |reg| if (edgeMovesPreserveReg(set, reg)) {
+                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    set.consumed = true;
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = false } });
+                    try code.append(allocator, encode.cbz(reg, 0));
+                    return;
+                },
+                .reg_eqz => |reg| if (edgeMovesPreserveReg(set, reg)) {
+                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    set.consumed = true;
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = true } });
+                    try code.append(allocator, encode.cbnz(reg, 0));
+                    return;
+                },
             };
             // With no moves on the cold ELSE edge, branch there directly and let THEN fall through.
             // This removes the local label plus unconditional branch from the hot loop-header shape.
@@ -3330,7 +3349,20 @@ const Ctx = struct {
                     try code.append(allocator, encode.bcc(cond, 0));
                     return;
                 },
-                else => {},
+                .reg => |reg| if (edgeMovesPreserveReg(set, reg)) {
+                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    set.consumed = true;
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = true } });
+                    try code.append(allocator, encode.cbnz(reg, 0));
+                    return;
+                },
+                .reg_eqz => |reg| if (edgeMovesPreserveReg(set, reg)) {
+                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    set.consumed = true;
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = false } });
+                    try code.append(allocator, encode.cbz(reg, 0));
+                    return;
+                },
             };
             // Symmetric move-free fast path: branch directly to THEN and let ELSE fall through.
             if ((direct_fallthrough or common_moves) and (common_moves or self.edgeMovesEmpty(cf.then))) switch (branch) {
@@ -3474,6 +3506,14 @@ const Ctx = struct {
             if (!move.destination_free_other_edges or move.src != .reg or move.dst != .reg) return null;
         }
         return set;
+    }
+
+    fn edgeMovesPreserveReg(set: *const EdgeMoveSet, reg: Reg) bool {
+        for (set.moves) |move| switch (move.dst) {
+            .reg => |destination| if (destination == reg) return false,
+            .slot => unreachable,
+        };
+        return true;
     }
 
     fn matchingEdgeMoves(self: Ctx, lhs: ir.function.Jump, rhs: ir.function.Jump) ?MatchingEdgeMoves {
@@ -6930,6 +6970,8 @@ test "speculatable edge moves cross a forwarding block only with allocation proo
     };
     const branch = func.opcode(func.blockInsts(pred)[0]).@"if";
     try std.testing.expect(ctx.speculatableEdgeMoves(branch.then) == &sets[0]);
+    try std.testing.expect(Ctx.edgeMovesPreserveReg(&sets[0], .x1));
+    try std.testing.expect(!Ctx.edgeMovesPreserveReg(&sets[0], .x2));
     moves[0].destination_free_other_edges = false;
     try std.testing.expect(ctx.speculatableEdgeMoves(branch.then) == null);
 }
