@@ -1457,6 +1457,43 @@ test "resolve: a block-param arg in a different register than the param becomes 
     try std.testing.expect(locEq(em.moves[0].dst, .{ .reg = p_reg }));
 }
 
+test "resolve: a forwarding edge move records a free alternate-edge destination" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const forward = try func.appendBlock();
+    const done = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const seed = try func.appendBlockParam(entry, t);
+    const cond = try func.appendBlockParam(entry, bool_t);
+    try func.appendIf(entry, cond, .{ .target = forward }, .{ .target = done });
+    try func.setJump(forward, loop, &.{seed});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+    const carried = try func.appendBlockParam(loop, t);
+    const next = try func.appendInst(loop, t, .{ .arith_imm = .{ .op = .add, .lhs = carried, .imm = 1 } });
+    func.setTerminator(loop, .{ .ret = ir.function.Ret.one(next) });
+
+    var desc = try aarch64.aarch64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+    var alloc = try wimmer.allocate(allocator, &func, &desc);
+    defer alloc.deinit(allocator);
+
+    var found = false;
+    for (alloc.edge_moves) |edge| {
+        if (edge.pred != forward or edge.succ != loop) continue;
+        for (edge.moves) |move| {
+            if (move.src != .reg or move.dst != .reg) continue;
+            try std.testing.expect(move.destination_free_other_edges);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
 test "resolve: an argument feeding a spilled successor parameter becomes a reg-to-slot store move" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);

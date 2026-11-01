@@ -949,6 +949,10 @@ pub const Move = struct {
     /// The source value has no live range at the successor entry. Backends may combine this with
     /// machine-level adjacency and entry proofs to retarget a producer across an empty block.
     source_dead: bool = false,
+    /// No value occupies the destination register at any other successor entry of this
+    /// predecessor. A backend may execute this edge move before a flag-based conditional branch:
+    /// the untaken edge cannot observe the clobber.
+    destination_free_other_edges: bool = false,
 };
 
 /// An intra-block spill, reload, or move the resolver emits at position `at`. A same-position
@@ -3126,13 +3130,15 @@ fn addEdgeMoves(
             // width for a width-aware backend.
             const insts = func.blockInsts(pred);
             const last_result = if (insts.len > 0) func.instResult(insts[insts.len - 1]) else null;
+            const class = desc.classOf(desc.ctx, func, p);
             try raw.append(allocator, .{
                 .src = from,
                 .dst = to,
-                .class = desc.classOf(desc.ctx, func, p),
+                .class = class,
                 .value = p,
                 .coalesce_result = !live.liveAt(a, ss) and last_result == a,
                 .source_dead = !live.liveAt(a, ss),
+                .destination_free_other_edges = destinationFreeOnOtherEdges(func, desc, live, result, block_from, pred, succ, class, to),
             });
         }
     }
@@ -3161,6 +3167,65 @@ fn addEdgeMoves(
     const ordered = try orderMoves(allocator, raw.items, desc);
     errdefer allocator.free(ordered);
     try edges.append(allocator, .{ .pred = pred, .succ = succ, .moves = ordered });
+}
+
+fn destinationFreeOnOtherEdges(
+    func: *const Function,
+    desc: *const RegDescription,
+    live: *const LiveIndex,
+    result: *const Allocation,
+    block_from: []const u32,
+    pred: Block,
+    selected_succ: Block,
+    class: u16,
+    destination: Location,
+) bool {
+    if (!locIsReg(destination)) return false;
+    var alternative: ?Block = null;
+    for (func.blockInsts(pred)) |inst| switch (func.opcode(inst)) {
+        .@"if" => |cf| for ([_]Jump{ cf.then, cf.@"else" }) |edge| {
+            if (edge.target == selected_succ) continue;
+            if (alternative != null and alternative.? != edge.target) return false;
+            alternative = edge.target;
+        },
+        else => {},
+    };
+    if (func.terminator(pred)) |term| switch (term) {
+        .jump => |edge| if (edge.target != selected_succ) {
+            if (alternative != null and alternative.? != edge.target) return false;
+            alternative = edge.target;
+        },
+        .ret => {},
+    };
+    if (alternative == null and func.blockInsts(pred).len == 0) {
+        var origin: ?Block = null;
+        for (0..func.blockCount()) |block_index| {
+            const candidate: Block = @fromBackingInt(@intCast(block_index));
+            for (func.blockInsts(candidate)) |inst| switch (func.opcode(inst)) {
+                .@"if" => |cf| {
+                    const reaches_pred = cf.then.target == pred or cf.@"else".target == pred;
+                    if (!reaches_pred) continue;
+                    if (origin != null and origin.? != candidate) return false;
+                    origin = candidate;
+                    const sibling = if (cf.then.target == pred) cf.@"else".target else cf.then.target;
+                    if (sibling != pred) alternative = sibling;
+                },
+                else => {},
+            };
+        }
+    }
+    const other = alternative orelse return false;
+    const other_start = block_from[@backingInt(other)];
+    var it = result.segments.iterator();
+    while (it.next()) |entry| {
+        const value = entry.key_ptr.*;
+        if (!live.liveAt(value, other_start)) continue;
+        if (desc.classOf(desc.ctx, func, value) != class) continue;
+        const segments = entry.value_ptr.*;
+        if (segments.len == 0 or segments[0].from > other_start) continue;
+        if (locEql(locationAt(segments, other_start), destination)) return false;
+    }
+    return true;
 }
 
 /// True iff `loc` is a register (rather than a spill slot).

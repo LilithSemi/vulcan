@@ -606,6 +606,7 @@ const EdgeMove = struct {
     class: u16,
     coalesce_result: bool = false,
     source_dead: bool = false,
+    destination_free_other_edges: bool = false,
 };
 
 /// The ordered move list on one control-flow edge `pred -> succ` (translated from `wimmer.EdgeMoves`
@@ -3273,6 +3274,19 @@ const Ctx = struct {
         const else_next = next_block != null and resolveTransparentTarget(self.func, self.alloc, else_target) == next_block.?;
 
         if (then_next) {
+            // A move on the taken edge may execute before a flag-based branch when allocation
+            // proved its destination unused on the fallthrough edge. This turns a loop-edge
+            // move block into one direct backedge without clobbering either outcome.
+            if (!common_moves and self.edgeMovesEmpty(cf.then)) if (self.speculatableEdgeMoves(cf.@"else")) |set| switch (branch) {
+                .cc => |cond| {
+                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    set.consumed = true;
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .cond = encode.invertCond(cond) });
+                    try code.append(allocator, encode.bcc(encode.invertCond(cond), 0));
+                    return;
+                },
+                else => {},
+            };
             // With no moves on the cold ELSE edge, branch there directly and let THEN fall through.
             // This removes the local label plus unconditional branch from the hot loop-header shape.
             if ((direct_fallthrough or common_moves) and (common_moves or self.edgeMovesEmpty(cf.@"else"))) switch (branch) {
@@ -3308,6 +3322,16 @@ const Ctx = struct {
         }
 
         if (else_next) {
+            if (!common_moves and self.edgeMovesEmpty(cf.@"else")) if (self.speculatableEdgeMoves(cf.then)) |set| switch (branch) {
+                .cc => |cond| {
+                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    set.consumed = true;
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .cond = cond });
+                    try code.append(allocator, encode.bcc(cond, 0));
+                    return;
+                },
+                else => {},
+            };
             // Symmetric move-free fast path: branch directly to THEN and let ELSE fall through.
             if ((direct_fallthrough or common_moves) and (common_moves or self.edgeMovesEmpty(cf.then))) switch (branch) {
                 .cc => |cond| {
@@ -3441,6 +3465,15 @@ const Ctx = struct {
         if (!self.alloc.edge_move_driven) return false;
         const set = self.findEdgeMoves(self.block, jump.target) orelse return true;
         return set.consumed or set.moves.len == 0;
+    }
+
+    fn speculatableEdgeMoves(self: Ctx, jump: ir.function.Jump) ?*EdgeMoveSet {
+        const set = self.edgeOrForwardMoves(jump) orelse return null;
+        if (set.consumed or set.moves.len == 0) return null;
+        for (set.moves) |move| {
+            if (!move.destination_free_other_edges or move.src != .reg or move.dst != .reg) return null;
+        }
+        return set;
     }
 
     fn matchingEdgeMoves(self: Ctx, lhs: ir.function.Jump, rhs: ir.function.Jump) ?MatchingEdgeMoves {
@@ -4516,6 +4549,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
                 .class = wm.class,
                 .coalesce_result = wm.coalesce_result,
                 .source_dead = wm.source_dead,
+                .destination_free_other_edges = wm.destination_free_other_edges,
             };
         }
         try edge_sets.append(allocator, .{ .pred = wem.pred, .succ = wem.succ, .moves = moves });
@@ -6856,6 +6890,48 @@ test "matching edge moves cross critical-edge forwarding blocks" {
     try std.testing.expect(matching.rhs == &sets[1]);
     matching.lhs.consumed = true;
     try std.testing.expectEqual(left_target, resolveTransparentTarget(&func, &allocation, left));
+}
+
+test "speculatable edge moves cross a forwarding block only with allocation proof" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const bool_t = try func.types.intern(.bool);
+    const pred = try func.appendBlock();
+    const forward = try func.appendBlock();
+    const done = try func.appendBlock();
+    const target = try func.appendBlock();
+    const cond = try func.appendBlockParam(pred, bool_t);
+    try func.appendIf(pred, cond, .{ .target = forward }, .{ .target = done });
+    try func.setJump(forward, target, &.{});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(cond) });
+    func.setTerminator(target, .{ .ret = ir.function.Ret.one(cond) });
+
+    var moves = [_]EdgeMove{.{
+        .src = .{ .reg = .x1 },
+        .dst = .{ .reg = .x2 },
+        .class = 0,
+        .destination_free_other_edges = true,
+    }};
+    var sets = [_]EdgeMoveSet{.{ .pred = forward, .succ = target, .moves = &moves }};
+    var allocation = Allocation{ .edge_moves = &sets, .edge_move_driven = true };
+    var alloca_off: std.AutoHashMapUnmanaged(Value, u32) = .empty;
+    var coalescable: std.ArrayList(usize) = .empty;
+    var dead_source: std.ArrayList(usize) = .empty;
+    const ctx = Ctx{
+        .func = &func,
+        .alloc = &allocation,
+        .spill_base = 0,
+        .alloca_base = 0,
+        .alloca_off = &alloca_off,
+        .coalescable_edge_moves = &coalescable,
+        .dead_source_edge_moves = &dead_source,
+        .block = pred,
+    };
+    const branch = func.opcode(func.blockInsts(pred)[0]).@"if";
+    try std.testing.expect(ctx.speculatableEdgeMoves(branch.then) == &sets[0]);
+    moves[0].destination_free_other_edges = false;
+    try std.testing.expect(ctx.speculatableEdgeMoves(branch.then) == null);
 }
 
 test "a hoisted loop value is placed before a transparent split entry" {
