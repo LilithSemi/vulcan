@@ -38,6 +38,7 @@ pub const unroll = @import("microarch/unroll.zig");
 pub const splitunroll = @import("microarch/splitunroll.zig");
 pub const loopvec = @import("microarch/loopvec.zig");
 pub const prefetch = @import("microarch/prefetch.zig");
+pub const offsetcombine = @import("microarch/offsetcombine.zig");
 pub const dotprod = @import("microarch/dotprod.zig");
 // Matmul-nest recognition: raises a naive fp32 triply-nested matmul loop to the et-soc tensor `matmul`
 // op. Wired into `optimize` below; exposed here too so its canonical nest builder is reachable from
@@ -140,7 +141,7 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
     if (m.arch != .aarch64) return false;
     var gate = try score.IRGate.init(allocator, func, m);
     defer gate.deinit();
-    const changed = try pass.run(allocator, gate.candidateFunction(), &.{ loopimm.pass_def, dce.pass_def });
+    const changed = try pass.run(allocator, gate.candidateFunction(), &.{ offsetcombine.pass_def, loopimm.pass_def, dce.pass_def });
     if (!changed) return false;
     return gate.commit(func);
 }
@@ -152,6 +153,7 @@ test {
     std.testing.refAllDecls(@import("microarch/score.zig"));
     std.testing.refAllDecls(@import("microarch/unroll.zig"));
     std.testing.refAllDecls(@import("microarch/loopimm.zig"));
+    std.testing.refAllDecls(@import("microarch/offsetcombine.zig"));
     std.testing.refAllDecls(@import("microarch/prefetch.zig"));
     std.testing.refAllDecls(@import("microarch/dotprod.zig"));
     std.testing.refAllDecls(@import("microarch/matmul_recog.zig"));
