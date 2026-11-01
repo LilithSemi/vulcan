@@ -4447,7 +4447,7 @@ fn fusedCmpForSelect(func: *const Function, insts: []const ir.function.Inst, sel
         idx -= 1;
         if (insts[idx] == cmp_inst) break;
         switch (func.opcode(insts[idx])) {
-            .arith, .arith_imm => {},
+            .iconst, .arith, .arith_imm, .convert => {},
             else => return null,
         }
     } else return null;
@@ -4606,7 +4606,7 @@ fn parityForCmp(func: *const Function, insts: []const ir.function.Inst, cmp_idx:
     var idx = cmp_idx + 1;
     while (idx < insts.len) : (idx += 1) {
         switch (func.opcode(insts[idx])) {
-            .arith, .arith_imm => continue,
+            .iconst, .arith, .arith_imm, .convert => continue,
             .select => |select| {
                 if (select.cond != condition) return null;
                 const cmp = fusedCmpForSelect(func, insts, idx) orelse return null;
@@ -4649,7 +4649,7 @@ fn cmpFeedsLaterSelect(func: *const Function, insts: []const ir.function.Inst, c
     var idx = cmp_idx + 1;
     while (idx < insts.len) : (idx += 1) {
         switch (func.opcode(insts[idx])) {
-            .arith, .arith_imm => continue,
+            .iconst, .arith, .arith_imm, .convert => continue,
             .select => {
                 const select = func.opcode(insts[idx]).select;
                 return select.cond == result and fusedCmpForSelect(func, insts, idx) != null;
@@ -6077,11 +6077,12 @@ test "folds a shifted low mask into ubfx" {
     try std.testing.expectEqual(encode.ret(), code[1]);
 }
 
-test "single-use integer compare feeds csel through flags without cset" {
+test "single-use integer compare preserves flags through pure integer setup" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
     const b = try func.appendBlock();
     const lhs = try func.appendBlockParam(b, t);
@@ -6090,7 +6091,11 @@ test "single-use integer compare feeds csel through flags without cset" {
     const else_value = try func.appendBlockParam(b, t);
     const cond = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = lhs, .rhs = rhs } });
     const adjusted = try func.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = then_value, .rhs = else_value } });
-    const selected = try func.appendInst(b, t, .{ .select = .{ .cond = cond, .then = adjusted, .@"else" = else_value } });
+    const unsigned = try func.appendInst(b, u32_t, .{ .convert = .{ .value = adjusted } });
+    const signed = try func.appendInst(b, t, .{ .convert = .{ .value = unsigned } });
+    const one = try func.appendInst(b, t, .{ .iconst = 1 });
+    const incremented = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = signed, .rhs = one } });
+    const selected = try func.appendInst(b, t, .{ .select = .{ .cond = cond, .then = incremented, .@"else" = else_value } });
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(selected) });
 
     const code = try selectFunction(allocator, &func);
