@@ -70,13 +70,22 @@ pub fn runSmallAcyclic(allocator: std.mem.Allocator, caller: *Function, lookup: 
 /// multi-block path appends cloned blocks and invalidates the analysis. The small total expansion
 /// budget prevents several loop call sites from multiplying a large dispatch tree without bound.
 pub fn runLoopAcyclic(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup) Error!bool {
+    return runLoopCalls(allocator, caller, lookup, false);
+}
+
+/// Inline bounded loop-bearing callees at call sites inside a natural loop.
+pub fn runLoopCycles(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup) Error!bool {
+    return runLoopCalls(allocator, caller, lookup, true);
+}
+
+fn runLoopCalls(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, require_cycle: bool) Error!bool {
     var changed = false;
     var expansion_budget: usize = 512;
     while (expansion_budget > 0) {
         var info = try loops.analyze(allocator, caller);
         defer info.deinit(allocator);
 
-        const inlined_size = try inlineOneInLoops(allocator, caller, lookup, &info, @min(expansion_budget, 256)) orelse break;
+        const inlined_size = try inlineOneInLoops(allocator, caller, lookup, &info, @min(expansion_budget, 256), require_cycle) orelse break;
         expansion_budget -= inlined_size;
         changed = true;
     }
@@ -175,14 +184,14 @@ fn blockInLoop(info: *const loops.LoopInfo, block: usize) bool {
     return false;
 }
 
-/// Inline one bounded, acyclic leaf called from a loop and return its instruction count. Keeping
-/// this to one mutation per analysis makes every loop-membership lookup valid.
+/// Inline one bounded leaf called from a loop and return its instruction count.
 fn inlineOneInLoops(
     allocator: std.mem.Allocator,
     caller: *Function,
     lookup: Lookup,
     info: *const loops.LoopInfo,
     instruction_limit: usize,
+    require_cycle: bool,
 ) Error!?usize {
     for (0..caller.blockCount()) |bi| {
         if (!blockInLoop(info, bi)) continue;
@@ -193,17 +202,31 @@ fn inlineOneInLoops(
             const callee = lookup.get(name) orelse continue;
             const size = instructionCount(callee);
             if (size == 0 or size > instruction_limit) continue;
+            if (require_cycle and !cycleInlineSafe(callee)) continue;
             if (inlinable(callee)) {
+                if (require_cycle) continue;
                 try inlineCall(allocator, caller, @intCast(bi), idx, inst, callee);
                 return size;
             }
-            if (inlinableMulti(callee) and !try hasCfgCycle(allocator, callee)) {
+            if (inlinableMulti(callee) and try hasCfgCycle(allocator, callee) == require_cycle) {
                 try inlineCallMulti(allocator, caller, @intCast(bi), idx, inst, callee);
                 return size;
             }
         }
     }
     return null;
+}
+
+fn cycleInlineSafe(callee: *const Function) bool {
+    for (0..callee.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (callee.blockInsts(block)) |inst| switch (callee.opcode(inst)) {
+            .store, .atomic_rmw, .prefetch, .matmul, .barrier, .call, .call_indirect => return false,
+            .load => |load| if (load.@"volatile") return false,
+            else => {},
+        };
+    }
+    return true;
 }
 
 fn inlineCall(allocator: std.mem.Allocator, caller: *Function, bi: u32, call_idx: usize, call_inst: Inst, callee: *const Function) Error!void {

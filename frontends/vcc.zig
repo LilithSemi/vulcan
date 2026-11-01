@@ -985,6 +985,7 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
     const early_end = std.Io.Timestamp.now(io, .awake);
 
     const microarch_start = early_end;
+    if (optimize.inlinesCalls() and profile == null) try inlineHotLoopBodies(allocator, &mod);
     if (optimize.runsMicroarch()) if (model) |m| {
         for (mod.funcs) |*nf| _ = try mm.optimizeTransforms(allocator, &nf.func, m);
     };
@@ -1076,6 +1077,11 @@ fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module, profile:
 fn inlineHotLoopCalls(allocator: std.mem.Allocator, mod: *cc.Module) !void {
     const lookup = opt.inlining.Lookup{ .context = mod, .func = ModuleLookup.get };
     for (mod.funcs) |*named| _ = try opt.inlining.runLoopAcyclic(allocator, &named.func, lookup);
+}
+
+fn inlineHotLoopBodies(allocator: std.mem.Allocator, mod: *cc.Module) !void {
+    const lookup = opt.inlining.Lookup{ .context = mod, .func = ModuleLookup.get };
+    for (mod.funcs) |*named| _ = try opt.inlining.runLoopCycles(allocator, &named.func, lookup);
 }
 
 fn profileHotThreshold(counts: []const u64) u64 {
@@ -2022,6 +2028,46 @@ test "translation-unit inlining gives loop calls a larger growth budget" {
             try std.testing.expect(main_func.opcode(inst) != .call);
         }
     }
+}
+
+test "translation-unit inlining admits a bounded loop callee at a hot loop site" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\int sum_to(int n) { int sum = 0; for (int i = 0; i < n; ++i) sum += i; return sum; }
+        \\int main(void) { int sum = 0; for (int i = 0; i < 100; ++i) sum += sum_to(i); return sum; }
+    );
+    defer mod.deinit(allocator);
+    const main_func = mod.find("main") orelse return error.TestUnexpectedResult;
+
+    try inlineTranslationUnit(allocator, &mod, null);
+    for (mod.funcs) |*named| _ = try opt.optimizeEarly(allocator, &named.func);
+    try inlineHotLoopBodies(allocator, &mod);
+    for (0..main_func.blockCount()) |bi| {
+        for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            try std.testing.expect(main_func.opcode(inst) != .call);
+        }
+    }
+}
+
+test "translation-unit inlining keeps a loop callee with memory writes separate" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\void fill(int *p, int n) { for (int i = 0; i < n; ++i) p[i] = i; }
+        \\int main(void) { int values[16]; for (int i = 0; i < 100; ++i) fill(values, 16); return values[15]; }
+    );
+    defer mod.deinit(allocator);
+    const main_func = mod.find("main") orelse return error.TestUnexpectedResult;
+
+    try inlineTranslationUnit(allocator, &mod, null);
+    for (mod.funcs) |*named| _ = try opt.optimizeEarly(allocator, &named.func);
+    try inlineHotLoopBodies(allocator, &mod);
+    var calls: usize = 0;
+    for (0..main_func.blockCount()) |bi| {
+        for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (main_func.opcode(inst) == .call) calls += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
 test "profile-guided translation-unit inlining keeps a cold call" {
