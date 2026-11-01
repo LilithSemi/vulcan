@@ -347,6 +347,7 @@ pub fn pairMemoryForModelWithMoves(
         std.debug.assert(bs.* <= write);
     }
     for (fixups) |*f| {
+        if (f.table_base) |base| f.table_base = base - removed_before[base];
         f.at -= removed_before[f.at];
         std.debug.assert(f.at < write);
     }

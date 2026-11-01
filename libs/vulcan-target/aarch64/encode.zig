@@ -577,6 +577,11 @@ pub fn ldrW(rt: Reg, rn: Reg, off: u14) u32 {
     return 0xB9400000 | ((@as(u32, off) >> 2) << 10) | (n(rn) << 5) | n(rt);
 }
 
+/// `ldr wt, [xn, xm, lsl #2]` (32-bit load with a scaled register offset).
+pub fn ldrWReg(rt: Reg, rn: Reg, rm: Reg) u32 {
+    return 0xB8607800 | (n(rm) << 16) | (n(rn) << 5) | n(rt);
+}
+
 /// `ldrsw xt, [xn, #off]` (load a 32-bit word, sign-extended into the 64-bit register). `off`
 /// is a byte offset, scaled by 4 (a multiple of 4). Used to read a signed `va_list` field
 /// (`__gr_offs`/`__vr_offs`) whole into an X register so the negative value adds to a pointer.
@@ -1544,6 +1549,10 @@ test "ldp/stp offset-form encoders match known bytes" {
     const s4 = try disasm.one(a, ldpOffW(.x3, .x4, .x5, -8));
     defer a.free(s4);
     try std.testing.expectEqualStrings("ldp w3, w4, [x5, #-8]", s4);
+}
+
+test "scaled register-offset word load encoding" {
+    try std.testing.expectEqual(@as(u32, 0xB8747A11), ldrWReg(.x17, .x16, .x20));
 }
 
 test "aarch64 byte and halfword offset-form load/store encoders match the disassembler" {

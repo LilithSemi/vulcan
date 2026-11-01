@@ -314,7 +314,14 @@ fn emitGprStackLoad(allocator: std.mem.Allocator, code: *std.ArrayList(u32), dst
 }
 
 const Move = struct { src: Reg, dst: Reg };
-pub const Fixup = struct { at: usize, target: u32, cond: ?encode.Cond = null };
+pub const Fixup = struct {
+    at: usize,
+    target: u32,
+    cond: ?encode.Cond = null,
+    /// Word index used as the base of a dense-switch offset table. Null identifies an ordinary
+    /// branch fixup. A table row stores `(target - table_base)` in instruction words.
+    table_base: ?usize = null,
+};
 
 const DenseSwitch = struct {
     value: Value,
@@ -2189,13 +2196,14 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         }
                         const adr_at = code.items.len;
                         try code.append(allocator, encode.adr(scratch_imm, 0));
-                        try code.append(allocator, encode.addShifted64(scratch_move, scratch_imm, index, 2));
+                        try code.append(allocator, encode.ldrWReg(scratch_move, scratch_imm, index));
+                        try code.append(allocator, encode.addShifted64(scratch_move, scratch_imm, scratch_move, 2));
                         try code.append(allocator, encode.br(scratch_move));
                         const table_at = code.items.len;
                         code.items[adr_at] = encode.adr(scratch_imm, @intCast((@as(i64, @intCast(table_at)) - @as(i64, @intCast(adr_at))) * 4));
                         for (plan.targets) |target| {
-                            try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(target) });
-                            try code.append(allocator, encode.b(0));
+                            try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(target), .table_base = table_at });
+                            try code.append(allocator, 0);
                         }
                     } else try ctx.emitIf(
                         allocator,
@@ -2373,6 +2381,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             const block: Block = @fromBackingInt(@intCast(target));
             const forwarded = transparentForwardTarget(func, alloc, block) orelse break;
             target = @backingInt(forwarded);
+        }
+        if (f.table_base) |table_base| {
+            std.debug.assert(block_start[target] >= table_base);
+            const word_delta = block_start[target] - table_base;
+            if (word_delta > std.math.maxInt(u32)) return error.Unsupported;
+            code.items[f.at] = @intCast(word_delta);
+            continue;
         }
         const off: i28 = @intCast((@as(i64, @intCast(block_start[target])) - @as(i64, @intCast(f.at))) * 4);
         code.items[f.at] = if (f.cond) |cond| encode.bcc(cond, @intCast(off)) else encode.b(off);
