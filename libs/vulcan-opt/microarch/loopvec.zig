@@ -52,9 +52,10 @@ const Plan = struct {
     groups: u32,
     /// Scalar element type of a vector induction carried through the widened loop.
     index_elem_type: ?Type,
+    carry_addresses: bool,
 };
 
-fn carriedArgs(storage: []Value, index: Value, vector_index: ?Value, accumulators: []const ?Value) []const Value {
+fn carriedArgs(storage: []Value, index: Value, vector_index: ?Value, accumulators: []const ?Value, pointers: []const Value) []const Value {
     var len: usize = 0;
     storage[len] = index;
     len += 1;
@@ -66,6 +67,10 @@ fn carriedArgs(storage: []Value, index: Value, vector_index: ?Value, accumulator
         storage[len] = value;
         len += 1;
     };
+    for (pointers) |pointer| {
+        storage[len] = pointer;
+        len += 1;
+    }
     return storage[0..len];
 }
 
@@ -106,6 +111,16 @@ fn functionHasFastMath(func: *const Function) bool {
 fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error!void {
     const V = plan.factor;
     const U = V * plan.groups;
+    var pointer_families: std.ArrayList(AccessBase) = .empty;
+    defer pointer_families.deinit(allocator);
+    if (plan.carry_addresses) for (plan.accesses) |access| {
+        var found = false;
+        for (pointer_families.items) |family| if (family.base == access.base and family.stride == access.stride) {
+            found = true;
+            break;
+        };
+        if (!found) try pointer_families.append(allocator, .{ .base = access.base, .stride = access.stride });
+    };
     const ind_ty = func.valueType(func.blockParams(plan.header)[plan.induction]);
     const reduction_ty = if (plan.reduction) |red| func.valueType(func.blockParams(plan.header)[red.accumulator]) else null;
     const reduction_vec_ty = if (reduction_ty) |elem|
@@ -136,6 +151,10 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     if (reduction_vec_ty) |vec_ty| {
         for (0..plan.groups) |group| maccs[group] = try func.appendBlockParam(mainheader, vec_ty);
     }
+    const mptrs = try allocator.alloc(Value, pointer_families.items.len);
+    defer allocator.free(mptrs);
+    for (pointer_families.items, mptrs) |family, *pointer|
+        pointer.* = try func.appendBlockParam(mainheader, func.valueType(family.base));
 
     // Preheader -> main header, carrying the induction's initial value.
     const pre_args = try allocator.dupe(Value, func.blockArgs(func.terminator(plan.preheader).?.jump));
@@ -161,10 +180,21 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     } else null;
     var initial_accs: [2]?Value = @splat(null);
     for (0..plan.groups) |group| initial_accs[group] = vector_identity;
+    const initial_ptrs = try allocator.alloc(Value, pointer_families.items.len);
+    defer allocator.free(initial_ptrs);
+    for (pointer_families.items, initial_ptrs) |family, *pointer| {
+        const pointer_ty = func.valueType(family.base);
+        const scaled = try func.appendArithImm(plan.preheader, pointer_ty, .mul, init_i, family.stride);
+        pointer.* = try func.appendInst(plan.preheader, pointer_ty, .{ .arith = .{ .op = .add, .lhs = family.base, .rhs = scaled } });
+    }
     const threshold = if (ind_int.signedness == .unsigned and offset_fits)
         try func.appendArithImm(plan.preheader, ind_ty, .sub, plan.bound, group_offset.?)
     else
         null;
+    const carried_storage_a = try allocator.alloc(Value, 4 + pointer_families.items.len);
+    defer allocator.free(carried_storage_a);
+    const carried_storage_b = try allocator.alloc(Value, 4 + pointer_families.items.len);
+    defer allocator.free(carried_storage_b);
     if (threshold != null) {
         const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
         const wide_bound = try func.appendInst(plan.preheader, u64_t, .{ .convert = .{ .value = plan.bound } });
@@ -179,12 +209,10 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         };
         const reverse: CmpOp = if (plan.exit_cond == .lt) .gt else .ge;
         const can_enter = try func.appendInst(plan.preheader, bool_t, .{ .icmp = .{ .op = reverse, .lhs = wide_bound, .rhs = wide_highest } });
-        var enter_storage: [4]Value = undefined;
-        const enter_args = carriedArgs(&enter_storage, init_i, init_vi, &initial_accs);
+        const enter_args = carriedArgs(carried_storage_a, init_i, init_vi, &initial_accs, initial_ptrs);
         try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = enter_args }, .{ .target = plan.header, .args = pre_args });
     } else {
-        var enter_storage: [4]Value = undefined;
-        try func.setJump(plan.preheader, mainheader, carriedArgs(&enter_storage, init_i, init_vi, &initial_accs));
+        try func.setJump(plan.preheader, mainheader, carriedArgs(carried_storage_a, init_i, init_vi, &initial_accs, initial_ptrs));
     }
 
     // Main header: run a full group only while the highest index in it still passes the test.
@@ -217,9 +245,7 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         break :guard guarded;
     };
     if (cont) |condition| {
-        var body_storage: [4]Value = undefined;
-        var combine_storage: [3]Value = undefined;
-        try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = carriedArgs(&body_storage, mi, mvi, &maccs) }, .{ .target = combine, .args = carriedArgs(&combine_storage, mi, null, &maccs) });
+        try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = carriedArgs(carried_storage_a, mi, mvi, &maccs, mptrs) }, .{ .target = combine, .args = carriedArgs(carried_storage_b, mi, null, &maccs, &.{}) });
     }
 
     // Main body: U copies emitted operation-major in V-wide groups, which gives the SLP pass one or more
@@ -240,8 +266,13 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     } else if (reduction_vec_ty) |vec_ty| {
         for (0..plan.groups) |group| baccs[group] = try func.appendBlockParam(mainbody, vec_ty);
     }
+    const bptrs = try allocator.alloc(Value, pointer_families.items.len);
+    defer allocator.free(bptrs);
+    if (rotated) {
+        @memcpy(bptrs, mptrs);
+    } else for (pointer_families.items, bptrs) |family, *pointer|
+        pointer.* = try func.appendBlockParam(mainbody, func.valueType(family.base));
     const ind_update = plan.induction_update;
-    const base_ty = func.valueType(plan.accesses[0].base);
 
     // Per-copy value maps, pre-seeded with the induction and every regenerated address. Deduplicate by
     // the address instruction (a load and a store to the same slot share it).
@@ -283,12 +314,21 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         try skip.put(allocator, acc.scale_inst, {});
         const addr_res = func.instResult(acc.addr_inst).?;
         if (vmaps[0].contains(addr_res)) continue; // already handled via a shared address instruction
-        const entry = try access_bases.getOrPut(allocator, .{ .base = acc.base, .stride = acc.stride });
-        if (!entry.found_existing) {
-            const scaled = try func.appendArithImm(mainbody, base_ty, .mul, bmi, acc.stride);
-            entry.value_ptr.* = try func.appendInst(mainbody, base_ty, .{ .arith = .{ .op = .add, .lhs = acc.base, .rhs = scaled } });
-        }
-        const unadjusted = entry.value_ptr.*;
+        const unadjusted = if (plan.carry_addresses) carried: {
+            for (pointer_families.items, 0..) |family, family_index| {
+                if (family.base == acc.base and family.stride == acc.stride) break :carried bptrs[family_index];
+            }
+            unreachable;
+        } else calculated: {
+            const base_ty = func.valueType(acc.base);
+            const entry = try access_bases.getOrPut(allocator, .{ .base = acc.base, .stride = acc.stride });
+            if (!entry.found_existing) {
+                const scaled = try func.appendArithImm(mainbody, base_ty, .mul, bmi, acc.stride);
+                entry.value_ptr.* = try func.appendInst(mainbody, base_ty, .{ .arith = .{ .op = .add, .lhs = acc.base, .rhs = scaled } });
+            }
+            break :calculated entry.value_ptr.*;
+        };
+        const base_ty = func.valueType(acc.base);
         const base_i = if (acc.offset == 0)
             unadjusted
         else
@@ -351,14 +391,15 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     };
     const nmi = try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(U)));
     const next_vi = if (bvi) |vi| try func.appendInst(mainbody, index_vec_ty.?, .{ .arith = .{ .op = .add, .lhs = vi, .rhs = index_step.? } }) else null;
+    const next_ptrs = try allocator.alloc(Value, pointer_families.items.len);
+    defer allocator.free(next_ptrs);
+    for (pointer_families.items, bptrs, next_ptrs) |family, pointer, *next|
+        next.* = try func.appendArithImm(mainbody, func.valueType(family.base), .add, pointer, @as(i64, @intCast(U)) * family.stride);
     if (rotated) {
         const next_cont = try func.appendInst(mainbody, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = nmi, .rhs = threshold.? } });
-        var loop_storage: [4]Value = undefined;
-        var exit_storage: [3]Value = undefined;
-        try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = carriedArgs(&loop_storage, nmi, next_vi, &next_accs) }, .{ .target = combine, .args = carriedArgs(&exit_storage, nmi, null, &next_accs) });
+        try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = carriedArgs(carried_storage_a, nmi, next_vi, &next_accs, next_ptrs) }, .{ .target = combine, .args = carriedArgs(carried_storage_b, nmi, null, &next_accs, &.{}) });
     } else {
-        var loop_storage: [4]Value = undefined;
-        try func.setJump(mainbody, mainheader, carriedArgs(&loop_storage, nmi, next_vi, &next_accs));
+        try func.setJump(mainbody, mainheader, carriedArgs(carried_storage_a, nmi, next_vi, &next_accs, next_ptrs));
     }
 
     // Continue in the original loop at the current index and accumulator value.
@@ -673,6 +714,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         .factor = V,
         .groups = groups,
         .index_elem_type = index_elem_type,
+        .carry_addresses = model.arch == .aarch64,
     };
 }
 
@@ -1370,13 +1412,18 @@ test "recognizes a frontend-shaped stencil map with xor reduction and affine nei
     try testing.expect(!saw_wide_group_offset);
     const vector_body = vector_header;
     var scaled_bases: usize = 0;
+    var pointer_steps: usize = 0;
     for (func.blockInsts(vector_body)) |inst| switch (func.opcode(inst)) {
         .arith_imm => |arith| if (arith.op == .mul) {
             scaled_bases += 1;
+        } else if (arith.op == .add and arith.imm == 16) {
+            const result = func.instResult(inst).?;
+            if (func.types.type_kind(func.valueType(result)) == .ptr) pointer_steps += 1;
         },
         else => {},
     };
-    try testing.expectEqual(@as(usize, 2), scaled_bases); // one each for input and output
+    try testing.expectEqual(@as(usize, 0), scaled_bases);
+    try testing.expectEqual(@as(usize, 2), pointer_steps); // one each for input and output
     var diags = try ir.verify.verify(allocator, &func, .low);
     defer diags.deinit();
     try testing.expect(diags.ok());
