@@ -104,7 +104,7 @@ fn machineClass(word: u32) MachineClass {
 
 const RegisterDeps = struct {
     reads: [4]?u7 = @splat(null),
-    writes: [2]?u7 = @splat(null),
+    writes: [3]?u7 = @splat(null),
 };
 
 fn dependencies(word: u32, class: MachineClass) RegisterDeps {
@@ -113,7 +113,7 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
             fpReg(mem.rt)
         else
             gpReg(mem.rt);
-        if (isLoad(mem.kind)) return .{ .reads = .{ gpReg(mem.rn), null, null, null }, .writes = .{ data, null } };
+        if (isLoad(mem.kind)) return .{ .reads = .{ gpReg(mem.rn), null, null, null }, .writes = .{ data, null, null } };
         return .{ .reads = .{ gpReg(mem.rn), data, null, null } };
     }
     if (decodePairMemory(word)) |pair| {
@@ -123,20 +123,20 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
         const rn: u5 = @truncate(word >> 5);
         const data1 = if (pair.simd) fpReg(rt1) else gpReg(rt1);
         const data2 = if (pair.simd) fpReg(rt2) else gpReg(rt2);
-        if (load) return .{ .reads = .{ gpReg(rn), null, null, null }, .writes = .{ data1, data2 } };
+        if (load) return .{ .reads = .{ gpReg(rn), null, null, null }, .writes = .{ data1, data2, if (pair.writeback) gpReg(rn) else null } };
         return .{ .reads = .{ gpReg(rn), data1, data2, null } };
     }
     if (isRegisterMemory(word)) {
         const rt: u5 = @truncate(word);
         const rn: u5 = @truncate(word >> 5);
         const rm: u5 = @truncate(word >> 16);
-        return .{ .reads = .{ gpReg(rn), gpReg(rm), null, null }, .writes = .{ gpReg(rt), null } };
+        return .{ .reads = .{ gpReg(rn), gpReg(rm), null, null }, .writes = .{ gpReg(rt), null, null } };
     }
     if (class == .mul) {
         const ra: u5 = @truncate(word >> 10);
         return .{
             .reads = .{ gpReg(@truncate(word >> 5)), gpReg(@truncate(word >> 16)), gpReg(ra), null },
-            .writes = .{ gpReg(@truncate(word)), null },
+            .writes = .{ gpReg(@truncate(word)), null, null },
         };
     }
     if (class == .div or isRegisterAlu(word)) {
@@ -147,7 +147,7 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
                 if (readsFlags(word)) nzcvReg() else null,
                 null,
             },
-            .writes = .{ gpReg(@truncate(word)), null },
+            .writes = .{ gpReg(@truncate(word)), null, null },
         };
         if (writesFlags(word)) result.writes[1] = nzcvReg();
         return result;
@@ -155,14 +155,14 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
     if (isImmediateAlu(word)) {
         var result = RegisterDeps{
             .reads = .{ gpReg(@truncate(word >> 5)), null, null, null },
-            .writes = .{ gpReg(@truncate(word)), null },
+            .writes = .{ gpReg(@truncate(word)), null, null },
         };
         if (writesFlags(word)) result.writes[1] = nzcvReg();
         return result;
     }
     if (isMoveWide(word)) return .{
         .reads = .{ gpReg(@truncate(word)), null, null, null },
-        .writes = .{ gpReg(@truncate(word)), null },
+        .writes = .{ gpReg(@truncate(word)), null, null },
     };
     if (vectorDependencies(word)) |result| return result;
     if (isConditionalBranch(word)) return .{ .reads = .{ nzcvReg(), null, null, null } };
@@ -241,28 +241,28 @@ fn vectorDependencies(word: u32) ?RegisterDeps {
                 if (accumulates) fpReg(@truncate(word)) else null,
                 null,
             },
-            .writes = .{ fpReg(@truncate(word)), null },
+            .writes = .{ fpReg(@truncate(word)), null, null },
         },
         0x4E000400, // DUP Vd.4S, Vn.S[index]
         0x5E000400, // DUP Sd, Vn.S[index]
         => return .{
             .reads = .{ fpReg(@truncate(word >> 5)), null, null, null },
-            .writes = .{ fpReg(@truncate(word)), null },
+            .writes = .{ fpReg(@truncate(word)), null, null },
         },
         0x6E000400, // INS Vd.S[index], Vn.S[0]
         => return .{
             .reads = .{ fpReg(@truncate(word >> 5)), fpReg(@truncate(word)), null, null },
-            .writes = .{ fpReg(@truncate(word)), null },
+            .writes = .{ fpReg(@truncate(word)), null, null },
         },
         else => {},
     }
     if (word & 0xFFFFFC00 == 0x4E040C00) return .{
         .reads = .{ gpReg(@truncate(word >> 5)), null, null, null },
-        .writes = .{ fpReg(@truncate(word)), null },
+        .writes = .{ fpReg(@truncate(word)), null, null },
     };
     if (word & 0xFF00FC00 == 0x4F005400) return .{
         .reads = .{ fpReg(@truncate(word >> 5)), null, null, null },
-        .writes = .{ fpReg(@truncate(word)), null },
+        .writes = .{ fpReg(@truncate(word)), null, null },
     };
     return null;
 }
@@ -281,12 +281,13 @@ fn isDivide(word: u32) bool {
     return form == 0x1AC00C00 or form == 0x1AC00800;
 }
 
-const PairMemory = struct { simd: bool };
+const PairMemory = struct { simd: bool, writeback: bool = false };
 
 fn decodePairMemory(word: u32) ?PairMemory {
     return switch (word & 0xFFC00000) {
         0xA9400000, 0xA9000000, 0x29400000, 0x29000000 => .{ .simd = false },
         0xAD400000, 0xAD000000 => .{ .simd = true },
+        0xACC00000 => .{ .simd = true, .writeback = true },
         else => null,
     };
 }
@@ -419,6 +420,23 @@ pub fn tryFuse(a: MemInsn, b: MemInsn) ?u32 {
         .str_q => encode.stpOffQ(rt1, rt2, rn, imm),
         .ldr_s, .str_s, .ldr_d, .str_d => null,
     };
+}
+
+fn tryPostIndexQ(pair_word: u32, add_word: u32) ?u32 {
+    if (pair_word & 0xFFC00000 != 0xAD400000) return null;
+    if ((pair_word >> 15) & 0x7F != 0) return null;
+    if (add_word & 0xFFC00000 != 0x91000000) return null;
+    const base: u5 = @truncate(pair_word >> 5);
+    const add_source: u5 = @truncate(add_word >> 5);
+    const add_dest: u5 = @truncate(add_word);
+    const immediate = (add_word >> 10) & 0xFFF;
+    if (add_source != base or add_dest != base or immediate != 32) return null;
+    return encode.ldpPostQ(
+        @fromBackingInt(@as(u5, @truncate(pair_word))),
+        @fromBackingInt(@as(u5, @truncate(pair_word >> 10))),
+        @fromBackingInt(base),
+        32,
+    );
 }
 
 /// Fuse an adjacent integer `mul` and register `add` when the add consumes the product exactly
@@ -816,6 +834,82 @@ pub fn pairMemoryForModelWithMoveProofs(
         if (!candidate.accepts(baseline)) continue;
         for (rewrite.at[0..rewrite.len], rewrite.words[0..rewrite.len]) |at, word| words.items[at] = word;
         removed_distant[move_at] = true;
+    }
+
+    // Normalize two interleaved Q-load streams before looking for their pointer updates. Keeping
+    // both resulting pairs in the first two slots lets the post-index scan below reason about each
+    // base independently while the ordinary compactor removes the consumed trailing loads.
+    if (len >= 4) for (0..len - 3) |at| {
+        if (removed_distant[at] or removed_distant[at + 1] or removed_distant[at + 2] or removed_distant[at + 3] or
+            is_block_start[at + 1] or is_block_start[at + 2] or is_block_start[at + 3] or
+            is_data[at] or is_data[at + 1] or is_data[at + 2] or is_data[at + 3]) continue;
+        const a0 = decodeMem(words.items[at]) orelse continue;
+        const b0 = decodeMem(words.items[at + 1]) orelse continue;
+        const a1 = decodeMem(words.items[at + 2]) orelse continue;
+        const b1 = decodeMem(words.items[at + 3]) orelse continue;
+        if (a0.kind != .ldr_q or b0.kind != .ldr_q or a1.kind != .ldr_q or b1.kind != .ldr_q) continue;
+        const pair_a = tryFuse(a0, a1) orelse continue;
+        const pair_b = tryFuse(b0, b1) orelse continue;
+        const baseline = scoreWords(words.items[at .. at + 4], model);
+        const candidate = scoreWords(&.{ pair_a, pair_b }, model);
+        if (!candidate.accepts(baseline)) continue;
+        words.items[at] = pair_a;
+        words.items[at + 1] = pair_b;
+        removed_distant[at + 2] = true;
+        removed_distant[at + 3] = true;
+    };
+
+    // A carried vector pointer commonly reaches the machine stream as either two adjacent Q loads
+    // or an already-paired `ldp q..., [base]`, followed by a few independent instructions and then
+    // `add base, base, #32`. Pair and fold the update in one scored rewrite when nothing between
+    // them observes or changes `base`. This is deliberately a physical-register rewrite: exact
+    // register hazards and the final machine score are both known.
+    for (0..len) |load_at| {
+        if (removed_distant[load_at] or is_data[load_at]) continue;
+        var pair_word: u32 = undefined;
+        var pair_second: ?usize = null;
+        if (decodePairMemory(words.items[load_at])) |pair| {
+            if (!pair.simd or pair.writeback or words.items[load_at] & 0xFFC00000 != 0xAD400000) continue;
+            pair_word = words.items[load_at];
+        } else {
+            const second_at = load_at + 1;
+            if (second_at >= len or removed_distant[second_at] or is_block_start[second_at] or is_data[second_at]) continue;
+            const first = decodeMem(words.items[load_at]) orelse continue;
+            const second = decodeMem(words.items[second_at]) orelse continue;
+            if (first.kind != .ldr_q or second.kind != .ldr_q) continue;
+            pair_word = tryFuse(first, second) orelse continue;
+            pair_second = second_at;
+        }
+        const base: u5 = @truncate(pair_word >> 5);
+        var add_at = (pair_second orelse load_at) + 1;
+        while (add_at < len and add_at - load_at <= 8) : (add_at += 1) {
+            if (removed_distant[add_at]) continue;
+            if (is_block_start[add_at] or is_data[add_at]) break;
+            if (tryPostIndexQ(pair_word, words.items[add_at])) |post| {
+                var baseline_words: [9]u32 = undefined;
+                var candidate_words: [8]u32 = undefined;
+                var baseline_len: usize = 0;
+                var candidate_len: usize = 0;
+                for (load_at..add_at + 1) |at| {
+                    if (removed_distant[at]) continue;
+                    baseline_words[baseline_len] = words.items[at];
+                    baseline_len += 1;
+                    if (at == add_at or at == pair_second) continue;
+                    candidate_words[candidate_len] = if (at == load_at) post else words.items[at];
+                    candidate_len += 1;
+                }
+                if (scoreWords(candidate_words[0..candidate_len], model).accepts(scoreWords(baseline_words[0..baseline_len], model))) {
+                    words.items[load_at] = post;
+                    if (pair_second) |second_at| removed_distant[second_at] = true;
+                    removed_distant[add_at] = true;
+                }
+                break;
+            }
+            const class = machineClass(words.items[add_at]);
+            if (class == .branch) break;
+            const deps = dependencies(words.items[add_at], class);
+            if (containsReg(deps.reads, base) or containsReg(deps.writes, base)) break;
+        }
     }
 
     // `removed_before[w]` = number of words deleted with index strictly before `w`, with the twist
@@ -1333,6 +1427,63 @@ test "pairMemory scores and fuses two interleaved q-load streams" {
     try std.testing.expectEqualSlices(u32, &.{
         encode.ldpOffQ(.x12, .x14, .x23, 0),
         encode.ldpOffQ(.x13, .x15, .x24, 0),
+    }, words.items);
+}
+
+test "pairMemory folds a carried q-pair pointer update into post-index" {
+    const allocator = std.testing.allocator;
+    var words = try wordsFrom(allocator, &.{
+        encode.ldpOffQ(.x0, .x1, .x2, 0),
+        encode.add(.x3, .x4, .x5),
+        encode.addImm64(.x2, .x2, 32),
+    });
+    defer words.deinit(allocator);
+
+    try pairMemory(allocator, &words, &.{}, &.{}, &.{}, &.{});
+
+    try std.testing.expectEqualSlices(u32, &.{
+        encode.ldpPostQ(.x0, .x1, .x2, 32),
+        encode.add(.x3, .x4, .x5),
+    }, words.items);
+}
+
+test "pairMemory combines q loads with a carried pointer update" {
+    const allocator = std.testing.allocator;
+    var words = try wordsFrom(allocator, &.{
+        encode.ldrQ(.x0, .x2, 0),
+        encode.ldrQ(.x1, .x2, 16),
+        encode.add(.x3, .x4, .x5),
+        encode.addImm64(.x2, .x2, 32),
+    });
+    defer words.deinit(allocator);
+
+    try pairMemory(allocator, &words, &.{}, &.{}, &.{}, &.{});
+
+    try std.testing.expectEqualSlices(u32, &.{
+        encode.ldpPostQ(.x0, .x1, .x2, 32),
+        encode.add(.x3, .x4, .x5),
+    }, words.items);
+}
+
+test "pairMemory post-indexes two interleaved q-load streams" {
+    const allocator = std.testing.allocator;
+    var words = try wordsFrom(allocator, &.{
+        encode.ldrQ(.x0, .x10, 0),
+        encode.ldrQ(.x2, .x11, 0),
+        encode.ldrQ(.x1, .x10, 16),
+        encode.ldrQ(.x3, .x11, 16),
+        encode.addImm(.x4, .x4, 8),
+        encode.addImm64(.x10, .x10, 32),
+        encode.addImm64(.x11, .x11, 32),
+    });
+    defer words.deinit(allocator);
+
+    try pairMemory(allocator, &words, &.{}, &.{}, &.{}, &.{});
+
+    try std.testing.expectEqualSlices(u32, &.{
+        encode.ldpPostQ(.x0, .x1, .x10, 32),
+        encode.ldpPostQ(.x2, .x3, .x11, 32),
+        encode.addImm(.x4, .x4, 8),
     }, words.items);
 }
 

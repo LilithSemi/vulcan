@@ -519,6 +519,13 @@ pub fn ldpOffQ(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
     return 0xAD400000 | (imm7 << 15) | (n(rt2) << 10) | (n(rn) << 5) | n(rt1);
 }
 
+/// `ldp qt1, qt2, [rn], #imm` (128-bit SIMD registers, signed post-index). `imm` is a multiple of
+/// 16 in the range [-1024, 1008].
+pub fn ldpPostQ(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
+    const imm7: u32 = @as(u32, @bitCast(@as(i32, imm) >> 4)) & 0x7F;
+    return 0xACC00000 | (imm7 << 15) | (n(rt2) << 10) | (n(rn) << 5) | n(rt1);
+}
+
 /// `stp qt1, qt2, [rn, #imm]` (128-bit SIMD registers, signed offset, no writeback).
 pub fn stpOffQ(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
     const imm7: u32 = @as(u32, @bitCast(@as(i32, imm) >> 4)) & 0x7F;
@@ -1588,6 +1595,7 @@ test "ldp/stp offset-form encoders match known bytes" {
     try std.testing.expectEqual(@as(u32, 0x29010440), stpOffW(.x0, .x1, .x2, 8));
     try std.testing.expectEqual(@as(u32, 0x297F10A3), ldpOffW(.x3, .x4, .x5, -8));
     try std.testing.expectEqual(@as(u32, 0xAD410440), ldpOffQ(.x0, .x1, .x2, 32));
+    try std.testing.expectEqual(@as(u32, 0xACC10440), ldpPostQ(.x0, .x1, .x2, 32));
 
     const disasm = @import("disasm.zig");
     const a = std.testing.allocator;
