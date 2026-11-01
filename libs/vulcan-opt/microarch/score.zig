@@ -74,12 +74,22 @@ pub fn function(allocator: std.mem.Allocator, func: *const Function, model: *con
 
     var result: Score = .{};
     for (0..func.blockCount()) |bi| {
-        const block_result = try block(allocator, func, @fromBackingInt(@intCast(bi)), model);
+        const block_id: Block = @fromBackingInt(@intCast(bi));
+        const block_result = try block(allocator, func, block_id, model);
         const weight = executionWeight(&graph, &doms, &loop_info, bi);
         result.cycles += block_result.cycles * weight;
         result.instructions += block_result.instructions * weight;
         result.peak_live = @max(result.peak_live, block_result.peak_live);
         result.idle_slots += block_result.idle_slots * weight;
+
+        if (func.terminator(block_id)) |term| switch (term) {
+            .jump => |jump| if (@backingInt(jump.target) <= bi) {
+                result.cycles += weight;
+                result.instructions += weight;
+                result.idle_slots += (@as(u64, @max(1, model.issue_width)) - 1) * weight;
+            },
+            .ret => {},
+        };
     }
     return result;
 }
