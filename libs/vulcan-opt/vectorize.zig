@@ -496,12 +496,14 @@ fn vectorizeImmediateOne(
         }
         const chained_lhs = chainVector(vmap, lhs[0..lanes]) != null;
         const load_run = if (chained_lhs) null else analyzeLoadRun(func, block, lhs[0..lanes], g, model != null and model.?.arch == .aarch64);
+        const progression_lhs = !chained_lhs and load_run == null and arithmeticProgression(func, lhs[0..lanes]) != null;
         const result_store = resultsAreCoalesceableStores(func, block, results[0..lanes], lanes, model != null and model.?.arch == .aarch64);
         const result_chained = if (result_store) false else resultsChainIntoGroup(func, block, results[0..lanes], g + lanes - 1);
         if (model) |m| {
             const coalesced_ops: u8 = if (load_run != null) 1 else 0;
             const chained_ops: u8 = if (chained_lhs) 1 else 0;
-            if (!cost.slpProfitableMem(m, head.arith_imm.op, false, lanes, 2, coalesced_ops, chained_ops, 1, result_store, result_chained)) continue :scan;
+            const splat_ops: u8 = 1 + @as(u8, @intFromBool(progression_lhs));
+            if (!cost.slpProfitableMem(m, head.arith_imm.op, false, lanes, 2, coalesced_ops, chained_ops, splat_ops, result_store, result_chained)) continue :scan;
         }
         pos = g;
         op = head.arith_imm.op;
@@ -631,8 +633,8 @@ fn vectorizeOne(
             // A splat operand is the same scalar in every lane (e.g. the SAXPY invariant multiplier):
             // built by one broadcast (`dup`), not a per-lane pack. Only when it is not already a chain
             // reuse or a coalesced load run (those take priority in `buildOperand`).
-            const splat_a = !chain_a and run_a == null and allSame(ca[0..lanes]);
-            const splat_b = if (a_eq_b) splat_a else (!chain_b and run_b == null and allSame(cb[0..lanes]));
+            const splat_a = !chain_a and run_a == null and (allSame(ca[0..lanes]) or arithmeticProgression(func, ca[0..lanes]) != null);
+            const splat_b = if (a_eq_b) splat_a else (!chain_b and run_b == null and (allSame(cb[0..lanes]) or arithmeticProgression(func, cb[0..lanes]) != null));
             if (model) |m| {
                 const distinct: u8 = if (a_eq_b) 1 else 2;
                 const coalesced_ops: u8 = if (a_eq_b)
@@ -738,6 +740,20 @@ fn buildOperand(
         }
         return func.appendSplat(block, vt, scalars[0]);
     }
+    if (arithmeticProgression(func, scalars)) |progression| {
+        const elem_t = func.valueType(progression.base);
+        const base = try func.appendSplat(block, vt, progression.base);
+        var offsets: [MAX_LANES]Value = undefined;
+        for (offsets[0..scalars.len], 0..) |*offset, lane| {
+            const immediate = std.math.mul(i64, progression.step, @intCast(lane)) catch unreachable;
+            offset.* = try func.appendInst(block, elem_t, .{ .iconst = immediate });
+        }
+        const offset_vector = try pack(func, block, vt, offsets[0..scalars.len]);
+        const vector = try func.appendInst(block, vt, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset_vector } });
+        for (scalars, 0..) |scalar, lane| try vmap.put(allocator, scalar, .{ .vec = vector, .lane = @intCast(lane) });
+        coalesced.* = true;
+        return vector;
+    }
     const v = try pack(func, block, vt, scalars);
     for (scalars, 0..) |scalar, lane| try vmap.put(allocator, scalar, .{ .vec = v, .lane = @intCast(lane) });
     return v;
@@ -747,6 +763,47 @@ fn buildOperand(
 fn allSame(scalars: []const Value) bool {
     for (scalars[1..]) |s| if (s != scalars[0]) return false;
     return true;
+}
+
+const Progression = struct { base: Value, step: i64 };
+
+/// Recognize `[base, base + step, ..., base + (N - 1) * step]` before it becomes a lane-insert
+/// pack. The vector form is one broadcast plus one add, and its constant offset vector can hoist.
+fn arithmeticProgression(func: *const Function, scalars: []const Value) ?Progression {
+    if (scalars.len < 2) return null;
+    const base = scalars[0];
+    const second_inst = func.definingInst(scalars[1]) orelse return null;
+    const second = switch (func.opcode(second_inst)) {
+        .arith_imm => |arith| if (arith.op == .add and arith.lhs == base) arith else return null,
+        else => return null,
+    };
+    const step = second.imm;
+    for (scalars[2..], 2..) |scalar, lane| {
+        const expected = std.math.mul(i64, step, @intCast(lane)) catch return null;
+        const inst = func.definingInst(scalar) orelse return null;
+        const arith = switch (func.opcode(inst)) {
+            .arith_imm => |candidate| candidate,
+            else => return null,
+        };
+        if (arith.op != .add or arith.lhs != base or arith.imm != expected) return null;
+    }
+    return .{ .base = base, .step = step };
+}
+
+test "recognizes scalar induction lanes as an arithmetic progression" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const base = try func.appendBlockParam(block, i32_t);
+    var lanes: [4]Value = undefined;
+    lanes[0] = base;
+    for (lanes[1..], 1..) |*lane, index|
+        lane.* = try func.appendArithImm(block, i32_t, .add, base, @as(i64, @intCast(index)) * 17);
+    const progression = arithmeticProgression(&func, &lanes).?;
+    try std.testing.expectEqual(base, progression.base);
+    try std.testing.expectEqual(@as(i64, 17), progression.step);
 }
 
 /// If `scalars` are exactly lanes 0..N-1 of one existing vector, return that vector (chain reuse).
