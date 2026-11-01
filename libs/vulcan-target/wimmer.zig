@@ -1244,8 +1244,8 @@ fn tryAllocateFreeReg(
         }
     }
 
-    // Pick the register free the longest, preferring a hint on a tie. Three hints can apply: the
-    // copy-coalesce hint (a copy destination keeps its source's register, eliding the move), the
+    // Pick the register free the longest, preferring a hint that covers the whole interval. Three
+    // hints can apply: the copy-coalesce hint (a copy destination keeps its source's register), the
     // block-parameter hint (a parameter keeps an incoming argument's register, eliding the edge
     // move), and the entry-parameter hint (a parameter keeps its ABI register). The coalesce hint
     // wins, then the block-parameter hint, then the entry hint. These three never apply to the same
@@ -1269,12 +1269,12 @@ fn tryAllocateFreeReg(
     var chosen: ?u16 = null;
     if (coalesce_hint) |h| {
         if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
-            spanMin(&free_until, h, current.regs) == best_free) chosen = h;
+            spanMin(&free_until, h, current.regs) >= current.end()) chosen = h;
     }
     if (chosen == null) {
         for (param_hints) |h| {
             if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
-                spanMin(&free_until, h, current.regs) == best_free)
+                spanMin(&free_until, h, current.regs) >= current.end())
             {
                 chosen = h;
                 break;
@@ -1283,7 +1283,7 @@ fn tryAllocateFreeReg(
     }
     if (chosen == null) if (hint) |h| {
         if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
-            spanMin(&free_until, h, current.regs) == best_free) chosen = h;
+            spanMin(&free_until, h, current.regs) >= current.end()) chosen = h;
     };
     if (chosen == null) {
         for (0..limit) |b| {
