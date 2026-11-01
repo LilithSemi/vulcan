@@ -143,6 +143,10 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
         .reads = .{ gpReg(@truncate(word >> 5)), null, null, null },
         .writes = .{ gpReg(@truncate(word)), null },
     };
+    if (isMoveWide(word)) return .{
+        .reads = .{ gpReg(@truncate(word)), null, null, null },
+        .writes = .{ gpReg(@truncate(word)), null },
+    };
     return .{};
 }
 
@@ -165,6 +169,10 @@ fn isImmediateAlu(word: u32) bool {
     return word & 0x1F000000 == 0x11000000 or // add/sub immediate, including flag-setting forms
         word & 0x1F800000 == 0x12000000 or // logical immediate
         word & 0x1F800000 == 0x13000000; // bitfield
+}
+
+fn isMoveWide(word: u32) bool {
+    return word & 0x1F800000 == 0x12800000;
 }
 
 fn isRegisterMemory(word: u32) bool {
@@ -358,6 +366,112 @@ pub fn tryCoalesceResultMove(producer: u32, move: u32) ?u32 {
     if (!rewritable) return null;
 
     return producer & ~@as(u32, 0x1F) | destination;
+}
+
+const DistantResultMove = struct {
+    at: [12]usize = @splat(0),
+    words: [12]u32 = @splat(0),
+    len: usize = 0,
+    baseline: [13]u32 = @splat(0),
+    baseline_len: usize = 0,
+};
+
+fn tryCoalesceDistantResultMove(
+    words: []const u32,
+    removed: []const bool,
+    is_block_start: []const bool,
+    block_start: []const usize,
+    fixups: []const Fixup,
+    move_at: usize,
+) ?DistantResultMove {
+    if (move_at >= words.len or removed[move_at]) return null;
+    const move = words[move_at];
+    if (move & 0xFFE0FFE0 != 0xAA0003E0) return null;
+    const source: u5 = @truncate(move >> 16);
+    const destination: u5 = @truncate(move);
+    if (source == 31 or destination == 31 or source == destination) return null;
+
+    var producer_at = move_at;
+    var scanned: usize = 0;
+    while (producer_at > 0 and scanned < 12) {
+        producer_at -= 1;
+        if (removed[producer_at]) continue;
+        if (is_block_start[producer_at + 1] and !hasOnlyFallthroughEntry(producer_at + 1, block_start, fixups)) return null;
+        scanned += 1;
+
+        const deps = dependencies(words[producer_at], machineClass(words[producer_at]));
+        if (containsReg(deps.writes, source)) break;
+        if (containsReg(deps.writes, destination) or containsReg(deps.reads, destination)) return null;
+        _ = retargetReads(words[producer_at], source, destination) orelse return null;
+    } else return null;
+
+    const producer = tryCoalesceResultMove(words[producer_at], move) orelse return null;
+    var result = DistantResultMove{};
+    for (producer_at..move_at + 1) |at| {
+        if (removed[at]) continue;
+        result.baseline[result.baseline_len] = words[at];
+        result.baseline_len += 1;
+        if (at == move_at) continue;
+        result.at[result.len] = at;
+        result.words[result.len] = if (at == producer_at)
+            producer
+        else
+            retargetReads(words[at], source, destination) orelse return null;
+        result.len += 1;
+    }
+    return result;
+}
+
+fn retargetReads(word: u32, source: u5, destination: u5) ?u32 {
+    const class = machineClass(word);
+    const deps = dependencies(word, class);
+    if (containsReg(deps.writes, source) or containsReg(deps.writes, destination) or containsReg(deps.reads, destination)) return null;
+
+    var result = word;
+    if (class == .mul) {
+        result = replaceRegField(result, 5, source, destination);
+        result = replaceRegField(result, 16, source, destination);
+        return replaceRegField(result, 10, source, destination);
+    }
+    if (class == .div or isRegisterAlu(word)) {
+        result = replaceRegField(result, 5, source, destination);
+        return replaceRegField(result, 16, source, destination);
+    }
+    if (isImmediateAlu(word)) return replaceRegField(result, 5, source, destination);
+    if (isMoveWide(word)) return result;
+    return null;
+}
+
+fn replaceRegField(word: u32, shift: u5, source: u5, destination: u5) u32 {
+    if (@as(u5, @truncate(word >> shift)) != source) return word;
+    const mask = @as(u32, 0x1F) << shift;
+    return word & ~mask | (@as(u32, destination) << shift);
+}
+
+fn containsReg(registers: anytype, reg: u5) bool {
+    for (registers) |candidate| if (candidate != null and candidate.? == reg) return true;
+    return false;
+}
+
+fn moveRunHasCycle(words: []const u32, move_indices: []const usize) bool {
+    var reach: [31]u32 = @splat(0);
+    for (move_indices) |at| {
+        const move = words[at];
+        if (move & 0xFFE0FFE0 != 0xAA0003E0) return true;
+        const source: u5 = @truncate(move >> 16);
+        const destination: u5 = @truncate(move);
+        if (source == 31 or destination == 31) return true;
+        reach[source] |= @as(u32, 1) << destination;
+    }
+    for (0..31) |through| {
+        for (0..31) |source| {
+            if (reach[source] & (@as(u32, 1) << @intCast(through)) != 0) reach[source] |= reach[through];
+        }
+    }
+    for (0..31) |reg| {
+        if (reach[reg] & (@as(u32, 1) << @intCast(reg)) != 0) return true;
+    }
+    return false;
 }
 
 /// A move that coincides with an IR block start can still be physically inside its predecessor when
@@ -562,6 +676,31 @@ pub fn pairMemoryForModelWithMoveProofs(
         std.debug.assert(at < len);
         has_dead_source[at] = true;
     }
+    const removed_distant = try allocator.alloc(bool, len);
+    defer allocator.free(removed_distant);
+    @memset(removed_distant, false);
+    const cyclic_move = try allocator.alloc(bool, len);
+    defer allocator.free(cyclic_move);
+    @memset(cyclic_move, false);
+    var run_start: usize = 0;
+    while (run_start < remapped_dead_source_moves.len) {
+        var run_end = run_start + 1;
+        while (run_end < remapped_dead_source_moves.len and remapped_dead_source_moves[run_end] == remapped_dead_source_moves[run_end - 1] + 1) : (run_end += 1) {}
+        const run = remapped_dead_source_moves[run_start..run_end];
+        if (moveRunHasCycle(words.items, run)) {
+            for (run) |at| cyclic_move[at] = true;
+        }
+        run_start = run_end;
+    }
+    for (remapped_dead_source_moves) |move_at| {
+        if (cyclic_move[move_at]) continue;
+        const rewrite = tryCoalesceDistantResultMove(words.items, removed_distant, is_block_start, block_start, fixups, move_at) orelse continue;
+        const baseline = scoreWords(rewrite.baseline[0..rewrite.baseline_len], model);
+        const candidate = scoreWords(rewrite.words[0..rewrite.len], model);
+        if (!candidate.accepts(baseline)) continue;
+        for (rewrite.at[0..rewrite.len], rewrite.words[0..rewrite.len]) |at, word| words.items[at] = word;
+        removed_distant[move_at] = true;
+    }
 
     // `removed_before[w]` = number of words deleted with index strictly before `w`, with the twist
     // that a deleted word's own slot records the count INCLUDING its own deletion. That makes a
@@ -575,11 +714,17 @@ pub fn pairMemoryForModelWithMoveProofs(
     var removed: u32 = 0;
     var i: usize = 0;
     while (i < len) {
+        if (removed_distant[i]) {
+            removed += 1;
+            removed_before[i] = removed;
+            i += 1;
+            continue;
+        }
         var did_fuse = false;
         // Memory and multiply-add pairs cannot cross a block start. A proven result move may cross
         // a coincident, unentered start because `hasOnlyFallthroughEntry` rules out another path.
         // Never chain a third word into the same pair (i += 2).
-        if (i + 1 < len) {
+        if (i + 1 < len and !removed_distant[i + 1]) {
             const result_entry_safe = !is_block_start[i + 1] or hasOnlyFallthroughEntry(i + 1, block_start, fixups);
             const result_proven = is_coalescable_result_move[i + 1] or has_dead_source[i + 1];
             const fused = (if (result_entry_safe and result_proven) tryCoalesceResultMove(words.items[i], words.items[i + 1]) else null) orelse
@@ -857,6 +1002,74 @@ test "magic rewrite remaps a later proven result move" {
     }, words.items);
     try std.testing.expectEqualSlices(usize, &.{ 0, 4 }, &block_start);
     try std.testing.expectEqual(@as(usize, 3), fixups[0].at);
+}
+
+test "dead edge moves retarget recurrence producers across compares" {
+    const alloc = std.testing.allocator;
+    var words = try wordsFrom(alloc, &.{
+        encode.add(.x11, .x11, .x9),
+        encode.addImm(.x1, .x2, 1),
+        encode.cmp(.x1, .x3),
+        encode.mov(.x2, .x1),
+        encode.mov(.x1, .x11),
+        encode.b(0),
+        encode.ret(),
+    });
+    defer words.deinit(alloc);
+    var block_start = [_]usize{ 0, 1, 6 };
+    var fixups = [_]Fixup{.{ .at = 5, .target = 2 }};
+
+    try pairMemoryForModelWithMoveProofs(alloc, &words, &block_start, &fixups, &.{}, &.{}, &.{}, &.{ 3, 4 }, .{});
+
+    try std.testing.expectEqualSlices(u32, &.{
+        encode.add(.x1, .x11, .x9),
+        encode.addImm(.x2, .x2, 1),
+        encode.cmp(.x2, .x3),
+        encode.b(0),
+        encode.ret(),
+    }, words.items);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4 }, &block_start);
+    try std.testing.expectEqual(@as(usize, 3), fixups[0].at);
+}
+
+test "dead edge moves do not retarget across a directly entered block" {
+    const alloc = std.testing.allocator;
+    var words = try wordsFrom(alloc, &.{
+        encode.add(.x11, .x11, .x9),
+        encode.addImm(.x1, .x2, 1),
+        encode.cmp(.x1, .x3),
+        encode.mov(.x2, .x1),
+        encode.mov(.x1, .x11),
+        encode.b(0),
+        encode.ret(),
+    });
+    defer words.deinit(alloc);
+    var block_start = [_]usize{ 0, 1, 6 };
+    var fixups = [_]Fixup{.{ .at = 5, .target = 1 }};
+
+    try pairMemoryForModelWithMoveProofs(alloc, &words, &block_start, &fixups, &.{}, &.{}, &.{}, &.{ 3, 4 }, .{});
+
+    try std.testing.expectEqualSlices(u32, &.{
+        encode.add(.x11, .x11, .x9),
+        encode.addImm(.x2, .x2, 1),
+        encode.cmp(.x2, .x3),
+        encode.mov(.x1, .x11),
+        encode.b(0),
+        encode.ret(),
+    }, words.items);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 5 }, &block_start);
+    try std.testing.expectEqual(@as(usize, 4), fixups[0].at);
+}
+
+test "dead edge move cycles stay intact" {
+    const words = [_]u32{
+        encode.mov(.x5, .x2),
+        encode.mov(.x2, .x3),
+        encode.mov(.x3, .x2),
+        encode.mov(.x2, .x5),
+    };
+    try std.testing.expect(moveRunHasCycle(&words, &.{ 0, 1, 2, 3 }));
+    try std.testing.expect(!moveRunHasCycle(&words, &.{ 0, 1 }));
 }
 
 test "pairMemory also fuses multiply-add and remaps side tables" {

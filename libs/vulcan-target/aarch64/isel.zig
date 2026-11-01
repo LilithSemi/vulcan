@@ -3255,6 +3255,7 @@ const Ctx = struct {
         const set = self.findEdgeMoves(pred, succ) orelse return;
         if (set.consumed) return;
         const edge_start = code.items.len;
+        const all_gpr_sources_dead = allGprSourcesDead(set.moves);
         for (set.moves) |m| {
             const move_at = code.items.len;
             try self.emitEdgeMove(allocator, code, m);
@@ -3263,9 +3264,7 @@ const Ctx = struct {
             {
                 try self.coalescable_edge_moves.append(allocator, move_at);
             }
-            if (m.source_dead and m.class == 0 and move_at == edge_start and code.items.len == move_at + 1 and
-                m.src == .reg and m.dst == .reg)
-            {
+            if (all_gpr_sources_dead and m.source_dead and m.class == 0 and code.items.len == move_at + 1 and m.src == .reg and m.dst == .reg) {
                 try self.dead_source_edge_moves.append(allocator, move_at);
             }
         }
@@ -3421,6 +3420,13 @@ const Ctx = struct {
         }
     }
 };
+
+fn allGprSourcesDead(moves: []const EdgeMove) bool {
+    for (moves) |move| {
+        if (move.class == 0 and move.src == .reg and move.dst == .reg and !move.source_dead) return false;
+    }
+    return true;
+}
 
 /// Store `result` (held in `reg`) to its spill slot iff its location at its def position is a
 /// slot. A value that stays in a register at its def emits nothing (a later split, if any, would
@@ -6603,6 +6609,21 @@ test "matching edge moves cross critical-edge forwarding blocks" {
     try std.testing.expect(matching.rhs == &sets[1]);
     matching.lhs.consumed = true;
     try std.testing.expectEqual(left_target, resolveTransparentTarget(&func, &allocation, left));
+}
+
+test "a scratch-routed edge cycle suppresses dead-source proofs" {
+    const safe = [_]EdgeMove{
+        .{ .src = .{ .reg = .x1 }, .dst = .{ .reg = .x2 }, .class = 0, .source_dead = true },
+        .{ .src = .{ .reg = .x11 }, .dst = .{ .reg = .x1 }, .class = 0, .source_dead = true },
+    };
+    try std.testing.expect(allGprSourcesDead(&safe));
+
+    const cycled = [_]EdgeMove{
+        .{ .src = .{ .reg = .x2 }, .dst = .{ .reg = .x15 }, .class = 0 },
+        .{ .src = .{ .reg = .x3 }, .dst = .{ .reg = .x2 }, .class = 0, .source_dead = true },
+        .{ .src = .{ .reg = .x15 }, .dst = .{ .reg = .x3 }, .class = 0, .source_dead = true },
+    };
+    try std.testing.expect(!allGprSourcesDead(&cycled));
 }
 
 test "a barrier is rejected, not dropped like a prefetch" {
