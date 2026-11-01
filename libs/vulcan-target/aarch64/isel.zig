@@ -2995,8 +2995,16 @@ const Ctx = struct {
         const rd = self.resultReg(result);
         if (isVector(self.func, result)) {
             if (laneKind(self.func, result) == .i32) {
-                std.debug.assert(op == .add and @backingInt(rd) == @backingInt(c));
-                try code.append(allocator, encode.mlaVecI32(rd, a, b));
+                std.debug.assert(op == .add);
+                if (@backingInt(rd) == @backingInt(c)) {
+                    try code.append(allocator, encode.mlaVecI32(rd, a, b));
+                } else {
+                    // Allocation normally coalesces the destructive add result with its lhs
+                    // accumulator. If pressure prevents that, preserve the exact unfused shape
+                    // instead of relying on an assertion or adding scratch-register moves.
+                    try code.append(allocator, encode.mulVecI32(rd, a, b));
+                    try code.append(allocator, encode.addVecI32(rd, rd, c));
+                }
                 try storeResult(allocator, code, self, result, rd);
                 return;
             }
@@ -5127,13 +5135,12 @@ fn isFloatVector(func: *const Function, v: Value) bool {
 
 /// Whether the `mul` at `insts[idx]` fuses into an immediately-following `add`/`sub`
 /// that consumes its result as a fused multiply-add/subtract. Float contraction is legal because
-/// Vulcan permits it; integer-vector contraction is restricted to the backend-private
-/// interleaved-record accumulator shape. When it fuses, the mul's
+/// Vulcan permits it; integer-vector contraction is exact wrapping arithmetic. When it fuses, the mul's
 /// materialization is skipped and the add/sub emits fmadd/fmsub/fnmsub (scalar) or
 /// fmla/fmls (vector) on the mul's own operands (see `Ctx.emitFusedArith`). This is the ONE
 /// eligibility predicate shared by the mul-skip and the fused add/sub emission, so they
 /// never disagree (no dangling or doubled multiply). It mirrors `fusesIntoNextIf`. Gated to
-/// float operands (scalar or vector), plus tagged integer vectors that select MLA. For a float
+/// float operands (scalar or vector), plus i32 vectors that select MLA. For a float
 /// vector mul, only the two shapes a single NEON instruction can
 /// express are allowed: `add(mul,c)` = a*b+c -> FMLA, and `sub(c,mul)` = c-a*b -> FMLS.
 /// `sub(mul,c)` = a*b-c has no matching NEON op (FMLA/FMLS only ever add or subtract the
@@ -5175,12 +5182,6 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     if (addsub.lhs != result and addsub.rhs != result) return false; // must consume this mul's result
     if (integer_vector) {
         if (addsub.op != .add) return false;
-        const add_result = func.instResult(insts[idx + 1]) orelse return false;
-        const lane = interleaveResultLane(func, add_result) orelse return false;
-        const accumulator = if (addsub.lhs == result) addsub.rhs else addsub.lhs;
-        const accumulator_inst = func.definingInst(accumulator) orelse return false;
-        if (func.opcode(accumulator_inst) != .load or interleaveLane(func, accumulator_inst) != lane)
-            return false;
     }
     // Vector sub(mul, c) = a*b-c has no single-instruction NEON form: reject it here so
     // both call sites (the mul-skip and the fused emit) agree and fall back to fmul+fsub.
@@ -6623,6 +6624,33 @@ test "interleaved store results fuse integer vector multiply-adds" {
     }
     try std.testing.expectEqual(@as(usize, 4), multiply_adds);
     try std.testing.expectEqual(@as(usize, 0), multiplies);
+}
+
+test "ordinary integer vector accumulators are mla eligible with a safe fallback" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const block = try func.appendBlock();
+    const accumulator = try func.appendBlockParam(block, vec_t);
+    const lhs = try func.appendBlockParam(block, vec_t);
+    const rhs = try func.appendBlockParam(block, vec_t);
+    const product = try func.appendInst(block, vec_t, .{ .arith = .{ .op = .mul, .lhs = lhs, .rhs = rhs } });
+    const result = try func.appendInst(block, vec_t, .{ .arith = .{ .op = .add, .lhs = accumulator, .rhs = product } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+
+    try std.testing.expect(fusesIntoNextArith(&func, func.blockInsts(block), 0));
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var multiply_adds: usize = 0;
+    var multiplies: usize = 0;
+    for (code) |word| {
+        if (word & 0xFFE0FC00 == 0x4EA09400) multiply_adds += 1;
+        if (word & 0xFFE0FC00 == 0x4EA09C00) multiplies += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), multiply_adds + multiplies);
 }
 
 test "via_got global_addr lowers to adrp+ldr with got_pg/got_lo12 relocs (GOT-indirect)" {
