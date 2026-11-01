@@ -223,6 +223,27 @@ pub fn slpProfitableMem(
     return vector < scalar;
 }
 
+/// Estimate steady-state cycles per vector-width reduction group. Independent accumulators divide
+/// the recurrence and loop-control chains, but consume another live vector register. Memory and
+/// SIMD port pressure remain per group and therefore do not disappear when the loop is unrolled.
+pub fn reductionLoopCost(model: *const Model, op: BinOp, memory_streams: u8, accumulator_groups: u8) f64 {
+    std.debug.assert(accumulator_groups >= 1);
+    const groups: f64 = @floatFromInt(accumulator_groups);
+    const memory_ports: f64 = @floatFromInt(@max(@as(u32, 1), sched.classPorts(model, .mem)));
+    const simd_ports: f64 = @floatFromInt(@max(@as(u32, 1), sched.classPorts(model, .fpsimd)));
+    const issue_width: f64 = @floatFromInt(@max(@as(u8, 1), model.issue_width));
+    const memory_pressure = @as(f64, @floatFromInt(memory_streams)) / memory_ports;
+    const simd_pressure = opWeight(model, op, false) / simd_ports;
+    const recurrence = @as(f64, @floatFromInt(model.latency(arithOpcode(op)))) / groups;
+    const loop_control = 3.0 / (issue_width * groups);
+    const register_pressure = 0.25 * (groups - 1.0);
+    return memory_pressure + simd_pressure + recurrence + loop_control + register_pressure;
+}
+
+pub fn reductionGroupsProfitable(model: *const Model, op: BinOp, memory_streams: u8, candidate: u8) bool {
+    return reductionLoopCost(model, op, memory_streams, candidate) < reductionLoopCost(model, op, memory_streams, 1);
+}
+
 const registry = @import("registry.zig");
 
 test "ampere cheap-add SLP is declined: the wide OoO core parallelizes the scalar adds" {
@@ -236,6 +257,12 @@ test "ampere cheap-add SLP is declined: the wide OoO core parallelizes the scala
     try std.testing.expect(!slpProfitable(altra, .add, true, 8, 2));
     // Integer cheap add on the wide core is likewise unprofitable.
     try std.testing.expect(!slpProfitable(altra, .add, false, 4, 2));
+}
+
+test "ampere reduction score accepts two independent accumulators" {
+    const model = registry.modelFor(.@"ampere-altra");
+    try std.testing.expect(reductionGroupsProfitable(model, .add, 2, 2));
+    try std.testing.expect(reductionLoopCost(model, .add, 2, 2) < reductionLoopCost(model, .add, 2, 1));
 }
 
 test "et-soc SLP stays profitable: the single-issue core serializes the scalar ops" {

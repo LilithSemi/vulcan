@@ -7,6 +7,7 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const mm = @import("model.zig");
+const cost = @import("cost.zig");
 const loops = @import("../loops.zig");
 
 const Function = ir.function.Function;
@@ -52,6 +53,21 @@ const Plan = struct {
     /// Scalar element type of a vector induction carried through the widened loop.
     index_elem_type: ?Type,
 };
+
+fn carriedArgs(storage: []Value, index: Value, vector_index: ?Value, accumulators: []const ?Value) []const Value {
+    var len: usize = 0;
+    storage[len] = index;
+    len += 1;
+    if (vector_index) |value| {
+        storage[len] = value;
+        len += 1;
+    }
+    for (accumulators) |accumulator| if (accumulator) |value| {
+        storage[len] = value;
+        len += 1;
+    };
+    return storage[0..len];
+}
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const mm.Model) Error!bool {
     var info = try loops.analyze(allocator, func);
@@ -116,10 +132,10 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     const combine = try func.appendBlock();
     const mi = try func.appendBlockParam(mainheader, ind_ty);
     const mvi = if (index_vec_ty) |vec_ty| try func.appendBlockParam(mainheader, vec_ty) else null;
-    const macc = if (reduction_vec_ty) |vec_ty|
-        try func.appendBlockParam(mainheader, vec_ty)
-    else
-        null;
+    var maccs: [2]?Value = @splat(null);
+    if (reduction_vec_ty) |vec_ty| {
+        for (0..plan.groups) |group| maccs[group] = try func.appendBlockParam(mainheader, vec_ty);
+    }
 
     // Preheader -> main header, carrying the induction's initial value.
     const pre_args = try allocator.dupe(Value, func.blockArgs(func.terminator(plan.preheader).?.jump));
@@ -143,6 +159,8 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         const scalar = try identityConst(func, plan.preheader, red.op, reduction_ty.?);
         break :identity try func.appendSplat(plan.preheader, reduction_vec_ty.?, scalar);
     } else null;
+    var initial_accs: [2]?Value = @splat(null);
+    for (0..plan.groups) |group| initial_accs[group] = vector_identity;
     const threshold = if (ind_int.signedness == .unsigned and offset_fits)
         try func.appendArithImm(plan.preheader, ind_ty, .sub, plan.bound, group_offset.?)
     else
@@ -161,22 +179,12 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         };
         const reverse: CmpOp = if (plan.exit_cond == .lt) .gt else .ge;
         const can_enter = try func.appendInst(plan.preheader, bool_t, .{ .icmp = .{ .op = reverse, .lhs = wide_bound, .rhs = wide_highest } });
-        if (init_vi != null and vector_identity != null)
-            try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{ init_i, init_vi.?, vector_identity.? } }, .{ .target = plan.header, .args = pre_args })
-        else if (init_vi) |vi|
-            try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{ init_i, vi } }, .{ .target = plan.header, .args = pre_args })
-        else if (vector_identity) |identity|
-            try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{ init_i, identity } }, .{ .target = plan.header, .args = pre_args })
-        else
-            try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = &.{init_i} }, .{ .target = plan.header, .args = pre_args });
-    } else if (init_vi != null and vector_identity != null) {
-        try func.setJump(plan.preheader, mainheader, &.{ init_i, init_vi.?, vector_identity.? });
-    } else if (init_vi) |vi| {
-        try func.setJump(plan.preheader, mainheader, &.{ init_i, vi });
-    } else if (vector_identity) |identity| {
-        try func.setJump(plan.preheader, mainheader, &.{ init_i, identity });
+        var enter_storage: [4]Value = undefined;
+        const enter_args = carriedArgs(&enter_storage, init_i, init_vi, &initial_accs);
+        try func.appendIf(plan.preheader, can_enter, .{ .target = mainheader, .args = enter_args }, .{ .target = plan.header, .args = pre_args });
     } else {
-        try func.setJump(plan.preheader, mainheader, &.{init_i});
+        var enter_storage: [4]Value = undefined;
+        try func.setJump(plan.preheader, mainheader, carriedArgs(&enter_storage, init_i, init_vi, &initial_accs));
     }
 
     // Main header: run a full group only while the highest index in it still passes the test.
@@ -209,14 +217,9 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         break :guard guarded;
     };
     if (cont) |condition| {
-        if (mvi != null and macc != null)
-            try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{ mi, mvi.?, macc.? } }, .{ .target = combine, .args = &.{ mi, macc.? } })
-        else if (mvi) |vi|
-            try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{ mi, vi } }, .{ .target = combine, .args = &.{mi} })
-        else if (macc) |acc|
-            try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{ mi, acc } }, .{ .target = combine, .args = &.{ mi, acc } })
-        else
-            try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{mi} }, .{ .target = combine, .args = &.{mi} });
+        var body_storage: [4]Value = undefined;
+        var combine_storage: [3]Value = undefined;
+        try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = carriedArgs(&body_storage, mi, mvi, &maccs) }, .{ .target = combine, .args = carriedArgs(&combine_storage, mi, null, &maccs) });
     }
 
     // Main body: U copies emitted operation-major in V-wide groups, which gives the SLP pass one or more
@@ -231,12 +234,12 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         try func.appendBlockParam(mainbody, vec_ty)
     else
         null;
-    const bacc = if (rotated)
-        macc
-    else if (reduction_vec_ty) |vec_ty|
-        try func.appendBlockParam(mainbody, vec_ty)
-    else
-        null;
+    var baccs: [2]?Value = @splat(null);
+    if (rotated) {
+        baccs = maccs;
+    } else if (reduction_vec_ty) |vec_ty| {
+        for (0..plan.groups) |group| baccs[group] = try func.appendBlockParam(mainbody, vec_ty);
+    }
     const ind_update = plan.induction_update;
     const base_ty = func.valueType(plan.accesses[0].base);
 
@@ -336,41 +339,37 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     }
 
     try func.cloneAttrs(value_pairs.items, inst_pairs.items);
-    const next_acc = if (plan.reduction) |red| acc: {
-        var increments: std.ArrayList(Value) = .empty;
-        defer increments.deinit(allocator);
-        for (vmaps) |*vm| try increments.append(allocator, vm.get(red.increment) orelse red.increment);
-        const group = try func.appendInst(mainbody, reduction_vec_ty.?, .{ .struct_new = .{ .fields = try func.internValues(increments.items) } });
-        break :acc try func.appendInst(mainbody, reduction_vec_ty.?, .{ .arith = .{ .op = red.op, .lhs = bacc.?, .rhs = group } });
-    } else null;
+    var next_accs: [2]?Value = @splat(null);
+    if (plan.reduction) |red| for (0..plan.groups) |group_index| {
+        var increments: [MAX_LANES]Value = undefined;
+        for (0..V) |lane| {
+            const vm = &vmaps[group_index * V + lane];
+            increments[lane] = vm.get(red.increment) orelse red.increment;
+        }
+        const increment_vector = try func.appendInst(mainbody, reduction_vec_ty.?, .{ .struct_new = .{ .fields = try func.internValues(increments[0..V]) } });
+        next_accs[group_index] = try func.appendInst(mainbody, reduction_vec_ty.?, .{ .arith = .{ .op = red.op, .lhs = baccs[group_index].?, .rhs = increment_vector } });
+    };
     const nmi = try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(U)));
     const next_vi = if (bvi) |vi| try func.appendInst(mainbody, index_vec_ty.?, .{ .arith = .{ .op = .add, .lhs = vi, .rhs = index_step.? } }) else null;
     if (rotated) {
         const next_cont = try func.appendInst(mainbody, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = nmi, .rhs = threshold.? } });
-        if (next_vi != null and next_acc != null)
-            try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{ nmi, next_vi.?, next_acc.? } }, .{ .target = combine, .args = &.{ nmi, next_acc.? } })
-        else if (next_vi) |vi|
-            try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{ nmi, vi } }, .{ .target = combine, .args = &.{nmi} })
-        else if (next_acc) |acc|
-            try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{ nmi, acc } }, .{ .target = combine, .args = &.{ nmi, acc } })
-        else
-            try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = &.{nmi} }, .{ .target = combine, .args = &.{nmi} });
-    } else if (next_vi != null and next_acc != null) {
-        try func.setJump(mainbody, mainheader, &.{ nmi, next_vi.?, next_acc.? });
-    } else if (next_vi) |vi| {
-        try func.setJump(mainbody, mainheader, &.{ nmi, vi });
-    } else if (next_acc) |acc| {
-        try func.setJump(mainbody, mainheader, &.{ nmi, acc });
+        var loop_storage: [4]Value = undefined;
+        var exit_storage: [3]Value = undefined;
+        try func.appendIf(mainbody, next_cont, .{ .target = mainbody, .args = carriedArgs(&loop_storage, nmi, next_vi, &next_accs) }, .{ .target = combine, .args = carriedArgs(&exit_storage, nmi, null, &next_accs) });
     } else {
-        try func.setJump(mainbody, mainheader, &.{nmi});
+        var loop_storage: [4]Value = undefined;
+        try func.setJump(mainbody, mainheader, carriedArgs(&loop_storage, nmi, next_vi, &next_accs));
     }
 
     // Continue in the original loop at the current index and accumulator value.
     const cmi = try func.appendBlockParam(combine, ind_ty);
     if (plan.reduction) |red| {
-        const cacc = try func.appendBlockParam(combine, reduction_vec_ty.?);
-        const horizontal = try func.appendReduce(combine, red.op, cacc);
-        const scalar_acc = try func.appendInst(combine, reduction_ty.?, .{ .arith = .{ .op = red.op, .lhs = init_acc.?, .rhs = horizontal } });
+        var scalar_acc = init_acc.?;
+        for (0..plan.groups) |_| {
+            const cacc = try func.appendBlockParam(combine, reduction_vec_ty.?);
+            const horizontal = try func.appendReduce(combine, red.op, cacc);
+            scalar_acc = try func.appendInst(combine, reduction_ty.?, .{ .arith = .{ .op = red.op, .lhs = scalar_acc, .rhs = horizontal } });
+        }
         var rem_args: [2]Value = undefined;
         rem_args[plan.induction] = cmi;
         rem_args[red.accumulator] = scalar_acc;
@@ -632,7 +631,9 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     if (has_interleaved and index_elem_type == null)
         index_elem_type = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = induction_bits } });
 
-    const groups: u32 = if (model.arch == .aarch64 and reduction == null and accesses.items.len <= 2 and V * 2 <= MAX_LANES) 2 else 1;
+    const parallel_reduction = reduction == null or
+        (reduction.?.op == .add and cost.reductionGroupsProfitable(model, reduction.?.op, @intCast(accesses.items.len), 2));
+    const groups: u32 = if (model.arch == .aarch64 and parallel_reduction and accesses.items.len <= 2 and V * 2 <= MAX_LANES) 2 else 1;
     return Plan{
         .header = header,
         .body = bodyb,
@@ -1486,6 +1487,9 @@ test "a reduction body with a second memory effect is declined" {
     try buildIntReduction(&plain, false);
     var plain_info = try loops.analyze(allocator, &plain);
     defer plain_info.deinit(allocator);
+    const scored_plan = (try recognize(allocator, &plain, registry.modelFor(.@"ampere-altra"), &plain_info.loops[0])) orelse return error.NotRecognized;
+    defer allocator.free(scored_plan.accesses);
+    try testing.expectEqual(@as(u32, 2), scored_plan.groups);
     try testing.expect(recognizeReduction(&plain, registry.modelFor(.@"ampere-altra"), &plain_info.loops[0], false) != null);
 
     var stored = Function.init(allocator);
