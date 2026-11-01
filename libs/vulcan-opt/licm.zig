@@ -166,10 +166,20 @@ fn runFiltered(allocator: std.mem.Allocator, func: *Function, analyses: *pass.An
             }
             insts.shrinkRetainingCapacity(w);
         }
-        // Append them to the preheader (before its terminator), in order.
+        // Insert them before structured control. A versioned loop uses its guarded entry as the
+        // insertion block, and `if` is an instruction rather than the block terminator. Appending
+        // after it makes the hoisted instructions unreachable in machine code.
         const pre_insts = func.blockInstsMut(@fromBackingInt(@intCast(pre)));
+        var insert_at = pre_insts.items.len;
+        for (pre_insts.items, 0..) |inst, index| {
+            if (func.opcode(inst) == .@"if") {
+                insert_at = index;
+                break;
+            }
+        }
         for (to_hoist.items) |h| {
-            try pre_insts.append(allocator, h.inst);
+            try pre_insts.insert(allocator, insert_at, h.inst);
+            insert_at += 1;
             if (func.instResult(h.inst)) |result| def_block[@backingInt(result)] = pre;
         }
         changed = true;
@@ -258,6 +268,33 @@ test "hoists a loop-invariant product to the preheader" {
     // The invariant `x * y` left the body and landed in the preheader (entry).
     try std.testing.expectEqual(entry_before + 1, func.blockInsts(entry).len);
     try std.testing.expectEqual(body_before - 1, func.blockInsts(body).len);
+}
+
+test "hoists before a guarded loop entry's structured control" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const cond = try func.appendBlockParam(entry, bool_t);
+    const x = try func.appendBlockParam(entry, i32_t);
+    const y = try func.appendBlockParam(entry, i32_t);
+    try func.appendIf(entry, cond, .{ .target = body }, .{ .target = done });
+    const invariant = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+    try func.setJump(body, body, &.{});
+    _ = invariant;
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(x) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+    const entry_insts = func.blockInsts(entry);
+    try std.testing.expectEqual(@as(usize, 2), entry_insts.len);
+    try std.testing.expect(func.opcode(entry_insts[0]) == .arith);
+    try std.testing.expect(func.opcode(entry_insts[1]) == .@"if");
 }
 
 test "constant-only LICM bounds loop register pressure" {
