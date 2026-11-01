@@ -1512,6 +1512,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (foldsAsShiftImm(func, insts, inst_idx)) continue;
                     if (foldsAsVectorShiftImmScalar(func, result)) continue;
                     if (cnegZeroForLaterSelect(func, insts, result, caps.machine_model)) continue;
+                    if (parityConstantForLaterSelect(func, insts, result, caps.machine_model)) continue;
                     const rd = ctx.resultReg(result);
                     if (regClass(func, result) == .fpr) {
                         // A float-typed integer constant (the frontend zero-inits float
@@ -1595,6 +1596,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if ((a.op == .shl or a.op == .shr) and fusesIntoNextShiftAdd(func, insts, inst_idx, caps.fuse_shift_add)) continue;
                     const result = func.instResult(inst).?;
                     if (a.op == .sub and cnegProducerForLaterSelect(func, insts, inst_idx, caps.machine_model)) continue;
+                    if ((a.op == .add or a.op == .bit_and) and parityForLaterSelect(func, insts, result, caps.machine_model)) continue;
                     if ((a.op == .shl or a.op == .shr) and foldsAsBitfieldExtractSource(func, result)) continue;
                     if ((a.op == .add or a.op == .sub) and inst_idx >= 1 and fusesIntoNextArith(func, insts, inst_idx - 1)) {
                         const mul = func.opcode(insts[inst_idx - 1]).arith;
@@ -1671,6 +1673,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // emits the flag-setting `addsImm`/`subsImm` + `b.cc` under the SAME predicate.
                     if (isArithBranchProducer(func, insts, inst_idx, caps.fuse_arith_branch and caps.fuse_cmp_branch)) continue;
                     const result = func.instResult(inst).?;
+                    if ((a.op == .add or a.op == .bit_and) and parityForLaterSelect(func, insts, result, caps.machine_model)) continue;
                     if (inst_idx >= 1 and fusesIntegerMulIntoNextImmAdd(func, insts, inst_idx - 1)) {
                         const mul = func.opcode(insts[inst_idx - 1]).arith;
                         const rn = try ctx.loadOp(allocator, &code, mul.lhs, spill_op[0]);
@@ -1717,6 +1720,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // one-use boolean. Emit the compare at its original position so allocator
                     // transition moves before the select cannot clobber its operands.
                     if (cmpFeedsLaterSelect(func, insts, inst_idx)) {
+                        if (parityForCmp(func, insts, inst_idx)) |parity| {
+                            if (machinePrefersParity(caps.machine_model, isWide(func, parity.value))) {
+                                const value = try ctx.loadOp(allocator, &code, parity.value, spill_op[0]);
+                                try code.append(allocator, encode.andsImm(.zr, value, 1, isWide(func, parity.value)).?);
+                                continue;
+                            }
+                        }
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, spill_op[0]);
                         const wide = isWide(func, cmp.lhs);
                         if (cmpFoldImm(func, cmp.rhs)) |imm| {
@@ -1823,6 +1833,16 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try code.append(allocator, encode.fcsel(rd, tr, el, cc, fkindOf(func, result, fp16)));
                         try storeResult(allocator, &code, ctx, result, rd);
                     } else {
+                        if (fused_cmp) |cmp| if (paritySelect(func, s, cmp)) |parity| {
+                            if (machinePrefersParity(caps.machine_model, isWide(func, result))) {
+                                const decrement = try ctx.loadOp(allocator, &code, parity.decrement, spill_op[0]);
+                                const value = try ctx.loadOp(allocator, &code, parity.value, spill_op[1]);
+                                const rd = ctx.resultReg(result);
+                                try code.append(allocator, encode.csinc(rd, decrement, value, encode.invertCond(cc), isWide(func, result)));
+                                try storeResult(allocator, &code, ctx, result, rd);
+                                continue;
+                            }
+                        };
                         if (fused_cmp) |cmp| if (cnegSelectValue(func, s, cmp)) |value| {
                             if (machinePrefersCneg(caps.machine_model, isWide(func, result))) {
                                 const src = try ctx.loadOp(allocator, &code, value, spill_op[0]);
@@ -4498,6 +4518,132 @@ fn cnegZeroForLaterSelect(func: *const Function, insts: []const ir.function.Inst
     return false;
 }
 
+const ParitySelect = struct {
+    value: Value,
+    increment: Value,
+    decrement: Value,
+    masked: Value,
+};
+
+/// Match `(x & 1) != 0 ? x + 1 : x - 1`. TST supplies the condition flags and CSINC selects the
+/// decrement for even values or increments x for odd values.
+fn paritySelect(func: *const Function, select: ir.function.Select, cmp: ir.function.Compare) ?ParitySelect {
+    if (cmp.op != .ne or !isConstZero(func, cmp.rhs)) return null;
+    const value = parityMaskValue(func, cmp.lhs) orelse return null;
+    if (countUses(func, cmp.lhs) != 1) return null;
+
+    if (!parityIncrementOf(func, select.then, value) or !parityDecrementOf(func, select.@"else", value)) return null;
+    if (countUses(func, select.then) != 1 or countUses(func, select.@"else") != 1) return null;
+    return .{ .value = value, .increment = select.then, .decrement = select.@"else", .masked = cmp.lhs };
+}
+
+fn parityMaskValue(func: *const Function, result: Value) ?Value {
+    const inst = func.definingInst(result) orelse return null;
+    return switch (func.opcode(inst)) {
+        .arith => |arith| if (arith.op == .bit_and)
+            (if (isConstOne(func, arith.rhs)) arith.lhs else if (isConstOne(func, arith.lhs)) arith.rhs else null)
+        else
+            null,
+        .arith_imm => |arith| if (arith.op == .bit_and and arith.imm == 1) arith.lhs else null,
+        else => null,
+    };
+}
+
+fn parityIncrementOf(func: *const Function, result: Value, value: Value) bool {
+    const inst = func.definingInst(result) orelse return false;
+    return switch (func.opcode(inst)) {
+        .arith => |arith| arith.op == .add and ((arith.lhs == value and isConstOne(func, arith.rhs)) or (arith.rhs == value and isConstOne(func, arith.lhs))),
+        .arith_imm => |arith| arith.op == .add and arith.lhs == value and arith.imm == 1,
+        else => false,
+    };
+}
+
+fn parityDecrementOf(func: *const Function, result: Value, value: Value) bool {
+    const inst = func.definingInst(result) orelse return false;
+    return switch (func.opcode(inst)) {
+        .arith => |arith| arith.op == .sub and arith.lhs == value and isConstOne(func, arith.rhs),
+        .arith_imm => |arith| arith.op == .sub and arith.lhs == value and arith.imm == 1,
+        else => false,
+    };
+}
+
+fn isConstOne(func: *const Function, value: Value) bool {
+    const inst = func.definingInst(value) orelse return false;
+    return func.opcode(inst) == .iconst and func.opcode(inst).iconst == 1;
+}
+
+fn machinePrefersParity(model: peephole.MachineModel, wide: bool) bool {
+    const baseline = [_]u32{
+        if (wide) encode.addImm64(.x1, .x0, 1) else encode.addImm(.x1, .x0, 1),
+        encode.andImm(.x2, .x0, 1, wide).?,
+        if (wide) encode.subsImm64(.zr, .x2, 0) else encode.subsImm(.zr, .x2, 0),
+        if (wide) encode.subImm64(.x3, .x0, 1) else encode.subImm(.x3, .x0, 1),
+        encode.csel(.x4, .x1, .x3, .ne) | (if (wide) @as(u32, 1) << 31 else 0),
+    };
+    const candidate = [_]u32{
+        encode.andsImm(.zr, .x0, 1, wide).?,
+        if (wide) encode.subImm64(.x3, .x0, 1) else encode.subImm(.x3, .x0, 1),
+        encode.csinc(.x4, .x3, .x0, .eq, wide),
+    };
+    return peephole.scoreWords(&candidate, model).accepts(peephole.scoreWords(&baseline, model));
+}
+
+fn parityForLaterSelect(func: *const Function, insts: []const ir.function.Inst, result: Value, model: peephole.MachineModel) bool {
+    for (insts, 0..) |inst, idx| {
+        const select = switch (func.opcode(inst)) {
+            .select => |value| value,
+            else => continue,
+        };
+        const cmp = fusedCmpForSelect(func, insts, idx) orelse continue;
+        const parity = paritySelect(func, select, cmp) orelse continue;
+        if ((parity.increment == result or parity.masked == result) and machinePrefersParity(model, isWide(func, parity.value))) return true;
+    }
+    return false;
+}
+
+fn parityForCmp(func: *const Function, insts: []const ir.function.Inst, cmp_idx: usize) ?ParitySelect {
+    const condition = func.instResult(insts[cmp_idx]) orelse return null;
+    var idx = cmp_idx + 1;
+    while (idx < insts.len) : (idx += 1) {
+        switch (func.opcode(insts[idx])) {
+            .arith, .arith_imm => continue,
+            .select => |select| {
+                if (select.cond != condition) return null;
+                const cmp = fusedCmpForSelect(func, insts, idx) orelse return null;
+                return paritySelect(func, select, cmp);
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn parityConstantForLaterSelect(func: *const Function, insts: []const ir.function.Inst, constant: Value, model: peephole.MachineModel) bool {
+    if (!isConstOne(func, constant)) return false;
+    for (insts, 0..) |inst, idx| {
+        const select = switch (func.opcode(inst)) {
+            .select => |value| value,
+            else => continue,
+        };
+        const cmp = fusedCmpForSelect(func, insts, idx) orelse continue;
+        const parity = paritySelect(func, select, cmp) orelse continue;
+        const used = arithmeticUses(func, parity.masked, constant) or
+            arithmeticUses(func, parity.increment, constant) or
+            arithmeticUses(func, parity.decrement, constant);
+        if (used and machinePrefersParity(model, isWide(func, parity.value))) return true;
+    }
+    return false;
+}
+
+fn arithmeticUses(func: *const Function, result: Value, value: Value) bool {
+    const inst = func.definingInst(result) orelse return false;
+    return switch (func.opcode(inst)) {
+        .arith => |arith| arith.lhs == value or arith.rhs == value,
+        .arith_imm => |arith| arith.lhs == value,
+        else => false,
+    };
+}
+
 fn cmpFeedsLaterSelect(func: *const Function, insts: []const ir.function.Inst, cmp_idx: usize) bool {
     const result = func.instResult(insts[cmp_idx]) orelse return false;
     var idx = cmp_idx + 1;
@@ -5827,6 +5973,34 @@ test "selects signed absolute value with conditional negate" {
     }
     try std.testing.expectEqual(@as(usize, 1), cneg_count);
     try std.testing.expectEqual(@as(usize, 0), zero_move_count);
+}
+
+test "selects odd increment and even decrement with test and csinc" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const increment = try func.appendInst(b, t, .{ .arith_imm = .{ .op = .add, .lhs = x, .imm = 1 } });
+    const masked = try func.appendInst(b, t, .{ .arith_imm = .{ .op = .bit_and, .lhs = x, .imm = 1 } });
+    const zero = try func.appendInst(b, t, .{ .iconst = 0 });
+    const odd = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .ne, .lhs = masked, .rhs = zero } });
+    const decrement = try func.appendInst(b, t, .{ .arith_imm = .{ .op = .sub, .lhs = x, .imm = 1 } });
+    const adjusted = try func.appendInst(b, t, .{ .select = .{ .cond = odd, .then = increment, .@"else" = decrement } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(adjusted) });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var test_count: usize = 0;
+    var csinc_count: usize = 0;
+    for (code) |word| {
+        if (word & 0x7F800000 == 0x72000000) test_count += 1;
+        if (word & 0x7FE00C00 == 0x1A800400) csinc_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), test_count);
+    try std.testing.expectEqual(@as(usize, 1), csinc_count);
 }
 
 test "masked switch index proves its upper bound" {

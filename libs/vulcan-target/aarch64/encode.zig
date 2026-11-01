@@ -254,6 +254,10 @@ pub fn andImm(rd: Reg, rn: Reg, value: u64, wide: bool) ?u32 {
     return logicalImm(0, rd, rn, value, wide);
 }
 
+pub fn andsImm(rd: Reg, rn: Reg, value: u64, wide: bool) ?u32 {
+    return logicalImm(3, rd, rn, value, wide);
+}
+
 pub fn orrImm(rd: Reg, rn: Reg, value: u64, wide: bool) ?u32 {
     return logicalImm(1, rd, rn, value, wide);
 }
@@ -781,6 +785,16 @@ pub fn asrv64(rd: Reg, rn: Reg, rm: Reg) u32 {
 /// `csel wd, wn, wm, cond` (32-bit): wd = cond ? wn : wm.
 pub fn csel(rd: Reg, rn: Reg, rm: Reg, cond: Cond) u32 {
     return 0x1A800000 | (n(rm) << 16) | (@as(u32, @backingInt(cond)) << 12) | (n(rn) << 5) | n(rd);
+}
+
+/// `csinc wd, wn, wm, cond`: select `wn` when cond is true, otherwise `wm + 1`.
+pub fn csinc(rd: Reg, rn: Reg, rm: Reg, cond: Cond, wide: bool) u32 {
+    return (if (wide) @as(u32, 1) << 31 else 0) |
+        0x1A800400 |
+        (n(rm) << 16) |
+        (@as(u32, @backingInt(cond)) << 12) |
+        (n(rn) << 5) |
+        n(rd);
 }
 
 /// `cneg wd, wn, cond`, an alias of `csneg wd, wn, wn, invert(cond)`.
@@ -1574,6 +1588,11 @@ test "scaled register-offset word load encoding" {
 test "conditional negate encoding" {
     try std.testing.expectEqual(@as(u32, 0x5A89A529), cneg(.x9, .x9, .lt, false));
     try std.testing.expectEqual(@as(u32, 0xDA83B462), cneg(.x2, .x3, .ge, true));
+}
+
+test "parity select encodings" {
+    try std.testing.expectEqual(@as(u32, 0x7200013F), andsImm(.zr, .x9, 1, false).?);
+    try std.testing.expectEqual(@as(u32, 0x1A890589), csinc(.x9, .x12, .x9, .eq, false));
 }
 
 test "aarch64 byte and halfword offset-form load/store encoders match the disassembler" {
