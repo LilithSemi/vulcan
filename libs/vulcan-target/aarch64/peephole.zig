@@ -384,12 +384,7 @@ pub fn decodeMem(word: u32) ?MemInsn {
 ///    derived from an unsigned u12 scaled-imm so it is always >= 0, making the range check just
 ///    this upper bound.
 ///
-/// Task 1 only added GPR (x/w) offset-form ldp/stp encoders (`ldpOffX`/`stpOffX`/`ldpOffW`/
-/// `stpOffW`). The scalar-float (s/d) and 128-bit vector (q) ldp/stp forms live at different,
-/// not-yet-added-or-disasm-confirmed base opcodes (the SIMD&FP register-pair family), so
-/// pairing those kinds is deliberately deferred: they still decode correctly above (so a caller
-/// walking code with `decodeMem` treats them as opaque single instructions, not garbage), but
-/// `tryFuse` returns null for them rather than emit an unvalidated encoding.
+/// Scalar-float s/d pairs remain deferred. Q pairs use the validated SIMD register-pair encoding.
 pub fn tryFuse(a: MemInsn, b: MemInsn) ?u32 {
     if (a.kind != b.kind) return null;
     if (a.rn != b.rn) return null;
@@ -397,7 +392,7 @@ pub fn tryFuse(a: MemInsn, b: MemInsn) ?u32 {
     if (b.off != a.off + size) return null;
     if (isLoad(a.kind)) {
         if (a.rt == b.rt) return null;
-        if (a.rt == a.rn) return null;
+        if ((a.kind == .ldr_x or a.kind == .ldr_w) and a.rt == a.rn) return null;
     }
     const imm7: u32 = a.off / size;
     if (imm7 > 63) return null;
@@ -411,7 +406,9 @@ pub fn tryFuse(a: MemInsn, b: MemInsn) ?u32 {
         .str_x => encode.stpOffX(rt1, rt2, rn, imm),
         .ldr_w => encode.ldpOffW(rt1, rt2, rn, imm),
         .str_w => encode.stpOffW(rt1, rt2, rn, imm),
-        .ldr_s, .str_s, .ldr_d, .str_d, .ldr_q, .str_q => null,
+        .ldr_q => encode.ldpOffQ(rt1, rt2, rn, imm),
+        .str_q => encode.stpOffQ(rt1, rt2, rn, imm),
+        .ldr_s, .str_s, .ldr_d, .str_d => null,
     };
 }
 
@@ -828,6 +825,38 @@ pub fn pairMemoryForModelWithMoveProofs(
             removed += 1;
             removed_before[i] = removed;
             i += 1;
+            continue;
+        }
+        // The scheduler may interleave two independent vector streams as A0, B0, A1, B1 to start
+        // both dependency chains early. Four adjacent loads may be regrouped as pair(A0, A1),
+        // pair(B0, B1): no write or observable instruction is crossed, and the strict pair
+        // legality plus machine score still decide whether the rewrite commits.
+        if (i + 3 < len and
+            !removed_distant[i + 1] and !removed_distant[i + 2] and !removed_distant[i + 3] and
+            !is_block_start[i + 1] and !is_block_start[i + 2] and !is_block_start[i + 3] and
+            !is_data[i] and !is_data[i + 1] and !is_data[i + 2] and !is_data[i + 3])
+        interleaved: {
+            const a0 = decodeMem(words.items[i]) orelse break :interleaved;
+            const b0 = decodeMem(words.items[i + 1]) orelse break :interleaved;
+            const a1 = decodeMem(words.items[i + 2]) orelse break :interleaved;
+            const b1 = decodeMem(words.items[i + 3]) orelse break :interleaved;
+            if (!isLoad(a0.kind) or !isLoad(b0.kind) or !isLoad(a1.kind) or !isLoad(b1.kind)) break :interleaved;
+            const pair_a = tryFuse(a0, a1) orelse break :interleaved;
+            const pair_b = tryFuse(b0, b1) orelse break :interleaved;
+            const baseline = scoreWords(words.items[i .. i + 4], model);
+            const candidate = scoreWords(&.{ pair_a, pair_b }, model);
+            if (!candidate.accepts(baseline)) break :interleaved;
+
+            removed_before[i] = removed;
+            removed_before[i + 1] = removed;
+            removed += 1;
+            removed_before[i + 2] = removed;
+            removed += 1;
+            removed_before[i + 3] = removed;
+            words.items[write] = pair_a;
+            words.items[write + 1] = pair_b;
+            write += 2;
+            i += 4;
             continue;
         }
         var did_fuse = false;
@@ -1257,7 +1286,7 @@ test "tryFuse allows a store pair even when rt equals rn (the load-only base-clo
     try std.testing.expectEqual(encode.stpOffX(.x2, .x3, .x2, 0), tryFuse(a, b).?);
 }
 
-test "tryFuse returns null for scalar-float and vector kinds (no validated fp/q ldp/stp encoder yet)" {
+test "tryFuse pairs q registers and leaves scalar-float pairs alone" {
     const s1 = MemInsn{ .kind = .ldr_s, .rt = 0, .rn = 1, .off = 0 };
     const s2 = MemInsn{ .kind = .ldr_s, .rt = 2, .rn = 1, .off = 4 };
     try std.testing.expectEqual(@as(?u32, null), tryFuse(s1, s2));
@@ -1268,7 +1297,24 @@ test "tryFuse returns null for scalar-float and vector kinds (no validated fp/q 
 
     const q1 = MemInsn{ .kind = .ldr_q, .rt = 0, .rn = 1, .off = 0 };
     const q2 = MemInsn{ .kind = .ldr_q, .rt = 2, .rn = 1, .off = 16 };
-    try std.testing.expectEqual(@as(?u32, null), tryFuse(q1, q2));
+    try std.testing.expectEqual(encode.ldpOffQ(.x0, .x2, .x1, 0), tryFuse(q1, q2).?);
+}
+
+test "pairMemory scores and fuses two interleaved q-load streams" {
+    const allocator = std.testing.allocator;
+    var words = try wordsFrom(allocator, &.{
+        encode.ldrQ(.x12, .x23, 0),
+        encode.ldrQ(.x13, .x24, 0),
+        encode.ldrQ(.x14, .x23, 16),
+        encode.ldrQ(.x15, .x24, 16),
+    });
+    defer words.deinit(allocator);
+
+    try pairMemory(allocator, &words, &.{}, &.{}, &.{}, &.{});
+    try std.testing.expectEqualSlices(u32, &.{
+        encode.ldpOffQ(.x12, .x14, .x23, 0),
+        encode.ldpOffQ(.x13, .x15, .x24, 0),
+    }, words.items);
 }
 
 /// Build an owned `std.ArrayList(u32)` from a literal slice so a test can hand `pairMemory` a

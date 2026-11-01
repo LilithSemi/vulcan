@@ -687,7 +687,17 @@ fn decode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32, ctx: ?Context) 
         return;
     }
 
-    // stp/ldp signed offset (bit31 selects 32/64-bit, bit22 selects load).
+    // SIMD q-register stp/ldp signed offset.
+    if (w & 0xFFC00000 == 0xAD000000 or w & 0xFFC00000 == 0xAD400000) {
+        const load = (w >> 22) & 1 != 0;
+        const imm7: i32 = (@as(i32, @bitCast(w << 10)) >> 25) << 4;
+        try buf.print(a, "{s} q{d}, q{d}, [", .{ if (load) "ldp" else "stp", rd(w), ra(w) });
+        try sp(buf, a, true, rn(w));
+        if (imm7 != 0) try buf.print(a, ", #{d}]", .{imm7}) else try buf.appendSlice(a, "]");
+        return;
+    }
+
+    // GPR stp/ldp signed offset (bit31 selects 32/64-bit, bit22 selects load).
     if (w & 0x7FC00000 == 0x29000000 or w & 0x7FC00000 == 0x29400000) {
         const x64 = (w >> 31) & 1 != 0;
         const load = (w >> 22) & 1 != 0;

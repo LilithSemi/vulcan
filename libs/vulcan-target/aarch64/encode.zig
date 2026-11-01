@@ -512,6 +512,19 @@ pub fn stpOffW(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
     return 0x29000000 | (imm7 << 15) | (n(rt2) << 10) | (n(rn) << 5) | n(rt1);
 }
 
+/// `ldp qt1, qt2, [rn, #imm]` (128-bit SIMD registers, signed offset, no writeback). `imm` is a
+/// multiple of 16 in the range [-1024, 1008].
+pub fn ldpOffQ(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
+    const imm7: u32 = @as(u32, @bitCast(@as(i32, imm) >> 4)) & 0x7F;
+    return 0xAD400000 | (imm7 << 15) | (n(rt2) << 10) | (n(rn) << 5) | n(rt1);
+}
+
+/// `stp qt1, qt2, [rn, #imm]` (128-bit SIMD registers, signed offset, no writeback).
+pub fn stpOffQ(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
+    const imm7: u32 = @as(u32, @bitCast(@as(i32, imm) >> 4)) & 0x7F;
+    return 0xAD000000 | (imm7 << 15) | (n(rt2) << 10) | (n(rn) << 5) | n(rt1);
+}
+
 /// `str xt, [xn, #off]` (64-bit unsigned offset, `off` a multiple of 8).
 pub fn strOff(rt: Reg, rn: Reg, off: u15) u32 {
     return 0xF9000000 | ((@as(u32, off) >> 3) << 10) | (n(rn) << 5) | n(rt);
@@ -1574,6 +1587,7 @@ test "ldp/stp offset-form encoders match known bytes" {
     try std.testing.expectEqual(@as(u32, 0xA9410440), ldpOffX(.x0, .x1, .x2, 16));
     try std.testing.expectEqual(@as(u32, 0x29010440), stpOffW(.x0, .x1, .x2, 8));
     try std.testing.expectEqual(@as(u32, 0x297F10A3), ldpOffW(.x3, .x4, .x5, -8));
+    try std.testing.expectEqual(@as(u32, 0xAD410440), ldpOffQ(.x0, .x1, .x2, 32));
 
     const disasm = @import("disasm.zig");
     const a = std.testing.allocator;
@@ -1593,6 +1607,10 @@ test "ldp/stp offset-form encoders match known bytes" {
     const s4 = try disasm.one(a, ldpOffW(.x3, .x4, .x5, -8));
     defer a.free(s4);
     try std.testing.expectEqualStrings("ldp w3, w4, [x5, #-8]", s4);
+
+    const s5 = try disasm.one(a, ldpOffQ(.x0, .x1, .x2, 32));
+    defer a.free(s5);
+    try std.testing.expectEqualStrings("ldp q0, q1, [x2, #32]", s5);
 }
 
 test "scaled register-offset word load encoding" {
