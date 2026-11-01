@@ -16,6 +16,7 @@ const licm = @import("licm.zig");
 const ifconvert = @import("ifconvert.zig");
 const loopimm = @import("microarch/loopimm.zig");
 const looprotate = @import("microarch/looprotate.zig");
+const rangediv = @import("microarch/rangediv.zig");
 
 const model_mod = @import("microarch/model.zig");
 const registry = @import("microarch/registry.zig");
@@ -142,7 +143,7 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
     if (m.arch != .aarch64) return false;
     var gate = try score.IRGate.init(allocator, func, m);
     defer gate.deinit();
-    const changed = try pass.run(allocator, gate.candidateFunction(), &.{ offsetcombine.pass_def, loopimm.pass_def, looprotate.pass_def, dce.pass_def });
+    const changed = try pass.run(allocator, gate.candidateFunction(), &.{ rangediv.pass_def, offsetcombine.pass_def, loopimm.pass_def, looprotate.pass_def, dce.pass_def });
     if (!changed) return false;
     return gate.commit(func);
 }
@@ -156,6 +157,7 @@ test {
     std.testing.refAllDecls(@import("microarch/loopimm.zig"));
     std.testing.refAllDecls(@import("microarch/looprotate.zig"));
     std.testing.refAllDecls(@import("microarch/offsetcombine.zig"));
+    std.testing.refAllDecls(@import("microarch/rangediv.zig"));
     std.testing.refAllDecls(@import("microarch/prefetch.zig"));
     std.testing.refAllDecls(@import("microarch/dotprod.zig"));
     std.testing.refAllDecls(@import("microarch/matmul_recog.zig"));
