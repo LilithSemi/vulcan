@@ -913,6 +913,17 @@ pub fn strQ(rt: Reg, rn: Reg, off: u16) u32 {
     return 0x3D800000 | ((@as(u32, off) >> 4) << 10) | (n(rn) << 5) | n(rt);
 }
 
+/// `ldr qt, [xn], #imm` / `str qt, [xn], #imm`: post-indexed 128-bit SIMD&FP memory access.
+/// `imm` is an unscaled signed 9-bit byte offset.
+pub fn ldrQPost(rt: Reg, rn: Reg, imm: i16) u32 {
+    const imm9: u32 = @as(u32, @bitCast(@as(i32, imm))) & 0x1FF;
+    return 0x3CC00400 | (imm9 << 12) | (n(rn) << 5) | n(rt);
+}
+pub fn strQPost(rt: Reg, rn: Reg, imm: i16) u32 {
+    const imm9: u32 = @as(u32, @bitCast(@as(i32, imm))) & 0x1FF;
+    return 0x3C800400 | (imm9 << 12) | (n(rn) << 5) | n(rt);
+}
+
 /// `ld4 {vt.4s-v(t+3).4s}, [xn]` / `st4 ...`: deinterleave or interleave four streams of
 /// 32-bit lanes. The four vector registers are consecutive modulo 32, as required by A64.
 pub fn ld4S4(rt: Reg, rn: Reg) u32 {
@@ -1591,6 +1602,8 @@ test "four-way interleaved vector memory encoders match the disassembler" {
     try std.testing.expectEqual(@as(u32, 0x4C4008BC), ld4S4(@fromBackingInt(28), .x5));
     try std.testing.expectEqual(@as(u32, 0x4C0008BC), st4S4(@fromBackingInt(28), .x5));
     try std.testing.expectEqual(@as(u32, 0x4C9F08BC), st4S4Post(@fromBackingInt(28), .x5));
+    try std.testing.expectEqual(@as(u32, 0x3CC104E3), ldrQPost(.x3, .x7, 16));
+    try std.testing.expectEqual(@as(u32, 0x3C810524), strQPost(.x4, .x9, 16));
 
     const load = try disasm.one(a, ld4S4(@fromBackingInt(28), .x5));
     defer a.free(load);

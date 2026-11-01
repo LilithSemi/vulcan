@@ -94,7 +94,7 @@ pub fn scoreWords(words: []const u32, model: MachineModel) MachineScore {
 }
 
 fn machineClass(word: u32) MachineClass {
-    if (decodeMem(word) != null or isPairMemory(word) or decodeStruct4(word) != null or isRegisterMemory(word)) return .mem;
+    if (decodeMem(word) != null or decodePostQ(word) != null or isPairMemory(word) or decodeStruct4(word) != null or isRegisterMemory(word)) return .mem;
     if (isDivide(word)) return .div;
     if (word & 0x7F000000 == 0x1B000000) return .mul;
     if (word & 0x7C000000 == 0x14000000 or word & 0xFF000010 == 0x54000000) return .branch;
@@ -115,6 +115,17 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
             gpReg(mem.rt);
         if (isLoad(mem.kind)) return .{ .reads = .{ gpReg(mem.rn), null, null, null, null }, .writes = .{ data, null, null, null, null } };
         return .{ .reads = .{ gpReg(mem.rn), data, null, null, null } };
+    }
+    if (decodePostQ(word)) |mem| {
+        const data = fpReg(mem.rt);
+        if (mem.load) return .{
+            .reads = .{ gpReg(mem.rn), null, null, null, null },
+            .writes = .{ data, gpReg(mem.rn), null, null, null },
+        };
+        return .{
+            .reads = .{ gpReg(mem.rn), data, null, null, null },
+            .writes = .{ gpReg(mem.rn), null, null, null, null },
+        };
     }
     if (decodePairMemory(word)) |pair| {
         const load = word & 0x00400000 != 0;
@@ -334,6 +345,17 @@ fn isPairMemory(word: u32) bool {
     return decodePairMemory(word) != null;
 }
 
+const PostQ = struct { load: bool, rt: u5, rn: u5 };
+
+fn decodePostQ(word: u32) ?PostQ {
+    const load = switch (word & 0xFFE00C00) {
+        0x3CC00400 => true,
+        0x3C800400 => false,
+        else => return null,
+    };
+    return .{ .load = load, .rt = @truncate(word), .rn = @truncate(word >> 5) };
+}
+
 fn ports(model: MachineModel, class: MachineClass) u32 {
     return @max(1, switch (class) {
         .alu => model.units.alu,
@@ -477,6 +499,22 @@ fn tryPostIndexQ(pair_word: u32, add_word: u32) ?u32 {
         encode.ldpPostQ(first, second, base_reg, 32)
     else
         encode.stpPostQ(first, second, base_reg, 32);
+}
+
+fn tryPostIndexSingleQ(memory_word: u32, add_word: u32) ?u32 {
+    const memory = decodeMem(memory_word) orelse return null;
+    if ((memory.kind != .ldr_q and memory.kind != .str_q) or memory.off != 0) return null;
+    if (add_word & 0xFFC00000 != 0x91000000) return null;
+    const add_source: u5 = @truncate(add_word >> 5);
+    const add_dest: u5 = @truncate(add_word);
+    const immediate = (add_word >> 10) & 0xFFF;
+    if (add_source != memory.rn or add_dest != memory.rn or immediate != 16) return null;
+    const rt: Reg = @fromBackingInt(memory.rt);
+    const rn: Reg = @fromBackingInt(memory.rn);
+    return if (memory.kind == .ldr_q)
+        encode.ldrQPost(rt, rn, 16)
+    else
+        encode.strQPost(rt, rn, 16);
 }
 
 const Struct4Update = struct { temporary: u5, base: u5 };
@@ -950,6 +988,45 @@ pub fn pairMemoryForModelWithMoveProofs(
             const deps = dependencies(words.items[store_at], class);
             if (containsReg(deps.reads, temporary) or containsReg(deps.writes, temporary) or
                 containsReg(deps.writes, base)) break;
+        }
+    }
+
+    // Fold a later 16-byte base update into a single Q load/store. The physical-register scan
+    // allows independent arithmetic between the memory operation and update, but stops at any use
+    // or definition of the base so writeback cannot change an intervening observation.
+    for (0..len) |memory_at| {
+        if (removed_distant[memory_at] or is_data[memory_at]) continue;
+        const memory = decodeMem(words.items[memory_at]) orelse continue;
+        if ((memory.kind != .ldr_q and memory.kind != .str_q) or memory.off != 0) continue;
+        var add_at = memory_at + 1;
+        while (add_at < len and add_at - memory_at <= 16) : (add_at += 1) {
+            if (removed_distant[add_at]) continue;
+            if (is_block_start[add_at] or is_data[add_at]) break;
+            if (tryPostIndexSingleQ(words.items[memory_at], words.items[add_at])) |post| {
+                var baseline_words: [17]u32 = undefined;
+                var candidate_words: [16]u32 = undefined;
+                var baseline_len: usize = 0;
+                var candidate_len: usize = 0;
+                for (memory_at..add_at + 1) |at| {
+                    if (removed_distant[at]) continue;
+                    baseline_words[baseline_len] = words.items[at];
+                    baseline_len += 1;
+                    if (at == add_at) continue;
+                    candidate_words[candidate_len] = if (at == memory_at) post else words.items[at];
+                    candidate_len += 1;
+                }
+                const baseline = scoreWords(baseline_words[0..baseline_len], model);
+                const candidate = scoreWords(candidate_words[0..candidate_len], model);
+                if (candidate.accepts(baseline)) {
+                    words.items[memory_at] = post;
+                    removed_distant[add_at] = true;
+                }
+                break;
+            }
+            const class = machineClass(words.items[add_at]);
+            if (class == .branch) break;
+            const deps = dependencies(words.items[add_at], class);
+            if (containsReg(deps.reads, memory.rn) or containsReg(deps.writes, memory.rn)) break;
         }
     }
 
@@ -1599,6 +1676,43 @@ test "pairMemory combines q stores with a carried pointer update" {
         encode.stpPostQ(.x0, .x1, .x2, 32),
         encode.add(.x3, .x4, .x5),
     }, words.items);
+}
+
+test "pairMemory post-indexes single q memory operations" {
+    const allocator = std.testing.allocator;
+    var words = try wordsFrom(allocator, &.{
+        encode.ldrQ(.x0, .x2, 0),
+        encode.add(.x6, .x7, .x8),
+        encode.addImm64(.x2, .x2, 16),
+        encode.strQ(.x1, .x3, 0),
+        encode.add(.x9, .x10, .x11),
+        encode.addImm64(.x3, .x3, 16),
+    });
+    defer words.deinit(allocator);
+
+    try pairMemory(allocator, &words, &.{}, &.{}, &.{}, &.{});
+
+    try std.testing.expectEqualSlices(u32, &.{
+        encode.ldrQPost(.x0, .x2, 16),
+        encode.add(.x6, .x7, .x8),
+        encode.strQPost(.x1, .x3, 16),
+        encode.add(.x9, .x10, .x11),
+    }, words.items);
+}
+
+test "pairMemory keeps a q pointer update across an intervening base use" {
+    const allocator = std.testing.allocator;
+    const original = [_]u32{
+        encode.ldrQ(.x0, .x2, 0),
+        encode.add(.x6, .x2, .x8),
+        encode.addImm64(.x2, .x2, 16),
+    };
+    var words = try wordsFrom(allocator, &original);
+    defer words.deinit(allocator);
+
+    try pairMemory(allocator, &words, &.{}, &.{}, &.{}, &.{});
+
+    try std.testing.expectEqualSlices(u32, &original, words.items);
 }
 
 test "pairMemory folds a temporary structure pointer into post-index st4" {
