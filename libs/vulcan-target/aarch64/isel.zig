@@ -944,6 +944,63 @@ fn alignPadWords(words: usize, fetch_align: u16) usize {
     return if (rem == 0) 0 else per - rem;
 }
 
+fn restoreLoopAlignment(
+    allocator: std.mem.Allocator,
+    words: *std.ArrayList(u32),
+    block_start: []usize,
+    fixups: []Fixup,
+    relocs: []Reloc,
+    lines: []LineEntry,
+    aligned_headers: []const bool,
+    fetch_align: u16,
+) std.mem.Allocator.Error!void {
+    if (fetch_align <= 4) return;
+    const old_len = words.items.len;
+    const padding = try allocator.alloc(usize, old_len + 1);
+    defer allocator.free(padding);
+    @memset(padding, 0);
+
+    var inserted: usize = 0;
+    for (block_start, aligned_headers) |start, aligned| {
+        if (!aligned or start >= old_len) continue;
+        const count = alignPadWords(start + inserted, fetch_align);
+        padding[start] += count;
+        inserted += count;
+    }
+    if (inserted == 0) return;
+
+    const added = try allocator.alloc(usize, old_len + 1);
+    defer allocator.free(added);
+    var running: usize = 0;
+    for (padding, 0..) |count, index| {
+        running += count;
+        added[index] = running;
+    }
+
+    var realigned: std.ArrayList(u32) = .empty;
+    errdefer realigned.deinit(allocator);
+    try realigned.ensureTotalCapacity(allocator, old_len + inserted);
+    for (words.items, 0..) |word, index| {
+        for (0..padding[index]) |_| realigned.appendAssumeCapacity(encode.nop());
+        realigned.appendAssumeCapacity(word);
+    }
+    for (0..padding[old_len]) |_| realigned.appendAssumeCapacity(encode.nop());
+
+    for (block_start) |*start| start.* += added[start.*];
+    for (fixups) |*fixup| {
+        fixup.at += added[fixup.at];
+        if (fixup.table_base) |base| fixup.table_base = base + added[base];
+        if (fixup.adr_target) |target| fixup.adr_target = target + added[target];
+    }
+    for (relocs) |*reloc| reloc.offset += added[reloc.offset];
+    for (lines) |*line| {
+        const word = line.offset / 4;
+        line.offset = @intCast((word + added[word]) * 4);
+    }
+    words.deinit(allocator);
+    words.* = realigned;
+}
+
 /// Rewrite `work` in place so address folding is SOUND under the fold-agnostic Wimmer allocator.
 /// The shared allocator sees only the actual IR operands, so for a foldable
 /// `p = arith_imm.add(base, imm); load(p)` it keeps `p` live to the load and lets `base` die at the
@@ -1345,6 +1402,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     var is_loop_header = try allocator.alloc(bool, nblocks);
     defer allocator.free(is_loop_header);
     @memset(is_loop_header, false);
+    var aligned_loop_header = try allocator.alloc(bool, nblocks);
+    defer allocator.free(aligned_loop_header);
+    @memset(aligned_loop_header, false);
     var li = try loops.analyze(allocator, func);
     defer li.deinit(allocator);
     for (li.loops) |l| is_loop_header[l.header] = true;
@@ -1598,6 +1658,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         if (fetch_align > 4 and is_loop_header[bi]) {
             var pad = alignPadWords(code.items.len, fetch_align);
             while (pad > 0) : (pad -= 1) try code.append(allocator, encode.nop());
+            aligned_loop_header[bi] = true;
         }
         block_start[bi] = code.items.len;
         var terminated = false;
@@ -2623,6 +2684,16 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         coalescable_edge_moves.items,
         dead_source_edge_moves.items,
         caps.machine_model,
+    );
+    try restoreLoopAlignment(
+        allocator,
+        &code,
+        block_start,
+        fixups.items,
+        relocs.items,
+        lines.items,
+        aligned_loop_header,
+        fetch_align,
     );
 
     for (fixups.items) |f| {
@@ -6580,6 +6651,28 @@ test "alignPadWords computes the nop count to reach a fetch-align boundary" {
     // fetch_align <= 4 (one word or less, or disabled): always a no-op.
     try std.testing.expectEqual(@as(usize, 0), alignPadWords(3, 4));
     try std.testing.expectEqual(@as(usize, 0), alignPadWords(3, 0));
+}
+
+test "machine shrinking cannot invalidate loop header alignment" {
+    const allocator = std.testing.allocator;
+    var words: std.ArrayList(u32) = .empty;
+    defer words.deinit(allocator);
+    try words.appendSlice(allocator, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    var starts = [_]usize{ 0, 7 };
+    var fixups = [_]Fixup{.{ .at = 7, .target = 1, .adr_target = 7 }};
+    var relocs = [_]Reloc{.{ .offset = 7, .symbol = "callee" }};
+    var lines = [_]LineEntry{.{ .offset = 28, .line = 9 }};
+
+    try restoreLoopAlignment(allocator, &words, &starts, &fixups, &relocs, &lines, &.{ false, true }, 32);
+
+    try std.testing.expectEqual(@as(usize, 9), words.items.len);
+    try std.testing.expectEqual(encode.nop(), words.items[7]);
+    try std.testing.expectEqual(@as(u32, 8), words.items[8]);
+    try std.testing.expectEqual(@as(usize, 8), starts[1]);
+    try std.testing.expectEqual(@as(usize, 8), fixups[0].at);
+    try std.testing.expectEqual(@as(?usize, 8), fixups[0].adr_target);
+    try std.testing.expectEqual(@as(usize, 8), relocs[0].offset);
+    try std.testing.expectEqual(@as(u32, 32), lines[0].offset);
 }
 
 test "intra-block predicate and use positions" {
