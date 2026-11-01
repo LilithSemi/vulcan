@@ -48,6 +48,7 @@ const Plan = struct {
     accesses: []ArrayAccess, // owned
     reduction: ?MapReduction,
     factor: u32, // V
+    groups: u32,
     /// Scalar element type of a vector induction carried through the widened loop.
     index_elem_type: ?Type,
 };
@@ -88,6 +89,7 @@ fn functionHasFastMath(func: *const Function) bool {
 
 fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error!void {
     const V = plan.factor;
+    const U = V * plan.groups;
     const ind_ty = func.valueType(func.blockParams(plan.header)[plan.induction]);
     const reduction_ty = if (plan.reduction) |red| func.valueType(func.blockParams(plan.header)[red.accumulator]) else null;
     const reduction_vec_ty = if (reduction_ty) |elem|
@@ -104,7 +106,7 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         try func.types.intern(.{ .vector = .{ .len = @intCast(V), .elem = elem } })
     else
         null;
-    const group_offset: ?i64 = std.math.add(i64, @as(i64, @intCast(V - 1)), plan.exit_offset) catch null;
+    const group_offset: ?i64 = std.math.add(i64, @as(i64, @intCast(U - 1)), plan.exit_offset) catch null;
     const offset_fits = group_offset != null and group_offset.? >= 0 and ind_int.bits < 64 and
         @as(u64, @intCast(group_offset.?)) < (@as(u64, 1) << @intCast(ind_int.bits));
     const rotated = ind_int.signedness == .unsigned and offset_fits;
@@ -133,7 +135,7 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         break :init try func.appendInst(plan.preheader, vec_ty, .{ .struct_new = .{ .fields = try func.internValues(lanes[0..V]) } });
     } else null;
     const index_step = if (index_vec_ty) |vec_ty| step: {
-        const scalar = try func.appendInst(plan.preheader, index_elem_ty.?, .{ .iconst = @intCast(V) });
+        const scalar = try func.appendInst(plan.preheader, index_elem_ty.?, .{ .iconst = @intCast(U) });
         break :step try func.appendSplat(plan.preheader, vec_ty, scalar);
     } else null;
     const init_acc = if (plan.reduction) |red| pre_args[red.accumulator] else null;
@@ -186,7 +188,7 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         const wide_highest = try func.appendArithImm(mainheader, u64_t, .add, wide_i, group_offset.?);
         break :guard try func.appendInst(mainheader, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = wide_highest, .rhs = wide_bound } });
     } else guard: {
-        const highest_lane = try func.appendArithImm(mainheader, ind_ty, .add, mi, @as(i64, @intCast(V - 1)));
+        const highest_lane = try func.appendArithImm(mainheader, ind_ty, .add, mi, @as(i64, @intCast(U - 1)));
         const highest = if (plan.exit_offset == 0)
             highest_lane
         else
@@ -211,8 +213,8 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
             try func.appendIf(mainheader, condition, .{ .target = mainbody, .args = &.{mi} }, .{ .target = combine, .args = &.{mi} });
     }
 
-    // Main body: V copies emitted OP-MAJOR (all V copies of each instruction adjacently), which is
-    // the run of contiguous same-op instructions the SLP pass fuses into vectors. Per unique address,
+    // Main body: U copies emitted operation-major in V-wide groups, which gives the SLP pass one or more
+    // contiguous vector groups. Per unique address,
     // base_i = base + bmi*stride computed once; copy m reads/writes base_i + m*stride. Each copy's
     // induction maps to bmi+m, so pure body computation may observe the raw index too. The original
     // address/scale/induction-update instructions are skipped when cloning.
@@ -234,7 +236,7 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
 
     // Per-copy value maps, pre-seeded with the induction and every regenerated address. Deduplicate by
     // the address instruction (a load and a store to the same slot share it).
-    const vmaps = try allocator.alloc(std.AutoHashMapUnmanaged(Value, Value), V);
+    const vmaps = try allocator.alloc(std.AutoHashMapUnmanaged(Value, Value), U);
     defer {
         for (vmaps) |*vm| vm.deinit(allocator);
         allocator.free(vmaps);
@@ -248,9 +250,18 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     try skip.put(allocator, ind_update, {});
     if (plan.reduction) |red| try skip.put(allocator, red.update_inst, {});
     var vector_indices: [MAX_LANES]?Value = @splat(null);
-    if (bvi) |vector_index| for (vector_indices[0..V], 0..) |*lane, index| {
-        lane.* = try func.appendInst(mainbody, index_elem_ty.?, .{ .extract = .{ .aggregate = vector_index, .index = @intCast(index) } });
-    };
+    if (bvi) |vector_index| {
+        for (0..plan.groups) |group| {
+            const group_index = if (group == 0) vector_index else shifted: {
+                const offset = try func.appendInst(mainbody, index_elem_ty.?, .{ .iconst = @intCast(group * V) });
+                const offsets = try func.appendSplat(mainbody, index_vec_ty.?, offset);
+                break :shifted try func.appendInst(mainbody, index_vec_ty.?, .{ .arith = .{ .op = .add, .lhs = vector_index, .rhs = offsets } });
+            };
+            for (0..V) |lane| {
+                vector_indices[group * V + lane] = try func.appendInst(mainbody, index_elem_ty.?, .{ .extract = .{ .aggregate = group_index, .index = @intCast(lane) } });
+            }
+        }
+    }
     for (vmaps, 0..) |*vm, m| {
         const lane_i = if (m == 0)
             bmi
@@ -279,10 +290,10 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         }
     }
 
-    // Clone the body op-major: for each instruction, emit its V copies (one per value map) adjacently.
+    // Clone the body op-major: for each instruction, emit its U copies (one per value map) adjacently.
     //
-    // Each copy keeps the SAME type and the same operation as the original, so every attribute of
-    // the original travels with it. This is a scalar unroll by V, not a widening: an `endian` on a
+    // Each copy keeps the same type and operation as the original, so every attribute of
+    // the original travels with it. This is a scalar unroll by U, not a widening: an `endian` on a
     // 4-byte load still describes a 4-byte load in every copy. (The reduction path in
     // `applyReduction` below is the widening one, and it deliberately carries nothing.)
     const body_insts = try allocator.dupe(Inst, func.blockInsts(plan.body));
@@ -326,7 +337,7 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         const group = try func.appendInst(mainbody, reduction_vec_ty.?, .{ .struct_new = .{ .fields = try func.internValues(increments.items) } });
         break :acc try func.appendInst(mainbody, reduction_vec_ty.?, .{ .arith = .{ .op = red.op, .lhs = bacc.?, .rhs = group } });
     } else null;
-    const nmi = try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(V)));
+    const nmi = try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(U)));
     const next_vi = if (bvi) |vi| try func.appendInst(mainbody, index_vec_ty.?, .{ .arith = .{ .op = .add, .lhs = vi, .rhs = index_step.? } }) else null;
     if (rotated) {
         const next_cont = try func.appendInst(mainbody, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = nmi, .rhs = threshold.? } });
@@ -617,6 +628,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     if (has_interleaved and index_elem_type == null)
         index_elem_type = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = induction_bits } });
 
+    const groups: u32 = if (model.arch == .aarch64 and reduction == null and accesses.items.len <= 2 and V * 2 <= MAX_LANES) 2 else 1;
     return Plan{
         .header = header,
         .body = bodyb,
@@ -632,6 +644,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         .accesses = try accesses.toOwnedSlice(allocator),
         .reduction = reduction,
         .factor = V,
+        .groups = groups,
         .index_elem_type = index_elem_type,
     };
 }
@@ -1179,6 +1192,7 @@ test "recognizes a saxpy map loop: two contiguous loads, one contiguous store, V
     defer allocator.free(plan.accesses);
 
     try testing.expectEqual(@as(u32, 4), plan.factor); // 128-bit / 32-bit f32 = 4 lanes
+    try testing.expectEqual(@as(u32, 1), plan.groups);
     var loads: usize = 0;
     var stores: usize = 0;
     for (plan.accesses) |acc| {
@@ -1224,6 +1238,7 @@ test "frontend-shaped map loop may use the induction value as stored data" {
     const plan = (try recognize(allocator, &func, registry.modelFor(.@"ampere-altra"), &info.loops[0])) orelse return error.NotRecognized;
     defer allocator.free(plan.accesses);
     try testing.expectEqual(i32_t, plan.index_elem_type.?);
+    try testing.expectEqual(@as(u32, 2), plan.groups);
 
     try apply(allocator, &func, &plan);
     var diags = try ir.verify.verify(allocator, &func, .low);
@@ -1528,7 +1543,7 @@ test "volatile: a reduction over a volatile load is not widened" {
 }
 
 test "the map path carries a body instruction's endian attribute onto every lane copy" {
-    // The map path is a scalar unroll by V, not a widening: each copy loads the same 4 bytes as
+    // The map path is a scalar unroll by U, not a widening: each copy loads the same 4 bytes as
     // the original, so it keeps the original's `endian`. A copy that lost it would stop being
     // byte-swapped while the source iteration it stands for still is.
     const allocator = testing.allocator;
@@ -1545,7 +1560,7 @@ test "the map path carries a body instruction's endian attribute onto every lane
     try testing.expect(try run(allocator, &func, registry.modelFor(.@"ampere-altra")));
 
     // The original scalar body stays as the remainder loop, so its tag survives too: one
-    // original plus one per lane.
+    // original plus one per unrolled iteration.
     try testing.expectEqual(@as(usize, 1 + 4), countBigEndianValues(&func));
 }
 
