@@ -364,12 +364,13 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     // Continue in the original loop at the current index and accumulator value.
     const cmi = try func.appendBlockParam(combine, ind_ty);
     if (plan.reduction) |red| {
-        var scalar_acc = init_acc.?;
-        for (0..plan.groups) |_| {
-            const cacc = try func.appendBlockParam(combine, reduction_vec_ty.?);
-            const horizontal = try func.appendReduce(combine, red.op, cacc);
-            scalar_acc = try func.appendInst(combine, reduction_ty.?, .{ .arith = .{ .op = red.op, .lhs = scalar_acc, .rhs = horizontal } });
-        }
+        var caccs: [2]Value = undefined;
+        for (0..plan.groups) |group| caccs[group] = try func.appendBlockParam(combine, reduction_vec_ty.?);
+        var combined = caccs[0];
+        for (caccs[1..plan.groups]) |cacc|
+            combined = try func.appendInst(combine, reduction_vec_ty.?, .{ .arith = .{ .op = red.op, .lhs = combined, .rhs = cacc } });
+        const horizontal = try func.appendReduce(combine, red.op, combined);
+        const scalar_acc = try func.appendInst(combine, reduction_ty.?, .{ .arith = .{ .op = red.op, .lhs = init_acc.?, .rhs = horizontal } });
         var rem_args: [2]Value = undefined;
         rem_args[plan.induction] = cmi;
         rem_args[red.accumulator] = scalar_acc;
