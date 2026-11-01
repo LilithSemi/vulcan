@@ -139,6 +139,10 @@ fn dependencies(word: u32, class: MachineClass) RegisterDeps {
         .reads = .{ gpReg(@truncate(word >> 5)), gpReg(@truncate(word >> 16)), null, null },
         .writes = .{ gpReg(@truncate(word)), null },
     };
+    if (isImmediateAlu(word)) return .{
+        .reads = .{ gpReg(@truncate(word >> 5)), null, null, null },
+        .writes = .{ gpReg(@truncate(word)), null },
+    };
     return .{};
 }
 
@@ -155,6 +159,12 @@ fn isRegisterAlu(word: u32) bool {
         0x0A000000, 0x0B000000, 0x1A000000 => true,
         else => false,
     };
+}
+
+fn isImmediateAlu(word: u32) bool {
+    return word & 0x1F000000 == 0x11000000 or // add/sub immediate, including flag-setting forms
+        word & 0x1F800000 == 0x12000000 or // logical immediate
+        word & 0x1F800000 == 0x13000000; // bitfield
 }
 
 fn isRegisterMemory(word: u32) bool {
@@ -505,6 +515,13 @@ test "machine score tracks register dependency latency" {
     try std.testing.expectEqual(@as(u32, 5), dependent.critical_path);
     try std.testing.expectEqual(@as(u32, 4), independent.critical_path);
     try std.testing.expect(independent.accepts(dependent));
+}
+
+test "machine score tracks immediate producer dependencies" {
+    const model = MachineModel{ .issue_width = 4, .units = .{ .alu = 3 } };
+    const score = scoreWords(&.{ encode.subImm(.x1, .x0, 1), encode.csinc(.x2, .x1, .x0, .eq, false) }, model);
+
+    try std.testing.expectEqual(@as(u32, 2), score.critical_path);
 }
 
 test "machine score charges non-pipelined divide throughput" {
