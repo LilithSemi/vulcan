@@ -783,6 +783,16 @@ pub fn csel(rd: Reg, rn: Reg, rm: Reg, cond: Cond) u32 {
     return 0x1A800000 | (n(rm) << 16) | (@as(u32, @backingInt(cond)) << 12) | (n(rn) << 5) | n(rd);
 }
 
+/// `cneg wd, wn, cond`, an alias of `csneg wd, wn, wn, invert(cond)`.
+pub fn cneg(rd: Reg, rn: Reg, cond: Cond, wide: bool) u32 {
+    return (if (wide) @as(u32, 1) << 31 else 0) |
+        0x5A800400 |
+        (n(rn) << 16) |
+        (@as(u32, @backingInt(invertCond(cond))) << 12) |
+        (n(rn) << 5) |
+        n(rd);
+}
+
 // FP register operands are also indices 0..31, naming v0..v31 (s/d/h views). The scalar
 // FP encodings carry a 2-bit `ftype` field at bits [23:22] selecting the operand precision.
 
@@ -1559,6 +1569,11 @@ test "ldp/stp offset-form encoders match known bytes" {
 test "scaled register-offset word load encoding" {
     try std.testing.expectEqual(@as(u32, 0xB8747A11), ldrWReg(.x17, .x16, .x20));
     try std.testing.expectEqual(@as(u32, 0x38746811), ldrbReg(.x17, .x0, .x20));
+}
+
+test "conditional negate encoding" {
+    try std.testing.expectEqual(@as(u32, 0x5A89A529), cneg(.x9, .x9, .lt, false));
+    try std.testing.expectEqual(@as(u32, 0xDA83B462), cneg(.x2, .x3, .ge, true));
 }
 
 test "aarch64 byte and halfword offset-form load/store encoders match the disassembler" {

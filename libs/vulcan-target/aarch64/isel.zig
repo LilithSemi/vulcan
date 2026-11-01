@@ -1511,6 +1511,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (foldsAsLogicalImm(func, insts, inst_idx)) continue;
                     if (foldsAsShiftImm(func, insts, inst_idx)) continue;
                     if (foldsAsVectorShiftImmScalar(func, result)) continue;
+                    if (cnegZeroForLaterSelect(func, insts, result, caps.machine_model)) continue;
                     const rd = ctx.resultReg(result);
                     if (regClass(func, result) == .fpr) {
                         // A float-typed integer constant (the frontend zero-inits float
@@ -1593,6 +1594,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (a.op == .mul and (fusesIntoNextArith(func, insts, inst_idx) or fusesIntegerMulIntoNextImmAdd(func, insts, inst_idx))) continue;
                     if ((a.op == .shl or a.op == .shr) and fusesIntoNextShiftAdd(func, insts, inst_idx, caps.fuse_shift_add)) continue;
                     const result = func.instResult(inst).?;
+                    if (a.op == .sub and cnegProducerForLaterSelect(func, insts, inst_idx, caps.machine_model)) continue;
                     if ((a.op == .shl or a.op == .shr) and foldsAsBitfieldExtractSource(func, result)) continue;
                     if ((a.op == .add or a.op == .sub) and inst_idx >= 1 and fusesIntoNextArith(func, insts, inst_idx - 1)) {
                         const mul = func.opcode(insts[inst_idx - 1]).arith;
@@ -1821,6 +1823,15 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try code.append(allocator, encode.fcsel(rd, tr, el, cc, fkindOf(func, result, fp16)));
                         try storeResult(allocator, &code, ctx, result, rd);
                     } else {
+                        if (fused_cmp) |cmp| if (cnegSelectValue(func, s, cmp)) |value| {
+                            if (machinePrefersCneg(caps.machine_model, isWide(func, result))) {
+                                const src = try ctx.loadOp(allocator, &code, value, spill_op[0]);
+                                const rd = ctx.resultReg(result);
+                                try code.append(allocator, encode.cneg(rd, src, cc, isWide(func, result)));
+                                try storeResult(allocator, &code, ctx, result, rd);
+                                continue;
+                            }
+                        };
                         const tr = try ctx.loadOp(allocator, &code, s.then, spill_op[1]);
                         const el = try ctx.loadOp(allocator, &code, s.@"else", scratch_imm);
                         const rd = ctx.resultReg(result);
@@ -4429,6 +4440,64 @@ fn fusedCmpForSelect(func: *const Function, insts: []const ir.function.Inst, sel
     return cmp;
 }
 
+/// Match `x < 0 ? 0 - x : x`. The compare flags can feed CNEG directly, so the separate negate
+/// result is not needed when it has no other use.
+fn cnegSelectValue(func: *const Function, select: ir.function.Select, cmp: ir.function.Compare) ?Value {
+    if (cmp.op != .lt or !isSignedInt(func, cmp.lhs) or !isConstZero(func, cmp.rhs)) return null;
+    if (select.@"else" != cmp.lhs) return null;
+    const neg_inst = func.definingInst(select.then) orelse return null;
+    const neg = switch (func.opcode(neg_inst)) {
+        .arith => |arith| arith,
+        else => return null,
+    };
+    if (neg.op != .sub or !isConstZero(func, neg.lhs) or neg.rhs != cmp.lhs) return null;
+    if (countUses(func, select.then) != 1) return null;
+    return cmp.lhs;
+}
+
+fn machinePrefersCneg(model: peephole.MachineModel, wide: bool) bool {
+    const baseline = [_]u32{
+        if (wide) encode.sub64(.x1, .zr, .x0) else encode.sub(.x1, .zr, .x0),
+        encode.csel(.x2, .x1, .x0, .lt) | (if (wide) @as(u32, 1) << 31 else 0),
+    };
+    const candidate = [_]u32{encode.cneg(.x2, .x0, .lt, wide)};
+    return peephole.scoreWords(&candidate, model).accepts(peephole.scoreWords(&baseline, model));
+}
+
+fn cnegProducerForLaterSelect(func: *const Function, insts: []const ir.function.Inst, producer_idx: usize, model: peephole.MachineModel) bool {
+    const result = func.instResult(insts[producer_idx]) orelse return false;
+    var idx = producer_idx + 1;
+    while (idx < insts.len) : (idx += 1) {
+        switch (func.opcode(insts[idx])) {
+            .arith, .arith_imm, .icmp => continue,
+            .select => |select| {
+                if (select.then != result) return false;
+                const cmp = fusedCmpForSelect(func, insts, idx) orelse return false;
+                return cnegSelectValue(func, select, cmp) != null and machinePrefersCneg(model, isWide(func, result));
+            },
+            else => return false,
+        }
+    }
+    return false;
+}
+
+fn cnegZeroForLaterSelect(func: *const Function, insts: []const ir.function.Inst, zero: Value, model: peephole.MachineModel) bool {
+    if (!isConstZero(func, zero) or countUses(func, zero) != 2) return false;
+    for (insts, 0..) |inst, idx| {
+        const select = switch (func.opcode(inst)) {
+            .select => |value| value,
+            else => continue,
+        };
+        const cmp = fusedCmpForSelect(func, insts, idx) orelse continue;
+        const value = cnegSelectValue(func, select, cmp) orelse continue;
+        const neg_inst = func.definingInst(select.then).?;
+        const neg = func.opcode(neg_inst).arith;
+        if (cmp.rhs == zero and neg.lhs == zero)
+            return machinePrefersCneg(model, isWide(func, value));
+    }
+    return false;
+}
+
 fn cmpFeedsLaterSelect(func: *const Function, insts: []const ir.function.Inst, cmp_idx: usize) bool {
     const result = func.instResult(insts[cmp_idx]) orelse return false;
     var idx = cmp_idx + 1;
@@ -5732,6 +5801,32 @@ test "selects a straight-line arithmetic function" {
     const rd_mask = ~@as(u32, 0x1f);
     try std.testing.expectEqual(encode.madd(.x0, .x0, .x1, .x0, false) & rd_mask, code[0] & rd_mask);
     try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
+}
+
+test "selects signed absolute value with conditional negate" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const zero = try func.appendInst(b, t, .{ .iconst = 0 });
+    const negative = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = zero } });
+    const negated = try func.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = x } });
+    const absolute = try func.appendInst(b, t, .{ .select = .{ .cond = negative, .then = negated, .@"else" = x } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(absolute) });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var cneg_count: usize = 0;
+    var zero_move_count: usize = 0;
+    for (code) |word| {
+        if (word & 0x7FE00C00 == 0x5A800400) cneg_count += 1;
+        if (word & 0xFFFFFFE0 == 0x52800000) zero_move_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), cneg_count);
+    try std.testing.expectEqual(@as(usize, 0), zero_move_count);
 }
 
 test "masked switch index proves its upper bound" {
