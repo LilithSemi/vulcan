@@ -4,6 +4,7 @@ const std = @import("std");
 const ir = @import("vulcan-ir");
 const mm = @import("model.zig");
 const schedule = @import("schedule.zig");
+const registry = @import("registry.zig");
 
 const Function = ir.function.Function;
 const Block = ir.function.Block;
@@ -21,6 +22,42 @@ pub const Score = struct {
         if (candidate.peak_live != baseline.peak_live) return candidate.peak_live < baseline.peak_live;
         if (candidate.instructions != baseline.instructions) return candidate.instructions < baseline.instructions;
         return candidate.idle_slots <= baseline.idle_slots;
+    }
+};
+
+/// Owns a speculative pre-selection rewrite until its static score improves.
+pub const IRGate = struct {
+    allocator: std.mem.Allocator,
+    model: *const mm.Model,
+    baseline: Score,
+    candidate: ?Function,
+
+    pub fn init(allocator: std.mem.Allocator, original: *const Function, model: *const mm.Model) std.mem.Allocator.Error!IRGate {
+        return .{
+            .allocator = allocator,
+            .model = model,
+            .baseline = try function(allocator, original, model),
+            .candidate = try original.clone(allocator),
+        };
+    }
+
+    pub fn deinit(self: *IRGate) void {
+        if (self.candidate) |*candidate| candidate.deinit();
+        self.candidate = null;
+    }
+
+    pub fn candidateFunction(self: *IRGate) *Function {
+        return &self.candidate.?;
+    }
+
+    pub fn commit(self: *IRGate, original: *Function) std.mem.Allocator.Error!bool {
+        const candidate_score = try function(self.allocator, &self.candidate.?, self.model);
+        if (!candidate_score.accepts(self.baseline)) return false;
+
+        original.deinit();
+        original.* = self.candidate.?;
+        self.candidate = null;
+        return true;
     }
 };
 
@@ -152,4 +189,42 @@ test "score uses pressure and size to break cycle ties" {
     const baseline = Score{ .cycles = 8, .instructions = 6, .peak_live = 4 };
     try std.testing.expect((Score{ .cycles = 8, .instructions = 8, .peak_live = 3 }).accepts(baseline));
     try std.testing.expect((Score{ .cycles = 8, .instructions = 5, .peak_live = 4 }).accepts(baseline));
+}
+
+test "IR gate commits a faster candidate" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const value = try func.appendBlockParam(entry, i32_t);
+    const product = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = value, .rhs = value } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(product) });
+
+    var gate = try IRGate.init(allocator, &func, registry.modelFor(.@"ampere-altra"));
+    defer gate.deinit();
+    gate.candidateFunction().opcodeMut(gate.candidateFunction().definingInst(product).?).arith.op = .add;
+
+    try std.testing.expect(try gate.commit(&func));
+    try std.testing.expectEqual(ir.function.BinOp.add, func.opcode(func.definingInst(product).?).arith.op);
+}
+
+test "IR gate keeps the baseline when a candidate is slower" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const value = try func.appendBlockParam(entry, i32_t);
+    const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = value, .rhs = value } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
+
+    var gate = try IRGate.init(allocator, &func, registry.modelFor(.@"ampere-altra"));
+    defer gate.deinit();
+    gate.candidateFunction().opcodeMut(gate.candidateFunction().definingInst(sum).?).arith.op = .mul;
+
+    try std.testing.expect(!try gate.commit(&func));
+    try std.testing.expectEqual(ir.function.BinOp.add, func.opcode(func.definingInst(sum).?).arith.op);
 }

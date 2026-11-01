@@ -1,6 +1,5 @@
-//! Microarchitecture-aware optimization. This substrate exposes the model types, the predefined
-//! part models, and host detection. The passes (scheduling, vectorization width, unrolling,
-//! prefetch) and the backend hooks (fusion, alignment) are added in later plans.
+//! Microarchitecture-aware optimization. IRGate evaluates pre-selection candidates against the
+//! target model. Target peepholes apply stricter scoring to selected machine code.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -99,10 +98,13 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
     const vectorized = try vectorize.runModel(allocator, func, m);
     // Loop versioning and SLP create invariant splats after the ordinary optimization pipeline.
     // LICM understands guarded entries and hoists these non-trapping broadcasts before scheduling.
-    const late_cleaned = if (m.arch == .aarch64)
-        try pass.runToFixpoint(allocator, func, &.{ licm.pass_def, dce.pass_def }, 4)
-    else
-        false;
+    const late_cleaned = if (m.arch == .aarch64) late: {
+        var gate = try score.IRGate.init(allocator, func, m);
+        defer gate.deinit();
+        const candidate_changed = try pass.runToFixpoint(allocator, gate.candidateFunction(), &.{ licm.pass_def, dce.pass_def }, 4);
+        if (!candidate_changed) break :late false;
+        break :late try gate.commit(func);
+    } else false;
     // INT8 dot-product recognition runs after the general vectorizer (it needs the scalar reduction
     // loop intact) and before scheduling. It is internally gated on aarch64+dotprod, so non-aarch64
     // models are unaffected.
