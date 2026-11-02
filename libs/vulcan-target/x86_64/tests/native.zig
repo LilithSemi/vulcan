@@ -1419,37 +1419,46 @@ test "x86_64 dense switch lowers to a jump table and keeps every case and the de
     if (!ran) return error.SkipZigTest;
 }
 
-test "x86_64 masked switch selector drops the jump table bounds check" {
+/// Run a frontend-shaped switch over `key & mask` with labels 0..mask-1 and check every input.
+fn expectMaskedSwitch(mask: i64, want_table: bool) !void {
     const a = std.testing.allocator;
     var func = ir.function.Function.init(a);
     defer func.deinit();
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const entry = try func.appendBlock();
     const raw = try func.appendBlockParam(entry, i64_t);
-    const key = try func.appendArithImm(entry, i64_t, .bit_and, raw, 15);
+    const key = try func.appendArithImm(entry, i64_t, .bit_and, raw, mask);
     const default = try func.appendBlock();
     const minus_one = try func.appendInst(default, i64_t, .{ .iconst = -1 });
     func.setTerminator(default, .{ .ret = ir.function.Ret.one(minus_one) });
-    try buildSwitchNode(&func, entry, key, 0, 14, default);
+    try buildSwitchNode(&func, entry, key, 0, mask - 1, default);
 
     const code = try isel.selectFunction(a, &func);
     defer a.free(code);
-    try std.testing.expect(std.mem.indexOf(u8, code, &.{ 0x41, 0xFF, 0xE2 }) != null);
-    // No `ja` to the default.
-    try std.testing.expect(std.mem.indexOf(u8, code, &.{ 0x0F, 0x87 }) == null);
+    try std.testing.expectEqual(want_table, std.mem.indexOf(u8, code, &.{ 0x41, 0xFF, 0xE2 }) != null);
+    // A table needs no `ja` to the default.
+    if (want_table) try std.testing.expect(std.mem.indexOf(u8, code, &.{ 0x0F, 0x87 }) == null);
 
     var ran = false;
     for ([_]harness.Backend{ harness.native, harness.qemu }) |backend| {
         var k: i64 = -20;
-        while (k < 40) : (k += 1) {
+        while (k < 100) : (k += 1) {
             const got = try runCmpBranchOnFull(std.testing.io, a, code, &.{k}, backend) orelse break;
-            const masked = k & 15;
-            const want: i64 = if (masked < 15) masked * 7 + 3 else -1;
+            const masked = k & mask;
+            const want: i64 = if (masked < mask) masked * 7 + 3 else -1;
             try std.testing.expectEqual(want, got);
             ran = true;
         }
     }
     if (!ran) return error.SkipZigTest;
+}
+
+test "x86_64 masked switch selector drops the jump table bounds check" {
+    try expectMaskedSwitch(63, true);
+}
+
+test "x86_64 masked switch tree skips the leaf compares its range proves" {
+    try expectMaskedSwitch(15, false);
 }
 
 test "x86_64 folds single-use loads into add, sub, and xor memory operands" {

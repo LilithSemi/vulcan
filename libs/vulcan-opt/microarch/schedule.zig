@@ -192,6 +192,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
                 restoreMultiplyAddPairs(func, block, uses);
             }
             if (fuse_cmp) restoreCompareBranchPairs(func, block, uses);
+            if (model.arch == .x86_64) restoreCompareSelectPairs(func, block, uses);
         }
     }
 }
@@ -301,6 +302,25 @@ test "aarch64 restores an affine vector load pair for machine fusion" {
 /// may issue the compare early, but AArch64 can keep the relation in NZCV and branch on it directly
 /// only when instruction selection sees the pair. Moving the pure compare later preserves its data
 /// dependencies and lets the machine layer replace `cmp; cset; cbz` with `cmp; b.cc`.
+/// x86 sets the flags for a cmov with the compare itself only when the compare sits right
+/// before its select. Moving a single-use compare later keeps every dependency.
+fn restoreCompareSelectPairs(func: *Function, block: Block, uses: []const u32) void {
+    const insts = func.blockInstsMut(block).items;
+    var consumer_index: usize = 1;
+    while (consumer_index < insts.len) : (consumer_index += 1) {
+        const select = switch (func.opcode(insts[consumer_index])) {
+            .select => |s| s,
+            else => continue,
+        };
+        if (uses[@backingInt(select.cond)] != 1) continue;
+        const compare = func.definingInst(select.cond) orelse continue;
+        if (func.opcode(compare) != .icmp) continue;
+        const producer_index = std.mem.indexOfScalar(Inst, insts[0..consumer_index], compare) orelse continue;
+        if (producer_index + 1 == consumer_index) continue;
+        std.mem.rotate(Inst, insts[producer_index..consumer_index], 1);
+    }
+}
+
 fn restoreCompareBranchPairs(func: *Function, block: Block, uses: []const u32) void {
     const insts = func.blockInstsMut(block).items;
     var consumer_index: usize = 1;

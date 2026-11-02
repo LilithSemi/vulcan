@@ -817,6 +817,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
     }
     const loop_top = try loopTops(allocator, ctx);
     defer allocator.free(loop_top);
+    const decided = try decidedBranches(allocator, func);
+    defer allocator.free(decided);
     defer {
         for (dense_switches) |plan| if (plan) |p| allocator.free(p.targets);
         allocator.free(dense_switches);
@@ -1015,8 +1017,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 // edge targets `next_block` can fall through, so `emitIf` elides
                 // that branch.
                 const next_block = nextEmitted(skip_dispatch, bi);
+                const cf = func.opcode(inst).@"if";
                 if (dense_switches[bi]) |plan| {
                     try emitDenseSwitch(allocator, ctx, plan);
+                } else if (decided[bi]) |take_then| {
+                    try emitJump(allocator, ctx, if (take_then) cf.then else cf.@"else", block, next_block);
                 } else {
                     try emitIf(allocator, ctx, func.opcode(inst).@"if", block, next_block);
                 }
@@ -2302,11 +2307,46 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     const c = try ctx.use(allocator, s.cond, scratch1);
                     try ctx.put(allocator, encode.testReg(c, c, intBits(func, s.cond) > 32));
                 }
+                // A constant arm is an immediate `mov`, which leaves the flags alone. cmov has no
+                // immediate form, so a second constant goes through the scratch register.
+                const w64 = intBits(func, result) > 32;
+                const then_imm = foldedImm(func, s.then, w64);
+                const else_imm = foldedImm(func, s.@"else", w64);
+                const not_cc = encode.invertCond(cc);
+                if (then_imm != null or else_imm != null) {
+                    const rt: ?Reg = if (then_imm == null) try ctx.use(allocator, s.then, scratch1) else null;
+                    const re: ?Reg = if (else_imm == null) try ctx.use(allocator, s.@"else", scratch2) else null;
+                    const rd = ctx.dst(result, scratch1);
+                    if (then_imm != null and else_imm != null) {
+                        try ctx.put(allocator, encode.movImm(rd, else_imm.?, w64));
+                        try ctx.put(allocator, encode.movImm(scratch2, then_imm.?, w64));
+                        try ctx.put(allocator, encode.cmovcc(rd, scratch2, cc));
+                    } else if (else_imm) |imm| {
+                        if (rd == rt.?) {
+                            try ctx.put(allocator, encode.movImm(scratch2, imm, w64));
+                            try ctx.put(allocator, encode.cmovcc(rd, scratch2, not_cc));
+                        } else {
+                            try ctx.put(allocator, encode.movImm(rd, imm, w64));
+                            try ctx.put(allocator, encode.cmovcc(rd, rt.?, cc));
+                        }
+                    } else {
+                        const imm = then_imm.?;
+                        if (rd == re.?) {
+                            try ctx.put(allocator, encode.movImm(scratch2, imm, w64));
+                            try ctx.put(allocator, encode.cmovcc(rd, scratch2, cc));
+                        } else {
+                            try ctx.put(allocator, encode.movImm(rd, imm, w64));
+                            try ctx.put(allocator, encode.cmovcc(rd, re.?, not_cc));
+                        }
+                    }
+                    try ctx.store(allocator, result, rd);
+                    return;
+                }
                 const rt = try ctx.use(allocator, s.then, scratch1);
                 const re = try ctx.use(allocator, s.@"else", scratch2);
                 const rd = ctx.dst(result, scratch1);
                 if (rd == rt) {
-                    try ctx.put(allocator, encode.cmovcc(rd, re, encode.invertCond(cc)));
+                    try ctx.put(allocator, encode.cmovcc(rd, re, not_cc));
                 } else {
                     if (rd != re) try ctx.put(allocator, encode.movReg(rd, re));
                     try ctx.put(allocator, encode.cmovcc(rd, rt, cc));
@@ -2897,9 +2937,9 @@ fn findDenseSwitches(allocator: std.mem.Allocator, ctx: *const Ctx, skip: []bool
         // A masked selector covers every table entry once the default fills the last slot,
         // so the dispatch needs no bounds check.
         const bounded = maskedUpperBound(ctx.func, scan.value.?) == @as(?u64, @intCast(labels.len));
-        // With a bounds check, a small tree of compares predicts better on Zen 4: a periodic
-        // key made the checked indirect jump much slower.
-        const min_labels: usize = if (bounded) 8 else min_switch_table_labels;
+        // A small tree of compares predicts better on Zen 4: a periodic key made the indirect
+        // jump mispredict most of the time, with or without a bounds check.
+        const min_labels: usize = min_switch_table_labels;
         if (labels.len < min_labels or labels.len > 4096) continue;
         const dense = for (labels, 0..) |label, i| {
             if (label != @as(i64, @intCast(i))) break false;
@@ -2915,6 +2955,93 @@ fn findDenseSwitches(allocator: std.mem.Allocator, ctx: *const Ctx, skip: []bool
         for (scan.dispatch.items[1..]) |child| skip[@backingInt(child)] = true;
     }
     return plans;
+}
+
+/// Per block, the `if` edge that is always taken, proven by walking a compare tree on a masked
+/// value. The mask bounds the value to `[0, mask]`, each `le k` split narrows that range for
+/// its single-predecessor children, and an `eq k` leaf whose range is `{k}` always matches.
+fn decidedBranches(allocator: std.mem.Allocator, func: *const Function) Error![]?bool {
+    const nblocks = func.blockCount();
+    const decided = try allocator.alloc(?bool, nblocks);
+    errdefer allocator.free(decided);
+    @memset(decided, null);
+    const preds = try allocator.alloc(u32, nblocks);
+    defer allocator.free(preds);
+    @memset(preds, 0);
+    for (0..nblocks) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| if (func.opcode(inst) == .@"if") {
+            preds[@backingInt(func.opcode(inst).@"if".then.target)] += 1;
+            preds[@backingInt(func.opcode(inst).@"if".@"else".target)] += 1;
+        };
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |j| preds[@backingInt(j.target)] += 1,
+            .ret => {},
+        };
+    }
+    for (0..nblocks) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const tree = treeCompare(func, block) orelse continue;
+        const bound = maskedUpperBound(func, tree.cmp.lhs) orelse continue;
+        if (bound > std.math.maxInt(i32)) continue;
+        decideRange(func, preds, decided, block, tree.cmp.lhs, 0, @intCast(bound), 0);
+    }
+    return decided;
+}
+
+const TreeCompare = struct { cmp: ir.function.Compare, cf: ir.function.If, label: i64 };
+
+/// A block ending in `icmp value, const; if`, the shape of one switch tree node.
+fn treeCompare(func: *const Function, block: Block) ?TreeCompare {
+    const insts = func.blockInsts(block);
+    if (insts.len < 2) return null;
+    const cf = switch (func.opcode(insts[insts.len - 1])) {
+        .@"if" => |c| c,
+        else => return null,
+    };
+    const cmp = switch (func.opcode(insts[insts.len - 2])) {
+        .icmp => |c| c,
+        else => return null,
+    };
+    if (func.instResult(insts[insts.len - 2]) != cf.cond) return null;
+    if (isVector(func, cmp.lhs) or isFloat(func, cmp.lhs)) return null;
+    const constant = func.definingInst(cmp.rhs) orelse return null;
+    const label = switch (func.opcode(constant)) {
+        .iconst => |c| c,
+        else => return null,
+    };
+    return .{ .cmp = cmp, .cf = cf, .label = label };
+}
+
+fn decideRange(func: *const Function, preds: []const u32, decided: []?bool, block: Block, value: Value, lo: i64, hi: i64, depth: u8) void {
+    if (depth > 32) return;
+    const tree = treeCompare(func, block) orelse return;
+    if (tree.cmp.lhs != value) return;
+    const k = tree.label;
+    // The value is non-negative here, so a signed and an unsigned compare agree.
+    if (k < 0) return;
+    const b = @backingInt(block);
+    switch (tree.cmp.op) {
+        .eq => {
+            if (lo == k and hi == k) decided[b] = true else if (k < lo or k > hi) decided[b] = false;
+        },
+        .le => {
+            const then_hi = @min(hi, k);
+            const else_lo = @max(lo, k + 1);
+            if (then_hi < lo) {
+                decided[b] = false;
+            } else if (else_lo > hi) {
+                decided[b] = true;
+            }
+            const then_target = tree.cf.then.target;
+            const else_target = tree.cf.@"else".target;
+            if (then_hi >= lo and preds[@backingInt(then_target)] == 1)
+                decideRange(func, preds, decided, then_target, value, lo, then_hi, depth + 1);
+            if (else_lo <= hi and preds[@backingInt(else_target)] == 1)
+                decideRange(func, preds, decided, else_target, value, else_lo, hi, depth + 1);
+        },
+        else => {},
+    }
 }
 
 /// The upper bound that `value = x & mask` proves for a non-negative mask: an AND cannot set
@@ -3017,15 +3144,19 @@ fn emitDenseSwitch(allocator: std.mem.Allocator, ctx: *Ctx, plan: DenseSwitch) E
         try ctx.put(allocator, encode.aluImm(7, index, @intCast(plan.targets.len - 1), w64));
         try emitBranchTo(allocator, ctx, encode.jcc(.a, 0), @backingInt(plan.default_target));
     }
-    // A 32-bit move zero-extends, so the index is a clean 64-bit offset.
-    if (w64) {
-        try ctx.put(allocator, encode.movReg(scratch1, index));
-    } else {
+    // The index must be a clean 64-bit offset. Every 32-bit x86 ALU form zero-extends its
+    // result, so only other producers need the zero-extending 32-bit move.
+    const clean = w64 or if (ctx.func.definingInst(plan.value)) |def| switch (ctx.func.opcode(def)) {
+        .arith, .arith_imm => true,
+        else => false,
+    } else false;
+    const offset = if (clean) index else blk: {
         try ctx.put(allocator, encode.movReg32(scratch1, index));
-    }
+        break :blk scratch1;
+    };
     const lea_at = ctx.code.items.len;
     try ctx.put(allocator, encode.leaRipRel(scratch2, 0));
-    try ctx.put(allocator, encode.movsxdIndexed4(scratch1, scratch2, scratch1));
+    try ctx.put(allocator, encode.movsxdIndexed4(scratch1, scratch2, offset));
     try ctx.put(allocator, encode.add(scratch1, scratch2, true));
     try ctx.put(allocator, encode.jmpReg(scratch1));
     const table_at = ctx.code.items.len;
@@ -3696,18 +3827,35 @@ fn x86_64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.fu
         },
         // A compare fused into a select is emitted at the select, so the select keeps the
         // compare operands live up to its own position.
+        // A compare fused into a gpr select is emitted at the select, so the select keeps the
+        // compare operands live up to its own position. Constant arms are immediates.
         .select => |sel| {
-            const cond_inst = func.definingInst(sel.cond) orelse return null;
-            if (func.opcode(cond_inst) != .icmp) return null;
-            const at = instPosition(func, inst) orelse return null;
-            if (at.index == 0 or !fusesIntoNextSelect(func, at.insts, at.index - 1)) return null;
-            const cmp = func.opcode(at.insts[at.index - 1]).icmp;
-            out[0] = sel.then;
-            out[1] = sel.@"else";
-            out[2] = cmp.lhs;
-            if (foldedCmpImm(func, cmp) != null) return 3;
-            out[3] = cmp.rhs;
-            return 4;
+            const result = func.instResult(inst) orelse return null;
+            if (isXmm(func, result)) return null;
+            var count: u8 = 0;
+            const cond_inst = func.definingInst(sel.cond);
+            const fused = if (cond_inst != null and func.opcode(cond_inst.?) == .icmp)
+                if (instPosition(func, inst)) |at| at.index > 0 and fusesIntoNextSelect(func, at.insts, at.index - 1) else false
+            else
+                false;
+            if (fused) {
+                const cmp = func.opcode(cond_inst.?).icmp;
+                out[count] = cmp.lhs;
+                count += 1;
+                if (foldedCmpImm(func, cmp) == null) {
+                    out[count] = cmp.rhs;
+                    count += 1;
+                }
+            } else {
+                out[count] = sel.cond;
+                count += 1;
+            }
+            const w64 = intBits(func, result) > 32;
+            for ([_]Value{ sel.then, sel.@"else" }) |arm| if (foldedImm(func, arm, w64) == null) {
+                out[count] = arm;
+                count += 1;
+            };
+            return count;
         },
         .arith => |arith| {
             const result = func.instResult(inst) orelse return null;
@@ -3940,6 +4088,13 @@ fn x86_64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Valu
         .arith_imm => |a| switch (a.op) {
             .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => a.lhs,
             .mul, .div, .rem, .mulh => null,
+        },
+        // A cmov writes over its result, which may start as either register arm.
+        .select => |s| blk: {
+            const w64 = intBits(func, v) > 32;
+            if (foldedImm(func, s.then, w64) == null) break :blk s.then;
+            if (foldedImm(func, s.@"else", w64) == null) break :blk s.@"else";
+            break :blk null;
         },
         else => null,
     };
