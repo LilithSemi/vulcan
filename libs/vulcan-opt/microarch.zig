@@ -13,6 +13,7 @@ const strength = @import("strength.zig");
 const immform = @import("immform.zig");
 const dce = @import("dce.zig");
 const licm = @import("licm.zig");
+const jumpthread = @import("jumpthread.zig");
 const ifconvert = @import("ifconvert.zig");
 const loopimm = @import("microarch/loopimm.zig");
 const looprotate = @import("microarch/looprotate.zig");
@@ -132,13 +133,19 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
     return outer or split or looped or iv_reduced or unrolled or vectorized or if_converted or late_cleaned or dotted or matmuled or prefetched;
 }
 
-/// Hoist safe constants exposed by late inlining when the target score accepts the result.
+/// Thread the constants a late-inlined callee returns into the compares after the call. Then
+/// hoist safe constants exposed by the inline when the target score accepts the result.
 pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Function, m: *const Model) pass.Error!bool {
+    const threaded = try pass.runToFixpoint(allocator, func, &.{
+        jumpthread.pass_def,
+        dce.pass_def,
+    }, 8);
     var gate = try score.IRGate.init(allocator, func, m);
     defer gate.deinit();
     const changed = try pass.run(allocator, gate.candidateFunction(), &.{ licm.constants_pass_def, dce.pass_def });
-    if (!changed) return false;
-    return gate.commit(func);
+    if (!changed) return threaded;
+    const committed = try gate.commit(func);
+    return committed or threaded;
 }
 
 /// Apply target-aware IR rewrites after generic canonicalization and before instruction selection.
