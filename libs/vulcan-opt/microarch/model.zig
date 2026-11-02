@@ -235,6 +235,12 @@ pub const Model = struct {
     /// Whether this model's riscv64 backend should lower vectorized f32 arithmetic to the
     /// CORE-ET Erbium packed-single VPU (et-soc's custom 8-lane unit) instead of RVV. False for
     /// every non-riscv64 arch and every riscv64 model without the `vpu` feature bit.
+    /// The vector width the code generator lowers. The x86_64 backend has only 128-bit integer
+    /// vector forms, so a wider x86 part still vectorizes at 128 bits.
+    pub fn simdBits(self: *const Model) u16 {
+        return if (self.arch == .x86_64) @min(self.vector_bits, 128) else self.vector_bits;
+    }
+
     pub fn vpu(self: *const Model) bool {
         return switch (self.features) {
             .riscv64 => |f| f.vpu,

@@ -688,8 +688,8 @@ pub fn runModel(allocator: std.mem.Allocator, func: *Function, model: *const mm.
         .nvidia => false,
     };
     if (!vec_ok) return false;
-    if (model.vector_bits < 2 * ELEM_BITS) return false;
-    const lanes_full = model.vector_bits / ELEM_BITS;
+    if (model.simdBits() < 2 * ELEM_BITS) return false;
+    const lanes_full = model.simdBits() / ELEM_BITS;
     const lanes: u8 = @intCast(@min(lanes_full, @as(u16, MAX_LANES)));
     // Both CORE-ET's packed-integer unit and AArch64 NEON lower integer vectors. The per-op gate
     // below accounts for their different instruction sets.

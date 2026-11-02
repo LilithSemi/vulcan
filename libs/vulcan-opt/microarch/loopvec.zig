@@ -498,8 +498,8 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         // vector op for the NVIDIA backend to lower.
         .nvidia => false,
     };
-    if (!vec_ok or model.vector_bits < 2 * ELEM_BITS) return null;
-    const V: u32 = @min(model.vector_bits / ELEM_BITS, MAX_LANES);
+    if (!vec_ok or model.simdBits() < 2 * ELEM_BITS) return null;
+    const V: u32 = @min(model.simdBits() / ELEM_BITS, MAX_LANES);
     if (V < 2) return null;
 
     const header: Block = @fromBackingInt(@intCast(loop.header));
@@ -984,8 +984,8 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         // vector op for the NVIDIA backend to lower.
         .nvidia => false,
     };
-    if (!vec_ok or model.vector_bits < 2 * ELEM_BITS) return null;
-    const V: u32 = @min(model.vector_bits / ELEM_BITS, MAX_LANES);
+    if (!vec_ok or model.simdBits() < 2 * ELEM_BITS) return null;
+    const V: u32 = @min(model.simdBits() / ELEM_BITS, MAX_LANES);
     if (V < 2) return null;
 
     const header: Block = @fromBackingInt(@intCast(loop.header));

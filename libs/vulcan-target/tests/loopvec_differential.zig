@@ -443,13 +443,16 @@ test "loopvec differential: stencil map plus xor reduction, all trip counts" {
     try expectStencilMatches(ampere());
 }
 
-test "zen4 differential: i32 reductions, stencil, and maps through the full pipeline" {
+test "x86 differential: i32 reductions, stencil, and maps through the full pipeline" {
     if (comptime !hasJit()) return error.SkipZigTest;
-    try expectI32ReductionMatches(buildSumReductionI32, .full, zen4());
-    try expectI32ReductionMatches(buildSquareSumI32, .full, zen4());
-    try expectStencilMatches(zen4());
-    try expectMapMatches(buildSaxpy, .full, zen4());
-    try expectMapMatches(buildSquare, .full, zen4());
+    // Cascade Lake declares 512-bit vectors, wider than the x86 backend lowers.
+    for ([_]*const opt.microarch.Model{ zen4(), opt.microarch.modelFor(.@"cascadelake-sp") }) |model| {
+        try expectI32ReductionMatches(buildSumReductionI32, .full, model);
+        try expectI32ReductionMatches(buildSquareSumI32, .full, model);
+        try expectStencilMatches(model);
+        try expectMapMatches(buildSaxpy, .full, model);
+        try expectMapMatches(buildSquare, .full, model);
+    }
 }
 
 test "the full ampere pipeline vectorizes saxpy (splat-aware cost model)" {
