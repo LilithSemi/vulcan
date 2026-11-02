@@ -3324,7 +3324,9 @@ fn emitHeaderTest(allocator: std.mem.Allocator, ctx: *Ctx, header: Block, next_b
     const cond = func.instResult(insts[0]) orelse return false;
     if (cf.cond != cond or countUses(func, cond) != 1) return false;
     if (isVector(func, cmp.lhs) or isFloat(func, cmp.lhs)) return false;
-    if (!edgeMovesEmpty(ctx, cf.then, header) or !edgeMovesEmpty(ctx, cf.@"else", header)) return false;
+    const then_empty = edgeMovesEmpty(ctx, cf.then, header);
+    const else_empty = edgeMovesEmpty(ctx, cf.@"else", header);
+    if (!then_empty and !else_empty) return false;
 
     // Read the operands where the header's branch reads them.
     const saved_pos = ctx.pos;
@@ -3334,6 +3336,20 @@ fn emitHeaderTest(allocator: std.mem.Allocator, ctx: *Ctx, header: Block, next_b
     const cc = condOf(cmp.op, isSigned(func, cmp.lhs));
     const t = forwardedBlock(ctx, cf.then.target);
     const e = forwardedBlock(ctx, cf.@"else".target);
+    // One edge may carry moves, such as reloads on the loop exit. Branch on the clean edge
+    // and run the moves on the way out of the other.
+    if (!else_empty) {
+        try emitBranchTo(allocator, ctx, encode.jcc(cc, 0), @backingInt(t));
+        try emitMoves(allocator, ctx, cf.@"else", header);
+        if (next_block == null or forwardedBlock(ctx, cf.@"else".target) != next_block.?) try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(cf.@"else".target));
+        return true;
+    }
+    if (!then_empty) {
+        try emitBranchTo(allocator, ctx, encode.jcc(encode.invertCond(cc), 0), @backingInt(e));
+        try emitMoves(allocator, ctx, cf.then, header);
+        if (next_block == null or forwardedBlock(ctx, cf.then.target) != next_block.?) try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(cf.then.target));
+        return true;
+    }
     if (next_block != null and e == next_block.?) {
         try emitBranchTo(allocator, ctx, encode.jcc(cc, 0), @backingInt(t));
     } else if (next_block != null and t == next_block.?) {
@@ -3905,7 +3921,7 @@ fn fusedLoad(func: *const Function, insts: []const ir.function.Inst, idx: usize)
     else
         return null;
     switch (arith.op) {
-        .add, .sub, .bit_and, .bit_or, .bit_xor => {},
+        .add, .sub, .bit_and, .bit_or, .bit_xor, .mul => {},
         else => return null,
     }
     if (countUses(func, loaded) != 1) return null;
@@ -3946,7 +3962,11 @@ fn emitLoadOp(allocator: std.mem.Allocator, ctx: *Ctx, a: ir.function.Arith, fol
         try ctx.put(allocator, try binary(a.op, rd, scratch2, w64));
     } else {
         if (rd != other) try ctx.put(allocator, encode.movReg(rd, other));
-        try ctx.put(allocator, encode.aluFromMem(memOpcode(a.op), rd, base, disp, w64));
+        if (a.op == .mul) {
+            try ctx.put(allocator, encode.memIndexed(.{ .w = w64, .escape = true, .op = 0xAF }, @backingInt(rd), base, null, 0, disp));
+        } else {
+            try ctx.put(allocator, encode.aluFromMem(memOpcode(a.op), rd, base, disp, w64));
+        }
     }
     try ctx.store(allocator, result, rd);
 }

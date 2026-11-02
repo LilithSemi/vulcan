@@ -1460,7 +1460,7 @@ test "x86_64 masked switch tree skips the leaf compares its range proves" {
     try expectMaskedSwitch(15, false);
 }
 
-test "x86_64 folds single-use loads into add, sub, and xor memory operands" {
+test "x86_64 folds single-use loads into add, sub, xor, and mul memory operands" {
     if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     const a = std.testing.allocator;
     var func = ir.function.Function.init(a);
@@ -1470,7 +1470,7 @@ test "x86_64 folds single-use loads into add, sub, and xor memory operands" {
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const x = try func.appendBlockParam(entry, i32_t);
-    // ((x + p[0]) - p[1]) ^ p[2], each load right before its only use.
+    // (((x + p[0]) - p[1]) ^ p[2]) * p[3], each load right before its only use.
     const v0 = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p } });
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = v0 } });
     const p1 = try func.appendArithImm(entry, ptr_t, .add, p, 4);
@@ -1479,17 +1479,20 @@ test "x86_64 folds single-use loads into add, sub, and xor memory operands" {
     const p2 = try func.appendArithImm(entry, ptr_t, .add, p, 8);
     const v2 = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p2 } });
     const mixed = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .bit_xor, .lhs = v2, .rhs = diff } });
-    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(mixed) });
+    const p3 = try func.appendArithImm(entry, ptr_t, .add, p, 12);
+    const v3 = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p3 } });
+    const scaled = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = v3, .rhs = mixed } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(scaled) });
 
     const code = try isel.selectFunction(a, &func);
     defer a.free(code);
     var buffer = try jit.CodeBuffer.map(code);
     defer buffer.deinit();
     const f = buffer.entry(*const fn ([*]const i32, i32) callconv(.c) i32, 0);
-    const inputs = [_][4]i32{ .{ 1, 2, 3, 10 }, .{ -5, 100, 0x7fffffff, -1 }, .{ std.math.minInt(i32), 1, -1, 7 } };
+    const inputs = [_][5]i32{ .{ 1, 2, 3, 10, 7 }, .{ -5, 100, 0x7fffffff, -1, -3 }, .{ std.math.minInt(i32), 1, -1, 7, 65537 } };
     for (inputs) |c| {
-        const mem = [_]i32{ c[0], c[1], c[2] };
-        const want = ((c[3] +% c[0]) -% c[1]) ^ c[2];
+        const mem = [_]i32{ c[0], c[1], c[2], c[4] };
+        const want = (((c[3] +% c[0]) -% c[1]) ^ c[2]) *% c[4];
         try std.testing.expectEqual(want, f(&mem, c[3]));
     }
 }

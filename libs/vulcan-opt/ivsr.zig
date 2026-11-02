@@ -303,6 +303,9 @@ const LoopCtx = struct {
     /// READABLE outside the loop. The preheader argument holds the same value and is, so every
     /// expression this pass builds names that instead. See `fillSubstitutions`.
     substitute: []?Value,
+    /// Header parameters, by index, proven to stay in `[0, max]` of their signed type. A sign
+    /// extension of such a counter equals its zero extension.
+    nonneg_bivs: u64 = 0,
 
     /// Whether `v` holds one value for the whole loop.
     fn invariant(self: *const LoopCtx, v: Value) bool {
@@ -429,6 +432,18 @@ fn termOf(allocator: std.mem.Allocator, ctx: *const LoopCtx, pool: *Pool, ty: Ty
     }
     const source = intInfo(ctx.func, ctx.func.valueType(named));
     const target = intInfo(ctx.func, ty);
+    // A narrower constant widens by its own signedness.
+    if (source != null and target != null and target.?.bits > source.?.bits) {
+        if (ctx.func.definingInst(named)) |inst| switch (ctx.func.opcode(inst)) {
+            .iconst => |c| {
+                const shift: u6 = @intCast(64 - @as(u32, source.?.bits));
+                const bits = @as(u64, @bitCast(c)) << shift;
+                const wide: i64 = if (source.?.signedness == .signed) @as(i64, @bitCast(bits)) >> shift else @bitCast(bits >> shift);
+                return pool.konst(allocator, ty, wide);
+            },
+            else => {},
+        };
+    }
     if (source != null and target != null and source.?.signedness == .unsigned and target.?.bits > source.?.bits)
         return pool.convert(allocator, ty, named);
     return pool.value(allocator, ty, named);
@@ -478,6 +493,7 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
         const ty = func.valueType(hp);
         if (intInfo(func, ty) == null) continue; // an integer counter only
         if (stepOf(ctx, hp, latch_args[i]) == null) continue;
+        if (i < 64 and nonNegativeCounter(ctx, hp, pre_args[i], latch_args[i])) ctx.nonneg_bivs |= @as(u64, 1) << @intCast(i);
         const one = try pool.konst(allocator, ty, 1);
         const zero = try pool.konst(allocator, ty, 0);
         const rep = Affine{ .biv = @intCast(i), .scale = one, .offset = zero, .scale_ty = ty, .base = null };
@@ -679,6 +695,36 @@ fn edgeArgs(func: *const Function, edge: Edge) []const Value {
 /// The amount the back edge adds to a basic induction variable.
 const Step = union(enum) { konst: i64, value: Value };
 
+/// Whether header parameter `hp` counts up by one from a non-negative constant and the header
+/// leaves the loop unless `hp < bound` (signed). Then every value it takes lies in
+/// `[start, bound)`, inside `[0, max]`, and the step never overflows.
+fn nonNegativeCounter(ctx: *const LoopCtx, hp: Value, start: Value, next: Value) bool {
+    const func = ctx.func;
+    const info = intInfo(func, func.valueType(hp)) orelse return false;
+    if (info.signedness != .signed) return false;
+    const step = stepOf(ctx, hp, next) orelse return false;
+    if (step != .konst or step.konst != 1) return false;
+    const start_inst = func.definingInst(start) orelse return false;
+    const first = switch (func.opcode(start_inst)) {
+        .iconst => |c| c,
+        else => return false,
+    };
+    if (first < 0 or first > (@as(i64, 1) << @intCast(info.bits - 1)) - 1) return false;
+    const insts = func.blockInsts(ctx.header);
+    if (insts.len == 0) return false;
+    const cf = switch (func.opcode(insts[insts.len - 1])) {
+        .@"if" => |c| c,
+        else => return false,
+    };
+    const cmp_inst = func.definingInst(cf.cond) orelse return false;
+    const cmp = switch (func.opcode(cmp_inst)) {
+        .icmp => |c| c,
+        else => return false,
+    };
+    if (cmp.op != .lt or cmp.lhs != hp or !ctx.invariant(cmp.rhs)) return false;
+    return ctx.loop.contains(@backingInt(cf.then.target)) and !ctx.loop.contains(@backingInt(cf.@"else".target));
+}
+
 /// The step of header parameter `hp`, given the value the back edge passes for it, or null when
 /// that value is not `hp` plus a loop-invariant amount.
 fn stepOf(ctx: *const LoopCtx, hp: Value, next: Value) ?Step {
@@ -797,9 +843,14 @@ fn signExtend(value: i64, bits: anytype) i64 {
 fn affineConvert(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, value: Value, ty: Type) pass.Error!?Affine {
     const source = intInfo(ctx.func, ctx.func.valueType(value)) orelse return null;
     const target = intInfo(ctx.func, ty) orelse return null;
-    if (source.signedness != .unsigned or target.bits <= source.bits) return null;
+    if (target.bits <= source.bits) return null;
     const old = ctx.affine[@backingInt(value)] orelse return null;
     if (old.base != null) return null;
+    // A signed value widens like an unsigned one only while it is a non-negative counter.
+    if (source.signedness == .signed) {
+        if (old.biv >= 64 or ctx.nonneg_bivs & (@as(u64, 1) << @intCast(old.biv)) == 0) return null;
+        if (pool.constOf(old.scale) != @as(?i64, 1) or pool.constOf(old.offset) != @as(?i64, 0)) return null;
+    }
     // Widening is exact only while the narrow value does not wrap, and then each constant is a
     // signed delta: `i - 1` carries 0xffffffff in 32 bits but means -1 once widened.
     const scale = signExtend(pool.constOf(old.scale) orelse return null, source.bits);
@@ -1544,6 +1595,46 @@ test "a negative offset in a widened unsigned index stays negative" {
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
     try testing.expect(diags.ok());
+}
+
+fn buildSignedIndexLoop(func: *Function, start: i64) !Counted {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const c = try buildCounted(func, n, i32_t, entry);
+    const first = try func.appendInst(entry, i32_t, .{ .iconst = start });
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, c.head, &.{ first, zero });
+    const wide = try func.appendInst(c.body, i64_t, .{ .convert = .{ .value = c.bk } });
+    const off = try func.appendArithImm(c.body, i64_t, .shl, wide, 2);
+    const addr = try func.appendInst(c.body, ptr_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = off } });
+    const loaded = try func.appendInst(c.body, i32_t, .{ .load = .{ .ptr = addr } });
+    try closeCounted(func, c, loaded);
+    return c;
+}
+
+test "reduces an address indexed through a signed counter that stays non-negative" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const c = try buildSignedIndexLoop(&func, 0);
+    try testing.expect(try runPass(allocator, &func));
+    const ptr_t = try func.types.ptrGlobal();
+    try testing.expectEqual(ptr_t, func.valueType(func.blockParams(c.head)[2]));
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
+test "leaves a signed counter alone when it can start negative" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    _ = try buildSignedIndexLoop(&func, -1);
+    try testing.expect(!try runPass(allocator, &func));
 }
 
 test "a shared address space stays shared through the reduction" {
