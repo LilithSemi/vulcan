@@ -1949,6 +1949,15 @@ test "float arithmetic" {
 test "float f32" {
     try expectAgreesFloat("float f(void){ return 1.5f + 0.5f; }", &.{}); // 2.0f
 }
+test "a spilled double keeps its high bits as a call arg and a loop param" {
+    const helpers =
+        \\static double h(int k) { return 2.5 + k; }
+        \\static double g(double x) { return x * 3.0 + 0.25; }
+        \\
+    ;
+    try expectAgreesDouble(helpers ++ "double f(void) { double y = h(0); double z = h(1); return g(y) + g(z) * 2.0; }", &.{});
+    try expectAgreesDouble(helpers ++ "double f(void) { double t = 0.5; for (int r = 0; r < 4; ++r) t = g(t) + h(r); return t; }", &.{});
+}
 test "int plus double promotes" {
     try expectAgreesDouble("double f(int a){ return a + 0.5; }", &.{3}); // 3.5
 }

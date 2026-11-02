@@ -888,7 +888,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
             xmm_i += 1;
             switch (ctx.loc(p)) {
                 .xmm => |x| if (x != incoming) try ctx.put(allocator, if (isWide(func, p)) encode.vmovupsRR(x, incoming) else encode.movupsRR(x, incoming)), // no fp move cycles for a single arg
-                .xmm_spill => |slot| try ctx.put(allocator, if (isWide(func, p)) encode.vmovupsStore(ctx.xmmDisp(slot), incoming) else if (isVector(func, p)) encode.movupsStore(ctx.xmmDisp(slot), incoming) else encode.movssStore(ctx.xmmDisp(slot), incoming)),
+                .xmm_spill => |slot| try ctx.put(allocator, if (isWide(func, p)) encode.vmovupsStore(ctx.xmmDisp(slot), incoming) else encode.movupsStore(ctx.xmmDisp(slot), incoming)),
                 else => unreachable,
             }
         } else {
@@ -1500,7 +1500,7 @@ fn lowerDirectCall(allocator: std.mem.Allocator, ctx: *Ctx, c: ir.function.Call,
             xi += 1;
             if (ctx.loc(arg) == .xmm_spill) {
                 const disp = ctx.xmmDisp(ctx.loc(arg).xmm_spill) + stack_bytes;
-                try ctx.put(allocator, if (isWide(func, arg)) encode.vmovupsLoad(dst, disp) else if (isVector(func, arg) or isQuad(func, arg)) encode.movupsLoad(dst, disp) else encode.movssLoad(dst, disp));
+                try ctx.put(allocator, if (isWide(func, arg)) encode.vmovupsLoad(dst, disp) else encode.movupsLoad(dst, disp));
             }
         } else {
             if (gi >= arg_regs.len) {
@@ -1801,7 +1801,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 xi += 1;
                 if (ctx.loc(arg) == .xmm_spill) {
                     const disp = ctx.xmmDisp(ctx.loc(arg).xmm_spill) + stack_bytes;
-                    try ctx.put(allocator, if (isWide(func, arg)) encode.vmovupsLoad(dst, disp) else if (isVector(func, arg) or isQuad(func, arg)) encode.movupsLoad(dst, disp) else encode.movssLoad(dst, disp));
+                    try ctx.put(allocator, if (isWide(func, arg)) encode.vmovupsLoad(dst, disp) else encode.movupsLoad(dst, disp));
                 }
             } else {
                 if (gi >= arg_regs.len) {
@@ -3456,7 +3456,7 @@ fn emitMoves(allocator: std.mem.Allocator, ctx: *Ctx, jump: ir.function.Jump, pr
             .xmm_spill => |slot| {
                 const src = try ctx.useXmm(allocator, arg, xmm_scratch);
                 const disp = ctx.xmmDisp(slot);
-                try ctx.put(allocator, if (isWide(func, param)) encode.vmovupsStore(disp, src) else if (isVector(func, param)) encode.movupsStore(disp, src) else encode.movssStore(disp, src));
+                try ctx.put(allocator, if (isWide(func, param)) encode.vmovupsStore(disp, src) else encode.movupsStore(disp, src));
             },
             .reg => |dst| switch (ctx.loc(arg)) {
                 .reg => |src| if (src != dst) try moves.append(allocator, .{ .src = src, .dst = dst }),
@@ -3478,7 +3478,7 @@ fn emitMoves(allocator: std.mem.Allocator, ctx: *Ctx, jump: ir.function.Jump, pr
             .reg => |dst| if (ctx.loc(arg) == .spill) try ctx.put(allocator, encode.movFromStack(dst, slotDisp(ctx.loc(arg).spill))),
             .xmm => |dst| if (ctx.loc(arg) == .xmm_spill) {
                 const disp = ctx.xmmDisp(ctx.loc(arg).xmm_spill);
-                try ctx.put(allocator, if (isWide(func, param)) encode.vmovupsLoad(dst, disp) else if (isVector(func, param) or isQuad(func, param)) encode.movupsLoad(dst, disp) else encode.movssLoad(dst, disp));
+                try ctx.put(allocator, if (isWide(func, param)) encode.vmovupsLoad(dst, disp) else encode.movupsLoad(dst, disp));
             },
             else => {},
         }
