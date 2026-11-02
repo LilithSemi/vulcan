@@ -788,14 +788,22 @@ fn affineOf(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, inst: Inst
 /// Preserve an affine unsigned counter through an exact widening conversion. This is the common C
 /// address shape `(size_t)(unsigned_index) * stride`; narrowing and signed-source widening are not
 /// linear across wrap boundaries and remain deliberately unsupported.
+fn signExtend(value: i64, bits: anytype) i64 {
+    if (bits == 0 or bits >= 64) return value;
+    const shift: u6 = @intCast(64 - @as(u32, bits));
+    return (value << shift) >> shift;
+}
+
 fn affineConvert(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, value: Value, ty: Type) pass.Error!?Affine {
     const source = intInfo(ctx.func, ctx.func.valueType(value)) orelse return null;
     const target = intInfo(ctx.func, ty) orelse return null;
     if (source.signedness != .unsigned or target.bits <= source.bits) return null;
     const old = ctx.affine[@backingInt(value)] orelse return null;
     if (old.base != null) return null;
-    const scale = pool.constOf(old.scale) orelse return null;
-    const offset = pool.constOf(old.offset) orelse return null;
+    // Widening is exact only while the narrow value does not wrap, and then each constant is a
+    // signed delta: `i - 1` carries 0xffffffff in 32 bits but means -1 once widened.
+    const scale = signExtend(pool.constOf(old.scale) orelse return null, source.bits);
+    const offset = signExtend(pool.constOf(old.offset) orelse return null, source.bits);
     return .{
         .biv = old.biv,
         .scale = try pool.konst(allocator, ty, scale),
@@ -1497,6 +1505,42 @@ test "reduces an address indexed through an unsigned widening conversion" {
     try testing.expectEqual(@as(i64, 16), step.imm);
     try testing.expectEqual(walker, step.lhs);
 
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
+test "a negative offset in a widened unsigned index stays negative" {
+    // `p[(u64)(i - 1)]`: in 32 bits the offset is 0xffffffff, but widened it is -1, not
+    // 0xffffffff, for every iteration where `i - 1` does not wrap.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, u32_t);
+    const c = try buildCounted(&func, n, u32_t, entry);
+    const prev = try func.appendArithImm(c.body, u32_t, .add, c.bk, 0xffffffff);
+    const wide = try func.appendInst(c.body, i64_t, .{ .convert = .{ .value = prev } });
+    const off = try func.appendArithImm(c.body, i64_t, .shl, wide, 4);
+    const addr = try func.appendInst(c.body, ptr_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = off } });
+    const loaded = try func.appendInst(c.body, u32_t, .{ .load = .{ .ptr = addr } });
+    try closeCounted(&func, c, loaded);
+
+    try testing.expect(try runPass(allocator, &func));
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const constant: ?i64 = switch (func.opcode(inst)) {
+                .iconst => |k| if (func.valueType(func.instResult(inst).?) == i64_t) k else null,
+                .arith_imm => |a| if (func.valueType(func.instResult(inst).?) != u32_t) a.imm else null,
+                else => null,
+            };
+            if (constant) |k| try testing.expect(k >= -(1 << 32) and k <= (1 << 32));
+        }
+    }
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
     try testing.expect(diags.ok());
