@@ -1595,3 +1595,39 @@ test "x86_64 indexed loads and stores address base plus scaled index" {
         try std.testing.expectEqual(word_mem[k] *% 3, word_mem[k + 1]);
     }
 }
+
+test "x86_64 a widening convert of a narrow load reuses the load's extension" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const i16_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 16 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const q = try func.appendBlockParam(entry, ptr_t);
+    const byte = try func.appendInst(entry, u8_t, .{ .load = .{ .ptr = p } });
+    const half = try func.appendInst(entry, i16_t, .{ .load = .{ .ptr = q } });
+    const wide_byte = try func.appendInst(entry, u64_t, .{ .convert = .{ .value = byte } });
+    const wide_half = try func.appendInst(entry, i32_t, .{ .convert = .{ .value = half } });
+    const half64 = try func.appendInst(entry, u64_t, .{ .convert = .{ .value = wide_half } });
+    const sum = try func.appendInst(entry, u64_t, .{ .arith = .{ .op = .add, .lhs = wide_byte, .rhs = half64 } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
+
+    const code = try isel.selectFunction(a, &func);
+    defer a.free(code);
+    // No register-to-register movzx/movsx of a byte or word remains.
+    for (0..code.len -| 2) |k| {
+        if (code[k] == 0x0F and (code[k + 1] == 0xB6 or code[k + 1] == 0xBF) and code[k + 2] >= 0xC0) return error.TestUnexpectedResult;
+    }
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn (*const u8, *const i16) callconv(.c) u64, 0);
+    const b: u8 = 200;
+    const h: i16 = -5;
+    const want: u64 = 200 +% @as(u64, @bitCast(@as(i64, @as(i32, h))));
+    try std.testing.expectEqual(want, f(&b, &h));
+}

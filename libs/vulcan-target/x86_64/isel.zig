@@ -2460,7 +2460,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 const dst_bits = intBits(func, result);
                 const src = try ctx.use(allocator, cv.value, scratch2);
                 const rd = ctx.dst(result, scratch1);
-                if (dst_bits > src_bits and src_bits < 64) {
+                if (dst_bits > src_bits and src_bits < 64 and !loadExtended(func, cv.value, dst_bits)) {
                     const signed = isSigned(func, cv.value);
                     try ctx.put(allocator, switch (src_bits) {
                         8 => if (signed) encode.movsxByte(rd, src) else encode.movzxByte(rd, src),
@@ -4252,7 +4252,7 @@ fn x86_64CopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Val
         // exclude it, matching the emission's extend branch.
         const src_bits = intBits(func, src);
         const dst_bits = intBits(func, v);
-        if (dst_bits > src_bits and src_bits < 64) return null;
+        if (dst_bits > src_bits and src_bits < 64 and !loadExtended(func, src, dst_bits)) return null;
         return src;
     }
     if (src_x and dst_x) {
@@ -4312,6 +4312,18 @@ fn x86_64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Valu
         },
         else => null,
     };
+}
+
+/// Whether a narrow load already left `value` extended to `dst_bits` in its register. An
+/// unsigned load zero-extends to 64 bits, a signed 8 or 16-bit load sign-extends to 32, and
+/// a signed 32-bit load sign-extends to 64.
+fn loadExtended(func: *const Function, value: Value, dst_bits: u32) bool {
+    const inst = func.definingInst(value) orelse return false;
+    if (func.opcode(inst) != .load or isXmm(func, value)) return false;
+    const bits = intBits(func, value);
+    if (bits > 32) return false;
+    if (!isSigned(func, value)) return true;
+    return if (bits == 32) true else dst_bits <= 32;
 }
 
 /// Append a `u16` index for every register in `regs` to `list` (via `@intFromEnum`).
