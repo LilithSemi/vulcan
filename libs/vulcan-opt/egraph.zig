@@ -15,10 +15,14 @@ const Value = ir.function.Value;
 const reachable_marker = std.math.maxInt(u32);
 
 pub const pass_def = pass.Pass{ .name = "egraph", .run = run, .preserves_cfg = true };
+pub const latency_pass_def = pass.Pass{ .name = "egraph-latency", .run = runLatency, .preserves_cfg = true };
 
 pub const Limits = struct {
     max_nodes: usize = 512,
     max_iters: usize = 6,
+    /// Keep a root unchanged when the smaller form has a longer dependency chain. Out-of-order
+    /// cores hide extra instructions better than extra multiply latency.
+    latency_aware: bool = false,
 };
 
 const OpNode = struct {
@@ -1252,7 +1256,61 @@ fn optimizeRoot(graph: *Graph, extraction: *const Extraction, func: *Function, b
     if (class == reachable_marker) return null;
     const root = graph.find(class);
     if (extraction.costs[root] >= original_costs[@backingInt(root_value)]) return null;
+    if (graph.limits.latency_aware and try extractedDepth(graph, extraction, root) > try valueDepth(graph.allocator, func, root_value)) return null;
     return try materialize(graph, extraction, func, block, root, memo);
+}
+
+fn opLatency(op: BinOp) u32 {
+    return switch (op) {
+        .mul, .mulh => 3,
+        .div, .rem => 20,
+        .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
+    };
+}
+
+/// The latency-weighted dependency depth of the form extraction chose for `class`.
+fn extractedDepth(graph: *Graph, extraction: *const Extraction, class: u32) !u32 {
+    const memo = try graph.allocator.alloc(?u32, graph.parents.items.len);
+    defer graph.allocator.free(memo);
+    @memset(memo, null);
+    return extractedDepthAt(graph, extraction, class, memo);
+}
+
+fn extractedDepthAt(graph: *Graph, extraction: *const Extraction, class: u32, memo: []?u32) u32 {
+    const root = graph.find(class);
+    if (memo[root]) |depth| return depth;
+    const index = extraction.best[root] orelse return 0;
+    const depth = switch (graph.nodes.items[index].node) {
+        .leaf => 0,
+        .op => |raw| blk: {
+            const op = canonical(graph, raw);
+            const lhs = extractedDepthAt(graph, extraction, op.lhs, memo);
+            const rhs = extractedDepthAt(graph, extraction, op.rhs, memo);
+            break :blk opLatency(op.op) + @max(lhs, rhs);
+        },
+    };
+    memo[root] = depth;
+    return depth;
+}
+
+/// The latency-weighted dependency depth of `value` as the IR computes it now.
+fn valueDepth(allocator: std.mem.Allocator, func: *const Function, value: Value) !u32 {
+    var memo: std.AutoHashMapUnmanaged(Value, u32) = .empty;
+    defer memo.deinit(allocator);
+    return valueDepthAt(allocator, func, value, &memo, 0);
+}
+
+fn valueDepthAt(allocator: std.mem.Allocator, func: *const Function, value: Value, memo: *std.AutoHashMapUnmanaged(Value, u32), level: u8) !u32 {
+    if (memo.get(value)) |depth| return depth;
+    if (level > 64) return 0;
+    const inst = func.definingInst(value) orelse return 0;
+    const depth: u32 = switch (func.opcode(inst)) {
+        .arith => |a| opLatency(a.op) + @max(try valueDepthAt(allocator, func, a.lhs, memo, level + 1), try valueDepthAt(allocator, func, a.rhs, memo, level + 1)),
+        .arith_imm => |a| opLatency(a.op) + try valueDepthAt(allocator, func, a.lhs, memo, level + 1),
+        else => 0,
+    };
+    try memo.put(allocator, value, depth);
+    return depth;
 }
 
 pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limits) pass.Error!bool {
@@ -1334,6 +1392,11 @@ pub fn runWithLimits(allocator: std.mem.Allocator, func: *Function, limits: Limi
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
     return runWithLimits(allocator, func, .{});
+}
+
+fn runLatency(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    _ = analyses;
+    return runWithLimits(allocator, func, .{ .latency_aware = true });
 }
 
 fn expectBitwisePair(outer_op: BinOp, left_op: BinOp, right_op: BinOp, expected: BinOp) !void {

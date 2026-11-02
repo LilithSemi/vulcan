@@ -53,6 +53,16 @@ pub const default_pipeline = [_]pass.Pass{
     dce.pass_def,
 };
 
+/// The default pipeline with a latency-aware egraph, for wide out-of-order targets where a
+/// longer multiply chain costs more than an extra instruction.
+pub const latency_pipeline = blk: {
+    var passes = default_pipeline;
+    for (&passes) |*p| {
+        if (std.mem.eql(u8, p.name, egraph.pass_def.name)) p.* = egraph.latency_pass_def;
+    }
+    break :blk passes;
+};
+
 /// The late pipeline: induction-variable strength reduction, then just enough clean-up to settle
 /// what it leaves behind. It is SEPARATE from the default pipeline for a phase-ordering reason.
 ///
@@ -86,6 +96,11 @@ pub fn optimize(allocator: std.mem.Allocator, func: *ir.function.Function) pass.
 /// idiom recognizers read.
 pub fn optimizeEarly(allocator: std.mem.Allocator, func: *ir.function.Function) pass.Error!bool {
     return pass.runToFixpoint(allocator, func, &default_pipeline, 16);
+}
+
+/// `optimizeEarly`, keeping expression latency when `latency_aware` is set.
+pub fn optimizeEarlyFor(allocator: std.mem.Allocator, func: *ir.function.Function, latency_aware: bool) pass.Error!bool {
+    return pass.runToFixpoint(allocator, func, if (latency_aware) &latency_pipeline else &default_pipeline, 16);
 }
 
 /// The late pipeline to a fixpoint.

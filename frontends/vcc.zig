@@ -980,7 +980,10 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
 
     const early_start = inline_end;
     if (optimize.optimizes()) {
-        for (mod.funcs) |*nf| _ = try opt.optimizeEarly(allocator, &nf.func);
+        // An x86 model keeps expression latency: its wide out-of-order core hides an extra
+        // instruction better than a longer multiply chain.
+        const latency_aware = optimize.runsMicroarch() and model != null and model.?.arch == .x86_64;
+        for (mod.funcs) |*nf| _ = try opt.optimizeEarlyFor(allocator, &nf.func, latency_aware);
     }
     const early_end = std.Io.Timestamp.now(io, .awake);
 

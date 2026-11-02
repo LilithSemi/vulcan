@@ -2056,8 +2056,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 try ctx.store(allocator, result, rd);
                 return;
             }
-            if (foldedAluImm(func, a, result)) |imm| {
-                const rl = try ctx.use(allocator, a.lhs, scratch1);
+            if (foldedAluImm(func, a, result)) |fold| {
+                const imm = fold.imm;
+                const rl = try ctx.use(allocator, fold.reg, scratch1);
                 const rd = ctx.dst(result, scratch1);
                 if (a.op == .mul) {
                     try ctx.put(allocator, encode.imulImm(rd, rl, imm, w64));
@@ -3670,12 +3671,20 @@ fn foldedShift(func: *const Function, arith: ir.function.Arith, result: Value) ?
     return @intCast(imm);
 }
 
-/// The immediate when a gpr add, sub, and, or, xor, or mul reads a constant right operand.
-fn foldedAluImm(func: *const Function, arith: ir.function.Arith, result: Value) ?i32 {
-    return switch (arith.op) {
-        .add, .sub, .bit_and, .bit_or, .bit_xor, .mul => foldedImm(func, arith.rhs, intBits(func, result) > 32),
-        else => null,
-    };
+const AluImm = struct { reg: Value, imm: i32 };
+
+/// The register operand and immediate when a gpr add, sub, and, or, xor, or mul reads a
+/// constant. A commutative op may have the constant on either side.
+fn foldedAluImm(func: *const Function, arith: ir.function.Arith, result: Value) ?AluImm {
+    const w64 = intBits(func, result) > 32;
+    switch (arith.op) {
+        .add, .sub, .bit_and, .bit_or, .bit_xor, .mul => {},
+        else => return null,
+    }
+    if (foldedImm(func, arith.rhs, w64)) |imm| return .{ .reg = arith.lhs, .imm = imm };
+    if (arith.op == .sub) return null;
+    if (foldedImm(func, arith.lhs, w64)) |imm| return .{ .reg = arith.rhs, .imm = imm };
+    return null;
 }
 
 const InstPosition = struct { insts: []const ir.function.Inst, index: usize };
@@ -3877,7 +3886,11 @@ fn x86_64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.fu
                     return 2;
                 }
             };
-            if (foldedShift(func, arith, result) != null or foldedAluImm(func, arith, result) != null) {
+            if (foldedAluImm(func, arith, result)) |fold| {
+                out[0] = fold.reg;
+                return 1;
+            }
+            if (foldedShift(func, arith, result) != null) {
                 out[0] = arith.lhs;
                 return 1;
             }
@@ -4081,6 +4094,7 @@ fn x86_64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Valu
                 if (loadsOperand(func, a)) if (instPosition(func, inst)) |at| {
                     if (fusedLoad(func, at.insts, at.index)) |fold| return fold.other;
                 };
+                if (foldedAluImm(func, a, v)) |fold| return fold.reg;
                 return a.lhs;
             },
             .div, .rem, .mulh, .shl, .shr => null,
