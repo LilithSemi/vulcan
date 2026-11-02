@@ -9,6 +9,9 @@ const Compiler = struct {
     name: []const u8,
     command: []const u8,
     required: bool,
+    environ_map: ?*const std.process.Environ.Map = null,
+    /// Its code is the same as another row, so it is only in the compile table.
+    compile_only: bool = false,
 };
 
 const Result = struct {
@@ -40,8 +43,12 @@ pub fn main(init: std.process.Init) !void {
     defer workloads.deinit(allocator);
     if (workloads.items.len == 0) return error.NoWorkloads;
 
+    // A cold VCC runs without its cache, so the cost of the cache misses is visible.
+    var cold_env = try init.environ_map.clone(allocator);
+    try cold_env.put("VCC_NO_CACHE", "1");
     const candidates = [_]Compiler{
         .{ .name = "vcc", .command = vcc, .required = true },
+        .{ .name = "vcc-cold", .command = vcc, .required = true, .environ_map = &cold_env, .compile_only = true },
         .{ .name = "clang", .command = "clang", .required = false },
         .{ .name = "gcc", .command = "gcc", .required = false },
         .{ .name = "tcc", .command = "tcc", .required = false },
@@ -118,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
         var vcc_best: u64 = 0;
         var expected_checksum: ?[]const u8 = null;
         for (compilers.items, 0..) |compiler, compiler_index| {
+            if (compiler.compile_only) continue;
             const stem = workload[0 .. workload.len - 2];
             const output_name = try std.fmt.allocPrint(allocator, "{s}.{s}.bench", .{ stem, compiler.name });
             const output_path = try std.fs.path.join(allocator, &.{ output_dir, output_name });
@@ -148,6 +156,7 @@ pub fn main(init: std.process.Init) !void {
     try writer.writeAll("aggregate best execution time\n");
     const vcc_execution_total = totals[0];
     for (compilers.items, 0..) |compiler, index| {
+        if (compiler.compile_only) continue;
         try writer.print("  {s:<8}  ", .{compiler.name});
         try printDuration(writer, totals[index]);
         try writer.print("  {d:>7}% of vcc\n", .{@divTrunc(totals[index] * 100, vcc_execution_total)});
@@ -204,6 +213,7 @@ fn compileOnce(allocator: std.mem.Allocator, io: std.Io, compiler: Compiler, sou
     const start = if (timed) std.Io.Timestamp.now(io, .awake) else undefined;
     const result = try std.process.run(allocator, io, .{
         .argv = &.{ compiler.command, "-O2", "-c", source, "-o", output },
+        .environ_map = compiler.environ_map,
     });
     const finish = if (timed) std.Io.Timestamp.now(io, .awake) else undefined;
     defer allocator.free(result.stdout);
