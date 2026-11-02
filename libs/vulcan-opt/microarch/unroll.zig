@@ -1040,14 +1040,56 @@ fn countedShape(
     };
 }
 
+fn edgesInto(func: *const Function, target: Block) usize {
+    var count: usize = 0;
+    var b: usize = 0;
+    while (b < func.blockCount()) : (b += 1) {
+        const blk: Block = @fromBackingInt(@intCast(b));
+        for (func.blockInsts(blk)) |inst| {
+            if (func.opcode(inst) != .@"if") continue;
+            const cf = func.opcode(inst).@"if";
+            if (cf.then.target == target) count += 1;
+            if (cf.@"else".target == target) count += 1;
+        }
+        if (func.terminator(blk)) |term| switch (term) {
+            .jump => |j| if (j.target == target) {
+                count += 1;
+            },
+            .ret => {},
+        };
+    }
+    return count;
+}
+
+/// Puts a new block on the loop exit edge. The new block takes the edge args as params and
+/// jumps to the old exit with them.
+fn splitExitEdge(a: std.mem.Allocator, func: *Function, plan: *Plan) Error!void {
+    const exit = try func.appendBlock();
+    const cf = func.opcode(plan.if_inst).@"if";
+    const exit_is_then = cf.then.target == plan.exit;
+    const edge = if (exit_is_then) cf.then else cf.@"else";
+    const old_args = try a.dupe(Value, func.valueList(edge.args));
+    var params: std.ArrayList(Value) = .empty;
+    for (old_args) |arg| try params.append(a, try func.appendBlockParam(exit, func.valueType(arg)));
+    try func.setJump(exit, plan.exit, params.items);
+    const cf_mut = func.opcodeMut(plan.if_inst);
+    if (exit_is_then) cf_mut.@"if".then.target = exit else cf_mut.@"if".@"else".target = exit;
+    plan.exit = exit;
+}
+
 /// Steps B and C: rewrite escaping values into loop-closed form, then unroll by
 /// K. The strict counted shape takes the main-loop-plus-remainder emission; any
 /// other eligible loop gets K-1 extra guarded body copies spliced between the
 /// header entry and the back-edge.
-fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error!void {
+fn apply(allocator: std.mem.Allocator, func: *Function, loop_plan: *const Plan) Error!void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
+
+    // Step B adds params to the exit block, so it must have no edge other than the loop exit.
+    var dedicated = loop_plan.*;
+    if (edgesInto(func, dedicated.exit) > 1) try splitExitEdge(a, func, &dedicated);
+    const plan: *const Plan = &dedicated;
 
     // --- Step B: loop-closed SSA for values escaping the loop ---
     // Every value used by a block outside the loop.
@@ -2184,6 +2226,41 @@ test "run unrolls an eligible counted loop under a wide model, staying verifiabl
     const changed = try run(allocator, &func, registry.modelFor(.@"ampere-altra"));
     try std.testing.expect(changed);
     try std.testing.expect(func.blockCount() > before);
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "a loop whose exit block is the header of the next loop stays verifiable" {
+    const registry = @import("registry.zig");
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const next_loop = try func.appendBlock();
+    const next_body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const i = try func.appendBlockParam(loop, i32_t);
+    const bi = try func.appendBlockParam(body, i32_t);
+    const j = try func.appendBlockParam(next_loop, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{zero});
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = next_loop, .args = &.{zero} });
+    const step = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{step});
+    const next_cmp = try func.appendInst(next_loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = j, .rhs = n } });
+    try func.appendIf(next_loop, next_cmp, .{ .target = next_body }, .{ .target = done });
+    const next_step = try func.appendArithImm(next_body, i32_t, .add, j, 1);
+    try func.setJump(next_body, next_loop, &.{next_step});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(i) });
+
+    try std.testing.expect(try run(allocator, &func, registry.modelFor(.zen4)));
     var diags = try ir.verify.verify(allocator, &func, .low);
     defer diags.deinit();
     try std.testing.expect(diags.ok());
