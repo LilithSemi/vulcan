@@ -39,6 +39,7 @@ pub const score = @import("microarch/score.zig");
 pub const unroll = @import("microarch/unroll.zig");
 pub const splitunroll = @import("microarch/splitunroll.zig");
 pub const loopvec = @import("microarch/loopvec.zig");
+pub const outervec = @import("microarch/outervec.zig");
 pub const prefetch = @import("microarch/prefetch.zig");
 pub const offsetcombine = @import("microarch/offsetcombine.zig");
 pub const dotprod = @import("microarch/dotprod.zig");
@@ -78,6 +79,8 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
     // reduction-over-memory loops (a direct vector accumulator). It consumes the loops it can
     // vectorize; splitunroll then scalar-splits the remaining reductions (e.g. `s += i`, no memory to
     // widen), and the guarded unroller handles everything else.
+    // Outer-loop vectorization reads the nest before loopvec reshapes the inner loops.
+    const outer = try outervec.run(allocator, func, m);
     const looped = try loopvec.run(allocator, func, m);
     const split = try splitunroll.run(allocator, func, m);
     // NVIDIA's address-heavy scalar loops need induction-variable strength
@@ -126,7 +129,7 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
     // `model.vpu()` (et-soc only), so it is a no-op for every other model.
     const matmuled = try matmul_recog.run(allocator, func, m);
     const prefetched = try prefetch.run(allocator, func, m);
-    return split or looped or iv_reduced or unrolled or vectorized or if_converted or late_cleaned or dotted or matmuled or prefetched;
+    return outer or split or looped or iv_reduced or unrolled or vectorized or if_converted or late_cleaned or dotted or matmuled or prefetched;
 }
 
 /// Hoist safe constants exposed by late inlining when the target score accepts the result.
@@ -162,6 +165,7 @@ test {
     std.testing.refAllDecls(@import("microarch/loopimm.zig"));
     std.testing.refAllDecls(@import("microarch/looprotate.zig"));
     std.testing.refAllDecls(@import("microarch/offsetcombine.zig"));
+    std.testing.refAllDecls(@import("microarch/outervec.zig"));
     std.testing.refAllDecls(@import("microarch/rangediv.zig"));
     std.testing.refAllDecls(@import("microarch/prefetch.zig"));
     std.testing.refAllDecls(@import("microarch/dotprod.zig"));

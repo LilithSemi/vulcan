@@ -443,6 +443,109 @@ test "loopvec differential: stencil map plus xor reduction, all trip counts" {
     try expectStencilMatches(ampere());
 }
 
+/// `for i < 4: for j < n: { s = 0; for k < 8: s += A[i][k] * B[k][j]; C[i][j] = s; }` with
+/// 8-wide rows, shaped like the C frontend's output.
+fn buildMatmulNest(func: *Function) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const ih = try func.appendBlock();
+    const ib = try func.appendBlock();
+    const jh = try func.appendBlock();
+    const jb = try func.appendBlock();
+    const kh = try func.appendBlock();
+    const kb = try func.appendBlock();
+    const kx = try func.appendBlock();
+    const il = try func.appendBlock();
+    const done = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const four = try func.appendInst(entry, i32_t, .{ .iconst = 4 });
+    const eight = try func.appendInst(entry, i32_t, .{ .iconst = 8 });
+    try func.setJump(entry, ih, &.{zero});
+
+    const i = try func.appendBlockParam(ih, i32_t);
+    const i_more = try func.appendInst(ih, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = four } });
+    try func.appendIf(ih, i_more, .{ .target = ib }, .{ .target = done });
+    const ix = try func.appendInst(ib, i64_t, .{ .convert = .{ .value = i } });
+    const row = try func.appendArithImm(ib, i64_t, .shl, ix, 5);
+    const arow = try func.appendInst(ib, ptr_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = row } });
+    const crow = try func.appendInst(ib, ptr_t, .{ .arith = .{ .op = .add, .lhs = c, .rhs = row } });
+    try func.setJump(ib, jh, &.{zero});
+
+    const j = try func.appendBlockParam(jh, i32_t);
+    const j_more = try func.appendInst(jh, bool_t, .{ .icmp = .{ .op = .lt, .lhs = j, .rhs = n } });
+    try func.appendIf(jh, j_more, .{ .target = jb }, .{ .target = il });
+    const jx = try func.appendInst(jb, i64_t, .{ .convert = .{ .value = j } });
+    const jo = try func.appendArithImm(jb, i64_t, .shl, jx, 2);
+    try func.setJump(jb, kh, &.{ zero, zero });
+
+    const k = try func.appendBlockParam(kh, i32_t);
+    const s = try func.appendBlockParam(kh, i32_t);
+    const k_more = try func.appendInst(kh, bool_t, .{ .icmp = .{ .op = .lt, .lhs = k, .rhs = eight } });
+    try func.appendIf(kh, k_more, .{ .target = kb }, .{ .target = kx });
+    const kx64 = try func.appendInst(kb, i64_t, .{ .convert = .{ .value = k } });
+    const ko = try func.appendArithImm(kb, i64_t, .shl, kx64, 2);
+    const ap = try func.appendInst(kb, ptr_t, .{ .arith = .{ .op = .add, .lhs = arow, .rhs = ko } });
+    const av = try func.appendInst(kb, i32_t, .{ .load = .{ .ptr = ap } });
+    const bo = try func.appendArithImm(kb, i64_t, .shl, kx64, 5);
+    const brow = try func.appendInst(kb, ptr_t, .{ .arith = .{ .op = .add, .lhs = b, .rhs = bo } });
+    const bp = try func.appendInst(kb, ptr_t, .{ .arith = .{ .op = .add, .lhs = brow, .rhs = jo } });
+    const bv = try func.appendInst(kb, i32_t, .{ .load = .{ .ptr = bp } });
+    const prod = try func.appendInst(kb, i32_t, .{ .arith = .{ .op = .mul, .lhs = av, .rhs = bv } });
+    const s2 = try func.appendInst(kb, i32_t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = prod } });
+    const k2 = try func.appendArithImm(kb, i32_t, .add, k, 1);
+    try func.setJump(kb, kh, &.{ k2, s2 });
+
+    const cp = try func.appendInst(kx, ptr_t, .{ .arith = .{ .op = .add, .lhs = crow, .rhs = jo } });
+    try func.appendStore(kx, s, cp);
+    const j2 = try func.appendArithImm(kx, i32_t, .add, j, 1);
+    try func.setJump(kx, jh, &.{j2});
+    const i_next = try func.appendArithImm(il, i32_t, .add, i, 1);
+    try func.setJump(il, ih, &.{i_next});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+}
+
+test "zen4 differential: an outer-vectorized matmul nest matches at every column count" {
+    if (comptime !hasJit()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var orig = Function.init(allocator);
+    defer orig.deinit();
+    try buildMatmulNest(&orig);
+    var tuned = Function.init(allocator);
+    defer tuned.deinit();
+    try buildMatmulNest(&tuned);
+    try std.testing.expect(try opt.microarch.outervec.run(allocator, &tuned, zen4()));
+    try std.testing.expect(hasVectorValue(&tuned));
+    var diags = try ir.verify.verify(allocator, &tuned, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+
+    var buf_o = try target.native.jitFunction(allocator, &orig);
+    defer buf_o.deinit();
+    var buf_t = try target.native.jitFunction(allocator, &tuned);
+    defer buf_t.deinit();
+    const Fn = *const fn ([*]const i32, [*]const i32, [*]i32, i32) callconv(.c) void;
+    const f_o = buf_o.entry(Fn, 0);
+    const f_t = buf_t.entry(Fn, 0);
+    var a_mem: [32]i32 = undefined;
+    var b_mem: [64]i32 = undefined;
+    for (&a_mem, 0..) |*v, idx| v.* = @as(i32, @intCast((idx * 7 + 3) % 23)) - 11;
+    for (&b_mem, 0..) |*v, idx| v.* = @as(i32, @intCast((idx * 13 + 5) % 31)) - 15;
+    for (0..9) |cols| {
+        var c_o: [32]i32 = @splat(0x5a5a);
+        var c_t: [32]i32 = @splat(0x5a5a);
+        f_o(&a_mem, &b_mem, &c_o, @intCast(cols));
+        f_t(&a_mem, &b_mem, &c_t, @intCast(cols));
+        try std.testing.expectEqualSlices(i32, &c_o, &c_t);
+    }
+}
+
 test "x86 differential: i32 reductions, stencil, and maps through the full pipeline" {
     if (comptime !hasJit()) return error.SkipZigTest;
     // Cascade Lake declares 512-bit vectors, wider than the x86 backend lowers.
