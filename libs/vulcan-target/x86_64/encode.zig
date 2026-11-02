@@ -943,6 +943,19 @@ fn movMem(op: u8, data: Reg, base: Reg, disp: i32) Inst {
     }
     return Inst.of(&.{ rex, op, modrm_byte, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
+/// `op dst, [base + disp32]` for an ALU opcode in its reg, r/m form (03 add, 0B or, 23 and,
+/// 2B sub, 33 xor). `w` picks 64-bit over 32-bit.
+pub fn aluFromMem(opcode: u8, dst: Reg, base: Reg, disp: i32, w: bool) Inst {
+    return if (w) movMem(opcode, dst, base, disp) else movMem32(opcode, dst, base, disp);
+}
+
+test "aluFromMem encodes reg, mem forms" {
+    // add eax, [rdi + 4]
+    try std.testing.expectEqualSlices(u8, &.{ 0x03, 0x87, 0x04, 0x00, 0x00, 0x00 }, aluFromMem(0x03, .rax, .rdi, 4, false).slice());
+    // xor r9, [r12 + 8]
+    try std.testing.expectEqualSlices(u8, &.{ 0x4D, 0x33, 0x8C, 0x24, 0x08, 0x00, 0x00, 0x00 }, aluFromMem(0x33, .r9, .r12, 8, true).slice());
+}
+
 /// `mov dst, [base + disp32]` (REX.W 8B /r): load 64 bits from `[base+disp]`.
 pub fn movFromMem(dst: Reg, base: Reg, disp: i32) Inst {
     return movMem(0x8B, dst, base, disp);
@@ -998,6 +1011,74 @@ pub fn movsxdIndexed4(dst: Reg, base: Reg, index: Reg) Inst {
     const mrm: u8 = ((n(dst) & 7) << 3) | 0x04;
     const sib: u8 = (2 << 6) | ((n(index) & 7) << 3) | (n(base) & 7);
     return Inst.of(&.{ rex, 0x63, mrm, sib });
+}
+
+/// `lea dst, [base + index]` (8D /r with a SIB byte), a three-operand add that leaves the
+/// flags alone. Without `w` the 32-bit form zero-extends, like a 32-bit `add`.
+pub fn leaBaseIndex(dst: Reg, base_in: Reg, index_in: Reg, w: bool) Inst {
+    // rsp cannot be an index. An rbp or r13 base needs a disp8, which makes a slower
+    // three-component lea, so the operands swap when that avoids it. The add commutes.
+    const swap = index_in == .rsp or (n(base_in) & 7 == 5 and n(index_in) & 7 != 5 and base_in != .rsp);
+    const base = if (swap) index_in else base_in;
+    const index = if (swap) base_in else index_in;
+    std.debug.assert(index != .rsp);
+    const rex: u8 = 0x40 | (@as(u8, @intFromBool(w)) << 3) | (@as(u8, @intFromBool(n(dst) >= 8)) << 2) |
+        (@as(u8, @intFromBool(n(index) >= 8)) << 1) | @intFromBool(n(base) >= 8);
+    const sib: u8 = ((n(index) & 7) << 3) | (n(base) & 7);
+    // rbp and r13 as a base need an explicit zero disp8.
+    if (n(base) & 7 == 5) {
+        const mrm: u8 = 0x44 | ((n(dst) & 7) << 3);
+        if (rex == 0x40) return Inst.of(&.{ 0x8D, mrm, sib, 0 });
+        return Inst.of(&.{ rex, 0x8D, mrm, sib, 0 });
+    }
+    const mrm: u8 = 0x04 | ((n(dst) & 7) << 3);
+    if (rex == 0x40) return Inst.of(&.{ 0x8D, mrm, sib });
+    return Inst.of(&.{ rex, 0x8D, mrm, sib });
+}
+
+/// `lea dst, [base + disp]` (8D /r), with a disp8 when it fits.
+pub fn leaBaseDisp(dst: Reg, base: Reg, disp: i32, w: bool) Inst {
+    const rex: u8 = 0x40 | (@as(u8, @intFromBool(w)) << 3) | (@as(u8, @intFromBool(n(dst) >= 8)) << 2) | @intFromBool(n(base) >= 8);
+    var buf: [8]u8 = undefined;
+    var len: usize = 0;
+    if (rex != 0x40) {
+        buf[len] = rex;
+        len += 1;
+    }
+    buf[len] = 0x8D;
+    len += 1;
+    const short = disp >= -128 and disp <= 127;
+    buf[len] = (if (short) @as(u8, 0x40) else 0x80) | ((n(dst) & 7) << 3) | (n(base) & 7);
+    len += 1;
+    // rsp and r12 as a base need a SIB byte.
+    if (n(base) & 7 == 4) {
+        buf[len] = 0x24;
+        len += 1;
+    }
+    const u: u32 = @bitCast(disp);
+    if (short) {
+        buf[len] = @truncate(u);
+        len += 1;
+    } else {
+        for (0..4) |k| buf[len + k] = @truncate(u >> @intCast(8 * k));
+        len += 4;
+    }
+    return Inst.of(buf[0..len]);
+}
+
+test "lea encodes three-operand adds" {
+    // lea eax, [rcx + rdx]
+    try std.testing.expectEqualSlices(u8, &.{ 0x8D, 0x04, 0x11 }, leaBaseIndex(.rax, .rcx, .rdx, false).slice());
+    // lea r10, [r13 + r9] swaps to [r9 + r13], so r13 needs no disp8 as the base
+    try std.testing.expectEqualSlices(u8, &.{ 0x4F, 0x8D, 0x14, 0x29 }, leaBaseIndex(.r10, .r13, .r9, true).slice());
+    // lea rax, [rbp + r13] has no swap that helps, so it keeps the zero disp8
+    try std.testing.expectEqualSlices(u8, &.{ 0x4A, 0x8D, 0x44, 0x2D, 0x00 }, leaBaseIndex(.rax, .rbp, .r13, true).slice());
+    // lea eax, [rsp + rcx] swaps rsp out of the index
+    try std.testing.expectEqualSlices(u8, &.{ 0x8D, 0x04, 0x0C }, leaBaseIndex(.rax, .rcx, .rsp, false).slice());
+    // lea esi, [rdi + 3]
+    try std.testing.expectEqualSlices(u8, &.{ 0x8D, 0x77, 0x03 }, leaBaseDisp(.rsi, .rdi, 3, false).slice());
+    // lea r8, [r12 - 0x600]
+    try std.testing.expectEqualSlices(u8, &.{ 0x4D, 0x8D, 0x84, 0x24, 0x00, 0xFA, 0xFF, 0xFF }, leaBaseDisp(.r8, .r12, -0x600, true).slice());
 }
 
 /// `jmp r64` (FF /4).

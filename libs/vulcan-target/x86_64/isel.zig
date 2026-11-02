@@ -302,6 +302,12 @@ const Ctx = struct {
     edge_move_driven: bool = false,
     /// Per value, whether a machine instruction reads it from a register. Empty means all.
     reg_read: []const bool = &.{},
+    /// The first numbering position of each block, plus one past the end.
+    block_pos: []const u32 = &.{},
+    /// Per block, whether an allocator action lands inside it.
+    block_busy: []const bool = &.{},
+    /// Per block, whether it dispatches a jump table.
+    dense_root: []const bool = &.{},
     // Address-mode-fold analysis, consulted by the load/store emit arms and the
     // dead-add skip. Defaults to the empty analysis, where nothing folds, so the
     // Wimmer path and the allocator test hooks produce the same bytes as before
@@ -434,6 +440,8 @@ pub const ModelCaps = struct {
     /// together with `fuse_cmp_branch`, since the fold lives inside the
     /// compare-and-branch path, so both must be on.
     fuse_arith_branch: bool = false,
+    /// Align loop tops to this many bytes. Zero or one leaves the code unpadded.
+    fetch_align: u16 = 0,
 };
 
 /// Select x86-64 machine code for `func` (code only, call relocations dropped). Caller
@@ -466,6 +474,7 @@ pub fn capsForModel(model: *const mm.Model) ModelCaps {
     return .{
         .fuse_cmp_branch = model.fuses(.cmp_branch),
         .fuse_arith_branch = model.fuses(.arith_branch),
+        .fetch_align = model.fetch_align,
     };
 }
 
@@ -487,7 +496,7 @@ test "x86_64 capsForModel reads cascadelake-sp fusion: cmp and arith on" {
 fn forEachWimmerSegments(allocator: std.mem.Allocator, func: *const Function, comptime f: fn ([]const wimmer.Segment, *usize) void) Error!usize {
     var work = try func.clone(allocator);
     defer work.deinit();
-    try ir.critical_edge.splitCriticalEdges(allocator, &work);
+    try splitCriticalEdgesInPlace(allocator, &work);
     var desc = try x86_64RegDescription(allocator, &work);
     defer desc.deinit(allocator);
     var walloc = try wimmer.allocate(allocator, &work, &desc);
@@ -542,7 +551,7 @@ pub fn nvFp4SpillCountsForTest(allocator: std.mem.Allocator, func: *const Functi
     var work = try func.clone(allocator);
     defer work.deinit();
     _ = try ir.expand.expandNvFp4(allocator, &work);
-    try ir.critical_edge.splitCriticalEdges(allocator, &work);
+    try splitCriticalEdgesInPlace(allocator, &work);
     var desc = try x86_64RegDescription(allocator, &work);
     defer desc.deinit(allocator);
     var walloc = try wimmer.allocate(allocator, &work, &desc);
@@ -628,7 +637,7 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
 
     // Split critical edges first, before the code builds any numbering. The shared
     // resolver needs a block on every critical edge to place its shuffle moves.
-    try ir.critical_edge.splitCriticalEdges(allocator, &work);
+    try splitCriticalEdgesInPlace(allocator, &work);
 
     // Neutralize every block unreachable from the entry, before the code builds any
     // numbering. A pass that raises a loop nest into one op could orphan its
@@ -770,10 +779,44 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
     const nblocks = func.blockCount();
     const block_start = try allocator.alloc(usize, nblocks);
     defer allocator.free(block_start);
+    const block_pos = try allocator.alloc(u32, nblocks + 1);
+    defer allocator.free(block_pos);
+    block_pos[0] = 0;
+    for (0..nblocks) |bi| {
+        block_pos[bi + 1] = block_pos[bi] + 2 + @as(u32, @intCast(func.blockInsts(@fromBackingInt(@intCast(bi))).len));
+    }
+    const block_busy = try allocator.alloc(bool, nblocks);
+    defer allocator.free(block_busy);
+    @memset(block_busy, false);
+    var busy_block: usize = 0;
+    for (ctx.actions.items) |action| {
+        while (busy_block + 1 < nblocks and action.at >= block_pos[busy_block + 1]) busy_block += 1;
+        block_busy[busy_block] = true;
+    }
+    ctx.block_pos = block_pos;
+    ctx.block_busy = block_busy;
+    defer {
+        ctx.block_pos = &.{};
+        ctx.block_busy = &.{};
+    }
     const skip_dispatch = try allocator.alloc(bool, nblocks);
     defer allocator.free(skip_dispatch);
     @memset(skip_dispatch, false);
     const dense_switches = try findDenseSwitches(allocator, ctx, skip_dispatch);
+    const dense_root = try allocator.alloc(bool, nblocks);
+    defer allocator.free(dense_root);
+    for (dense_switches, dense_root) |plan, *root| root.* = plan != null;
+    ctx.dense_root = dense_root;
+    defer ctx.dense_root = &.{};
+    // A pure forwarding block emits no code: every branch into it is retargeted to its final
+    // destination, and fall-through only goes to a block that emits code. Execution enters at
+    // block 0, so it always emits.
+    for (1..nblocks) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        if (forwardedBlock(ctx, block) != block) skip_dispatch[bi] = true;
+    }
+    const loop_top = try loopTops(allocator, ctx);
+    defer allocator.free(loop_top);
     defer {
         for (dense_switches) |plan| if (plan) |p| allocator.free(p.targets);
         allocator.free(dense_switches);
@@ -895,6 +938,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
     var action_cursor: usize = 0;
     for (0..nblocks) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
+        if (loop_top[bi] and !skip_dispatch[bi]) try padTo(allocator, ctx, ctx.caps.fetch_align);
         block_start[bi] = ctx.code.items.len;
         // A dispatch block that a jump table replaces. The scan proved it has no allocator
         // actions, so only the numbering advances.
@@ -970,7 +1014,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 // one emitted, or null at the last block. Whichever successor
                 // edge targets `next_block` can fall through, so `emitIf` elides
                 // that branch.
-                const next_block: ?Block = if (bi + 1 < nblocks) @fromBackingInt(@intCast(bi + 1)) else null;
+                const next_block = nextEmitted(skip_dispatch, bi);
                 if (dense_switches[bi]) |plan| {
                     try emitDenseSwitch(allocator, ctx, plan);
                 } else {
@@ -1087,7 +1131,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 // `next_block` is the next block emitted (`bi+1`), or null at
                 // the last block. A jump to it falls through, so `emitJump`
                 // elides the `jmp`.
-                const next_block: ?Block = if (bi + 1 < nblocks) @fromBackingInt(@intCast(bi + 1)) else null;
+                const next_block = nextEmitted(skip_dispatch, bi);
                 try emitJump(allocator, ctx, j, block, next_block);
             },
         };
@@ -1105,7 +1149,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
     defer jump_at.deinit(allocator);
     for (ctx.fixups.items) |f| if (f.table == null) try jump_at.put(allocator, f.at, f.target);
     for (ctx.fixups.items) |f| {
-        const target = threadedTarget(ctx.code.items, block_start, &jump_at, f.target);
+        const target = threadedTarget(ctx.code.items, block_start, &jump_at, @backingInt(forwardedBlock(ctx, @fromBackingInt(f.target))));
         const origin = f.table orelse f.at + 4;
         const rel: i32 = @intCast(@as(i64, @intCast(block_start[target])) - @as(i64, @intCast(origin)));
         std.mem.writeInt(u32, ctx.code.items[f.at..][0..4], @bitCast(rel), .little);
@@ -1924,6 +1968,30 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                         }
                     }
                 }
+                // pmulld is two uops with a long latency, so a multiply by 2^k, 2^k+1, or
+                // 2^k-1 uses a shift and an add or subtract instead.
+                if (int_vec and a.op == .mul) if (vectorMulShape(func, a.rhs)) |shape| {
+                    switch (shape.kind) {
+                        .pow2 => {
+                            if (work != rl) try ctx.put(allocator, encode.movupsRR(work, rl));
+                            try ctx.put(allocator, encode.pslldImm(work, shape.shift));
+                        },
+                        .plus => {
+                            try ctx.put(allocator, encode.movupsRR(xmm_op1, rl));
+                            try ctx.put(allocator, encode.pslldImm(xmm_op1, shape.shift));
+                            if (work != rl) try ctx.put(allocator, encode.movupsRR(work, rl));
+                            try ctx.put(allocator, encode.paddd(work, xmm_op1));
+                        },
+                        .minus => {
+                            try ctx.put(allocator, encode.movupsRR(xmm_op1, rl));
+                            try ctx.put(allocator, encode.pslldImm(xmm_op1, shape.shift));
+                            try ctx.put(allocator, encode.psubd(xmm_op1, rl));
+                            try ctx.put(allocator, encode.movupsRR(work, xmm_op1));
+                        },
+                    }
+                    try ctx.storeXmm(allocator, result, work);
+                    return;
+                };
                 const rr = try ctx.useXmm(allocator, a.rhs, xmm_op1);
                 const op = struct {
                     fn e(o: ir.function.BinOp, v: bool, iv: bool, d: bool, dst: Xmm, src: Xmm) Error!encode.Inst {
@@ -1969,6 +2037,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             // i32, i16, and i8 use 32-bit ops, whose result auto-zeroes the
             // upper 32 bits, so the value stays clean.
             const w64 = intBits(func, result) > 32;
+            if (fusedLoad(func, ctx.cur_insts, ctx.cur_idx)) |fold| {
+                try emitLoadOp(allocator, ctx, a, fold, result);
+                return;
+            }
             // A constant right operand is an immediate here, and `x86_64FusedOperands`
             // keeps it out of the register allocation, so its register must not be read.
             if (foldedShift(func, a, result)) |count| {
@@ -1985,8 +2057,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 if (a.op == .mul) {
                     try ctx.put(allocator, encode.imulImm(rd, rl, imm, w64));
                 } else {
-                    if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
-                    try ctx.put(allocator, encode.aluImm(aluDigit(a.op), rd, imm, w64));
+                    try emitAluImm(allocator, ctx, a.op, rd, rl, imm, w64);
                 }
                 try ctx.store(allocator, result, rd);
                 return;
@@ -2056,8 +2127,12 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     const rl = try ctx.use(allocator, a.lhs, scratch1);
                     const rr = try ctx.use(allocator, a.rhs, scratch2);
                     const rd = ctx.dst(result, scratch1);
-                    if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
-                    try ctx.put(allocator, try binary(a.op, rd, rr, w64));
+                    if (a.op == .add and rd != rl and rd != rr and !flagsReadAfter(ctx)) {
+                        try ctx.put(allocator, encode.leaBaseIndex(rd, rl, rr, w64));
+                    } else {
+                        if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
+                        try ctx.put(allocator, try binary(a.op, rd, rr, w64));
+                    }
                     try ctx.store(allocator, result, rd);
                 },
             }
@@ -2077,8 +2152,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 .add, .sub, .bit_and, .bit_or, .bit_xor => {
                     const rl = try ctx.use(allocator, a.lhs, scratch1);
                     const rd = ctx.dst(result, scratch1);
-                    if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
-                    try ctx.put(allocator, encode.aluImm(aluDigit(a.op), rd, imm, w64));
+                    try emitAluImm(allocator, ctx, a.op, rd, rl, imm, w64);
                     try ctx.store(allocator, result, rd);
                 },
                 .shl, .shr => {
@@ -2576,6 +2650,8 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             // A masked load is per-lane predication (see `Load.mask`), which this backend has no
             // form for. Reading every lane is a wrong answer, so refuse.
             if (func.opcode(inst).load.mask != null) return error.Unsupported;
+            // The next arith reads this load as a memory operand.
+            if (fusedLoad(func, ctx.cur_insts, ctx.cur_idx + 1) != null) return;
             // A folded load addresses `[base + disp32]`. `baseOf` yields the
             // fold base, the add's lhs, and `offOf` yields the displacement.
             // Both are the raw ptr and 0 when unfolded, so the non-folding
@@ -2684,6 +2760,22 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
     const then_next = next_block != null and cf.then.target == next_block.?;
     const else_next = next_block != null and cf.@"else".target == next_block.?;
 
+    // With no moves on either edge, branch to the final targets past empty forwarding
+    // blocks, and fall through only into a block that does real work.
+    if (edgeMovesEmpty(ctx, cf.then, pred) and edgeMovesEmpty(ctx, cf.@"else", pred)) {
+        const t = forwardedBlock(ctx, cf.then.target);
+        const e = forwardedBlock(ctx, cf.@"else".target);
+        if (next_block != null and e == next_block.?) {
+            try emitBranchTo(allocator, ctx, encode.jcc(cc, 0), @backingInt(t));
+        } else if (next_block != null and t == next_block.?) {
+            try emitBranchTo(allocator, ctx, encode.jcc(encode.invertCond(cc), 0), @backingInt(e));
+        } else {
+            try emitBranchTo(allocator, ctx, encode.jcc(cc, 0), @backingInt(t));
+            try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(e));
+        }
+        return;
+    }
+
     // When the edge that does not fall through carries no moves, one conditional branch
     // straight to its target replaces the `jcc` over a `jmp`.
     if (then_next and edgeMovesEmpty(ctx, cf.@"else", pred)) {
@@ -2745,7 +2837,7 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
 const min_switch_table_labels = 32;
 
 /// A balanced compare tree over the labels 0..N-1 that one jump table can replace.
-const DenseSwitch = struct { value: Value, targets: []Block, default_target: Block };
+const DenseSwitch = struct { value: Value, targets: []Block, default_target: Block, bounds_check: bool };
 
 const SwitchScan = struct {
     value: ?Value = null,
@@ -2802,21 +2894,45 @@ fn findDenseSwitches(allocator: std.mem.Allocator, ctx: *const Ctx, skip: []bool
         defer scan.deinit(allocator);
         if (!try collectSwitch(allocator, ctx, &scan, @fromBackingInt(@intCast(bi)))) continue;
         const labels = scan.labels.items;
-        // A small tree of compares predicts well with branch history. Below this size the
-        // indirect jump measured no faster on Zen 4, and a periodic key made it much slower.
-        if (labels.len < min_switch_table_labels or labels.len > 4096) continue;
+        // A masked selector covers every table entry once the default fills the last slot,
+        // so the dispatch needs no bounds check.
+        const bounded = maskedUpperBound(ctx.func, scan.value.?) == @as(?u64, @intCast(labels.len));
+        // With a bounds check, a small tree of compares predicts better on Zen 4: a periodic
+        // key made the checked indirect jump much slower.
+        const min_labels: usize = if (bounded) 8 else min_switch_table_labels;
+        if (labels.len < min_labels or labels.len > 4096) continue;
         const dense = for (labels, 0..) |label, i| {
             if (label != @as(i64, @intCast(i))) break false;
         } else true;
         if (!dense) continue;
+        if (bounded) try scan.targets.append(allocator, scan.default_target.?);
         plans[bi] = .{
             .value = scan.value.?,
             .targets = try allocator.dupe(Block, scan.targets.items),
             .default_target = scan.default_target.?,
+            .bounds_check = !bounded,
         };
         for (scan.dispatch.items[1..]) |child| skip[@backingInt(child)] = true;
     }
     return plans;
+}
+
+/// The upper bound that `value = x & mask` proves for a non-negative mask: an AND cannot set
+/// a bit the mask lacks.
+fn maskedUpperBound(func: *const Function, value: Value) ?u64 {
+    const inst = func.definingInst(value) orelse return null;
+    switch (func.opcode(inst)) {
+        .arith_imm => |a| if (a.op == .bit_and and a.imm >= 0) return @intCast(a.imm),
+        .arith => |a| if (a.op == .bit_and) for ([_]Value{ a.lhs, a.rhs }) |operand| {
+            const constant_inst = func.definingInst(operand) orelse continue;
+            switch (func.opcode(constant_inst)) {
+                .iconst => |c| if (c >= 0) return @intCast(c),
+                else => {},
+            }
+        },
+        else => {},
+    }
+    return null;
 }
 
 fn blockHasActions(ctx: *const Ctx, scan: *const SwitchScan, block: Block) bool {
@@ -2897,8 +3013,10 @@ fn collectSwitch(allocator: std.mem.Allocator, ctx: *const Ctx, scan: *SwitchSca
 fn emitDenseSwitch(allocator: std.mem.Allocator, ctx: *Ctx, plan: DenseSwitch) Error!void {
     const w64 = intBits(ctx.func, plan.value) > 32;
     const index = try ctx.use(allocator, plan.value, scratch1);
-    try ctx.put(allocator, encode.aluImm(7, index, @intCast(plan.targets.len - 1), w64));
-    try emitBranchTo(allocator, ctx, encode.jcc(.a, 0), @backingInt(plan.default_target));
+    if (plan.bounds_check) {
+        try ctx.put(allocator, encode.aluImm(7, index, @intCast(plan.targets.len - 1), w64));
+        try emitBranchTo(allocator, ctx, encode.jcc(.a, 0), @backingInt(plan.default_target));
+    }
     // A 32-bit move zero-extends, so the index is a clean 64-bit offset.
     if (w64) {
         try ctx.put(allocator, encode.movReg(scratch1, index));
@@ -2934,6 +3052,168 @@ fn threadedTarget(code: []const u8, block_start: []const usize, jump_at: *const 
     return t;
 }
 
+/// Split critical edges, then put each new forwarding block right after the block it leaves.
+/// Appended at the end, a forwarding block on a loop back edge would sit outside the loop in
+/// the allocator's numbering, and the values live across the loop would be stored and
+/// reloaded on every iteration.
+fn splitCriticalEdgesInPlace(allocator: std.mem.Allocator, func: *Function) Error!void {
+    const original = func.blockCount();
+    try ir.critical_edge.splitCriticalEdges(allocator, func);
+    const total = func.blockCount();
+    if (total == original) return;
+    for (func.attributeEntries()) |entry| if (entry.target == .block) return;
+
+    const owner = try allocator.alloc(u32, total - original);
+    defer allocator.free(owner);
+    for (0..original) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| if (func.opcode(inst) == .@"if") {
+            const cf = func.opcode(inst).@"if";
+            for ([_]Block{ cf.then.target, cf.@"else".target }) |target| {
+                const t = @backingInt(target);
+                if (t >= original) owner[t - original] = @intCast(bi);
+            }
+        };
+    }
+    const order = try allocator.alloc(Block, total);
+    defer allocator.free(order);
+    var n: usize = 0;
+    for (0..original) |bi| {
+        order[n] = @fromBackingInt(@intCast(bi));
+        n += 1;
+        for (owner, 0..) |pred, k| if (pred == bi) {
+            order[n] = @fromBackingInt(@intCast(original + k));
+            n += 1;
+        };
+    }
+    std.debug.assert(n == total);
+    try func.reorderBlocks(allocator, order);
+}
+
+/// The blocks a back edge lands on. For a header that `emitHeaderTest` repeats at the latch,
+/// that is also the header's successor inside the loop.
+fn loopTops(allocator: std.mem.Allocator, ctx: *const Ctx) Error![]bool {
+    const func = ctx.func;
+    const nblocks = func.blockCount();
+    const tops = try allocator.alloc(bool, nblocks);
+    @memset(tops, false);
+    if (ctx.caps.fetch_align <= 1) return tops;
+    for (0..nblocks) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        var succs: [3]?Block = .{ null, null, null };
+        for (func.blockInsts(block)) |inst| if (func.opcode(inst) == .@"if") {
+            succs[0] = func.opcode(inst).@"if".then.target;
+            succs[1] = func.opcode(inst).@"if".@"else".target;
+        };
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |j| succs[2] = j.target,
+            .ret => {},
+        };
+        for (succs) |maybe| {
+            const header = forwardedBlock(ctx, maybe orelse continue);
+            const h = @backingInt(header);
+            if (h > bi) continue;
+            tops[h] = true;
+            const insts = func.blockInsts(header);
+            if (insts.len == 0) continue;
+            const cf = switch (func.opcode(insts[insts.len - 1])) {
+                .@"if" => |c| c,
+                else => continue,
+            };
+            for ([_]Block{ cf.then.target, cf.@"else".target }) |next| {
+                const inside = @backingInt(forwardedBlock(ctx, next));
+                if (inside > h and inside <= bi) tops[inside] = true;
+            }
+        }
+    }
+    return tops;
+}
+
+/// Pad with multi-byte NOPs to the next `alignment` boundary.
+fn padTo(allocator: std.mem.Allocator, ctx: *Ctx, alignment: u16) Error!void {
+    if (alignment <= 1) return;
+    const nops = [_][]const u8{
+        &.{0x90},
+        &.{ 0x66, 0x90 },
+        &.{ 0x0F, 0x1F, 0x00 },
+        &.{ 0x0F, 0x1F, 0x40, 0x00 },
+        &.{ 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+        &.{ 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+        &.{ 0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00 },
+        &.{ 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        &.{ 0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    };
+    var pad = (alignment - ctx.code.items.len % alignment) % alignment;
+    while (pad > 0) {
+        const chunk = @min(pad, nops.len);
+        try ctx.code.appendSlice(allocator, nops[chunk - 1]);
+        pad -= chunk;
+    }
+}
+
+/// On a back edge to a header that only compares and branches, repeat that test here and
+/// branch straight to the header's successors. This turns a top-tested loop into a
+/// bottom-tested one. The back-edge moves already put every value in its header location.
+fn emitHeaderTest(allocator: std.mem.Allocator, ctx: *Ctx, header: Block, next_block: ?Block) Error!bool {
+    const func = ctx.func;
+    if (ctx.block_pos.len == 0) return false;
+    const h = @backingInt(header);
+    if (ctx.block_busy[h] or ctx.dense_root[h]) return false;
+    const insts = func.blockInsts(header);
+    if (insts.len != 2) return false;
+    const cmp = switch (func.opcode(insts[0])) {
+        .icmp => |c| c,
+        else => return false,
+    };
+    const cf = switch (func.opcode(insts[1])) {
+        .@"if" => |c| c,
+        else => return false,
+    };
+    const cond = func.instResult(insts[0]) orelse return false;
+    if (cf.cond != cond or countUses(func, cond) != 1) return false;
+    if (isVector(func, cmp.lhs) or isFloat(func, cmp.lhs)) return false;
+    if (!edgeMovesEmpty(ctx, cf.then, header) or !edgeMovesEmpty(ctx, cf.@"else", header)) return false;
+
+    // Read the operands where the header's branch reads them.
+    const saved_pos = ctx.pos;
+    ctx.pos = ctx.block_pos[h] + 2;
+    defer ctx.pos = saved_pos;
+    try emitCompare(allocator, ctx, cmp, try ctx.use(allocator, cmp.lhs, scratch1));
+    const cc = condOf(cmp.op, isSigned(func, cmp.lhs));
+    const t = forwardedBlock(ctx, cf.then.target);
+    const e = forwardedBlock(ctx, cf.@"else".target);
+    if (next_block != null and e == next_block.?) {
+        try emitBranchTo(allocator, ctx, encode.jcc(cc, 0), @backingInt(t));
+    } else if (next_block != null and t == next_block.?) {
+        try emitBranchTo(allocator, ctx, encode.jcc(encode.invertCond(cc), 0), @backingInt(e));
+    } else {
+        try emitBranchTo(allocator, ctx, encode.jcc(cc, 0), @backingInt(t));
+        try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(e));
+    }
+    return true;
+}
+
+/// The next block after `bi` that emits code, which is where execution falls through.
+fn nextEmitted(skip: []const bool, bi: usize) ?Block {
+    var next = bi + 1;
+    while (next < skip.len and skip[next]) next += 1;
+    return if (next < skip.len) @fromBackingInt(@intCast(next)) else null;
+}
+
+/// Follow blocks that only jump on, with no instructions, moves, or allocator actions.
+fn forwardedBlock(ctx: *const Ctx, start: Block) Block {
+    const func = ctx.func;
+    if (ctx.block_pos.len == 0) return start;
+    var block = start;
+    for (0..8) |_| {
+        if (func.blockInsts(block).len != 0 or func.blockParams(block).len != 0) return block;
+        const term = func.terminator(block) orelse return block;
+        if (term != .jump or func.blockArgs(term.jump).len != 0) return block;
+        if (!edgeMovesEmpty(ctx, term.jump, block) or ctx.block_busy[@backingInt(block)]) return block;
+        block = term.jump.target;
+    }
+    return block;
+}
+
 /// Whether the edge `pred -> jump.target` emits no code.
 fn edgeMovesEmpty(ctx: *const Ctx, jump: ir.function.Jump, pred: Block) bool {
     if (!ctx.edge_move_driven) return ctx.func.blockArgs(jump).len == 0;
@@ -2953,7 +3233,8 @@ fn emitJump(allocator: std.mem.Allocator, ctx: *Ctx, jump: ir.function.Jump, pre
     // immediately after this one falls through, so the code elides the
     // `jmp` and its fixup.
     try emitMoves(allocator, ctx, jump, pred);
-    if (next_block != null and jump.target == next_block.?) return;
+    if (next_block != null and forwardedBlock(ctx, jump.target) == next_block.?) return;
+    if (@backingInt(jump.target) <= @backingInt(pred) and try emitHeaderTest(allocator, ctx, jump.target, next_block)) return;
     try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(jump.target));
 }
 
@@ -3296,6 +3577,99 @@ fn fusesIntoNextSelect(func: *const Function, insts: []const ir.function.Inst, i
     return countUses(func, result) == 1;
 }
 
+const LoadFold = struct { load: ir.function.Inst, other: Value };
+
+/// A single-use scalar integer load right before the gpr arith at `insts[idx]`, which then
+/// reads memory directly as `op reg, [mem]`. A subtract needs the load on the right.
+fn fusedLoad(func: *const Function, insts: []const ir.function.Inst, idx: usize) ?LoadFold {
+    if (idx == 0 or idx >= insts.len) return null;
+    const arith = switch (func.opcode(insts[idx])) {
+        .arith => |a| a,
+        else => return null,
+    };
+    const result = func.instResult(insts[idx]) orelse return null;
+    if (isXmm(func, result)) return null;
+    const load_inst = insts[idx - 1];
+    const load = switch (func.opcode(load_inst)) {
+        .load => |l| l,
+        else => return null,
+    };
+    if (load.@"volatile" or load.mask != null) return null;
+    const loaded = func.instResult(load_inst) orelse return null;
+    if (isXmm(func, loaded)) return null;
+    const load_bits = intBits(func, loaded);
+    const op_bits = intBits(func, result);
+    if (load_bits < 17 or load_bits > 64 or (load_bits > 32) != (op_bits > 32) or op_bits < 17) return null;
+    const other = if (arith.rhs == loaded and arith.lhs != loaded)
+        arith.lhs
+    else if (arith.lhs == loaded and arith.rhs != loaded and arith.op != .sub)
+        arith.rhs
+    else
+        return null;
+    switch (arith.op) {
+        .add, .sub, .bit_and, .bit_or, .bit_xor => {},
+        else => return null,
+    }
+    if (countUses(func, loaded) != 1) return null;
+    return .{ .load = load_inst, .other = other };
+}
+
+fn loadsOperand(func: *const Function, arith: ir.function.Arith) bool {
+    for ([_]Value{ arith.lhs, arith.rhs }) |operand| {
+        const inst = func.definingInst(operand) orelse continue;
+        if (func.opcode(inst) == .load) return true;
+    }
+    return false;
+}
+
+fn memOpcode(op: ir.function.BinOp) u8 {
+    return switch (op) {
+        .add => 0x03,
+        .bit_or => 0x0B,
+        .bit_and => 0x23,
+        .sub => 0x2B,
+        .bit_xor => 0x33,
+        else => unreachable,
+    };
+}
+
+/// `rd = other op [mem]` for a load that `fusedLoad` folded into this arith.
+fn emitLoadOp(allocator: std.mem.Allocator, ctx: *Ctx, a: ir.function.Arith, fold: LoadFold, result: Value) Error!void {
+    const func = ctx.func;
+    const w64 = intBits(func, result) > 32;
+    const base = try ctx.use(allocator, ctx.fold.baseOf(func, fold.load), scratch2);
+    const disp: i32 = @intCast(ctx.fold.offOf(fold.load));
+    const other = try ctx.use(allocator, fold.other, scratch1);
+    const rd = ctx.dst(result, scratch1);
+    if (rd == base and rd != other) {
+        // Writing `other` into rd first would lose the address, so load into the scratch.
+        try ctx.put(allocator, if (w64) encode.movFromMem(scratch2, base, disp) else encode.movFromMem32(scratch2, base, disp));
+        try ctx.put(allocator, encode.movReg(rd, other));
+        try ctx.put(allocator, try binary(a.op, rd, scratch2, w64));
+    } else {
+        if (rd != other) try ctx.put(allocator, encode.movReg(rd, other));
+        try ctx.put(allocator, encode.aluFromMem(memOpcode(a.op), rd, base, disp, w64));
+    }
+    try ctx.store(allocator, result, rd);
+}
+
+/// Whether a branch two instructions on reads the flags the current arith sets.
+fn flagsReadAfter(ctx: *const Ctx) bool {
+    const enabled = ctx.caps.fuse_arith_branch and ctx.caps.fuse_cmp_branch;
+    return ctx.cur_idx + 2 < ctx.cur_insts.len and fusesArithIntoBranch(ctx.func, ctx.cur_insts, ctx.cur_idx + 2, enabled);
+}
+
+/// `rd = rl op imm`. An add or subtract into a different register is one `lea` when no
+/// branch reads its flags.
+fn emitAluImm(allocator: std.mem.Allocator, ctx: *Ctx, op: ir.function.BinOp, rd: Reg, rl: Reg, imm: i32, w64: bool) Error!void {
+    if (rd != rl and (op == .add or (op == .sub and imm != std.math.minInt(i32))) and !flagsReadAfter(ctx)) {
+        try ctx.put(allocator, encode.leaBaseDisp(rd, rl, if (op == .add) imm else -imm, w64));
+        return;
+    }
+    if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
+    try ctx.put(allocator, encode.aluImm(aluDigit(op), rd, imm, w64));
+}
+
 /// `cmp lhs, rhs` at the operand width, with an immediate when the right operand folds.
 fn emitCompare(allocator: std.mem.Allocator, ctx: *Ctx, cmp: ir.function.Compare, lhs: Reg) Error!void {
     const w64 = intBits(ctx.func, cmp.lhs) > 32;
@@ -3338,12 +3712,23 @@ fn x86_64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.fu
         .arith => |arith| {
             const result = func.instResult(inst) orelse return null;
             if (isXmm(func, result)) {
-                if (!isVector(func, result) or (arith.op != .shl and arith.op != .shr)) return null;
-                const amount = vectorSplatInt(func, arith.rhs) orelse return null;
-                if (amount < 0 or amount > 31) return null;
+                if (!isVector(func, result) or laneKind(func, result) != .i32) return null;
+                const folds = switch (arith.op) {
+                    .shl, .shr => if (vectorSplatInt(func, arith.rhs)) |amount| amount >= 0 and amount <= 31 else false,
+                    .mul => vectorMulShape(func, arith.rhs) != null,
+                    else => false,
+                };
+                if (!folds) return null;
                 out[0] = arith.lhs;
                 return 1;
             }
+            if (loadsOperand(func, arith)) if (instPosition(func, inst)) |at| {
+                if (fusedLoad(func, at.insts, at.index)) |fold| {
+                    out[0] = fold.other;
+                    out[1] = func.opcode(fold.load).load.ptr;
+                    return 2;
+                }
+            };
             if (foldedShift(func, arith, result) != null or foldedAluImm(func, arith, result) != null) {
                 out[0] = arith.lhs;
                 return 1;
@@ -3351,6 +3736,19 @@ fn x86_64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.fu
         },
         else => {},
     }
+    return null;
+}
+
+const MulShape = struct { kind: enum { pow2, plus, minus }, shift: u8 };
+
+/// A splat multiplier of the form 2^k, 2^k+1, or 2^k-1.
+fn vectorMulShape(func: *const Function, rhs: Value) ?MulShape {
+    const c = vectorSplatInt(func, rhs) orelse return null;
+    if (c < 2 or c > std.math.maxInt(i32)) return null;
+    const u: u32 = @intCast(c);
+    if (std.math.isPowerOfTwo(u)) return .{ .kind = .pow2, .shift = @intCast(@ctz(u)) };
+    if (std.math.isPowerOfTwo(u - 1)) return .{ .kind = .plus, .shift = @intCast(@ctz(u - 1)) };
+    if (std.math.isPowerOfTwo(u + 1)) return .{ .kind = .minus, .shift = @intCast(@ctz(u + 1)) };
     return null;
 }
 
@@ -3530,7 +3928,13 @@ fn x86_64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Valu
     }
     return switch (func.opcode(inst)) {
         .arith => |a| switch (a.op) {
-            .add, .sub, .mul, .bit_and, .bit_or, .bit_xor => a.lhs,
+            .add, .sub, .mul, .bit_and, .bit_or, .bit_xor => {
+                // With a folded load, the register operand is the one the op writes over.
+                if (loadsOperand(func, a)) if (instPosition(func, inst)) |at| {
+                    if (fusedLoad(func, at.insts, at.index)) |fold| return fold.other;
+                };
+                return a.lhs;
+            },
             .div, .rem, .mulh, .shl, .shr => null,
         },
         .arith_imm => |a| switch (a.op) {
@@ -3694,6 +4098,8 @@ pub fn x86_64RegDescription(allocator: std.mem.Allocator, func: *const Function)
         .fusedOperands = x86_64FusedOperands,
         .coalesce_block_params = true,
         .coalesce_spill_slots = true,
+        .hoist_loop_reloads = true,
+        .destructive_holes = true,
         .entry_fixed = entry_fixed,
         .call_sites = call_sites,
         .scratch = scratch,

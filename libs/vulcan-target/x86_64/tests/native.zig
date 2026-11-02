@@ -620,24 +620,20 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     defer a.free(code);
     const text = try disasm.format(a, code);
     defer a.free(text);
-    // The shared Wimmer allocator SPLITS the two critical edges e->m, so each arm reaches
-    // the join `m` through its own forwarding block (the extra `jmp`s). With block-param
+    // The shared Wimmer allocator SPLITS the two critical edges e->m. With block-param
     // coalescing on, the join parameter `r` lands on `rdi` (the first arm's incoming value
-    // `x`, already in rdi): the `x` arm needs no move at all, and the `y` arm carries its
-    // value with a single `mov rdi, rsi` before the join loads the result into rax.
+    // `x`, already in rdi), so the `x` forwarding block is empty and emits no code. The `y`
+    // arm carries its value with a single `mov rdi, rsi` and falls into the join.
     try std.testing.expectEqualStrings(
         \\0000: cmp edi, esi
         \\0002: setg al
         \\0006: movzx rax, al
         \\000a: test rax, rax
-        \\000d: jne .+5
-        \\0013: jmp .+14
-        \\0018: jmp .+0
-        \\001d: mov rax, rdi
-        \\0020: ret
-        \\0021: jmp .-9
-        \\0026: mov rdi, rsi
-        \\0029: jmp .-17
+        \\000d: je .+5
+        \\0013: jmp .+3
+        \\0018: mov rdi, rsi
+        \\001b: mov rax, rdi
+        \\001e: ret
         \\
     , text);
 }
@@ -1421,4 +1417,71 @@ test "x86_64 dense switch lowers to a jump table and keeps every case and the de
         }
     }
     if (!ran) return error.SkipZigTest;
+}
+
+test "x86_64 masked switch selector drops the jump table bounds check" {
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const entry = try func.appendBlock();
+    const raw = try func.appendBlockParam(entry, i64_t);
+    const key = try func.appendArithImm(entry, i64_t, .bit_and, raw, 15);
+    const default = try func.appendBlock();
+    const minus_one = try func.appendInst(default, i64_t, .{ .iconst = -1 });
+    func.setTerminator(default, .{ .ret = ir.function.Ret.one(minus_one) });
+    try buildSwitchNode(&func, entry, key, 0, 14, default);
+
+    const code = try isel.selectFunction(a, &func);
+    defer a.free(code);
+    try std.testing.expect(std.mem.indexOf(u8, code, &.{ 0x41, 0xFF, 0xE2 }) != null);
+    // No `ja` to the default.
+    try std.testing.expect(std.mem.indexOf(u8, code, &.{ 0x0F, 0x87 }) == null);
+
+    var ran = false;
+    for ([_]harness.Backend{ harness.native, harness.qemu }) |backend| {
+        var k: i64 = -20;
+        while (k < 40) : (k += 1) {
+            const got = try runCmpBranchOnFull(std.testing.io, a, code, &.{k}, backend) orelse break;
+            const masked = k & 15;
+            const want: i64 = if (masked < 15) masked * 7 + 3 else -1;
+            try std.testing.expectEqual(want, got);
+            ran = true;
+        }
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
+test "x86_64 folds single-use loads into add, sub, and xor memory operands" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const x = try func.appendBlockParam(entry, i32_t);
+    // ((x + p[0]) - p[1]) ^ p[2], each load right before its only use.
+    const v0 = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p } });
+    const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = v0 } });
+    const p1 = try func.appendArithImm(entry, ptr_t, .add, p, 4);
+    const v1 = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p1 } });
+    const diff = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = sum, .rhs = v1 } });
+    const p2 = try func.appendArithImm(entry, ptr_t, .add, p, 8);
+    const v2 = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p2 } });
+    const mixed = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .bit_xor, .lhs = v2, .rhs = diff } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(mixed) });
+
+    const code = try isel.selectFunction(a, &func);
+    defer a.free(code);
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn ([*]const i32, i32) callconv(.c) i32, 0);
+    const inputs = [_][4]i32{ .{ 1, 2, 3, 10 }, .{ -5, 100, 0x7fffffff, -1 }, .{ std.math.minInt(i32), 1, -1, 7 } };
+    for (inputs) |c| {
+        const mem = [_]i32{ c[0], c[1], c[2] };
+        const want = ((c[3] +% c[0]) -% c[1]) ^ c[2];
+        try std.testing.expectEqual(want, f(&mem, c[3]));
+    }
 }

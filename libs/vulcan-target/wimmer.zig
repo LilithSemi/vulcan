@@ -168,6 +168,15 @@ pub const RegDescription = struct {
     // the guard ever fails the whole coalescing is dropped and the byte-identical distinct-slot
     // placement stands. False (the default) keeps the allocator byte-identical for a non-opting backend.
     coalesce_spill_slots: bool = false,
+    // OPTIONAL loop-aware reload placement. When a spilled value is reloaded for a use inside a
+    // loop that the spilled part enters from outside, the reload moves to the loop entry. The
+    // value then stays in its register around the back edge instead of a store and reload each
+    // iteration. False (the default) keeps the reload at the use.
+    hoist_loop_reloads: bool = false,
+    // OPTIONAL relaxed destructive coalescing. A result may reuse its destructive source register
+    // when the source range ends at the def, even if the source is live again later, as long as
+    // the two never overlap after the def. False keeps the stricter rule that the source dies.
+    destructive_holes: bool = false,
     // OPTIONAL multi-register width hook. Return how many CONSECUTIVE registers value `v` occupies
     // and the alignment its base register index must satisfy. It exists because an NVIDIA 64-bit
     // address lives in an EVEN-ALIGNED GPR pair `R(n):R(n + 1)`, the first value in this project that
@@ -1217,7 +1226,9 @@ fn tryAllocateFreeReg(
         if (it.class != class_idx) continue;
         if (sameValue(it, current)) continue;
         const r = assignedReg(it);
-        if (copyDiesAt(current, it) or destructiveSourceDiesAt(current, it)) {
+        if (copyDiesAt(current, it) or destructiveSourceDiesAt(current, it) or
+            (desc.destructive_holes and destructiveSourceFreeAfter(current, it)))
+        {
             if (r < limit and is_candidate[r]) coalesce_hint = r;
             continue;
         }
@@ -1326,6 +1337,26 @@ fn copyDiesAt(dst: *const Interval, src: *const Interval) bool {
     return src.end() == dst.start() + 1;
 }
 
+/// Like `destructiveSourceDiesAt`, but the source may live again later: its range ends at the def,
+/// and it never overlaps the result after that.
+fn destructiveSourceFreeAfter(dst: *const Interval, src: *const Interval) bool {
+    const destructive = dst.destructive_src orelse return false;
+    if (src.fixed_reg != null) return false;
+    const sv = src.value orelse return false;
+    if (destructive != sv) return false;
+    if (src.regs != dst.regs or src.reg_align != dst.reg_align) return false;
+    const def = dst.start();
+    var ends_at_def = false;
+    for (src.ranges) |r| {
+        if (r.from <= def and r.to == def + 1) ends_at_def = true;
+    }
+    if (!ends_at_def) return false;
+    for (src.ranges) |r| for (dst.ranges) |d| {
+        if (@max(r.from, d.from, def + 1) < @min(r.to, d.to)) return false;
+    };
+    return true;
+}
+
 fn destructiveSourceDiesAt(dst: *const Interval, src: *const Interval) bool {
     const destructive = dst.destructive_src orelse return false;
     if (src.fixed_reg != null) return false;
@@ -1344,7 +1375,7 @@ fn isCopyCoalescePair(a: *const Interval, b: *const Interval) bool {
 }
 
 fn isDestructiveCoalescePair(a: *const Interval, b: *const Interval) bool {
-    return destructiveSourceDiesAt(a, b) or destructiveSourceDiesAt(b, a);
+    return destructiveSourceFreeAfter(a, b) or destructiveSourceFreeAfter(b, a);
 }
 
 /// True iff both intervals describe the same value (used to skip a value's own entry-param hint
@@ -1903,6 +1934,8 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     const bounds = try computeBlockBounds(allocator, func);
     defer allocator.free(bounds.from);
     defer allocator.free(bounds.to);
+    const loop_spans: []Range = if (desc.hoist_loop_reloads) try loopSpans(allocator, func, bounds.from, bounds.to) else &.{};
+    defer allocator.free(loop_spans);
 
     // The worklist (`unhandled`) is a priority queue. It holds value intervals sorted descending
     // by start, popped from the end, with split children re-inserted in sorted position. Fixed
@@ -2005,7 +2038,7 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
             current.location = .{ .reg = reg };
             try active.append(allocator, current);
         } else {
-            try allocateBlockedReg(allocator, current, &active, &inactive, &unhandled, &children, slots, desc, limit, bounds.from);
+            try allocateBlockedReg(allocator, current, &active, &inactive, &unhandled, &children, slots, desc, limit, bounds.from, loop_spans);
         }
     }
 
@@ -2241,6 +2274,45 @@ fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, chil
 /// filled the hole. So the two stores sit on paths that never meet, and the store at `u` is dead but
 /// harmless. `coalesceSpillSlots` holds the slot over the whole prefix `[store_at, start())`, so no
 /// other value can take the slot inside the gap.
+/// The position span of each loop, from its header entry to the end of its last back-edge
+/// block. A back edge is an edge to a block at the same or a lower index, which matches the
+/// dominance-respecting block order the numbering already relies on.
+fn loopSpans(allocator: std.mem.Allocator, func: *const Function, block_from: []const u32, block_to: []const u32) Error![]Range {
+    var spans: std.ArrayList(Range) = .empty;
+    errdefer spans.deinit(allocator);
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        var succs: [3]?Block = .{ null, null, null };
+        for (func.blockInsts(block)) |inst| if (func.opcode(inst) == .@"if") {
+            succs[0] = func.opcode(inst).@"if".then.target;
+            succs[1] = func.opcode(inst).@"if".@"else".target;
+        };
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |j| succs[2] = j.target,
+            .ret => {},
+        };
+        for (succs) |maybe| {
+            const succ = maybe orelse continue;
+            const hi = @backingInt(succ);
+            if (hi > bi) continue;
+            try spans.append(allocator, .{ .from = block_from[hi], .to = block_to[bi] });
+        }
+    }
+    return spans.toOwnedSlice(allocator);
+}
+
+/// For a spilled part that reloads at `use`, the entry of the outermost loop that contains the
+/// use and starts after the spilled part does. Null when no loop qualifies.
+fn loopEntrySplit(current: *const Interval, use: u32, loop_spans: []const Range) ?u32 {
+    var best: ?u32 = null;
+    for (loop_spans) |span| {
+        if (span.from <= current.start() or span.from > use or use >= span.to) continue;
+        if (!current.covers(span.from)) continue;
+        if (best == null or span.from < best.?) best = span.from;
+    }
+    return best;
+}
+
 fn canReloadAtUse(current: *const Interval, u: u32, block_from: []const u32) bool {
     if (!current.split_child) return false;
     if (current.end() <= u + 1) return false;
@@ -2277,6 +2349,7 @@ fn spillCurrent(
     slots: []u32,
     class_idx: u16,
     block_from: []const u32,
+    loop_spans: []const Range,
 ) AllocateError!void {
     if (firstMustHaveUse(current)) |u| {
         // A must_have use AT `current.start()` means `current` needs a register the instant it
@@ -2318,7 +2391,7 @@ fn spillCurrent(
             // a use at a block-entry row, the hole shape stops holding and this fires here, instead
             // of recursing without a bound.
             std.debug.assert(rest.uses.len == 0 or rest.uses[0].pos > rest.start() or rest.uses[0].kind != .must_have_register);
-            try spillCurrent(allocator, rest, unhandled, children, slots, class_idx, block_from);
+            try spillCurrent(allocator, rest, unhandled, children, slots, class_idx, block_from, loop_spans);
             // Re-queue `current`. It no longer covers `u + 1`, so `fixedClobberConflict` reports no
             // conflict with the call clobber and `tryAllocateFreeReg` serves it from a caller-saved
             // register on the next pop. Clearing the location drops any register the caller handed
@@ -2327,7 +2400,7 @@ fn spillCurrent(
             try insertSorted(allocator, unhandled, current);
             return;
         }
-        const tail = try splitInterval(allocator, current, u, children);
+        const tail = try splitInterval(allocator, current, loopEntrySplit(current, u, loop_spans) orelse u, children);
         current.location = .{ .slot = slots[class_idx] };
         slots[class_idx] += 1;
         try insertSorted(allocator, unhandled, tail);
@@ -2418,6 +2491,7 @@ fn allocateBlockedReg(
     desc: *const RegDescription,
     limit: usize,
     block_from: []const u32,
+    loop_spans: []const Range,
 ) AllocateError!void {
     const class_idx = current.class;
     const class = desc.classes[class_idx];
@@ -2590,7 +2664,7 @@ fn allocateBlockedReg(
         // argument also live across it builds. The one-position gate above declines it and
         // `spillCurrent` bails, because demoting for it would need `current` split before its next
         // clobber, the split the gate deliberately avoids. Left for a real case to justify the cost.
-        try spillCurrent(allocator, current, unhandled, children, slots, class_idx, block_from);
+        try spillCurrent(allocator, current, unhandled, children, slots, class_idx, block_from, loop_spans);
         return;
     };
 
@@ -2600,7 +2674,7 @@ fn allocateBlockedReg(
     // existed.
     const current_first_use = current.firstUseAfter(p);
     if (current_first_use == null or current_first_use.? > best) {
-        try spillCurrent(allocator, current, unhandled, children, slots, class_idx, block_from);
+        try spillCurrent(allocator, current, unhandled, children, slots, class_idx, block_from, loop_spans);
         return;
     }
 
@@ -2648,7 +2722,7 @@ fn allocateBlockedReg(
         // at its start, a demand no slot can satisfy. A target whose uses may read from a slot
         // (`should_have_register`) spills cleanly.
         if (bp <= p) {
-            try spillCurrent(allocator, current, unhandled, children, slots, class_idx, block_from);
+            try spillCurrent(allocator, current, unhandled, children, slots, class_idx, block_from, loop_spans);
             return;
         }
         const tail = try splitInterval(allocator, current, bp, children);
