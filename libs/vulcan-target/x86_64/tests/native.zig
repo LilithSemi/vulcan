@@ -1546,3 +1546,53 @@ test "x86_64 arith_imm with a constant wider than imm32 keeps every bit" {
     const f = buffer.entry(*const fn (u32) callconv(.c) u32, 0);
     try std.testing.expectEqual(@as(u32, 5) +% 0x9e3779b9, f(5));
 }
+
+test "x86_64 indexed loads and stores address base plus scaled index" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const words = try func.appendBlockParam(entry, ptr_t);
+    const longs = try func.appendBlockParam(entry, ptr_t);
+    const bytes = try func.appendBlockParam(entry, ptr_t);
+    const i = try func.appendBlockParam(entry, i64_t);
+    // words[i + 1] = words[i] * 3, then return words[i + 1] + longs[i] + bytes[i].
+    const w_off = try func.appendArithImm(entry, i64_t, .shl, i, 2);
+    const w_addr = try func.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = words, .rhs = w_off } });
+    const w = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = w_addr } });
+    const tripled = try func.appendArithImm(entry, i32_t, .mul, w, 3);
+    const next = try func.appendArithImm(entry, i64_t, .add, i, 1);
+    const n_off = try func.appendArithImm(entry, i64_t, .shl, next, 2);
+    const n_addr = try func.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = words, .rhs = n_off } });
+    try func.appendStore(entry, tripled, n_addr);
+    const l_off = try func.appendArithImm(entry, i64_t, .shl, i, 3);
+    const l_addr = try func.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = l_off, .rhs = longs } });
+    const l = try func.appendInst(entry, i64_t, .{ .load = .{ .ptr = l_addr } });
+    const b_addr = try func.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = bytes, .rhs = i } });
+    const b = try func.appendInst(entry, u8_t, .{ .load = .{ .ptr = b_addr } });
+    const b_wide = try func.appendInst(entry, i64_t, .{ .convert = .{ .value = b } });
+    const t_wide = try func.appendInst(entry, i64_t, .{ .convert = .{ .value = tripled } });
+    const s1 = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = t_wide, .rhs = l } });
+    const s2 = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = s1, .rhs = b_wide } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(s2) });
+
+    const code = try isel.selectFunction(a, &func);
+    defer a.free(code);
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn ([*]i32, [*]const i64, [*]const u8, i64) callconv(.c) i64, 0);
+    var word_mem = [_]i32{ 5, -7, 11, 13, 17 };
+    const long_mem = [_]i64{ 1 << 40, -3, 9, 1000, 77 };
+    const byte_mem = [_]u8{ 200, 1, 255, 3, 4 };
+    for (0..4) |k| {
+        const want = @as(i64, word_mem[k] *% 3) + long_mem[k] + byte_mem[k];
+        const got = f(&word_mem, &long_mem, &byte_mem, @intCast(k));
+        try std.testing.expectEqual(want, got);
+        try std.testing.expectEqual(word_mem[k] *% 3, word_mem[k + 1]);
+    }
+}

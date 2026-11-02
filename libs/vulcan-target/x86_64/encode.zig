@@ -943,6 +943,93 @@ fn movMem(op: u8, data: Reg, base: Reg, disp: i32) Inst {
     }
     return Inst.of(&.{ rex, op, modrm_byte, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
+/// One load or store form for `memIndexed`: an optional legacy prefix, REX.W, an optional
+/// `0F` escape, and the opcode byte. `byte_reg` marks an 8-bit register operand, which needs
+/// a REX prefix for spl, bpl, sil, and dil.
+pub const MemForm = struct { prefix: ?u8 = null, w: bool = false, escape: bool = false, op: u8, byte_reg: bool = false };
+
+pub const mem_form = struct {
+    pub const load_sx8: MemForm = .{ .escape = true, .op = 0xBE };
+    pub const load_zx8: MemForm = .{ .escape = true, .op = 0xB6 };
+    pub const load_sx16: MemForm = .{ .escape = true, .op = 0xBF };
+    pub const load_zx16: MemForm = .{ .escape = true, .op = 0xB7 };
+    pub const load_sx32: MemForm = .{ .w = true, .op = 0x63 };
+    pub const load32: MemForm = .{ .op = 0x8B };
+    pub const load64: MemForm = .{ .w = true, .op = 0x8B };
+    pub const store8: MemForm = .{ .op = 0x88, .byte_reg = true };
+    pub const store16: MemForm = .{ .prefix = 0x66, .op = 0x89 };
+    pub const store32: MemForm = .{ .op = 0x89 };
+    pub const store64: MemForm = .{ .w = true, .op = 0x89 };
+    pub const movss_load: MemForm = .{ .prefix = 0xF3, .escape = true, .op = 0x10 };
+    pub const movss_store: MemForm = .{ .prefix = 0xF3, .escape = true, .op = 0x11 };
+    pub const movsd_load: MemForm = .{ .prefix = 0xF2, .escape = true, .op = 0x10 };
+    pub const movsd_store: MemForm = .{ .prefix = 0xF2, .escape = true, .op = 0x11 };
+    pub const movups_load: MemForm = .{ .escape = true, .op = 0x10 };
+    pub const movups_store: MemForm = .{ .escape = true, .op = 0x11 };
+};
+
+/// `form reg, [base + index * (1 << scale) + disp]` with a SIB byte. `reg` is the register
+/// field number, a gpr or xmm index. A null index encodes as none; rsp cannot be an index.
+pub fn memIndexed(form: MemForm, reg: u8, base: Reg, index: ?Reg, scale: u2, disp: i32) Inst {
+    std.debug.assert(index != .rsp);
+    const b = n(base);
+    const x: u8 = if (index) |i| n(i) else 4;
+    var buf: [15]u8 = undefined;
+    var len: usize = 0;
+    if (form.prefix) |p| {
+        buf[len] = p;
+        len += 1;
+    }
+    const rex: u8 = 0x40 | (@as(u8, @intFromBool(form.w)) << 3) | (@as(u8, @intFromBool(reg >= 8)) << 2) |
+        (@as(u8, @intFromBool(x >= 8)) << 1) | @intFromBool(b >= 8);
+    if (rex != 0x40 or (form.byte_reg and reg >= 4)) {
+        buf[len] = rex;
+        len += 1;
+    }
+    if (form.escape) {
+        buf[len] = 0x0F;
+        len += 1;
+    }
+    buf[len] = form.op;
+    len += 1;
+    // rbp and r13 as a base have no mod=00 form, so they take a zero disp8.
+    const mod: u8 = if (disp == 0 and b & 7 != 5) 0x00 else if (disp >= -128 and disp <= 127) 0x40 else 0x80;
+    buf[len] = mod | ((reg & 7) << 3) | 0x04;
+    buf[len + 1] = (@as(u8, scale) << 6) | ((x & 7) << 3) | (b & 7);
+    len += 2;
+    const u: u32 = @bitCast(disp);
+    if (mod == 0x40) {
+        buf[len] = @truncate(u);
+        len += 1;
+    } else if (mod == 0x80) {
+        for (0..4) |k| buf[len + k] = @truncate(u >> @intCast(8 * k));
+        len += 4;
+    }
+    return Inst.of(buf[0..len]);
+}
+
+/// `lea dst, [base + index * (1 << scale)]`.
+pub fn memIndexedLea(dst: Reg, base: Reg, index: Reg, scale: u2) Inst {
+    return memIndexed(.{ .w = true, .op = 0x8D }, n(dst), base, index, scale, 0);
+}
+
+test "memIndexed encodes scaled-index loads and stores" {
+    // mov [r11 + 4], eax with no index
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0x89, 0x44, 0x23, 0x04 }, memIndexed(mem_form.store32, 0, .r11, null, 0, 4).slice());
+    // lea r11, [r11 + r10*4]
+    try std.testing.expectEqualSlices(u8, &.{ 0x4F, 0x8D, 0x1C, 0x93 }, memIndexedLea(.r11, .r11, .r10, 2).slice());
+    // mov eax, [rdi + rcx*4]
+    try std.testing.expectEqualSlices(u8, &.{ 0x8B, 0x04, 0x8F }, memIndexed(mem_form.load32, 0, .rdi, .rcx, 2, 0).slice());
+    // movsxd r9, [r13 + r10*4 + 8]
+    try std.testing.expectEqualSlices(u8, &.{ 0x4F, 0x63, 0x4C, 0x95, 0x08 }, memIndexed(mem_form.load_sx32, 9, .r13, .r10, 2, 8).slice());
+    // mov byte [rax + rbx], sil needs a bare REX
+    try std.testing.expectEqualSlices(u8, &.{ 0x40, 0x88, 0x34, 0x18 }, memIndexed(mem_form.store8, 6, .rax, .rbx, 0, 0).slice());
+    // movups xmm9, [rsi + rdx*8 + 0x100]
+    try std.testing.expectEqualSlices(u8, &.{ 0x44, 0x0F, 0x10, 0x8C, 0xD6, 0x00, 0x01, 0x00, 0x00 }, memIndexed(mem_form.movups_load, 9, .rsi, .rdx, 3, 0x100).slice());
+    // mov word [rbp + rax*2], cx
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x89, 0x4C, 0x45, 0x00 }, memIndexed(mem_form.store16, 1, .rbp, .rax, 1, 0).slice());
+}
+
 /// `op dst, [base + disp32]` for an ALU opcode in its reg, r/m form (03 add, 0B or, 23 and,
 /// 2B sub, 33 xor). `w` picks 64-bit over 32-bit.
 pub fn aluFromMem(opcode: u8, dst: Reg, base: Reg, disp: i32, w: bool) Inst {

@@ -1614,6 +1614,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         // A masked store is per-lane predication (see `Store.mask`), which this backend has no
         // form for. Writing every lane is a wrong answer, so refuse.
         if (st.mask != null) return error.Unsupported;
+        if (sibAddress(func, inst)) |sib| {
+            try emitIndexedStore(allocator, ctx, inst, sib, st.value);
+            return;
+        }
         // A folded store addresses `[base + disp32]`. `baseOf` yields the fold
         // base, the add's lhs, and `offOf` yields the displacement. Both are
         // the raw ptr and 0 when unfolded, so the non-folding case stays
@@ -1844,6 +1848,13 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         return lowerDirectCall(allocator, ctx, func.opcode(inst).call, null);
     }
     const result = func.instResult(inst) orelse return unhandledStatement(func.opcode(inst));
+    // A pure gpr add or shift that no instruction reads, such as an address an indexed
+    // access replaced, emits nothing.
+    if (ctx.reg_read.len != 0 and !ctx.reg_read[@backingInt(result)] and !isXmm(func, result)) switch (func.opcode(inst)) {
+        .arith => |a| if (pureOp(a.op)) return,
+        .arith_imm => |a| if (pureOp(a.op)) return,
+        else => {},
+    };
     switch (func.opcode(inst)) {
         .iconst => |c| {
             if (isXmm(func, result)) {
@@ -2699,6 +2710,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             if (func.opcode(inst).load.mask != null) return error.Unsupported;
             // The next arith reads this load as a memory operand.
             if (fusedLoad(func, ctx.cur_insts, ctx.cur_idx + 1) != null) return;
+            if (sibAddress(func, inst)) |sib| {
+                try emitIndexedLoad(allocator, ctx, inst, sib, result);
+                return;
+            }
             // A folded load addresses `[base + disp32]`. `baseOf` yields the
             // fold base, the add's lhs, and `offOf` yields the displacement.
             // Both are the raw ptr and 0 when unfolded, so the non-folding
@@ -3723,6 +3738,141 @@ fn fusesIntoNextSelect(func: *const Function, insts: []const ir.function.Inst, i
     return countUses(func, result) == 1;
 }
 
+/// An op whose only effect is its result: no trap, no flags a later branch reads.
+fn pureOp(op: ir.function.BinOp) bool {
+    return switch (op) {
+        .add, .sub, .shl, .shr, .bit_and, .bit_or, .bit_xor, .mul => true,
+        .div, .rem, .mulh => false,
+    };
+}
+
+const Sib = struct { base: Value, index: Value, scale: u2 };
+
+/// The `[base + index * scale]` form of a load or store pointer `base + (index << k)` or
+/// `base + index`. It applies only when every use of the pointer is such an access, so the
+/// add and shift that build it become dead.
+fn sibAddress(func: *const Function, inst: ir.function.Inst) ?Sib {
+    const ptr = switch (func.opcode(inst)) {
+        .load => |l| blk: {
+            const result = func.instResult(inst) orelse return null;
+            if (isHalf(func, result) or isWide(func, result)) return null;
+            break :blk l.ptr;
+        },
+        .store => |s| blk: {
+            if (isHalf(func, s.value) or isWide(func, s.value) or s.value == s.ptr) return null;
+            break :blk s.ptr;
+        },
+        else => return null,
+    };
+    const def = func.definingInst(ptr) orelse return null;
+    const add = switch (func.opcode(def)) {
+        .arith => |a| if (a.op == .add) a else return null,
+        else => return null,
+    };
+    if (isXmm(func, add.lhs) or isXmm(func, add.rhs)) return null;
+    var sib: Sib = .{ .base = add.lhs, .index = add.rhs, .scale = 0 };
+    for ([_][2]Value{ .{ add.lhs, add.rhs }, .{ add.rhs, add.lhs } }) |pair| {
+        const shl_inst = func.definingInst(pair[1]) orelse continue;
+        switch (func.opcode(shl_inst)) {
+            .arith_imm => |s| if (s.op == .shl and s.imm >= 1 and s.imm <= 3) {
+                sib = .{ .base = pair[0], .index = s.lhs, .scale = @intCast(s.imm) };
+                break;
+            },
+            else => {},
+        }
+    }
+    if (intBits(func, sib.index) != 64) return null;
+    if (!onlyAddressUses(func, ptr)) return null;
+    return sib;
+}
+
+fn onlyAddressUses(func: *const Function, ptr: Value) bool {
+    var address_uses: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
+            .load => |l| if (l.ptr == ptr) {
+                address_uses += 1;
+            },
+            .store => |s| if (s.ptr == ptr and s.value != ptr) {
+                address_uses += 1;
+            },
+            else => {},
+        };
+    }
+    return address_uses == countUses(func, ptr);
+}
+
+fn emitIndexedLoad(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst, sib: Sib, result: Value) Error!void {
+    const func = ctx.func;
+    const disp: i32 = @intCast(ctx.fold.offOf(inst));
+    const base = try ctx.use(allocator, sib.base, scratch2);
+    const index = try ctx.use(allocator, sib.index, scratch1);
+    if (isXmm(func, result)) {
+        const rd = try ctx.dstXmm(result, xmm_scratch);
+        try ctx.put(allocator, encode.memIndexed(loadForm(func, result), @backingInt(rd), base, index, sib.scale, disp));
+        try ctx.storeXmm(allocator, result, rd);
+    } else {
+        const rd = ctx.dst(result, scratch1);
+        try ctx.put(allocator, encode.memIndexed(loadForm(func, result), @backingInt(rd), base, index, sib.scale, disp));
+        try ctx.store(allocator, result, rd);
+    }
+}
+
+fn emitIndexedStore(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst, sib: Sib, value: Value) Error!void {
+    const func = ctx.func;
+    const disp: i32 = @intCast(ctx.fold.offOf(inst));
+    const form = storeForm(func, value);
+    if (isXmm(func, value)) {
+        const val = try ctx.useXmm(allocator, value, xmm_op0);
+        const base = try ctx.use(allocator, sib.base, scratch2);
+        const index = try ctx.use(allocator, sib.index, scratch1);
+        try ctx.put(allocator, encode.memIndexed(form, @backingInt(val), base, index, sib.scale, disp));
+        return;
+    }
+    const value_spilled = ctx.loc(value) != .reg;
+    const index_spilled = ctx.loc(sib.index) != .reg;
+    if (value_spilled and index_spilled) {
+        // Both need scratch1, so fold the index into the address first.
+        const base = try ctx.use(allocator, sib.base, scratch2);
+        const index = try ctx.use(allocator, sib.index, scratch1);
+        try ctx.put(allocator, encode.memIndexedLea(scratch2, base, index, sib.scale));
+        const val = try ctx.use(allocator, value, scratch1);
+        try ctx.put(allocator, encode.memIndexed(form, @backingInt(val), scratch2, null, 0, disp));
+        return;
+    }
+    const val = try ctx.use(allocator, value, scratch1);
+    const base = try ctx.use(allocator, sib.base, scratch2);
+    const index = try ctx.use(allocator, sib.index, scratch1);
+    try ctx.put(allocator, encode.memIndexed(form, @backingInt(val), base, index, sib.scale, disp));
+}
+
+fn loadForm(func: *const Function, result: Value) encode.MemForm {
+    const f = encode.mem_form;
+    if (isXmm(func, result)) {
+        return if (isVector(func, result) or isQuad(func, result)) f.movups_load else if (isDouble(func, result)) f.movsd_load else f.movss_load;
+    }
+    const signed = isSigned(func, result);
+    return switch (intBits(func, result)) {
+        0...8 => if (signed) f.load_sx8 else f.load_zx8,
+        9...16 => if (signed) f.load_sx16 else f.load_zx16,
+        17...32 => if (signed) f.load_sx32 else f.load32,
+        else => f.load64,
+    };
+}
+
+fn storeForm(func: *const Function, value: Value) encode.MemForm {
+    const f = encode.mem_form;
+    if (isXmm(func, value)) {
+        return if (isVector(func, value) or isQuad(func, value)) f.movups_store else if (isDouble(func, value)) f.movsd_store else f.movss_store;
+    }
+    return switch (intBits(func, value)) {
+        0...8 => f.store8,
+        9...16 => f.store16,
+        17...32 => f.store32,
+        else => f.store64,
+    };
+}
+
 const LoadFold = struct { load: ir.function.Inst, other: Value };
 
 /// A single-use scalar integer load right before the gpr arith at `insts[idx]`, which then
@@ -3741,6 +3891,7 @@ fn fusedLoad(func: *const Function, insts: []const ir.function.Inst, idx: usize)
         else => return null,
     };
     if (load.@"volatile" or load.mask != null) return null;
+    if (sibAddress(func, load_inst) != null) return null;
     const loaded = func.instResult(load_inst) orelse return null;
     if (isXmm(func, loaded)) return null;
     const load_bits = intBits(func, loaded);
@@ -3872,6 +4023,18 @@ fn x86_64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.fu
         },
         // A compare fused into a select is emitted at the select, so the select keeps the
         // compare operands live up to its own position.
+        // An indexed access reads its base and index, not the pointer they add up to.
+        .load => if (sibAddress(func, inst)) |sib| {
+            out[0] = sib.base;
+            out[1] = sib.index;
+            return 2;
+        },
+        .store => |st| if (sibAddress(func, inst)) |sib| {
+            out[0] = st.value;
+            out[1] = sib.base;
+            out[2] = sib.index;
+            return 3;
+        },
         // A compare fused into a gpr select is emitted at the select, so the select keeps the
         // compare operands live up to its own position. Constant arms are immediates.
         .select => |sel| {
@@ -4866,30 +5029,78 @@ fn forEachTermOperand(func: *const Function, term: ir.function.Terminator, ctx: 
     }
 }
 
-/// Mark every value that some machine instruction reads from a register, using the same
-/// operand lists the register allocator sees.
+/// Mark every value that some emitted machine instruction reads from a register, using the
+/// same operand lists the register allocator sees. A pure op nobody reads emits nothing, so
+/// its own operands do not count as read either.
 fn registerReads(allocator: std.mem.Allocator, func: *const Function) Error![]bool {
-    const read = try allocator.alloc(bool, func.valueCount());
-    @memset(read, false);
-    const Mark = struct {
-        fn mark(set: []bool, operand: Value, is_edge_arg: bool) void {
+    const readers = try allocator.alloc(u32, func.valueCount());
+    defer allocator.free(readers);
+    @memset(readers, 0);
+    const Count = struct {
+        fn add(counts: []u32, operand: Value, is_edge_arg: bool) void {
             _ = is_edge_arg;
-            set[@backingInt(operand)] = true;
+            counts[@backingInt(operand)] += 1;
         }
     };
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         for (func.blockInsts(block)) |inst| {
-            var fused: [wimmer.max_fused_operands]Value = undefined;
-            if (x86_64FusedOperands(undefined, func, inst, &fused)) |count| {
-                for (fused[0..count]) |v| read[@backingInt(v)] = true;
+            var operands: [wimmer.max_fused_operands]Value = undefined;
+            if (x86_64FusedOperands(undefined, func, inst, &operands)) |count| {
+                for (operands[0..count]) |v| readers[@backingInt(v)] += 1;
             } else {
-                forEachOperand(func, inst, &empty_fold, read, Mark.mark);
+                forEachOperand(func, inst, &empty_fold, readers, Count.add);
             }
         }
-        if (func.terminator(block)) |term| forEachTermOperand(func, term, read, Mark.mark);
+        if (func.terminator(block)) |term| forEachTermOperand(func, term, readers, Count.add);
     }
+
+    var work: std.ArrayList(ir.function.Inst) = .empty;
+    defer work.deinit(allocator);
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (deadPure(func, inst, readers)) try work.append(allocator, inst);
+        }
+    }
+    while (work.pop()) |inst| {
+        var operands: [wimmer.max_fused_operands]Value = undefined;
+        const count: u8 = x86_64FusedOperands(undefined, func, inst, &operands) orelse blk: {
+            const a = func.opcode(inst);
+            switch (a) {
+                .arith => |x| {
+                    operands[0] = x.lhs;
+                    operands[1] = x.rhs;
+                    break :blk 2;
+                },
+                .arith_imm => |x| {
+                    operands[0] = x.lhs;
+                    break :blk 1;
+                },
+                else => unreachable,
+            }
+        };
+        for (operands[0..count]) |v| {
+            readers[@backingInt(v)] -= 1;
+            if (readers[@backingInt(v)] != 0) continue;
+            const def = func.definingInst(v) orelse continue;
+            if (deadPure(func, def, readers)) try work.append(allocator, def);
+        }
+    }
+
+    const read = try allocator.alloc(bool, func.valueCount());
+    for (readers, read) |n, *r| r.* = n != 0;
     return read;
+}
+
+/// A gpr add, shift, or other pure arith whose result no instruction reads.
+fn deadPure(func: *const Function, inst: ir.function.Inst, readers: []const u32) bool {
+    const result = func.instResult(inst) orelse return false;
+    if (readers[@backingInt(result)] != 0 or isXmm(func, result)) return false;
+    return switch (func.opcode(inst)) {
+        .arith => |a| pureOp(a.op),
+        .arith_imm => |a| pureOp(a.op),
+        else => false,
+    };
 }
 
 const CountCtx = struct { target: Value, count: *usize };

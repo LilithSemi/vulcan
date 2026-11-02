@@ -92,11 +92,61 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 /// A block entered by exactly one edge gets its parameters straight from that edge. The
 /// predecessor dominates the block, so each incoming value is available at every use of its
 /// parameter. Threading a short-circuit merge leaves this shape behind.
-pub const single_edge_params_pass_def = pass.Pass{ .name = "single-edge-params", .run = runSingleEdgeParams, .preserves_cfg = true };
+pub const single_edge_params_pass_def = pass.Pass{ .name = "single-edge-params", .run = runSingleEdgeParams, .preserves_cfg = false };
 
 fn runSingleEdgeParams(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
-    _ = analyses;
-    return forwardSingleEdgeParams(allocator, func);
+    const forwarded = try forwardSingleEdgeParams(allocator, func);
+    const merged = try mergeSingleJumpBlocks(allocator, func);
+    if (forwarded or merged) analyses.invalidate();
+    return forwarded or merged;
+}
+
+/// A block whose only incoming edge is a plain jump joins its predecessor, so a compare
+/// split from its branch by a block boundary sits beside it again. The emptied block keeps
+/// no instructions and no terminator, the shape of any other dead block.
+fn mergeSingleJumpBlocks(allocator: std.mem.Allocator, func: *Function) pass.Error!bool {
+    const n = func.blockCount();
+    const counts = try allocator.alloc(u32, n);
+    defer allocator.free(counts);
+    var changed = false;
+    var again = true;
+    while (again) {
+        again = false;
+        @memset(counts, 0);
+        for (0..n) |bi| {
+            const block: Block = @fromBackingInt(@intCast(bi));
+            for (func.blockInsts(block)) |inst| if (func.opcode(inst) == .@"if") {
+                counts[@backingInt(func.opcode(inst).@"if".then.target)] += 1;
+                counts[@backingInt(func.opcode(inst).@"if".@"else".target)] += 1;
+            };
+            if (func.terminator(block)) |term| switch (term) {
+                .jump => |j| counts[@backingInt(j.target)] += 1,
+                .ret => {},
+            };
+        }
+        for (0..n) |bi| {
+            const pred: Block = @fromBackingInt(@intCast(bi));
+            if (endsInIf(func, pred) != null) continue;
+            const jump = switch (func.terminator(pred) orelse continue) {
+                .jump => |j| j,
+                .ret => continue,
+            };
+            const succ = jump.target;
+            const si = @backingInt(succ);
+            if (si == 0 or succ == pred or counts[si] != 1) continue;
+            if (func.blockParams(succ).len != 0 or func.blockArgs(jump).len != 0) continue;
+            // Only a successor that branches gains: its compare can then sit beside the branch.
+            if (endsInIf(func, succ) == null) continue;
+            const moved = func.blockInsts(succ);
+            try func.blockInstsMut(pred).appendSlice(allocator, moved);
+            func.terminatorPtr(pred).* = func.terminator(succ);
+            func.blockInstsMut(succ).clearRetainingCapacity();
+            func.terminatorPtr(succ).* = null;
+            changed = true;
+            again = true;
+        }
+    }
+    return changed;
 }
 
 fn forwardSingleEdgeParams(allocator: std.mem.Allocator, func: *Function) pass.Error!bool {
@@ -1583,4 +1633,32 @@ test "single-edge params: a block entered by one edge takes its values from that
         const want: i64 = if (in[0] >= 0 and in[1] != 0) 1 else 2;
         try testing.expectEqual(want, try evalFunc(&func, &in));
     }
+}
+
+test "single-edge params: a block entered by one jump joins its predecessor" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try i32Ty(&func);
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const tail = try func.appendBlock();
+    const yes = try func.appendBlock();
+    const no = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, t);
+    const one = try func.appendInst(entry, t, .{ .iconst = 1 });
+    const y = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = one } });
+    try func.setJump(entry, tail, &.{});
+    const ten = try func.appendInst(tail, t, .{ .iconst = 10 });
+    const c = try func.appendInst(tail, bool_t, .{ .icmp = .{ .op = .lt, .lhs = y, .rhs = ten } });
+    try func.appendIf(tail, c, .{ .target = yes }, .{ .target = no });
+    func.setTerminator(yes, .{ .ret = ir.function.Ret.one(y) });
+    func.setTerminator(no, .{ .ret = ir.function.Ret.one(ten) });
+
+    try testing.expect(try mergeSingleJumpBlocks(allocator, &func));
+    try verifyClean(allocator, &func);
+    try testing.expect(endsInIf(&func, entry) != null);
+    try testing.expectEqual(@as(usize, 0), func.blockInsts(tail).len);
+    try testing.expectEqual(@as(i64, 5), try evalFunc(&func, &.{4}));
+    try testing.expectEqual(@as(i64, 10), try evalFunc(&func, &.{12}));
 }
