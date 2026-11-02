@@ -173,6 +173,7 @@ pub fn build(b: *std.Build) void {
     run_frontend_bench.addArtifactArg(bench_vcc);
     run_frontend_bench.addDirectoryArg(b.path("bench/frontends/c"));
     _ = run_frontend_bench.addOutputDirectoryArg("frontend-bench");
+    run_frontend_bench.addPassthruArgs();
     run_frontend_bench.stdio = .inherit;
 
     const cuda_bench_cli = addCudaBench(b, target);

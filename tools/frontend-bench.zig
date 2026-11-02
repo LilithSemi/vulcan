@@ -26,6 +26,30 @@ const ExecutionResult = struct {
     checksum: []const u8,
 };
 
+const Format = enum { text, github };
+
+const Report = struct {
+    compilers: []const Compiler,
+    skipped: []const []const u8,
+    workloads: []const []const u8,
+    /// Indexed by workload, then compiler.
+    compile: []const []const Result,
+    /// Indexed by workload, then compiler. Null for a compile-only row.
+    execute: []const []const ?ExecutionResult,
+
+    fn compileTotal(report: Report, compiler: usize) u64 {
+        var total: u64 = 0;
+        for (report.compile) |row| total += row[compiler].best_ns;
+        return total;
+    }
+
+    fn executeTotal(report: Report, compiler: usize) u64 {
+        var total: u64 = 0;
+        for (report.execute) |row| total += if (row[compiler]) |result| result.best_ns else 0;
+        return total;
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const io = init.io;
@@ -36,7 +60,12 @@ pub fn main(init: std.process.Init) !void {
     const vcc = args.next() orelse return usage();
     const source_dir = args.next() orelse return usage();
     const output_dir = args.next() orelse return usage();
-    if (args.next() != null) return usage();
+    var format: Format = .text;
+    while (args.next()) |arg| {
+        if (!std.mem.eql(u8, arg, "--format")) return usage();
+        const name = args.next() orelse return usage();
+        format = std.meta.stringToEnum(Format, name) orelse return usage();
+    }
 
     try std.Io.Dir.cwd().createDirPath(io, output_dir);
     var workloads = try discoverWorkloads(allocator, io, source_dir);
@@ -67,70 +96,25 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    var buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buffer);
-    const writer = &stdout.interface;
-    try writer.print(
-        "C frontend benchmark (-O2 -c, best/median of {d}; lower is better)\n" ++
-            "VCC is built ReleaseFast; compiler process startup is included.\n",
-        .{samples},
-    );
-    if (skipped.items.len != 0) {
-        try writer.writeAll("optional compilers not found:");
-        for (skipped.items) |name| try writer.print(" {s}", .{name});
-        try writer.writeByte('\n');
-    }
-    try writer.writeAll("\nworkload             compiler       best       median   time/vcc  object B\n");
-    try writer.writeAll("-------------------  --------  ---------  -----------  ---------  --------\n");
-
-    var totals = try allocator.alloc(u64, compilers.items.len);
-    @memset(totals, 0);
-    for (workloads.items) |workload| {
+    const compile = try allocator.alloc([]Result, workloads.items.len);
+    const execute = try allocator.alloc([]?ExecutionResult, workloads.items.len);
+    for (workloads.items, compile, execute) |workload, *compile_row, *execute_row| {
         const source_path = try std.fs.path.join(allocator, &.{ source_dir, workload });
-        var vcc_best: u64 = 0;
-        for (compilers.items, 0..) |compiler, compiler_index| {
-            const stem = workload[0 .. workload.len - 2];
-            const output_name = try std.fmt.allocPrint(allocator, "{s}.{s}.o", .{ stem, compiler.name });
-            const output_path = try std.fs.path.join(allocator, &.{ output_dir, output_name });
-            const result = try benchmarkCompiler(allocator, io, compiler, source_path, output_path);
-            if (compiler_index == 0) vcc_best = result.best_ns;
-            totals[compiler_index] += result.best_ns;
-            try writer.print("{s:<19}  {s:<8}  ", .{ workload, compiler.name });
-            try printDuration(writer, result.best_ns);
-            try writer.writeAll("  ");
-            try printDuration(writer, result.median_ns);
-            try writer.print("  {d:>7}%  {d:>8}\n", .{
-                @divTrunc(result.best_ns * 100, vcc_best),
-                result.object_bytes,
-            });
-        }
-        try writer.writeByte('\n');
-    }
-
-    try writer.writeAll("aggregate best time\n");
-    const vcc_total = totals[0];
-    for (compilers.items, 0..) |compiler, index| {
-        try writer.print("  {s:<8}  ", .{compiler.name});
-        try printDuration(writer, totals[index]);
-        try writer.print("  {d:>7}% of vcc\n", .{@divTrunc(totals[index] * 100, vcc_total)});
-    }
-
-    @memset(totals, 0);
-    try writer.writeAll("\ngenerated-code execution (best/median of 7; lower is better)\n");
-    try writer.writeAll("Checksums must match across compilers; process startup is included.\n\n");
-    try writer.writeAll("workload             compiler       best       median   time/vcc  checksum\n");
-    try writer.writeAll("-------------------  --------  ---------  -----------  ---------  --------\n");
-    for (workloads.items) |workload| {
-        const source_path = try std.fs.path.join(allocator, &.{ source_dir, workload });
-        var vcc_best: u64 = 0;
+        const stem = workload[0 .. workload.len - 2];
+        compile_row.* = try allocator.alloc(Result, compilers.items.len);
+        execute_row.* = try allocator.alloc(?ExecutionResult, compilers.items.len);
         var expected_checksum: ?[]const u8 = null;
-        for (compilers.items, 0..) |compiler, compiler_index| {
+        for (compilers.items, compile_row.*, execute_row.*) |compiler, *compiled, *executed| {
+            const object_name = try std.fmt.allocPrint(allocator, "{s}.{s}.o", .{ stem, compiler.name });
+            const object_path = try std.fs.path.join(allocator, &.{ output_dir, object_name });
+            compiled.* = try benchmarkCompiler(allocator, io, compiler, source_path, object_path);
+            executed.* = null;
             if (compiler.compile_only) continue;
-            const stem = workload[0 .. workload.len - 2];
-            const output_name = try std.fmt.allocPrint(allocator, "{s}.{s}.bench", .{ stem, compiler.name });
-            const output_path = try std.fs.path.join(allocator, &.{ output_dir, output_name });
-            try buildExecutable(allocator, io, compiler, source_path, output_path);
-            const result = try benchmarkExecutable(allocator, io, compiler, output_path);
+
+            const exe_name = try std.fmt.allocPrint(allocator, "{s}.{s}.bench", .{ stem, compiler.name });
+            const exe_path = try std.fs.path.join(allocator, &.{ output_dir, exe_name });
+            try buildExecutable(allocator, io, compiler, source_path, exe_path);
+            const result = try benchmarkExecutable(allocator, io, compiler, exe_path);
             if (expected_checksum) |expected| {
                 if (!std.mem.eql(u8, expected, result.checksum)) {
                     std.debug.print("checksum mismatch for {s}: vcc={s}, {s}={s}\n", .{ workload, expected, compiler.name, result.checksum });
@@ -139,33 +123,161 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 expected_checksum = result.checksum;
             }
-            if (compiler_index == 0) vcc_best = result.best_ns;
-            totals[compiler_index] += result.best_ns;
-            try writer.print("{s:<19}  {s:<8}  ", .{ workload, compiler.name });
-            try printDuration(writer, result.best_ns);
-            try writer.writeAll("  ");
-            try printDuration(writer, result.median_ns);
-            try writer.print("  {d:>7}%  {s}\n", .{
-                @divTrunc(result.best_ns * 100, vcc_best),
-                result.checksum,
-            });
+            executed.* = result;
         }
-        try writer.writeByte('\n');
     }
 
-    try writer.writeAll("aggregate best execution time\n");
-    const vcc_execution_total = totals[0];
-    for (compilers.items, 0..) |compiler, index| {
-        if (compiler.compile_only) continue;
-        try writer.print("  {s:<8}  ", .{compiler.name});
-        try printDuration(writer, totals[index]);
-        try writer.print("  {d:>7}% of vcc\n", .{@divTrunc(totals[index] * 100, vcc_execution_total)});
+    const report: Report = .{
+        .compilers = compilers.items,
+        .skipped = skipped.items,
+        .workloads = workloads.items,
+        .compile = compile,
+        .execute = execute,
+    };
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
+    const writer = &stdout.interface;
+    switch (format) {
+        .text => try writeText(writer, report),
+        .github => try writeGithub(writer, report),
     }
     try writer.flush();
 }
 
+fn percent(value: u64, base: u64) u64 {
+    return @divTrunc(value * 100, @max(base, 1));
+}
+
+fn writeText(writer: *std.Io.Writer, report: Report) !void {
+    try writer.print(
+        "C frontend benchmark (-O2 -c, best/median of {d}; lower is better)\n" ++
+            "VCC is built ReleaseFast; compiler process startup is included.\n",
+        .{samples},
+    );
+    if (report.skipped.len != 0) {
+        try writer.writeAll("optional compilers not found:");
+        for (report.skipped) |name| try writer.print(" {s}", .{name});
+        try writer.writeByte('\n');
+    }
+    try writer.writeAll("\nworkload             compiler       best       median   time/vcc  object B\n");
+    try writer.writeAll("-------------------  --------  ---------  -----------  ---------  --------\n");
+    for (report.workloads, report.compile) |workload, row| {
+        for (report.compilers, row) |compiler, result| {
+            try writer.print("{s:<19}  {s:<8}  ", .{ workload, compiler.name });
+            try printDuration(writer, result.best_ns);
+            try writer.writeAll("  ");
+            try printDuration(writer, result.median_ns);
+            try writer.print("  {d:>7}%  {d:>8}\n", .{ percent(result.best_ns, row[0].best_ns), result.object_bytes });
+        }
+        try writer.writeByte('\n');
+    }
+    try writer.writeAll("aggregate best time\n");
+    for (report.compilers, 0..) |compiler, index| {
+        try writer.print("  {s:<8}  ", .{compiler.name});
+        try printDuration(writer, report.compileTotal(index));
+        try writer.print("  {d:>7}% of vcc\n", .{percent(report.compileTotal(index), report.compileTotal(0))});
+    }
+
+    try writer.print("\ngenerated-code execution (best/median of {d}; lower is better)\n", .{samples});
+    try writer.writeAll("Checksums must match across compilers; process startup is included.\n\n");
+    try writer.writeAll("workload             compiler       best       median   time/vcc  checksum\n");
+    try writer.writeAll("-------------------  --------  ---------  -----------  ---------  --------\n");
+    for (report.workloads, report.execute) |workload, row| {
+        for (report.compilers, row) |compiler, maybe| {
+            const result = maybe orelse continue;
+            try writer.print("{s:<19}  {s:<8}  ", .{ workload, compiler.name });
+            try printDuration(writer, result.best_ns);
+            try writer.writeAll("  ");
+            try printDuration(writer, result.median_ns);
+            try writer.print("  {d:>7}%  {s}\n", .{ percent(result.best_ns, row[0].?.best_ns), result.checksum });
+        }
+        try writer.writeByte('\n');
+    }
+    try writer.writeAll("aggregate best execution time\n");
+    for (report.compilers, 0..) |compiler, index| {
+        if (compiler.compile_only) continue;
+        try writer.print("  {s:<8}  ", .{compiler.name});
+        try printDuration(writer, report.executeTotal(index));
+        try writer.print("  {d:>7}% of vcc\n", .{percent(report.executeTotal(index), report.executeTotal(0))});
+    }
+}
+
+/// Markdown for a GitHub comment. The totals are visible, and the per-workload tables are
+/// in collapsed `<details>` blocks.
+fn writeGithub(writer: *std.Io.Writer, report: Report) !void {
+    try writer.writeAll("## Vulcan benchmark\n\n");
+    try writer.print("Best of {d} runs, lower is better. Process startup is included.", .{samples});
+    if (report.skipped.len != 0) {
+        try writer.writeAll(" Not found:");
+        for (report.skipped) |name| try writer.print(" {s}", .{name});
+        try writer.writeByte('.');
+    }
+    try writer.writeAll("\n\n| compiler | compile (`-O2 -c`) | vs vcc | generated code | vs vcc |\n");
+    try writer.writeAll("|---|---:|---:|---:|---:|\n");
+    for (report.compilers, 0..) |compiler, index| {
+        try writer.print("| {s} | ", .{compiler.name});
+        try writeMs(writer, report.compileTotal(index));
+        try writer.print(" | {d}% | ", .{percent(report.compileTotal(index), report.compileTotal(0))});
+        if (compiler.compile_only) {
+            try writer.writeAll(" | |\n");
+            continue;
+        }
+        try writeMs(writer, report.executeTotal(index));
+        try writer.print(" | {d}% |\n", .{percent(report.executeTotal(index), report.executeTotal(0))});
+    }
+
+    try writer.writeAll("\n<details>\n<summary>Generated code per workload</summary>\n\n");
+    try writeGithubHeader(writer, report, true);
+    for (report.workloads, report.execute) |workload, row| {
+        try writer.print("| {s} |", .{workload});
+        for (report.compilers, row) |compiler, maybe| {
+            if (compiler.compile_only) continue;
+            try writer.writeByte(' ');
+            try writeMs(writer, maybe.?.best_ns);
+            try writer.print(" ({d}%) |", .{percent(maybe.?.best_ns, row[0].?.best_ns)});
+        }
+        try writer.print(" `{s}` |\n", .{row[0].?.checksum});
+    }
+
+    try writer.writeAll("\n</details>\n\n<details>\n<summary>Compile time per workload</summary>\n\n");
+    try writeGithubHeader(writer, report, false);
+    for (report.workloads, report.compile) |workload, row| {
+        try writer.print("| {s} |", .{workload});
+        for (row) |result| {
+            try writer.writeByte(' ');
+            try writeMs(writer, result.best_ns);
+            try writer.print(" ({d}%) |", .{percent(result.best_ns, row[0].best_ns)});
+        }
+        try writer.writeByte('\n');
+    }
+
+    try writer.writeAll("\n</details>\n\n<details>\n<summary>Object size per workload (bytes)</summary>\n\n");
+    try writeGithubHeader(writer, report, false);
+    for (report.workloads, report.compile) |workload, row| {
+        try writer.print("| {s} |", .{workload});
+        for (row) |result| try writer.print(" {d} |", .{result.object_bytes});
+        try writer.writeByte('\n');
+    }
+    try writer.writeAll("\n</details>\n");
+}
+
+fn writeGithubHeader(writer: *std.Io.Writer, report: Report, execute: bool) !void {
+    try writer.writeAll("| workload |");
+    var columns: usize = 0;
+    for (report.compilers) |compiler| {
+        if (execute and compiler.compile_only) continue;
+        try writer.print(" {s} |", .{compiler.name});
+        columns += 1;
+    }
+    if (execute) try writer.writeAll(" checksum |");
+    try writer.writeAll("\n|---|");
+    for (0..columns) |_| try writer.writeAll("---:|");
+    if (execute) try writer.writeAll("---|");
+    try writer.writeByte('\n');
+}
+
 fn usage() error{InvalidArguments} {
-    std.debug.print("usage: vulcan-frontend-bench <vcc> <source-dir> <output-dir>\n", .{});
+    std.debug.print("usage: vulcan-frontend-bench <vcc> <source-dir> <output-dir> [--format text|github]\n", .{});
     return error.InvalidArguments;
 }
 
@@ -280,4 +392,9 @@ fn benchmarkExecutable(allocator: std.mem.Allocator, io: std.Io, compiler: Compi
 fn printDuration(writer: *std.Io.Writer, nanoseconds: u64) !void {
     const microseconds = nanoseconds / std.time.ns_per_us;
     try writer.print("{d:>5}.{d:0>3} ms", .{ microseconds / 1000, microseconds % 1000 });
+}
+
+fn writeMs(writer: *std.Io.Writer, nanoseconds: u64) !void {
+    const microseconds = nanoseconds / std.time.ns_per_us;
+    try writer.print("{d}.{d:0>3} ms", .{ microseconds / 1000, microseconds % 1000 });
 }

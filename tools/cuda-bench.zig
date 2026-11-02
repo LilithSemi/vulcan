@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.next() != null) return usage();
 
     var buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
     const writer = &stdout.interface;
     if (!try programAvailable(allocator, io, "ptxas") or !try programAvailable(allocator, io, "nvcc")) {
         try writer.writeAll("\nCUDA benchmark skipped: nvcc or ptxas is unavailable\n");
