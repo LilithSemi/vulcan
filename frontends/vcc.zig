@@ -596,10 +596,10 @@ fn shOutput(allocator: std.mem.Allocator, io: std.Io, script: []const u8) !?[]u8
 /// Locates the HOST glibc "dev" include directory, the one holding a real `stdio.h`,
 /// `features.h`, `sys/cdefs.h`, and similar files, so `#include <stdio.h>` resolves with no
 /// explicit `-I`/`-isystem`. The function tries candidates in order, and validates each one
-/// by checking for a real `stdio.h` inside it before trusting it: (1) `VCC_GLIBC_INCLUDE`,
-/// an explicit override for a host where the search below doesn't apply; (2) the host C
+/// by checking for a real `features.h` inside it before trusting it. It uses the host C
 /// compiler's own `-E -v` system-include search list, taking the LAST directory in it that
-/// actually holds a `stdio.h` (the C library's include dir). This asks the compiler where its
+/// holds a `features.h` (the C library's include dir). `SysdirProbe` checks the
+/// `VCC_GLIBC_INCLUDE` override before it calls this function. This asks the compiler where its
 /// headers are rather than assuming a filesystem layout, so it works on any host (a nix store
 /// path, `/usr/include`, a cross sysroot) with no store globbing. This function never fails:
 /// `null` means no default system dir is added, so `#include <stdio.h>` then fails later, AT
@@ -607,9 +607,6 @@ fn shOutput(allocator: std.mem.Allocator, io: std.Io, script: []const u8) !?[]u8
 /// hard driver error.
 fn findHostGlibcIncludeDir(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
     const script =
-        \\if [ -n "${VCC_GLIBC_INCLUDE:-}" ] && [ -f "$VCC_GLIBC_INCLUDE/stdio.h" ]; then
-        \\  echo "$VCC_GLIBC_INCLUDE"; exit 0
-        \\fi
         \\for cc_ in cc gcc; do
         \\  command -v "$cc_" >/dev/null 2>&1 || continue
         \\  last=""
@@ -647,16 +644,90 @@ fn findCrossGlibcIncludeDir(allocator: std.mem.Allocator, io: std.Io, triple: []
     return shOutput(allocator, io, script);
 }
 
+/// Finds the default system include dir. The probe result is kept in the user cache dir,
+/// with the real path of the C compiler as the key, because the probe takes about 30 ms.
 const SysdirProbe = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     arch: link.Arch,
+    env: *const std.process.Environ.Map,
 
     fn find(ctx: *anyopaque) std.mem.Allocator.Error!?[]const u8 {
         const self: *SysdirProbe = @ptrCast(@alignCast(ctx));
         const host_arch: ?link.Arch = hostLinkArch() catch null;
-        if (host_arch == self.arch) return findHostGlibcIncludeDir(self.allocator, self.io);
-        return findCrossGlibcIncludeDir(self.allocator, self.io, archTriple(self.arch));
+        const host = host_arch == self.arch;
+        if (host) if (self.env.get("VCC_GLIBC_INCLUDE")) |dir| {
+            if (self.holds(dir, "stdio.h")) return dir;
+        };
+        const cache_path = try self.cachePath(host);
+        if (cache_path) |path| {
+            if (std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(4096))) |dir| {
+                if (self.holds(dir, "features.h")) return dir;
+            } else |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                else => {},
+            }
+        }
+        const found = if (host)
+            try findHostGlibcIncludeDir(self.allocator, self.io)
+        else
+            try findCrossGlibcIncludeDir(self.allocator, self.io, archTriple(self.arch));
+        if (found) |dir| if (cache_path) |path| self.store(path, dir);
+        return found;
+    }
+
+    fn holds(self: *SysdirProbe, dir: []const u8, name: []const u8) bool {
+        var d = std.Io.Dir.cwd().openDir(self.io, dir, .{}) catch return false;
+        defer d.close(self.io);
+        d.access(self.io, name, .{}) catch return false;
+        return true;
+    }
+
+    /// Returns null when `VCC_NO_CACHE` is set, no C compiler is on PATH, or no cache dir is known.
+    fn cachePath(self: *SysdirProbe, host: bool) std.mem.Allocator.Error!?[]const u8 {
+        if (self.env.get("VCC_NO_CACHE")) |value| if (value.len > 0) return null;
+        const triple = archTriple(self.arch);
+        const host_names = [_][]const u8{ "cc", "gcc" };
+        var cross_names: [2][]const u8 = undefined;
+        cross_names[0] = try std.fmt.allocPrint(self.allocator, "{s}-gcc", .{triple});
+        cross_names[1] = try std.fmt.allocPrint(self.allocator, "{s}-cc", .{triple});
+        const names: []const []const u8 = if (host) &host_names else &cross_names;
+        const compiler = try self.onPath(names) orelse return null;
+
+        const root = if (self.env.get("XDG_CACHE_HOME")) |xdg|
+            try std.fs.path.join(self.allocator, &.{ xdg, "vulcan" })
+        else if (self.env.get("HOME")) |home|
+            try std.fs.path.join(self.allocator, &.{ home, ".cache", "vulcan" })
+        else
+            return null;
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(compiler);
+        hasher.update(@tagName(self.arch));
+        const name = try std.fmt.allocPrint(self.allocator, "sysdir-{x:0>16}", .{hasher.final()});
+        return try std.fs.path.join(self.allocator, &.{ root, name });
+    }
+
+    fn onPath(self: *SysdirProbe, names: []const []const u8) std.mem.Allocator.Error!?[]const u8 {
+        const path = self.env.get("PATH") orelse return null;
+        for (names) |name| {
+            var it = std.mem.tokenizeScalar(u8, path, ':');
+            while (it.next()) |dir| {
+                const full = try std.fs.path.join(self.allocator, &.{ dir, name });
+                const real = std.Io.Dir.cwd().realPathFileAlloc(self.io, full, self.allocator) catch |err| switch (err) {
+                    error.OutOfMemory => |e| return e,
+                    else => continue,
+                };
+                return real;
+            }
+        }
+        return null;
+    }
+
+    /// A failed write only means the next compile runs the probe again.
+    fn store(self: *SysdirProbe, path: []const u8, dir: []const u8) void {
+        const cwd = std.Io.Dir.cwd();
+        if (std.fs.path.dirname(path)) |parent| cwd.createDirPath(self.io, parent) catch return;
+        cwd.writeFile(self.io, .{ .sub_path = path, .data = dir }) catch return;
     }
 };
 
@@ -1284,7 +1355,7 @@ pub fn main(init: std.process.Init) !void {
     // just means no default dir is added. The compile only fails later, AT an actual
     // `#include <...>` that needed it, not here.
     // The probe spawns the host C compiler, so it runs only when an include misses all other dirs.
-    var sysdir_probe: SysdirProbe = .{ .allocator = allocator, .io = io, .arch = arch };
+    var sysdir_probe: SysdirProbe = .{ .allocator = allocator, .io = io, .arch = arch, .env = init.environ_map };
 
     // The `FsResolver` wired into `pp_base.resolver` replaces the old disk-only
     // `diskResolve`. It serves this compiler's own built-in `<stddef.h>`/`<stdarg.h>` FIRST
