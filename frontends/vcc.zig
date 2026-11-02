@@ -647,6 +647,19 @@ fn findCrossGlibcIncludeDir(allocator: std.mem.Allocator, io: std.Io, triple: []
     return shOutput(allocator, io, script);
 }
 
+const SysdirProbe = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    arch: link.Arch,
+
+    fn find(ctx: *anyopaque) std.mem.Allocator.Error!?[]const u8 {
+        const self: *SysdirProbe = @ptrCast(@alignCast(ctx));
+        const host_arch: ?link.Arch = hostLinkArch() catch null;
+        if (host_arch == self.arch) return findHostGlibcIncludeDir(self.allocator, self.io);
+        return findCrossGlibcIncludeDir(self.allocator, self.io, archTriple(self.arch));
+    }
+};
+
 /// The per-arch dynamic-linker soname the autolink embeds as `PT_INTERP`, so a linked
 /// executable finds its loader with no explicit `--dynamic-linker`. These are the
 /// canonical glibc loader names, one per target. `external_linkage.zig`/`variadic.zig`
@@ -1270,13 +1283,8 @@ pub fn main(init: std.process.Init) !void {
     // (the host has no matching glibc dev tree on this machine, or none for a cross target)
     // just means no default dir is added. The compile only fails later, AT an actual
     // `#include <...>` that needed it, not here.
-    const default_sysdir: ?[]const u8 = if (opts.no_stdinc) null else blk: {
-        const host_arch: ?link.Arch = hostLinkArch() catch null;
-        break :blk if (host_arch != null and arch == host_arch.?)
-            try findHostGlibcIncludeDir(allocator, io)
-        else
-            try findCrossGlibcIncludeDir(allocator, io, archTriple(arch));
-    };
+    // The probe spawns the host C compiler, so it runs only when an include misses all other dirs.
+    var sysdir_probe: SysdirProbe = .{ .allocator = allocator, .io = io, .arch = arch };
 
     // The `FsResolver` wired into `pp_base.resolver` replaces the old disk-only
     // `diskResolve`. It serves this compiler's own built-in `<stddef.h>`/`<stdarg.h>` FIRST
@@ -1285,8 +1293,9 @@ pub fn main(init: std.process.Init) !void {
     // `var`, not a temporary inside a helper, backed by `allocator` (the process arena, see
     // `init.arena` above). So it, and every `ResolvedFile` it hands out, outlive the whole
     // compile, the same way `disk_ctx` did before it.
-    const system_dirs = try buildSystemDirs(allocator, &opts, default_sysdir);
+    const system_dirs = try buildSystemDirs(allocator, &opts, null);
     var fs_resolver = cc.fs_resolver.FsResolver.init(allocator, io, system_dirs);
+    if (!opts.no_stdinc) fs_resolver.fallback = .{ .ctx = &sysdir_probe, .findFn = SysdirProbe.find };
 
     // `-freproducible-compile` pins `__DATE__`/`__TIME__` to the epoch instead of reading
     // the wall clock, so `preprocess`/`preprocessToText`/`compileWithOpts` themselves stay

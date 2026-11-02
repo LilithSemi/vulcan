@@ -45,9 +45,25 @@ pub const FsResolver = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     system_dirs: []const []const u8,
+    /// Finds the last search directory only when a search first needs it, because
+    /// finding it can be slow (for example, a probe of the host C compiler).
+    fallback: ?Fallback = null,
+    fallback_dir: ?[]const u8 = null,
+
+    pub const Fallback = struct {
+        ctx: *anyopaque,
+        findFn: *const fn (ctx: *anyopaque) std.mem.Allocator.Error!?[]const u8,
+    };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, system_dirs: []const []const u8) FsResolver {
         return .{ .allocator = allocator, .io = io, .system_dirs = system_dirs };
+    }
+
+    fn fallbackDir(self: *FsResolver) std.mem.Allocator.Error!?[]const u8 {
+        const fallback = self.fallback orelse return self.fallback_dir;
+        self.fallback = null;
+        self.fallback_dir = try fallback.findFn(fallback.ctx);
+        return self.fallback_dir;
     }
 
     /// The `IncludeResolver` vtable view of this resolver. Wire this into
@@ -91,10 +107,19 @@ pub const FsResolver = struct {
                     start = k + 1;
                 }
             }
+            // The fallback directory is last in the order, so a file from it has nothing after it.
+            const last = try self.fallbackDir();
+            if (last) |dir| {
+                if (self.dirRealPath(dir, &buf)) |real| {
+                    const inside = std.mem.startsWith(u8, after, real) and
+                        (after.len == real.len or after[real.len] == '/');
+                    if (inside and real.len >= best_len) return null;
+                }
+            }
             for (self.system_dirs[start..]) |dir| {
                 if (try self.tryDir(dir, name)) |rf| return rf;
             }
-            return null;
+            return self.tryDir(last orelse return null, name);
         }
         if (is_system) {
             if (resolveBuiltin(name, is_system)) |b| return .{ .identity = name, .bytes = b };
@@ -104,7 +129,8 @@ pub const FsResolver = struct {
         for (self.system_dirs) |dir| {
             if (try self.tryDir(dir, name)) |rf| return rf;
         }
-        return null;
+        const last = try self.fallbackDir() orelse return null;
+        return self.tryDir(last, name);
     }
 
     /// The canonical absolute path of `dir`, written into `buf` and returned as a sub-slice.
@@ -256,6 +282,47 @@ test "a missing header resolves to null, surfacing as a clear preprocessor error
     defer arena.deinit();
     var fsr = FsResolver.init(arena.allocator(), io, &dirs);
     try std.testing.expectError(error.PreprocError, preproc.preprocess(allocator, "#include <missing.h>\nint y;\n", .{ .resolver = fsr.asResolver() }));
+}
+
+test "the fallback dir is found only when system_dirs miss" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "first");
+    try tmp.dir.createDirPath(io, "last");
+    try tmp.dir.writeFile(io, .{ .sub_path = "first/a.h", .data = "int from_a;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "last/b.h", .data = "int from_b;\n" });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const base = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const dirs = [_][]const u8{try std.fs.path.join(arena.allocator(), &.{ base, "first" })};
+
+    const Probe = struct {
+        dir: []const u8,
+        calls: u32 = 0,
+        fn find(ctx: *anyopaque) std.mem.Allocator.Error!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return self.dir;
+        }
+    };
+    var probe: Probe = .{ .dir = try std.fs.path.join(arena.allocator(), &.{ base, "last" }) };
+    var fsr = FsResolver.init(arena.allocator(), io, &dirs);
+    fsr.fallback = .{ .ctx = &probe, .findFn = Probe.find };
+    const resolver = fsr.asResolver();
+
+    const a = (try resolver.resolveFn(resolver.ctx, "a.h", true, null, null)).?;
+    try std.testing.expectEqualStrings("int from_a;\n", a.bytes);
+    try std.testing.expectEqual(0, probe.calls);
+
+    const b = (try resolver.resolveFn(resolver.ctx, "b.h", true, null, null)).?;
+    try std.testing.expectEqualStrings("int from_b;\n", b.bytes);
+    try std.testing.expectEqual(null, try resolver.resolveFn(resolver.ctx, "b.h", true, null, b.identity));
+    try std.testing.expectEqual(null, try resolver.resolveFn(resolver.ctx, "c.h", true, null, null));
+    try std.testing.expectEqual(1, probe.calls);
 }
 
 test "a quoted include searches includer_dir before system_dirs" {
