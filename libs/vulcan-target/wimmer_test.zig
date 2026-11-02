@@ -420,17 +420,17 @@ test "x86_64 description: gpr pool includes callee-saved, xmm pool, entry param 
     try std.testing.expectEqualStrings("xmm", desc.classes[1].name);
 
     // Class 0 (gpr): allocatable is the caller-saved set {rax,rcx,rdx,rsi,rdi,r8,r9} PLUS the
-    // callee-saved set {rbx,r12,r13,r14,r15}. Index = the register's own enum value.
+    // callee-saved set {rbx,rbp,r12,r13,r14,r15}. Index = the register's own enum value.
     for ([_]u16{ 0, 1, 2, 6, 7, 8, 9 }) |idx| try std.testing.expect(contains(desc.classes[0].allocatable, idx));
-    for ([_]u16{ 3, 12, 13, 14, 15 }) |idx| try std.testing.expect(contains(desc.classes[0].allocatable, idx));
-    // rbp/rsp (frame/stack) and r10/r11 (scratch) are excluded.
-    for ([_]u16{ 4, 5, 10, 11 }) |idx| try std.testing.expect(!contains(desc.classes[0].allocatable, idx));
-    try std.testing.expectEqual(@as(usize, 12), desc.classes[0].allocatable.len);
+    for ([_]u16{ 3, 5, 12, 13, 14, 15 }) |idx| try std.testing.expect(contains(desc.classes[0].allocatable, idx));
+    // rsp (stack) and r10/r11 (scratch) are excluded.
+    for ([_]u16{ 4, 10, 11 }) |idx| try std.testing.expect(!contains(desc.classes[0].allocatable, idx));
+    try std.testing.expectEqual(@as(usize, 13), desc.classes[0].allocatable.len);
     try std.testing.expectEqual(@as(u16, 8), desc.classes[0].slot_bytes);
 
-    // Callee-saved gpr set is exactly {rbx,r12,r13,r14,r15}.
-    try std.testing.expectEqual(@as(usize, 5), desc.classes[0].callee_saved.len);
-    for ([_]u16{ 3, 12, 13, 14, 15 }) |idx| try std.testing.expect(contains(desc.classes[0].callee_saved, idx));
+    // Callee-saved gpr set is exactly {rbx,rbp,r12,r13,r14,r15}.
+    try std.testing.expectEqual(@as(usize, 6), desc.classes[0].callee_saved.len);
+    for ([_]u16{ 3, 5, 12, 13, 14, 15 }) |idx| try std.testing.expect(contains(desc.classes[0].callee_saved, idx));
 
     // Class 1 (xmm): allocatable is xmm0..xmm12 (xmm13/14/15 are reserved scratch), no callee-saved.
     try std.testing.expectEqual(@as(usize, 13), desc.classes[1].allocatable.len);

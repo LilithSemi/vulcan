@@ -4152,11 +4152,11 @@ fn vectorSplatInt(func: *const Function, value: Value) ?i64 {
 /// clobbers exactly these, and the callee-saved set survives. R10 and R11
 /// are scratch and never enter the pool.
 const caller_saved_gpr = [_]Reg{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9 };
-/// The callee-saved gpr set: rbx, r12, r13, r14, r15. This set is
+/// The callee-saved gpr set: rbx, rbp, r12, r13, r14, r15. This set is
 /// allocatable, so cross-call values can use it, but it survives a call, so
-/// no call clobbers it. Rbp and rsp are the frame and stack pointers, and
-/// are excluded.
-const callee_saved_gpr = [_]Reg{ .rbx, .r12, .r13, .r14, .r15 };
+/// no call clobbers it. Frames address spill slots from rsp, so rbp is an
+/// ordinary register here. Rsp is the stack pointer and is excluded.
+const callee_saved_gpr = [_]Reg{ .rbx, .rbp, .r12, .r13, .r14, .r15 };
 /// The number of allocatable xmm registers: xmm0 through xmm12. xmm13,
 /// xmm14, and xmm15 are reserved scratch.
 const xmm_allocatable_count: u16 = 13;
@@ -5572,8 +5572,9 @@ test "a call_indirect that fits in the argument registers opens no stack window"
 }
 
 test "a gp stack argument stored from a slot goes through the scratch" {
-    // Six parameters are register args; six more values are computed from them and passed as the stack
-    // args, kept live across the call so at least one must sit in a slot at the call. A slot-resident
+    // Six parameters are register args; seven more values are computed from them and passed as the
+    // stack args, kept live across the call. Six callee-saved registers cannot hold seven, so at least
+    // one must sit in a slot at the call. A slot-resident
     // stack arg reloads into the scratch (r10) and then stores to the argument window, the `.spill`
     // path in `lowerDirectCall`. The companion running test in `tests/cases.zig` checks that the values
     // reach the callee; this one pins the reload that delivers them.
@@ -5583,11 +5584,11 @@ test "a gp stack argument stored from a slot goes through the scratch" {
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
-    var a: [12]Value = undefined;
+    var a: [13]Value = undefined;
     inline for (0..6) |i| a[i] = try func.appendArithImm(b, t, .add, x, @intCast((i + 1) * 10));
-    inline for (0..6) |i| a[6 + i] = try func.appendArithImm(b, t, .add, x, @intCast(i + 1));
+    inline for (0..7) |i| a[6 + i] = try func.appendArithImm(b, t, .add, x, @intCast(i + 1));
     var acc = try func.appendCall(b, t, "callee", &a);
-    inline for (0..6) |i| {
+    inline for (0..7) |i| {
         acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = a[6 + i] } });
     }
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
