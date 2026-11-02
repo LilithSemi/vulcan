@@ -74,6 +74,9 @@ fn immediates(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         .{ .op = .mul, .imm = 6, .want = 60 },
         .{ .op = .shl, .imm = 4, .want = 160 },
         .{ .op = .div, .imm = 3, .want = 3 },
+        // A constant above i32 max still reads as its low 32 bits.
+        .{ .op = .add, .imm = 0x9e3779b9, .want = 0xc3 },
+        .{ .op = .bit_xor, .imm = 0x9e3779b9, .want = 0xb3 },
     };
     inline for (cases) |c| {
         var f = Function.init(allocator);

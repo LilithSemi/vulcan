@@ -30,8 +30,7 @@ const empty_fold: addrfold.Analysis = addrfold.Analysis.empty;
 /// The x86-32 fold predicate for `addrfold.analyze`. It folds a load or store whose pointer is an
 /// `arith_imm.add(base, imm)` into a `[base + disp32]` addressing mode, for any access size (an x86
 /// memory operand carries a 32-bit signed displacement regardless of width). The fold applies exactly
-/// when the add's imm fits a signed 32-bit displacement. The isel already assumes an `arith_imm` imm
-/// fits an i32 (`@intCast(a.imm)` when it emits the add), so this matches an existing invariant. It
+/// when the add's imm fits a signed 32-bit displacement. It
 /// returns the byte offset (equal to the add's imm) when in range, else null. `analyze` calls this
 /// only after confirming the pointer is an `arith_imm.add`, so the unwraps below are guaranteed, but
 /// still asserted. The fold analysis covers all loads and stores, including float and vector ones, but
@@ -509,7 +508,8 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             }
         },
         .arith_imm => |a| {
-            const imm: i32 = @intCast(a.imm);
+            // Every op here is 32-bit and reads only the low 32 bits of the constant.
+            const imm: i32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(a.imm)))));
             switch (a.op) {
                 .mul => {
                     const rd = ctx.dst(result, scratch1);

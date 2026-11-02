@@ -1494,3 +1494,55 @@ test "x86_64 folds single-use loads into add, sub, and xor memory operands" {
         try std.testing.expectEqual(want, f(&mem, c[3]));
     }
 }
+
+test "x86_64 arith_imm with a constant wider than imm32 keeps every bit" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ops = [_]ir.function.BinOp{ .add, .sub, .bit_and, .bit_or, .bit_xor, .mul, .div, .rem };
+    const wide: i64 = @bitCast(@as(u64, 0x9e3779b97f4a7c15));
+    const inputs = [_]u64{ 0, 1, 0x123456789abcdef1, 0xffffffffffffffff, 0x8000000000000000 };
+    for (ops) |op| {
+        var func = ir.function.Function.init(a);
+        defer func.deinit();
+        const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const entry = try func.appendBlock();
+        const x = try func.appendBlockParam(entry, u64_t);
+        const r = try func.appendArithImm(entry, u64_t, op, x, wide);
+        func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
+        const code = try isel.selectFunction(a, &func);
+        defer a.free(code);
+        var buffer = try jit.CodeBuffer.map(code);
+        defer buffer.deinit();
+        const f = buffer.entry(*const fn (u64) callconv(.c) u64, 0);
+        const k: u64 = @bitCast(wide);
+        for (inputs) |v| {
+            const want: u64 = switch (op) {
+                .add => v +% k,
+                .sub => v -% k,
+                .bit_and => v & k,
+                .bit_or => v | k,
+                .bit_xor => v ^ k,
+                .mul => v *% k,
+                .div => v / k,
+                .rem => v % k,
+                else => unreachable,
+            };
+            try std.testing.expectEqual(want, f(v));
+        }
+    }
+
+    // A 32-bit op reads only the low 32 bits of a constant above i32 max.
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, u32_t);
+    const r = try func.appendArithImm(entry, u32_t, .add, x, 0x9e3779b9);
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
+    const code = try isel.selectFunction(a, &func);
+    defer a.free(code);
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn (u32) callconv(.c) u32, 0);
+    try std.testing.expectEqual(@as(u32, 5) +% 0x9e3779b9, f(5));
+}

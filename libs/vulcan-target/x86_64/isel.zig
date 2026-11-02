@@ -35,8 +35,7 @@ const empty_fold: addrfold.Analysis = addrfold.Analysis.empty;
 /// pointer is an `arith_imm.add(base, imm)` into a `[base + disp32]` addressing mode,
 /// for any access size, since x86 mem operands carry a 32-bit signed displacement
 /// regardless of width. The fold applies exactly when the add's imm fits a signed
-/// 32-bit displacement. The isel already assumes an `arith_imm` imm fits an i32
-/// (`@intCast(a.imm)` when it emits the add), so this matches an existing invariant.
+/// 32-bit displacement. A wider imm stays an add, which builds it in a register.
 /// The function returns the byte offset (equal to the add's imm) when in range, else
 /// null. `analyze` calls this function only after it confirms the pointer is an
 /// `arith_imm.add`, so the unwraps below are guaranteed to succeed. The code still
@@ -2144,10 +2143,17 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             }
         },
         .arith_imm => |a| {
-            const imm: i32 = @intCast(a.imm);
             // The code uses 64-bit operand size only for i64 and wider types.
             // A 32-bit or smaller result uses 32-bit ops.
             const w64 = intBits(func, result) > 32;
+            // A 32-bit op reads only the low 32 bits of the constant. A 64-bit op whose
+            // constant does not fit a sign-extended imm32 uses the register form.
+            const imm: i32 = std.math.cast(i32, a.imm) orelse if (!w64)
+                @bitCast(@as(u32, @truncate(@as(u64, @bitCast(a.imm)))))
+            else {
+                try emitArithWideImm(allocator, ctx, a, result);
+                return;
+            };
             switch (a.op) {
                 .mul => {
                     const rd = ctx.dst(result, scratch1);
@@ -3791,6 +3797,36 @@ fn emitLoadOp(allocator: std.mem.Allocator, ctx: *Ctx, a: ir.function.Arith, fol
         try ctx.put(allocator, encode.aluFromMem(memOpcode(a.op), rd, base, disp, w64));
     }
     try ctx.store(allocator, result, rd);
+}
+
+/// A 64-bit `arith_imm` whose constant needs all 64 bits: build it in the scratch register
+/// with `movabs`, then use the register form. A shift count always fits imm8, so shifts
+/// never reach here.
+fn emitArithWideImm(allocator: std.mem.Allocator, ctx: *Ctx, a: ir.function.ArithImm, result: Value) Error!void {
+    const func = ctx.func;
+    const bits: u64 = @bitCast(a.imm);
+    switch (a.op) {
+        .add, .sub, .bit_and, .bit_or, .bit_xor, .mul => {
+            const rl = try ctx.use(allocator, a.lhs, scratch1);
+            try ctx.put(allocator, encode.movImm64(scratch2, bits));
+            const rd = ctx.dst(result, scratch1);
+            if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
+            try ctx.put(allocator, try binary(a.op, rd, scratch2, true));
+            try ctx.store(allocator, result, rd);
+        },
+        .div, .rem => {
+            const signed = isSigned(func, a.lhs);
+            try ctx.put(allocator, encode.movReg(.rax, try ctx.use(allocator, a.lhs, scratch1)));
+            try ctx.put(allocator, if (signed) encode.cqo() else encode.xorr(.rdx, .rdx, true));
+            try ctx.put(allocator, encode.movImm64(scratch2, bits));
+            try ctx.put(allocator, if (signed) encode.idiv(scratch2, true) else encode.divu(scratch2, true));
+            const rd = ctx.dst(result, scratch1);
+            const res: Reg = if (a.op == .div) .rax else .rdx;
+            if (rd != res) try ctx.put(allocator, encode.movReg(rd, res));
+            try ctx.store(allocator, result, rd);
+        },
+        .shl, .shr, .mulh => return error.Unsupported,
+    }
 }
 
 /// Whether a branch two instructions on reads the flags the current arith sets.
