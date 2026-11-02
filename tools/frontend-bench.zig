@@ -1,5 +1,5 @@
 //! End-to-end C frontend compile-time benchmark driver.
-//! VCC is supplied by the build graph; Clang and GCC are included when present on PATH.
+//! VCC is supplied by the build graph. Clang, GCC, and TCC are included when present on PATH.
 
 const std = @import("std");
 
@@ -44,6 +44,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "vcc", .command = vcc, .required = true },
         .{ .name = "clang", .command = "clang", .required = false },
         .{ .name = "gcc", .command = "gcc", .required = false },
+        .{ .name = "tcc", .command = "tcc", .required = false },
     };
     var compilers: std.ArrayList(Compiler) = .empty;
     defer compilers.deinit(allocator);

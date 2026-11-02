@@ -10,6 +10,7 @@
   etsoc-sysemu,
   llvmPackages,
   gcc,
+  tinycc,
   cudaPackages,
 }:
 let
@@ -52,6 +53,7 @@ stdenv.mkDerivation (finalAttrs: {
         binutils
         llvmPackages.clang
         gcc
+        tinycc
       ]
       ++ lib.optionals stdenv.hostPlatform.isLinux [
         # nvcc injects cuda_runtime.h even for a cubin-only compilation.
