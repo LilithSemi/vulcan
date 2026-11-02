@@ -25,16 +25,46 @@ pub const pass_def = pass.Pass{ .name = "loadfwd", .run = run, .preserves_cfg = 
 const Avail = struct { ptr: Value, value: Value };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
-    _ = analyses;
     var changed = false;
     var avail: std.ArrayList(Avail) = .empty;
     defer avail.deinit(allocator);
     var keep: std.ArrayList(Inst) = .empty;
     defer keep.deinit(allocator);
 
-    for (0..func.blockCount()) |bi| {
-        avail.clearRetainingCapacity(); // availability does not cross block boundaries here
+    // A block with one predecessor starts with what was available at the end of that
+    // predecessor, which dominates it. Reverse postorder visits the predecessor first.
+    const graph = try analyses.cfg();
+    const rpo = try analyses.reversePostorder();
+    const ends = try allocator.alloc(?[]const Avail, func.blockCount());
+    defer {
+        for (ends) |end| if (end) |items| allocator.free(items);
+        allocator.free(ends);
+    }
+    @memset(ends, null);
+    const order = try allocator.alloc(u32, func.blockCount());
+    defer allocator.free(order);
+    const reached = try allocator.alloc(bool, func.blockCount());
+    defer allocator.free(reached);
+    @memset(reached, false);
+    for (rpo, 0..) |b, k| {
+        order[k] = b;
+        reached[b] = true;
+    }
+    var next = rpo.len;
+    for (reached, 0..) |r, b| if (!r) {
+        order[next] = @intCast(b);
+        next += 1;
+    };
+
+    for (order) |bi| {
+        avail.clearRetainingCapacity();
         keep.clearRetainingCapacity();
+        if (bi < graph.blockCount()) {
+            const preds = graph.predecessors(bi);
+            if (preds.len == 1 and preds[0] != bi) {
+                if (ends[preds[0]]) |items| try avail.appendSlice(allocator, items);
+            }
+        }
         var block_changed = false;
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             switch (func.opcode(inst)) {
@@ -132,6 +162,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             }
             try keep.append(allocator, inst);
         }
+        ends[bi] = try allocator.dupe(Avail, avail.items);
         if (block_changed) {
             try func.setBlockInsts(@fromBackingInt(@intCast(bi)), keep.items);
             changed = true;
@@ -283,6 +314,61 @@ test "a store forwards its value to a later load of the same address" {
 
     try testing.expect(try runOnce(allocator, &func));
     try testing.expectEqual(v, func.terminator(b).?.ret.values[0]); // load forwarded the stored value
+}
+
+test "a block with one predecessor reuses a load from it, a join block does not" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try i32Ty(&func);
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const only = try func.appendBlock();
+    const other = try func.appendBlock();
+    const join = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const first = try func.appendInst(entry, t, .{ .load = .{ .ptr = p } });
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const positive = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = first, .rhs = zero } });
+    try func.appendIf(entry, positive, .{ .target = only }, .{ .target = other });
+    const second = try func.appendInst(only, t, .{ .load = .{ .ptr = p } });
+    func.setTerminator(only, .{ .ret = ir.function.Ret.one(second) });
+    try func.setJump(other, join, &.{});
+    const third = try func.appendInst(join, t, .{ .load = .{ .ptr = p } });
+    func.setTerminator(join, .{ .ret = ir.function.Ret.one(third) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    try testing.expectEqual(first, func.terminator(only).?.ret.values[0]);
+    // `join` has one predecessor too, so it is answered through `other`.
+    try testing.expectEqual(first, func.terminator(join).?.ret.values[0]);
+}
+
+test "a join block with two predecessors does not reuse a load" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try i32Ty(&func);
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const left = try func.appendBlock();
+    const right = try func.appendBlock();
+    const join = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const v = try func.appendBlockParam(entry, t);
+    const first = try func.appendInst(entry, t, .{ .load = .{ .ptr = p } });
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const positive = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = first, .rhs = zero } });
+    try func.appendIf(entry, positive, .{ .target = left }, .{ .target = right });
+    try func.appendStore(left, v, p);
+    try func.setJump(left, join, &.{});
+    try func.setJump(right, join, &.{});
+    const again = try func.appendInst(join, t, .{ .load = .{ .ptr = p } });
+    func.setTerminator(join, .{ .ret = ir.function.Ret.one(again) });
+
+    _ = try runOnce(allocator, &func);
+    try testing.expectEqual(again, func.terminator(join).?.ret.values[0]);
 }
 
 test "a second load of an address reuses the first" {
