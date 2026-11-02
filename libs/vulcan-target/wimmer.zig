@@ -2301,6 +2301,40 @@ fn loopSpans(allocator: std.mem.Allocator, func: *const Function, block_from: []
     return spans.toOwnedSlice(allocator);
 }
 
+/// The entry of the outermost loop containing `p` that `it` lives through without a use, or
+/// null. Spilling there keeps the store and reload out of the loop.
+fn loopThroughSpill(it: *const Interval, p: u32, loop_spans: []const Range) ?u32 {
+    var best: ?u32 = null;
+    for (loop_spans) |span| {
+        if (span.from > p or p >= span.to) continue;
+        if (span.from <= it.start() or !it.covers(span.from)) continue;
+        const used = for (it.uses) |use| {
+            if (use.pos >= span.from and use.pos < span.to) break true;
+        } else false;
+        if (used) continue;
+        if (best == null or span.from < best.?) best = span.from;
+    }
+    return best;
+}
+
+/// The next use of `it` after `p`, seen around the back edge of the innermost loop containing
+/// `p`. A value live at that loop's end with a use earlier in the loop is wanted again next
+/// iteration, so it counts as used at the loop end instead of at its next linear use.
+fn loopAwareNextUse(it: *const Interval, p: u32, loop_spans: []const Range) u32 {
+    const linear = it.firstUseAfter(p) orelse it.end();
+    var inner: ?Range = null;
+    for (loop_spans) |span| {
+        if (span.from > p or p >= span.to) continue;
+        if (inner == null or span.to - span.from < inner.?.to - inner.?.from) inner = span;
+    }
+    const loop = inner orelse return linear;
+    if (linear < loop.to or !it.covers(loop.to - 1)) return linear;
+    for (it.uses) |use| {
+        if (use.pos >= loop.from and use.pos < p) return loop.to;
+    }
+    return linear;
+}
+
 /// For a spilled part that reloads at `use`, the entry of the outermost loop that contains the
 /// use and starts after the spilled part does. Null when no loop qualifies.
 fn loopEntrySplit(current: *const Interval, use: u32, loop_spans: []const Range) ?u32 {
@@ -2524,7 +2558,7 @@ fn allocateBlockedReg(
         if (it.fixed_reg != null) continue;
         const r = assignedReg(it);
         if (r >= limit) continue;
-        const u = it.firstUseAfter(p) orelse it.end();
+        const u = loopAwareNextUse(it, p, loop_spans);
         // The occupant holds its WHOLE span, so every register of it is wanted again at that use,
         // and every register of it is unevictable when the occupant starts here. Recording the base
         // only would let the scan steal the second half of a two-register value.
@@ -2692,6 +2726,13 @@ fn allocateBlockedReg(
         if (it.fixed_reg != null) continue;
         if (!spansOverlap(assignedReg(it), it.regs, reg, current.regs)) continue;
         std.debug.assert(it.start() < p);
+        // A value the loop around `p` never reads leaves its register at the loop entry, so
+        // the store sits on the entry edge instead of inside every iteration.
+        if (loopThroughSpill(it, p, loop_spans)) |entry| {
+            const tail = try splitInterval(allocator, it, entry, children);
+            try spillCurrent(allocator, tail, unhandled, children, slots, class_idx, block_from, loop_spans);
+            continue;
+        }
         const tail = try splitInterval(allocator, it, p, children);
         try insertSorted(allocator, unhandled, tail);
     }

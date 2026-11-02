@@ -3360,7 +3360,8 @@ fn forwardedBlock(ctx: *const Ctx, start: Block) Block {
     for (0..8) |_| {
         if (func.blockInsts(block).len != 0 or func.blockParams(block).len != 0) return block;
         const term = func.terminator(block) orelse return block;
-        if (term != .jump or func.blockArgs(term.jump).len != 0) return block;
+        // Edge arguments already in their parameter locations emit no moves.
+        if (term != .jump) return block;
         if (!edgeMovesEmpty(ctx, term.jump, block) or ctx.block_busy[@backingInt(block)]) return block;
         block = term.jump.target;
     }
