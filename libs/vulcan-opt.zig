@@ -48,6 +48,7 @@ pub const default_pipeline = [_]pass.Pass{
     branchfold.pass_def,
     ifconvert.pass_def,
     jumpthread.pass_def,
+    jumpthread.single_edge_params_pass_def,
     gvn.pass_def,
     licm.pass_def,
     dce.pass_def,

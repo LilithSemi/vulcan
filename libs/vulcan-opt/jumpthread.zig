@@ -89,6 +89,115 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     return changed;
 }
 
+/// A block entered by exactly one edge gets its parameters straight from that edge. The
+/// predecessor dominates the block, so each incoming value is available at every use of its
+/// parameter. Threading a short-circuit merge leaves this shape behind.
+pub const single_edge_params_pass_def = pass.Pass{ .name = "single-edge-params", .run = runSingleEdgeParams, .preserves_cfg = true };
+
+fn runSingleEdgeParams(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    _ = analyses;
+    return forwardSingleEdgeParams(allocator, func);
+}
+
+fn forwardSingleEdgeParams(allocator: std.mem.Allocator, func: *Function) pass.Error!bool {
+    const n = func.blockCount();
+    const Edge = struct { block: Block, kind: EdgeRef, inst: ?Inst };
+    const counts = try allocator.alloc(u32, n);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+    const edges = try allocator.alloc(?Edge, n);
+    defer allocator.free(edges);
+    @memset(edges, null);
+    // An unreachable cycle can feed itself, so only reachable blocks are proven dominated.
+    const reachable = try allocator.alloc(bool, n);
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+    var work: std.ArrayList(Block) = .empty;
+    defer work.deinit(allocator);
+    if (n > 0) {
+        reachable[0] = true;
+        try work.append(allocator, @fromBackingInt(0));
+    }
+    while (work.pop()) |block| {
+        var succs: [3]?Block = .{ null, null, null };
+        for (func.blockInsts(block)) |inst| if (func.opcode(inst) == .@"if") {
+            succs[0] = func.opcode(inst).@"if".then.target;
+            succs[1] = func.opcode(inst).@"if".@"else".target;
+        };
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |j| succs[2] = j.target,
+            .ret => {},
+        };
+        for (succs) |maybe| {
+            const s = maybe orelse continue;
+            if (reachable[@backingInt(s)]) continue;
+            reachable[@backingInt(s)] = true;
+            try work.append(allocator, s);
+        }
+    }
+
+    // Count only edges from reachable blocks: a threaded-away block still jumps on.
+    for (0..n) |bi| {
+        if (!reachable[bi]) continue;
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| if (func.opcode(inst) == .@"if") {
+            const cf = func.opcode(inst).@"if";
+            counts[@backingInt(cf.then.target)] += 1;
+            edges[@backingInt(cf.then.target)] = .{ .block = block, .kind = .if_then, .inst = inst };
+            counts[@backingInt(cf.@"else".target)] += 1;
+            edges[@backingInt(cf.@"else".target)] = .{ .block = block, .kind = .if_else, .inst = inst };
+        };
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |j| {
+                counts[@backingInt(j.target)] += 1;
+                edges[@backingInt(j.target)] = .{ .block = block, .kind = .jump, .inst = null };
+            },
+            .ret => {},
+        };
+    }
+    const emptied = try allocator.alloc(bool, n);
+    defer allocator.free(emptied);
+    @memset(emptied, false);
+    var changed = false;
+    for (1..n) |bi| {
+        if (counts[bi] != 1 or !reachable[bi]) continue;
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const params = func.blockParams(block);
+        if (params.len == 0) continue;
+        const edge = edges[bi].?;
+        if (edge.block == block) continue;
+        const jump = switch (edge.kind) {
+            .jump => func.terminator(edge.block).?.jump,
+            .if_then => func.opcode(edge.inst.?).@"if".then,
+            .if_else => func.opcode(edge.inst.?).@"if".@"else",
+        };
+        const args = func.blockArgs(jump);
+        if (args.len != params.len) continue;
+        for (params, args) |param, arg| func.replaceAllUses(param, arg);
+        try func.setBlockParams(block, &.{});
+        emptied[bi] = true;
+        changed = true;
+    }
+    if (!changed) return false;
+    // Every edge into an emptied block, including one from a dead block, now carries nothing.
+    const none = try func.internValues(&.{});
+    for (0..n) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| if (func.opcode(inst) == .@"if") {
+            const cf = func.opcodeMut(inst);
+            if (emptied[@backingInt(cf.@"if".then.target)]) cf.@"if".then.args = none;
+            if (emptied[@backingInt(cf.@"if".@"else".target)]) cf.@"if".@"else".args = none;
+        };
+        if (func.terminatorPtr(block).*) |*term| switch (term.*) {
+            .jump => |*j| if (emptied[@backingInt(j.target)]) {
+                j.args = none;
+            },
+            .ret => {},
+        };
+    }
+    return true;
+}
+
 const Candidates = struct { has_if: bool = false, has_forwarder: bool = false };
 
 fn findCandidates(func: *const Function) Candidates {
@@ -319,6 +428,10 @@ fn tryThreadEdge(
             break;
         }
     }
+    // A compare in B of a B param against a constant is known too when P passes a constant.
+    // A loop header is left alone: threading its entry edge would rotate the loop away from
+    // the top-tested shape the loop passes recognize.
+    if (known == null and !isLoopHeader(doms, cfg, bi_b)) known = knownParamCompare(func, b, cond, p_args);
     const truth = known orelse return false;
 
     const s_edge = if (truth) then_edge else else_edge;
@@ -387,6 +500,58 @@ fn tryThreadEdge(
         .if_else => func.opcodeMut(p_if.?).@"if".@"else" = .{ .target = s, .args = new_args },
     }
     return true;
+}
+
+fn isLoopHeader(doms: *const dom.Dominators, cfg: *const cfg_mod.Cfg, b: u32) bool {
+    for (cfg.predecessors(b)) |q| {
+        if (doms.dominates(b, q)) return true;
+    }
+    return false;
+}
+
+/// The outcome of `cond = icmp param, k` defined in B, when P passes a constant for `param`.
+/// This is the merge a short-circuit `&&` or `||` leaves: one edge passes a constant bool.
+fn knownParamCompare(func: *const Function, b: Block, cond: Value, p_args: []const Value) ?bool {
+    const cond_inst = func.definingInst(cond) orelse return null;
+    if (std.mem.indexOfScalar(Inst, func.blockInsts(b), cond_inst) == null) return null;
+    const cmp = switch (func.opcode(cond_inst)) {
+        .icmp => |c| c,
+        else => return null,
+    };
+    const k_inst = func.definingInst(cmp.rhs) orelse return null;
+    const k = switch (func.opcode(k_inst)) {
+        .iconst => |c| c,
+        else => return null,
+    };
+    const int = switch (func.types.type_kind(func.valueType(cmp.lhs))) {
+        .int => |i| i,
+        else => return null,
+    };
+    if (int.bits == 0 or int.bits > 64) return null;
+    for (func.blockParams(b), 0..) |param, i| {
+        if (param != cmp.lhs) continue;
+        if (i >= p_args.len) return null;
+        const arg_inst = func.definingInst(p_args[i]) orelse return null;
+        const c = switch (func.opcode(arg_inst)) {
+            .iconst => |v| v,
+            else => return null,
+        };
+        const shift: u6 = @intCast(64 - @as(u32, int.bits));
+        const ua = (@as(u64, @bitCast(c)) << shift) >> shift;
+        const ub = (@as(u64, @bitCast(k)) << shift) >> shift;
+        const sa = @as(i64, @bitCast(@as(u64, @bitCast(c)) << shift)) >> shift;
+        const sb = @as(i64, @bitCast(@as(u64, @bitCast(k)) << shift)) >> shift;
+        const signed = int.signedness == .signed;
+        return switch (cmp.op) {
+            .eq => ua == ub,
+            .ne => ua != ub,
+            .lt => if (signed) sa < sb else ua < ub,
+            .le => if (signed) sa <= sb else ua <= ub,
+            .gt => if (signed) sa > sb else ua > ub,
+            .ge => if (signed) sa >= sb else ua >= ub,
+        };
+    }
+    return null;
 }
 
 /// Tail-duplicate B for the edge P->B whose `@"if"` outcome selects successor S. Clone B onto a fresh
@@ -1354,4 +1519,68 @@ test "a block holding an atomic is tail-duplicated, not threaded past" {
     }
     try testing.expectEqual(@as(usize, 1), atomics);
     try verifyClean(allocator, &func);
+}
+
+/// `a >= 0 && b != 0` as the frontend lowers it: the false edge of the first test passes a
+/// constant into the merge, which tests its param against zero.
+fn buildShortCircuit(func: *Function) !struct { entry: Block, no: Block } {
+    const t = try i32Ty(func);
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const rhs = try func.appendBlock();
+    const merge = try func.appendBlock();
+    const yes = try func.appendBlock();
+    const no = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const c1 = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .ge, .lhs = a, .rhs = zero } });
+    try func.appendIf(entry, c1, .{ .target = rhs }, .{ .target = merge, .args = &.{zero} });
+    try func.setJump(rhs, merge, &.{b});
+    const p = try func.appendBlockParam(merge, t);
+    const zero2 = try func.appendInst(merge, t, .{ .iconst = 0 });
+    const c2 = try func.appendInst(merge, bool_t, .{ .icmp = .{ .op = .ne, .lhs = p, .rhs = zero2 } });
+    try func.appendIf(merge, c2, .{ .target = yes }, .{ .target = no });
+    const one = try func.appendInst(yes, t, .{ .iconst = 1 });
+    func.setTerminator(yes, .{ .ret = ir.function.Ret.one(one) });
+    const two = try func.appendInst(no, t, .{ .iconst = 2 });
+    func.setTerminator(no, .{ .ret = ir.function.Ret.one(two) });
+    return .{ .entry = entry, .no = no };
+}
+
+test "jumpthread: a constant fed into a short-circuit merge compare threads to its target" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const shape = try buildShortCircuit(&func);
+
+    try testing.expect(try runOnce(allocator, &func));
+    try verifyClean(allocator, &func);
+    const entry_if = endsInIf(&func, shape.entry).?;
+    try testing.expectEqual(shape.no, func.opcode(entry_if).@"if".@"else".target);
+    const inputs = [_][2]i64{ .{ -1, 0 }, .{ -1, 5 }, .{ 0, 0 }, .{ 3, 7 } };
+    for (inputs) |in| {
+        const want: i64 = if (in[0] >= 0 and in[1] != 0) 1 else 2;
+        try testing.expectEqual(want, try evalFunc(&func, &in));
+    }
+}
+
+test "single-edge params: a block entered by one edge takes its values from that edge" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const shape = try buildShortCircuit(&func);
+    _ = try runOnce(allocator, &func);
+    // After threading, the merge is entered by one live edge, so its param can go.
+    const entry_if = endsInIf(&func, shape.entry).?;
+    const merge = func.opcode(entry_if).@"if".then.target;
+    try testing.expectEqual(@as(usize, 1), func.blockParams(merge).len);
+    try testing.expect(try forwardSingleEdgeParams(allocator, &func));
+    try verifyClean(allocator, &func);
+    try testing.expectEqual(@as(usize, 0), func.blockParams(merge).len);
+    const inputs = [_][2]i64{ .{ -1, 0 }, .{ -1, 5 }, .{ 0, 0 }, .{ 3, 7 } };
+    for (inputs) |in| {
+        const want: i64 = if (in[0] >= 0 and in[1] != 0) 1 else 2;
+        try testing.expectEqual(want, try evalFunc(&func, &in));
+    }
 }
