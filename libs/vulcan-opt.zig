@@ -20,6 +20,7 @@ pub const egraph = @import("vulcan-opt/egraph.zig");
 pub const strength = @import("vulcan-opt/strength.zig");
 pub const immform = @import("vulcan-opt/immform.zig");
 pub const branchfold = @import("vulcan-opt/branchfold.zig");
+pub const rangecheck = @import("vulcan-opt/rangecheck.zig");
 pub const ifconvert = @import("vulcan-opt/ifconvert.zig");
 pub const gvn = @import("vulcan-opt/gvn.zig");
 pub const licm = @import("vulcan-opt/licm.zig");
@@ -46,6 +47,7 @@ pub const default_pipeline = [_]pass.Pass{
     strength.pass_def,
     immform.pass_def,
     branchfold.pass_def,
+    rangecheck.pass_def,
     ifconvert.pass_def,
     jumpthread.pass_def,
     jumpthread.single_edge_params_pass_def,

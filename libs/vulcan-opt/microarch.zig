@@ -14,6 +14,7 @@ const immform = @import("immform.zig");
 const dce = @import("dce.zig");
 const licm = @import("licm.zig");
 const jumpthread = @import("jumpthread.zig");
+const rangecheck = @import("rangecheck.zig");
 const ifconvert = @import("ifconvert.zig");
 const loopimm = @import("microarch/loopimm.zig");
 const looprotate = @import("microarch/looprotate.zig");
@@ -133,11 +134,13 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
     return outer or split or looped or iv_reduced or unrolled or vectorized or if_converted or late_cleaned or dotted or matmuled or prefetched;
 }
 
-/// Thread the constants a late-inlined callee returns into the compares after the call. Then
-/// hoist safe constants exposed by the inline when the target score accepts the result.
+/// Thread the constants a late-inlined callee returns into the compares after the call, and fuse
+/// the range checks it exposes. Then hoist safe constants exposed by the inline when the target
+/// score accepts the result.
 pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Function, m: *const Model) pass.Error!bool {
     const threaded = try pass.runToFixpoint(allocator, func, &.{
         jumpthread.pass_def,
+        rangecheck.pass_def,
         dce.pass_def,
     }, 8);
     var gate = try score.IRGate.init(allocator, func, m);
