@@ -2061,3 +2061,56 @@ test "wimmer: a long chain with many live values allocates without scanning ever
     // The values are live to the end, so every one of them has a placement.
     try std.testing.expect(alloc.segments.count() >= 1500);
 }
+
+test "scan: x86_64 keeps values a loop never reads out of the loop's spill traffic" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const exit = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, t);
+    const n = try func.appendBlockParam(entry, t);
+    // Fourteen values live across the loop but unused in it, more than the gpr pool holds.
+    var live: [14]Value = undefined;
+    for (&live, 0..) |*v, k| v.* = try func.appendArithImm(entry, t, .mul, x, @intCast(k + 3));
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    try func.setJump(entry, header, &.{zero});
+    const i = try func.appendBlockParam(header, t);
+    const more = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(header, more, .{ .target = body }, .{ .target = exit });
+    const sq = try func.appendInst(body, t, .{ .arith = .{ .op = .mul, .lhs = i, .rhs = i } });
+    const next = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = i, .rhs = sq } });
+    const step = try func.appendArithImm(body, t, .add, next, 1);
+    try func.setJump(body, header, &.{step});
+    var acc = i;
+    for (live) |v| acc = try func.appendInst(exit, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(acc) });
+
+    var desc = try x86_64.x86_64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+    var alloc = try wimmer.allocate(allocator, &func, &desc);
+    defer alloc.deinit(allocator);
+
+    try std.testing.expect(alloc.slot_count_per_class[0] > 0);
+    // Header and body are blocks 1 and 2: no split action lands in them.
+    var pos: u32 = 0;
+    var loop_from: u32 = 0;
+    var loop_to: u32 = 0;
+    for (0..func.blockCount()) |bi| {
+        const size: u32 = 2 + @as(u32, @intCast(func.blockInsts(@fromBackingInt(@intCast(bi))).len));
+        if (bi == 1) loop_from = pos;
+        if (bi == 2) loop_to = pos + size;
+        pos += size;
+    }
+    for (alloc.actions) |action| try std.testing.expect(action.at < loop_from or action.at >= loop_to);
+    // The back edge carries no moves.
+    for (alloc.edge_moves) |edge| {
+        if (edge.pred == body and edge.succ == header) {
+            for (edge.moves) |m| try std.testing.expect(locEq(m.src, m.dst));
+        }
+    }
+}
