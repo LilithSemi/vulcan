@@ -10,6 +10,7 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const pass = @import("pass.zig");
+const loops = @import("loops.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -130,6 +131,10 @@ fn runFiltered(allocator: std.mem.Allocator, func: *Function, analyses: *pass.An
         // so it is not a canonical preheader. Every opcode accepted by `hoistable` is deliberately
         // safe to speculate, making that guarded entry a valid insertion point for LICM.
         const pre = loop.preheader orelse loop.entry orelse continue;
+        // Register allocation numbers blocks in index order and expects a definition to come
+        // before its uses. A pass that appends a preheader after its loop breaks that order, and
+        // block layout does not always repair it.
+        if (!precedesLoop(func, &loop, pre)) continue;
 
         // A value is invariant if it is defined outside the loop. Loop block
         // params stay variant. Loop instructions become invariant once proven.
@@ -187,6 +192,13 @@ fn runFiltered(allocator: std.mem.Allocator, func: *Function, analyses: *pass.An
         changed = true;
     }
     return changed;
+}
+
+fn precedesLoop(func: *const Function, loop: *const loops.Loop, pre: u32) bool {
+    for (0..func.blockCount()) |bi| {
+        if (bi < loop.body.len and loop.contains(bi) and bi < pre) return false;
+    }
+    return true;
 }
 
 fn literal(opcode: ir.function.Opcode) bool {
@@ -270,6 +282,40 @@ test "hoists a loop-invariant product to the preheader" {
     // The invariant `x * y` left the body and landed in the preheader (entry).
     try std.testing.expectEqual(entry_before + 1, func.blockInsts(entry).len);
     try std.testing.expectEqual(body_before - 1, func.blockInsts(body).len);
+}
+
+test "does not hoist into a preheader numbered after its loop" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const pre = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, i32_t);
+    const y = try func.appendBlockParam(entry, i32_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    try func.setJump(entry, pre, &.{});
+    const zero = try func.appendInst(pre, i32_t, .{ .iconst = 0 });
+    try func.setJump(pre, loop, &.{zero});
+    const i = try func.appendBlockParam(loop, i32_t);
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    _ = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+    const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{next});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
+
+    const body_before = func.blockInsts(body).len;
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+    try std.testing.expectEqual(body_before, func.blockInsts(body).len);
 }
 
 test "hoists before a guarded loop entry's structured control" {

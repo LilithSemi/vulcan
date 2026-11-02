@@ -147,7 +147,7 @@ fn canBuildPackedVector(func: *const Function, block: Block, scalars: []const Va
     const first_inst = func.definingInst(scalars[0]) orelse return false;
     switch (func.opcode(first_inst)) {
         .arith_imm => |first| {
-            if (!modelSupportsI32Op(model, first.op)) return false;
+            if (!modelSupportsI32ImmOp(model, first.op)) return false;
             var lhs: [MAX_LANES]Value = undefined;
             lhs[0] = first.lhs;
             for (scalars[1..], 1..) |scalar, lane| {
@@ -681,7 +681,7 @@ pub fn runModel(allocator: std.mem.Allocator, func: *Function, model: *const mm.
     const vec_ok = switch (model.features) {
         .aarch64 => |f| f.neon,
         .riscv64 => |f| f.v or f.vpu,
-        .x86_64 => false,
+        .x86_64 => |f| f.sse41,
         // An NVIDIA model vectorizes nothing here: a warp lane IS the vector lane on an SM, so
         // packing several f32 into one IR vector op describes the wrong machine and the NVIDIA
         // backend has no lowering for one.
@@ -693,7 +693,7 @@ pub fn runModel(allocator: std.mem.Allocator, func: *Function, model: *const mm.
     const lanes: u8 = @intCast(@min(lanes_full, @as(u16, MAX_LANES)));
     // Both CORE-ET's packed-integer unit and AArch64 NEON lower integer vectors. The per-op gate
     // below accounts for their different instruction sets.
-    const allow_i32 = model.vpu() or model.arch == .aarch64;
+    const allow_i32 = model.vpu() or model.arch == .aarch64 or model.arch == .x86_64;
     return runLanesGated(allocator, func, lanes, allow_i32, model);
 }
 
@@ -733,8 +733,19 @@ fn modelSupportsI32Op(model: ?*const mm.Model, op: BinOp) bool {
             .div, .rem, .mulh, .shr => false,
         },
         .riscv64 => m.vpu() and piSupportsOp(op),
-        .x86_64, .nvidia => false,
+        // SSE4.1 has pmulld. Shifts by a vector amount need AVX2, so only splat shifts lower.
+        .x86_64 => switch (op) {
+            .add, .sub, .mul, .bit_and, .bit_or, .bit_xor => true,
+            .div, .rem, .mulh, .shl, .shr => false,
+        },
+        .nvidia => false,
     };
+}
+
+/// The broadcast-immediate form. x86 lowers a shift by a splat constant with one SSE2 shift.
+fn modelSupportsI32ImmOp(model: ?*const mm.Model, op: BinOp) bool {
+    if (model) |m| if (m.arch == .x86_64 and (op == .shl or op == .shr)) return true;
+    return modelSupportsI32Op(model, op);
 }
 
 /// Fuse a run of scalar integer immediate operations into one vector operation with a broadcast
@@ -765,7 +776,7 @@ fn vectorizeImmediateOne(
         const head = func.opcode(insts[g]);
         if (head != .arith_imm) continue;
         const head_result = func.instResult(insts[g]).?;
-        if (!isScalarI32(func, head_result) or !modelSupportsI32Op(model, head.arith_imm.op)) continue;
+        if (!isScalarI32(func, head_result) or !modelSupportsI32ImmOp(model, head.arith_imm.op)) continue;
         const head_ty = func.valueType(head_result);
         var lhs: [MAX_LANES]Value = undefined;
         var results: [MAX_LANES]Value = undefined;

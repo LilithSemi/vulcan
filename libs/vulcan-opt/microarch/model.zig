@@ -112,6 +112,7 @@ pub const Features = union(Arch) {
         zfh: bool = false,
     },
     x86_64: struct {
+        sse41: bool = false,
         avx2: bool = false,
         fma: bool = false,
         avx512f: bool = false,
@@ -145,6 +146,7 @@ pub const Microarch = enum {
     @"river-rc1.f",
     @"river-rc1.ma",
     @"cascadelake-sp",
+    zen4,
     sm_120,
 
     pub fn parse(name_: []const u8) ?Microarch {

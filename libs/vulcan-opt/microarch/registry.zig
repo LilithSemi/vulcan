@@ -182,6 +182,46 @@ fn cascadelakeThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
     };
 }
 
+// AMD Zen 4 (family 19h). Public figures from the AMD family 19h software optimization guide:
+// imul is 3 cycles, the 32-bit divider is 10 to 14 cycles, and an integer L1 hit is 4 cycles.
+fn zen4Arith(op: ir.function.BinOp) u32 {
+    return switch (op) {
+        .mul, .mulh => 3,
+        .div, .rem => 14,
+        .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
+    };
+}
+
+fn zen4Latency(op: ir.function.Opcode) u32 {
+    return switch (op) {
+        .arith => |a| zen4Arith(a.op),
+        .arith_imm => |a| zen4Arith(a.op),
+        .load => 4,
+        .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 3,
+        .dot, .reduce => 3,
+        .splat => 1,
+        .matmul => 64,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .va_start, .va_arg, .va_end, .atomic_rmw, .barrier => 1,
+    };
+}
+
+fn zen4Throughput(op: ir.function.Opcode, elem_float: bool) u32 {
+    return switch (op) {
+        .arith => |a| zen4ArithThroughput(a.op, elem_float),
+        .arith_imm => |a| zen4ArithThroughput(a.op, elem_float),
+        .matmul => 64,
+        else => 1,
+    };
+}
+
+fn zen4ArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
+    return switch (op) {
+        .div, .rem => if (elem_float) 5 else 7,
+        else => 1,
+    };
+}
+
 fn etsocArith(op: ir.function.BinOp) u32 {
     return switch (op) {
         .mul, .mulh => 8,
@@ -712,6 +752,7 @@ const cascadelake = Model{
     .cache_line = 64,
     .fetch_align = 32,
     .features = .{ .x86_64 = .{
+        .sse41 = true,
         .avx2 = true,
         .fma = true,
         .avx512f = true,
@@ -725,6 +766,40 @@ const cascadelake = Model{
     .throughput = cascadelakeThroughput,
     .unitOf = unitOfShared,
     .fusion = &cascadelake_fusion,
+};
+
+const zen4_fusion = [_]model.FusionRule{
+    .{ .kind = .cmp_branch },
+};
+
+// AMD Zen 4. Six-wide dispatch, four ALUs, three AGUs, and four FP pipes. AVX-512 runs on a
+// 256-bit datapath. The x86_64 backend lowers integer vectors with 128-bit SSE, so vector_bits
+// stays at 128 until the backend has 256-bit integer forms.
+const zen4 = Model{
+    .tag = .zen4,
+    .arch = .x86_64,
+    .exec = .out_of_order,
+    .issue_width = 6,
+    .rob_size = 320,
+    .units = .{ .alu = 4, .muldiv = 1, .mem = 3, .branch = 2, .fpsimd = 4 },
+    .vector_bits = 128,
+    .cache_line = 64,
+    .fetch_align = 32,
+    .features = .{ .x86_64 = .{
+        .sse41 = true,
+        .avx2 = true,
+        .fma = true,
+        .avx512f = true,
+        .avx512vl = true,
+        .avx512dq = true,
+        .avx512bw = true,
+        .avx512vnni = true,
+        .bmi2 = true,
+    } },
+    .latency = zen4Latency,
+    .throughput = zen4Throughput,
+    .unitOf = unitOfShared,
+    .fusion = &zen4_fusion,
 };
 
 /// The sm_120 SM description. Every number carries its source.
@@ -835,6 +910,7 @@ pub fn modelFor(tag: Microarch) *const Model {
         .@"river-rc1.f" => &river_f,
         .@"river-rc1.ma" => &river_ma,
         .@"cascadelake-sp" => &cascadelake,
+        .zen4 => &zen4,
         .sm_120 => &sm_120,
     };
 }
@@ -908,10 +984,58 @@ fn hostIsCascadeLake() bool {
 pub fn detectHost() ?Microarch {
     switch (builtin.cpu.arch) {
         .aarch64 => if (midrPartIsN1()) return .@"ampere-altra",
-        .x86_64 => if (hostIsCascadeLake()) return .@"cascadelake-sp",
+        .x86_64 => {
+            if (hostIsCascadeLake()) return .@"cascadelake-sp";
+            if (hostIsZen4()) return .zen4;
+        },
         else => {},
     }
     return null;
+}
+
+/// Zen 4 is AMD family 19h with AVX-512. Zen 3 shares the family but has no AVX-512.
+fn zen4Discriminator(amd: bool, family: u32, avx512f: bool) bool {
+    return amd and family == 0x19 and avx512f;
+}
+
+fn hostIsZen4() bool {
+    if (comptime builtin.cpu.arch == .x86_64) {
+        const vendor = cpuid(0);
+        // "AuthenticAMD" is spread over ebx, edx, and ecx.
+        const amd = vendor.ebx == 0x68747541 and vendor.edx == 0x69746e65 and vendor.ecx == 0x444d4163;
+        const version = cpuid(1).eax;
+        const base_family = (version >> 8) & 0xF;
+        const family = if (base_family == 0xF) base_family + ((version >> 20) & 0xFF) else base_family;
+        const avx512f = (cpuid(7).ebx & (1 << 16)) != 0;
+        return zen4Discriminator(amd, family, avx512f);
+    } else {
+        return false;
+    }
+}
+
+const CpuidResult = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+fn cpuid(leaf: u32) CpuidResult {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [a] "={eax}" (eax),
+          [b] "={ebx}" (ebx),
+          [c] "={ecx}" (ecx),
+          [d] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [sub] "{ecx}" (@as(u32, 0)),
+    );
+    return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
+}
+
+test "zen4 discriminator needs AMD family 19h with AVX-512" {
+    try std.testing.expect(zen4Discriminator(true, 0x19, true));
+    try std.testing.expect(!zen4Discriminator(true, 0x19, false));
+    try std.testing.expect(!zen4Discriminator(true, 0x17, true));
+    try std.testing.expect(!zen4Discriminator(false, 0x19, true));
 }
 
 test "modelFor returns a self-consistent model for every Microarch" {

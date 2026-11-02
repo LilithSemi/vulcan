@@ -16,6 +16,10 @@ fn ampere() *const opt.microarch.Model {
     return opt.microarch.modelFor(.@"ampere-altra");
 }
 
+fn zen4() *const opt.microarch.Model {
+    return opt.microarch.modelFor(.zen4);
+}
+
 fn hasJit() bool {
     return switch (builtin.cpu.arch) {
         .aarch64, .x86_64, .riscv64, .x86 => true,
@@ -153,6 +157,37 @@ fn buildSumReductionI32(func: *Function) !void {
     func.setTerminator(done, .{ .ret = ir.function.Ret.one(rs) });
 }
 
+/// `for (i = 0; i < n; i += 1) s += a[i] * a[i];` over i32, so the vector body has a lane multiply.
+fn buildSquareSumI32(func: *Function) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero_i = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const zero_s = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{ zero_i, zero_s });
+    const i = try func.appendBlockParam(loop, i32_t);
+    const s = try func.appendBlockParam(loop, i32_t);
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, s } }, .{ .target = done, .args = &.{s} });
+    const bi = try func.appendBlockParam(body, i32_t);
+    const bs = try func.appendBlockParam(body, i32_t);
+    const off = try func.appendArithImm(body, i32_t, .mul, bi, 4);
+    const addr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = off } });
+    const v = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = addr } });
+    const sq = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .mul, .lhs = v, .rhs = v } });
+    const ns = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = sq } });
+    const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{ ni, ns });
+    const rs = try func.appendBlockParam(done, i32_t);
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(rs) });
+}
+
 /// Frontend-shaped three-point stencil with a stored map result and XOR checksum reduction.
 fn buildStencil(func: *Function) !void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
@@ -207,7 +242,7 @@ const StencilFn = *const fn (input: [*]const i32, output: [*]i32, n: u32) callco
 /// Transform: apply loopvec only, or the full microarch pipeline (so SLP widens the body too).
 const Mode = enum { loopvec_only, full };
 
-fn expectMapMatches(build: Builder, mode: Mode) !void {
+fn expectMapMatches(build: Builder, mode: Mode, model: *const opt.microarch.Model) !void {
     const allocator = std.testing.allocator;
     const trip_counts = [_]i32{ 0, 1, 3, 4, 5, 7, 8, 12, 13, 17, 100 };
 
@@ -219,8 +254,8 @@ fn expectMapMatches(build: Builder, mode: Mode) !void {
     defer tuned.deinit();
     try build(&tuned);
     switch (mode) {
-        .loopvec_only => try std.testing.expect(try opt.microarch.loopvec.run(allocator, &tuned, ampere())),
-        .full => _ = try opt.microarch.optimize(allocator, &tuned, ampere()),
+        .loopvec_only => try std.testing.expect(try opt.microarch.loopvec.run(allocator, &tuned, model)),
+        .full => _ = try opt.microarch.optimize(allocator, &tuned, model),
     }
 
     var diags = try ir.verify.verify(allocator, &tuned, .low);
@@ -254,22 +289,22 @@ fn expectMapMatches(build: Builder, mode: Mode) !void {
 
 test "loopvec differential: saxpy, scalar V-unroll, all trip counts" {
     if (comptime !hasJit()) return error.SkipZigTest;
-    try expectMapMatches(buildSaxpy, .loopvec_only);
+    try expectMapMatches(buildSaxpy, .loopvec_only, ampere());
 }
 
 test "loopvec differential: pure square map, scalar V-unroll, all trip counts" {
     if (comptime !hasJit()) return error.SkipZigTest;
-    try expectMapMatches(buildSquare, .loopvec_only);
+    try expectMapMatches(buildSquare, .loopvec_only, ampere());
 }
 
 test "loopvec differential: saxpy through the full pipeline (SLP-widened), all trip counts" {
     if (comptime !hasJit()) return error.SkipZigTest;
-    try expectMapMatches(buildSaxpy, .full);
+    try expectMapMatches(buildSaxpy, .full, ampere());
 }
 
 test "loopvec differential: pure square map through the full pipeline, all trip counts" {
     if (comptime !hasJit()) return error.SkipZigTest;
-    try expectMapMatches(buildSquare, .full);
+    try expectMapMatches(buildSquare, .full, ampere());
 }
 
 fn hasVectorValue(func: *const Function) bool {
@@ -328,18 +363,20 @@ test "loopvec differential: f32 sum reduction (vector accumulator), all trip cou
     }
 }
 
-test "loopvec differential: i32 sum reduction (vector accumulator), all trip counts" {
-    if (comptime !hasJit()) return error.SkipZigTest;
+fn expectI32ReductionMatches(build: Builder, mode: Mode, model: *const opt.microarch.Model) !void {
     const allocator = std.testing.allocator;
     const trip_counts = [_]i32{ 0, 1, 3, 4, 5, 7, 8, 12, 13, 17, 100 };
 
     var orig = Function.init(allocator);
     defer orig.deinit();
-    try buildSumReductionI32(&orig);
+    try build(&orig);
     var tuned = Function.init(allocator);
     defer tuned.deinit();
-    try buildSumReductionI32(&tuned);
-    try std.testing.expect(try opt.microarch.loopvec.run(allocator, &tuned, ampere()));
+    try build(&tuned);
+    switch (mode) {
+        .loopvec_only => try std.testing.expect(try opt.microarch.loopvec.run(allocator, &tuned, model)),
+        .full => _ = try opt.microarch.optimize(allocator, &tuned, model),
+    }
     try std.testing.expect(hasVectorValue(&tuned)); // a genuine vector accumulator was emitted
 
     var diags = try ir.verify.verify(allocator, &tuned, .low);
@@ -357,13 +394,17 @@ test "loopvec differential: i32 sum reduction (vector accumulator), all trip cou
         // Integer add is associative and exact, so serial and vector-partial reductions
         // must agree bit-for-bit at every trip count, not just in the common case.
         var arr: [128]i32 = undefined;
-        for (0..128) |k| arr[k] = @intCast((k % 7) + 1);
+        for (0..128) |k| arr[k] = @as(i32, @intCast((k * 2654435761) % 100003)) - 50000;
         try std.testing.expectEqual(f_o(&arr, n), f_t(&arr, n));
     }
 }
 
-test "loopvec differential: stencil map plus xor reduction, all trip counts" {
+test "loopvec differential: i32 sum reduction (vector accumulator), all trip counts" {
     if (comptime !hasJit()) return error.SkipZigTest;
+    try expectI32ReductionMatches(buildSumReductionI32, .loopvec_only, ampere());
+}
+
+fn expectStencilMatches(model: *const opt.microarch.Model) !void {
     const allocator = std.testing.allocator;
     const trip_counts = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 17, 100 };
 
@@ -373,7 +414,7 @@ test "loopvec differential: stencil map plus xor reduction, all trip counts" {
     var tuned = Function.init(allocator);
     defer tuned.deinit();
     try buildStencil(&tuned);
-    _ = try opt.microarch.optimize(allocator, &tuned, ampere());
+    _ = try opt.microarch.optimize(allocator, &tuned, model);
 
     var diags = try ir.verify.verify(allocator, &tuned, .low);
     defer diags.deinit();
@@ -395,6 +436,20 @@ test "loopvec differential: stencil map plus xor reduction, all trip counts" {
         try std.testing.expectEqual(f_o(&input, &out_o, n), f_t(&input, &out_t, n));
         try std.testing.expectEqualSlices(i32, &out_o, &out_t);
     }
+}
+
+test "loopvec differential: stencil map plus xor reduction, all trip counts" {
+    if (comptime !hasJit()) return error.SkipZigTest;
+    try expectStencilMatches(ampere());
+}
+
+test "zen4 differential: i32 reductions, stencil, and maps through the full pipeline" {
+    if (comptime !hasJit()) return error.SkipZigTest;
+    try expectI32ReductionMatches(buildSumReductionI32, .full, zen4());
+    try expectI32ReductionMatches(buildSquareSumI32, .full, zen4());
+    try expectStencilMatches(zen4());
+    try expectMapMatches(buildSaxpy, .full, zen4());
+    try expectMapMatches(buildSquare, .full, zen4());
 }
 
 test "the full ampere pipeline vectorizes saxpy (splat-aware cost model)" {

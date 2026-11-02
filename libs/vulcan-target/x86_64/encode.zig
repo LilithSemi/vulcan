@@ -192,6 +192,22 @@ pub fn por(dst: Xmm, src: Xmm) Inst {
 pub fn pxor(dst: Xmm, src: Xmm) Inst {
     return sse66Packed(0xEF, dst, src);
 }
+/// `pmulld dst, src` (66 0F 38 40 /r, SSE4.1): the low 32 bits of each lane product.
+pub fn pmulld(dst: Xmm, src: Xmm) Inst {
+    const r = xn(dst);
+    const b = xn(src);
+    const mod: u8 = 0xC0 | ((r & 7) << 3) | (b & 7);
+    if (r >= 8 or b >= 8) {
+        const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+        return Inst.of(&.{ 0x66, rex, 0x0F, 0x38, 0x40, mod });
+    }
+    return Inst.of(&.{ 0x66, 0x0F, 0x38, 0x40, mod });
+}
+
+test "pmulld encodes the SSE4.1 form" {
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x38, 0x40, 0xC1 }, pmulld(.xmm0, .xmm1).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x45, 0x0F, 0x38, 0x40, 0xFE }, pmulld(.xmm15, .xmm14).slice());
+}
 
 fn sse66ShiftImm(digit: u3, dst: Xmm, imm: u8) Inst {
     const reg = xn(dst);
@@ -973,6 +989,33 @@ pub fn movFromMem32(dst: Reg, base: Reg, disp: i32) Inst {
 pub fn movToMem32(base: Reg, disp: i32, src: Reg) Inst {
     return movMem32(0x89, src, base, disp);
 }
+/// `movsxd dst, dword [base + index*4]` (REX.W 63 /r with a SIB byte). `base` must not be rbp
+/// or r13, whose mod=00 encoding means a disp32 with no base.
+pub fn movsxdIndexed4(dst: Reg, base: Reg, index: Reg) Inst {
+    std.debug.assert(n(base) & 7 != 5);
+    std.debug.assert(index != .rsp);
+    const rex: u8 = 0x48 | (@as(u8, @intFromBool(n(dst) >= 8)) << 2) | (@as(u8, @intFromBool(n(index) >= 8)) << 1) | @intFromBool(n(base) >= 8);
+    const mrm: u8 = ((n(dst) & 7) << 3) | 0x04;
+    const sib: u8 = (2 << 6) | ((n(index) & 7) << 3) | (n(base) & 7);
+    return Inst.of(&.{ rex, 0x63, mrm, sib });
+}
+
+/// `jmp r64` (FF /4).
+pub fn jmpReg(target: Reg) Inst {
+    const mrm: u8 = 0xE0 | (n(target) & 7);
+    if (n(target) >= 8) return Inst.of(&.{ 0x41, 0xFF, mrm });
+    return Inst.of(&.{ 0xFF, mrm });
+}
+
+test "jump table encoders" {
+    // movsxd r10, dword [r11 + r10*4]
+    try std.testing.expectEqualSlices(u8, &.{ 0x4F, 0x63, 0x14, 0x93 }, movsxdIndexed4(.r10, .r11, .r10).slice());
+    // movsxd rax, dword [rcx + rdx*4]
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x63, 0x04, 0x91 }, movsxdIndexed4(.rax, .rcx, .rdx).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0xFF, 0xE2 }, jmpReg(.r10).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0xFF, 0xE0 }, jmpReg(.rax).slice());
+}
+
 /// Sign-extending 32-bit load `movsxd r64, [base+disp]` (63 /r, REX.W): a signed i32 into i64.
 pub fn movsxdFromMem(dst: Reg, base: Reg, disp: i32) Inst {
     return movMem(0x63, dst, base, disp);

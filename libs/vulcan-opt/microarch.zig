@@ -110,7 +110,7 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
     } else false;
     // Loop versioning and SLP create invariant splats after the ordinary optimization pipeline.
     // LICM understands guarded entries and hoists these non-trapping broadcasts before scheduling.
-    const late_cleaned = if (m.arch == .aarch64) late: {
+    const late_cleaned = if (m.arch == .aarch64 or m.arch == .x86_64) late: {
         var gate = try score.IRGate.init(allocator, func, m);
         defer gate.deinit();
         const candidate_changed = try pass.runToFixpoint(allocator, gate.candidateFunction(), &.{ licm.pass_def, dce.pass_def }, 4);
@@ -140,10 +140,15 @@ pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Funct
 
 /// Apply target-aware IR rewrites after generic canonicalization and before instruction selection.
 pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Function, m: *const Model) pass.Error!bool {
-    if (m.arch != .aarch64) return false;
+    // x86 encodes any imm32 in place, so hoisting loop immediates only adds register pressure.
+    const passes: []const pass.Pass = switch (m.arch) {
+        .aarch64 => &.{ rangediv.pass_def, offsetcombine.pass_def, loopimm.pass_def, looprotate.pass_def, dce.pass_def },
+        .x86_64 => &.{ rangediv.pass_def, offsetcombine.pass_def, dce.pass_def },
+        else => return false,
+    };
     var gate = try score.IRGate.init(allocator, func, m);
     defer gate.deinit();
-    const changed = try pass.run(allocator, gate.candidateFunction(), &.{ rangediv.pass_def, offsetcombine.pass_def, loopimm.pass_def, looprotate.pass_def, dce.pass_def });
+    const changed = try pass.run(allocator, gate.candidateFunction(), passes);
     if (!changed) return false;
     return gate.commit(func);
 }

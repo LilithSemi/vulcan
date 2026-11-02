@@ -590,11 +590,11 @@ test "codegen+disasm round-trip: integer add" {
     defer a.free(code);
     const text = try disasm.format(a, code);
     defer a.free(text);
-    // The shared Wimmer allocator keeps the two params in their ABI registers and the
-    // result in rax, so the add is `x += y` in place with no shuffle moves.
+    // The add result reuses the dying `x` register (two-address `x += y`), and one move
+    // carries it to rax for the return.
     try std.testing.expectEqualStrings(
-        \\0000: mov rax, rdi
-        \\0003: add eax, esi
+        \\0000: add edi, esi
+        \\0002: mov rax, rdi
         \\0005: ret
         \\
     , text);
@@ -632,7 +632,7 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
         \\000a: test rax, rax
         \\000d: jne .+5
         \\0013: jmp .+14
-        \\0018: jmp .+4
+        \\0018: jmp .+0
         \\001d: mov rax, rdi
         \\0020: ret
         \\0021: jmp .-9
@@ -831,7 +831,8 @@ test "x86_64 cmp_branch fold: tuned build emits cmp+jcc with no setcc, plain kee
     const tuned_text = try disasm.format(a, tuned);
     defer a.free(tuned_text);
     try std.testing.expect(std.mem.indexOf(u8, tuned_text, "cmp ") != null); // the compare survives
-    try std.testing.expect(std.mem.indexOf(u8, tuned_text, "jg ") != null); // fused conditional branch (signed gt)
+    // Fused conditional branch on signed gt, or its inverse when the else edge falls through.
+    try std.testing.expect(std.mem.indexOf(u8, tuned_text, "jg ") != null or std.mem.indexOf(u8, tuned_text, "jle ") != null);
     try std.testing.expect(std.mem.indexOf(u8, tuned_text, "setg") == null); // no boolean materialized
     try std.testing.expect(std.mem.indexOf(u8, tuned_text, "movzx") == null); // no zero-extend of a boolean
     try std.testing.expect(std.mem.indexOf(u8, tuned_text, "test") == null); // no re-test of a boolean
@@ -1084,7 +1085,8 @@ test "x86_64 arith_branch fold: tuned build emits sub immediately followed by jn
     const tuned_text = try disasm.format(a, tuned);
     defer a.free(tuned_text);
     try std.testing.expect(std.mem.indexOf(u8, tuned_text, "cmp ") == null); // no separate compare anywhere
-    try std.testing.expect(hasAdjacentLines(tuned_text, "sub ", "jne ")); // sub immediately followed by jne
+    // sub immediately followed by the branch on its flags, in either polarity
+    try std.testing.expect(hasAdjacentLines(tuned_text, "sub ", "jne ") or hasAdjacentLines(tuned_text, "sub ", "je "));
 }
 
 test "x86_64 arith_branch fold: a multi-use arith result does NOT fuse (cmp survives, correct result)" {
@@ -1361,4 +1363,62 @@ test "x86_64: optimize(cascadelake) then selectFunctionForModel is execution-equ
         }
         if (!ran) return error.SkipZigTest;
     }
+}
+
+const switch_cases: i64 = 40;
+
+/// Build the balanced tree of `le` splits and `eq` leaves the C frontend emits for a dense
+/// `switch` over 0..hi, each case block returning `key * 7 + 3`.
+fn buildSwitchNode(func: *ir.function.Function, block: ir.function.Block, key: ir.function.Value, lo: i64, hi: i64, default: ir.function.Block) !void {
+    const bool_t = try func.types.intern(.bool);
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    if (lo == hi) {
+        const label = try func.appendInst(block, i64_t, .{ .iconst = lo });
+        const cond = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = key, .rhs = label } });
+        const case = try func.appendBlock();
+        const value = try func.appendInst(case, i64_t, .{ .iconst = lo * 7 + 3 });
+        func.setTerminator(case, .{ .ret = ir.function.Ret.one(value) });
+        const miss = try func.appendBlock();
+        try func.setJump(miss, default, &.{});
+        try func.appendIf(block, cond, .{ .target = case }, .{ .target = miss });
+        return;
+    }
+    const mid = lo + @divTrunc(hi - lo, 2);
+    const split = try func.appendInst(block, i64_t, .{ .iconst = mid });
+    const cond = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .le, .lhs = key, .rhs = split } });
+    const left = try func.appendBlock();
+    const right = try func.appendBlock();
+    try func.appendIf(block, cond, .{ .target = left }, .{ .target = right });
+    try buildSwitchNode(func, left, key, lo, mid, default);
+    try buildSwitchNode(func, right, key, mid + 1, hi, default);
+}
+
+test "x86_64 dense switch lowers to a jump table and keeps every case and the default" {
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const entry = try func.appendBlock();
+    const key = try func.appendBlockParam(entry, i64_t);
+    const default = try func.appendBlock();
+    const minus_one = try func.appendInst(default, i64_t, .{ .iconst = -1 });
+    func.setTerminator(default, .{ .ret = ir.function.Ret.one(minus_one) });
+    try buildSwitchNode(&func, entry, key, 0, switch_cases - 1, default);
+
+    const code = try isel.selectFunction(a, &func);
+    defer a.free(code);
+    // The indirect `jmp r10` through the table.
+    try std.testing.expect(std.mem.indexOf(u8, code, &.{ 0x41, 0xFF, 0xE2 }) != null);
+
+    const keys = [_]i64{ -5, -1, 0, 1, 7, 19, 20, 38, 39, 40, 41, 1000, std.math.minInt(i32) };
+    var ran = false;
+    for ([_]harness.Backend{ harness.native, harness.qemu }) |backend| {
+        for (keys) |k| {
+            const got = try runCmpBranchOnFull(std.testing.io, a, code, &.{k}, backend) orelse break;
+            const want: i64 = if (k >= 0 and k < switch_cases) k * 7 + 3 else -1;
+            try std.testing.expectEqual(want, got);
+            ran = true;
+        }
+    }
+    if (!ran) return error.SkipZigTest;
 }

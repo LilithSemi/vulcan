@@ -318,6 +318,7 @@ fn dispatch(a: std.mem.Allocator, b: *std.ArrayList(u8), d: *D, op: u8) !void {
                 4 => "and",
                 5 => "sub",
                 6 => "xor",
+                7 => "cmp",
                 else => "alu?",
             };
             try b.print(a, "{s} {s}, {d}", .{ mnem, rv(d, o.rm), imm });
@@ -760,6 +761,7 @@ test "round-trips integer ops" {
     try expectOne(encode.cmp(.rsi, .rdi, true), "cmp rsi, rdi");
     try expectOne(encode.aluImm(0, .rax, 5, true), "add rax, 5");
     try expectOne(encode.aluImm(5, .rbx, 7, true), "sub rbx, 7");
+    try expectOne(encode.aluImm(7, .rcx, 14, true), "cmp rcx, 14");
     try expectOne(encode.imulImm(.rax, .rbx, 3, true), "imul rax, rbx, 3");
     try expectOne(encode.shiftImm(4, .rax, 2, true), "shl rax, 2");
     try expectOne(encode.shrCl(.rbx, true), "shr rbx, cl");

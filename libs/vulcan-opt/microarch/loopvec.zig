@@ -493,7 +493,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     const vec_ok = switch (model.features) {
         .aarch64 => |f| f.neon,
         .riscv64 => |f| f.v or f.vpu,
-        .x86_64 => false,
+        .x86_64 => |f| f.sse41,
         // See vectorize.zig: a warp lane is already the vector lane on an SM, so there is no IR
         // vector op for the NVIDIA backend to lower.
         .nvidia => false,
@@ -704,7 +704,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     // loop so SLP can reuse the lanes instead of rebuilding each group with a scalar broadcast and
     // offsets. Address-generation uses are regenerated separately below, and the latch increment is
     // replaced by the wide step, so neither one alone justifies the extra vector loop parameter.
-    if (model.arch == .aarch64 and index_elem_type == null) body_use: for (func.blockInsts(bodyb)) |inst| {
+    if (carriesLoopState(model) and index_elem_type == null) body_use: for (func.blockInsts(bodyb)) |inst| {
         if (inst == ind_update) continue;
         for (accesses.items) |access| {
             if (inst == access.addr_inst or inst == access.scale_inst) continue :body_use;
@@ -724,7 +724,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
 
     const parallel_reduction = reduction == null or
         cost.reductionGroupsProfitable(model, reduction.?.op, @intCast(accesses.items.len), 2);
-    const groups: u32 = if (model.arch == .aarch64 and parallel_reduction and accesses.items.len <= 2 and V * 2 <= MAX_LANES) 2 else 1;
+    const groups: u32 = if (carriesLoopState(model) and parallel_reduction and accesses.items.len <= 2 and V * 2 <= MAX_LANES) 2 else 1;
     return Plan{
         .header = header,
         .body = bodyb,
@@ -742,8 +742,14 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         .factor = V,
         .groups = groups,
         .index_elem_type = index_elem_type,
-        .carry_addresses = model.arch == .aarch64,
+        .carry_addresses = carriesLoopState(model),
     };
+}
+
+/// Targets with enough registers to carry pointers, vector indices, and two accumulator groups
+/// through the main loop.
+fn carriesLoopState(model: *const mm.Model) bool {
+    return model.arch == .aarch64 or model.arch == .x86_64;
 }
 
 fn hasNonAddressUse(func: *const Function, body: Block, value: Value, accesses: []const ArrayAccess) bool {
@@ -973,7 +979,7 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
     const vec_ok = switch (model.features) {
         .aarch64 => |f| f.neon,
         .riscv64 => |f| f.v or f.vpu,
-        .x86_64 => false,
+        .x86_64 => |f| f.sse41,
         // See vectorize.zig: a warp lane is already the vector lane on an SM, so there is no IR
         // vector op for the NVIDIA backend to lower.
         .nvidia => false,

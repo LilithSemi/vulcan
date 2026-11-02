@@ -179,7 +179,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
     }
     for (0..func.blockCount()) |bi| try scheduleBlock(allocator, func, @fromBackingInt(@intCast(bi)), model);
 
-    if (model.fuses(.shift_add) or model.arch == .aarch64) {
+    const fuse_cmp = model.arch == .aarch64 or model.fuses(.cmp_branch);
+    if (model.fuses(.shift_add) or fuse_cmp) {
         const uses = try allocator.alloc(u32, func.valueCount());
         defer allocator.free(uses);
         dce.countUses(func, uses);
@@ -189,8 +190,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
             if (model.arch == .aarch64) {
                 restoreVectorLoadPairs(func, block);
                 restoreMultiplyAddPairs(func, block, uses);
-                restoreCompareBranchPairs(func, block, uses);
             }
+            if (fuse_cmp) restoreCompareBranchPairs(func, block, uses);
         }
     }
 }

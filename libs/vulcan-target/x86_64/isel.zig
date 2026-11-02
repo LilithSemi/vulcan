@@ -220,7 +220,8 @@ fn hasCall(func: *const Function) bool {
     return false;
 }
 
-const Fixup = struct { at: usize, target: u32 };
+/// A rel32 branch displacement, or with `table` set, a jump table entry relative to the table.
+const Fixup = struct { at: usize, target: u32, table: ?usize = null };
 
 /// Which relocation shape a `Reloc` records. `.call` is a `call rel32`'s displacement,
 /// with addend -4 from the E8 opcode, resolved intra-module by the linker.
@@ -299,6 +300,8 @@ const Ctx = struct {
     // path existed.
     edge_moves: []EdgeMoveSet = &.{},
     edge_move_driven: bool = false,
+    /// Per value, whether a machine instruction reads it from a register. Empty means all.
+    reg_read: []const bool = &.{},
     // Address-mode-fold analysis, consulted by the load/store emit arms and the
     // dead-add skip. Defaults to the empty analysis, where nothing folds, so the
     // Wimmer path and the allocator test hooks produce the same bytes as before
@@ -659,7 +662,9 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
     var walloc = try wimmer.allocate(allocator, &work, &desc);
     defer walloc.deinit(allocator);
 
-    var ctx = Ctx{ .func = &work, .fold = &fold, .caps = caps };
+    const reg_read = try registerReads(allocator, &work);
+    defer allocator.free(reg_read);
+    var ctx = Ctx{ .func = &work, .fold = &fold, .caps = caps, .reg_read = reg_read };
     defer ctx.loc_of.deinit(allocator);
     defer ctx.code.deinit(allocator);
     defer ctx.fixups.deinit(allocator);
@@ -765,6 +770,14 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
     const nblocks = func.blockCount();
     const block_start = try allocator.alloc(usize, nblocks);
     defer allocator.free(block_start);
+    const skip_dispatch = try allocator.alloc(bool, nblocks);
+    defer allocator.free(skip_dispatch);
+    @memset(skip_dispatch, false);
+    const dense_switches = try findDenseSwitches(allocator, ctx, skip_dispatch);
+    defer {
+        for (dense_switches) |plan| if (plan) |p| allocator.free(p.targets);
+        allocator.free(dense_switches);
+    }
 
     // Prologue: push the used callee-saved GPRs, a no-op for the default path.
     // Then reserve the spill frame, then move each argument from its ABI register
@@ -883,6 +896,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
     for (0..nblocks) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         block_start[bi] = ctx.code.items.len;
+        // A dispatch block that a jump table replaces. The scan proved it has no allocator
+        // actions, so only the numbering advances.
+        if (skip_dispatch[bi]) {
+            pos_base += 2 + @as(u32, @intCast(func.blockInsts(block).len));
+            continue;
+        }
         // A neutralized, unreachable block: `neutralizeUnreachable` emptied its
         // params, instructions, and terminator, so downstream passes see only the
         // reachable CFG. It carries no code, and no reachable branch targets it
@@ -952,7 +971,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 // edge targets `next_block` can fall through, so `emitIf` elides
                 // that branch.
                 const next_block: ?Block = if (bi + 1 < nblocks) @fromBackingInt(@intCast(bi + 1)) else null;
-                try emitIf(allocator, ctx, func.opcode(inst).@"if", block, next_block);
+                if (dense_switches[bi]) |plan| {
+                    try emitDenseSwitch(allocator, ctx, plan);
+                } else {
+                    try emitIf(allocator, ctx, func.opcode(inst).@"if", block, next_block);
+                }
                 terminated = true;
             } else {
                 try lowerInst(allocator, ctx, inst);
@@ -1078,8 +1101,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
     // so no store can outlive it.
     std.debug.assert(action_cursor == ctx.actions.items.len);
 
+    var jump_at: std.AutoHashMapUnmanaged(usize, u32) = .empty;
+    defer jump_at.deinit(allocator);
+    for (ctx.fixups.items) |f| if (f.table == null) try jump_at.put(allocator, f.at, f.target);
     for (ctx.fixups.items) |f| {
-        const rel: i32 = @intCast(@as(i64, @intCast(block_start[f.target])) - @as(i64, @intCast(f.at + 4)));
+        const target = threadedTarget(ctx.code.items, block_start, &jump_at, f.target);
+        const origin = f.table orelse f.at + 4;
+        const rel: i32 = @intCast(@as(i64, @intCast(block_start[target])) - @as(i64, @intCast(origin)));
         std.mem.writeInt(u32, ctx.code.items[f.at..][0..4], @bitCast(rel), .little);
     }
     return .{ .code = try ctx.code.toOwnedSlice(allocator), .relocs = try ctx.relocs.toOwnedSlice(allocator), .lines = try ctx.lines.toOwnedSlice(allocator) };
@@ -1786,6 +1814,8 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 }
                 try ctx.storeXmm(allocator, result, rd);
             } else {
+                // Every use encodes this constant as an immediate.
+                if (ctx.reg_read.len != 0 and !ctx.reg_read[@backingInt(result)]) return;
                 const rd = ctx.dst(result, scratch1);
                 // A 64-bit constant needs the full imm64 mov. `movImm` only
                 // carries a sign-extended imm32, and `@intCast(c)` would
@@ -1903,6 +1933,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                             .bit_and => encode.pand(dst, src),
                             .bit_or => encode.por(dst, src),
                             .bit_xor => encode.pxor(dst, src),
+                            .mul => encode.pmulld(dst, src),
                             else => error.Unsupported,
                         };
                         return switch (o) {
@@ -1938,6 +1969,28 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             // i32, i16, and i8 use 32-bit ops, whose result auto-zeroes the
             // upper 32 bits, so the value stays clean.
             const w64 = intBits(func, result) > 32;
+            // A constant right operand is an immediate here, and `x86_64FusedOperands`
+            // keeps it out of the register allocation, so its register must not be read.
+            if (foldedShift(func, a, result)) |count| {
+                const rl = try ctx.use(allocator, a.lhs, scratch1);
+                const rd = ctx.dst(result, scratch1);
+                if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
+                try ctx.put(allocator, encode.shiftImm(shiftDigit(a.op, signed), rd, count, w64));
+                try ctx.store(allocator, result, rd);
+                return;
+            }
+            if (foldedAluImm(func, a, result)) |imm| {
+                const rl = try ctx.use(allocator, a.lhs, scratch1);
+                const rd = ctx.dst(result, scratch1);
+                if (a.op == .mul) {
+                    try ctx.put(allocator, encode.imulImm(rd, rl, imm, w64));
+                } else {
+                    if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
+                    try ctx.put(allocator, encode.aluImm(aluDigit(a.op), rd, imm, w64));
+                }
+                try ctx.store(allocator, result, rd);
+                return;
+            }
             switch (a.op) {
                 .div, .rem => {
                     // The dividend width follows the operands. A 32-bit
@@ -2127,13 +2180,13 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             // its sole use, the if's cond, is folded away, and its
             // destination register can stay unwritten.
             if (ctx.caps.fuse_cmp_branch and fusesIntoNextIf(func, ctx.cur_insts, ctx.cur_idx)) return;
+            if (fusesIntoNextSelect(func, ctx.cur_insts, ctx.cur_idx)) return;
             const rl = try ctx.use(allocator, cmp.lhs, scratch1);
-            const rr = try ctx.use(allocator, cmp.rhs, scratch2);
-            const rd = ctx.dst(result, scratch1);
             // Compare at the operand width. An i32 compare sets flags from
             // the low 32 bits, so a dirty upper half, for example a
             // sign-extended incoming i32 arg, does not skew the result.
-            try ctx.put(allocator, encode.cmp(rl, rr, intBits(func, cmp.lhs) > 32));
+            try emitCompare(allocator, ctx, cmp, rl);
+            const rd = ctx.dst(result, scratch1);
             try ctx.put(allocator, encode.setcc(rd, condOf(cmp.op, isSigned(func, cmp.lhs))));
             try ctx.put(allocator, encode.movzxByte(rd, rd));
             try ctx.store(allocator, result, rd);
@@ -2163,6 +2216,30 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             // branch: each arm writes exactly one operand into the result,
             // touching nothing else. This works for both gpr and xmm
             // results.
+            if (!isXmm(func, result)) {
+                // Branch-free. A single-use compare just before the select sets the flags
+                // itself. Reloads are plain moves, so the flags survive to the cmov.
+                var cc: encode.Cond = .ne;
+                if (ctx.cur_idx >= 1 and fusesIntoNextSelect(func, ctx.cur_insts, ctx.cur_idx - 1)) {
+                    const cmp = func.opcode(ctx.cur_insts[ctx.cur_idx - 1]).icmp;
+                    try emitCompare(allocator, ctx, cmp, try ctx.use(allocator, cmp.lhs, scratch1));
+                    cc = condOf(cmp.op, isSigned(func, cmp.lhs));
+                } else {
+                    const c = try ctx.use(allocator, s.cond, scratch1);
+                    try ctx.put(allocator, encode.testReg(c, c, intBits(func, s.cond) > 32));
+                }
+                const rt = try ctx.use(allocator, s.then, scratch1);
+                const re = try ctx.use(allocator, s.@"else", scratch2);
+                const rd = ctx.dst(result, scratch1);
+                if (rd == rt) {
+                    try ctx.put(allocator, encode.cmovcc(rd, re, encode.invertCond(cc)));
+                } else {
+                    if (rd != re) try ctx.put(allocator, encode.movReg(rd, re));
+                    try ctx.put(allocator, encode.cmovcc(rd, rt, cc));
+                }
+                try ctx.store(allocator, result, rd);
+                return;
+            }
             const c = try ctx.use(allocator, s.cond, scratch1);
             // Test at the condition's width, so a raw i32 cond with a dirty
             // upper half is not read as nonzero on its garbage bits.
@@ -2381,6 +2458,12 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                         return;
                     }
                     if (fields.len != 4) return error.Unsupported; // <4 x f32>
+                    if (allSameValue(fields)) {
+                        const fr = try ctx.useXmm(allocator, fields[0], xmm_op0);
+                        try ctx.put(allocator, encode.pshufd(rd, fr, 0));
+                        try ctx.storeXmm(allocator, result, rd);
+                        return;
+                    }
                     for ([_]u8{ 1, 2, 3, 0 }) |lane| {
                         const fr = try ctx.useXmm(allocator, fields[lane], xmm_op0); // a spilled field reloads to op0
                         try ctx.put(allocator, encode.insertps(rd, fr, lane << 4)); // src lane 0 -> dst lane
@@ -2392,6 +2475,16 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     // out of scope until something builds one.
                     if (isWide(func, result)) return error.Unsupported;
                     if (fields.len != 4) return error.Unsupported; // <4 x i32>
+                    if (allSameValue(fields)) {
+                        if (vectorSplatInt(func, result) == 0) {
+                            try ctx.put(allocator, encode.pxor(rd, rd));
+                        } else {
+                            try ctx.put(allocator, encode.movdToXmm(rd, try ctx.use(allocator, fields[0], scratch2)));
+                            try ctx.put(allocator, encode.pshufd(rd, rd, 0));
+                        }
+                        try ctx.storeXmm(allocator, result, rd);
+                        return;
+                    }
                     for ([_]u2{ 1, 2, 3, 0 }) |lane| {
                         // A gpr reload, never xmm: an integer field lives in the
                         // general-register file, so reloading it through the xmm
@@ -2569,12 +2662,10 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
             // only, per `fusesArithIntoBranch`), so the `jcc` this setup
             // yields to branches directly on those flags.
         } else {
-            const rl = try ctx.use(allocator, cmp.lhs, scratch1);
-            const rr = try ctx.use(allocator, cmp.rhs, scratch2);
             // Compare at the operand width, exactly like the unfused icmp
             // lowering. An i32 compare sets flags from the low 32 bits, so
             // a dirty upper half does not skew the result.
-            try ctx.put(allocator, encode.cmp(rl, rr, intBits(func, cmp.lhs) > 32));
+            try emitCompare(allocator, ctx, cmp, try ctx.use(allocator, cmp.lhs, scratch1));
         }
         cc = condOf(cmp.op, isSigned(func, cmp.lhs));
     } else {
@@ -2592,6 +2683,19 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
     // elides one branch, and both edges still reach the same block.
     const then_next = next_block != null and cf.then.target == next_block.?;
     const else_next = next_block != null and cf.@"else".target == next_block.?;
+
+    // When the edge that does not fall through carries no moves, one conditional branch
+    // straight to its target replaces the `jcc` over a `jmp`.
+    if (then_next and edgeMovesEmpty(ctx, cf.@"else", pred)) {
+        try emitBranchTo(allocator, ctx, encode.jcc(encode.invertCond(cc), 0), @backingInt(cf.@"else".target));
+        try emitMoves(allocator, ctx, cf.then, pred);
+        return;
+    }
+    if (else_next and !then_next and edgeMovesEmpty(ctx, cf.then, pred)) {
+        try emitBranchTo(allocator, ctx, encode.jcc(cc, 0), @backingInt(cf.then.target));
+        try emitMoves(allocator, ctx, cf.@"else", pred);
+        return;
+    }
 
     if (then_next) {
         // `then` falls through. Keep `jcc -> then_start`, emit the
@@ -2636,6 +2740,212 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
     std.mem.writeInt(u32, ctx.code.items[jcc_at..][0..4], @bitCast(rel), .little);
     try emitMoves(allocator, ctx, cf.then, pred);
     try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(cf.then.target));
+}
+
+const min_switch_table_labels = 32;
+
+/// A balanced compare tree over the labels 0..N-1 that one jump table can replace.
+const DenseSwitch = struct { value: Value, targets: []Block, default_target: Block };
+
+const SwitchScan = struct {
+    value: ?Value = null,
+    default_target: ?Block = null,
+    labels: std.ArrayList(i64) = .empty,
+    targets: std.ArrayList(Block) = .empty,
+    dispatch: std.ArrayList(Block) = .empty,
+    /// The first numbering position of each block, matching `translateAllocationX86`.
+    block_pos: []const u32,
+    preds: []const u32,
+
+    fn deinit(self: *SwitchScan, allocator: std.mem.Allocator) void {
+        self.labels.deinit(allocator);
+        self.targets.deinit(allocator);
+        self.dispatch.deinit(allocator);
+    }
+};
+
+/// Find the dense switch trees the frontend lowers a C `switch` into. The table jumps
+/// straight from the root to each case, so every bypassed block and edge must emit no
+/// code: no allocator actions, no edge moves, and no instruction other than its own
+/// compare and label constant.
+fn findDenseSwitches(allocator: std.mem.Allocator, ctx: *const Ctx, skip: []bool) Error![]?DenseSwitch {
+    const func = ctx.func;
+    const nblocks = func.blockCount();
+    const plans = try allocator.alloc(?DenseSwitch, nblocks);
+    errdefer allocator.free(plans);
+    @memset(plans, null);
+    if (!ctx.edge_move_driven) return plans;
+
+    const block_pos = try allocator.alloc(u32, nblocks + 1);
+    defer allocator.free(block_pos);
+    const preds = try allocator.alloc(u32, nblocks);
+    defer allocator.free(preds);
+    @memset(preds, 0);
+    block_pos[0] = 0;
+    for (0..nblocks) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        block_pos[bi + 1] = block_pos[bi] + 2 + @as(u32, @intCast(func.blockInsts(block).len));
+        for (func.blockInsts(block)) |inst| if (func.opcode(inst) == .@"if") {
+            const cf = func.opcode(inst).@"if";
+            preds[@backingInt(cf.then.target)] += 1;
+            preds[@backingInt(cf.@"else".target)] += 1;
+        };
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |j| preds[@backingInt(j.target)] += 1,
+            .ret => {},
+        };
+    }
+
+    for (0..nblocks) |bi| {
+        if (skip[bi]) continue;
+        var scan: SwitchScan = .{ .block_pos = block_pos, .preds = preds };
+        defer scan.deinit(allocator);
+        if (!try collectSwitch(allocator, ctx, &scan, @fromBackingInt(@intCast(bi)))) continue;
+        const labels = scan.labels.items;
+        // A small tree of compares predicts well with branch history. Below this size the
+        // indirect jump measured no faster on Zen 4, and a periodic key made it much slower.
+        if (labels.len < min_switch_table_labels or labels.len > 4096) continue;
+        const dense = for (labels, 0..) |label, i| {
+            if (label != @as(i64, @intCast(i))) break false;
+        } else true;
+        if (!dense) continue;
+        plans[bi] = .{
+            .value = scan.value.?,
+            .targets = try allocator.dupe(Block, scan.targets.items),
+            .default_target = scan.default_target.?,
+        };
+        for (scan.dispatch.items[1..]) |child| skip[@backingInt(child)] = true;
+    }
+    return plans;
+}
+
+fn blockHasActions(ctx: *const Ctx, scan: *const SwitchScan, block: Block) bool {
+    const from = scan.block_pos[@backingInt(block)];
+    const to = scan.block_pos[@backingInt(block) + 1];
+    for (ctx.actions.items) |action| if (action.at >= from and action.at < to) return true;
+    return false;
+}
+
+/// Follow empty forwarding blocks from the edge `pred -> jump.target` to the block where
+/// code runs. Null when a move or action on the way would be skipped.
+fn forwardedSwitchTarget(ctx: *const Ctx, scan: *const SwitchScan, pred: Block, jump: ir.function.Jump) ?Block {
+    const func = ctx.func;
+    if (!edgeMovesEmpty(ctx, jump, pred)) return null;
+    var block = jump.target;
+    for (0..func.blockCount()) |_| {
+        if (func.blockInsts(block).len != 0 or func.blockParams(block).len != 0) return block;
+        const term = func.terminator(block) orelse return block;
+        if (term != .jump or func.blockArgs(term.jump).len != 0) return block;
+        if (blockHasActions(ctx, scan, block) or !edgeMovesEmpty(ctx, term.jump, block)) return null;
+        block = term.jump.target;
+    }
+    return null;
+}
+
+fn collectSwitch(allocator: std.mem.Allocator, ctx: *const Ctx, scan: *SwitchScan, block: Block) Error!bool {
+    const func = ctx.func;
+    const insts = func.blockInsts(block);
+    if (insts.len < 2) return false;
+    const cf = switch (func.opcode(insts[insts.len - 1])) {
+        .@"if" => |c| c,
+        else => return false,
+    };
+    const cmp = switch (func.opcode(insts[insts.len - 2])) {
+        .icmp => |c| c,
+        else => return false,
+    };
+    if (func.instResult(insts[insts.len - 2]) != cf.cond) return false;
+    if (isVector(func, cmp.lhs) or isFloat(func, cmp.lhs)) return false;
+    const constant_inst = func.definingInst(cmp.rhs) orelse return false;
+    const label = switch (func.opcode(constant_inst)) {
+        .iconst => |c| c,
+        else => return false,
+    };
+    if (func.blockArgs(cf.then).len != 0 or func.blockArgs(cf.@"else").len != 0) return false;
+    if (scan.value) |seen| {
+        if (seen != cmp.lhs) return false;
+    } else scan.value = cmp.lhs;
+
+    if (scan.dispatch.items.len != 0) {
+        if (scan.preds[@backingInt(block)] != 1 or blockHasActions(ctx, scan, block)) return false;
+        if (countUses(func, cf.cond) != 1) return false;
+        for (insts[0 .. insts.len - 2]) |inst| {
+            if (inst != constant_inst or countUses(func, cmp.rhs) != 1) return false;
+        }
+    }
+    try scan.dispatch.append(allocator, block);
+    if (!edgeMovesEmpty(ctx, cf.then, block) or !edgeMovesEmpty(ctx, cf.@"else", block)) return false;
+
+    switch (cmp.op) {
+        .eq => {
+            const fallback = forwardedSwitchTarget(ctx, scan, block, cf.@"else") orelse return false;
+            if (scan.default_target) |seen| {
+                if (seen != fallback) return false;
+            } else scan.default_target = fallback;
+            try scan.labels.append(allocator, label);
+            try scan.targets.append(allocator, cf.then.target);
+            return true;
+        },
+        .le => return try collectSwitch(allocator, ctx, scan, cf.then.target) and
+            try collectSwitch(allocator, ctx, scan, cf.@"else".target),
+        else => return false,
+    }
+}
+
+/// Bounds check, then an indirect jump through a table of rel32 entries:
+/// `cmp idx, N-1; ja default; lea r11, [table]; movsxd r10, [r11 + idx*4]; add r10, r11; jmp r10`.
+fn emitDenseSwitch(allocator: std.mem.Allocator, ctx: *Ctx, plan: DenseSwitch) Error!void {
+    const w64 = intBits(ctx.func, plan.value) > 32;
+    const index = try ctx.use(allocator, plan.value, scratch1);
+    try ctx.put(allocator, encode.aluImm(7, index, @intCast(plan.targets.len - 1), w64));
+    try emitBranchTo(allocator, ctx, encode.jcc(.a, 0), @backingInt(plan.default_target));
+    // A 32-bit move zero-extends, so the index is a clean 64-bit offset.
+    if (w64) {
+        try ctx.put(allocator, encode.movReg(scratch1, index));
+    } else {
+        try ctx.put(allocator, encode.movReg32(scratch1, index));
+    }
+    const lea_at = ctx.code.items.len;
+    try ctx.put(allocator, encode.leaRipRel(scratch2, 0));
+    try ctx.put(allocator, encode.movsxdIndexed4(scratch1, scratch2, scratch1));
+    try ctx.put(allocator, encode.add(scratch1, scratch2, true));
+    try ctx.put(allocator, encode.jmpReg(scratch1));
+    const table_at = ctx.code.items.len;
+    const lea_end = lea_at + 7;
+    std.mem.writeInt(u32, ctx.code.items[lea_end - 4 ..][0..4], @bitCast(@as(i32, @intCast(table_at - lea_end))), .little);
+    for (plan.targets) |target| {
+        try ctx.fixups.append(allocator, .{ .at = ctx.code.items.len, .target = @backingInt(target), .table = table_at });
+        try ctx.code.appendSlice(allocator, &.{ 0, 0, 0, 0 });
+    }
+}
+
+/// Follow blocks that start with an unconditional `jmp` to another block, so a branch lands on
+/// the final target. `jump_at` maps a fixup's displacement offset to its target block.
+fn threadedTarget(code: []const u8, block_start: []const usize, jump_at: *const std.AutoHashMapUnmanaged(usize, u32), target: u32) u32 {
+    var t = target;
+    var hops: u8 = 0;
+    while (hops < 8) : (hops += 1) {
+        const s = block_start[t];
+        if (s >= code.len or code[s] != 0xE9) break;
+        const next = jump_at.get(s + 1) orelse break;
+        if (next == t) break;
+        t = next;
+    }
+    return t;
+}
+
+/// Whether the edge `pred -> jump.target` emits no code.
+fn edgeMovesEmpty(ctx: *const Ctx, jump: ir.function.Jump, pred: Block) bool {
+    if (!ctx.edge_move_driven) return ctx.func.blockArgs(jump).len == 0;
+    const set = findEdgeMovesX86(ctx, pred, jump.target) orelse return true;
+    for (set.moves) |m| switch (m.src) {
+        .reg => |s| switch (m.dst) {
+            .reg => |d| if (s != d) return false,
+            .slot => return false,
+        },
+        .slot => return false,
+    };
+    return true;
 }
 
 fn emitJump(allocator: std.mem.Allocator, ctx: *Ctx, jump: ir.function.Jump, pred: Block, next_block: ?Block) Error!void {
@@ -2925,6 +3235,130 @@ fn vectorSigned(func: *const Function, value: Value) bool {
     };
 }
 
+/// The imm32 form of an integer constant operand at the given width. A 32-bit op reads only
+/// the low 32 bits, so an unsigned 32-bit constant fits too. A 64-bit op sign-extends imm32.
+fn foldedImm(func: *const Function, operand: Value, w64: bool) ?i32 {
+    const inst = func.definingInst(operand) orelse return null;
+    const value = switch (func.opcode(inst)) {
+        .iconst => |c| c,
+        else => return null,
+    };
+    if (func.types.type_kind(func.valueType(operand)) != .int) return null;
+    if (std.math.cast(i32, value)) |imm| return imm;
+    if (!w64 and value >= 0 and value <= std.math.maxInt(u32)) return @bitCast(@as(u32, @intCast(value)));
+    return null;
+}
+
+/// The shift count when a gpr shift reads a constant in range.
+fn foldedShift(func: *const Function, arith: ir.function.Arith, result: Value) ?u8 {
+    if (arith.op != .shl and arith.op != .shr) return null;
+    const bits = intBits(func, result);
+    const imm = foldedImm(func, arith.rhs, bits > 32) orelse return null;
+    if (imm < 0 or imm >= @as(i32, @intCast(@min(bits, 64)))) return null;
+    return @intCast(imm);
+}
+
+/// The immediate when a gpr add, sub, and, or, xor, or mul reads a constant right operand.
+fn foldedAluImm(func: *const Function, arith: ir.function.Arith, result: Value) ?i32 {
+    return switch (arith.op) {
+        .add, .sub, .bit_and, .bit_or, .bit_xor, .mul => foldedImm(func, arith.rhs, intBits(func, result) > 32),
+        else => null,
+    };
+}
+
+const InstPosition = struct { insts: []const ir.function.Inst, index: usize };
+
+fn instPosition(func: *const Function, inst: ir.function.Inst) ?InstPosition {
+    for (0..func.blockCount()) |bi| {
+        const insts = func.blockInsts(@fromBackingInt(@intCast(bi)));
+        if (std.mem.indexOfScalar(ir.function.Inst, insts, inst)) |index| return .{ .insts = insts, .index = index };
+    }
+    return null;
+}
+
+/// Whether the integer `icmp` at `insts[idx]` is the sole condition of a gpr `select` right
+/// after it. The select then emits the compare and a `cmovcc`, and the icmp emits nothing.
+fn fusesIntoNextSelect(func: *const Function, insts: []const ir.function.Inst, idx: usize) bool {
+    const cmp = switch (func.opcode(insts[idx])) {
+        .icmp => |c| c,
+        else => return false,
+    };
+    if (isVector(func, cmp.lhs) or isFloat(func, cmp.lhs)) return false;
+    if (idx + 1 >= insts.len) return false;
+    const sel = switch (func.opcode(insts[idx + 1])) {
+        .select => |s| s,
+        else => return false,
+    };
+    const result = func.instResult(insts[idx]) orelse return false;
+    const sel_result = func.instResult(insts[idx + 1]) orelse return false;
+    if (sel.cond != result or sel.then == result or sel.@"else" == result) return false;
+    if (isXmm(func, sel_result)) return false;
+    return countUses(func, result) == 1;
+}
+
+/// `cmp lhs, rhs` at the operand width, with an immediate when the right operand folds.
+fn emitCompare(allocator: std.mem.Allocator, ctx: *Ctx, cmp: ir.function.Compare, lhs: Reg) Error!void {
+    const w64 = intBits(ctx.func, cmp.lhs) > 32;
+    if (foldedCmpImm(ctx.func, cmp)) |imm| {
+        try ctx.put(allocator, encode.aluImm(7, lhs, imm, w64));
+    } else {
+        try ctx.put(allocator, encode.cmp(lhs, try ctx.use(allocator, cmp.rhs, scratch2), w64));
+    }
+}
+
+fn foldedCmpImm(func: *const Function, cmp: ir.function.Compare) ?i32 {
+    if (isVector(func, cmp.lhs) or isFloat(func, cmp.lhs)) return null;
+    return foldedImm(func, cmp.rhs, intBits(func, cmp.lhs) > 32);
+}
+
+/// `RegDescription.fusedOperands` for x86_64: a constant operand that the instruction encodes
+/// as an immediate is not a register read, so it does not hold a register live.
+fn x86_64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, out: *[wimmer.max_fused_operands]Value) ?u8 {
+    _ = ctx;
+    switch (func.opcode(inst)) {
+        .icmp => |cmp| if (foldedCmpImm(func, cmp) != null) {
+            out[0] = cmp.lhs;
+            return 1;
+        },
+        // A compare fused into a select is emitted at the select, so the select keeps the
+        // compare operands live up to its own position.
+        .select => |sel| {
+            const cond_inst = func.definingInst(sel.cond) orelse return null;
+            if (func.opcode(cond_inst) != .icmp) return null;
+            const at = instPosition(func, inst) orelse return null;
+            if (at.index == 0 or !fusesIntoNextSelect(func, at.insts, at.index - 1)) return null;
+            const cmp = func.opcode(at.insts[at.index - 1]).icmp;
+            out[0] = sel.then;
+            out[1] = sel.@"else";
+            out[2] = cmp.lhs;
+            if (foldedCmpImm(func, cmp) != null) return 3;
+            out[3] = cmp.rhs;
+            return 4;
+        },
+        .arith => |arith| {
+            const result = func.instResult(inst) orelse return null;
+            if (isXmm(func, result)) {
+                if (!isVector(func, result) or (arith.op != .shl and arith.op != .shr)) return null;
+                const amount = vectorSplatInt(func, arith.rhs) orelse return null;
+                if (amount < 0 or amount > 31) return null;
+                out[0] = arith.lhs;
+                return 1;
+            }
+            if (foldedShift(func, arith, result) != null or foldedAluImm(func, arith, result) != null) {
+                out[0] = arith.lhs;
+                return 1;
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn allSameValue(values: []const Value) bool {
+    for (values[1..]) |v| if (v != values[0]) return false;
+    return true;
+}
+
 fn vectorSplatInt(func: *const Function, value: Value) ?i64 {
     const inst = func.definingInst(value) orelse return null;
     const fields = switch (func.opcode(inst)) {
@@ -3076,6 +3510,37 @@ fn x86_64CopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Val
     return null;
 }
 
+/// x86 ALU and SSE forms are two-address: `dst op= src`. When the left operand dies at the
+/// instruction, putting the result in its register removes the `mov dst, lhs` copy. Register
+/// shifts are left out because their count moves through rcx. The 256-bit AVX forms are
+/// three-address, so reuse there is harmless.
+fn x86_64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
+    _ = ctx;
+    const inst = func.definingInst(v) orelse return null;
+    if (isQuad(func, v) or isHalf(func, v)) return null;
+    if (isXmm(func, v)) {
+        const arith = switch (func.opcode(inst)) {
+            .arith => |a| a,
+            else => return null,
+        };
+        return switch (arith.op) {
+            .add, .sub, .mul, .div, .bit_and, .bit_or, .bit_xor => arith.lhs,
+            .rem, .mulh, .shl, .shr => null,
+        };
+    }
+    return switch (func.opcode(inst)) {
+        .arith => |a| switch (a.op) {
+            .add, .sub, .mul, .bit_and, .bit_or, .bit_xor => a.lhs,
+            .div, .rem, .mulh, .shl, .shr => null,
+        },
+        .arith_imm => |a| switch (a.op) {
+            .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => a.lhs,
+            .mul, .div, .rem, .mulh => null,
+        },
+        else => null,
+    };
+}
+
 /// Append a `u16` index for every register in `regs` to `list` (via `@intFromEnum`).
 fn appendRegIndices(allocator: std.mem.Allocator, list: *std.ArrayList(u16), comptime R: type, regs: []const R) Error!void {
     for (regs) |r| try list.append(allocator, @backingInt(r));
@@ -3225,6 +3690,8 @@ pub fn x86_64RegDescription(allocator: std.mem.Allocator, func: *const Function)
         .classOf = x86_64ClassOf,
         .useKind = x86_64UseKind,
         .copySource = x86_64CopySource,
+        .destructiveSource = x86_64DestructiveSource,
+        .fusedOperands = x86_64FusedOperands,
         .coalesce_block_params = true,
         .coalesce_spill_slots = true,
         .entry_fixed = entry_fixed,
@@ -3786,6 +4253,32 @@ fn forEachTermOperand(func: *const Function, term: ir.function.Terminator, ctx: 
         .ret => |r| for (r.slice()) |vv| f(ctx, vv, false),
         .jump => |j| for (func.blockArgs(j)) |a| f(ctx, a, true),
     }
+}
+
+/// Mark every value that some machine instruction reads from a register, using the same
+/// operand lists the register allocator sees.
+fn registerReads(allocator: std.mem.Allocator, func: *const Function) Error![]bool {
+    const read = try allocator.alloc(bool, func.valueCount());
+    @memset(read, false);
+    const Mark = struct {
+        fn mark(set: []bool, operand: Value, is_edge_arg: bool) void {
+            _ = is_edge_arg;
+            set[@backingInt(operand)] = true;
+        }
+    };
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            var fused: [wimmer.max_fused_operands]Value = undefined;
+            if (x86_64FusedOperands(undefined, func, inst, &fused)) |count| {
+                for (fused[0..count]) |v| read[@backingInt(v)] = true;
+            } else {
+                forEachOperand(func, inst, &empty_fold, read, Mark.mark);
+            }
+        }
+        if (func.terminator(block)) |term| forEachTermOperand(func, term, read, Mark.mark);
+    }
+    return read;
 }
 
 const CountCtx = struct { target: Value, count: *usize };
