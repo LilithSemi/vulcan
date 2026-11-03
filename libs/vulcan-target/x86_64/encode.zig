@@ -209,6 +209,52 @@ test "pmulld encodes the SSE4.1 form" {
     try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x45, 0x0F, 0x38, 0x40, 0xFE }, pmulld(.xmm15, .xmm14).slice());
 }
 
+/// A two-xmm SSE4.1 op in the `66 0F 38` map (`66 [REX] 0F 38 op modrm`).
+fn sse66Map38(op: u8, dst: Xmm, src: Xmm) Inst {
+    const r = xn(dst);
+    const b = xn(src);
+    const mod: u8 = 0xC0 | ((r & 7) << 3) | (b & 7);
+    if (r >= 8 or b >= 8) {
+        const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+        return Inst.of(&.{ 0x66, rex, 0x0F, 0x38, op, mod });
+    }
+    return Inst.of(&.{ 0x66, 0x0F, 0x38, op, mod });
+}
+/// Widen the low lanes of `src` into `dst` with zero or sign extension (SSE4.1):
+/// bytes to dwords, words to dwords, or bytes to words.
+pub fn pmovzxbd(dst: Xmm, src: Xmm) Inst {
+    return sse66Map38(0x31, dst, src);
+}
+pub fn pmovsxbd(dst: Xmm, src: Xmm) Inst {
+    return sse66Map38(0x21, dst, src);
+}
+pub fn pmovzxwd(dst: Xmm, src: Xmm) Inst {
+    return sse66Map38(0x33, dst, src);
+}
+pub fn pmovsxwd(dst: Xmm, src: Xmm) Inst {
+    return sse66Map38(0x23, dst, src);
+}
+pub fn pmovzxbw(dst: Xmm, src: Xmm) Inst {
+    return sse66Map38(0x30, dst, src);
+}
+pub fn pmovsxbw(dst: Xmm, src: Xmm) Inst {
+    return sse66Map38(0x20, dst, src);
+}
+/// Per-lane dword compares into an all-ones or all-zero mask: equal, or signed greater.
+pub fn pcmpeqd(dst: Xmm, src: Xmm) Inst {
+    return sse66Packed(0x76, dst, src);
+}
+pub fn pcmpgtd(dst: Xmm, src: Xmm) Inst {
+    return sse66Packed(0x66, dst, src);
+}
+
+test "pmovzx, pmovsx and pcmp encode their SSE forms" {
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x38, 0x31, 0xC1 }, pmovzxbd(.xmm0, .xmm1).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x44, 0x0F, 0x38, 0x23, 0xC2 }, pmovsxwd(.xmm8, .xmm2).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x76, 0xC1 }, pcmpeqd(.xmm0, .xmm1).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x41, 0x0F, 0x66, 0xC1 }, pcmpgtd(.xmm0, .xmm9).slice());
+}
+
 fn sse66ShiftImm(digit: u3, dst: Xmm, imm: u8) Inst {
     const reg = xn(dst);
     const mod: u8 = 0xC0 | (@as(u8, digit) << 3) | (reg & 7);
@@ -980,6 +1026,10 @@ pub const mem_form = struct {
     pub const movsd_store: MemForm = .{ .prefix = 0xF2, .escape = true, .op = 0x11 };
     pub const movups_load: MemForm = .{ .escape = true, .op = 0x10 };
     pub const movups_store: MemForm = .{ .escape = true, .op = 0x11 };
+    pub const movd_load: MemForm = .{ .prefix = 0x66, .escape = true, .op = 0x6E };
+    pub const movd_store: MemForm = .{ .prefix = 0x66, .escape = true, .op = 0x7E };
+    pub const movq_load: MemForm = .{ .prefix = 0xF3, .escape = true, .op = 0x7E };
+    pub const movq_store: MemForm = .{ .prefix = 0x66, .escape = true, .op = 0xD6 };
 };
 
 /// `form reg, [base + index * (1 << scale) + disp]` with a SIB byte. `reg` is the register
@@ -1478,6 +1528,20 @@ pub fn movupsStoreMem(base: Reg, disp: i32, src: Xmm) Inst {
     return sseMem(null, 0x11, src, base, disp);
 }
 
+/// `movd xmm, [base+disp]` / `movq xmm, [base+disp]` (66 0F 6E / F3 0F 7E): load the low 32 or
+/// 64 bits and zero the rest. The stores (66 0F 7E / 66 0F D6) write only those bits.
+pub fn movdLoadMem(dst: Xmm, base: Reg, disp: i32) Inst {
+    return sseMem(0x66, 0x6E, dst, base, disp);
+}
+pub fn movqLoadMem(dst: Xmm, base: Reg, disp: i32) Inst {
+    return sseMem(0xF3, 0x7E, dst, base, disp);
+}
+pub fn movdStoreMem(base: Reg, disp: i32, src: Xmm) Inst {
+    return sseMem(0x66, 0x7E, src, base, disp);
+}
+pub fn movqStoreMem(base: Reg, disp: i32, src: Xmm) Inst {
+    return sseMem(0x66, 0xD6, src, base, disp);
+}
 /// `call rel32` (E8 cd): a relative call. `rel` is measured from the end of the instruction.
 /// The 4-byte displacement is the last 4 bytes, and is the relocation target.
 pub fn callRel(rel: i32) Inst {

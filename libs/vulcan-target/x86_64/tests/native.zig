@@ -1632,3 +1632,72 @@ test "x86_64 a widening convert of a narrow load reuses the load's extension" {
     const want: u64 = 200 +% @as(u64, @bitCast(@as(i64, @as(i32, h))));
     try std.testing.expectEqual(want, f(&b, &h));
 }
+
+/// `count(p, n, needle)`: the frontend's `for (i = 0; i < n; ++i) found += p[i] == needle;`
+/// loop, with a separate latch and the byte compared after a widening to i32.
+fn buildByteCount(allocator: std.mem.Allocator) !ir.function.Function {
+    var func = ir.function.Function.init(allocator);
+    errdefer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const latch = try func.appendBlock();
+    const done = try func.appendBlock();
+    const bytes = try func.appendBlockParam(entry, ptr_t);
+    const count = try func.appendBlockParam(entry, u32_t);
+    const needle = try func.appendBlockParam(entry, u8_t);
+    const zero = try func.appendInst(entry, u32_t, .{ .iconst = 0 });
+    const wide_needle = try func.appendInst(entry, i32_t, .{ .convert = .{ .value = needle } });
+    try func.setJump(entry, header, &.{ zero, zero });
+    const i = try func.appendBlockParam(header, u32_t);
+    const found = try func.appendBlockParam(header, u32_t);
+    const more = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = count } });
+    try func.appendIf(header, more, .{ .target = body }, .{ .target = done });
+    const offset = try func.appendInst(body, i64_t, .{ .convert = .{ .value = i } });
+    const address = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = bytes, .rhs = offset } });
+    const byte = try func.appendInst(body, u8_t, .{ .load = .{ .ptr = address } });
+    const wide_byte = try func.appendInst(body, i32_t, .{ .convert = .{ .value = byte } });
+    const same = try func.appendInst(body, bool_t, .{ .icmp = .{ .op = .eq, .lhs = wide_byte, .rhs = wide_needle } });
+    const as_int = try func.appendInst(body, i32_t, .{ .convert = .{ .value = same } });
+    const as_count = try func.appendInst(body, u32_t, .{ .convert = .{ .value = as_int } });
+    const next_found = try func.appendInst(body, u32_t, .{ .arith = .{ .op = .add, .lhs = found, .rhs = as_count } });
+    try func.setJump(body, latch, &.{});
+    const next_i = try func.appendArithImm(latch, u32_t, .add, i, 1);
+    try func.setJump(latch, header, &.{ next_i, next_found });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(found) });
+    return func;
+}
+
+test "x86_64 native widened byte count agrees with a scalar count for every tail length" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = try buildByteCount(allocator);
+    defer func.deinit();
+    const model = mm.modelFor(.zen4);
+    try std.testing.expect(try mm.loopvec.run(allocator, &func, model));
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+    const code = try isel.selectFunctionForModel(allocator, &func, model);
+    defer allocator.free(code);
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const run = buffer.entry(*const fn ([*]const u8, u32, u8) callconv(.c) u32, 0);
+
+    // Bytes above 0x7f catch a sign extension where a zero extension belongs.
+    var bytes: [45]u8 = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @truncate(index * 37 % 7 * 0x2b);
+    for (0..bytes.len + 1) |n| {
+        for ([_]u8{ 0, 0x2b, 0xd7, 0xff }) |needle| {
+            var want: u32 = 0;
+            for (bytes[0..n]) |byte| want += @intFromBool(byte == needle);
+            try std.testing.expectEqual(want, run(&bytes, @intCast(n), needle));
+        }
+    }
+}

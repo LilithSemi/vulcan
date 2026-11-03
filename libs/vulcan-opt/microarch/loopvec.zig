@@ -960,7 +960,13 @@ fn definedInLoop(func: *const Function, loop: *const loops.Loop, v: Value) bool 
     return false;
 }
 
-/// A recognized `s op= a[i]` reduction over contiguous memory, vectorizable to a vector accumulator.
+/// The most body instructions a widened reduction increment may hold, load included.
+const MAX_TREE: usize = 8;
+/// The most vector accumulators a widened reduction carries.
+const MAX_GROUPS: u32 = 2;
+
+/// A recognized `s op= f(a[i])` reduction over contiguous memory, vectorizable to a vector
+/// accumulator. `f` is the load itself or a short pure expression over it (`tree`).
 const RedPlan = struct {
     header: Block,
     preheader: Block,
@@ -972,7 +978,14 @@ const RedPlan = struct {
     elem_ty: ir.types.Type, // the reduction/element type (32-bit)
     load_base: Value, // the contiguous load's base pointer
     stride: i64, // element byte size (unit stride)
+    offset: i64, // constant byte offset of the first element from `load_base + i*stride`
+    load: Inst,
+    /// The body instructions from the load to the increment, in body order.
+    tree: [MAX_TREE]Inst,
+    tree_len: usize,
+    increment: Value,
     factor: u32, // V
+    groups: u32, // independent vector accumulators, at most MAX_GROUPS
 };
 
 fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *const loops.Loop, fast_math: bool) ?RedPlan {
@@ -991,8 +1004,9 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
     const header: Block = @fromBackingInt(@intCast(loop.header));
     const preheader = loop.preheader orelse return null;
 
-    // Single-block straight-line body, only latch, no if/matmul.
-    var body: ?Block = null;
+    // A straight-line body that is its own latch, or a body followed by one latch block that
+    // holds at most the induction step.
+    var latch: ?Block = null;
     var in_loop_blocks: usize = 0;
     for (0..func.blockCount()) |bi| {
         if (bi >= loop.body.len or !loop.body[bi]) continue;
@@ -1001,15 +1015,48 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         if (b == header) continue;
         switch (func.terminator(b) orelse return null) {
             .jump => |j| if (j.target == header) {
-                if (body != null) return null;
-                body = b;
-            } else return null,
+                if (latch != null) return null;
+                latch = b;
+            },
             .ret => return null,
         }
     }
-    if (in_loop_blocks != 2) return null;
-    const bodyb = body orelse return null;
-    for (func.blockInsts(bodyb)) |inst| switch (func.opcode(inst)) {
+    const latchb = latch orelse return null;
+
+    // Header: pure test, body on then, params passed through or read directly.
+    var if_inst: ?Inst = null;
+    for (func.blockInsts(header)) |inst| switch (func.opcode(inst)) {
+        .@"if" => {
+            if (if_inst != null) return null;
+            if_inst = inst;
+        },
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .unary => {},
+        else => return null,
+    };
+    const cf = func.opcode(if_inst orelse return null).@"if";
+    const bodyb = cf.then.target;
+    if (bodyb == header) return null;
+    if (bodyb == latchb) {
+        if (in_loop_blocks != 2) return null;
+    } else {
+        if (in_loop_blocks != 3) return null;
+        const body_term = func.terminator(bodyb) orelse return null;
+        if (body_term != .jump or body_term.jump.target != latchb) return null;
+        if (func.blockParams(latchb).len != 0) return null;
+    }
+    const hparams = func.blockParams(header);
+    if (hparams.len != 2) return null; // exactly [induction, accumulator]
+    const body_args = func.blockArgs(cf.then);
+    const bparams = func.blockParams(bodyb);
+    if (body_args.len == 0) {
+        if (bparams.len != 0) return null;
+    } else {
+        if (body_args.len != hparams.len) return null;
+        for (body_args, hparams) |arg, hp| if (arg != hp) return null;
+    }
+    const aliases = if (body_args.len == 0) hparams else bparams;
+
+    for ([_]Block{ bodyb, latchb }) |b| for (func.blockInsts(b)) |inst| switch (func.opcode(inst)) {
         // An atomic joins them, for both reasons at once: vectorizing by V would run V
         // times fewer read-modify-writes, and `applyReduction` does not clone this body at
         // all, so the write would happen only in the scalar remainder.
@@ -1044,7 +1091,7 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         // attribute onto it. Even carrying the tag would be wrong, because reversing a V-element
         // vector is not the same as reversing each element. The map path above REPLICATES
         // instead, and carries the tag onto every copy, which is correct there.
-        .load => |l| if (l.@"volatile" or func.isByteOrderTagged(inst)) return null,
+        .load => |l| if (l.@"volatile" or l.mask != null or func.isByteOrderTagged(inst)) return null,
         // Pure, or a hint with no observable effect. `applyReduction` reads the load and the
         // reduction arith it recognized below and needs nothing else from this body.
         .prefetch,
@@ -1067,24 +1114,6 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         => {},
     };
 
-    // Header: pure test, body on then, params passed through.
-    var if_inst: ?Inst = null;
-    for (func.blockInsts(header)) |inst| switch (func.opcode(inst)) {
-        .@"if" => {
-            if (if_inst != null) return null;
-            if_inst = inst;
-        },
-        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .unary => {},
-        else => return null,
-    };
-    const cf = func.opcode(if_inst orelse return null).@"if";
-    if (cf.then.target != bodyb) return null;
-    const hparams = func.blockParams(header);
-    if (hparams.len != 2) return null; // exactly [induction, accumulator]
-    const body_args = func.blockArgs(cf.then);
-    if (body_args.len != hparams.len) return null;
-    for (body_args, hparams) |arg, hp| if (arg != hp) return null;
-
     const cmp = switch (func.opcode(func.definingInst(cf.cond) orelse return null)) {
         .icmp => |c| c,
         else => return null,
@@ -1093,35 +1122,46 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
     const induction = paramIndex(hparams, cmp.lhs) orelse return null;
     if (definedInLoop(func, loop, cmp.rhs)) return null;
     const accumulator = 1 - induction; // the other of the two params
-    const bparams = func.blockParams(bodyb);
-    const back_args = func.blockArgs(func.terminator(bodyb).?.jump);
+    const back_args = func.blockArgs(func.terminator(latchb).?.jump);
+    const ind_alias = aliases[induction];
+    const acc_alias = aliases[accumulator];
 
-    // Induction steps by 1.
-    if ((constAddend(func, back_args[induction], bparams[induction]) orelse return null) != 1) return null;
+    // Induction steps by 1, and a separate latch holds nothing but that step.
+    if ((constAddend(func, back_args[induction], ind_alias) orelse return null) != 1) return null;
+    if (latchb != bodyb) {
+        const step_inst = func.definingInst(back_args[induction]) orelse return null;
+        for (func.blockInsts(latchb)) |inst| if (inst != step_inst) return null;
+    }
 
-    // The accumulator's next value is `acc_body op load(a[i])`, op associative & reorderable, and the
-    // increment is a contiguous unit-stride load of a 32-bit element.
-    const acc_body = bparams[accumulator];
+    // The accumulator's next value is `acc op f(a[i])`, op associative and reorderable.
     const upd = func.definingInst(back_args[accumulator]) orelse return null;
     const ar = switch (func.opcode(upd)) {
         .arith => |a| a,
         else => return null,
     };
-    const incr = if (ar.lhs == acc_body) ar.rhs else if (ar.rhs == acc_body) ar.lhs else return null;
+    const incr = if (ar.lhs == acc_alias) ar.rhs else if (ar.rhs == acc_alias) ar.lhs else return null;
     if (!reorderable(func, back_args[accumulator], ar.op, fast_math)) return null;
-    const load_inst = func.definingInst(incr) orelse return null;
-    const load = switch (func.opcode(load_inst)) {
-        .load => |l| l,
-        else => return null,
-    };
-    const elem_ty = func.valueType(incr);
-    if (byteSize(func, elem_ty) * 8 != ELEM_BITS) return null; // 32-bit element for the vector path
-    const sa = stridedAddress(func, load.ptr, bparams[induction]) orelse return null;
-    if (sa.stride != byteSize(func, elem_ty)) return null;
-    // The accumulator body-alias is used only by its update.
-    if (countUses(func, bodyb, acc_body) != 1) return null;
+    // The accumulator is read only by its update inside the loop.
+    if (countUses(func, bodyb, acc_alias) != 1) return null;
+    if (latchb != bodyb and countUses(func, latchb, acc_alias) != 0) return null;
+    for (func.blockInsts(header)) |inst| if (inst != if_inst.? and usesValue(func, inst, acc_alias)) return null;
 
-    return RedPlan{
+    const elem_ty = func.valueType(incr);
+    if (byteSize(func, elem_ty) * 8 != ELEM_BITS) return null;
+
+    var tree = IncrementTree{ .func = func, .loop = loop };
+    if (!tree.visit(incr)) return null;
+    const load_inst = tree.load orelse return null;
+    // Only x86_64 lowers the narrow loads, widening converts and integer lane compares a
+    // longer increment needs.
+    if (tree.len > 1 and model.arch != .x86_64) return null;
+    const load = func.opcode(load_inst).load;
+    const load_ty = func.valueType(func.instResult(load_inst).?);
+    const sa = unitAddress(func, load.ptr, ind_alias) orelse return null;
+    if (sa.stride != byteSize(func, load_ty)) return null;
+    if (definedInLoop(func, loop, sa.base)) return null;
+
+    var plan = RedPlan{
         .header = header,
         .preheader = @fromBackingInt(@intCast(preheader)),
         .exit_cond = cmp.op,
@@ -1132,8 +1172,125 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         .elem_ty = elem_ty,
         .load_base = sa.base,
         .stride = sa.stride,
+        .offset = sa.offset,
+        .load = load_inst,
+        .tree = undefined,
+        .tree_len = 0,
+        .increment = incr,
         .factor = V,
+        // Two accumulators hide the vector add latency and halve the loop overhead per element.
+        .groups = if (model.arch == .x86_64) MAX_GROUPS else 1,
     };
+    // Keep the body order, so each operand is emitted before its readers.
+    for (func.blockInsts(bodyb)) |inst| {
+        if (!tree.contains(inst)) continue;
+        plan.tree[plan.tree_len] = inst;
+        plan.tree_len += 1;
+    }
+    if (plan.tree_len != tree.len) return null;
+    return plan;
+}
+
+/// The instructions an increment is computed from: exactly one contiguous load, then
+/// conversions, lane compares and arithmetic on 32-bit lanes. Every other operand is a loop
+/// invariant, which the vector body splats.
+const IncrementTree = struct {
+    func: *const Function,
+    loop: *const loops.Loop,
+    insts: [MAX_TREE]Inst = undefined,
+    len: usize = 0,
+    load: ?Inst = null,
+
+    fn contains(self: *const IncrementTree, inst: Inst) bool {
+        for (self.insts[0..self.len]) |member| if (member == inst) return true;
+        return false;
+    }
+
+    fn visit(self: *IncrementTree, v: Value) bool {
+        const func = self.func;
+        const inst = func.definingInst(v) orelse return !definedInLoop(func, self.loop, v) and splattable(func, v);
+        if (self.contains(inst)) return true;
+        if (!definedInLoop(func, self.loop, v)) return splattable(func, v);
+        switch (func.opcode(inst)) {
+            .iconst => return splattable(func, v),
+            .load => {
+                if (self.load != null) return false;
+                if (!loadLane(func, v)) return false;
+                self.load = inst;
+            },
+            .convert => |c| {
+                if (!isInt(func, v) or intBitsOf(func, v) != ELEM_BITS) return false;
+                const src_ty = func.valueType(c.value);
+                const src_ok = switch (func.types.type_kind(src_ty)) {
+                    .bool => true,
+                    .int => |int| int.bits == 8 or int.bits == 16 or int.bits == 32,
+                    else => false,
+                };
+                if (!src_ok or !self.visit(c.value)) return false;
+            },
+            .icmp => |c| {
+                if (c.op != .eq and c.op != .ne) return false;
+                if (!isInt(func, c.lhs) or intBitsOf(func, c.lhs) != ELEM_BITS) return false;
+                if (!self.visit(c.lhs) or !self.visit(c.rhs)) return false;
+            },
+            .arith => |a| {
+                switch (a.op) {
+                    .add, .sub, .bit_and, .bit_or, .bit_xor => {},
+                    else => return false,
+                }
+                if (!isInt(func, v) or intBitsOf(func, v) != ELEM_BITS) return false;
+                if (!self.visit(a.lhs) or !self.visit(a.rhs)) return false;
+            },
+            else => return false,
+        }
+        if (self.len == MAX_TREE) return false;
+        self.insts[self.len] = inst;
+        self.len += 1;
+        return true;
+    }
+
+    /// A lane the vector load reads: a 32-bit value on its own, or a narrower integer that a
+    /// convert widens.
+    fn loadLane(func: *const Function, v: Value) bool {
+        const bits = byteSize(func, func.valueType(v)) * 8;
+        if (bits == ELEM_BITS) return true;
+        return isInt(func, v) and (bits == 8 or bits == 16);
+    }
+
+    fn splattable(func: *const Function, v: Value) bool {
+        return isInt(func, v) and intBitsOf(func, v) == ELEM_BITS;
+    }
+};
+
+fn isInt(func: *const Function, v: Value) bool {
+    return func.types.type_kind(func.valueType(v)) == .int;
+}
+
+fn intBitsOf(func: *const Function, v: Value) u16 {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .int => |int| int.bits,
+        else => 0,
+    };
+}
+
+/// `stridedAddress`, plus the `base + i` form of a byte array, which has no scale.
+fn unitAddress(func: *const Function, addr: Value, i_alias: Value) ?struct { base: Value, stride: i64, offset: i64 } {
+    if (stridedAddress(func, addr, i_alias)) |sa| return .{ .base = sa.base, .stride = sa.stride, .offset = sa.offset };
+    const addr_inst = func.definingInst(addr) orelse return null;
+    switch (func.opcode(addr_inst)) {
+        .arith_imm => |a| if (a.op == .add) {
+            const inner = unitAddress(func, a.lhs, i_alias) orelse return null;
+            return .{ .base = inner.base, .stride = inner.stride, .offset = std.math.add(i64, inner.offset, a.imm) catch return null };
+        },
+        .arith => |a| if (a.op == .add) {
+            for ([_][2]Value{ .{ a.lhs, a.rhs }, .{ a.rhs, a.lhs } }) |pair| {
+                if (func.types.type_kind(func.valueType(pair[0])) != .ptr) continue;
+                if (inductionOffset(func, pair[1], i_alias)) |offset| return .{ .base = pair[0], .stride = 1, .offset = offset };
+            }
+        },
+        else => {},
+    }
+    return null;
 }
 
 fn countUses(func: *const Function, block: Block, v: Value) usize {
@@ -1179,17 +1336,18 @@ fn identityConst(func: *Function, block: Block, op: BinOp, ty: ir.types.Type) Er
 
 fn applyReduction(allocator: std.mem.Allocator, func: *Function, plan: *const RedPlan) Error!void {
     const V = plan.factor;
+    const G = plan.groups;
+    const U = V * G;
     const hparams = try allocator.dupe(Value, func.blockParams(plan.header));
     defer allocator.free(hparams);
     const ind_ty = func.valueType(hparams[plan.induction]);
     const base_ty = func.valueType(plan.load_base);
     const vt = try func.types.intern(.{ .vector = .{ .len = @intCast(V), .elem = plan.elem_ty } });
 
-    const mainheader = try func.appendBlock();
     const mainbody = try func.appendBlock();
     const combine = try func.appendBlock();
 
-    // Preheader: build a splat-identity vector accumulator, redirect into the main header.
+    // Preheader: build splat-identity vector accumulators, then enter the main loop.
     const pre_args = try allocator.dupe(Value, func.blockArgs(func.terminator(plan.preheader).?.jump));
     defer allocator.free(pre_args);
     const init_i = pre_args[plan.induction];
@@ -1199,34 +1357,108 @@ fn applyReduction(allocator: std.mem.Allocator, func: *Function, plan: *const Re
     defer idlanes.deinit(allocator);
     for (0..V) |_| try idlanes.append(allocator, ident);
     const vacc0 = try func.appendInst(plan.preheader, vt, .{ .struct_new = .{ .fields = try func.internValues(idlanes.items) } });
-    try func.setJump(plan.preheader, mainheader, &.{ init_i, vacc0 });
+    var entry_args: [1 + MAX_GROUPS]Value = undefined;
+    entry_args[0] = init_i;
+    for (entry_args[1 .. 1 + G]) |*acc| acc.* = vacc0;
 
-    // Main header: [mi, vacc]. Run a full V-group while the highest index passes the test.
-    const mi = try func.appendBlockParam(mainheader, ind_ty);
-    const vacc = try func.appendBlockParam(mainheader, vt);
-    const highest = try func.appendArithImm(mainheader, ind_ty, .add, mi, @as(i64, @intCast(V - 1)));
-    const bool_t = try func.types.intern(.bool);
-    const cont = try func.appendInst(mainheader, bool_t, .{ .icmp = .{ .op = plan.exit_cond, .lhs = highest, .rhs = plan.bound } });
-    try func.appendIf(mainheader, cont, .{ .target = mainbody, .args = &.{ mi, vacc } }, .{ .target = combine, .args = &.{ mi, vacc } });
+    // The main loop is rotated: the preheader and the end of each step test whether the next
+    // U elements still pass the exit test. An index narrower than 64 bits is compared in 64
+    // bits, so `i + U - 1` cannot wrap.
+    const ind_int = func.types.type_kind(ind_ty).int;
+    const wide_ty = if (ind_int.bits < 64)
+        try func.types.intern(.{ .int = .{ .signedness = ind_int.signedness, .bits = 64 } })
+    else
+        ind_ty;
+    const wide_bound = if (ind_int.bits < 64)
+        try func.appendInst(plan.preheader, wide_ty, .{ .convert = .{ .value = plan.bound } })
+    else
+        plan.bound;
+    const enter = try groupFits(func, plan.preheader, init_i, wide_ty, wide_bound, plan.exit_cond, U);
+    try func.appendIf(plan.preheader, enter, .{ .target = mainbody, .args = entry_args[0 .. 1 + G] }, .{ .target = combine, .args = entry_args[0 .. 1 + G] });
 
-    // Main body: wide-load V contiguous elements at base + mi*stride, add into the vector accumulator.
+    // Main body: per group, wide-load V contiguous elements, rebuild the increment on V lanes,
+    // and fold it into that group's vector accumulator.
     const bmi = try func.appendBlockParam(mainbody, ind_ty);
-    const bvacc = try func.appendBlockParam(mainbody, vt);
-    const scaled = try func.appendArithImm(mainbody, base_ty, .mul, bmi, plan.stride);
+    var next_args: [1 + MAX_GROUPS]Value = undefined;
+    for (next_args[1 .. 1 + G]) |*acc| acc.* = try func.appendBlockParam(mainbody, vt);
+    const index = if (ind_int.bits < 64) try func.appendInst(mainbody, wide_ty, .{ .convert = .{ .value = bmi } }) else bmi;
+    const scaled = if (plan.stride == 1) index else try func.appendArithImm(mainbody, wide_ty, .mul, index, plan.stride);
     const base_i = try func.appendInst(mainbody, base_ty, .{ .arith = .{ .op = .add, .lhs = plan.load_base, .rhs = scaled } });
-    const wv = try func.appendInst(mainbody, vt, .{ .load = .{ .ptr = base_i } });
-    const nvacc = try func.appendInst(mainbody, vt, .{ .arith = .{ .op = plan.op, .lhs = bvacc, .rhs = wv } });
-    const nmi = try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(V)));
-    try func.setJump(mainbody, mainheader, &.{ nmi, nvacc });
 
-    // Combine: horizontally reduce the vector accumulator (extract each lane, tree-sum), fold in the
-    // original init, then fall into the ORIGINAL loop (remainder) for the leftover scalar iterations.
-    const cmi = try func.appendBlockParam(combine, ind_ty);
-    const cvacc = try func.appendBlockParam(combine, vt);
-    var lanes: std.ArrayList(Value) = .empty;
+    var splats: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer splats.deinit(allocator);
+    var lanes: std.AutoHashMapUnmanaged(Value, Value) = .empty;
     defer lanes.deinit(allocator);
-    for (0..V) |k| try lanes.append(allocator, try func.appendInst(combine, plan.elem_ty, .{ .extract = .{ .aggregate = cvacc, .index = @intCast(k) } }));
-    const hsum = try buildTree(func, combine, plan.op, plan.elem_ty, lanes.items, allocator);
+    // A zero-extended lane compare is `0 - mask`. This keeps the mask, so `acc + (0 - mask)`
+    // becomes `acc - mask`.
+    var negated: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer negated.deinit(allocator);
+    for (0..G) |group| {
+        lanes.clearRetainingCapacity();
+        negated.clearRetainingCapacity();
+        const group_offset = plan.offset + @as(i64, @intCast(group * V)) * plan.stride;
+        const group_base = if (group_offset == 0) base_i else try func.appendArithImm(mainbody, base_ty, .add, base_i, group_offset);
+        const lane_ctx = LaneContext{ .func = func, .preheader = plan.preheader, .allocator = allocator, .lanes = &lanes, .splats = &splats, .V = V };
+        for (plan.tree[0..plan.tree_len]) |inst| {
+            const result = func.instResult(inst).?;
+            const scalar_ty = func.valueType(result);
+            const lane_vt = try func.types.intern(.{ .vector = .{ .len = @intCast(V), .elem = scalar_ty } });
+            const wide: Value = switch (func.opcode(inst)) {
+                .load => try func.appendInst(mainbody, lane_vt, .{ .load = .{ .ptr = group_base } }),
+                .convert => |c| conv: {
+                    const src = try lane_ctx.get(c.value);
+                    if (func.types.type_kind(func.valueType(c.value)) == .bool) {
+                        const mask = try func.appendInst(mainbody, lane_vt, .{ .convert = .{ .value = src } });
+                        const zero = try func.appendInst(plan.preheader, scalar_ty, .{ .iconst = 0 });
+                        const zeros = try func.appendSplat(plan.preheader, lane_vt, zero);
+                        try negated.put(allocator, result, mask);
+                        break :conv try func.appendInst(mainbody, lane_vt, .{ .arith = .{ .op = .sub, .lhs = zeros, .rhs = mask } });
+                    }
+                    const out = try func.appendInst(mainbody, lane_vt, .{ .convert = .{ .value = src } });
+                    if (negated.get(c.value)) |mask| {
+                        if (intBitsOf(func, c.value) == intBitsOf(func, result))
+                            try negated.put(allocator, result, try func.appendInst(mainbody, lane_vt, .{ .convert = .{ .value = mask } }));
+                    }
+                    break :conv out;
+                },
+                .icmp => |c| cmp: {
+                    // A lane compare yields an all-ones or all-zero mask of the operand type.
+                    const lhs = try lane_ctx.get(c.lhs);
+                    const rhs = try lane_ctx.get(c.rhs);
+                    break :cmp try func.appendInst(mainbody, func.valueType(lhs), .{ .icmp = .{ .op = c.op, .lhs = lhs, .rhs = rhs } });
+                },
+                .arith => |a| try func.appendInst(mainbody, lane_vt, .{ .arith = .{
+                    .op = a.op,
+                    .lhs = try lane_ctx.get(a.lhs),
+                    .rhs = try lane_ctx.get(a.rhs),
+                } }),
+                else => unreachable,
+            };
+            try lanes.put(allocator, result, wide);
+        }
+        const acc = &next_args[1 + group];
+        acc.* = if (plan.op == .add and negated.contains(plan.increment))
+            try func.appendInst(mainbody, vt, .{ .arith = .{ .op = .sub, .lhs = acc.*, .rhs = negated.get(plan.increment).? } })
+        else
+            try func.appendInst(mainbody, vt, .{ .arith = .{ .op = plan.op, .lhs = acc.*, .rhs = lanes.get(plan.increment).? } });
+    }
+    next_args[0] = try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(U)));
+    const again = try groupFits(func, mainbody, next_args[0], wide_ty, wide_bound, plan.exit_cond, U);
+    try func.appendIf(mainbody, again, .{ .target = mainbody, .args = next_args[0 .. 1 + G] }, .{ .target = combine, .args = next_args[0 .. 1 + G] });
+
+    // Combine: join the group accumulators, horizontally reduce (extract each lane, tree-sum),
+    // fold in the original init, then fall into the ORIGINAL loop (remainder) for the leftover
+    // scalar iterations.
+    const cmi = try func.appendBlockParam(combine, ind_ty);
+    var cvacc = try func.appendBlockParam(combine, vt);
+    for (1..G) |_| {
+        const other = try func.appendBlockParam(combine, vt);
+        cvacc = try func.appendInst(combine, vt, .{ .arith = .{ .op = plan.op, .lhs = cvacc, .rhs = other } });
+    }
+    var parts: std.ArrayList(Value) = .empty;
+    defer parts.deinit(allocator);
+    for (0..V) |k| try parts.append(allocator, try func.appendInst(combine, plan.elem_ty, .{ .extract = .{ .aggregate = cvacc, .index = @intCast(k) } }));
+    const hsum = try buildTree(func, combine, plan.op, plan.elem_ty, parts.items, allocator);
     const sacc = try func.appendInst(combine, plan.elem_ty, .{ .arith = .{ .op = plan.op, .lhs = init_acc, .rhs = hsum } });
     const rem_args = try allocator.alloc(Value, hparams.len);
     defer allocator.free(rem_args);
@@ -1234,6 +1466,40 @@ fn applyReduction(allocator: std.mem.Allocator, func: *Function, plan: *const Re
     rem_args[plan.accumulator] = sacc;
     try func.setJump(combine, plan.header, rem_args);
 }
+
+/// Whether the V-group starting at `index` passes the exit test against `wide_bound`.
+fn groupFits(func: *Function, block: Block, index: Value, wide_ty: Type, wide_bound: Value, exit_cond: CmpOp, V: u32) Error!Value {
+    const wide = if (func.valueType(index) == wide_ty) index else try func.appendInst(block, wide_ty, .{ .convert = .{ .value = index } });
+    const highest = try func.appendArithImm(block, wide_ty, .add, wide, @as(i64, @intCast(V - 1)));
+    const bool_t = try func.types.intern(.bool);
+    return func.appendInst(block, bool_t, .{ .icmp = .{ .op = exit_cond, .lhs = highest, .rhs = wide_bound } });
+}
+
+/// Maps an increment operand to its V-lane form: the group's widened value, or a splat of a
+/// loop invariant built once in the preheader.
+const LaneContext = struct {
+    func: *Function,
+    preheader: Block,
+    allocator: std.mem.Allocator,
+    lanes: *std.AutoHashMapUnmanaged(Value, Value),
+    splats: *std.AutoHashMapUnmanaged(Value, Value),
+    V: u32,
+
+    fn get(self: LaneContext, v: Value) Error!Value {
+        if (self.lanes.get(v)) |wide| return wide;
+        if (self.splats.get(v)) |splat| return splat;
+        const func = self.func;
+        const ty = func.valueType(v);
+        const vt = try func.types.intern(.{ .vector = .{ .len = @intCast(self.V), .elem = ty } });
+        const scalar = if (func.definingInst(v)) |inst| switch (func.opcode(inst)) {
+            .iconst => |c| try func.appendInst(self.preheader, ty, .{ .iconst = c }),
+            else => v,
+        } else v;
+        const splat = try func.appendSplat(self.preheader, vt, scalar);
+        try self.splats.put(self.allocator, v, splat);
+        return splat;
+    }
+};
 
 fn buildTree(func: *Function, block: Block, op: BinOp, ty: ir.types.Type, items: []const Value, allocator: std.mem.Allocator) Error!Value {
     var cur: std.ArrayList(Value) = .empty;
@@ -1851,4 +2117,61 @@ test "a reduction body holding an atomic is declined" {
     var info = try loops.analyze(allocator, &func);
     defer info.deinit(allocator);
     try testing.expect(recognizeReduction(&func, model, &info.loops[0], false) == null);
+}
+
+test "widens a byte match count only where the target lowers its lane compares" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const latch = try func.appendBlock();
+    const done = try func.appendBlock();
+    const bytes = try func.appendBlockParam(entry, ptr_t);
+    const count = try func.appendBlockParam(entry, u32_t);
+    const needle = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, u32_t, .{ .iconst = 0 });
+    try func.setJump(entry, header, &.{ zero, zero });
+    const i = try func.appendBlockParam(header, u32_t);
+    const found = try func.appendBlockParam(header, u32_t);
+    const more = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = count } });
+    try func.appendIf(header, more, .{ .target = body }, .{ .target = done });
+    const offset = try func.appendInst(body, i64_t, .{ .convert = .{ .value = i } });
+    const address = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = bytes, .rhs = offset } });
+    const byte = try func.appendInst(body, u8_t, .{ .load = .{ .ptr = address } });
+    const wide = try func.appendInst(body, i32_t, .{ .convert = .{ .value = byte } });
+    const same = try func.appendInst(body, bool_t, .{ .icmp = .{ .op = .eq, .lhs = wide, .rhs = needle } });
+    const as_int = try func.appendInst(body, u32_t, .{ .convert = .{ .value = same } });
+    const next_found = try func.appendInst(body, u32_t, .{ .arith = .{ .op = .add, .lhs = found, .rhs = as_int } });
+    try func.setJump(body, latch, &.{});
+    const next_i = try func.appendArithImm(latch, u32_t, .add, i, 1);
+    try func.setJump(latch, header, &.{ next_i, next_found });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(found) });
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    try testing.expect(recognizeReduction(&func, registry.modelFor(.@"ampere-altra"), &info.loops[0], false) == null);
+    const plan = recognizeReduction(&func, registry.modelFor(.zen4), &info.loops[0], false) orelse return error.NotRecognized;
+    try testing.expectEqual(@as(usize, 4), plan.tree_len);
+    try testing.expectEqual(@as(i64, 1), plan.stride);
+
+    try applyReduction(allocator, &func, &plan);
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+    var lane_compares: usize = 0;
+    for (0..func.blockCount()) |bi| for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
+        .icmp => |c| if (func.types.type_kind(func.valueType(c.lhs)) == .vector) {
+            lane_compares += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), lane_compares); // one per accumulator group
 }

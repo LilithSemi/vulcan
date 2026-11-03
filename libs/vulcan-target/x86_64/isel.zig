@@ -1637,7 +1637,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 try ctx.put(allocator, encode.movdFromXmm(scratch1, xmm_scratch));
                 try ctx.put(allocator, encode.movToMem16(base, disp, scratch1));
             } else {
-                try ctx.put(allocator, if (isVector(func, st.value) or isQuad(func, st.value)) encode.movupsStoreMem(base, disp, val) else if (isDouble(func, st.value)) encode.movsdStoreMem(base, disp, val) else encode.movssStoreMem(base, disp, val));
+                try ctx.put(allocator, xmmStoreMem(func, st.value, base, disp, val));
             }
         } else {
             const val = try ctx.use(allocator, st.value, scratch1);
@@ -2226,7 +2226,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             }
         },
         .icmp => |cmp| {
+            if (isVector(func, cmp.lhs) and laneKind(func, cmp.lhs) == .i32) return emitIntVectorCompare(allocator, ctx, cmp, result);
             if (isVector(func, cmp.lhs)) {
+                if (laneKind(func, cmp.lhs) != .f32) return error.Unsupported;
                 // Per-lane float compare via cmpps, producing an all-ones or
                 // all-zero lane mask that a later vector select reads. gt and
                 // ge have no ordered SSE predicate, so the code swaps the
@@ -2418,6 +2420,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             // `__extend*`/`__trunc*`/`__float*`/`__fix*` libcall before isel, so a real f128
             // convert never reaches here. Reject defensively rather than emit a wrong convert.
             if (isQuad(func, cv.value) or isQuad(func, result)) return error.Unsupported;
+            if (isVector(func, result) or isVector(func, cv.value)) return emitVectorConvert(allocator, ctx, cv.value, result);
             const src_float = isFloat(func, cv.value);
             const dst_float = isFloat(func, result);
             if (!src_float and dst_float) {
@@ -2754,7 +2757,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     try ctx.put(allocator, encode.movdToXmm(rd, scratch1));
                     try ctx.put(allocator, encode.vcvtph2ps(rd, rd));
                 } else {
-                    try ctx.put(allocator, if (isVector(func, result) or isQuad(func, result)) encode.movupsLoadMem(rd, base, disp) else if (isDouble(func, result)) encode.movsdLoadMem(rd, base, disp) else encode.movssLoadMem(rd, base, disp));
+                    try ctx.put(allocator, xmmLoadMem(func, result, rd, base, disp));
                 }
                 try ctx.storeXmm(allocator, result, rd);
             } else {
@@ -3893,8 +3896,32 @@ fn emitIndexedStore(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.I
     try ctx.put(allocator, encode.memIndexed(form, @backingInt(val), base, index, sib.scale, disp));
 }
 
+/// The byte size of a vector narrower than an xmm register, or null. Such a vector moves
+/// through memory with movd or movq, so it never reads or writes past its own bytes.
+fn narrowVectorBytes(func: *const Function, v: Value) ?u32 {
+    const vec = switch (func.types.type_kind(func.valueType(v))) {
+        .vector => |vec| vec,
+        else => return null,
+    };
+    const bytes = @as(u32, vec.len) * typeSize(func, vec.elem);
+    return if (bytes == 4 or bytes == 8) bytes else null;
+}
+
+fn xmmLoadMem(func: *const Function, v: Value, rd: Xmm, base: Reg, disp: i32) encode.Inst {
+    if (narrowVectorBytes(func, v)) |bytes| return if (bytes == 4) encode.movdLoadMem(rd, base, disp) else encode.movqLoadMem(rd, base, disp);
+    if (isVector(func, v) or isQuad(func, v)) return encode.movupsLoadMem(rd, base, disp);
+    return if (isDouble(func, v)) encode.movsdLoadMem(rd, base, disp) else encode.movssLoadMem(rd, base, disp);
+}
+
+fn xmmStoreMem(func: *const Function, v: Value, base: Reg, disp: i32, src: Xmm) encode.Inst {
+    if (narrowVectorBytes(func, v)) |bytes| return if (bytes == 4) encode.movdStoreMem(base, disp, src) else encode.movqStoreMem(base, disp, src);
+    if (isVector(func, v) or isQuad(func, v)) return encode.movupsStoreMem(base, disp, src);
+    return if (isDouble(func, v)) encode.movsdStoreMem(base, disp, src) else encode.movssStoreMem(base, disp, src);
+}
+
 fn loadForm(func: *const Function, result: Value) encode.MemForm {
     const f = encode.mem_form;
+    if (narrowVectorBytes(func, result)) |bytes| return if (bytes == 4) f.movd_load else f.movq_load;
     if (isXmm(func, result)) {
         return if (isVector(func, result) or isQuad(func, result)) f.movups_load else if (isDouble(func, result)) f.movsd_load else f.movss_load;
     }
@@ -3909,6 +3936,7 @@ fn loadForm(func: *const Function, result: Value) encode.MemForm {
 
 fn storeForm(func: *const Function, value: Value) encode.MemForm {
     const f = encode.mem_form;
+    if (narrowVectorBytes(func, value)) |bytes| return if (bytes == 4) f.movd_store else f.movq_store;
     if (isXmm(func, value)) {
         return if (isVector(func, value) or isQuad(func, value)) f.movups_store else if (isDouble(func, value)) f.movsd_store else f.movss_store;
     }
@@ -4059,6 +4087,69 @@ fn emitAluImm(allocator: std.mem.Allocator, ctx: *Ctx, op: ir.function.BinOp, rd
 }
 
 /// `cmp lhs, rhs` at the operand width, with an immediate when the right operand folds.
+/// A lane-wise integer convert between two 128-bit or narrower vectors with the same lane
+/// count: a same-width copy, or a zero or sign widening by the source signedness.
+fn emitVectorConvert(allocator: std.mem.Allocator, ctx: *Ctx, value: Value, result: Value) Error!void {
+    const func = ctx.func;
+    const src_vec = vectorType(func, value) orelse return error.Unsupported;
+    const dst_vec = vectorType(func, result) orelse return error.Unsupported;
+    if (src_vec.len != dst_vec.len or isWide(func, value) or isWide(func, result)) return error.Unsupported;
+    const src_int = switch (func.types.type_kind(src_vec.elem)) {
+        .int => |int| int,
+        else => return error.Unsupported,
+    };
+    const dst_bits = switch (func.types.type_kind(dst_vec.elem)) {
+        .int => |int| int.bits,
+        else => return error.Unsupported,
+    };
+    const signed = src_int.signedness == .signed;
+    const src = try ctx.useXmm(allocator, value, xmm_op0);
+    const rd = try ctx.dstXmm(result, xmm_scratch);
+    if (src_int.bits == dst_bits) {
+        if (rd != src) try ctx.put(allocator, encode.movupsRR(rd, src));
+    } else if (src_int.bits == 8 and dst_bits == 32) {
+        try ctx.put(allocator, if (signed) encode.pmovsxbd(rd, src) else encode.pmovzxbd(rd, src));
+    } else if (src_int.bits == 16 and dst_bits == 32) {
+        try ctx.put(allocator, if (signed) encode.pmovsxwd(rd, src) else encode.pmovzxwd(rd, src));
+    } else if (src_int.bits == 8 and dst_bits == 16) {
+        try ctx.put(allocator, if (signed) encode.pmovsxbw(rd, src) else encode.pmovzxbw(rd, src));
+    } else return error.Unsupported;
+    try ctx.storeXmm(allocator, result, rd);
+}
+
+/// A lane-wise compare of two `<4 x i32>` vectors into an all-ones or all-zero lane mask.
+/// SSE has only equal and signed greater, so an unsigned order compare is refused.
+fn emitIntVectorCompare(allocator: std.mem.Allocator, ctx: *Ctx, cmp: ir.function.Compare, result: Value) Error!void {
+    const func = ctx.func;
+    if (isWide(func, cmp.lhs)) return error.Unsupported;
+    const signed = vectorSigned(func, cmp.lhs);
+    if (cmp.op != .eq and cmp.op != .ne and !signed) return error.Unsupported;
+    const rl = try ctx.useXmm(allocator, cmp.lhs, xmm_op0);
+    const rr = try ctx.useXmm(allocator, cmp.rhs, xmm_op1);
+    const swap = cmp.op == .lt or cmp.op == .ge;
+    const first = if (swap) rr else rl;
+    const second = if (swap) rl else rr;
+    // Compare in the result register unless it holds the second operand.
+    const rd = try ctx.dstXmm(result, xmm_scratch);
+    const work = if (rd == second and rd != first) xmm_scratch else rd;
+    if (work != first) try ctx.put(allocator, encode.movupsRR(work, first));
+    try ctx.put(allocator, if (cmp.op == .eq or cmp.op == .ne) encode.pcmpeqd(work, second) else encode.pcmpgtd(work, second));
+    if (cmp.op == .ne or cmp.op == .le or cmp.op == .ge) {
+        const ones = if (work == xmm_op1) xmm_op0 else xmm_op1;
+        try ctx.put(allocator, encode.pcmpeqd(ones, ones));
+        try ctx.put(allocator, encode.pxor(work, ones));
+    }
+    if (rd != work) try ctx.put(allocator, encode.movupsRR(rd, work));
+    try ctx.storeXmm(allocator, result, rd);
+}
+
+fn vectorType(func: *const Function, v: Value) ?ir.types.Vector {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .vector => |vec| vec,
+        else => null,
+    };
+}
+
 fn emitCompare(allocator: std.mem.Allocator, ctx: *Ctx, cmp: ir.function.Compare, lhs: Reg) Error!void {
     const w64 = intBits(ctx.func, cmp.lhs) > 32;
     if (foldedCmpImm(ctx.func, cmp)) |imm| {
@@ -4320,6 +4411,13 @@ fn x86_64CopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Val
         // a bare `movups` whole-value copy here, so exclude it. A narrowing to f16 rounds,
         // and a single/double view change is a real convert. Everything else (same-view
         // scalar float, or the f16 -> f32 widen) is a bare `movups` copy.
+        if (isVector(func, src) and isVector(func, v)) {
+            const from = vectorType(func, src).?;
+            const to = vectorType(func, v).?;
+            const same = from.len == to.len and typeSize(func, from.elem) == typeSize(func, to.elem) and
+                func.types.type_kind(from.elem) == .int and func.types.type_kind(to.elem) == .int;
+            return if (same) src else null;
+        }
         if (isVector(func, src) or isVector(func, v)) return null;
         if (isHalf(func, v)) return null;
         if (isDouble(func, src) != isDouble(func, v)) return null;
@@ -4340,6 +4438,10 @@ fn x86_64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Valu
     if (isXmm(func, v)) {
         const arith = switch (func.opcode(inst)) {
             .arith => |a| a,
+            .icmp => |c| return if (laneKind(func, c.lhs) == .i32)
+                (if (c.op == .lt or c.op == .ge) c.rhs else c.lhs)
+            else
+                null,
             else => return null,
         };
         return switch (arith.op) {
