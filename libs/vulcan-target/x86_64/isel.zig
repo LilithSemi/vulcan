@@ -2314,6 +2314,14 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             // destination register can stay unwritten.
             if (ctx.caps.fuse_cmp_branch and fusesIntoNextIf(func, ctx.cur_insts, ctx.cur_idx)) return;
             if (fusesIntoNextSelect(func, ctx.cur_insts, ctx.cur_idx)) return;
+            if (bitTest(func, cmp)) |b| {
+                const cc = try emitBitTest(allocator, ctx, b);
+                const rd = ctx.dst(result, scratch1);
+                try ctx.put(allocator, encode.setcc(rd, cc));
+                try ctx.put(allocator, encode.movzxByte(rd, rd));
+                try ctx.store(allocator, result, rd);
+                return;
+            }
             const rl = try ctx.use(allocator, cmp.lhs, scratch1);
             // Compare at the operand width. An i32 compare sets flags from
             // the low 32 bits, so a dirty upper half, for example a
@@ -2833,7 +2841,9 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
     var cc: encode.Cond = .ne;
     if (ctx.cur_idx >= 1 and ctx.caps.fuse_cmp_branch and fusesIntoNextIf(func, ctx.cur_insts, ctx.cur_idx - 1)) {
         const cmp = func.opcode(ctx.cur_insts[ctx.cur_idx - 1]).icmp;
-        if (fusesArithIntoBranch(func, ctx.cur_insts, ctx.cur_idx, ctx.caps.fuse_arith_branch and ctx.caps.fuse_cmp_branch)) {
+        if (bitTest(func, cmp)) |b| {
+            cc = try emitBitTest(allocator, ctx, b);
+        } else if (fusesArithIntoBranch(func, ctx.cur_insts, ctx.cur_idx, ctx.caps.fuse_arith_branch and ctx.caps.fuse_cmp_branch)) {
             // Emit nothing here: the arith at cur_idx-2 already left ZF =
             // (result == 0) set. `cc` below is set from `cmp.op` (eq/ne
             // only, per `fusesArithIntoBranch`), so the `jcc` this setup
@@ -2844,7 +2854,7 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
             // a dirty upper half does not skew the result.
             try emitCompare(allocator, ctx, cmp, try ctx.use(allocator, cmp.lhs, scratch1));
         }
-        cc = condOf(cmp.op, isSigned(func, cmp.lhs));
+        if (bitTest(func, cmp) == null) cc = condOf(cmp.op, isSigned(func, cmp.lhs));
     } else {
         const cond = try ctx.use(allocator, cf.cond, scratch1);
         // Test at the condition's width, so a dirty upper half of a raw i32
@@ -3394,8 +3404,10 @@ fn emitHeaderTest(allocator: std.mem.Allocator, ctx: *Ctx, header: Block, next_b
     ctx.pos = ctx.block_pos[h] + @as(u32, @intCast(n));
     ctx.cur_insts = insts;
     ctx.cur_idx = n - 1;
-    try emitCompare(allocator, ctx, cmp, try ctx.use(allocator, cmp.lhs, scratch1));
-    const cc = condOf(cmp.op, isSigned(func, cmp.lhs));
+    const cc = if (bitTest(func, cmp)) |b| try emitBitTest(allocator, ctx, b) else cc: {
+        try emitCompare(allocator, ctx, cmp, try ctx.use(allocator, cmp.lhs, scratch1));
+        break :cc condOf(cmp.op, isSigned(func, cmp.lhs));
+    };
     const t = forwardedBlock(ctx, cf.then.target);
     const e = forwardedBlock(ctx, cf.@"else".target);
     // One edge may carry moves, such as reloads on the loop exit. Branch on the clean edge
@@ -3804,7 +3816,7 @@ fn fusesIntoNextSelect(func: *const Function, insts: []const ir.function.Inst, i
         .icmp => |c| c,
         else => return false,
     };
-    if (isVector(func, cmp.lhs) or isFloat(func, cmp.lhs)) return false;
+    if (isVector(func, cmp.lhs) or isFloat(func, cmp.lhs) or bitTest(func, cmp) != null) return false;
     if (idx + 1 >= insts.len) return false;
     const sel = switch (func.opcode(insts[idx + 1])) {
         .select => |s| s,
@@ -4223,7 +4235,10 @@ fn x86_64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.fu
     _ = ctx;
     if (rmwOperands(func, inst, out)) |count| return count;
     switch (func.opcode(inst)) {
-        .icmp => |cmp| if (foldedCmpImm(func, cmp) != null) {
+        .icmp => |cmp| if (bitTest(func, cmp)) |b| {
+            out[0] = b.index;
+            return 1;
+        } else if (foldedCmpImm(func, cmp) != null) {
             out[0] = cmp.lhs;
             return 1;
         },
@@ -6318,4 +6333,41 @@ fn emitRmw(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst, st: 
     };
     const form: encode.MemForm = .{ .prefix = prefix, .w = bits == 64, .op = if (bits == 8) op - 1 else op, .byte_reg = bits == 8 };
     try ctx.put(allocator, encode.memIndexed(form, @backingInt(reg), base, index, scale, disp));
+}
+
+/// A compare of `(mask >> index) & 1` against zero with a constant mask: a set membership test,
+/// see the `bitset` pass. x86 runs it as one `bt`, so the shift and the mask are never computed.
+const BitTest = struct { mask: i64, index: Value, set: bool };
+
+fn bitTest(func: *const Function, cmp: ir.function.Compare) ?BitTest {
+    if (cmp.op != .eq and cmp.op != .ne) return null;
+    const zero = func.definingInst(cmp.rhs) orelse return null;
+    if (func.opcode(zero) != .iconst or func.opcode(zero).iconst != 0) return null;
+    if (intBits(func, cmp.lhs) != 64) return null;
+    const and_inst = func.definingInst(cmp.lhs) orelse return null;
+    const bit = switch (func.opcode(and_inst)) {
+        .arith_imm => |a| if (a.op == .bit_and and a.imm == 1) a else return null,
+        else => return null,
+    };
+    const shr_inst = func.definingInst(bit.lhs) orelse return null;
+    const shr = switch (func.opcode(shr_inst)) {
+        .arith => |a| if (a.op == .shr) a else return null,
+        else => return null,
+    };
+    const mask_inst = func.definingInst(shr.lhs) orelse return null;
+    const mask = switch (func.opcode(mask_inst)) {
+        .iconst => |c| c,
+        else => return null,
+    };
+    if (isXmm(func, shr.rhs) or intBits(func, shr.rhs) != 64) return null;
+    if (countUses(func, cmp.lhs) != 1 or countUses(func, bit.lhs) != 1) return null;
+    return .{ .mask = mask, .index = shr.rhs, .set = cmp.op == .ne };
+}
+
+/// Emit the `bt` of a bit test and return the condition that holds when the compare is true.
+fn emitBitTest(allocator: std.mem.Allocator, ctx: *Ctx, b: BitTest) Error!encode.Cond {
+    const index = try ctx.use(allocator, b.index, scratch1);
+    try ctx.put(allocator, encode.movImm64(scratch2, @bitCast(b.mask)));
+    try ctx.put(allocator, encode.btReg(scratch2, index));
+    return if (b.set) .b else .ae;
 }

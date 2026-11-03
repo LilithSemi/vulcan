@@ -1908,3 +1908,45 @@ test "x86_64 a load, op and store to one address become one memory update" {
     f(&data, 0, 0xff00);
     try std.testing.expectEqualSlices(u32, &.{ 6, 2 ^ 0x0f0f ^ 0xff00, 3, 4 }, &data);
 }
+
+test "x86_64 a constant mask bit test is one bt and gives the right member for every byte" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const in_range = try func.appendBlock();
+    const yes = try func.appendBlock();
+    const no = try func.appendBlock();
+    // The shape the `bitset` pass builds for c == ' ' || c == '\t' || c == '\n'.
+    const c = try func.appendBlockParam(entry, u32_t);
+    const offset = try func.appendArithImm(entry, u32_t, .sub, c, 9);
+    const width = try func.appendInst(entry, u32_t, .{ .iconst = 23 });
+    const inside = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .le, .lhs = offset, .rhs = width } });
+    try func.appendIf(entry, inside, .{ .target = in_range }, .{ .target = no });
+    const wide = try func.appendInst(in_range, u64_t, .{ .convert = .{ .value = offset } });
+    const mask = try func.appendInst(in_range, u64_t, .{ .iconst = 0x800003 });
+    const shifted = try func.appendInst(in_range, u64_t, .{ .arith = .{ .op = .shr, .lhs = mask, .rhs = wide } });
+    const bit = try func.appendArithImm(in_range, u64_t, .bit_and, shifted, 1);
+    const zero = try func.appendInst(in_range, u64_t, .{ .iconst = 0 });
+    const hit = try func.appendInst(in_range, bool_t, .{ .icmp = .{ .op = .ne, .lhs = bit, .rhs = zero } });
+    try func.appendIf(in_range, hit, .{ .target = yes }, .{ .target = no });
+    const one = try func.appendInst(yes, u32_t, .{ .iconst = 1 });
+    func.setTerminator(yes, .{ .ret = ir.function.Ret.one(one) });
+    const none = try func.appendInst(no, u32_t, .{ .iconst = 0 });
+    func.setTerminator(no, .{ .ret = ir.function.Ret.one(none) });
+
+    const code = try isel.selectFunctionForModel(a, &func, mm.modelFor(.zen4));
+    defer a.free(code);
+    try std.testing.expect(std.mem.indexOf(u8, code, &.{ 0x0F, 0xA3 }) != null); // bt
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn (u32) callconv(.c) u32, 0);
+    for (0..256) |byte| {
+        const want: u32 = @intFromBool(byte == ' ' or byte == '\t' or byte == '\n');
+        try std.testing.expectEqual(want, f(@intCast(byte)));
+    }
+}

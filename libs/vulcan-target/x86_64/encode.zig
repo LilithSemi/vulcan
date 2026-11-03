@@ -821,6 +821,19 @@ pub fn testAlAl() Inst {
 }
 
 /// A condition code: the low nibble of the Jcc/SETcc opcode.
+/// `bt base, bit` (REX.W 0F A3 /r): copy bit `bit mod 64` of `base` into the carry flag.
+pub fn btReg(base: Reg, bit: Reg) Inst {
+    const mod: u8 = 0xC0 | ((n(bit) & 7) << 3) | (n(base) & 7);
+    return Inst.of(&.{ rexW(bit, base), 0x0F, 0xA3, mod });
+}
+
+test "btReg encodes the register form" {
+    // bt rax, rcx
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x0F, 0xA3, 0xC8 }, btReg(.rax, .rcx).slice());
+    // bt r10, r13
+    try std.testing.expectEqualSlices(u8, &.{ 0x4D, 0x0F, 0xA3, 0xEA }, btReg(.r10, .r13).slice());
+}
+
 pub const Cond = enum(u8) {
     e = 0x4, // equal / zero
     ne = 0x5, // not equal
