@@ -2166,6 +2166,11 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     const rd = ctx.dst(result, scratch1);
                     if (a.op == .add and rd != rl and rd != rr and !flagsReadAfter(ctx)) {
                         try ctx.put(allocator, encode.leaBaseIndex(rd, rl, rr, w64));
+                    } else if (rd == rr and rd != rl) {
+                        // The result took the dying right operand's register (see
+                        // `x86_64DestructiveAlternate`), so the commutative op runs the other way.
+                        std.debug.assert(commutativeOp(a.op));
+                        try ctx.put(allocator, try binary(a.op, rd, rl, w64));
                     } else {
                         if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
                         try ctx.put(allocator, try binary(a.op, rd, rr, w64));
@@ -4499,6 +4504,24 @@ fn x86_64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Valu
     };
 }
 
+/// The right operand of a commutative register-form ALU op, which the op may write over instead
+/// of the left one: `x = y ^ x` is `xor x, y`.
+fn x86_64DestructiveAlternate(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
+    _ = ctx;
+    if (isXmm(func, v)) return null;
+    const inst = func.definingInst(v) orelse return null;
+    const a = switch (func.opcode(inst)) {
+        .arith => |a| a,
+        else => return null,
+    };
+    switch (a.op) {
+        .add, .mul, .bit_and, .bit_or, .bit_xor => {},
+        else => return null,
+    }
+    if (a.lhs == a.rhs or loadsOperand(func, a) or foldedAluImm(func, a, v) != null) return null;
+    return a.rhs;
+}
+
 /// Whether a narrow load already left `value` extended to `dst_bits` in its register. An
 /// unsigned load zero-extends to 64 bits, a signed 8 or 16-bit load sign-extends to 32, and
 /// a signed 32-bit load sign-extends to 64.
@@ -4661,6 +4684,7 @@ pub fn x86_64RegDescription(allocator: std.mem.Allocator, func: *const Function)
         .useKind = x86_64UseKind,
         .copySource = x86_64CopySource,
         .destructiveSource = x86_64DestructiveSource,
+        .destructiveAlternate = x86_64DestructiveAlternate,
         .fusedOperands = x86_64FusedOperands,
         .coalesce_block_params = true,
         .coalesce_spill_slots = true,
@@ -6032,4 +6056,11 @@ test "an atomic is rejected, not dropped like a prefetch" {
 
         try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
     }
+}
+
+fn commutativeOp(op: ir.function.BinOp) bool {
+    return switch (op) {
+        .add, .mul, .bit_and, .bit_or, .bit_xor => true,
+        else => false,
+    };
 }

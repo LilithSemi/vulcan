@@ -128,6 +128,9 @@ pub const RegDescription = struct {
     // allocator may overlap both intervals. Unlike `copySource`, the instruction is still emitted;
     // this only enables normal two-address-style register reuse on a three-address ISA.
     destructiveSource: ?*const fn (ctx: *const anyopaque, func: *const Function, v: Value) ?Value = null,
+    // OPTIONAL second operand for `destructiveSource`, for a commutative instruction that may write
+    // over either input. The allocator treats it exactly like the first.
+    destructiveAlternate: ?*const fn (ctx: *const anyopaque, func: *const Function, v: Value) ?Value = null,
     // OPTIONAL narrow-value predicate. Return true when value `v` survives a call clobber of a
     // register in its class's `narrow_preserved` set (i.e. it fits in the preserved low half). On
     // aarch64 this is a SCALAR float (not a 128-bit vector), which AAPCS64 preserves in v8..v15
@@ -276,6 +279,7 @@ pub const Interval = struct {
     // An input the defining instruction may safely alias with this result. The instruction remains
     // real code; sharing merely chooses Rd == Rn when the input dies at the definition.
     destructive_src: ?Value = null,
+    destructive_alt: ?Value = null,
     // For a VALUE interval, true when the backend's `RegDescription.isNarrow` flagged this value as
     // one that survives a clobber of a `RegClass.narrow_preserved` register (e.g. a scalar float in
     // aarch64 v8..v15, whose low 64 bits AAPCS64 preserves across a call). A narrow value may stay
@@ -803,6 +807,12 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
                 if (desc.classOf(desc.ctx, func, s) == class) destructive_src = s;
             }
         }
+        var destructive_alt: ?Value = null;
+        if (desc.destructiveAlternate) |hook| {
+            if (hook(desc.ctx, func, value)) |s| {
+                if (desc.classOf(desc.ctx, func, s) == class) destructive_alt = s;
+            }
+        }
         const narrow = if (desc.isNarrow) |hook| hook(desc.ctx, func, value) else false;
         // The register width is read ONCE here and carried on the interval, so every later site
         // (the scan, the splitter, the resolver, the verifier) reads one answer.
@@ -815,6 +825,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             .uses = us,
             .copy_src = copy_src,
             .destructive_src = destructive_src,
+            .destructive_alt = destructive_alt,
             .narrow = narrow,
             .regs = width.regs,
             .reg_align = width.alignment,
@@ -1222,6 +1233,8 @@ fn tryAllocateFreeReg(
     // register makes the copy a no-op. Keep the register free for `current` and record it as the
     // preferred (coalesce) register, so the backend elides the move.
     var coalesce_hint: ?u16 = null;
+    // The second operand of a commutative op is a fallback, taken only when the first cannot be.
+    var alternate_hint: ?u16 = null;
     for (active) |it| {
         if (it.class != class_idx) continue;
         if (sameValue(it, current)) continue;
@@ -1229,7 +1242,12 @@ fn tryAllocateFreeReg(
         if (copyDiesAt(current, it) or destructiveSourceDiesAt(current, it) or
             (desc.destructive_holes and destructiveSourceFreeAfter(current, it)))
         {
-            if (r < limit and is_candidate[r]) coalesce_hint = r;
+            if (r < limit and is_candidate[r]) {
+                if (it.value != null and it.value == current.destructive_alt and it.value != current.destructive_src)
+                    alternate_hint = r
+                else
+                    coalesce_hint = r;
+            }
             continue;
         }
         // The occupant holds its WHOLE span right now, so every register of it is busy. Marking only
@@ -1300,6 +1318,10 @@ fn tryAllocateFreeReg(
         if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
             spanMin(&free_until, h, current.regs) >= current.end()) chosen = h;
     };
+    if (chosen == null) if (alternate_hint) |h| {
+        if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
+            spanMin(&free_until, h, current.regs) >= current.end()) chosen = h;
+    };
     if (chosen == null) {
         for (0..limit) |b| {
             if (!spanPlaceable(&is_candidate, null, limit, b, current.regs, current.reg_align)) continue;
@@ -1340,10 +1362,9 @@ fn copyDiesAt(dst: *const Interval, src: *const Interval) bool {
 /// Like `destructiveSourceDiesAt`, but the source may live again later: its range ends at the def,
 /// and it never overlaps the result after that.
 fn destructiveSourceFreeAfter(dst: *const Interval, src: *const Interval) bool {
-    const destructive = dst.destructive_src orelse return false;
     if (src.fixed_reg != null) return false;
     const sv = src.value orelse return false;
-    if (destructive != sv) return false;
+    if (!isDestructiveOperand(dst, sv)) return false;
     if (src.regs != dst.regs or src.reg_align != dst.reg_align) return false;
     const def = dst.start();
     var ends_at_def = false;
@@ -1358,10 +1379,9 @@ fn destructiveSourceFreeAfter(dst: *const Interval, src: *const Interval) bool {
 }
 
 fn destructiveSourceDiesAt(dst: *const Interval, src: *const Interval) bool {
-    const destructive = dst.destructive_src orelse return false;
     if (src.fixed_reg != null) return false;
     const sv = src.value orelse return false;
-    if (destructive != sv) return false;
+    if (!isDestructiveOperand(dst, sv)) return false;
     if (src.regs != dst.regs or src.reg_align != dst.reg_align) return false;
     return src.end() == dst.start() + 1;
 }
@@ -4052,4 +4072,9 @@ test "slotIntervalsInterfere: an early store holds the slot in front of the inte
     // refuse every union.
     const free = [_]*Interval{ &rest, &earlier };
     try std.testing.expect(!slotGroupsInterfere(&free, &parent, &class_off, 0, 0, 1));
+}
+
+/// Whether `sv` is an input the instruction defining `dst` may write over.
+fn isDestructiveOperand(dst: *const Interval, sv: Value) bool {
+    return dst.destructive_src == sv or dst.destructive_alt == sv;
 }
