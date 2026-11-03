@@ -25,6 +25,7 @@ pub const bitset = @import("vulcan-opt/bitset.zig");
 pub const looppromote = @import("vulcan-opt/looppromote.zig");
 pub const samewidth = @import("vulcan-opt/samewidth.zig");
 pub const libcall = @import("vulcan-opt/libcall.zig");
+pub const tailrecurse = @import("vulcan-opt/tailrecurse.zig");
 pub const joinconst = @import("vulcan-opt/joinconst.zig");
 pub const ifconvert = @import("vulcan-opt/ifconvert.zig");
 pub const gvn = @import("vulcan-opt/gvn.zig");

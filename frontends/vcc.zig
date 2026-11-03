@@ -1075,6 +1075,10 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
             if (constants) |c| if (try opt.libcall.run(allocator, &nf.func, c)) {
                 _ = try opt.optimizeEarlyFor(allocator, &nf.func, latency_aware);
             };
+            // A self call whose result only feeds an associative op before the return becomes a loop.
+            if (optimize.inlinesCalls() and try opt.tailrecurse.run(allocator, &nf.func, nf.name)) {
+                _ = try opt.optimizeEarlyFor(allocator, &nf.func, latency_aware);
+            }
         }
     }
     const early_end = std.Io.Timestamp.now(io, .awake);
