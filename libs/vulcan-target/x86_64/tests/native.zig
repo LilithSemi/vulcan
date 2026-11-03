@@ -1815,3 +1815,58 @@ test "x86_64 a masked 32-bit slot indexes memory without a separate zero extensi
     const data = [_]u32{ 10, 11, 12, 13, 14, 15, 16, 17 };
     for ([_]u32{ 0, 5, 7, 8, 0xffffffff, 0x80000003 }) |k| try std.testing.expectEqual(data[k & 7], f(&data, k));
 }
+
+test "x86_64 a list walk loads the next node into the register of the current one" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const first = try func.appendBlockParam(entry, ptr_t);
+    const zero = try func.appendInst(entry, i64_t, .{ .iconst = 0 });
+    const null_ptr = try func.appendInst(entry, ptr_t, .{ .iconst = 0 });
+    try func.setJump(entry, header, &.{ first, zero });
+    // while (node) { sum += node->value; node = node->next; } with next at 0 and value at 8.
+    const node = try func.appendBlockParam(header, ptr_t);
+    const sum = try func.appendBlockParam(header, i64_t);
+    const more = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .ne, .lhs = node, .rhs = null_ptr } });
+    try func.appendIf(header, more, .{ .target = body }, .{ .target = done });
+    const value_at = try func.appendArithImm(body, ptr_t, .add, node, 8);
+    const value = try func.appendInst(body, i64_t, .{ .load = .{ .ptr = value_at } });
+    const next_sum = try func.appendInst(body, i64_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = value } });
+    const next = try func.appendInst(body, ptr_t, .{ .load = .{ .ptr = node } });
+    try func.setJump(body, header, &.{ next, next_sum });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(sum) });
+
+    const code = try isel.selectFunctionForModel(a, &func, mm.modelFor(.zen4));
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+    var chases = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const at = std.mem.indexOf(u8, line, "mov ") orelse continue;
+        const operands = line[at + 4 ..];
+        const comma = std.mem.indexOfScalar(u8, operands, ',') orelse continue;
+        const dst = operands[0..comma];
+        const bracket = std.mem.indexOfScalar(u8, operands, '[') orelse continue;
+        if (std.mem.startsWith(u8, operands[bracket + 1 ..], dst)) chases = true;
+    }
+    try std.testing.expect(chases);
+
+    const Node = extern struct { next: ?*const @This(), value: i64 };
+    const third = Node{ .next = null, .value = -4 };
+    const second = Node{ .next = &third, .value = 100 };
+    const head = Node{ .next = &second, .value = 7 };
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn (?*const Node) callconv(.c) i64, 0);
+    try std.testing.expectEqual(@as(i64, 103), f(&head));
+    try std.testing.expectEqual(@as(i64, 0), f(null));
+}

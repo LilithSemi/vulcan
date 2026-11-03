@@ -4201,6 +4201,14 @@ fn emitCompare(allocator: std.mem.Allocator, ctx: *Ctx, cmp: ir.function.Compare
 
 fn foldedCmpImm(func: *const Function, cmp: ir.function.Compare) ?i32 {
     if (isVector(func, cmp.lhs) or isFloat(func, cmp.lhs)) return null;
+    // A pointer compares with a small constant, such as null, as an immediate too.
+    if (func.types.type_kind(func.valueType(cmp.lhs)) == .ptr) {
+        const inst = func.definingInst(cmp.rhs) orelse return null;
+        return switch (func.opcode(inst)) {
+            .iconst => |c| std.math.cast(i32, c),
+            else => null,
+        };
+    }
     return foldedImm(func, cmp.rhs, intBits(func, cmp.lhs) > 32);
 }
 
@@ -4505,6 +4513,9 @@ fn x86_64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Valu
             .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => a.lhs,
             .mul, .div, .rem, .mulh => null,
         },
+        // A load reads its address before it writes its result. When the result becomes the next
+        // value of its own base, as in `p = p->next`, both share one register.
+        .load => |l| if (sibAddress(func, inst) == null and feedsOwnBase(func, v, l.ptr)) l.ptr else null,
         // A cmov writes over its result, which may start as either register arm.
         .select => |s| blk: {
             const w64 = intBits(func, v) > 32;
@@ -6139,4 +6150,28 @@ fn producesZeroUpper(func: *const Function, def: ir.function.Inst) bool {
         .load => |l| l.mask == null,
         else => false,
     };
+}
+
+/// Whether `v` is passed on an edge to the block parameter `base`.
+fn feedsOwnBase(func: *const Function, v: Value, base: Value) bool {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| if (func.opcode(inst) == .@"if") {
+            const cf = func.opcode(inst).@"if";
+            for ([_]ir.function.Jump{ cf.then, cf.@"else" }) |edge| if (edgeFeeds(func, edge, v, base)) return true;
+        };
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |j| if (edgeFeeds(func, j, v, base)) return true,
+            .ret => {},
+        };
+    }
+    return false;
+}
+
+fn edgeFeeds(func: *const Function, edge: ir.function.Jump, v: Value, param: Value) bool {
+    const params = func.blockParams(edge.target);
+    for (func.blockArgs(edge), 0..) |arg, index| {
+        if (arg == v and index < params.len and params[index] == param) return true;
+    }
+    return false;
 }
