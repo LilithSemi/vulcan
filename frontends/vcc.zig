@@ -1181,6 +1181,54 @@ fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module, profile:
             _ = try opt.inlining.runSmallAcyclic(allocator, &named.func, lookup);
         }
     }
+    if (profile == null) try inlineSingleCallSites(allocator, mod);
+}
+
+/// Finds only the `static` functions that have one direct call and no taken address.
+const SingleSiteLookup = struct {
+    mod: *const cc.Module,
+    names: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn get(context: *anyopaque, name: []const u8) ?*const cc.Function {
+        const self: *const SingleSiteLookup = @ptrCast(@alignCast(context));
+        if (!self.names.contains(name)) return null;
+        return self.mod.find(name);
+    }
+};
+
+/// A `static` function called from one place costs nothing extra when inlined there, and the
+/// caller may become a leaf that a loop can then inline.
+fn inlineSingleCallSites(allocator: std.mem.Allocator, mod: *cc.Module) !void {
+    var uses: std.StringHashMapUnmanaged(u32) = .empty;
+    defer uses.deinit(allocator);
+    for (mod.funcs) |*named| {
+        const func = &named.func;
+        for (0..func.blockCount()) |bi| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+                const symbol, const weight: u32 = switch (func.opcode(inst)) {
+                    .call => |c| .{ c.symbol, 1 },
+                    .global_addr => |g| .{ g.symbol, 2 },
+                    else => continue,
+                };
+                const name = func.symbolName(symbol);
+                const entry = try uses.getOrPutValue(allocator, name, 0);
+                entry.value_ptr.* += if (std.mem.eql(u8, name, named.name)) 2 else weight;
+            }
+        }
+    }
+    for (mod.data) |object| for (object.relocs) |reloc| {
+        const entry = try uses.getOrPutValue(allocator, reloc.symbol, 0);
+        entry.value_ptr.* += 2;
+    };
+    var lookup_state: SingleSiteLookup = .{ .mod = mod };
+    defer lookup_state.names.deinit(allocator);
+    for (mod.funcs) |*named| {
+        if (!named.func.is_local or (uses.get(named.name) orelse 0) != 1) continue;
+        try lookup_state.names.put(allocator, named.name, {});
+    }
+    if (lookup_state.names.count() == 0) return;
+    const lookup = opt.inlining.Lookup{ .context = &lookup_state, .func = SingleSiteLookup.get };
+    for (mod.funcs) |*named| _ = try opt.inlining.run(allocator, &named.func, lookup);
 }
 
 /// The bytes of a read-only data object in the module, for constant library calls.
