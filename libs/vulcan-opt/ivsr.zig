@@ -553,17 +553,43 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
     // instruction order. A hand-built loop that presented a smaller offset later would still
     // coalesce correctly, just not with the smallest offset as the walking value; that is a quality
     // choice, not a correctness one, so this pass does not pay for a global rescan to guarantee it.
-    var families: std.AutoHashMapUnmanaged(FamilyKey, Keeper) = .empty;
-    defer families.deinit(allocator);
-
+    // The member furthest along the step keeps the variable: the next pointer is then never the
+    // address of another member, which would keep two pointers live across the body.
+    var preferred: std.AutoHashMapUnmanaged(FamilyKey, i64) = .empty;
+    defer preferred.deinit(allocator);
     for (0..func.blockCount()) |bi| {
         if (!ctx.loop.contains(bi)) continue;
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const result = func.instResult(inst) orelse continue;
             const rep = ctx.affine[@backingInt(result)] orelse continue;
             if (!worthReducing(ctx, pool, result, rep)) continue;
+            const f = coalescable(ctx, pool, rep) orelse continue;
+            const step = stepOf(ctx, func.blockParams(ctx.header)[rep.biv], latch_args[rep.biv]) orelse continue;
+            if (step != .konst) continue;
+            const forward = (f.key.scale > 0) == (step.konst > 0);
+            const entry = try preferred.getOrPut(allocator, f.key);
+            if (!entry.found_existing or (forward and f.offset > entry.value_ptr.*) or (!forward and f.offset < entry.value_ptr.*))
+                entry.value_ptr.* = f.offset;
+        }
+    }
+
+    var families: std.AutoHashMapUnmanaged(FamilyKey, Keeper) = .empty;
+    defer families.deinit(allocator);
+
+    // The first round places the preferred keepers, the second everything else.
+    for (0..2) |round| for (0..func.blockCount()) |bi| {
+        if (!ctx.loop.contains(bi)) continue;
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const result = func.instResult(inst) orelse continue;
+            if (reduced[@backingInt(result)]) continue;
+            const rep = ctx.affine[@backingInt(result)] orelse continue;
+            if (!worthReducing(ctx, pool, result, rep)) continue;
 
             const family = coalescable(ctx, pool, rep);
+            if (round == 0) {
+                const f = family orelse continue;
+                if (preferred.get(f.key) != f.offset or families.contains(f.key)) continue;
+            }
             if (family) |f| {
                 if (families.get(f.key)) |keeper| {
                     if (func.valueType(result) == keeper.ty) {
@@ -610,7 +636,7 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
                 }
             }
         }
-    }
+    };
 }
 
 /// Map each in-loop value that carries a header parameter unchanged to that parameter. Header
@@ -2344,4 +2370,39 @@ fn counterPlusConstant(ctx: *const LoopCtx, pool: *const Pool, v: Value, biv: u3
     const inner = ctx.affine[@backingInt(counter)] orelse return false;
     return inner.base == null and inner.biv == biv and
         pool.constOf(inner.scale) == @as(?i64, 1) and pool.constOf(inner.offset) == @as(?i64, 0);
+}
+
+test "the pointer furthest along the step keeps the variable, so the next pointer is no member" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const c = try buildCounted(&func, n, i32_t, entry);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, c.head, &.{ zero, zero });
+    // p[k] + p[k + 1], read in that order, while k counts up.
+    var loads: [2]Value = undefined;
+    for (0..2) |m| {
+        const index = if (m == 0) c.bk else try func.appendInst(c.body, i32_t, .{ .arith_imm = .{ .op = .add, .lhs = c.bk, .imm = 1, .nsw = true } });
+        const wide = try func.appendInst(c.body, i64_t, .{ .convert = .{ .value = index } });
+        const off = try func.appendArithImm(c.body, i64_t, .shl, wide, 2);
+        const addr = try func.appendInst(c.body, ptr_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = off } });
+        loads[m] = try func.appendInst(c.body, i32_t, .{ .load = .{ .ptr = addr } });
+    }
+    const pair = try func.appendInst(c.body, i32_t, .{ .arith = .{ .op = .add, .lhs = loads[0], .rhs = loads[1] } });
+    try closeCounted(&func, c, pair);
+
+    try testing.expect(try runPass(allocator, &func));
+    // p[k] now rides 4 bytes behind the variable that walks p[k + 1].
+    const first = func.opcode(func.definingInst(loads[0]).?).load.ptr;
+    const rider = func.opcode(func.definingInst(first).?);
+    try testing.expect(rider == .arith_imm and rider.arith_imm.imm == -4);
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
 }
