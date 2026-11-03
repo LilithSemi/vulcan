@@ -1782,3 +1782,36 @@ test "x86_64 a commutative op writes over its dying right operand" {
         try std.testing.expectEqual((v ^ (v >> 30)) +% v, f(v));
     }
 }
+
+test "x86_64 a masked 32-bit slot indexes memory without a separate zero extension" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const table = try func.appendBlockParam(entry, ptr_t);
+    const key = try func.appendBlockParam(entry, u32_t);
+    // table[key & 7]: the 32-bit `and` already cleared the upper half of its register.
+    const slot = try func.appendArithImm(entry, u32_t, .bit_and, key, 7);
+    const wide = try func.appendInst(entry, i64_t, .{ .convert = .{ .value = slot } });
+    const offset = try func.appendArithImm(entry, i64_t, .shl, wide, 2);
+    const address = try func.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = table, .rhs = offset } });
+    const value = try func.appendInst(entry, u32_t, .{ .load = .{ .ptr = address } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(value) });
+
+    const code = try isel.selectFunctionForModel(a, &func, mm.modelFor(.zen4));
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "and "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "mov"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "["));
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn ([*]const u32, u32) callconv(.c) u32, 0);
+    const data = [_]u32{ 10, 11, 12, 13, 14, 15, 16, 17 };
+    for ([_]u32{ 0, 5, 7, 8, 0xffffffff, 0x80000003 }) |k| try std.testing.expectEqual(data[k & 7], f(&data, k));
+}
