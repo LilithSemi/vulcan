@@ -30,6 +30,10 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     defer avail.deinit(allocator);
     var keep: std.ArrayList(Inst) = .empty;
     defer keep.deinit(allocator);
+    // Addresses every predecessor holds, each with its own value. A load of one takes a new
+    // block param that each predecessor fills on its edge.
+    var merges: std.ArrayList(Avail) = .empty;
+    defer merges.deinit(allocator);
 
     // A block starts with the entries available at the end of every predecessor. A value that is
     // available in all of them is defined above all of them, so it dominates the block. Reverse
@@ -60,8 +64,10 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     for (order) |bi| {
         avail.clearRetainingCapacity();
         keep.clearRetainingCapacity();
+        merges.clearRetainingCapacity();
+        var preds: []const u32 = &.{};
         if (bi < graph.blockCount()) {
-            const preds = graph.predecessors(bi);
+            preds = graph.predecessors(bi);
             const all_seen = for (preds) |p| {
                 if (p == bi or ends[p] == null) break false;
             } else preds.len != 0;
@@ -70,7 +76,15 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     const everywhere = for (preds[1..]) |p| {
                         if (!holds(ends[p].?, entry)) break false;
                     } else true;
-                    if (everywhere) try avail.append(allocator, entry);
+                    if (everywhere) {
+                        try avail.append(allocator, entry);
+                        continue;
+                    }
+                    const ty = func.valueType(entry.value);
+                    const anywhere = for (preds[1..]) |p| {
+                        if (exact(ends[p].?, func, entry.ptr, ty) == null) break false;
+                    } else true;
+                    if (anywhere) try merges.append(allocator, entry);
                 }
             }
         }
@@ -100,6 +114,12 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                             block_changed = true;
                             continue; // drop the now-redundant load
                         }
+                        if (try joinValue(allocator, func, merges.items, ends, preds, @intCast(bi), ld.ptr, func.valueType(result))) |v| {
+                            func.replaceAllLiveUses(result, v);
+                            try avail.append(allocator, .{ .ptr = ld.ptr, .value = v });
+                            block_changed = true;
+                            continue;
+                        }
                         try avail.append(allocator, .{ .ptr = ld.ptr, .value = result });
                     }
                 },
@@ -114,7 +134,9 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     // mask bit is clear did not write, so the address does not hold `st.value`
                     // afterwards. It still invalidates, because the lanes that did write changed
                     // what is there.
-                    invalidateAliasing(&avail, func, st.ptr, func.valueType(st.value));
+                    const same = sameValueStore(func, inst, st);
+                    invalidateStore(&avail, func, st.ptr, st.value, same);
+                    invalidateStore(&merges, func, st.ptr, st.value, same);
                     if (!st.@"volatile" and st.mask == null and !func.isByteOrderTagged(inst)) {
                         try avail.append(allocator, .{ .ptr = st.ptr, .value = st.value });
                     }
@@ -128,19 +150,34 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 // before it visible after it, which is what a barrier does, so it drops the
                 // whole set the way the `barrier` arm below does.
                 .atomic_rmw => |a| switch (a.ordering) {
-                    .relaxed => invalidateAliasing(&avail, func, a.ptr, func.valueType(a.value)),
-                    .acquire, .release, .acq_rel, .seq_cst => avail.clearRetainingCapacity(),
+                    .relaxed => {
+                        invalidateAliasing(&avail, func, a.ptr, func.valueType(a.value));
+                        invalidateAliasing(&merges, func, a.ptr, func.valueType(a.value));
+                    },
+                    .acquire, .release, .acq_rel, .seq_cst => {
+                        avail.clearRetainingCapacity();
+                        merges.clearRetainingCapacity();
+                    },
                 },
                 // A call or a matmul may write any memory, so everything recorded is dropped.
-                .call, .call_indirect, .matmul => avail.clearRetainingCapacity(),
+                .call, .call_indirect, .matmul => {
+                    avail.clearRetainingCapacity();
+                    merges.clearRetainingCapacity();
+                },
                 // A barrier makes memory another thread wrote before it visible after it, so
                 // every value this block believes it holds may now be stale. Forwarding a
                 // store to a load across a barrier is exactly the bug the barrier exists to
                 // prevent, so drop the whole availability set.
-                .barrier => avail.clearRetainingCapacity(),
+                .barrier => {
+                    avail.clearRetainingCapacity();
+                    merges.clearRetainingCapacity();
+                },
                 // These three read and mutate the `va_list` object through `list`, so they
                 // may write memory a recorded entry names. Drop the set, like a call.
-                .va_start, .va_arg, .va_end => avail.clearRetainingCapacity(),
+                .va_start, .va_arg, .va_end => {
+                    avail.clearRetainingCapacity();
+                    merges.clearRetainingCapacity();
+                },
                 // The rest are pure (no memory effect) and leave availability intact. A
                 // prefetch is a hint and writes nothing. The switch is exhaustive with no
                 // `else` prong on purpose: an `else` reads a newly added effectful opcode as
@@ -197,11 +234,82 @@ fn find(items: []const Avail, func: *const Function, ptr: Value, want_ty: ir.typ
     return null;
 }
 
+/// The value an entry holds for exactly `ptr` at type `ty`.
+fn exact(items: []const Avail, func: *const Function, ptr: Value, ty: ir.types.Type) ?Value {
+    for (items) |item| {
+        if (item.ptr == ptr and func.valueType(item.value) == ty) return item.value;
+    }
+    return null;
+}
+
+/// A new param of `block` for a merged address. Each predecessor passes the value it holds there.
+fn joinValue(allocator: std.mem.Allocator, func: *Function, merges: []const Avail, ends: []const ?[]const Avail, preds: []const u32, block: u32, ptr: Value, ty: ir.types.Type) !?Value {
+    const merge = for (merges) |m| {
+        if (sameAddress(func, m.ptr, ptr) and func.valueType(m.value) == ty) break m;
+    } else return null;
+    const param = try func.appendBlockParam(@fromBackingInt(block), ty);
+    for (preds, 0..) |p, k| {
+        if (std.mem.indexOfScalar(u32, preds[0..k], p) != null) continue;
+        const value = exact(ends[p].?, func, merge.ptr, ty).?;
+        try passOnEdges(allocator, func, @fromBackingInt(p), @fromBackingInt(block), value);
+    }
+    return param;
+}
+
+/// Append `value` to the args of every edge from `from` to `to`.
+fn passOnEdges(allocator: std.mem.Allocator, func: *Function, from: Block, to: Block, value: Value) !void {
+    for (func.blockInsts(from)) |inst| {
+        if (func.opcode(inst) != .@"if") continue;
+        const cf = func.opcode(inst).@"if";
+        const then_args = if (cf.then.target == to) try withArg(allocator, func, func.blockArgs(cf.then), value) else null;
+        const else_args = if (cf.@"else".target == to) try withArg(allocator, func, func.blockArgs(cf.@"else"), value) else null;
+        const cf_mut = &func.opcodeMut(inst).@"if";
+        if (then_args) |args| cf_mut.then.args = args;
+        if (else_args) |args| cf_mut.@"else".args = args;
+    }
+    if (func.terminator(from)) |term| switch (term) {
+        .jump => |j| if (j.target == to) {
+            const args = try allocator.alloc(Value, func.blockArgs(j).len + 1);
+            defer allocator.free(args);
+            @memcpy(args[0 .. args.len - 1], func.blockArgs(j));
+            args[args.len - 1] = value;
+            try func.setJump(from, to, args);
+        },
+        .ret => {},
+    };
+}
+
+fn withArg(allocator: std.mem.Allocator, func: *Function, args: []const Value, value: Value) !ir.function.ValueList {
+    const list = try allocator.alloc(Value, args.len + 1);
+    defer allocator.free(list);
+    @memcpy(list[0..args.len], args);
+    list[args.len] = value;
+    return func.internValues(list);
+}
+
 fn holds(items: []const Avail, entry: Avail) bool {
     for (items) |item| {
         if (item.ptr == entry.ptr and item.value == entry.value) return true;
     }
     return false;
+}
+
+/// A store of the value an entry already holds leaves that entry true whether the addresses alias or
+/// not. This needs whole overlap or none, which holds for pointer-typed values, since C never places
+/// two pointer objects partly over each other.
+fn sameValueStore(func: *const Function, inst: Inst, st: ir.function.Store) bool {
+    return st.mask == null and !func.isByteOrderTagged(inst) and
+        func.types.type_kind(func.valueType(st.value)) == .ptr;
+}
+
+fn invalidateStore(avail: *std.ArrayList(Avail), func: *const Function, ptr: Value, value: Value, same: bool) void {
+    var i: usize = 0;
+    while (i < avail.items.len) {
+        const item = avail.items[i];
+        if (!(same and item.value == value) and mayAlias(func, item.ptr, func.valueType(item.value), ptr, func.valueType(value))) {
+            _ = avail.swapRemove(i);
+        } else i += 1;
+    }
 }
 
 /// Drop every availability entry whose address may alias `ptr` (a store to `ptr` may have
@@ -360,7 +468,7 @@ test "a block with one predecessor reuses a load from it, a join block does not"
     try testing.expectEqual(first, func.terminator(join).?.ret.values[0]);
 }
 
-test "a join block with two predecessors does not reuse a load" {
+test "a join block takes a param for an address each predecessor holds with its own value" {
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -384,7 +492,13 @@ test "a join block with two predecessors does not reuse a load" {
     func.setTerminator(join, .{ .ret = ir.function.Ret.one(again) });
 
     _ = try runOnce(allocator, &func);
-    try testing.expectEqual(again, func.terminator(join).?.ret.values[0]);
+    const merged = func.terminator(join).?.ret.values[0];
+    try testing.expectEqual(func.blockParams(join)[0], merged);
+    try testing.expectEqual(v, func.blockArgs(func.terminator(left).?.jump)[0]);
+    try testing.expectEqual(first, func.blockArgs(func.terminator(right).?.jump)[0]);
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
 }
 
 test "a join block reuses a load that every predecessor still holds" {
@@ -835,4 +949,38 @@ test "a masked store does not forward its value to a later load" {
         try testing.expect(try runOnce(allocator, &func));
         try testing.expectEqual(s.stored, func.terminator(s.block).?.ret.values[0]);
     }
+}
+
+test "storing the pointer an address already holds keeps that address known" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const l = try func.appendBlockParam(b, ptr_t);
+    const other = try func.appendBlockParam(b, ptr_t);
+    const next = try func.appendInst(b, ptr_t, .{ .load = .{ .ptr = l } });
+    try func.appendStore(b, next, other);
+    const again = try func.appendInst(b, ptr_t, .{ .load = .{ .ptr = l } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(again) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    try testing.expectEqual(next, func.terminator(b).?.ret.values[0]);
+}
+
+test "storing a different pointer to an unknown address drops what an address holds" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const l = try func.appendBlockParam(b, ptr_t);
+    const other = try func.appendBlockParam(b, ptr_t);
+    const next = try func.appendInst(b, ptr_t, .{ .load = .{ .ptr = l } });
+    try func.appendStore(b, other, other);
+    const again = try func.appendInst(b, ptr_t, .{ .load = .{ .ptr = l } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(again) });
+
+    _ = try runOnce(allocator, &func);
+    try testing.expect(func.terminator(b).?.ret.values[0] != next);
 }
