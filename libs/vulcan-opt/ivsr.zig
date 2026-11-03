@@ -1337,6 +1337,40 @@ fn applyPlan(allocator: std.mem.Allocator, func: *Function, ctx: *LoopCtx, pool:
 
     try appendEdgeArgs(allocator, func, ctx.preheader, inits);
     try appendEdgeArgs(allocator, func, ctx.latch, next_values);
+    try appendDeadEdgeArgs(allocator, func, ctx, inits);
+}
+
+/// Any other edge into the header is in a dead block, since the loop has a unique preheader and
+/// latch. It still has to pass one argument per header parameter, so it passes the initial values.
+fn appendDeadEdgeArgs(allocator: std.mem.Allocator, func: *Function, ctx: *const LoopCtx, extra: []const Value) pass.Error!void {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        if (block == ctx.preheader or block == ctx.latch) continue;
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |j| if (j.target == ctx.header) try appendEdgeArgs(allocator, func, block, extra),
+            .ret => {},
+        };
+        for (func.blockInsts(block)) |inst| {
+            if (func.opcode(inst) != .@"if") continue;
+            const cf = func.opcode(inst).@"if";
+            if (cf.then.target == ctx.header) {
+                const list = try withExtra(allocator, func, func.blockArgs(cf.then), extra);
+                func.opcodeMut(inst).@"if".then.args = list;
+            }
+            if (cf.@"else".target == ctx.header) {
+                const list = try withExtra(allocator, func, func.blockArgs(cf.@"else"), extra);
+                func.opcodeMut(inst).@"if".@"else".args = list;
+            }
+        }
+    }
+}
+
+fn withExtra(allocator: std.mem.Allocator, func: *Function, args: []const Value, extra: []const Value) pass.Error!ir.function.ValueList {
+    var all: std.ArrayList(Value) = .empty;
+    defer all.deinit(allocator);
+    try all.appendSlice(allocator, args);
+    try all.appendSlice(allocator, extra);
+    return func.internValues(all.items);
 }
 
 /// `base + offset` at `ty`, using the immediate form when the offset is a known constant. The

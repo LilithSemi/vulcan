@@ -1949,6 +1949,37 @@ test "float arithmetic" {
 test "float f32" {
     try expectAgreesFloat("float f(void){ return 1.5f + 0.5f; }", &.{}); // 2.0f
 }
+test "a counting-down signed index addresses memory like gcc" {
+    const sort =
+        \\int f(int a) {
+        \\  int v[24];
+        \\  unsigned s = (unsigned)a * 2654435761u + 7u;
+        \\  for (int i = 0; i < 24; ++i) { s = s * 1103515245u + 12345u; v[i] = (int)(s >> 8) - 4000000; }
+        \\  for (int i = 1; i < 24; ++i) {
+        \\    int x = v[i], j = i - 1;
+        \\    while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; --j; }
+        \\    v[j + 1] = x;
+        \\  }
+        \\  int sum = 0;
+        \\  for (int i = 0; i < 24; ++i) sum = sum * 31 + v[i] * (i + 1);
+        \\  return sum;
+        \\}
+    ;
+    const below =
+        \\int f(int a) {
+        \\  int v[16];
+        \\  for (int i = 0; i < 16; ++i) v[i] = i * a + 3;
+        \\  int sum = 0;
+        \\  for (int j = 15; j > -1; --j) sum = sum * 7 + v[j];
+        \\  return sum;
+        \\}
+    ;
+    for ([_]i32{ 0, 1, 42, -5, 99999 }) |a| {
+        try expectAgrees(sort, &.{a});
+        try expectAgrees(below, &.{a});
+    }
+}
+
 test "division and remainder by a widened constant match gcc" {
     const unsigned64 =
         \\unsigned long long f(int a) {
