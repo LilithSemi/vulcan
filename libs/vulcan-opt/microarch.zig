@@ -15,6 +15,7 @@ const dce = @import("dce.zig");
 const licm = @import("licm.zig");
 const jumpthread = @import("jumpthread.zig");
 const branchfold = @import("branchfold.zig");
+const mem2reg = @import("mem2reg.zig");
 const rangecheck = @import("rangecheck.zig");
 const joinconst = @import("joinconst.zig");
 const ifconvert = @import("ifconvert.zig");
@@ -141,6 +142,7 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
 /// score accepts the result.
 pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Function, m: *const Model) pass.Error!bool {
     const threaded = try pass.runToFixpoint(allocator, func, &.{
+        mem2reg.pass_def,
         joinconst.pass_def,
         jumpthread.pass_def,
         rangecheck.pass_def,
