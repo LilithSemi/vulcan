@@ -270,9 +270,16 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 
     var changed = false;
     for (info.loops) |*loop| {
-        if (try reduceLoop(allocator, func, loop)) changed = true;
+        if (try reduceLoop(allocator, func, loop, containsLoop(info, loop))) changed = true;
     }
     return changed;
+}
+
+fn containsLoop(info: *const loops_mod.LoopInfo, loop: *const loops_mod.Loop) bool {
+    for (info.loops) |*other| {
+        if (other.header != loop.header and loop.contains(other.header)) return true;
+    }
+    return false;
 }
 
 /// Everything one loop's analysis needs to answer questions about its values.
@@ -306,6 +313,8 @@ const LoopCtx = struct {
     /// Header parameters, by index, proven to stay in `[0, max]` of their signed type. A sign
     /// extension of such a counter equals its zero extension.
     nonneg_bivs: u64 = 0,
+    /// Whether another loop is inside this one.
+    outer: bool = false,
 
     /// Whether `v` holds one value for the whole loop.
     fn invariant(self: *const LoopCtx, v: Value) bool {
@@ -320,7 +329,7 @@ const LoopCtx = struct {
 };
 
 /// Reduce one loop. Returns whether it changed the function.
-fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_mod.Loop) pass.Error!bool {
+fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_mod.Loop, outer: bool) pass.Error!bool {
     const preheader_index = loop.preheader orelse return false;
     const latch_index = findLatch(func, loop) orelse return false;
 
@@ -357,6 +366,7 @@ fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_
         .total_uses = total_uses,
         .chain_safe = chain_safe,
         .substitute = substitute,
+        .outer = outer,
     };
     fillDefBlocks(func, def_block);
 
@@ -1173,6 +1183,9 @@ fn worthReducing(ctx: *const LoopCtx, pool: *const Pool, v: Value, rep: Affine) 
     // A POINTER with a unit scale is a different trade. Its address chain is the integer add plus
     // the base add, so one advance per trip replaces two operations, and it is kept.
     if (rep.base == null and pool.constOf(rep.scale) == @as(?i64, 1)) return false;
+    // In a loop that holds another loop, an integer variable saves one operation per outer
+    // trip, but it keeps a register live through the whole inner loop.
+    if (rep.base == null and ctx.outer) return false;
     // Nothing left that has to read it: reducing it would only add a dead variable.
     if (ctx.demanding_uses[@backingInt(v)] == 0) return false;
     // A value the back edge already carries to the header is already a loop recurrence, so a
