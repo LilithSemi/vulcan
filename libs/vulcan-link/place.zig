@@ -38,12 +38,16 @@ const Class = enum { text, rodata, data, bss };
 /// to within its region, and the alignment each region concatenates at. The x86
 /// backends want a 16-byte text alignment; riscv64 and aarch64 want 4. Everything else
 /// is 8 on every architecture today.
+const split_page = 4096;
+
 pub const ArchDesc = struct {
     text_align: u64,
     ro_align: u64 = 8,
     rw_align: u64 = 8,
     bss_align: u64 = 8,
     region_align: u64 = 8,
+    /// Start the data at its own page, so the code maps without write access.
+    split_writable: bool = false,
 };
 
 /// riscv64's extern-stub/GOT region hook, the one non-uniform placement piece. It runs
@@ -186,10 +190,14 @@ pub fn computeDefaultPlacement(
     // Concatenate the regions: text at `base`, then rodata, then data, each aligned. The
     // file image ends after the last non-empty region (`data_end`).
     const rodata_region = alignUp(text_total, desc.region_align);
-    const data_region = alignUp(rodata_region + rodata_total, desc.region_align);
+    const split = desc.split_writable and stub == null;
+    const data_region = alignUp(rodata_region + rodata_total, if (split) split_page else desc.region_align);
+    const writable_offset: u64 = if (split) data_region else 0;
     var data_end: u64 = text_total;
     if (rodata_total > 0) data_end = rodata_region + rodata_total;
     if (data_total > 0) data_end = data_region + data_total;
+    // The bss follows the data, so it must not start in the code pages either.
+    if (split) data_end = @max(data_end, data_region);
 
     // The bss region used to resolve `.bss` symbols. A `StubHook` region (riscv64) can
     // still push the file image past `data_end`, but the old riscv64 placer resolved bss
@@ -291,5 +299,6 @@ pub fn computeDefaultPlacement(
         .entry = 0,
         .section_places = section_places,
         .section_place_base = section_place_base,
+        .writable_offset = writable_offset,
     };
 }

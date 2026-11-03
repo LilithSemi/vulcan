@@ -532,7 +532,7 @@ fn findQemu(allocator: std.mem.Allocator) !?[]u8 {
 }
 
 /// One parsed ELF64 program header (the fields this test asserts on).
-const Phdr = struct { p_type: u32, p_offset: u64, p_vaddr: u64 };
+const Phdr = struct { p_type: u32, p_flags: u32, p_offset: u64, p_vaddr: u64 };
 
 fn parsePhdrs(allocator: std.mem.Allocator, exe: []const u8) ![]Phdr {
     const r = std.mem.readInt;
@@ -546,6 +546,7 @@ fn parsePhdrs(allocator: std.mem.Allocator, exe: []const u8) ![]Phdr {
         const p = exe[@intCast(e_phoff + i * e_phentsize)..];
         try out.append(allocator, .{
             .p_type = r(u32, p[0..4], .little),
+            .p_flags = r(u32, p[4..8], .little),
             .p_offset = r(u64, p[8..16], .little),
             .p_vaddr = r(u64, p[16..24], .little),
         });
@@ -1087,4 +1088,27 @@ test "x86-64 linkDynamic gc_sections program (uncalled function dropped) still r
         error.FileNotFound => return error.SkipZigTest,
         else => return e,
     };
+}
+
+test "x86-64 linkDynamic maps code without write access and data without execute access" {
+    const allocator = std.testing.allocator;
+    const obj = try buildPointerDataObj(allocator);
+    defer allocator.free(obj);
+    const exe = try ld.linkDynamic(allocator, &.{.{ .object = obj }}, .{
+        .mode = .exec,
+        .interp = "/lib64/ld-linux-x86-64.so.2",
+        .entry = "_start",
+    });
+    defer allocator.free(exe);
+    const phdrs = try parsePhdrs(allocator, exe);
+    defer allocator.free(phdrs);
+    var code = false;
+    var data = false;
+    for (phdrs) |ph| {
+        if (ph.p_type != 1) continue;
+        try std.testing.expect(ph.p_flags & 3 != 3);
+        if (ph.p_vaddr == 0x400000) code = ph.p_flags == 5;
+        if (ph.p_flags == 6) data = true;
+    }
+    try std.testing.expect(code and data);
 }

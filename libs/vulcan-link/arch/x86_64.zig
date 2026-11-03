@@ -52,7 +52,7 @@ pub fn computeDefaultPlacement(allocator: std.mem.Allocator, parsed: []ParsedObj
     // x86-64 packs `.text` to 16 bytes and has no stub/GOT region, so it passes no hook.
     // The shared placer ignores `resolver` without a hook. `live` is the GC mask (null when
     // GC is off, so the layout is byte-identical).
-    return place.computeDefaultPlacement(allocator, parsed, base, .{ .text_align = 16 }, null, resolver, live);
+    return place.computeDefaultPlacement(allocator, parsed, base, .{ .text_align = 16, .split_writable = true }, null, resolver, live);
 }
 
 /// Apply every relocation into `placement`'s segment bytes, sourcing each site's address

@@ -187,6 +187,9 @@ pub const DynOptions = struct {
     // byte-identical to before. On, `linkDynamic` runs the GC mark pass and the sweep leaves
     // out the dead sections. The driver turns this on, the library default is off.
     gc_sections: bool = false,
+    /// The code image offset where its writable part starts, page aligned. Zero maps the whole
+    /// image as one writable and executable segment.
+    writable_offset: u64 = 0,
 };
 
 /// One link input for the dynamic path: a relocatable object, an `.a` archive, or a
@@ -455,6 +458,8 @@ pub fn emit(
     if (is_exec) nph += 1;
     if (ni > 0) nph += 1;
     if (is_pie) nph += 1;
+    const split = opts.writable_offset != 0 and opts.writable_offset < @max(@as(u64, code.len), memsz);
+    if (split) nph += 1;
     var off: u64 = ehdr_size + @as(u64, nph) * phdr_size;
 
     var interp_off: u64 = 0;
@@ -614,24 +619,47 @@ pub fn emit(
         });
         ph += phdr_size;
     }
-    // PT_LOAD #0: headers + dynamic read-only tables + the code image (R+W+X). The code
-    // image packs `.text`/`.rodata`/`.data`/`.bss` into one blob (see
-    // `computeDefaultPlacement`), so this single segment must stay writable for the same
-    // reason the static path's single-segment `PT_LOAD` is R+W+X (`elf.zig`'s
-    // `p_flags: u32 = 7` default): dropping W here would land any writable global
-    // (`.data`/`.bss`) in a read+execute-only mapping and SIGSEGV on its first write under
-    // a real `ld.so`. A proper W^X split of the text/data image is a later refinement, not
-    // needed for a loadable, correct dynamic ELF matching the static path's convention.
-    writePhdr(buf, ph, .{
-        .p_type = PT_LOAD,
-        .p_flags = PF_R | PF_W | PF_X,
-        .p_offset = 0,
-        .p_vaddr = base,
-        .p_filesz = code_filesz,
-        .p_memsz = code_memsz,
-        .p_align = page,
-    });
-    ph += phdr_size;
+    // PT_LOAD #0: headers + dynamic read-only tables + the code image. The code image packs
+    // `.text`/`.rodata`/`.data`/`.bss` into one blob (see `computeDefaultPlacement`). When the
+    // placement starts the data on its own page, the code maps R+X and the data R+W. Otherwise
+    // the one segment must stay R+W+X, or a write to a global faults.
+    if (split) {
+        // The code maps without write access and the data without execute access.
+        const data_off = code_off + opts.writable_offset;
+        writePhdr(buf, ph, .{
+            .p_type = PT_LOAD,
+            .p_flags = PF_R | PF_X,
+            .p_offset = 0,
+            .p_vaddr = base,
+            .p_filesz = data_off,
+            .p_memsz = data_off,
+            .p_align = page,
+        });
+        ph += phdr_size;
+        writePhdr(buf, ph, .{
+            .p_type = PT_LOAD,
+            .p_flags = PF_R | PF_W,
+            .p_offset = data_off,
+            .p_vaddr = base + data_off,
+            .p_filesz = @max(code_filesz, data_off) - data_off,
+            .p_memsz = code_memsz - data_off,
+            .p_align = page,
+        });
+        ph += phdr_size;
+    } else {
+        // A split placement with nothing past the split has no writable data at all.
+        const flags: u32 = if (opts.writable_offset != 0) PF_R | PF_X else PF_R | PF_W | PF_X;
+        writePhdr(buf, ph, .{
+            .p_type = PT_LOAD,
+            .p_flags = flags,
+            .p_offset = 0,
+            .p_vaddr = base,
+            .p_filesz = code_filesz,
+            .p_memsz = code_memsz,
+            .p_align = page,
+        });
+        ph += phdr_size;
+    }
     // PT_LOAD (imports only): the executable `.plt` (R+X), its own page-aligned segment.
     if (ni > 0) {
         writePhdr(buf, ph, .{

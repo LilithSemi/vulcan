@@ -822,7 +822,7 @@ pub fn linkDynamic(allocator: std.mem.Allocator, inputs: []const dynamic.DynInpu
         defer allocator.free(exports);
         for (placement.symbols, 0..) |s, i| exports[i] = .{ .name = s.name, .offset = s.address, .kind = symKindOf(s.is_exec) };
         const seg0 = placement.segments[0];
-        return dynamic.emit(allocator, execParams(arch), seg0.bytes, seg0.memsz, opts, exports, &.{}, &.{}, &.{}, &.{}, fixups);
+        return dynamic.emit(allocator, execParams(arch), seg0.bytes, seg0.memsz, splitOptions(opts, &placement), exports, &.{}, &.{}, &.{}, &.{}, fixups);
     }
 
     // Imports present (aarch64/x86-64/i386/riscv64 for functions; aarch64-only for data). Link
@@ -960,7 +960,13 @@ fn linkDynamicImports(
     defer allocator.free(fixups);
 
     const seg0 = placement.segments[0];
-    return dynamic.emit(allocator, execParams(arch), seg0.bytes, seg0.memsz, opts, exports, imports, import_calls, data_imports, data_refs, fixups);
+    return dynamic.emit(allocator, execParams(arch), seg0.bytes, seg0.memsz, splitOptions(opts, &placement), exports, imports, import_calls, data_imports, data_refs, fixups);
+}
+
+fn splitOptions(opts: dynamic.DynOptions, placement: *const elf.Placement) dynamic.DynOptions {
+    var out = opts;
+    out.writable_offset = placement.writable_offset;
+    return out;
 }
 
 /// Gather the internal-target data-section pointer-init relocations (`R_*_ABS64` in

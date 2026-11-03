@@ -294,6 +294,9 @@ pub const Placement = struct {
     /// Per-object start offset into `section_places` (length = object count + 1, the
     /// last entry the total section count). Empty when `section_places` is.
     section_place_base: []usize = &.{},
+    /// The image offset where the writable data starts, page aligned, so a loader can map the code
+    /// before it without write access. Zero when the image is not split.
+    writable_offset: u64 = 0,
 
     /// The place of one (object, section) in the section-indexed map.
     pub fn sectionPlace(self: *const Placement, oi: usize, section_index: usize) SecPlace {
