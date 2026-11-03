@@ -222,6 +222,13 @@ fn hasCall(func: *const Function) bool {
 /// A rel32 branch displacement, or with `table` set, a jump table entry relative to the table.
 const Fixup = struct { at: usize, target: u32, table: ?usize = null };
 
+/// A rel32 field patched during emission to reach the code offset `target`. A `branch` field
+/// ends a jcc or jmp, which relaxation may shorten.
+const Local = struct { at: usize, target: usize, branch: bool };
+
+/// Alignment padding of `len` NOPs at `at`, recomputed when code before it shrinks.
+const Pad = struct { at: usize, len: usize, alignment: u16 };
+
 /// Which relocation shape a `Reloc` records. `.call` is a `call rel32`'s displacement,
 /// with addend -4 from the E8 opcode, resolved intra-module by the linker.
 /// `.pcrel_lea` is a `global_addr`'s `lea rd, [rip+disp32]` displacement, with addend
@@ -264,6 +271,8 @@ const Ctx = struct {
     loc_of: std.AutoHashMapUnmanaged(Value, Loc) = .{},
     code: std.ArrayList(u8) = .empty,
     fixups: std.ArrayList(Fixup) = .empty,
+    locals: std.ArrayList(Local) = .empty,
+    pads: std.ArrayList(Pad) = .empty,
     relocs: std.ArrayList(Reloc) = .empty,
     lines: std.ArrayList(LineEntry) = .empty,
     last_line: u32 = 0,
@@ -676,6 +685,8 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
     defer ctx.loc_of.deinit(allocator);
     defer ctx.code.deinit(allocator);
     defer ctx.fixups.deinit(allocator);
+    defer ctx.locals.deinit(allocator);
+    defer ctx.pads.deinit(allocator);
     defer ctx.relocs.deinit(allocator);
     defer ctx.lines.deinit(allocator);
     defer ctx.alloca_off.deinit(allocator);
@@ -1152,13 +1163,153 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
     var jump_at: std.AutoHashMapUnmanaged(usize, u32) = .empty;
     defer jump_at.deinit(allocator);
     for (ctx.fixups.items) |f| if (f.table == null) try jump_at.put(allocator, f.at, f.target);
+    var fields: std.ArrayList(Field) = .empty;
+    defer fields.deinit(allocator);
     for (ctx.fixups.items) |f| {
         const target = threadedTarget(ctx.code.items, block_start, &jump_at, @backingInt(forwardedBlock(ctx, @fromBackingInt(f.target))));
-        const origin = f.table orelse f.at + 4;
-        const rel: i32 = @intCast(@as(i64, @intCast(block_start[target])) - @as(i64, @intCast(origin)));
-        std.mem.writeInt(u32, ctx.code.items[f.at..][0..4], @bitCast(rel), .little);
+        try fields.append(allocator, .{ .at = f.at, .target = block_start[target], .table = f.table, .branch = f.table == null });
     }
+    for (ctx.locals.items) |l| try fields.append(allocator, .{ .at = l.at, .target = l.target, .table = null, .branch = l.branch });
+    try relaxAndPatch(allocator, ctx, fields.items);
     return .{ .code = try ctx.code.toOwnedSlice(allocator), .relocs = try ctx.relocs.toOwnedSlice(allocator), .lines = try ctx.lines.toOwnedSlice(allocator) };
+}
+
+/// A rel32 field aimed at a code offset. A table entry counts from `table`, every other field
+/// from its own end. A `branch` field ends a jcc or jmp.
+const Field = struct { at: usize, target: usize, table: ?usize, branch: bool };
+
+/// A branch that may take its rel8 form, or alignment padding, in the order of the code.
+const Region = struct { start: usize, len: usize, field: ?usize, alignment: u16, short: bool = false, new_len: usize = 0, before: i64 = 0, after: i64 = 0 };
+
+fn regionLessThan(_: void, a: Region, b: Region) bool {
+    return a.start < b.start;
+}
+
+fn fitsRel8(d: i64) bool {
+    return d >= -128 and d <= 127;
+}
+
+/// The offset `x` moves to once the regions take their new lengths.
+fn relaxedOffset(regions: []const Region, x: usize) usize {
+    var lo: usize = 0;
+    var hi: usize = regions.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (regions[mid].start <= x) lo = mid + 1 else hi = mid;
+    }
+    if (lo == 0) return x;
+    const r = regions[lo - 1];
+    const delta = if (x < r.start + r.len) r.before else r.after;
+    return @intCast(@as(i64, @intCast(x)) + delta);
+}
+
+fn layoutRegions(regions: []Region) void {
+    var delta: i64 = 0;
+    for (regions) |*r| {
+        r.before = delta;
+        const start: usize = @intCast(@as(i64, @intCast(r.start)) + delta);
+        r.new_len = if (r.field != null) (if (r.short) 2 else r.len) else (r.alignment - start % r.alignment) % r.alignment;
+        delta += @as(i64, @intCast(r.new_len)) - @as(i64, @intCast(r.len));
+        r.after = delta;
+    }
+}
+
+/// Give every branch that reaches its target within a signed byte the two-byte form, redo the
+/// alignment padding behind it, and patch every field. A branch that no longer fits once the
+/// padding grows goes back to rel32, and the loop stops when nothing changes.
+fn relaxAndPatch(allocator: std.mem.Allocator, ctx: *Ctx, fields: []Field) Error!void {
+    const code = ctx.code.items;
+    var regions: std.ArrayList(Region) = .empty;
+    defer regions.deinit(allocator);
+    for (fields, 0..) |f, i| {
+        if (!f.branch) continue;
+        const start = if (code[f.at - 1] == 0xE9)
+            f.at - 1
+        else if (f.at >= 2 and code[f.at - 2] == 0x0F and code[f.at - 1] & 0xF0 == 0x80)
+            f.at - 2
+        else
+            continue;
+        try regions.append(allocator, .{ .start = start, .len = f.at + 4 - start, .field = i, .alignment = 0 });
+    }
+    for (ctx.pads.items) |p| try regions.append(allocator, .{ .start = p.at, .len = p.len, .field = null, .alignment = p.alignment });
+    std.mem.sort(Region, regions.items, {}, regionLessThan);
+
+    var settled = false;
+    for (0..32) |_| {
+        layoutRegions(regions.items);
+        var changed = false;
+        for (regions.items) |*r| {
+            const f = fields[r.field orelse continue];
+            const new_start: i64 = @as(i64, @intCast(r.start)) + r.before;
+            const target: i64 = @intCast(relaxedOffset(regions.items, f.target));
+            if (r.short) {
+                if (!fitsRel8(target - new_start - 2)) {
+                    r.short = false;
+                    changed = true;
+                }
+            } else {
+                // A forward target moves closer by the bytes this branch gives up.
+                const d = if (f.target > r.start) target - new_start - @as(i64, @intCast(r.len)) else target - new_start - 2;
+                if (fitsRel8(d)) {
+                    r.short = true;
+                    changed = true;
+                }
+            }
+        }
+        if (!changed) {
+            settled = true;
+            break;
+        }
+    }
+    if (!settled) {
+        for (regions.items) |*r| r.short = false;
+        layoutRegions(regions.items);
+    }
+
+    const total: usize = @intCast(@as(i64, @intCast(code.len)) + (if (regions.items.len == 0) 0 else regions.items[regions.items.len - 1].after));
+    const out = try allocator.alloc(u8, total);
+    errdefer allocator.free(out);
+    const short_at = try allocator.alloc(?usize, fields.len);
+    defer allocator.free(short_at);
+    @memset(short_at, null);
+    var src: usize = 0;
+    var dst: usize = 0;
+    for (regions.items) |r| {
+        @memcpy(out[dst..][0 .. r.start - src], code[src..r.start]);
+        dst += r.start - src;
+        src = r.start;
+        if (r.field) |i| {
+            if (r.short) {
+                out[dst] = if (code[r.start] == 0xE9) 0xEB else 0x70 | (code[r.start + 1] & 0x0F);
+                short_at[i] = dst + 1;
+            } else {
+                @memcpy(out[dst..][0..r.len], code[r.start..][0..r.len]);
+            }
+        } else {
+            writeNops(out[dst..][0..r.new_len]);
+        }
+        dst += r.new_len;
+        src += r.len;
+    }
+    @memcpy(out[dst..][0 .. code.len - src], code[src..]);
+    std.debug.assert(dst + code.len - src == total);
+
+    for (fields, 0..) |f, i| {
+        const target = relaxedOffset(regions.items, f.target);
+        if (short_at[i]) |at| {
+            const d: i64 = @as(i64, @intCast(target)) - @as(i64, @intCast(at + 1));
+            out[at] = @bitCast(@as(i8, @intCast(d)));
+            continue;
+        }
+        const at = relaxedOffset(regions.items, f.at);
+        const origin = if (f.table) |t| relaxedOffset(regions.items, t) else at + 4;
+        const rel: i32 = @intCast(@as(i64, @intCast(target)) - @as(i64, @intCast(origin)));
+        std.mem.writeInt(u32, out[at..][0..4], @bitCast(rel), .little);
+    }
+    for (ctx.relocs.items) |*r| r.offset = relaxedOffset(regions.items, r.offset);
+    for (ctx.lines.items) |*l| l.offset = @intCast(relaxedOffset(regions.items, l.offset));
+    ctx.code.deinit(allocator);
+    ctx.code = .fromOwnedSlice(out);
 }
 
 /// Emit one split-boundary drain action. A GPR `store` writes `reg` to its slot.
@@ -1236,9 +1387,15 @@ fn roundToHalf(allocator: std.mem.Allocator, ctx: *Ctx, reg: Xmm) Error!void {
 /// relative-branch rule. The code uses this for local branches inside a single
 /// instruction's expansion (the variadic prologue AL gate and `va_arg`), which
 /// never cross a block boundary and so need no `ctx.fixups` entry.
-fn patchRel32(ctx: *Ctx, field: usize, target: usize) void {
+fn patchRel32(allocator: std.mem.Allocator, ctx: *Ctx, field: usize, target: usize) Error!void {
+    try patchLocal(allocator, ctx, field, target, true);
+}
+
+/// Patch the rel32 at `field` to reach `target` and record it, so relaxation can move both.
+fn patchLocal(allocator: std.mem.Allocator, ctx: *Ctx, field: usize, target: usize, branch: bool) Error!void {
     const rel: i32 = @intCast(@as(i64, @intCast(target)) - @as(i64, @intCast(field + 4)));
     std.mem.writeInt(u32, ctx.code.items[field..][0..4], @bitCast(rel), .little);
+    try ctx.locals.append(allocator, .{ .at = field, .target = target, .branch = branch });
 }
 
 /// Emit the System V variadic register-save-area fill from the prologue, only
@@ -1259,7 +1416,7 @@ fn emitVariadicSave(allocator: std.mem.Allocator, ctx: *Ctx) Error!void {
     for (xmm_arg_regs, 0..) |x, i| {
         try ctx.put(allocator, encode.movapsStore(ctx.rsa_off + 48 + @as(i32, @intCast(i)) * 16, x));
     }
-    patchRel32(ctx, je_field, ctx.code.items.len); // .skip lands right after the movaps block
+    try patchRel32(allocator, ctx, je_field, ctx.code.items.len); // .skip lands right after the movaps block
 }
 
 /// The System V count of this variadic function's fixed parameters that landed
@@ -1358,8 +1515,8 @@ fn emitVaArg(allocator: std.mem.Allocator, ctx: *Ctx, list: Value, result: Value
         });
         try ctx.store(allocator, result, rd);
     }
-    patchRel32(ctx, jae_field, overflow_target);
-    patchRel32(ctx, jmp_field, load_target);
+    try patchRel32(allocator, ctx, jae_field, overflow_target);
+    try patchRel32(allocator, ctx, jmp_field, load_target);
 }
 
 /// The call this store serves is a direct call. `result_opt` (on that call) is
@@ -2425,11 +2582,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             try selectInto(allocator, ctx, result, s.then);
             try ctx.put(allocator, encode.jmp(0)); // jmp -> end, patched
             const jmp_at = ctx.code.items.len - 4;
-            const else_rel: i32 = @intCast(@as(i64, @intCast(ctx.code.items.len)) - @as(i64, @intCast(je_at + 4)));
-            std.mem.writeInt(u32, ctx.code.items[je_at..][0..4], @bitCast(else_rel), .little);
+            try patchRel32(allocator, ctx, je_at, ctx.code.items.len);
             try selectInto(allocator, ctx, result, s.@"else");
-            const end_rel: i32 = @intCast(@as(i64, @intCast(ctx.code.items.len)) - @as(i64, @intCast(jmp_at + 4)));
-            std.mem.writeInt(u32, ctx.code.items[jmp_at..][0..4], @bitCast(end_rel), .little);
+            try patchRel32(allocator, ctx, jmp_at, ctx.code.items.len);
         },
         .decode_low_float, .encode_low_float => return error.Unsupported,
         .dequantize_nvfp4, .quantize_nvfp4 => return error.Unsupported,
@@ -2910,8 +3065,7 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
         try emitMoves(allocator, ctx, cf.@"else", pred); // ELSE-moves on the else path
         try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(cf.@"else".target));
         const then_start = ctx.code.items.len;
-        const rel: i32 = @intCast(@as(i64, @intCast(then_start)) - @as(i64, @intCast(jcc_at + 4)));
-        std.mem.writeInt(u32, ctx.code.items[jcc_at..][0..4], @bitCast(rel), .little);
+        try patchRel32(allocator, ctx, jcc_at, then_start);
         try emitMoves(allocator, ctx, cf.then, pred); // THEN-moves, then fall through to THEN
         return;
     }
@@ -2927,8 +3081,7 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
         try emitMoves(allocator, ctx, cf.then, pred); // THEN-moves on the then (not-taken) path
         try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(cf.then.target));
         const else_start = ctx.code.items.len;
-        const rel: i32 = @intCast(@as(i64, @intCast(else_start)) - @as(i64, @intCast(jcc_at + 4)));
-        std.mem.writeInt(u32, ctx.code.items[jcc_at..][0..4], @bitCast(rel), .little);
+        try patchRel32(allocator, ctx, jcc_at, else_start);
         try emitMoves(allocator, ctx, cf.@"else", pred); // ELSE-moves, then fall through to ELSE
         return;
     }
@@ -2939,8 +3092,7 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
     try emitMoves(allocator, ctx, cf.@"else", pred);
     try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(cf.@"else".target));
     const then_start = ctx.code.items.len;
-    const rel: i32 = @intCast(@as(i64, @intCast(then_start)) - @as(i64, @intCast(jcc_at + 4)));
-    std.mem.writeInt(u32, ctx.code.items[jcc_at..][0..4], @bitCast(rel), .little);
+    try patchRel32(allocator, ctx, jcc_at, then_start);
     try emitMoves(allocator, ctx, cf.then, pred);
     try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(cf.then.target));
 }
@@ -3232,7 +3384,7 @@ fn emitDenseSwitch(allocator: std.mem.Allocator, ctx: *Ctx, plan: DenseSwitch) E
     try ctx.put(allocator, encode.jmpReg(scratch1));
     const table_at = ctx.code.items.len;
     const lea_end = lea_at + 7;
-    std.mem.writeInt(u32, ctx.code.items[lea_end - 4 ..][0..4], @bitCast(@as(i32, @intCast(table_at - lea_end))), .little);
+    try patchLocal(allocator, ctx, lea_end - 4, table_at, false);
     for (plan.targets) |target| {
         try ctx.fixups.append(allocator, .{ .at = ctx.code.items.len, .target = @backingInt(target), .table = table_at });
         try ctx.code.appendSlice(allocator, &.{ 0, 0, 0, 0 });
@@ -3330,21 +3482,32 @@ fn loopTops(allocator: std.mem.Allocator, ctx: *const Ctx) Error![]bool {
     return tops;
 }
 
+const nops = [_][]const u8{
+    &.{0x90},
+    &.{ 0x66, 0x90 },
+    &.{ 0x0F, 0x1F, 0x00 },
+    &.{ 0x0F, 0x1F, 0x40, 0x00 },
+    &.{ 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+    &.{ 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+    &.{ 0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00 },
+    &.{ 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    &.{ 0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },
+};
+
+fn writeNops(out: []u8) void {
+    var at: usize = 0;
+    while (at < out.len) {
+        const chunk = @min(out.len - at, nops.len);
+        @memcpy(out[at..][0..chunk], nops[chunk - 1]);
+        at += chunk;
+    }
+}
+
 /// Pad with multi-byte NOPs to the next `alignment` boundary.
 fn padTo(allocator: std.mem.Allocator, ctx: *Ctx, alignment: u16) Error!void {
     if (alignment <= 1) return;
-    const nops = [_][]const u8{
-        &.{0x90},
-        &.{ 0x66, 0x90 },
-        &.{ 0x0F, 0x1F, 0x00 },
-        &.{ 0x0F, 0x1F, 0x40, 0x00 },
-        &.{ 0x0F, 0x1F, 0x44, 0x00, 0x00 },
-        &.{ 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
-        &.{ 0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00 },
-        &.{ 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },
-        &.{ 0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    };
     var pad = (alignment - ctx.code.items.len % alignment) % alignment;
+    if (pad != 0) try ctx.pads.append(allocator, .{ .at = ctx.code.items.len, .len = pad, .alignment = alignment });
     while (pad > 0) {
         const chunk = @min(pad, nops.len);
         try ctx.code.appendSlice(allocator, nops[chunk - 1]);
@@ -5105,6 +5268,8 @@ pub fn compileFunctionWimmerX86(allocator: std.mem.Allocator, func: *Function) E
     defer ctx.loc_of.deinit(allocator);
     defer ctx.code.deinit(allocator);
     defer ctx.fixups.deinit(allocator);
+    defer ctx.locals.deinit(allocator);
+    defer ctx.pads.deinit(allocator);
     defer ctx.relocs.deinit(allocator);
     defer ctx.lines.deinit(allocator);
     defer ctx.alloca_off.deinit(allocator);
@@ -5174,6 +5339,8 @@ pub fn compileFunctionWimmerX86Fold(allocator: std.mem.Allocator, func: *Functio
     defer ctx.loc_of.deinit(allocator);
     defer ctx.code.deinit(allocator);
     defer ctx.fixups.deinit(allocator);
+    defer ctx.locals.deinit(allocator);
+    defer ctx.pads.deinit(allocator);
     defer ctx.relocs.deinit(allocator);
     defer ctx.lines.deinit(allocator);
     defer ctx.alloca_off.deinit(allocator);

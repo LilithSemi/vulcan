@@ -601,7 +601,7 @@ test "codegen+disasm round-trip: integer add" {
 }
 
 test "codegen+disasm round-trip: control flow (max via if/else)" {
-    // Exercises the disassembler on real setcc/movzx/test and jcc/jmp rel32 branches.
+    // Exercises the disassembler on real setcc/movzx/test and a short jcc.
     const a = std.testing.allocator;
     var func = ir.function.Function.init(a);
     defer func.deinit();
@@ -630,9 +630,9 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
         \\0006: movzx rax, al
         \\000a: test rax, rax
         \\000d: jne .+3
-        \\0013: mov rdi, rsi
-        \\0016: mov rax, rdi
-        \\0019: ret
+        \\000f: mov rdi, rsi
+        \\0012: mov rax, rdi
+        \\0015: ret
         \\
     , text);
 }
@@ -1997,4 +1997,57 @@ test "x86_64 an edge that passes a value on and loads its successor needs no swa
     const f = buffer.entry(*const fn (?*const Node) callconv(.c) ?*const Node, 0);
     try std.testing.expectEqual(@as(?*const Node, &third), f(&head));
     try std.testing.expectEqual(@as(?*const Node, null), f(null));
+}
+
+test "x86_64 a near branch takes the two-byte form and a far one keeps rel32" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const small = try func.appendBlock();
+    const big = try func.appendBlock();
+    const join = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, i64_t);
+    const flag = try func.appendBlockParam(entry, i64_t);
+    const zero = try func.appendInst(entry, i64_t, .{ .iconst = 0 });
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .ne, .lhs = flag, .rhs = zero } });
+    try func.appendIf(entry, c, .{ .target = small }, .{ .target = big });
+    const plus = try func.appendArithImm(small, i64_t, .add, x, 1);
+    try func.setJump(small, join, &.{plus});
+    // Enough wide immediates that the jump from `small` to `join` cannot reach in a byte.
+    var y = x;
+    for (0..32) |i| y = try func.appendArithImm(big, i64_t, .bit_xor, y, 0x10000 + @as(i64, @intCast(i)));
+    try func.setJump(big, join, &.{y});
+    const result = try func.appendBlockParam(join, i64_t);
+    func.setTerminator(join, .{ .ret = ir.function.Ret.one(result) });
+
+    const code = try isel.selectFunction(a, &func);
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+    var short = false;
+    var long = false;
+    var previous: ?struct { at: usize, branch: bool } = null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len < 6) continue;
+        const at = try std.fmt.parseInt(usize, line[0..4], 16);
+        if (previous) |p| if (p.branch) {
+            if (at - p.at == 2) short = true;
+            if (at - p.at >= 5) long = true;
+        };
+        previous = .{ .at = at, .branch = line[6] == 'j' };
+    }
+    try std.testing.expect(short and long);
+
+    var expected = @as(i64, 5);
+    for (0..32) |i| expected ^= 0x10000 + @as(i64, @intCast(i));
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn (i64, i64) callconv(.c) i64, 0);
+    try std.testing.expectEqual(@as(i64, 6), f(5, 1));
+    try std.testing.expectEqual(expected, f(5, 0));
 }
