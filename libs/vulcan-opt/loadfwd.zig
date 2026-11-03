@@ -31,8 +31,9 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     var keep: std.ArrayList(Inst) = .empty;
     defer keep.deinit(allocator);
 
-    // A block with one predecessor starts with what was available at the end of that
-    // predecessor, which dominates it. Reverse postorder visits the predecessor first.
+    // A block starts with the entries available at the end of every predecessor. A value that is
+    // available in all of them is defined above all of them, so it dominates the block. Reverse
+    // postorder visits the predecessors first, except along a back edge, which gives nothing.
     const graph = try analyses.cfg();
     const rpo = try analyses.reversePostorder();
     const ends = try allocator.alloc(?[]const Avail, func.blockCount());
@@ -61,8 +62,16 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         keep.clearRetainingCapacity();
         if (bi < graph.blockCount()) {
             const preds = graph.predecessors(bi);
-            if (preds.len == 1 and preds[0] != bi) {
-                if (ends[preds[0]]) |items| try avail.appendSlice(allocator, items);
+            const all_seen = for (preds) |p| {
+                if (p == bi or ends[p] == null) break false;
+            } else preds.len != 0;
+            if (all_seen) {
+                for (ends[preds[0]].?) |entry| {
+                    const everywhere = for (preds[1..]) |p| {
+                        if (!holds(ends[p].?, entry)) break false;
+                    } else true;
+                    if (everywhere) try avail.append(allocator, entry);
+                }
             }
         }
         var block_changed = false;
@@ -186,6 +195,13 @@ fn find(items: []const Avail, func: *const Function, ptr: Value, want_ty: ir.typ
         if (sameAddress(func, a.ptr, ptr) and func.valueType(a.value) == want_ty) return a.value;
     }
     return null;
+}
+
+fn holds(items: []const Avail, entry: Avail) bool {
+    for (items) |item| {
+        if (item.ptr == entry.ptr and item.value == entry.value) return true;
+    }
+    return false;
 }
 
 /// Drop every availability entry whose address may alias `ptr` (a store to `ptr` may have
@@ -369,6 +385,32 @@ test "a join block with two predecessors does not reuse a load" {
 
     _ = try runOnce(allocator, &func);
     try testing.expectEqual(again, func.terminator(join).?.ret.values[0]);
+}
+
+test "a join block reuses a load that every predecessor still holds" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try i32Ty(&func);
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const left = try func.appendBlock();
+    const right = try func.appendBlock();
+    const join = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const first = try func.appendInst(entry, t, .{ .load = .{ .ptr = p } });
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const positive = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = first, .rhs = zero } });
+    try func.appendIf(entry, positive, .{ .target = left }, .{ .target = right });
+    _ = try func.appendArithImm(left, t, .add, first, 1);
+    try func.setJump(left, join, &.{});
+    try func.setJump(right, join, &.{});
+    const again = try func.appendInst(join, t, .{ .load = .{ .ptr = p } });
+    func.setTerminator(join, .{ .ret = ir.function.Ret.one(again) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    try testing.expectEqual(first, func.terminator(join).?.ret.values[0]);
 }
 
 test "a second load of an address reuses the first" {
