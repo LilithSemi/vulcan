@@ -21,6 +21,7 @@ pub const strength = @import("vulcan-opt/strength.zig");
 pub const immform = @import("vulcan-opt/immform.zig");
 pub const branchfold = @import("vulcan-opt/branchfold.zig");
 pub const rangecheck = @import("vulcan-opt/rangecheck.zig");
+pub const bitset = @import("vulcan-opt/bitset.zig");
 pub const looppromote = @import("vulcan-opt/looppromote.zig");
 pub const samewidth = @import("vulcan-opt/samewidth.zig");
 pub const libcall = @import("vulcan-opt/libcall.zig");
@@ -52,6 +53,7 @@ pub const default_pipeline = [_]pass.Pass{
     immform.pass_def,
     branchfold.pass_def,
     rangecheck.pass_def,
+    bitset.pass_def,
     ifconvert.pass_def,
     joinconst.pass_def,
     jumpthread.pass_def,

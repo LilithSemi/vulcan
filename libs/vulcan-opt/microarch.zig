@@ -17,6 +17,7 @@ const jumpthread = @import("jumpthread.zig");
 const branchfold = @import("branchfold.zig");
 const mem2reg = @import("mem2reg.zig");
 const rangecheck = @import("rangecheck.zig");
+const bitset = @import("bitset.zig");
 const samewidth = @import("samewidth.zig");
 const knownbits = @import("knownbits.zig");
 const joinconst = @import("joinconst.zig");
@@ -148,6 +149,7 @@ pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Funct
         joinconst.pass_def,
         jumpthread.pass_def,
         rangecheck.pass_def,
+        bitset.pass_def,
         branchfold.pass_def,
         jumpthread.single_edge_params_pass_def,
         knownbits.pass_def,
