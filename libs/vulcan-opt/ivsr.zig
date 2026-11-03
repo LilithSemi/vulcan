@@ -310,9 +310,9 @@ const LoopCtx = struct {
     /// READABLE outside the loop. The preheader argument holds the same value and is, so every
     /// expression this pass builds names that instead. See `fillSubstitutions`.
     substitute: []?Value,
-    /// Header parameters, by index, proven to stay in `[0, max]` of their signed type. A sign
-    /// extension of such a counter equals its zero extension.
-    nonneg_bivs: u64 = 0,
+    /// Signed header parameters, by index, proven never to wrap, so a sign extension of the
+    /// counter steps with it. See `nonWrappingCounter`.
+    nowrap_bivs: u64 = 0,
     /// Whether another loop is inside this one.
     outer: bool = false,
 
@@ -503,7 +503,7 @@ fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *
         const ty = func.valueType(hp);
         if (intInfo(func, ty) == null) continue; // an integer counter only
         if (stepOf(ctx, hp, latch_args[i]) == null) continue;
-        if (i < 64 and nonNegativeCounter(ctx, hp, pre_args[i], latch_args[i])) ctx.nonneg_bivs |= @as(u64, 1) << @intCast(i);
+        if (i < 64 and nonWrappingCounter(ctx, hp, pre_args[i], latch_args[i])) ctx.nowrap_bivs |= @as(u64, 1) << @intCast(i);
         const one = try pool.konst(allocator, ty, 1);
         const zero = try pool.konst(allocator, ty, 0);
         const rep = Affine{ .biv = @intCast(i), .scale = one, .offset = zero, .scale_ty = ty, .base = null };
@@ -705,34 +705,51 @@ fn edgeArgs(func: *const Function, edge: Edge) []const Value {
 /// The amount the back edge adds to a basic induction variable.
 const Step = union(enum) { konst: i64, value: Value };
 
-/// Whether header parameter `hp` counts up by one from a non-negative constant and the header
-/// leaves the loop unless `hp < bound` (signed). Then every value it takes lies in
-/// `[start, bound)`, inside `[0, max]`, and the step never overflows.
-fn nonNegativeCounter(ctx: *const LoopCtx, hp: Value, start: Value, next: Value) bool {
+/// Whether signed header parameter `hp` never wraps. The header leaves the loop unless a test of
+/// `hp` passes, and the step is taken only after it passes. Two shapes are known:
+///   - `hp` counts up by one from a non-negative constant while `hp < bound`, so it stays in
+///     `[start, bound]`.
+///   - `hp` counts down by one while `hp >= k` or `hp > k` for a constant `k` above the minimum,
+///     so it never goes below `k - 1`.
+fn nonWrappingCounter(ctx: *const LoopCtx, hp: Value, start: Value, next: Value) bool {
     const func = ctx.func;
     const info = intInfo(func, func.valueType(hp)) orelse return false;
     if (info.signedness != .signed) return false;
     const step = stepOf(ctx, hp, next) orelse return false;
-    if (step != .konst or step.konst != 1) return false;
-    const start_inst = func.definingInst(start) orelse return false;
-    const first = switch (func.opcode(start_inst)) {
-        .iconst => |c| c,
-        else => return false,
-    };
-    if (first < 0 or first > (@as(i64, 1) << @intCast(info.bits - 1)) - 1) return false;
+    if (step != .konst or (step.konst != 1 and step.konst != -1)) return false;
     const insts = func.blockInsts(ctx.header);
     if (insts.len == 0) return false;
     const cf = switch (func.opcode(insts[insts.len - 1])) {
         .@"if" => |c| c,
         else => return false,
     };
+    if (!ctx.loop.contains(@backingInt(cf.then.target)) or ctx.loop.contains(@backingInt(cf.@"else".target))) return false;
     const cmp_inst = func.definingInst(cf.cond) orelse return false;
     const cmp = switch (func.opcode(cmp_inst)) {
         .icmp => |c| c,
         else => return false,
     };
-    if (cmp.op != .lt or cmp.lhs != hp or !ctx.invariant(cmp.rhs)) return false;
-    return ctx.loop.contains(@backingInt(cf.then.target)) and !ctx.loop.contains(@backingInt(cf.@"else".target));
+    if (cmp.lhs != hp) return false;
+    const min = -(@as(i64, 1) << @intCast(info.bits - 1));
+    if (step.konst == -1) {
+        const k_inst = func.definingInst(cmp.rhs) orelse return false;
+        const k = switch (func.opcode(k_inst)) {
+            .iconst => |c| signExtend(c, info.bits),
+            else => return false,
+        };
+        return switch (cmp.op) {
+            .gt => true,
+            .ge => k > min,
+            else => false,
+        };
+    }
+    const start_inst = func.definingInst(start) orelse return false;
+    const first = switch (func.opcode(start_inst)) {
+        .iconst => |c| c,
+        else => return false,
+    };
+    if (first < 0 or first > -(min + 1)) return false;
+    return cmp.op == .lt and ctx.invariant(cmp.rhs);
 }
 
 /// The step of header parameter `hp`, given the value the back edge passes for it, or null when
@@ -760,7 +777,16 @@ fn stepOf(ctx: *const LoopCtx, hp: Value, next: Value) ?Step {
                 if (carries(ctx, hp, a.rhs) and ctx.invariant(a.lhs)) break :blk Step{ .value = a.lhs };
                 break :blk null;
             },
-            .sub, .mul, .div, .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr, .mulh => null,
+            // Subtracting a constant is a step by its negation.
+            .sub => blk: {
+                if (!carries(ctx, hp, a.lhs)) break :blk null;
+                const k_inst = func.definingInst(a.rhs) orelse break :blk null;
+                break :blk switch (func.opcode(k_inst)) {
+                    .iconst => |c| Step{ .konst = -%c },
+                    else => null,
+                };
+            },
+            .mul, .div, .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr, .mulh => null,
         },
         .iconst,
         .fconst,
@@ -856,9 +882,9 @@ fn affineConvert(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, value
     if (target.bits <= source.bits) return null;
     const old = ctx.affine[@backingInt(value)] orelse return null;
     if (old.base != null) return null;
-    // A signed value widens like an unsigned one only while it is a non-negative counter.
+    // A signed value widens with its counter only while the counter never wraps.
     if (source.signedness == .signed) {
-        if (old.biv >= 64 or ctx.nonneg_bivs & (@as(u64, 1) << @intCast(old.biv)) == 0) return null;
+        if (old.biv >= 64 or ctx.nowrap_bivs & (@as(u64, 1) << @intCast(old.biv)) == 0) return null;
         if (pool.constOf(old.scale) != @as(?i64, 1) or pool.constOf(old.offset) != @as(?i64, 0)) return null;
     }
     // Widening is exact only while the narrow value does not wrap, and then each constant is a
