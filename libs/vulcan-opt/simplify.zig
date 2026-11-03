@@ -21,6 +21,7 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const pass = @import("pass.zig");
+const dce = @import("dce.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -129,6 +130,9 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     defer allocator.free(replacements);
     for (replacements, 0..) |*replacement, index| replacement.* = @fromBackingInt(@intCast(index));
 
+    var uses: ?[]u32 = null;
+    defer if (uses) |counts| allocator.free(counts);
+
     var changed = false;
     var has_replacements = false;
     for (0..func.blockCount()) |bi| {
@@ -180,6 +184,26 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     else
                         .none;
                 },
+                // A load whose only use is a same-width integer convert loads that type itself.
+                // The bits are the same, and a later widening then extends the load directly.
+                .convert => |cv| blk: {
+                    if (canonical(replacements, cv.value) != cv.value) break :blk .none;
+                    if (!isInt(func, cv.value)) break :blk .none;
+                    const def = func.definingInst(cv.value) orelse break :blk .none;
+                    if (func.opcode(def) != .load) break :blk .none;
+                    const from = func.types.type_kind(func.valueType(cv.value)).int;
+                    const to = func.types.type_kind(func.valueType(result)).int;
+                    if (from.bits != to.bits) break :blk .none;
+                    const counts = uses orelse counted: {
+                        const fresh = try allocator.alloc(u32, func.valueCount());
+                        dce.countUses(func, fresh);
+                        uses = fresh;
+                        break :counted fresh;
+                    };
+                    if (counts[@backingInt(cv.value)] != 1) break :blk .none;
+                    func.setValueType(cv.value, func.valueType(result));
+                    break :blk .{ .value = cv.value };
+                },
                 else => .none,
             };
             switch (simplified) {
@@ -228,6 +252,44 @@ test "x + 0 simplifies to x (the return now yields x directly)" {
 
     try testing.expect(try runOnce(allocator, &func));
     try testing.expectEqual(s.x, func.terminator(s.b).?.ret.values[0]); // ret x, not ret (x+0)
+}
+
+test "a load used only by a same-width convert takes the convert's type" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const byte = try func.appendInst(b, i8_t, .{ .load = .{ .ptr = p } });
+    const unsigned_byte = try func.appendInst(b, u8_t, .{ .convert = .{ .value = byte } });
+    const wide = try func.appendInst(b, i32_t, .{ .convert = .{ .value = unsigned_byte } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(wide) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    try testing.expectEqual(u8_t, func.valueType(byte));
+    try testing.expectEqual(byte, func.opcode(func.definingInst(wide).?).convert.value);
+}
+
+test "a load with a second use keeps its type" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const byte = try func.appendInst(b, i8_t, .{ .load = .{ .ptr = p } });
+    const unsigned_byte = try func.appendInst(b, u8_t, .{ .convert = .{ .value = byte } });
+    try func.appendStore(b, byte, p);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(unsigned_byte) });
+
+    _ = try runOnce(allocator, &func);
+    try testing.expectEqual(i8_t, func.valueType(byte));
 }
 
 test "x * 0 simplifies to the constant 0" {
