@@ -68,6 +68,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             const lc = consts[@backingInt(a.lhs)];
             const rc = consts[@backingInt(a.rhs)];
             if (lc != null and rc != null) continue; // both constant: leave it for constant folding
+            if (!fitsImmediate(func, a.lhs, lc, rc)) continue;
             if (rc) |c| {
                 if (uses[@backingInt(a.rhs)] != 1) continue;
                 func.opcodeMut(inst).* = .{ .arith_imm = .{ .op = a.op, .lhs = a.lhs, .imm = c } };
@@ -131,6 +132,32 @@ test "single-use constant adds become arith_imm" {
     try std.testing.expectEqual(x, p2.lhs);
 }
 
+test "a 64-bit add constant wider than 32 bits stays a register operand" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, u64_t);
+    const y = try func.appendBlockParam(b, u32_t);
+    const golden = try func.appendInst(b, u64_t, .{ .iconst = @bitCast(@as(u64, 0x9e3779b97f4a7c15)) });
+    const wide = try func.appendInst(b, u64_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = golden } });
+    // A 32-bit add keeps only the low bits of its constant, so any constant fits.
+    const mask = try func.appendInst(b, u32_t, .{ .iconst = 0xffffffff });
+    const narrow = try func.appendInst(b, u32_t, .{ .arith = .{ .op = .add, .lhs = y, .rhs = mask } });
+    const narrow_wide = try func.appendInst(b, u64_t, .{ .convert = .{ .value = narrow } });
+    const sum = try func.appendInst(b, u64_t, .{ .arith = .{ .op = .bit_xor, .lhs = wide, .rhs = narrow_wide } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+    try std.testing.expect(func.opcode(func.definingInst(wide).?) == .arith);
+    try std.testing.expect(func.opcode(func.definingInst(narrow).?) == .arith_imm);
+}
+
 test "a plain constant add needs no memory use" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
@@ -172,4 +199,16 @@ test "a shared constant remains register form" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+/// Whether the constant operand fits the signed 32-bit immediate field every backend has. A wider
+/// 64-bit constant stays an `iconst`, which loop-invariant code motion can hoist.
+fn fitsImmediate(func: *const Function, lhs: Value, lc: ?i64, rc: ?i64) bool {
+    const c = rc orelse lc orelse return true;
+    const bits = switch (func.types.type_kind(func.valueType(lhs))) {
+        .int => |int| int.bits,
+        else => 64,
+    };
+    if (bits <= 32) return true;
+    return c >= std.math.minInt(i32) and c <= std.math.maxInt(i32);
 }
