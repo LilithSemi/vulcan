@@ -1,5 +1,6 @@
-//! Constants passed on an edge are rebuilt in the block that passes them. An edge move of a
-//! constant then writes an immediate, which costs the same as a register copy, and the constant
+//! Constants passed on an edge are rebuilt on that edge: in the block that jumps, or in a new
+//! block on a conditional edge so the other path does not run them. An edge move of a constant
+//! then writes an immediate, which costs the same as a register copy, and the constant
 //! no longer holds a register across the whole function. This matters for a loop that picks one
 //! of several constants per path, such as a token kind.
 
@@ -12,7 +13,7 @@ const Block = ir.function.Block;
 const Value = ir.function.Value;
 const Inst = ir.function.Inst;
 
-pub const pass_def = pass.Pass{ .name = "constedge", .run = run, .preserves_cfg = true };
+pub const pass_def = pass.Pass{ .name = "constedge", .run = run };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
@@ -39,20 +40,25 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         var made: std.ArrayList(Inst) = .empty;
         defer made.deinit(allocator);
         if (last_if) |inst| {
-            const cf = func.opcode(inst).@"if";
-            const then_args = try localArgs(allocator, func, def_block, @intCast(bi), func.blockArgs(cf.then), &copies, &made);
-            defer allocator.free(then_args);
-            const else_args = try localArgs(allocator, func, def_block, @intCast(bi), func.blockArgs(cf.@"else"), &copies, &made);
-            defer allocator.free(else_args);
-            if (made.items.len == 0) continue;
-            const then_list = try func.internValues(then_args);
-            const else_list = try func.internValues(else_args);
-            const cf_mut = &func.opcodeMut(inst).@"if";
-            cf_mut.then.args = then_list;
-            cf_mut.@"else".args = else_list;
-            // The copies go right before the `if`.
-            const list = func.blockInstsMut(block);
-            try list.insertSlice(func.allocator, list.items.len - 1, made.items);
+            // Each edge gets its own block for its constants, so they run only on that edge.
+            var any = false;
+            for ([_]bool{ true, false }) |then| {
+                const cf = func.opcode(inst).@"if";
+                const edge = if (then) cf.then else cf.@"else";
+                copies.clearRetainingCapacity();
+                made.clearRetainingCapacity();
+                const args = try localArgs(allocator, func, def_block, @intCast(bi), func.blockArgs(edge), &copies, &made);
+                defer allocator.free(args);
+                if (made.items.len == 0) continue;
+                const pad = try func.appendBlock();
+                try func.blockInstsMut(pad).appendSlice(func.allocator, made.items);
+                try func.setJump(pad, edge.target, args);
+                const cf_mut = &func.opcodeMut(inst).@"if";
+                const new_edge: ir.function.Jump = .{ .target = pad, .args = try func.internValues(&.{}) };
+                if (then) cf_mut.then = new_edge else cf_mut.@"else" = new_edge;
+                any = true;
+            }
+            if (!any) continue;
         } else if (func.terminator(block)) |term| switch (term) {
             .jump => |j| {
                 const args = try localArgs(allocator, func, def_block, @intCast(bi), func.blockArgs(j), &copies, &made);
@@ -90,7 +96,7 @@ fn localArgs(allocator: std.mem.Allocator, func: *Function, def_block: []const ?
 
 const testing = std.testing;
 
-test "a constant passed on a loop edge is rebuilt in the passing block" {
+test "a constant passed on a conditional edge is rebuilt on that edge alone" {
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -113,9 +119,10 @@ test "a constant passed on a loop edge is rebuilt in the passing block" {
     try testing.expect(try run(allocator, &func, &analyses));
     const cf = func.opcode(func.blockInsts(pick)[func.blockInsts(pick).len - 1]).@"if";
     for ([_]ir.function.Jump{ cf.then, cf.@"else" }) |edge| {
-        const arg = func.blockArgs(edge)[0];
-        try testing.expect(arg != two and arg != three);
-        try testing.expect(std.mem.indexOfScalar(Inst, func.blockInsts(pick), func.definingInst(arg).?) != null);
+        try testing.expect(edge.target != join);
+        const rebuilt = func.blockArgs(func.terminator(edge.target).?.jump)[0];
+        try testing.expect(rebuilt != two and rebuilt != three);
+        try testing.expect(std.mem.indexOfScalar(Inst, func.blockInsts(edge.target), func.definingInst(rebuilt).?) != null);
     }
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
