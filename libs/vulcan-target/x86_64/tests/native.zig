@@ -1748,3 +1748,37 @@ test "x86_64 a back edge repeats a header that loads before its test" {
         try std.testing.expectEqual(want, f(&data, p, s));
     };
 }
+
+test "x86_64 a commutative op writes over its dying right operand" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const entry = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, u64_t);
+    // (x ^ (x >> 30)) + x: `x` lives past the xor, and the shifted value dies at it.
+    const shifted = try func.appendArithImm(entry, u64_t, .shr, x, 30);
+    const mixed = try func.appendInst(entry, u64_t, .{ .arith = .{ .op = .bit_xor, .lhs = x, .rhs = shifted } });
+    const sum = try func.appendInst(entry, u64_t, .{ .arith = .{ .op = .add, .lhs = mixed, .rhs = x } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
+
+    const code = try isel.selectFunctionForModel(a, &func, mm.modelFor(.zen4));
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+    try std.testing.expectEqualStrings(
+        \\0000: mov rax, rdi
+        \\0003: shr rax, 30
+        \\0007: xor rax, rdi
+        \\000a: add rax, rdi
+        \\000d: ret
+        \\
+    , text);
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn (u64) callconv(.c) u64, 0);
+    for ([_]u64{ 0, 1, 0x9e3779b97f4a7c15, std.math.maxInt(u64) }) |v| {
+        try std.testing.expectEqual((v ^ (v >> 30)) +% v, f(v));
+    }
+}
