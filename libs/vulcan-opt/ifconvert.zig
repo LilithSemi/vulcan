@@ -35,6 +35,8 @@ fn runWithBudget(allocator: std.mem.Allocator, func: *Function, analyses: *pass.
         if (func.terminator(block) != null) continue;
         const cf = func.opcode(insts[insts.len - 1]).@"if";
         if (cf.then.target == cf.@"else".target) continue;
+        if (try convertTriangle(allocator, func, graph, block, cf, true)) return true;
+        if (try convertTriangle(allocator, func, graph, block, cf, false)) return true;
         if (func.blockArgs(cf.then).len != 0 or func.blockArgs(cf.@"else").len != 0) continue;
 
         const then_block = cf.then.target;
@@ -62,6 +64,65 @@ fn runWithBudget(allocator: std.mem.Allocator, func: *Function, analyses: *pass.
         return true;
     }
     return false;
+}
+
+const max_triangle_insts = 2;
+
+/// `if c { arm } else { merge(direct) }` where `arm` jumps to `merge` too. The arm runs
+/// unconditionally and each merge param selects between the two edges.
+fn convertTriangle(allocator: std.mem.Allocator, func: *Function, graph: anytype, block: Block, cf: ir.function.If, arm_is_then: bool) !bool {
+    const arm_edge = if (arm_is_then) cf.then else cf.@"else";
+    const direct_edge = if (arm_is_then) cf.@"else" else cf.then;
+    const arm = arm_edge.target;
+    const merge = direct_edge.target;
+    if (func.blockArgs(arm_edge).len != 0 or arm == block or merge == block or merge == arm) return false;
+    if (!singlePredecessor(graph, arm, @backingInt(block))) return false;
+    if (func.blockParams(arm).len != 0 or hasBlockAttrs(func, arm)) return false;
+    const arm_jump = jumpTerminator(func, arm) orelse return false;
+    if (arm_jump.target != merge) return false;
+    const predecessors = graph.predecessors(@backingInt(merge));
+    if (predecessors.len != 2 or !contains(predecessors, @backingInt(block)) or !contains(predecessors, @backingInt(arm))) return false;
+    const params = func.blockParams(merge);
+    const arm_args = func.blockArgs(arm_jump);
+    const direct_args = func.blockArgs(direct_edge);
+    if (params.len == 0 or params.len > 2 or arm_args.len != params.len or direct_args.len != params.len) return false;
+    if (!cheapArm(func, arm)) return false;
+    var work: usize = 0;
+    for (func.blockInsts(arm)) |inst| switch (func.opcode(inst)) {
+        .iconst => {},
+        // A compare in the arm is a short circuit, which range checks fold better as branches.
+        .icmp => return false,
+        else => work += 1,
+    };
+    // An arm of constants only is left for jump threading, which folds the merge away.
+    if (work == 0 or work > max_triangle_insts) return false;
+
+    const owned_params = try allocator.dupe(ir.function.Value, params);
+    defer allocator.free(owned_params);
+    const owned_arm_args = try allocator.dupe(ir.function.Value, arm_args);
+    defer allocator.free(owned_arm_args);
+    const owned_direct_args = try allocator.dupe(ir.function.Value, direct_args);
+    defer allocator.free(owned_direct_args);
+    const arm_insts = try allocator.dupe(Inst, func.blockInsts(arm));
+    defer allocator.free(arm_insts);
+
+    const parent = func.blockInstsMut(block);
+    _ = parent.pop();
+    try parent.appendSlice(allocator, arm_insts);
+    func.blockInstsMut(arm).clearRetainingCapacity();
+    func.terminatorPtr(arm).* = null;
+    for (owned_params, owned_arm_args, owned_direct_args) |param, arm_value, direct_value| {
+        const selected = try func.appendInst(block, func.valueType(param), .{ .select = .{
+            .cond = cf.cond,
+            .then = if (arm_is_then) arm_value else direct_value,
+            .@"else" = if (arm_is_then) direct_value else arm_value,
+        } });
+        func.replaceAllUses(param, selected);
+        func.retargetAttrs(.{ .value = param }, .{ .value = selected });
+    }
+    try func.setBlockParams(merge, &.{});
+    try func.setJump(block, merge, &.{});
+    return true;
 }
 
 fn singlePredecessor(graph: anytype, block: Block, predecessor: usize) bool {
@@ -242,4 +303,38 @@ test "model ifconvert admits a wider pure diamond" {
     try testing.expect(!try run(allocator, &func, &analyses));
     try testing.expect(try runModel(allocator, &func, &analyses));
     try testing.expect(func.terminator(entry).? == .jump);
+}
+
+test "ifconvert turns a one-arm triangle into a select on either edge" {
+    const allocator = testing.allocator;
+    for ([_]bool{ true, false }) |arm_is_then| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bool_t = try func.types.intern(.bool);
+        const entry = try func.appendBlock();
+        const arm = try func.appendBlock();
+        const merge = try func.appendBlock();
+        const cond = try func.appendBlockParam(entry, bool_t);
+        const x = try func.appendBlockParam(entry, i32_t);
+        const result = try func.appendBlockParam(merge, i32_t);
+        const to_arm: ir.function.EdgeDesc = .{ .target = arm };
+        const direct: ir.function.EdgeDesc = .{ .target = merge, .args = &.{x} };
+        if (arm_is_then) try func.appendIf(entry, cond, to_arm, direct) else try func.appendIf(entry, cond, direct, to_arm);
+        const masked = try func.appendInst(arm, i32_t, .{ .arith_imm = .{ .op = .bit_and, .lhs = x, .imm = 2047 } });
+        try func.setJump(arm, merge, &.{masked});
+        func.setTerminator(merge, .{ .ret = ir.function.Ret.one(result) });
+
+        var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+        defer analyses.deinit();
+        try testing.expect(try run(allocator, &func, &analyses));
+        try testing.expect(func.terminator(entry).? == .jump);
+        const insts = func.blockInsts(entry);
+        const select = func.opcode(insts[insts.len - 1]).select;
+        try testing.expectEqual(if (arm_is_then) masked else x, select.then);
+        try testing.expectEqual(if (arm_is_then) x else masked, select.@"else");
+        var diags = try ir.verify.verify(allocator, &func, .high);
+        defer diags.deinit();
+        try testing.expect(diags.ok());
+    }
 }
