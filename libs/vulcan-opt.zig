@@ -21,6 +21,7 @@ pub const strength = @import("vulcan-opt/strength.zig");
 pub const immform = @import("vulcan-opt/immform.zig");
 pub const branchfold = @import("vulcan-opt/branchfold.zig");
 pub const rangecheck = @import("vulcan-opt/rangecheck.zig");
+pub const samewidth = @import("vulcan-opt/samewidth.zig");
 pub const joinconst = @import("vulcan-opt/joinconst.zig");
 pub const ifconvert = @import("vulcan-opt/ifconvert.zig");
 pub const gvn = @import("vulcan-opt/gvn.zig");

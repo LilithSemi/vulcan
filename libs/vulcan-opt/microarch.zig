@@ -17,6 +17,7 @@ const jumpthread = @import("jumpthread.zig");
 const branchfold = @import("branchfold.zig");
 const mem2reg = @import("mem2reg.zig");
 const rangecheck = @import("rangecheck.zig");
+const samewidth = @import("samewidth.zig");
 const joinconst = @import("joinconst.zig");
 const ifconvert = @import("ifconvert.zig");
 const loopimm = @import("microarch/loopimm.zig");
@@ -166,11 +167,17 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
         .x86_64 => &.{ rangediv.pass_def, offsetcombine.pass_def, dce.pass_def },
         else => return false,
     };
+    // Sharing one side of a same-width convert removes a register copy and adds no work, so it
+    // needs no score.
+    const shared = if (m.arch == .x86_64)
+        try pass.runToFixpoint(allocator, func, &.{ samewidth.pass_def, dce.pass_def }, 4)
+    else
+        false;
     var gate = try score.IRGate.init(allocator, func, m);
     defer gate.deinit();
     const changed = try pass.run(allocator, gate.candidateFunction(), passes);
-    if (!changed) return false;
-    return gate.commit(func);
+    if (!changed) return shared;
+    return try gate.commit(func) or shared;
 }
 
 test {
