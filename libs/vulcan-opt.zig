@@ -106,6 +106,12 @@ pub fn optimizeEarlyFor(allocator: std.mem.Allocator, func: *ir.function.Functio
     return pass.runToFixpoint(allocator, func, if (latency_aware) &latency_pipeline else &default_pipeline, 16);
 }
 
+/// Promote locals to SSA values before the inliner measures a callee, so a callee is judged by its
+/// real size and not by the loads and stores of its unpromoted locals.
+pub fn optimizePreInline(allocator: std.mem.Allocator, func: *ir.function.Function) pass.Error!bool {
+    return pass.run(allocator, func, &.{ mem2reg.pass_def, dce.pass_def });
+}
+
 /// The late pipeline to a fixpoint.
 pub fn optimizeLate(allocator: std.mem.Allocator, func: *ir.function.Function) pass.Error!bool {
     return pass.runToFixpoint(allocator, func, &late_pipeline, 16);

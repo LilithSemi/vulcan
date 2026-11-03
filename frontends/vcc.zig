@@ -1157,6 +1157,9 @@ const ModuleLookup = struct {
 /// Inline calls whose definitions are available in this translation unit.
 fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module, profile: ?*const opt.pgo.Profile) !void {
     const lookup = opt.inlining.Lookup{ .context = mod, .func = ModuleLookup.get };
+    if (profile == null) {
+        for (mod.funcs) |*named| _ = try opt.optimizePreInline(allocator, &named.func);
+    }
     for (mod.funcs) |*named| {
         if (profile) |p| {
             const counts = p.get(named.name) orelse continue;
@@ -2158,6 +2161,31 @@ test "translation-unit inlining keeps a loop callee with memory writes separate"
         }
     }
     try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "translation-unit inlining takes a loop callee whose only write is outside its loop" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\int bits(unsigned *state) {
+        \\  unsigned v = *state * 2654435761u;
+        \\  *state = v;
+        \\  int c = 0;
+        \\  while (v) { v &= v - 1; ++c; }
+        \\  return c;
+        \\}
+        \\int main(void) { unsigned s = 1; int t = 0; for (int i = 0; i < 100; ++i) t += bits(&s); return t; }
+    );
+    defer mod.deinit(allocator);
+    const main_func = mod.find("main") orelse return error.TestUnexpectedResult;
+
+    try inlineTranslationUnit(allocator, &mod, null);
+    for (mod.funcs) |*named| _ = try opt.optimizeEarly(allocator, &named.func);
+    try inlineHotLoopBodies(allocator, &mod);
+    for (0..main_func.blockCount()) |bi| {
+        for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            try std.testing.expect(main_func.opcode(inst) != .call);
+        }
+    }
 }
 
 test "profile-guided translation-unit inlining keeps a cold call" {

@@ -59,7 +59,8 @@ pub fn runAcyclic(allocator: std.mem.Allocator, caller: *Function, lookup: Looku
 }
 
 /// Inline small acyclic callees. Large control-flow graphs remain separate to bound code growth and
-/// register pressure in the caller.
+/// register pressure in the caller. A callee with a loop is inlined too when it is not larger than
+/// `small_loop_limit`, so its caller can become a leaf that a later inline can take.
 pub fn runSmallAcyclic(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup) Error!bool {
     return runWithPolicy(allocator, caller, lookup, null, false, 32);
 }
@@ -154,7 +155,9 @@ fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, fi
                 try inlineCall(allocator, caller, @intCast(bi), idx, inst, callee); // single-block fast path
                 return true;
             }
-            if (inlinableMulti(callee) and (inline_cycles or !try hasCfgCycle(allocator, callee))) {
+            const small_loop = instruction_limit != null and withinInstructionLimit(callee, small_loop_limit) and
+                cycleInlineSafe(callee) and try loopsWriteNoMemory(allocator, callee);
+            if (inlinableMulti(callee) and (inline_cycles or small_loop or !try hasCfgCycle(allocator, callee))) {
                 try inlineCallMulti(allocator, caller, @intCast(bi), idx, inst, callee);
                 return true;
             }
@@ -163,6 +166,8 @@ fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, fi
     }
     return false;
 }
+
+const small_loop_limit = 16;
 
 fn withinInstructionLimit(func: *const Function, limit: usize) bool {
     var count: usize = 0;
@@ -202,7 +207,7 @@ fn inlineOneInLoops(
             const callee = lookup.get(name) orelse continue;
             const size = instructionCount(callee);
             if (size == 0 or size > instruction_limit) continue;
-            if (require_cycle and !cycleInlineSafe(callee)) continue;
+            if (require_cycle and !(cycleInlineSafe(callee) and try loopsWriteNoMemory(allocator, callee))) continue;
             if (inlinable(callee)) {
                 if (require_cycle) continue;
                 try inlineCall(allocator, caller, @intCast(bi), idx, inst, callee);
@@ -217,11 +222,26 @@ fn inlineOneInLoops(
     return null;
 }
 
+/// Whether no store in `callee` is inside one of its loops. A loop that writes memory stays a
+/// separate function, where it is vectorized on its own. A store outside the loops is fine.
+fn loopsWriteNoMemory(allocator: std.mem.Allocator, callee: *const Function) Error!bool {
+    var info = try loops.analyze(allocator, callee);
+    defer info.deinit(allocator);
+    for (0..callee.blockCount()) |bi| {
+        if (!blockInLoop(&info, bi)) continue;
+        for (callee.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (callee.opcode(inst) == .store) return false;
+        }
+    }
+    return true;
+}
+
 fn cycleInlineSafe(callee: *const Function) bool {
     for (0..callee.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         for (callee.blockInsts(block)) |inst| switch (callee.opcode(inst)) {
-            .store, .atomic_rmw, .prefetch, .matmul, .barrier, .call, .call_indirect => return false,
+            .atomic_rmw, .prefetch, .matmul, .barrier, .call, .call_indirect => return false,
+            .store => |store| if (store.@"volatile") return false,
             .load => |load| if (load.@"volatile") return false,
             else => {},
         };
