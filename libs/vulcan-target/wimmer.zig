@@ -301,6 +301,9 @@ pub const Interval = struct {
     /// has a location the store can read at the split point. False for an interval `buildIntervals`
     /// made, which is the value's first piece and holds no location before its own start.
     split_child: bool = false,
+    // True for an interval a split cut short, so a later piece of the same value follows it. Such
+    // an interval does not end its value, so no copy or destructive result may take its register.
+    has_tail: bool = false,
     /// For a SPILLED interval whose value must reach memory BEFORE the interval starts: the position
     /// the store is emitted at, in place of the interval's own start. A reload-at-use split leaves a
     /// register holding the value for exactly the position of a must-have use, and a fixed clobber
@@ -1240,7 +1243,7 @@ fn tryAllocateFreeReg(
         if (sameValue(it, current)) continue;
         const r = assignedReg(it);
         if (copyDiesAt(current, it) or destructiveSourceDiesAt(current, it) or
-            (desc.destructive_holes and destructiveSourceFreeAfter(current, it)))
+            (desc.destructive_holes and !it.has_tail and destructiveSourceFreeAfter(current, it)))
         {
             if (r < limit and is_candidate[r]) {
                 if (it.value != null and it.value == current.destructive_alt and it.value != current.destructive_src)
@@ -1348,7 +1351,7 @@ fn tryAllocateFreeReg(
 /// interval, not a fixed one. This is the single safety test both the scan and the verifier key off.
 fn copyDiesAt(dst: *const Interval, src: *const Interval) bool {
     const cs = dst.copy_src orelse return false;
-    if (src.fixed_reg != null) return false;
+    if (src.fixed_reg != null or src.has_tail) return false;
     const sv = src.value orelse return false;
     if (cs != sv) return false;
     // Two values can share ONE register span only when they have the same shape. A width or an
@@ -1379,7 +1382,7 @@ fn destructiveSourceFreeAfter(dst: *const Interval, src: *const Interval) bool {
 }
 
 fn destructiveSourceDiesAt(dst: *const Interval, src: *const Interval) bool {
-    if (src.fixed_reg != null) return false;
+    if (src.fixed_reg != null or src.has_tail) return false;
     const sv = src.value orelse return false;
     if (!isDestructiveOperand(dst, sv)) return false;
     if (src.regs != dst.regs or src.reg_align != dst.reg_align) return false;
@@ -2257,6 +2260,7 @@ fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, chil
     };
     try children.append(allocator, child);
 
+    parent.has_tail = true;
     // Commit: the child now owns the tail. Replace the parent's ranges and uses with the head.
     allocator.free(parent.ranges);
     parent.ranges = hr;
@@ -4077,4 +4081,35 @@ test "slotIntervalsInterfere: an early store holds the slot in front of the inte
 /// Whether `sv` is an input the instruction defining `dst` may write over.
 fn isDestructiveOperand(dst: *const Interval, sv: Value) bool {
     return dst.destructive_src == sv or dst.destructive_alt == sv;
+}
+
+test "a copy or destructive result never takes the register of a piece its value outlives" {
+    var no_uses = [_]UsePos{};
+    // The source's piece ends where the result is defined, at position 9.
+    var src_ranges = [_]Range{.{ .from = 0, .to = 10 }};
+    var src: Interval = .{
+        .value = @fromBackingInt(@intCast(1)),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &src_ranges,
+        .uses = &no_uses,
+    };
+    var dst_ranges = [_]Range{.{ .from = 9, .to = 20 }};
+    const dst: Interval = .{
+        .value = @fromBackingInt(@intCast(2)),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &dst_ranges,
+        .uses = &no_uses,
+        .copy_src = @fromBackingInt(@intCast(1)),
+        .destructive_src = @fromBackingInt(@intCast(1)),
+    };
+    try std.testing.expect(copyDiesAt(&dst, &src));
+    try std.testing.expect(destructiveSourceDiesAt(&dst, &src));
+
+    // A split cut the source short: the value lives on in a later piece, which a store at the
+    // split reads from this register. The result must not overwrite it.
+    src.has_tail = true;
+    try std.testing.expect(!copyDiesAt(&dst, &src));
+    try std.testing.expect(!destructiveSourceDiesAt(&dst, &src));
 }
