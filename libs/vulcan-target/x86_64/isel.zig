@@ -2114,6 +2114,27 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     if (rd != res) try ctx.put(allocator, encode.movReg(rd, res));
                     try ctx.store(allocator, result, rd);
                 },
+                // The one-operand mul or imul leaves the high half of the product in RDX. It
+                // reads RAX and writes RDX, the same registers as a divide.
+                .mulh => {
+                    const dw = intBits(func, a.lhs) > 32;
+                    const rhs_in_clobber = switch (ctx.loc(a.rhs)) {
+                        .reg => |r| r == .rax or r == .rdx,
+                        else => false,
+                    };
+                    var factor: ?Reg = null;
+                    if (rhs_in_clobber) {
+                        const rr = try ctx.use(allocator, a.rhs, scratch2);
+                        try ctx.put(allocator, encode.movReg(scratch2, rr));
+                        factor = scratch2;
+                    }
+                    try ctx.put(allocator, encode.movReg(.rax, try ctx.use(allocator, a.lhs, scratch1)));
+                    const rr = factor orelse try ctx.use(allocator, a.rhs, scratch2);
+                    try ctx.put(allocator, if (signed) encode.imulWide(rr, dw) else encode.mulWide(rr, dw));
+                    const rd = ctx.dst(result, scratch1);
+                    if (rd != .rdx) try ctx.put(allocator, encode.movReg(rd, .rdx));
+                    try ctx.store(allocator, result, rd);
+                },
                 .shl, .shr => {
                     // The shift count goes in RCX, so `lhs` allocated to RCX
                     // must be copied out before RCX is overwritten with the
@@ -2171,7 +2192,8 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     try ctx.put(allocator, encode.imulImm(rd, try ctx.use(allocator, a.lhs, scratch1), imm, w64));
                     try ctx.store(allocator, result, rd);
                 },
-                .mulh => return error.Unsupported, // mulh has no immediate form. It is expanded before isel.
+                // mulh has no immediate form, so the constant goes in a register.
+                .mulh => return emitArithWideImm(allocator, ctx, a, result),
                 .add, .sub, .bit_and, .bit_or, .bit_xor => {
                     const rl = try ctx.use(allocator, a.lhs, scratch1);
                     const rd = ctx.dst(result, scratch1);
@@ -3997,7 +4019,17 @@ fn emitArithWideImm(allocator: std.mem.Allocator, ctx: *Ctx, a: ir.function.Arit
             if (rd != res) try ctx.put(allocator, encode.movReg(rd, res));
             try ctx.store(allocator, result, rd);
         },
-        .shl, .shr, .mulh => return error.Unsupported,
+        .mulh => {
+            const signed = isSigned(func, a.lhs);
+            try ctx.put(allocator, encode.movReg(.rax, try ctx.use(allocator, a.lhs, scratch1)));
+            try ctx.put(allocator, encode.movImm64(scratch2, bits));
+            const dw = intBits(func, a.lhs) > 32;
+            try ctx.put(allocator, if (signed) encode.imulWide(scratch2, dw) else encode.mulWide(scratch2, dw));
+            const rd = ctx.dst(result, scratch1);
+            if (rd != .rdx) try ctx.put(allocator, encode.movReg(rd, .rdx));
+            try ctx.store(allocator, result, rd);
+        },
+        .shl, .shr => return error.Unsupported,
     }
 }
 
@@ -4365,12 +4397,12 @@ fn clobberKindOf(func: *const Function, inst: ir.function.Inst) ClobberKind {
     return switch (func.opcode(inst)) {
         .call, .call_indirect => .call,
         .arith => |a| switch (a.op) {
-            .div, .rem => .div,
+            .div, .rem, .mulh => .div,
             .shl, .shr => .shift,
             else => .none,
         },
         .arith_imm => |a| switch (a.op) {
-            .div, .rem => .div,
+            .div, .rem, .mulh => .div,
             else => .none,
         },
         else => .none,

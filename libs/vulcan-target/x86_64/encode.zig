@@ -714,6 +714,20 @@ pub fn idiv(src: Reg, w: bool) Inst {
     return Inst.of(&.{ 0xF7, mrm });
 }
 
+/// `mul src` (F7 /4): an unsigned multiply of (R/E)AX by `src` into (R/E)DX:(R/E)AX.
+pub fn mulWide(src: Reg, w: bool) Inst {
+    const mrm: u8 = 0xC0 | (4 << 3) | (n(src) & 7);
+    if (rexOne(n(src) >= 8, w)) |rex| return Inst.of(&.{ rex, 0xF7, mrm });
+    return Inst.of(&.{ 0xF7, mrm });
+}
+
+/// `imul src` (F7 /5): a signed multiply of (R/E)AX by `src` into (R/E)DX:(R/E)AX.
+pub fn imulWide(src: Reg, w: bool) Inst {
+    const mrm: u8 = 0xC0 | (5 << 3) | (n(src) & 7);
+    if (rexOne(n(src) >= 8, w)) |rex| return Inst.of(&.{ rex, 0xF7, mrm });
+    return Inst.of(&.{ 0xF7, mrm });
+}
+
 /// `div src` (F7 /6): an unsigned divide of RDX:RAX or EDX:EAX by `src`. Clear the high half
 /// first. `w` picks the operand size. A 32-bit div reads only EAX, the low 32 bits, as the
 /// dividend, so it correctly ignores a dirty upper half of RAX.
@@ -1680,6 +1694,8 @@ test "division and shift encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x99 }, cqo().slice()); // cqo
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xF7, 0xF9 }, idiv(.rcx, true).slice()); // idiv rcx
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xF7, 0xF1 }, divu(.rcx, true).slice()); // div rcx
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xF7, 0xE1 }, mulWide(.rcx, true).slice()); // mul rcx
+    try std.testing.expectEqualSlices(u8, &.{ 0x49, 0xF7, 0xEB }, imulWide(.r11, true).slice()); // imul r11
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xD3, 0xE0 }, shlCl(.rax, true).slice()); // shl rax, cl
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xD3, 0xF8 }, sarCl(.rax, true).slice()); // sar rax, cl
     // 32-bit forms: cdq (no REX.W) sign-extends eax->edx, and idiv/div/shifts drop REX.W.
