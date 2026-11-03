@@ -1949,6 +1949,32 @@ test "float arithmetic" {
 test "float f32" {
     try expectAgreesFloat("float f(void){ return 1.5f + 0.5f; }", &.{}); // 2.0f
 }
+test "division and remainder by a widened constant match gcc" {
+    const unsigned64 =
+        \\unsigned long long f(int a) {
+        \\  unsigned long long x = (unsigned long long)a * 0x9e3779b97f4a7c15ull;
+        \\  return x % 1000003u + x / 7u;
+        \\}
+    ;
+    const signed64 =
+        \\long long f(int a) {
+        \\  long long x = (long long)a * -123456789123LL;
+        \\  return x / 7 + x % 1000003;
+        \\}
+    ;
+    const unsigned32 =
+        \\unsigned f(int a) {
+        \\  unsigned x = (unsigned)a * 2654435761u;
+        \\  return x / 10u + x % 17u;
+        \\}
+    ;
+    for ([_]i32{ 0, 1, 7, -1, 123456, -987654321, 2147483647 }) |a| {
+        try expectAgreesBits(unsigned64, &.{a}, 64);
+        try expectAgreesBits(signed64, &.{a}, 64);
+        try expectAgreesBits(unsigned32, &.{a}, 32);
+    }
+}
+
 test "a spilled double keeps its high bits as a call arg and a loop param" {
     const helpers =
         \\static double h(int k) { return 2.5 + k; }

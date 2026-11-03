@@ -166,14 +166,23 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                         break :blk evalCmp(c.op, lc, rc, ty);
                     },
                     // Same-width integer conversion changes only the type's signed interpretation; the
-                    // emitted bits are identical. Widening and narrowing remain deliberately unfolded:
-                    // this IR lowers them as register operations whose exact behavior must stay aligned
+                    // emitted bits are identical. Widening extends by the source signedness on every
+                    // backend, so it folds the same way. Narrowing remains deliberately unfolded:
+                    // this IR lowers it as a register operation whose exact behavior must stay aligned
                     // with each backend rather than applying C-style wrapping here.
                     .convert => |c| blk: {
                         const source_ty = intType(func, c.value) orelse break :blk null;
                         const result_ty = intType(func, result) orelse break :blk null;
-                        if (source_ty.bits != result_ty.bits) break :blk null;
-                        break :blk consts[@backingInt(c.value)];
+                        const value = consts[@backingInt(c.value)] orelse break :blk null;
+                        if (source_ty.bits == result_ty.bits) break :blk value;
+                        if (source_ty.bits > result_ty.bits or source_ty.bits == 0) break :blk null;
+                        if (source_ty.bits >= 64) break :blk value;
+                        const shift: u6 = @intCast(64 - @as(u32, source_ty.bits));
+                        const bits = @as(u64, @bitCast(value)) << shift;
+                        break :blk if (source_ty.signedness == .signed)
+                            @as(i64, @bitCast(bits)) >> shift
+                        else
+                            @as(i64, @bitCast(bits >> shift));
                     },
                     else => null,
                 };
@@ -229,7 +238,30 @@ test "folds an unsigned comparison to a bool constant" {
     try std.testing.expectEqual(@as(i64, 1), func.opcode(func.definingInst(cmp).?).iconst); // 200 > 100 unsigned
 }
 
-test "folds only same-width integer constant conversions" {
+test "folds a widening constant conversion by the source signedness" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const b = try func.appendBlock();
+    const minus_two = try func.appendInst(b, i8_t, .{ .iconst = -2 });
+    const sign_extended = try func.appendInst(b, u64_t, .{ .convert = .{ .value = minus_two } });
+    const all_ones = try func.appendInst(b, u32_t, .{ .iconst = 0xffff_ffff });
+    const zero_extended = try func.appendInst(b, u64_t, .{ .convert = .{ .value = all_ones } });
+    const sum = try func.appendInst(b, u64_t, .{ .arith = .{ .op = .add, .lhs = sign_extended, .rhs = zero_extended } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+    try std.testing.expectEqual(@as(i64, -2), func.opcode(func.definingInst(sign_extended).?).iconst);
+    try std.testing.expectEqual(@as(i64, 0xffff_ffff), func.opcode(func.definingInst(zero_extended).?).iconst);
+}
+
+test "a narrowing constant conversion stays unfolded" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
