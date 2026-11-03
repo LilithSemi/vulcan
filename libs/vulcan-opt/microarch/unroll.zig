@@ -1205,14 +1205,16 @@ fn apply(allocator: std.mem.Allocator, func: *Function, loop_plan: *const Plan) 
         for (h_pure) |inst| try cloneInstInto(func, g.ib, inst, &vmap, a);
 
         func.terminatorPtr(g.ib).* = null;
-        const then_args_i = try remapArgs(&vmap, in_args, a);
-        const else_args_i = try remapArgs(&vmap, ex_args, a);
-        try func.appendIf(
-            g.ib,
-            rv(&vmap, cond0),
-            .{ .target = g.body_entry, .args = then_args_i },
-            .{ .target = plan.exit, .args = else_args_i },
-        );
+        const in_args_i = try remapArgs(&vmap, in_args, a);
+        const ex_args_i = try remapArgs(&vmap, ex_args, a);
+        // The copy keeps the header's orientation: the condition holds on the edge that stays
+        // in the loop only when the header's then edge is that one.
+        const stay: ir.function.EdgeDesc = .{ .target = g.body_entry, .args = in_args_i };
+        const leave: ir.function.EdgeDesc = .{ .target = plan.exit, .args = ex_args_i };
+        if (in_is_then)
+            try func.appendIf(g.ib, rv(&vmap, cond0), stay, leave)
+        else
+            try func.appendIf(g.ib, rv(&vmap, cond0), leave, stay);
     }
 }
 
@@ -2720,4 +2722,42 @@ test "a counted loop whose body reads the header params directly takes the count
     var diags = try ir.verify.verify(allocator, &func, .low);
     defer diags.deinit();
     try std.testing.expect(diags.ok());
+}
+
+test "a guard keeps the header's orientation when the body is on the else edge" {
+    const registry = @import("registry.zig");
+    const a = std.testing.allocator;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{zero});
+    // while (!(i >= n)) ++i; with the exit on the then edge.
+    const i = try func.appendBlockParam(loop, i32_t);
+    const stop = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .ge, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, stop, .{ .target = done }, .{ .target = body });
+    func.setTerminator(loop, .{ .ret = ir.function.Ret.none() });
+    const next = try func.appendArithImm(body, i32_t, .add, i, 1);
+    try func.setJump(body, loop, &.{next});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(i) });
+
+    try std.testing.expect(try run(a, &func, registry.modelFor(.zen4)));
+    // Every `if` that tests a `>=` still leaves the loop on its then edge.
+    var guards: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        const insts = func.blockInsts(@fromBackingInt(@intCast(bi)));
+        if (insts.len == 0 or func.opcode(insts[insts.len - 1]) != .@"if") continue;
+        const cf = func.opcode(insts[insts.len - 1]).@"if";
+        const cmp = func.opcode(func.definingInst(cf.cond).?);
+        if (cmp != .icmp or cmp.icmp.op != .ge) continue;
+        try std.testing.expectEqual(done, cf.then.target);
+        guards += 1;
+    }
+    try std.testing.expect(guards >= 2);
 }
