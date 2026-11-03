@@ -14,6 +14,7 @@ const immform = @import("immform.zig");
 const dce = @import("dce.zig");
 const licm = @import("licm.zig");
 const jumpthread = @import("jumpthread.zig");
+const branchfold = @import("branchfold.zig");
 const rangecheck = @import("rangecheck.zig");
 const joinconst = @import("joinconst.zig");
 const ifconvert = @import("ifconvert.zig");
@@ -143,6 +144,7 @@ pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Funct
         joinconst.pass_def,
         jumpthread.pass_def,
         rangecheck.pass_def,
+        branchfold.pass_def,
         jumpthread.single_edge_params_pass_def,
         dce.pass_def,
     }, 8);
