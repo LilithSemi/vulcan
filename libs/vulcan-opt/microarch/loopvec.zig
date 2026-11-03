@@ -724,7 +724,10 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
 
     const parallel_reduction = reduction == null or
         cost.reductionGroupsProfitable(model, reduction.?.op, @intCast(accesses.items.len), 2);
-    const groups: u32 = if (carriesLoopState(model) and parallel_reduction and accesses.items.len <= 2 and V * 2 <= MAX_LANES) 2 else 1;
+    // x86 has sixteen vector registers and takes a third stream, such as the load and store of
+    // `y[i] = a * x[i] + y[i]`, in two groups as well.
+    const max_group_accesses: usize = if (model.arch == .x86_64) 3 else 2;
+    const groups: u32 = if (carriesLoopState(model) and parallel_reduction and accesses.items.len <= max_group_accesses and V * 2 <= MAX_LANES) 2 else 1;
     return Plan{
         .header = header,
         .body = bodyb,
