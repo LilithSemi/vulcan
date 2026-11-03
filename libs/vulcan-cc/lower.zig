@@ -69,6 +69,36 @@ test "lower and JIT-run a constant return" {
     try std.testing.expectEqual(@as(i32, -7), f());
 }
 
+test "signed int arithmetic is marked as not overflowing, unsigned and narrow arithmetic is not" {
+    const allocator = std.testing.allocator;
+    var mod = try compile(allocator,
+        \\int si(int a, int b) { return a + b; }
+        \\unsigned ui(unsigned a, unsigned b) { return a + b; }
+        \\long sl(long a) { long b = a; b -= 3; return b * a; }
+        \\char sc(char c) { c++; return c; }
+    );
+    defer mod.deinit(allocator);
+    const expected = [_]struct { name: []const u8, nsw: bool }{
+        .{ .name = "si", .nsw = true },
+        .{ .name = "ui", .nsw = false },
+        .{ .name = "sl", .nsw = true },
+        .{ .name = "sc", .nsw = false },
+    };
+    for (expected) |want| {
+        const func = mod.find(want.name) orelse return error.NoFunc;
+        var seen: usize = 0;
+        for (0..func.blockCount()) |bi| for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
+            .arith => |a| if (a.op == .add or a.op == .sub or a.op == .mul) {
+                if (func.types.type_kind(func.valueType(a.lhs)) != .int) continue;
+                try std.testing.expectEqual(want.nsw, a.nsw);
+                seen += 1;
+            },
+            else => {},
+        };
+        try std.testing.expect(seen != 0);
+    }
+}
+
 test "balanced switch dispatch selects every dense case and the default" {
     const allocator = std.testing.allocator;
     var mod = try compile(allocator,
@@ -2239,7 +2269,7 @@ fn lowerExpr(l: *L, expr: *const parser.Expr) Error!TypedValue {
             const lv = try l.convertTo(lhs, c);
             const rv = try l.convertTo(rhs, c);
             const ct = try l.irTy(c);
-            break :blk .{ .value = try f.appendInst(l.block, ct, .{ .arith = .{ .op = irBinOp(b.op), .lhs = lv, .rhs = rv } }), .ty = c };
+            break :blk .{ .value = try f.appendInst(l.block, ct, .{ .arith = .{ .op = irBinOp(b.op), .lhs = lv, .rhs = rv, .nsw = noSignedWrap(c, b.op) } }), .ty = c };
         },
         .compare => |c| blk: {
             const lhs = try lowerExpr(l, c.lhs);
@@ -2302,7 +2332,7 @@ fn lowerExpr(l: *L, expr: *const parser.Expr) Error!TypedValue {
                     const cv = try l.convertTo(cur, c);
                     const rv = try l.convertTo(rhs, c);
                     const ct = try l.irTy(c);
-                    const res = try f.appendInst(l.block, ct, .{ .arith = .{ .op = irBinOp(op), .lhs = cv, .rhs = rv } });
+                    const res = try f.appendInst(l.block, ct, .{ .arith = .{ .op = irBinOp(op), .lhs = cv, .rhs = rv, .nsw = noSignedWrap(c, op) } });
                     break :nv try l.convertTo(.{ .value = res, .ty = c }, dst.ty);
                 } else try l.convertTo(rhs, dst.ty);
                 try storeBitfield(l, dst.value, dst.ty, bf, new_v, dst.quals.is_volatile);
@@ -2338,7 +2368,7 @@ fn lowerExpr(l: *L, expr: *const parser.Expr) Error!TypedValue {
                 const cv = try l.convertTo(cur, c);
                 const rv = try l.convertTo(rhs, c);
                 const ct = try l.irTy(c);
-                const res = try f.appendInst(l.block, ct, .{ .arith = .{ .op = irBinOp(op), .lhs = cv, .rhs = rv } });
+                const res = try f.appendInst(l.block, ct, .{ .arith = .{ .op = irBinOp(op), .lhs = cv, .rhs = rv, .nsw = noSignedWrap(c, op) } });
                 break :nv try l.convertTo(.{ .value = res, .ty = c }, dst.ty);
             } else try l.convertTo(rhs, dst.ty);
             // A write through a `volatile`-qualified lvalue marks the store.
@@ -2384,7 +2414,7 @@ fn lowerExpr(l: *L, expr: *const parser.Expr) Error!TypedValue {
             } else iv: {
                 if (!cur.ty.isInt()) break :blk error.Unsupported; // struct/array target: not supported
                 const one = try f.appendInst(l.block, bt, .{ .iconst = 1 });
-                break :iv try f.appendInst(l.block, bt, .{ .arith = .{ .op = irBinOp(op), .lhs = cur.value, .rhs = one } });
+                break :iv try f.appendInst(l.block, bt, .{ .arith = .{ .op = irBinOp(op), .lhs = cur.value, .rhs = one, .nsw = noSignedWrap(cur.ty, op) } });
             };
             try f.appendStoreVol(l.block, new_v, dst.value, dst.quals.is_volatile);
             break :blk if (ie.prefix) TypedValue{ .value = new_v, .ty = dst.ty } else cur;
@@ -3128,6 +3158,14 @@ fn truthy(l: *L, tv: TypedValue) Error!Value {
 
 /// Map a parser binary op to the IR arithmetic op. Div/rem/shr pick their signed-vs-unsigned
 /// variant from the (already `commonType`-converted) operand IR type's signedness.
+/// Whether `op` in type `t` may assume no signed overflow. C leaves signed overflow undefined for
+/// `int` and wider. A narrower type is computed after promotion, so its wrap is defined.
+fn noSignedWrap(t: ctype.CType, op: parser.BinOp) bool {
+    const int = t.asInt() orelse return false;
+    if (!int.signed or @backingInt(int.rank) < @backingInt(ctype.Rank.int)) return false;
+    return op == .add or op == .sub or op == .mul;
+}
+
 fn irBinOp(op: parser.BinOp) ir.function.BinOp {
     return switch (op) {
         .add => .add,

@@ -716,6 +716,8 @@ fn nonWrappingCounter(ctx: *const LoopCtx, hp: Value, start: Value, next: Value)
     const info = intInfo(func, func.valueType(hp)) orelse return false;
     if (info.signedness != .signed) return false;
     const step = stepOf(ctx, hp, next) orelse return false;
+    // A step C promises never overflows keeps the counter exact at any constant stride.
+    if (step == .konst and hasNoSignedWrap(func, next)) return true;
     if (step != .konst or (step.konst != 1 and step.konst != -1)) return false;
     const insts = func.blockInsts(ctx.header);
     if (insts.len == 0) return false;
@@ -885,7 +887,9 @@ fn affineConvert(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, value
     // A signed value widens with its counter only while the counter never wraps.
     if (source.signedness == .signed) {
         if (old.biv >= 64 or ctx.nowrap_bivs & (@as(u64, 1) << @intCast(old.biv)) == 0) return null;
-        if (pool.constOf(old.scale) != @as(?i64, 1) or pool.constOf(old.offset) != @as(?i64, 0)) return null;
+        if (pool.constOf(old.scale) != @as(?i64, 1)) return null;
+        // `i + c` widens to `sext(i) + c` when C promises the add does not overflow.
+        if (pool.constOf(old.offset) != @as(?i64, 0) and !counterPlusConstant(ctx, pool, value, old.biv)) return null;
     }
     // Widening is exact only while the narrow value does not wrap, and then each constant is a
     // signed delta: `i - 1` carries 0xffffffff in 32 bits but means -1 once widened.
@@ -1710,6 +1714,48 @@ test "leaves a signed counter alone when it can start negative" {
     try testing.expect(!try runPass(allocator, &func));
 }
 
+test "a signed counter whose step cannot overflow is reduced from any start" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const c = try buildSignedIndexLoop(&func, -1);
+    // C promises `++k` on an `int` does not overflow, so the counter widens exactly.
+    const back = func.blockArgs(func.terminator(c.body).?.jump);
+    func.opcodeMut(func.definingInst(back[0]).?).arith_imm.nsw = true;
+    try testing.expect(try runPass(allocator, &func));
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
+test "an index one past a signed counter shares its pointer when the add cannot overflow" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const c = try buildCounted(&func, n, i32_t, entry);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, c.head, &.{ zero, zero });
+    // p[k + 1], with the add marked as C's non-overflowing signed add.
+    const next_index = try func.appendInst(c.body, i32_t, .{ .arith_imm = .{ .op = .add, .lhs = c.bk, .imm = 1, .nsw = true } });
+    const wide = try func.appendInst(c.body, i64_t, .{ .convert = .{ .value = next_index } });
+    const off = try func.appendArithImm(c.body, i64_t, .shl, wide, 2);
+    const addr = try func.appendInst(c.body, ptr_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = off } });
+    const loaded = try func.appendInst(c.body, i32_t, .{ .load = .{ .ptr = addr } });
+    try closeCounted(&func, c, loaded);
+
+    try testing.expect(try runPass(allocator, &func));
+    try testing.expectEqual(ptr_t, func.valueType(func.blockParams(c.head)[2]));
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
 test "a shared address space stays shared through the reduction" {
     // `verify.pointerArithChangesSpace` rejects a pointer add whose result names a different space,
     // so a reduction that took its type from anywhere but the value it replaces fails loudly here.
@@ -2268,4 +2314,34 @@ test "splitunroll's cloned address chains coalesce to one carried pointer instea
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
     try testing.expect(diags.ok());
+}
+
+/// Whether `v` is an `add` or `sub` marked as never overflowing in its signed type.
+fn hasNoSignedWrap(func: *const Function, v: Value) bool {
+    const inst = func.definingInst(v) orelse return false;
+    return switch (func.opcode(inst)) {
+        .arith => |a| a.nsw and (a.op == .add or a.op == .sub),
+        .arith_imm => |a| a.nsw and (a.op == .add or a.op == .sub),
+        else => false,
+    };
+}
+
+/// Whether `v` is `counter + c` or `counter - c` for a constant `c`, marked as never overflowing,
+/// where `counter` is the plain value of induction variable `biv`.
+fn counterPlusConstant(ctx: *const LoopCtx, pool: *const Pool, v: Value, biv: u32) bool {
+    const func = ctx.func;
+    if (!hasNoSignedWrap(func, v)) return false;
+    const inst = func.definingInst(v).?;
+    const counter = switch (func.opcode(inst)) {
+        .arith_imm => |a| a.lhs,
+        .arith => |a| blk: {
+            const k = func.definingInst(a.rhs) orelse return false;
+            if (func.opcode(k) != .iconst) return false;
+            break :blk a.lhs;
+        },
+        else => return false,
+    };
+    const inner = ctx.affine[@backingInt(counter)] orelse return false;
+    return inner.base == null and inner.biv == biv and
+        pool.constOf(inner.scale) == @as(?i64, 1) and pool.constOf(inner.offset) == @as(?i64, 0);
 }

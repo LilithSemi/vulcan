@@ -71,11 +71,11 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             if (!fitsImmediate(func, a.lhs, lc, rc)) continue;
             if (rc) |c| {
                 if (uses[@backingInt(a.rhs)] != 1) continue;
-                func.opcodeMut(inst).* = .{ .arith_imm = .{ .op = a.op, .lhs = a.lhs, .imm = c } };
+                func.opcodeMut(inst).* = .{ .arith_imm = .{ .op = a.op, .lhs = a.lhs, .imm = c, .nsw = a.nsw } };
                 changed = true;
             } else if (info.commutative) if (lc) |c| {
                 if (uses[@backingInt(a.lhs)] != 1) continue;
-                func.opcodeMut(inst).* = .{ .arith_imm = .{ .op = a.op, .lhs = a.rhs, .imm = c } };
+                func.opcodeMut(inst).* = .{ .arith_imm = .{ .op = a.op, .lhs = a.rhs, .imm = c, .nsw = a.nsw } };
                 changed = true;
             };
         }

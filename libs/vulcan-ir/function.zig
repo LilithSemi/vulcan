@@ -58,12 +58,14 @@ pub const BinOp = enum {
     }
 };
 
-/// A binary arithmetic/bitwise operation. The result type is the operand type.
-pub const Arith = struct { op: BinOp, lhs: Value, rhs: Value };
+/// A binary arithmetic/bitwise operation. The result type is the operand type. `nsw` states that
+/// a signed `add`, `sub` or `mul` never overflows, as C promises for its signed integers. A pass
+/// may drop it, and may keep it only when the operands keep their values.
+pub const Arith = struct { op: BinOp, lhs: Value, rhs: Value, nsw: bool = false };
 
 /// Arithmetic against a constant operand: `lhs <op> imm`. Lowers to an immediate
-/// instruction (addi/andi/.../slli) instead of materializing the constant.
-pub const ArithImm = struct { op: BinOp, lhs: Value, imm: i64 };
+/// instruction (addi/andi/.../slli) instead of materializing the constant. `nsw` is as for `Arith`.
+pub const ArithImm = struct { op: BinOp, lhs: Value, imm: i64, nsw: bool = false };
 
 /// A comparison relation. Signedness comes from the operand types, not the
 /// relation, so the relation stays signedness-agnostic.
