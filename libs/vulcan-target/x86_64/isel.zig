@@ -3785,7 +3785,7 @@ fn pureOp(op: ir.function.BinOp) bool {
     };
 }
 
-const Sib = struct { base: Value, index: Value, scale: u2 };
+const Sib = struct { base: Value, index: Value, scale: u2, disp: i32 = 0 };
 
 /// The `[base + index * scale]` form of a load or store pointer `base + (index << k)` or
 /// `base + index`. It applies only when every use of the pointer is such an access, so the
@@ -3822,6 +3822,14 @@ fn sibAddress(func: *const Function, inst: ir.function.Inst) ?Sib {
     }
     if (intBits(func, sib.index) != 64) return null;
     if (!onlyAddressUses(func, ptr)) return null;
+    // A base built as `inner + imm` for this access alone goes in the displacement instead.
+    if (func.definingInst(sib.base)) |base_def| switch (func.opcode(base_def)) {
+        .arith_imm => |b| if (b.op == .add and @abs(b.imm) <= 1 << 30 and countUses(func, sib.base) == 1) {
+            sib.disp = @intCast(b.imm);
+            sib.base = b.lhs;
+        },
+        else => {},
+    };
     return sib;
 }
 
@@ -3843,7 +3851,7 @@ fn onlyAddressUses(func: *const Function, ptr: Value) bool {
 
 fn emitIndexedLoad(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst, sib: Sib, result: Value) Error!void {
     const func = ctx.func;
-    const disp: i32 = @intCast(ctx.fold.offOf(inst));
+    const disp: i32 = @as(i32, @intCast(ctx.fold.offOf(inst))) + sib.disp;
     const base = try ctx.use(allocator, sib.base, scratch2);
     const index = try ctx.use(allocator, sib.index, scratch1);
     if (isXmm(func, result)) {
@@ -3859,7 +3867,7 @@ fn emitIndexedLoad(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.In
 
 fn emitIndexedStore(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst, sib: Sib, value: Value) Error!void {
     const func = ctx.func;
-    const disp: i32 = @intCast(ctx.fold.offOf(inst));
+    const disp: i32 = @as(i32, @intCast(ctx.fold.offOf(inst))) + sib.disp;
     const form = storeForm(func, value);
     if (isXmm(func, value)) {
         const val = try ctx.useXmm(allocator, value, xmm_op0);

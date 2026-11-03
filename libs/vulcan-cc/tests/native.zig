@@ -1949,6 +1949,24 @@ test "float arithmetic" {
 test "float f32" {
     try expectAgreesFloat("float f(void){ return 1.5f + 0.5f; }", &.{}); // 2.0f
 }
+test "an indexed access into a later struct field matches gcc" {
+    const source =
+        \\struct pair { int keys[300]; int values[300]; };
+        \\int f(int a) {
+        \\  struct pair p;
+        \\  for (int i = 0; i < 300; ++i) { p.keys[i] = i * a; p.values[i] = i ^ a; }
+        \\  int sum = 0;
+        \\  for (int i = 0; i < 300; i += 7) {
+        \\    long slot = (long)((unsigned)(i * 13 + a) % 300u);
+        \\    p.values[slot] += p.keys[slot];
+        \\    sum += p.values[slot];
+        \\  }
+        \\  return sum;
+        \\}
+    ;
+    for ([_]i32{ 0, 3, -11, 4096 }) |a| try expectAgrees(source, &.{a});
+}
+
 test "a counting-down signed index addresses memory like gcc" {
     const sort =
         \\int f(int a) {
