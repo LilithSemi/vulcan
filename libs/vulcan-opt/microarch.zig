@@ -141,6 +141,7 @@ pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Funct
     const threaded = try pass.runToFixpoint(allocator, func, &.{
         jumpthread.pass_def,
         rangecheck.pass_def,
+        jumpthread.single_edge_params_pass_def,
         dce.pass_def,
     }, 8);
     var gate = try score.IRGate.init(allocator, func, m);
