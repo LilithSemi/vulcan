@@ -2030,6 +2030,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 }.e;
                 if (work == rl) {
                     try ctx.put(allocator, try op(a.op, vec, int_vec, dbl, work, rr));
+                } else if (work == rr and commutativeOp(a.op)) {
+                    // The result took the dying right operand, so the op runs the other way.
+                    try ctx.put(allocator, try op(a.op, vec, int_vec, dbl, work, rl));
                 } else if (work == rr) {
                     try ctx.put(allocator, encode.movupsRR(xmm_scratch, rl));
                     try ctx.put(allocator, try op(a.op, vec, int_vec, dbl, xmm_scratch, rr));
@@ -4504,11 +4507,11 @@ fn x86_64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Valu
     };
 }
 
-/// The right operand of a commutative register-form ALU op, which the op may write over instead
+/// The right operand of a commutative register-form ALU or SSE op, which the op may write over instead
 /// of the left one: `x = y ^ x` is `xor x, y`.
 fn x86_64DestructiveAlternate(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
     _ = ctx;
-    if (isXmm(func, v)) return null;
+    if (isXmm(func, v) and (isWide(func, v) or isQuad(func, v))) return null;
     const inst = func.definingInst(v) orelse return null;
     const a = switch (func.opcode(inst)) {
         .arith => |a| a,
@@ -4518,7 +4521,9 @@ fn x86_64DestructiveAlternate(ctx: *const anyopaque, func: *const Function, v: V
         .add, .mul, .bit_and, .bit_or, .bit_xor => {},
         else => return null,
     }
-    if (a.lhs == a.rhs or loadsOperand(func, a) or foldedAluImm(func, a, v) != null) return null;
+    if (a.lhs == a.rhs) return null;
+    // A gpr op may read a constant or a load in place of its right register.
+    if (!isXmm(func, v) and (loadsOperand(func, a) or foldedAluImm(func, a, v) != null)) return null;
     return a.rhs;
 }
 
