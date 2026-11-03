@@ -1084,11 +1084,9 @@ test "x86_64 arith_branch fold: tuned build emits sub immediately followed by jn
     try std.testing.expect(hasAdjacentLines(tuned_text, "sub ", "jne ") or hasAdjacentLines(tuned_text, "sub ", "je "));
 }
 
-test "x86_64 arith_branch fold: a multi-use arith result does NOT fuse (cmp survives, correct result)" {
-    // The sub result feeds BOTH the icmp and a second, independent use, so it is not single-use:
-    // the arith_branch fold must decline (folding away the separate cmp would be fine either way
-    // here, since the arith still runs, but this proves `fusesArithIntoBranch`'s single-use gate
-    // is actually wired to the same predicate `emitIf` reads, not merely present on paper).
+test "x86_64 arith_branch fold: a multi-use arith result fuses, and its other readers still see it" {
+    // The sub result feeds both the icmp and the edge args. The arith still runs as a plain
+    // flag-setting sub, so the branch reads its flags and the edges read its register.
     const a = std.testing.allocator;
     var func = ir.function.Function.init(a);
     defer func.deinit();
@@ -1111,7 +1109,7 @@ test "x86_64 arith_branch fold: a multi-use arith result does NOT fuse (cmp surv
     defer a.free(tuned);
     const text = try disasm.format(a, tuned);
     defer a.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "cmp ") != null); // multi-use: arith_branch declined
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp ") == null);
 
     try harness.expectRun(std.testing.io, a, &func, &.{1}, 0, harness.qemu); // s=0, else edge carries s=0
     try harness.expectRun(std.testing.io, a, &func, &.{5}, 4, harness.qemu); // s=4, then edge carries s=4

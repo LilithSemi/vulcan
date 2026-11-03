@@ -5303,9 +5303,9 @@ fn fusesArithIntoBranch(func: *const Function, insts: []const ir.function.Inst, 
     // different lowering entirely and never leaves ZF meaningfully set for
     // this fold.
     if (isVector(func, arith_result) or isFloat(func, arith_result)) return false;
-    // Single-use: the arith result is read only by the icmp. Since the arith immediately precedes
-    // the icmp and is its LHS, a total use-count of exactly 1 means the icmp is the sole reader.
-    if (countUses(func, arith_result) != 1) return false;
+    // Other readers of the result, such as the next trip of a loop, keep the arith emitted as a
+    // plain flag-setting instruction. A pointer result is left out, since an address may fold.
+    if (func.types.type_kind(func.valueType(arith_result)) == .ptr) return false;
     return switch (func.opcode(arith_inst)) {
         .arith => |a| a.op == .add or a.op == .sub or a.op == .bit_and,
         // Only add/sub in the immediate form. A bit_and immediate stays
