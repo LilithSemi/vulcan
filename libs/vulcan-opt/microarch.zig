@@ -19,6 +19,7 @@ const mem2reg = @import("mem2reg.zig");
 const rangecheck = @import("rangecheck.zig");
 const bitset = @import("bitset.zig");
 const samewidth = @import("samewidth.zig");
+const constedge = @import("constedge.zig");
 const knownbits = @import("knownbits.zig");
 const joinconst = @import("joinconst.zig");
 const ifconvert = @import("ifconvert.zig");
@@ -171,10 +172,10 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
         .x86_64 => &.{ rangediv.pass_def, offsetcombine.pass_def, dce.pass_def },
         else => return false,
     };
-    // Sharing one side of a same-width convert removes a register copy and adds no work, so it
-    // needs no score.
+    // Sharing one side of a same-width convert removes a register copy, and a constant rebuilt at
+    // its edge frees a register. Neither adds work, so they need no score.
     const shared = if (m.arch == .x86_64)
-        try pass.runToFixpoint(allocator, func, &.{ samewidth.pass_def, dce.pass_def }, 4)
+        try pass.runToFixpoint(allocator, func, &.{ samewidth.pass_def, constedge.pass_def, dce.pass_def }, 4)
     else
         false;
     var gate = try score.IRGate.init(allocator, func, m);
