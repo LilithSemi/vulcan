@@ -21,6 +21,7 @@ pub const strength = @import("vulcan-opt/strength.zig");
 pub const immform = @import("vulcan-opt/immform.zig");
 pub const branchfold = @import("vulcan-opt/branchfold.zig");
 pub const rangecheck = @import("vulcan-opt/rangecheck.zig");
+pub const looppromote = @import("vulcan-opt/looppromote.zig");
 pub const samewidth = @import("vulcan-opt/samewidth.zig");
 pub const libcall = @import("vulcan-opt/libcall.zig");
 pub const joinconst = @import("vulcan-opt/joinconst.zig");
@@ -70,8 +71,9 @@ pub const latency_pipeline = blk: {
     break :blk passes;
 };
 
-/// The late pipeline: induction-variable strength reduction, then just enough clean-up to settle
-/// what it leaves behind. It is SEPARATE from the default pipeline for a phase-ordering reason.
+/// The late pipeline: induction-variable strength reduction and loop register promotion, then just
+/// enough clean-up to settle what they leave behind. It is SEPARATE from the default pipeline for
+/// a phase-ordering reason. Both passes add header parameters.
 ///
 /// `ivsr` rewrites a loop's addresses into loop-carried pointers, which grows the header's
 /// parameter list and turns index arithmetic into a back-edge step. Four microarch idiom
@@ -83,6 +85,7 @@ pub const latency_pipeline = blk: {
 /// `optimizeEarly` and `optimizeLate`, and `frontends/vcc.zig`, which is where both halves meet.
 pub const late_pipeline = [_]pass.Pass{
     ivsr.pass_def,
+    looppromote.pass_def,
     constfold.pass_def,
     simplify.pass_def,
     strength.pass_def,
