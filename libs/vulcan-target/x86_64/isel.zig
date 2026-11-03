@@ -1614,6 +1614,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         // A masked store is per-lane predication (see `Store.mask`), which this backend has no
         // form for. Writing every lane is a wrong answer, so refuse.
         if (st.mask != null) return error.Unsupported;
+        if (rmwStore(func, ctx.cur_insts, ctx.cur_idx)) |rmw| return emitRmw(allocator, ctx, inst, st, rmw);
         if (sibAddress(func, inst)) |sib| {
             try emitIndexedStore(allocator, ctx, inst, sib, st.value);
             return;
@@ -1848,6 +1849,8 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         return lowerDirectCall(allocator, ctx, func.opcode(inst).call, null);
     }
     const result = func.instResult(inst) orelse return unhandledStatement(func.opcode(inst));
+    // The op of an in-place update runs inside the store, see `rmwStore`.
+    if ((func.opcode(inst) == .arith or func.opcode(inst) == .arith_imm) and rmwStore(func, ctx.cur_insts, ctx.cur_idx + 1) != null) return;
     // A pure gpr add, shift or convert that no instruction reads, such as an address an indexed
     // access replaced, emits nothing.
     if (ctx.reg_read.len != 0 and !ctx.reg_read[@backingInt(result)] and !isXmm(func, result)) switch (func.opcode(inst)) {
@@ -2742,6 +2745,8 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             // A masked load is per-lane predication (see `Load.mask`), which this backend has no
             // form for. Reading every lane is a wrong answer, so refuse.
             if (func.opcode(inst).load.mask != null) return error.Unsupported;
+            // The store two instructions on writes the result back in place, see `rmwStore`.
+            if (rmwStore(func, ctx.cur_insts, ctx.cur_idx + 2) != null) return;
             // The next arith reads this load as a memory operand.
             if (fusedLoad(func, ctx.cur_insts, ctx.cur_idx + 1) != null) return;
             if (sibAddress(func, inst)) |sib| {
@@ -4216,6 +4221,7 @@ fn foldedCmpImm(func: *const Function, cmp: ir.function.Compare) ?i32 {
 /// as an immediate is not a register read, so it does not hold a register live.
 fn x86_64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, out: *[wimmer.max_fused_operands]Value) ?u8 {
     _ = ctx;
+    if (rmwOperands(func, inst, out)) |count| return count;
     switch (func.opcode(inst)) {
         .icmp => |cmp| if (foldedCmpImm(func, cmp) != null) {
             out[0] = cmp.lhs;
@@ -6174,4 +6180,142 @@ fn edgeFeeds(func: *const Function, edge: ir.function.Jump, v: Value, param: Val
         if (arg == v and index < params.len and params[index] == param) return true;
     }
     return false;
+}
+
+/// An in-place update `store (load p) op x, p`, three adjacent instructions with the load and
+/// the op each read once. x86 runs it as one `op [p], x`.
+const Rmw = struct { load: ir.function.Inst, op: ir.function.BinOp, other: ?Value, imm: ?i32 };
+
+/// The update whose store is `insts[idx]`, or null.
+fn rmwStore(func: *const Function, insts: []const ir.function.Inst, idx: usize) ?Rmw {
+    if (idx < 2 or idx >= insts.len) return null;
+    const st = switch (func.opcode(insts[idx])) {
+        .store => |s| s,
+        else => return null,
+    };
+    if (st.@"volatile" or st.mask != null or func.isByteOrderTagged(insts[idx])) return null;
+    const bits = switch (func.types.type_kind(func.valueType(st.value))) {
+        .int => |int| int.bits,
+        else => return null,
+    };
+    if (bits != 8 and bits != 16 and bits != 32 and bits != 64) return null;
+    const load_inst = insts[idx - 2];
+    const load = switch (func.opcode(load_inst)) {
+        .load => |l| l,
+        else => return null,
+    };
+    if (load.ptr != st.ptr or load.@"volatile" or load.mask != null or func.isByteOrderTagged(load_inst)) return null;
+    const loaded = func.instResult(load_inst) orelse return null;
+    if (func.valueType(loaded) != func.valueType(st.value)) return null;
+    const op_inst = insts[idx - 1];
+    if (func.instResult(op_inst) != st.value) return null;
+    var rmw: Rmw = switch (func.opcode(op_inst)) {
+        .arith => |a| blk: {
+            if (a.lhs == loaded and a.rhs != loaded) break :blk .{ .load = load_inst, .op = a.op, .other = a.rhs, .imm = null };
+            if (a.rhs == loaded and a.lhs != loaded and a.op != .sub) break :blk .{ .load = load_inst, .op = a.op, .other = a.lhs, .imm = null };
+            return null;
+        },
+        .arith_imm => |a| blk: {
+            if (a.lhs != loaded) return null;
+            const imm: i32 = std.math.cast(i32, a.imm) orelse if (bits <= 32)
+                @bitCast(@as(u32, @truncate(@as(u64, @bitCast(a.imm)))))
+            else
+                return null;
+            break :blk .{ .load = load_inst, .op = a.op, .other = null, .imm = imm };
+        },
+        else => return null,
+    };
+    switch (rmw.op) {
+        .add, .sub, .bit_and, .bit_or, .bit_xor => {},
+        else => return null,
+    }
+    if (rmw.other) |other| if (foldedImm(func, other, bits > 32)) |imm| {
+        rmw.other = null;
+        rmw.imm = imm;
+    };
+    if (countUses(func, loaded) != 1 or countUses(func, st.value) != 1) return null;
+    return rmw;
+}
+
+/// The register reads of an instruction that is part of an in-place update: the load and the op
+/// read nothing, and the store reads the address and the other operand.
+fn rmwOperands(func: *const Function, inst: ir.function.Inst, out: *[wimmer.max_fused_operands]Value) ?u8 {
+    const offset: usize = switch (func.opcode(inst)) {
+        .load => 2,
+        .arith, .arith_imm => 1,
+        .store => 0,
+        else => return null,
+    };
+    if (func.opcode(inst) == .store) {
+        const value_def = func.definingInst(func.opcode(inst).store.value) orelse return null;
+        if (func.opcode(value_def) != .arith and func.opcode(value_def) != .arith_imm) return null;
+    }
+    const at = instPosition(func, inst) orelse return null;
+    const rmw = rmwStore(func, at.insts, at.index + offset) orelse return null;
+    if (offset != 0) return 0;
+    var count: u8 = 0;
+    if (sibAddress(func, inst)) |sib| {
+        out[0] = sib.base;
+        out[1] = sib.index;
+        count = 2;
+    } else {
+        out[0] = func.opcode(inst).store.ptr;
+        count = 1;
+    }
+    if (rmw.other) |other| {
+        out[count] = other;
+        count += 1;
+    }
+    return count;
+}
+
+fn emitRmw(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst, st: ir.function.Store, rmw: Rmw) Error!void {
+    const func = ctx.func;
+    const bits = intBits(func, st.value);
+    var base: Reg = undefined;
+    var index: ?Reg = null;
+    var scale: u2 = 0;
+    var disp: i32 = @intCast(ctx.fold.offOf(inst));
+    if (sibAddress(func, inst)) |sib| {
+        base = try ctx.use(allocator, sib.base, scratch2);
+        index = try ctx.use(allocator, sib.index, scratch1);
+        scale = sib.scale;
+        disp += sib.disp;
+        // A spilled register operand reloads into scratch1, so fold the index in first.
+        if (rmw.other) |other| if (ctx.loc(other) != .reg and ctx.loc(sib.index) != .reg) {
+            try ctx.put(allocator, encode.memIndexedLea(scratch2, base, index.?, scale));
+            base = scratch2;
+            index = null;
+            scale = 0;
+        };
+    } else {
+        base = try ctx.use(allocator, ctx.fold.baseOf(func, inst), scratch2);
+    }
+    const prefix: ?u8 = if (bits == 16) 0x66 else null;
+    if (rmw.imm) |imm| {
+        const digit: u3 = switch (rmw.op) {
+            .add => 0,
+            .bit_or => 1,
+            .bit_and => 4,
+            .sub => 5,
+            .bit_xor => 6,
+            else => unreachable,
+        };
+        const small = imm >= -128 and imm <= 127;
+        const form: encode.MemForm = .{ .prefix = prefix, .w = bits == 64, .op = if (bits == 8) 0x80 else if (small) 0x83 else 0x81 };
+        const imm_bytes: u3 = if (bits == 8 or small) 1 else if (bits == 16) 2 else 4;
+        try ctx.put(allocator, encode.memIndexedImm(form, digit, base, index, scale, disp, imm, imm_bytes));
+        return;
+    }
+    const reg = try ctx.use(allocator, rmw.other.?, scratch1);
+    const op: u8 = switch (rmw.op) {
+        .add => 0x01,
+        .bit_or => 0x09,
+        .bit_and => 0x21,
+        .sub => 0x29,
+        .bit_xor => 0x31,
+        else => unreachable,
+    };
+    const form: encode.MemForm = .{ .prefix = prefix, .w = bits == 64, .op = if (bits == 8) op - 1 else op, .byte_reg = bits == 8 };
+    try ctx.put(allocator, encode.memIndexed(form, @backingInt(reg), base, index, scale, disp));
 }

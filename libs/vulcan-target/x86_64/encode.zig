@@ -1073,6 +1073,23 @@ pub fn memIndexed(form: MemForm, reg: u8, base: Reg, index: ?Reg, scale: u2, dis
 }
 
 /// `lea dst, [base + index * (1 << scale)]`.
+/// `form [base + index * (1 << scale) + disp], imm` for a group-1 ALU op whose `digit` sits in
+/// the ModRM reg field. `imm_bytes` is 1, 2 or 4, the size the opcode in `form` reads.
+pub fn memIndexedImm(form: MemForm, digit: u3, base: Reg, index: ?Reg, scale: u2, disp: i32, imm: i32, imm_bytes: u3) Inst {
+    var inst = memIndexed(form, digit, base, index, scale, disp);
+    const u: u32 = @bitCast(imm);
+    for (0..imm_bytes) |k| inst.bytes[inst.len + k] = @truncate(u >> @intCast(k * 8));
+    inst.len += imm_bytes;
+    return inst;
+}
+
+test "memIndexedImm appends the immediate after the address" {
+    // add dword [rdx + rax*4], 1
+    try std.testing.expectEqualSlices(u8, &.{ 0x83, 0x04, 0x82, 0x01 }, memIndexedImm(.{ .op = 0x83 }, 0, .rdx, .rax, 2, 0, 1, 1).slice());
+    // xor qword [rbx + 16], 0x1000
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x81, 0x74, 0x23, 0x10, 0x00, 0x10, 0x00, 0x00 }, memIndexedImm(.{ .w = true, .op = 0x81 }, 6, .rbx, null, 0, 16, 0x1000, 4).slice());
+}
+
 pub fn memIndexedLea(dst: Reg, base: Reg, index: Reg, scale: u2) Inst {
     return memIndexed(.{ .w = true, .op = 0x8D }, n(dst), base, index, scale, 0);
 }

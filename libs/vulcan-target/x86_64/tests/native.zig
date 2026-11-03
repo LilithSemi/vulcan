@@ -1870,3 +1870,41 @@ test "x86_64 a list walk loads the next node into the register of the current on
     try std.testing.expectEqual(@as(i64, 103), f(&head));
     try std.testing.expectEqual(@as(i64, 0), f(null));
 }
+
+test "x86_64 a load, op and store to one address become one memory update" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const counts = try func.appendBlockParam(entry, ptr_t);
+    const slot = try func.appendBlockParam(entry, u64_t);
+    const mix = try func.appendBlockParam(entry, u32_t);
+    // counts[slot] += 5; counts[1] ^= mix;
+    const offset = try func.appendArithImm(entry, u64_t, .shl, slot, 2);
+    const at = try func.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = counts, .rhs = offset } });
+    const old = try func.appendInst(entry, u32_t, .{ .load = .{ .ptr = at } });
+    const bumped = try func.appendArithImm(entry, u32_t, .add, old, 5);
+    try func.appendStore(entry, bumped, at);
+    const second = try func.appendArithImm(entry, ptr_t, .add, counts, 4);
+    const prev = try func.appendInst(entry, u32_t, .{ .load = .{ .ptr = second } });
+    const mixed = try func.appendInst(entry, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = prev, .rhs = mix } });
+    try func.appendStore(entry, mixed, second);
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const code = try isel.selectFunctionForModel(a, &func, mm.modelFor(.zen4));
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "["));
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn ([*]u32, u64, u32) callconv(.c) void, 0);
+    var data = [_]u32{ 1, 2, 3, 0xffffffff };
+    f(&data, 3, 0x0f0f);
+    f(&data, 0, 0xff00);
+    try std.testing.expectEqualSlices(u32, &.{ 6, 2 ^ 0x0f0f ^ 0xff00, 3, 4 }, &data);
+}
