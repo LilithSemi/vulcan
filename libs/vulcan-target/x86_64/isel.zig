@@ -3337,26 +3337,49 @@ fn emitHeaderTest(allocator: std.mem.Allocator, ctx: *Ctx, header: Block, next_b
     const h = @backingInt(header);
     if (ctx.block_busy[h] or ctx.dense_root[h]) return false;
     const insts = func.blockInsts(header);
-    if (insts.len != 2) return false;
-    const cmp = switch (func.opcode(insts[0])) {
+    // A few plain instructions may come before the compare, for example the load a search loop
+    // tests. The header holds no allocator actions, so each one runs again exactly as it does
+    // in the header.
+    if (insts.len < 2 or insts.len > 6) return false;
+    const n = insts.len;
+    for (insts[0 .. n - 2]) |inst| switch (func.opcode(inst)) {
+        .iconst, .arith, .arith_imm, .convert => {},
+        .load => |l| if (l.@"volatile" or l.mask != null) return false,
+        else => return false,
+    };
+    const cmp = switch (func.opcode(insts[n - 2])) {
         .icmp => |c| c,
         else => return false,
     };
-    const cf = switch (func.opcode(insts[1])) {
+    const cf = switch (func.opcode(insts[n - 1])) {
         .@"if" => |c| c,
         else => return false,
     };
-    const cond = func.instResult(insts[0]) orelse return false;
+    const cond = func.instResult(insts[n - 2]) orelse return false;
     if (cf.cond != cond or countUses(func, cond) != 1) return false;
     if (isVector(func, cmp.lhs) or isFloat(func, cmp.lhs)) return false;
     const then_empty = edgeMovesEmpty(ctx, cf.then, header);
     const else_empty = edgeMovesEmpty(ctx, cf.@"else", header);
     if (!then_empty and !else_empty) return false;
 
-    // Read the operands where the header's branch reads them.
     const saved_pos = ctx.pos;
-    ctx.pos = ctx.block_pos[h] + 2;
-    defer ctx.pos = saved_pos;
+    const saved_insts = ctx.cur_insts;
+    const saved_idx = ctx.cur_idx;
+    defer {
+        ctx.pos = saved_pos;
+        ctx.cur_insts = saved_insts;
+        ctx.cur_idx = saved_idx;
+    }
+    for (insts[0 .. n - 2], 0..) |inst, index| {
+        ctx.pos = ctx.block_pos[h] + 1 + @as(u32, @intCast(index));
+        ctx.cur_insts = insts;
+        ctx.cur_idx = index;
+        try lowerInst(allocator, ctx, inst);
+    }
+    // Read the operands where the header's branch reads them.
+    ctx.pos = ctx.block_pos[h] + @as(u32, @intCast(n));
+    ctx.cur_insts = insts;
+    ctx.cur_idx = n - 1;
     try emitCompare(allocator, ctx, cmp, try ctx.use(allocator, cmp.lhs, scratch1));
     const cc = condOf(cmp.op, isSigned(func, cmp.lhs));
     const t = forwardedBlock(ctx, cf.then.target);

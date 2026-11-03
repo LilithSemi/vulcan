@@ -1701,3 +1701,50 @@ test "x86_64 native widened byte count agrees with a scalar count for every tail
         }
     }
 }
+
+test "x86_64 a back edge repeats a header that loads before its test" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const values = try func.appendBlockParam(entry, ptr_t);
+    const pivot = try func.appendBlockParam(entry, i32_t);
+    const start = try func.appendBlockParam(entry, i32_t);
+    try func.setJump(entry, header, &.{start});
+    // while (values[i] < pivot) ++i; return i;
+    const i = try func.appendBlockParam(header, i32_t);
+    const wide = try func.appendInst(header, i64_t, .{ .convert = .{ .value = i } });
+    const offset = try func.appendArithImm(header, i64_t, .shl, wide, 2);
+    const address = try func.appendInst(header, ptr_t, .{ .arith = .{ .op = .add, .lhs = values, .rhs = offset } });
+    const value = try func.appendInst(header, i32_t, .{ .load = .{ .ptr = address } });
+    const below = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = value, .rhs = pivot } });
+    try func.appendIf(header, below, .{ .target = body }, .{ .target = done });
+    func.setTerminator(header, .{ .ret = ir.function.Ret.none() });
+    const next = try func.appendArithImm(body, i32_t, .add, i, 1);
+    try func.setJump(body, header, &.{next});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(i) });
+
+    const code = try isel.selectFunctionForModel(a, &func, mm.modelFor(.zen4));
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+    // The header load runs once on entry and once more at the bottom of each iteration.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "["));
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn ([*]const i32, i32, i32) callconv(.c) i32, 0);
+    const data = [_]i32{ -9, -3, 0, 4, 4, 8, 15, std.math.maxInt(i32) };
+    for ([_]i32{ -9, -2, 4, 5, 16 }) |p| for ([_]i32{ 0, 2 }) |s| {
+        var want = s;
+        while (data[@intCast(want)] < p) want += 1;
+        try std.testing.expectEqual(want, f(&data, p, s));
+    };
+}
