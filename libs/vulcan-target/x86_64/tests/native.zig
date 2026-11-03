@@ -1073,13 +1073,13 @@ test "x86_64 arith_branch fold: tuned build emits sub immediately followed by jn
     defer a.free(plain);
     const plain_text = try disasm.format(a, plain);
     defer a.free(plain_text);
-    try std.testing.expect(std.mem.indexOf(u8, plain_text, "cmp ") != null); // baseline: separate compare survives
+    try std.testing.expect(std.mem.indexOf(u8, plain_text, "cmp ") != null or std.mem.indexOf(u8, plain_text, "test ") != null); // baseline: separate compare survives
 
     const tuned = try isel.selectFunctionForModel(a, &func, mm.modelFor(.@"cascadelake-sp"));
     defer a.free(tuned);
     const tuned_text = try disasm.format(a, tuned);
     defer a.free(tuned_text);
-    try std.testing.expect(std.mem.indexOf(u8, tuned_text, "cmp ") == null); // no separate compare anywhere
+    try std.testing.expect(std.mem.indexOf(u8, tuned_text, "cmp ") == null and std.mem.indexOf(u8, tuned_text, "test ") == null); // no separate compare anywhere
     // sub immediately followed by the branch on its flags, in either polarity
     try std.testing.expect(hasAdjacentLines(tuned_text, "sub ", "jne ") or hasAdjacentLines(tuned_text, "sub ", "je "));
 }

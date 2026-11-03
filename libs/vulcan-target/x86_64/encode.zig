@@ -715,11 +715,17 @@ fn rexOne(ext: bool, w: bool) ?u8 {
     return null;
 }
 
-/// An ALU op against a 32-bit immediate (81 /digit id): ADD=/0, OR=/1, AND=/4, SUB=/5,
+/// An ALU op against an immediate (83 /digit ib when it fits a byte, else 81 /digit id): ADD=/0, OR=/1, AND=/4, SUB=/5,
 /// XOR=/6. `w` picks the operand size: REX.W for 64-bit, no REX or REX.B for 32-bit.
 pub fn aluImm(digit: u3, dst: Reg, imm: i32, w: bool) Inst {
+    // cmp against zero sets the same flags as test, which is a byte shorter.
+    if (digit == 7 and imm == 0) return testReg(dst, dst, w);
     const u: u32 = @bitCast(imm);
     const mrm: u8 = 0xC0 | (@as(u8, digit) << 3) | (n(dst) & 7);
+    if (imm >= -128 and imm <= 127) {
+        if (rexOne(n(dst) >= 8, w)) |rex| return Inst.of(&.{ rex, 0x83, mrm, @truncate(u) });
+        return Inst.of(&.{ 0x83, mrm, @truncate(u) });
+    }
     if (rexOne(n(dst) >= 8, w)) |rex| return Inst.of(&.{ rex, 0x81, mrm, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
     return Inst.of(&.{ 0x81, mrm, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
@@ -1000,6 +1006,39 @@ pub fn movapsStore(disp: i32, src: Xmm) Inst {
     return sseStack(null, 0x29, src, disp);
 }
 
+/// Rewrite the mod=10 address at the end of `inst`, ahead of `tail` immediate bytes, to the
+/// shortest form: no displacement when it is zero and the base allows it, else a disp8 when it
+/// fits. A mod=10 ModRM has its top bits set to 10, which a 0x24 SIB never has.
+fn shrinkDisp(inst: Inst, tail: u8) Inst {
+    const disp_at = inst.len - tail - 4;
+    const has_sib = inst.bytes[disp_at - 1] & 0xC0 != 0x80;
+    const modrm_at = disp_at - 1 - @intFromBool(has_sib);
+    std.debug.assert(inst.bytes[modrm_at] & 0xC0 == 0x80);
+    const disp = std.mem.readInt(i32, inst.bytes[disp_at..][0..4], .little);
+    const base_low: u8 = if (has_sib) inst.bytes[modrm_at + 1] & 7 else inst.bytes[modrm_at] & 7;
+    const disp_len: u8 = if (disp == 0 and base_low != 5) 0 else if (disp >= -128 and disp <= 127) 1 else 4;
+    if (disp_len == 4) return inst;
+    var out = inst;
+    out.bytes[modrm_at] = (inst.bytes[modrm_at] & 0x3F) | (if (disp_len == 0) @as(u8, 0x00) else 0x40);
+    if (disp_len == 1) out.bytes[disp_at] = @bitCast(@as(i8, @intCast(disp)));
+    @memcpy(out.bytes[disp_at + disp_len ..][0..tail], inst.bytes[disp_at + 4 ..][0..tail]);
+    out.len = inst.len - 4 + disp_len;
+    return out;
+}
+
+test "shrinkDisp picks no displacement, a disp8, or keeps the disp32" {
+    // mov rax, [rdi]
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8B, 0x07 }, movFromMem(.rax, .rdi, 0).slice());
+    // mov rax, [rbp] needs a zero disp8
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8B, 0x45, 0x00 }, movFromMem(.rax, .rbp, 0).slice());
+    // mov rax, [r12 - 8] keeps its SIB
+    try std.testing.expectEqualSlices(u8, &.{ 0x49, 0x8B, 0x44, 0x24, 0xF8 }, movFromMem(.rax, .r12, -8).slice());
+    // mov rax, [rsp + 0x200]
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8B, 0x84, 0x24, 0x00, 0x02, 0x00, 0x00 }, movFromMem(.rax, .rsp, 0x200).slice());
+    // add dword [rdi + 4], 8 keeps the immediate after the disp8
+    try std.testing.expectEqualSlices(u8, &.{ 0x83, 0x47, 0x04, 0x08 }, aluMemImm8(0, .rdi, 4, 8, false).slice());
+}
+
 /// A general `mov` to or from `[base + disp32]` with an arbitrary base register (mod=10,
 /// disp32). The data register is the ModRM `reg` field, the base is the `rm` field. A base
 /// of rsp(4) or r12 needs the 0x24 SIB byte. rm=rbp(5) is fine at mod=10, since disp32 is
@@ -1012,9 +1051,9 @@ fn movMem(op: u8, data: Reg, base: Reg, disp: i32) Inst {
     const rex: u8 = 0x48 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
     const modrm_byte: u8 = 0x80 | ((r & 7) << 3) | (b & 7); // mod=10, reg=data, rm=base
     if ((b & 7) == 4) { // rsp/r12 base needs a SIB byte (base=rm, no index)
-        return Inst.of(&.{ rex, op, modrm_byte, 0x24, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
+        return shrinkDisp(Inst.of(&.{ rex, op, modrm_byte, 0x24, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) }), 0);
     }
-    return Inst.of(&.{ rex, op, modrm_byte, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
+    return shrinkDisp(Inst.of(&.{ rex, op, modrm_byte, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) }), 0);
 }
 /// One load or store form for `memIndexed`: an optional legacy prefix, REX.W, an optional
 /// `0F` escape, and the opcode byte. `byte_reg` marks an 8-bit register operand, which needs
@@ -1132,9 +1171,9 @@ pub fn aluFromMem(opcode: u8, dst: Reg, base: Reg, disp: i32, w: bool) Inst {
 
 test "aluFromMem encodes reg, mem forms" {
     // add eax, [rdi + 4]
-    try std.testing.expectEqualSlices(u8, &.{ 0x03, 0x87, 0x04, 0x00, 0x00, 0x00 }, aluFromMem(0x03, .rax, .rdi, 4, false).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x03, 0x47, 0x04 }, aluFromMem(0x03, .rax, .rdi, 4, false).slice());
     // xor r9, [r12 + 8]
-    try std.testing.expectEqualSlices(u8, &.{ 0x4D, 0x33, 0x8C, 0x24, 0x08, 0x00, 0x00, 0x00 }, aluFromMem(0x33, .r9, .r12, 8, true).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x4D, 0x33, 0x4C, 0x24, 0x08 }, aluFromMem(0x33, .r9, .r12, 8, true).slice());
 }
 
 /// `mov dst, [base + disp32]` (REX.W 8B /r): load 64 bits from `[base+disp]`.
@@ -1173,7 +1212,7 @@ fn movMem32(op: u8, data: Reg, base: Reg, disp: i32) Inst {
     buf[i + 1] = @truncate(u >> 8);
     buf[i + 2] = @truncate(u >> 16);
     buf[i + 3] = @truncate(u >> 24);
-    return Inst.of(buf[0 .. i + 4]);
+    return shrinkDisp(Inst.of(buf[0 .. i + 4]), 0);
 }
 /// 32-bit integer load `mov r32, [base+disp]` (zero-extends to the 64-bit register).
 pub fn movFromMem32(dst: Reg, base: Reg, disp: i32) Inst {
@@ -1323,7 +1362,7 @@ pub fn aluMemImm8(digit: u3, base: Reg, disp: i32, imm8: i8, w: bool) Inst {
     i += 4;
     buf[i] = @bitCast(imm8);
     i += 1;
-    return Inst.of(buf[0..i]);
+    return shrinkDisp(Inst.of(buf[0..i]), 1);
 }
 
 /// `movzx dst, word ptr [base+disp32]` (0F B7 /r): load 16 bits, zero-extended into the
@@ -1356,7 +1395,7 @@ pub fn movzxWordFromMem(dst: Reg, base: Reg, disp: i32) Inst {
     buf[i + 1] = @truncate(u >> 8);
     buf[i + 2] = @truncate(u >> 16);
     buf[i + 3] = @truncate(u >> 24);
-    return Inst.of(buf[0 .. i + 4]);
+    return shrinkDisp(Inst.of(buf[0 .. i + 4]), 0);
 }
 
 /// `mov word ptr [base+disp32], src` (66 89 /r): store the low 16 bits of `src`. The 66
@@ -1389,7 +1428,7 @@ pub fn movToMem16(base: Reg, disp: i32, src: Reg) Inst {
     buf[i + 1] = @truncate(u >> 8);
     buf[i + 2] = @truncate(u >> 16);
     buf[i + 3] = @truncate(u >> 24);
-    return Inst.of(buf[0 .. i + 4]);
+    return shrinkDisp(Inst.of(buf[0 .. i + 4]), 0);
 }
 
 /// `mov byte ptr [base+disp32], src` (88 /r): store the low 8 bits of `src`, exactly 1 byte.
@@ -1423,7 +1462,7 @@ pub fn movToMem8(base: Reg, disp: i32, src: Reg) Inst {
     buf[i + 1] = @truncate(u >> 8);
     buf[i + 2] = @truncate(u >> 16);
     buf[i + 3] = @truncate(u >> 24);
-    return Inst.of(buf[0 .. i + 4]);
+    return shrinkDisp(Inst.of(buf[0 .. i + 4]), 0);
 }
 
 /// A sign- or zero-extending narrow load, `movsx`/`movzx dst32, byte/word ptr [base+disp32]`,
@@ -1457,7 +1496,7 @@ fn extMem(op: u8, dst: Reg, base: Reg, disp: i32) Inst {
     buf[i + 1] = @truncate(u >> 8);
     buf[i + 2] = @truncate(u >> 16);
     buf[i + 3] = @truncate(u >> 24);
-    return Inst.of(buf[0 .. i + 4]);
+    return shrinkDisp(Inst.of(buf[0 .. i + 4]), 0);
 }
 /// `movsx r32, byte ptr [base+disp]` (0F BE): load 1 byte, sign-extended (a signed i8 load).
 pub fn movsxByteFromMem(dst: Reg, base: Reg, disp: i32) Inst {
@@ -1534,7 +1573,7 @@ fn sseMem(prefix: ?u8, op: u8, x: Xmm, base: Reg, disp: i32) Inst {
     buf[i + 1] = @truncate(u >> 8);
     buf[i + 2] = @truncate(u >> 16);
     buf[i + 3] = @truncate(u >> 24);
-    return Inst.of(buf[0 .. i + 4]);
+    return shrinkDisp(Inst.of(buf[0 .. i + 4]), 0);
 }
 /// `movss xmm, [base+disp]` / `movss [base+disp], xmm` (F3 0F 10 / 11): load/store a scalar.
 pub fn movssLoadMem(dst: Xmm, base: Reg, disp: i32) Inst {
@@ -1714,41 +1753,41 @@ test "known AVX (VEX 256-bit) encodings" {
 }
 
 test "memory-operand encodings" {
-    // mov rax, [rcx+16]: REX.W 8B, mod=10 reg=rax(0) rm=rcx(1) -> 0x81, disp32.
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8B, 0x81, 0x10, 0x00, 0x00, 0x00 }, movFromMem(.rax, .rcx, 16).slice());
-    // mov [rdx+8], rsi: REX.W 89, mod=10 reg=rsi(6) rm=rdx(2) -> 0xB2, disp32.
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x89, 0xB2, 0x08, 0x00, 0x00, 0x00 }, movToMem(.rdx, 8, .rsi).slice());
+    // mov rax, [rcx+16]: REX.W 8B, mod=01 reg=rax(0) rm=rcx(1) -> 0x41, disp8.
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8B, 0x41, 0x10 }, movFromMem(.rax, .rcx, 16).slice());
+    // mov [rdx+8], rsi: REX.W 89, mod=01 reg=rsi(6) rm=rdx(2) -> 0x72, disp8.
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x89, 0x72, 0x08 }, movToMem(.rdx, 8, .rsi).slice());
     // an rsp base needs the 0x24 SIB byte: mov rax, [rsp+16].
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8B, 0x84, 0x24, 0x10, 0x00, 0x00, 0x00 }, movFromMem(.rax, .rsp, 16).slice());
-    // an rbp base at mod=10 keeps the plain disp32 form (no SIB): mov rax, [rbp+0].
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8B, 0x85, 0x00, 0x00, 0x00, 0x00 }, movFromMem(.rax, .rbp, 0).slice());
-    // r8 base needs REX.B: mov rax, [r8+0] -> REX.WB=0x49.
-    try std.testing.expectEqualSlices(u8, &.{ 0x49, 0x8B, 0x80, 0x00, 0x00, 0x00, 0x00 }, movFromMem(.rax, .r8, 0).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8B, 0x44, 0x24, 0x10 }, movFromMem(.rax, .rsp, 16).slice());
+    // an rbp base has no mod=00 form, so it keeps a zero disp8: mov rax, [rbp+0].
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8B, 0x45, 0x00 }, movFromMem(.rax, .rbp, 0).slice());
+    // r8 base needs REX.B: mov rax, [r8+0] -> REX.WB=0x49, no displacement.
+    try std.testing.expectEqualSlices(u8, &.{ 0x49, 0x8B, 0x00 }, movFromMem(.rax, .r8, 0).slice());
     // lea rax, [rsp+32]: REX.W 8D, SIB 0x24.
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8D, 0x84, 0x24, 0x20, 0x00, 0x00, 0x00 }, leaFromStack(.rax, 32).slice());
     // movss xmm0, [rcx+16] (F3 0F 10), movups [rdx+0], xmm1 (0F 11).
-    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x10, 0x81, 0x10, 0x00, 0x00, 0x00 }, movssLoadMem(.xmm0, .rcx, 16).slice());
-    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x11, 0x8A, 0x00, 0x00, 0x00, 0x00 }, movupsStoreMem(.rdx, 0, .xmm1).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x10, 0x41, 0x10 }, movssLoadMem(.xmm0, .rcx, 16).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x11, 0x0A }, movupsStoreMem(.rdx, 0, .xmm1).slice());
     // movss [rsp+8], xmm2 needs the SIB byte: F3 0F 11, reg=xmm2(2) rm=rsp(4).
-    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x11, 0x94, 0x24, 0x08, 0x00, 0x00, 0x00 }, movssStoreMem(.rsp, 8, .xmm2).slice());
-    // movzx eax, word ptr [rcx+16]: 0F B7, mod=10 reg=rax(0) rm=rcx(1) -> 0x81, disp32.
-    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xB7, 0x81, 0x10, 0x00, 0x00, 0x00 }, movzxWordFromMem(.rax, .rcx, 16).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x11, 0x54, 0x24, 0x08 }, movssStoreMem(.rsp, 8, .xmm2).slice());
+    // movzx eax, word ptr [rcx+16]: 0F B7, mod=01 reg=rax(0) rm=rcx(1) -> 0x41, disp8.
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xB7, 0x41, 0x10 }, movzxWordFromMem(.rax, .rcx, 16).slice());
     // movzx r10d, word ptr [r11+0]: both extended -> REX.RB=0x45, SIB not needed (r11 low bits=3).
-    try std.testing.expectEqualSlices(u8, &.{ 0x45, 0x0F, 0xB7, 0x93, 0x00, 0x00, 0x00, 0x00 }, movzxWordFromMem(.r10, .r11, 0).slice());
-    // mov word ptr [rdx+0], ax: 66 89, mod=10 reg=rax(0) rm=rdx(2) -> 0x82, disp32.
-    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x89, 0x82, 0x00, 0x00, 0x00, 0x00 }, movToMem16(.rdx, 0, .rax).slice());
-    // mov word ptr [rsp+8], ax needs the SIB byte: 66 89, reg=rax(0) rm=rsp(4) -> 0x84.
-    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x89, 0x84, 0x24, 0x08, 0x00, 0x00, 0x00 }, movToMem16(.rsp, 8, .rax).slice());
-    // mov byte ptr [rdx+0], al (88 /r): no REX for a low source (rax), reg=rax(0) rm=rdx(2) -> 0x82.
-    try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x82, 0x00, 0x00, 0x00, 0x00 }, movToMem8(.rdx, 0, .rax).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x45, 0x0F, 0xB7, 0x13 }, movzxWordFromMem(.r10, .r11, 0).slice());
+    // mov word ptr [rdx+0], ax: 66 89, mod=00 reg=rax(0) rm=rdx(2) -> 0x02.
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x89, 0x02 }, movToMem16(.rdx, 0, .rax).slice());
+    // mov word ptr [rsp+8], ax needs the SIB byte: 66 89, reg=rax(0) rm=rsp(4) -> 0x44.
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x89, 0x44, 0x24, 0x08 }, movToMem16(.rsp, 8, .rax).slice());
+    // mov byte ptr [rdx+0], al (88 /r): no REX for a low source (rax), reg=rax(0) rm=rdx(2) -> 0x02.
+    try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x02 }, movToMem8(.rdx, 0, .rax).slice());
     // mov byte ptr [rdx+0], sil: rsi (index 6) needs a REX to address sil, else it means dh.
-    try std.testing.expectEqualSlices(u8, &.{ 0x40, 0x88, 0xB2, 0x00, 0x00, 0x00, 0x00 }, movToMem8(.rdx, 0, .rsi).slice());
-    // movsx eax, byte ptr [rcx+16] (0F BE): sign-extending i8 load, reg=rax(0) rm=rcx(1) -> 0x81.
-    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xBE, 0x81, 0x10, 0x00, 0x00, 0x00 }, movsxByteFromMem(.rax, .rcx, 16).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x40, 0x88, 0x32 }, movToMem8(.rdx, 0, .rsi).slice());
+    // movsx eax, byte ptr [rcx+16] (0F BE): sign-extending i8 load, reg=rax(0) rm=rcx(1) -> 0x41.
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xBE, 0x41, 0x10 }, movsxByteFromMem(.rax, .rcx, 16).slice());
     // movzx eax, byte ptr [rcx+0] (0F B6): zero-extending i8 load.
-    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xB6, 0x81, 0x00, 0x00, 0x00, 0x00 }, movzxByteFromMem(.rax, .rcx, 0).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xB6, 0x01 }, movzxByteFromMem(.rax, .rcx, 0).slice());
     // movsx eax, word ptr [rcx+0] (0F BF): sign-extending i16 load.
-    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xBF, 0x81, 0x00, 0x00, 0x00, 0x00 }, movsxWordFromMem(.rax, .rcx, 0).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xBF, 0x01 }, movsxWordFromMem(.rax, .rcx, 0).slice());
 }
 
 test "control-flow encodings" {
