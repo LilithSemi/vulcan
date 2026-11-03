@@ -1203,6 +1203,7 @@ fn tryAllocateFreeReg(
     desc: *const RegDescription,
     limit: usize,
     param_hints: []const u16,
+    avoid: []const u16,
 ) ?u16 {
     const class_idx = current.class;
     const class = desc.classes[class_idx];
@@ -1325,6 +1326,16 @@ fn tryAllocateFreeReg(
         if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
             spanMin(&free_until, h, current.regs) >= current.end()) chosen = h;
     };
+    if (chosen == null) {
+        for (0..limit) |b| {
+            if (!spanPlaceable(&is_candidate, null, limit, b, current.regs, current.reg_align)) continue;
+            if (std.mem.indexOfScalar(u16, avoid, @intCast(b)) != null) continue;
+            if (spanMin(&free_until, b, current.regs) == best_free) {
+                chosen = @intCast(b);
+                break;
+            }
+        }
+    }
     if (chosen == null) {
         for (0..limit) |b| {
             if (!spanPlaceable(&is_candidate, null, limit, b, current.regs, current.reg_align)) continue;
@@ -1453,10 +1464,14 @@ const ValueRelations = std.AutoHashMapUnmanaged(Value, std.ArrayListUnmanaged(Va
 const ParamRelations = struct {
     param_args: ValueRelations = .empty,
     arg_params: ValueRelations = .empty,
+    /// For each argument, the other parameters of an edge it is passed on. Placing the argument
+    /// in one of their registers makes the edge copy a cycle.
+    arg_siblings: ValueRelations = .empty,
 
     fn deinit(self: *ParamRelations, allocator: std.mem.Allocator) void {
         freeValueRelations(allocator, &self.param_args);
         freeValueRelations(allocator, &self.arg_params);
+        freeValueRelations(allocator, &self.arg_siblings);
     }
 };
 
@@ -1476,6 +1491,11 @@ fn addParamArgEdge(allocator: std.mem.Allocator, func: *const Function, relation
     for (params, args) |p, a| {
         try addValueRelation(allocator, &relations.param_args, p, a);
         try addValueRelation(allocator, &relations.arg_params, a, p);
+    }
+    for (args, 0..) |a, i| {
+        for (params, args, 0..) |p, other, j| {
+            if (i != j and other != a) try addValueRelation(allocator, &relations.arg_siblings, a, p);
+        }
     }
 }
 
@@ -1504,6 +1524,27 @@ fn freeValueRelations(allocator: std.mem.Allocator, map: *ValueRelations) void {
     var it = map.valueIterator();
     while (it.next()) |list| list.deinit(allocator);
     map.deinit(allocator);
+}
+
+/// The placed registers of the parameters `current` must not land on, see `arg_siblings`.
+fn siblingRegs(
+    relations: *const ParamRelations,
+    intervals: []const Interval,
+    children: []const *Interval,
+    current: *const Interval,
+    out: *[max_phys_regs]u16,
+) []const u16 {
+    const v = current.value orelse return out[0..0];
+    const list = relations.arg_siblings.getPtr(v) orelse return out[0..0];
+    var len: usize = 0;
+    for (list.items) |related| {
+        const r = placedRegOf(intervals, children, related) orelse continue;
+        if (std.mem.indexOfScalar(u16, out[0..len], r) == null and len < out.len) {
+            out[len] = r;
+            len += 1;
+        }
+    }
+    return out[0..len];
 }
 
 /// Fill `out` with the distinct registers already assigned to incoming arguments of block parameter
@@ -2057,7 +2098,12 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
             computeParamHints(&param_relations, intervals, children.items, current, &param_hint_buf)
         else
             param_hint_buf[0..0];
-        if (tryAllocateFreeReg(current, active.items, inactive.items, desc, limit, param_hints)) |reg| {
+        var avoid_buf: [max_phys_regs]u16 = undefined;
+        const avoid: []const u16 = if (desc.coalesce_block_params)
+            siblingRegs(&param_relations, intervals, children.items, current, &avoid_buf)
+        else
+            avoid_buf[0..0];
+        if (tryAllocateFreeReg(current, active.items, inactive.items, desc, limit, param_hints, avoid)) |reg| {
             current.location = .{ .reg = reg };
             try active.append(allocator, current);
         } else {

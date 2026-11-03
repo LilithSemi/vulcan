@@ -1950,3 +1950,51 @@ test "x86_64 a constant mask bit test is one bt and gives the right member for e
         try std.testing.expectEqual(want, f(@intCast(byte)));
     }
 }
+
+test "x86_64 an edge that passes a value on and loads its successor needs no swap" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const first = try func.appendBlockParam(entry, ptr_t);
+    const null_ptr = try func.appendInst(entry, ptr_t, .{ .iconst = 0 });
+    try func.setJump(entry, header, &.{ null_ptr, first });
+    // while (node) { last = node; node = node->next; } return last;
+    const last = try func.appendBlockParam(header, ptr_t);
+    const node = try func.appendBlockParam(header, ptr_t);
+    const more = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .ne, .lhs = node, .rhs = null_ptr } });
+    try func.appendIf(header, more, .{ .target = body }, .{ .target = done });
+    const next = try func.appendInst(body, ptr_t, .{ .load = .{ .ptr = node } });
+    try func.setJump(body, header, &.{ node, next });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(last) });
+
+    const code = try isel.selectFunctionForModel(a, &func, mm.modelFor(.zen4));
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+    var copies: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const at = std.mem.indexOf(u8, line, "mov ") orelse continue;
+        const comma = std.mem.indexOf(u8, line[at..], ", ") orelse continue;
+        const source = line[at + comma + 2 ..];
+        if (source.len != 0 and source[0] == 'r') copies += 1;
+    }
+    try std.testing.expect(copies <= 2);
+
+    const Node = extern struct { next: ?*const @This() };
+    const third = Node{ .next = null };
+    const second = Node{ .next = &third };
+    const head = Node{ .next = &second };
+    var buffer = try jit.CodeBuffer.map(code);
+    defer buffer.deinit();
+    const f = buffer.entry(*const fn (?*const Node) callconv(.c) ?*const Node, 0);
+    try std.testing.expectEqual(@as(?*const Node, &third), f(&head));
+    try std.testing.expectEqual(@as(?*const Node, null), f(null));
+}
