@@ -770,6 +770,7 @@ const cascadelake = Model{
 
 const zen4_fusion = [_]model.FusionRule{
     .{ .kind = .cmp_branch },
+    .{ .kind = .arith_branch },
 };
 
 // AMD Zen 4. Six-wide dispatch, four ALUs, three AGUs, and four FP pipes. AVX-512 runs on a
