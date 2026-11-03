@@ -85,7 +85,7 @@ fn transfer(func: *const Function, bits: []const Bits, inst: Inst, w: u16, unsig
     const mask = widthMask(w);
     const r: Bits = switch (func.opcode(inst)) {
         .iconst => |c| .{ .ones = @as(u64, @bitCast(c)) & mask, .zeros = ~@as(u64, @bitCast(c)) & mask },
-        .arith => |a| binary(a.op, bits[@backingInt(a.lhs)], bits[@backingInt(a.rhs)], null, unsigned, mask, w),
+        .arith => |a| binary(a.op, bits[@backingInt(a.lhs)], bits[@backingInt(a.rhs)], knownValue(bits[@backingInt(a.rhs)], func, a.rhs), unsigned, mask, w),
         .arith_imm => |a| binary(a.op, bits[@backingInt(a.lhs)], constBits(a.imm), a.imm, unsigned, mask, w),
         .select => |s| meet(bits[@backingInt(s.then)], bits[@backingInt(s.@"else")]),
         .convert => |cv| convertKnown(func, bits, cv.value, w),
@@ -122,7 +122,7 @@ fn binary(op: BinOp, a: Bits, b: Bits, imm: ?i64, unsigned: bool, mask: u64, w: 
         .shl => if (imm) |k| shiftLeft(a, k) else .{},
         // Only an unsigned (logical) shift zero-fills the vacated high bits. A signed shift is
         // arithmetic (sign-fill), so its high bits are not known 0; treat it as unknown.
-        .shr => if (imm != null and unsigned) shiftRightLogical(a, imm.?) else .{},
+        .shr => if (imm != null and unsigned) shiftRightLogical(a, imm.?, mask) else .{},
         // a + b with a known-0 carry-in.
         .add => addCarry(a, b, true, false, mask),
         // a - b == a + ~b + 1, a known-1 carry-in. Negating b's known bits (zeros <-> ones) is exact:
@@ -252,12 +252,8 @@ fn divKnown(a: Bits, b: Bits, w: u16, mask: u64) Bits {
         const bv = b.ones & mask;
         if (bv != 0 and bv & (bv - 1) == 0) {
             const k: u6 = @intCast(@ctz(bv));
-            const shifted = shiftRightLogical(a, k);
-            // shiftRightLogical zero-fills relative to a full 64-bit register, not width `w`, so at
-            // w < 64 it under-claims: the top `k` bits within width `w` are also always vacated by a
-            // w-bit logical shift, so OR them in explicitly to get the exact result the brief expects.
-            const top_zero = ~(mask >> k) & mask;
-            return .{ .zeros = (shifted.zeros | top_zero) & mask, .ones = shifted.ones & mask };
+            const shifted = shiftRightLogical(a, k, mask);
+            return .{ .zeros = shifted.zeros & mask, .ones = shifted.ones & mask };
         }
     }
     const divisor_min = @max(@as(u64, 1), minValue(b, mask));
@@ -318,11 +314,13 @@ fn shiftLeft(a: Bits, k: i64) Bits {
     return .{ .ones = a.ones << s, .zeros = (a.zeros << s) | low_zero };
 }
 
-fn shiftRightLogical(a: Bits, k: i64) Bits {
-    if (k < 0 or k >= 64) return .{};
+/// A logical right shift within the value's width `mask`: the vacated high bits of that width are
+/// known 0.
+fn shiftRightLogical(a: Bits, k: i64, mask: u64) Bits {
+    if (k < 0 or k >= 64 or (mask >> @intCast(k)) == 0) return .{};
     const s: u6 = @intCast(k);
-    const high_zero = ~(~@as(u64, 0) >> s); // the vacated high bits are known 0 (logical shift)
-    return .{ .ones = a.ones >> s, .zeros = (a.zeros >> s) | high_zero };
+    const high_zero = mask & ~(mask >> s);
+    return .{ .ones = (a.ones & mask) >> s, .zeros = ((a.zeros & mask) >> s) | high_zero };
 }
 
 /// The minimum concrete value consistent with `a` (its unknown bits taken as 0), within `mask`.
@@ -384,6 +382,21 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const result = func.instResult(inst) orelse continue;
+            // An arithmetic result with every bit known is that constant, for example `x >> 16`
+            // of an `x` below 2^16.
+            switch (func.opcode(inst)) {
+                .arith, .arith_imm => if (knownValue(bits[@backingInt(result)], func, result)) |raw| {
+                    const w = intWidth(func, result).?;
+                    const s: u6 = @intCast(64 - @as(u32, @min(w, 64)) & 63);
+                    func.opcodeMut(inst).* = .{ .iconst = if (isUnsigned(func, result) or w >= 64)
+                        raw
+                    else
+                        @as(i64, @bitCast(@as(u64, @bitCast(raw)) << s)) >> s };
+                    changed = true;
+                    continue;
+                },
+                else => {},
+            }
             // Redundant mask: `x & c` is `x` when every bit that `c` clears is already known 0 in x.
             switch (func.opcode(inst)) {
                 .arith_imm => |a| if (a.op == .bit_and) {
@@ -423,7 +436,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 fn hasRewriteCandidate(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
-            .arith_imm => |a| if (a.op == .bit_and) return true,
+            .arith => |a| if (a.op == .shl or a.op == .shr or a.op == .bit_and) return true,
+            .arith_imm => |a| if (a.op == .shl or a.op == .shr or a.op == .bit_and) return true,
             .icmp => |c| if (c.op == .eq or c.op == .ne) return true,
             .convert => return true,
             else => {},
@@ -1439,4 +1453,34 @@ test "knownbits: redundant sign/zero extend still fires after the convert transf
 
     try testing.expect(try runOnce(allocator, &func));
     try testing.expectEqual(s, func.terminator(b).?.ret.values[0]); // round-trip recovered s, no regression
+}
+
+/// The value of `v` when every one of its bits is known.
+fn knownValue(b: Bits, func: *const Function, v: Value) ?i64 {
+    const w = intWidth(func, v) orelse return null;
+    const mask = widthMask(w);
+    if ((b.zeros | b.ones) & mask != mask) return null;
+    return @bitCast(b.ones & mask);
+}
+
+test "a logical shift that drops every possible set bit becomes zero" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try uintTy(&func, 32);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    // ((x >> 18) + 1) is at most 2^14, so shifting it right by 16 leaves nothing.
+    const eighteen = try func.appendInst(b, t, .{ .iconst = 18 });
+    const high = try func.appendInst(b, t, .{ .arith = .{ .op = .shr, .lhs = x, .rhs = eighteen } });
+    const key = try func.appendArithImm(b, t, .add, high, 1);
+    const sixteen = try func.appendInst(b, t, .{ .iconst = 16 });
+    const top = try func.appendInst(b, t, .{ .arith = .{ .op = .shr, .lhs = key, .rhs = sixteen } });
+    const mixed = try func.appendInst(b, t, .{ .arith = .{ .op = .bit_xor, .lhs = key, .rhs = top } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(mixed) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try testing.expect(try run(allocator, &func, &analyses));
+    try testing.expectEqual(ir.function.Opcode{ .iconst = 0 }, func.opcode(func.definingInst(top).?));
 }

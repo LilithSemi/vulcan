@@ -18,6 +18,7 @@ const branchfold = @import("branchfold.zig");
 const mem2reg = @import("mem2reg.zig");
 const rangecheck = @import("rangecheck.zig");
 const samewidth = @import("samewidth.zig");
+const knownbits = @import("knownbits.zig");
 const joinconst = @import("joinconst.zig");
 const ifconvert = @import("ifconvert.zig");
 const loopimm = @import("microarch/loopimm.zig");
@@ -149,6 +150,7 @@ pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Funct
         rangecheck.pass_def,
         branchfold.pass_def,
         jumpthread.single_edge_params_pass_def,
+        knownbits.pass_def,
         dce.pass_def,
     }, 8);
     var gate = try score.IRGate.init(allocator, func, m);
