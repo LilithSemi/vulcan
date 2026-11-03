@@ -484,10 +484,25 @@ fn tryThreadEdge(
     if (known == null and !isLoopHeader(doms, cfg, bi_b)) known = knownParamCompare(func, b, cond, p_args);
     const truth = known orelse return false;
 
-    const s_edge = if (truth) then_edge else else_edge;
+    var s_edge = if (truth) then_edge else else_edge;
+    // Follow blocks that only test a B param against a constant, which P's constants decide too.
+    // Every block passed this way is skipped by the threaded edge, like B itself.
+    var skipped: [8]Block = undefined;
+    var skipped_len: usize = 0;
+    while (skipped_len < skipped.len) {
+        if (func.blockArgs(s_edge).len != 0 or s_edge.target == b or s_edge.target == p) break;
+        const next = decidedTest(func, s_edge.target, b, p_args) orelse break;
+        skipped[skipped_len] = s_edge.target;
+        skipped_len += 1;
+        s_edge = next;
+    }
     const s = s_edge.target;
     if (s == b) return false; // threading to B itself would recreate the edge
     if (s == p) return false; // threading P onto itself would forge a self-loop, leave it for dup
+    for (skipped[0..skipped_len]) |t| {
+        if (t == s) return false;
+        if (try threadBreaksDominanceUse(allocator, func, doms, cfg, def_block, t, s)) return false;
+    }
 
     // REQUIRED precondition for threading P->B to S, for BOTH non-dup and future tail-dup: threading
     // must not break a DOMINANCE-USE of a B-defined value. This IR permits dominance-based cross-block
@@ -534,6 +549,8 @@ fn tryThreadEdge(
     // Non-dup safety (b): B must have no side effect, since the threaded path no longer runs B.
     if (nondup_safe and hasSideEffect(func, b)) nondup_safe = false;
 
+    // Tail duplication copies only B, so it cannot stand in for the skipped test blocks.
+    if (!nondup_safe and skipped_len != 0) return false;
     if (!nondup_safe) {
         // Non-dup is unsound here: either a successor-edge value is defined in B (so it is not
         // available on the P path) or B has a side effect the threaded path must still run. Tail
@@ -564,6 +581,33 @@ fn isLoopHeader(doms: *const dom.Dominators, cfg: *const cfg_mod.Cfg, b: u32) bo
 fn knownParamCompare(func: *const Function, b: Block, cond: Value, p_args: []const Value) ?bool {
     const cond_inst = func.definingInst(cond) orelse return null;
     if (std.mem.indexOfScalar(Inst, func.blockInsts(b), cond_inst) == null) return null;
+    return paramCompare(func, b, cond_inst, p_args);
+}
+
+/// The edge out of `block` when it holds only constants and an `if` on a compare of a parameter of
+/// `b` with a constant, and P passes a constant for that parameter.
+fn decidedTest(func: *const Function, block: Block, b: Block, p_args: []const Value) ?Jump {
+    const insts = func.blockInsts(block);
+    if (insts.len == 0) return null;
+    const cf = switch (func.opcode(insts[insts.len - 1])) {
+        .@"if" => |c| c,
+        else => return null,
+    };
+    const cond_inst = func.definingInst(cf.cond) orelse return null;
+    var holds_compare = false;
+    for (insts[0 .. insts.len - 1]) |inst| {
+        if (inst == cond_inst) {
+            holds_compare = true;
+        } else if (func.opcode(inst) != .iconst) return null;
+    }
+    if (!holds_compare) return null;
+    const truth = paramCompare(func, b, cond_inst, p_args) orelse return null;
+    return if (truth) cf.then else cf.@"else";
+}
+
+/// The outcome of the compare `cond_inst` of a parameter of `b` with a constant, when P passes a
+/// constant for that parameter.
+fn paramCompare(func: *const Function, b: Block, cond_inst: Inst, p_args: []const Value) ?bool {
     const cmp = switch (func.opcode(cond_inst)) {
         .icmp => |c| c,
         else => return null,
@@ -1661,4 +1705,47 @@ test "single-edge params: a block entered by one jump joins its predecessor" {
     try testing.expectEqual(@as(usize, 0), func.blockInsts(tail).len);
     try testing.expectEqual(@as(i64, 5), try evalFunc(&func, &.{4}));
     try testing.expectEqual(@as(i64, 10), try evalFunc(&func, &.{12}));
+}
+
+test "a constant edge threads through a chain of tests on the same param" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try i32Ty(&func);
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const left = try func.appendBlock();
+    const right = try func.appendBlock();
+    const b = try func.appendBlock();
+    const second = try func.appendBlock();
+    const zero_arm = try func.appendBlock();
+    const two_arm = try func.appendBlock();
+    const other_arm = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const five = try func.appendInst(entry, t, .{ .iconst = 5 });
+    const big = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = five } });
+    try func.appendIf(entry, big, .{ .target = left }, .{ .target = right });
+    const two = try func.appendInst(left, t, .{ .iconst = 2 });
+    try func.setJump(left, b, &.{two});
+    const zero = try func.appendInst(right, t, .{ .iconst = 0 });
+    try func.setJump(right, b, &.{zero});
+    const x = try func.appendBlockParam(b, t);
+    const k0 = try func.appendInst(b, t, .{ .iconst = 0 });
+    const is0 = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = k0 } });
+    try func.appendIf(b, is0, .{ .target = zero_arm }, .{ .target = second });
+    const k2 = try func.appendInst(second, t, .{ .iconst = 2 });
+    const is2 = try func.appendInst(second, bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = k2 } });
+    try func.appendIf(second, is2, .{ .target = two_arm }, .{ .target = other_arm });
+    const r10 = try func.appendInst(zero_arm, t, .{ .iconst = 10 });
+    func.setTerminator(zero_arm, .{ .ret = ir.function.Ret.one(r10) });
+    const r20 = try func.appendInst(two_arm, t, .{ .iconst = 20 });
+    func.setTerminator(two_arm, .{ .ret = ir.function.Ret.one(r20) });
+    const r30 = try func.appendInst(other_arm, t, .{ .iconst = 30 });
+    func.setTerminator(other_arm, .{ .ret = ir.function.Ret.one(r30) });
+
+    try std.testing.expect(try runOnce(allocator, &func));
+    try std.testing.expectEqual(two_arm, func.terminator(left).?.jump.target);
+    try verifyClean(allocator, &func);
+    try std.testing.expectEqual(@as(i64, 20), try evalFunc(&func, &.{7}));
+    try std.testing.expectEqual(@as(i64, 10), try evalFunc(&func, &.{1}));
 }
