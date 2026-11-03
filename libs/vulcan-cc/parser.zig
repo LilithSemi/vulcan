@@ -1162,6 +1162,42 @@ const Parser = struct {
                     const a: i64 = @intCast(try at.alignOf(self.layout));
                     return self.node(.{ .int_lit = .{ .value = a, .ty = ctype.ulong_t } });
                 }
+                if (std.mem.eql(u8, t.text, "__builtin_offsetof") and self.peek().kind == .lparen) {
+                    self.pos += 1;
+                    const base = try self.parseTypeSpec();
+                    var ty = try self.parseAbstractDeclarator(base.ty, base.quals);
+                    _ = try self.expect(.comma);
+                    var offset: u64 = 0;
+                    var first = true;
+                    while (true) {
+                        if (first or self.peek().kind == .dot) {
+                            if (!first) self.pos += 1;
+                            first = false;
+                            const name = try self.expect(.ident);
+                            const def = switch (ty) {
+                                .@"struct" => |s| s,
+                                else => return error.UnexpectedToken,
+                            };
+                            const field = for (def.fields) |f| {
+                                if (std.mem.eql(u8, f.name, name.text)) break f;
+                            } else return error.UnexpectedToken;
+                            offset += field.offset;
+                            ty = field.ty;
+                        } else if (self.peek().kind == .lbracket) {
+                            self.pos += 1;
+                            const index = constInt(try self.parseExpr()) orelse return error.UnexpectedToken;
+                            _ = try self.expect(.rbracket);
+                            const elem = switch (ty) {
+                                .array => |a| a.elem.*,
+                                else => return error.UnexpectedToken,
+                            };
+                            offset +%= @as(u64, @bitCast(index)) *% try elem.sizeInBytes(self.layout);
+                            ty = elem;
+                        } else break;
+                    }
+                    _ = try self.expect(.rparen);
+                    return self.node(.{ .int_lit = .{ .value = @bitCast(offset), .ty = ctype.ulong_t } });
+                }
                 // An `enum` constant resolves to its `i64` value at PARSE TIME. This is
                 // checked BEFORE the call/variable-name handling below, so a registered
                 // constant name never reaches `lowerExpr` as a `.name` at all. No constant

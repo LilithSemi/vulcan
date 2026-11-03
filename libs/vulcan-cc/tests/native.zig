@@ -3136,3 +3136,6 @@ test "struct-by-value integration: small int + large by-ref/sret + float HFA + m
         &.{},
     ); // 3 + 31 + 4 + 4 = 42
 }
+test "__builtin_offsetof through nested members and an array index matches gcc" {
+    try expectAgreesBits("struct In { char c; int v[4]; }; struct Out { long a; struct In in; }; unsigned long f(void){ return __builtin_offsetof(struct Out, in.v[2]) * 100 + __builtin_offsetof(struct Out, in); }", &.{}, 64);
+}
