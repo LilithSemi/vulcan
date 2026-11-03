@@ -1848,11 +1848,12 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         return lowerDirectCall(allocator, ctx, func.opcode(inst).call, null);
     }
     const result = func.instResult(inst) orelse return unhandledStatement(func.opcode(inst));
-    // A pure gpr add or shift that no instruction reads, such as an address an indexed
+    // A pure gpr add, shift or convert that no instruction reads, such as an address an indexed
     // access replaced, emits nothing.
     if (ctx.reg_read.len != 0 and !ctx.reg_read[@backingInt(result)] and !isXmm(func, result)) switch (func.opcode(inst)) {
         .arith => |a| if (pureOp(a.op)) return,
         .arith_imm => |a| if (pureOp(a.op)) return,
+        .convert => |c| if (!isXmm(func, c.value)) return,
         else => {},
     };
     switch (func.opcode(inst)) {
@@ -3856,6 +3857,14 @@ fn sibAddress(func: *const Function, inst: ir.function.Inst) ?Sib {
     }
     if (intBits(func, sib.index) != 64) return null;
     if (!onlyAddressUses(func, ptr)) return null;
+    // A 32-bit op already cleared the upper half, so a zero extension of its result is the
+    // same register.
+    if (func.definingInst(sib.index)) |index_def| switch (func.opcode(index_def)) {
+        .convert => |c| if (zeroExtendedIn64(func, c.value)) {
+            sib.index = c.value;
+        },
+        else => {},
+    };
     // A base built as `inner + imm` for this access alone goes in the displacement instead.
     if (func.definingInst(sib.base)) |base_def| switch (func.opcode(base_def)) {
         .arith_imm => |b| if (b.op == .add and @abs(b.imm) <= 1 << 30 and countUses(func, sib.base) == 1) {
@@ -5303,6 +5312,10 @@ fn registerReads(allocator: std.mem.Allocator, func: *const Function) Error![]bo
                     operands[0] = x.lhs;
                     break :blk 1;
                 },
+                .convert => |x| {
+                    operands[0] = x.value;
+                    break :blk 1;
+                },
                 else => unreachable,
             }
         };
@@ -5326,6 +5339,7 @@ fn deadPure(func: *const Function, inst: ir.function.Inst, readers: []const u32)
     return switch (func.opcode(inst)) {
         .arith => |a| pureOp(a.op),
         .arith_imm => |a| pureOp(a.op),
+        .convert => |c| !isXmm(func, c.value),
         else => false,
     };
 }
@@ -6066,6 +6080,63 @@ test "an atomic is rejected, not dropped like a prefetch" {
 fn commutativeOp(op: ir.function.BinOp) bool {
     return switch (op) {
         .add, .mul, .bit_and, .bit_or, .bit_xor => true,
+        else => false,
+    };
+}
+
+/// Whether `v` is an unsigned 32-bit value whose register always holds it zero-extended to 64
+/// bits: the result of a 32-bit ALU op or a 32-bit load, or a block parameter fed only such
+/// values, since edge moves copy whole registers. A function argument, a convert or a select may
+/// carry stale upper bits, so they do not count.
+fn zeroExtendedIn64(func: *const Function, v: Value) bool {
+    if (!unsigned32(func, v)) return false;
+    if (func.definingInst(v)) |def| return producesZeroUpper(func, def);
+    var param_block: ?Block = null;
+    var param_index: usize = 0;
+    for (1..func.blockCount()) |bi| {
+        for (func.blockParams(@fromBackingInt(@intCast(bi))), 0..) |p, index| if (p == v) {
+            param_block = @fromBackingInt(@intCast(bi));
+            param_index = index;
+        };
+    }
+    const target = param_block orelse return false;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| if (func.opcode(inst) == .@"if") {
+            const cf = func.opcode(inst).@"if";
+            for ([_]ir.function.Jump{ cf.then, cf.@"else" }) |edge| if (edge.target == target) {
+                if (!zeroUpperArg(func, func.blockArgs(edge), param_index)) return false;
+            };
+        };
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |j| if (j.target == target) {
+                if (!zeroUpperArg(func, func.blockArgs(j), param_index)) return false;
+            },
+            .ret => {},
+        };
+    }
+    return true;
+}
+
+fn zeroUpperArg(func: *const Function, args: []const Value, index: usize) bool {
+    if (index >= args.len) return false;
+    const arg = args[index];
+    if (!unsigned32(func, arg)) return false;
+    const def = func.definingInst(arg) orelse return false;
+    return producesZeroUpper(func, def);
+}
+
+fn unsigned32(func: *const Function, v: Value) bool {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .int => |int| int.signedness == .unsigned and int.bits == 32,
+        else => false,
+    };
+}
+
+fn producesZeroUpper(func: *const Function, def: ir.function.Inst) bool {
+    return switch (func.opcode(def)) {
+        .arith, .arith_imm => true,
+        .load => |l| l.mask == null,
         else => false,
     };
 }
