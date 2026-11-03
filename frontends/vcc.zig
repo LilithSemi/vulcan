@@ -1067,7 +1067,15 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
         // An x86 model keeps expression latency: its wide out-of-order core hides an extra
         // instruction better than a longer multiply chain.
         const latency_aware = optimize.runsMicroarch() and model != null and model.?.arch == .x86_64;
-        for (mod.funcs) |*nf| _ = try opt.optimizeEarlyFor(allocator, &nf.func, latency_aware);
+        const constants = if (optimize.inlinesCalls()) libraryConstants(&mod) else null;
+        for (mod.funcs) |*nf| {
+            _ = try opt.optimizeEarlyFor(allocator, &nf.func, latency_aware);
+            // Inlining and the early pipeline expose constant library call inputs. A fold
+            // leaves loads and constants for one more early run to clean up.
+            if (constants) |c| if (try opt.libcall.run(allocator, &nf.func, c)) {
+                _ = try opt.optimizeEarlyFor(allocator, &nf.func, latency_aware);
+            };
+        }
     }
     const early_end = std.Io.Timestamp.now(io, .awake);
 
@@ -1169,6 +1177,26 @@ fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module, profile:
             _ = try opt.inlining.runSmallAcyclic(allocator, &named.func, lookup);
         }
     }
+}
+
+/// The bytes of a read-only data object in the module, for constant library calls.
+const ModuleConstants = struct {
+    fn find(context: *const anyopaque, name: []const u8) ?[]const u8 {
+        const mod: *const cc.Module = @ptrCast(@alignCast(context));
+        for (mod.data) |object| {
+            if (!std.mem.eql(u8, object.name, name)) continue;
+            if (object.kind != .rodata or object.relocs.len != 0) return null;
+            return object.bytes;
+        }
+        return null;
+    }
+};
+
+/// The constant data for C library call folding, or null when the module defines those
+/// functions itself.
+fn libraryConstants(mod: *const cc.Module) ?opt.libcall.Constants {
+    if (mod.find("strlen") != null or mod.find("memcmp") != null) return null;
+    return .{ .context = mod, .find = ModuleConstants.find };
 }
 
 fn inlineHotLoopCalls(allocator: std.mem.Allocator, mod: *cc.Module) !void {
@@ -2184,6 +2212,33 @@ test "translation-unit inlining takes a loop callee whose only write is outside 
     for (0..main_func.blockCount()) |bi| {
         for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             try std.testing.expect(main_func.opcode(inst) != .call);
+        }
+    }
+}
+
+test "a loop callee called with a string literal is inlined, and its library calls fold" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\unsigned long strlen(const char *s);
+        \\int memcmp(const void *a, const void *b, unsigned long n);
+        \\unsigned long count(const char *text, unsigned long length, const char *word) {
+        \\  unsigned long n = strlen(word), found = 0;
+        \\  for (unsigned long i = 0; i + n <= length; ++i)
+        \\    if (memcmp(text + i, word, n) == 0) ++found;
+        \\  return found;
+        \\}
+        \\unsigned long run(const char *text, unsigned long length) { return count(text, length, "value"); }
+    );
+    defer mod.deinit(allocator);
+    const run_func = mod.find("run") orelse return error.TestUnexpectedResult;
+
+    try inlineTranslationUnit(allocator, &mod, null);
+    for (mod.funcs) |*named| _ = try opt.optimizeEarly(allocator, &named.func);
+    const constants = libraryConstants(&mod) orelse return error.TestUnexpectedResult;
+    _ = try opt.libcall.run(allocator, @constCast(run_func), constants);
+    for (0..run_func.blockCount()) |bi| {
+        for (run_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            try std.testing.expect(run_func.opcode(inst) != .call);
         }
     }
 }

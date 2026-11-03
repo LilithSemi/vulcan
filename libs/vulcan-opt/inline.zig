@@ -155,6 +155,14 @@ fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, fi
                 try inlineCall(allocator, caller, @intCast(bi), idx, inst, callee); // single-block fast path
                 return true;
             }
+            if (instruction_limit != null and callsTakeSiteConstants(caller, inst, callee) and
+                inlinableMultiWithCalls(callee) and try loopsWriteNoMemory(allocator, callee))
+            {
+                // A loop callee whose calls take a constant from this site may fold them once
+                // inlined, so it gets the whole acyclic budget.
+                try inlineCallMulti(allocator, caller, @intCast(bi), idx, inst, callee);
+                return true;
+            }
             const small_loop = instruction_limit != null and withinInstructionLimit(callee, small_loop_limit) and
                 cycleInlineSafe(callee) and try loopsWriteNoMemory(allocator, callee);
             if (inlinableMulti(callee) and (inline_cycles or small_loop or !try hasCfgCycle(allocator, callee))) {
@@ -247,6 +255,44 @@ fn cycleInlineSafe(callee: *const Function) bool {
         };
     }
     return true;
+}
+
+/// Like `cycleInlineSafe`, but a direct call is allowed when one of its arguments is a callee
+/// parameter that this call site passes as a constant. Inlined, such a call can fold, for
+/// example `strlen` of a string literal.
+fn callsTakeSiteConstants(caller: *const Function, site: Inst, callee: *const Function) bool {
+    const site_args = caller.valueList(caller.opcode(site).call.args);
+    const params = callee.blockParams(@fromBackingInt(0));
+    if (params.len != site_args.len) return false;
+    var calls: usize = 0;
+    for (0..callee.blockCount()) |bi| {
+        for (callee.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (callee.opcode(inst)) {
+            .atomic_rmw, .prefetch, .matmul, .barrier, .call_indirect => return false,
+            .store => |store| if (store.@"volatile") return false,
+            .load => |load| if (load.@"volatile") return false,
+            .call => |call| {
+                if (!takesSiteConstant(caller, callee.valueList(call.args), params, site_args)) return false;
+                calls += 1;
+            },
+            else => {},
+        };
+    }
+    return calls != 0;
+}
+
+fn takesSiteConstant(caller: *const Function, args: []const Value, params: []const Value, site_args: []const Value) bool {
+    for (args) |arg| for (params, site_args) |param, site_arg| {
+        if (arg == param and isConstant(caller, site_arg)) return true;
+    };
+    return false;
+}
+
+fn isConstant(func: *const Function, v: Value) bool {
+    const def = func.definingInst(v) orelse return false;
+    return switch (func.opcode(def)) {
+        .iconst, .global_addr => true,
+        else => false,
+    };
 }
 
 fn inlineCall(allocator: std.mem.Allocator, caller: *Function, bi: u32, call_idx: usize, call_inst: Inst, callee: *const Function) Error!void {
@@ -385,7 +431,16 @@ fn mapOpcode(caller: *Function, callee: *const Function, vmap: std.AutoHashMapUn
         // is never considered inlinable at all, so these three never reach here either.
         // `barrier` joins them: it has no result, so `inlinable`'s result-less check refuses
         // a callee that contains one and this arm is never reached.
-        .extract, .struct_new, .store, .prefetch, .matmul, .call, .call_indirect, .@"if", .va_start, .va_arg, .va_end, .barrier => unreachable,
+        .call => |c| blk: {
+            const args = callee.valueList(c.args);
+            var mapped_args: [max_cloned_call_args]Value = undefined;
+            for (args, mapped_args[0..args.len]) |arg, *out| out.* = m(vmap, arg);
+            var mapped = c;
+            mapped.symbol = try caller.internSymbol(callee.symbolName(c.symbol));
+            mapped.args = try caller.internValues(mapped_args[0..args.len]);
+            break :blk .{ .call = mapped };
+        },
+        .extract, .struct_new, .store, .prefetch, .matmul, .call_indirect, .@"if", .va_start, .va_arg, .va_end, .barrier => unreachable,
     };
 }
 
@@ -488,6 +543,15 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
 /// Whether `callee` can be inlined by the multi-block path. It must be a leaf with scalar parameter
 /// and result types and no aggregate ops. Each return becomes a jump to a continuation.
 fn inlinableMulti(callee: *const Function) bool {
+    return inlinableMultiPolicy(callee, false);
+}
+
+/// Like `inlinableMulti`, but a plain direct call with a scalar result is cloned too.
+fn inlinableMultiWithCalls(callee: *const Function) bool {
+    return inlinableMultiPolicy(callee, true);
+}
+
+fn inlinableMultiPolicy(callee: *const Function, allow_calls: bool) bool {
     // SM12 T3: see `inlinable`'s matching guard - never inline a variadic-defining callee.
     if (callee.is_variadic) return false;
     for (0..callee.blockCount()) |bi| {
@@ -499,7 +563,8 @@ fn inlinableMulti(callee: *const Function) bool {
             if (term == .ret and term.ret.count > 1) return false;
         }
         for (callee.blockInsts(block)) |inst| switch (callee.opcode(inst)) {
-            .call, .call_indirect => return false, // keep it leaf, no nested inlining here
+            .call => |c| if (!allow_calls or !plainCall(callee, inst, c)) return false,
+            .call_indirect => return false, // keep it leaf, no nested inlining here
             .struct_new, .extract => return false, // aggregate type remap is not handled
             .reduce, .splat => return false, // vector operand/result type remap is not handled
             .@"if" => {}, // control flow, cloned in a later pass
@@ -517,6 +582,18 @@ fn inlinableMulti(callee: *const Function) bool {
         };
     }
     return true;
+}
+
+/// The most arguments a cloned call carries.
+const max_cloned_call_args = 8;
+
+/// A direct call `mapOpcode` can clone: a fixed argument list, a scalar result, and no
+/// register-pair or memory return.
+fn plainCall(callee: *const Function, inst: Inst, call: ir.function.Call) bool {
+    if (call.is_variadic or call.sret or call.ret_dest != null or call.ret_regs != 0) return false;
+    if (callee.valueList(call.args).len > max_cloned_call_args) return false;
+    const result = callee.instResult(inst) orelse return false;
+    return scalar(callee, callee.valueType(result));
 }
 
 fn hasCfgCycle(allocator: std.mem.Allocator, func: *const Function) Error!bool {
