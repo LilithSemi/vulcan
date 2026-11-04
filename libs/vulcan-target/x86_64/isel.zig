@@ -17,7 +17,8 @@ const ir = @import("vulcan-ir");
 const encode = @import("encode.zig");
 const wimmer = @import("../wimmer.zig");
 const addrfold = @import("../addrfold.zig");
-const mm = @import("vulcan-opt").microarch;
+const vopt = @import("vulcan-opt");
+const mm = vopt.microarch;
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -3443,14 +3444,17 @@ fn splitCriticalEdgesInPlace(allocator: std.mem.Allocator, func: *Function) Erro
     try func.reorderBlocks(allocator, order);
 }
 
-/// The blocks a back edge lands on. For a header that `emitHeaderTest` repeats at the latch,
-/// that is also the header's successor inside the loop.
+/// The headers that a back edge lands on. For a header that `emitHeaderTest` repeats at the
+/// latch, that is also the header's successor inside the loop. A backward jump to a block that
+/// does not dominate the jump is not a loop and gets no padding.
 fn loopTops(allocator: std.mem.Allocator, ctx: *const Ctx) Error![]bool {
     const func = ctx.func;
     const nblocks = func.blockCount();
     const tops = try allocator.alloc(bool, nblocks);
     @memset(tops, false);
     if (ctx.caps.fetch_align <= 1) return tops;
+    var doms = try vopt.dominators.compute(allocator, func);
+    defer doms.deinit(allocator);
     for (0..nblocks) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         var succs: [3]?Block = .{ null, null, null };
@@ -3463,9 +3467,11 @@ fn loopTops(allocator: std.mem.Allocator, ctx: *const Ctx) Error![]bool {
             .ret => {},
         };
         for (succs) |maybe| {
-            const header = forwardedBlock(ctx, maybe orelse continue);
+            const target = maybe orelse continue;
+            const header = forwardedBlock(ctx, target);
             const h = @backingInt(header);
             if (h > bi) continue;
+            if (!doms.dominates(@backingInt(target), bi)) continue;
             tops[h] = true;
             const insts = func.blockInsts(header);
             if (insts.len == 0) continue;

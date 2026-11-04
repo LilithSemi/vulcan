@@ -190,6 +190,7 @@ fn bestSuccessor(
     var best_weight: u64 = 0;
     var best_rank: u32 = std.math.maxInt(u32);
     var best_loop_depth: usize = 0;
+    var best_latch = false;
     for (cfg.successors(from)) |s| {
         if (placed[s]) continue;
         if (!isPlaceable(doms, placed, s)) continue;
@@ -199,6 +200,7 @@ fn bestSuccessor(
         const rank = rpo_rank[s];
         const weight: u64 = if (profile) |p| p[s] else 0;
         const loop_depth = sharedLoopDepth(loop_info, from, s);
+        const latch = closesLoopOf(cfg, doms, s, from);
 
         const better = if (best == null)
             true
@@ -208,10 +210,12 @@ fn bestSuccessor(
         else
             // Structural mode: forward edges before back-edges, then keep a trace inside as many
             // surrounding loops as possible. This places a loop body after its header instead of
-            // the cold exit, allowing the body edge to fall through. RPO rank breaks the tie.
+            // the cold exit, allowing the body edge to fall through. Then a latch goes first, so the
+            // short path around the loop takes one branch. RPO rank breaks the tie.
             (@intFromBool(is_back) < @intFromBool(best_back) or
                 (is_back == best_back and (loop_depth > best_loop_depth or
-                    (loop_depth == best_loop_depth and rank < best_rank))));
+                    (loop_depth == best_loop_depth and (@intFromBool(latch) > @intFromBool(best_latch) or
+                        (latch == best_latch and rank < best_rank))))));
 
         if (better) {
             best = s;
@@ -219,9 +223,18 @@ fn bestSuccessor(
             best_weight = weight;
             best_rank = rank;
             best_loop_depth = loop_depth;
+            best_latch = latch;
         }
     }
     return best;
+}
+
+/// Whether `block` branches back to a loop header that dominates `from`.
+fn closesLoopOf(cfg: *const cfg_mod.Cfg, doms: *const dominators.Dominators, block: u32, from: u32) bool {
+    for (cfg.successors(block)) |h| {
+        if (doms.dominates(h, block) and doms.dominates(h, from)) return true;
+    }
+    return false;
 }
 
 fn sharedLoopDepth(loop_info: *const loops_mod.LoopInfo, from: u32, successor: u32) usize {
