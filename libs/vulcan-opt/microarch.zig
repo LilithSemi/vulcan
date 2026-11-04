@@ -174,6 +174,9 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
         .x86_64 => &.{ rangediv.pass_def, offsetcombine.pass_def, dce.pass_def },
         else => return false,
     };
+    // A pointer made from an integer constant, such as null, is that constant, so a compare with
+    // it takes an immediate.
+    const nulls = m.arch == .x86_64 and pointerConstants(func);
     // A loop that walks a pointer and a counter in step keeps only the pointer.
     const tested = m.arch == .x86_64 and try pass.runToFixpoint(allocator, func, &.{ lftr.pass_def, dce.pass_def }, 16);
     // Sharing one side of a same-width convert removes a register copy, and a constant rebuilt at
@@ -188,8 +191,35 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
     var gate = try score.IRGate.init(allocator, func, m);
     defer gate.deinit();
     const changed = try pass.run(allocator, gate.candidateFunction(), passes);
-    if (!changed) return shared or joined or tested;
-    return try gate.commit(func) or shared or joined or tested;
+    if (!changed) return shared or joined or tested or nulls;
+    return try gate.commit(func) or shared or joined or tested or nulls;
+}
+
+fn pointerConstants(func: *ir.function.Function) bool {
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const cv = switch (func.opcode(inst)) {
+                .convert => |c| c,
+                else => continue,
+            };
+            const result = func.instResult(inst) orelse continue;
+            if (func.types.type_kind(func.valueType(result)) != .ptr) continue;
+            const src = func.definingInst(cv.value) orelse continue;
+            const value = switch (func.opcode(src)) {
+                .iconst => |c| c,
+                else => continue,
+            };
+            const int = switch (func.types.type_kind(func.valueType(cv.value))) {
+                .int => |i| i,
+                else => continue,
+            };
+            if (value != 0 and int.bits < 64) continue;
+            func.opcodeMut(inst).* = .{ .iconst = value };
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 test {
