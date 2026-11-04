@@ -179,7 +179,9 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
         try pass.runToFixpoint(allocator, func, &.{ samewidth.pass_def, constedge.pass_def, dce.pass_def }, 4)
     else
         false;
+    // Each copy of a join has one predecessor, so its params fold to the values passed in.
     const joined = m.arch == .x86_64 and try pass.run(allocator, func, &.{jointail.pass_def});
+    if (joined) _ = try pass.runToFixpoint(allocator, func, &.{ jumpthread.single_edge_params_pass_def, constfold.pass_def, simplify.pass_def, immform.pass_def, dce.pass_def }, 4);
     var gate = try score.IRGate.init(allocator, func, m);
     defer gate.deinit();
     const changed = try pass.run(allocator, gate.candidateFunction(), passes);
