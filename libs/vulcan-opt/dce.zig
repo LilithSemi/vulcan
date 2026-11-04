@@ -34,93 +34,95 @@ fn isPure(op: ir.function.Opcode) bool {
 /// Count uses of each value across live instructions, `if` edges, and terminators.
 pub fn countUses(func: *const Function, uses: []u32) void {
     @memset(uses, 0);
-    for (0..func.blockCount()) |bi| {
-        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
-        for (func.blockInsts(block)) |inst| {
-            switch (func.opcode(inst)) {
-                .atomic_rmw => |a| {
-                    uses[@backingInt(a.ptr)] += 1;
-                    uses[@backingInt(a.value)] += 1;
-                    if (a.compare) |c| uses[@backingInt(c)] += 1;
-                },
-                // A barrier uses no Value, so it adds no use count.
-                .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
-                .arith => |a| {
-                    uses[@backingInt(a.lhs)] += 1;
-                    uses[@backingInt(a.rhs)] += 1;
-                },
-                .arith_imm => |a| uses[@backingInt(a.lhs)] += 1,
-                .icmp => |c| {
-                    uses[@backingInt(c.lhs)] += 1;
-                    uses[@backingInt(c.rhs)] += 1;
-                },
-                .select => |s| {
-                    uses[@backingInt(s.cond)] += 1;
-                    uses[@backingInt(s.then)] += 1;
-                    uses[@backingInt(s.@"else")] += 1;
-                },
-                .extract => |e| uses[@backingInt(e.aggregate)] += 1,
-                .convert => |cv| uses[@backingInt(cv.value)] += 1,
-                .decode_low_float, .encode_low_float => |cv| uses[@backingInt(cv.value)] += 1,
-                .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
-                    uses[@backingInt(cv.value)] += 1;
-                    uses[@backingInt(cv.block_scale)] += 1;
-                    uses[@backingInt(cv.global_scale)] += 1;
-                },
-                .unary => |u| uses[@backingInt(u.value)] += 1,
-                .load => |l| {
-                    uses[@backingInt(l.ptr)] += 1;
-                    if (l.mask) |m| uses[@backingInt(m)] += 1;
-                },
-                .store => |st| {
-                    uses[@backingInt(st.value)] += 1;
-                    uses[@backingInt(st.ptr)] += 1;
-                    if (st.mask) |m| uses[@backingInt(m)] += 1;
-                },
-                .prefetch => |pf| uses[@backingInt(pf.ptr)] += 1,
-                .va_start => |vs| uses[@backingInt(vs.list)] += 1,
-                .va_arg => |va| uses[@backingInt(va.list)] += 1,
-                .va_end => |ve| uses[@backingInt(ve.list)] += 1,
-                .dot => |d| {
-                    uses[@backingInt(d.acc)] += 1;
-                    uses[@backingInt(d.a)] += 1;
-                    uses[@backingInt(d.b)] += 1;
-                },
-                .reduce => |red| uses[@backingInt(red.vector)] += 1,
-                .splat => |sp| uses[@backingInt(sp.scalar)] += 1,
-                .matmul => |mm| {
-                    uses[@backingInt(mm.a)] += 1;
-                    uses[@backingInt(mm.b)] += 1;
-                    uses[@backingInt(mm.c)] += 1;
-                },
-                .struct_new => |sn| for (func.valueList(sn.fields)) |f| {
-                    uses[@backingInt(f)] += 1;
-                },
-                .call => |c| {
-                    for (func.valueList(c.args)) |arg| uses[@backingInt(arg)] += 1;
-                    if (c.ret_dest) |rd| uses[@backingInt(rd)] += 1; // SM14 M4d-c T1: dest kept alive for the post-call store
-                },
-                .call_indirect => |c| {
-                    uses[@backingInt(c.target)] += 1;
-                    for (func.valueList(c.args)) |arg| uses[@backingInt(arg)] += 1;
-                    if (c.ret_dest) |rd| uses[@backingInt(rd)] += 1; // SM14 M4d-c T1: dest kept alive for the post-call store
-                },
-                .@"if" => |cf| {
-                    uses[@backingInt(cf.cond)] += 1;
-                    for (func.blockArgs(cf.then)) |arg| uses[@backingInt(arg)] += 1;
-                    for (func.blockArgs(cf.@"else")) |arg| uses[@backingInt(arg)] += 1;
-                },
-            }
+    for (0..func.blockCount()) |bi| countBlockUses(func, @fromBackingInt(@intCast(bi)), uses);
+}
+
+/// Add the uses in `block` to `uses`.
+pub fn countBlockUses(func: *const Function, block: ir.function.Block, uses: []u32) void {
+    for (func.blockInsts(block)) |inst| {
+        switch (func.opcode(inst)) {
+            .atomic_rmw => |a| {
+                uses[@backingInt(a.ptr)] += 1;
+                uses[@backingInt(a.value)] += 1;
+                if (a.compare) |c| uses[@backingInt(c)] += 1;
+            },
+            // A barrier uses no Value, so it adds no use count.
+            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
+            .arith => |a| {
+                uses[@backingInt(a.lhs)] += 1;
+                uses[@backingInt(a.rhs)] += 1;
+            },
+            .arith_imm => |a| uses[@backingInt(a.lhs)] += 1,
+            .icmp => |c| {
+                uses[@backingInt(c.lhs)] += 1;
+                uses[@backingInt(c.rhs)] += 1;
+            },
+            .select => |s| {
+                uses[@backingInt(s.cond)] += 1;
+                uses[@backingInt(s.then)] += 1;
+                uses[@backingInt(s.@"else")] += 1;
+            },
+            .extract => |e| uses[@backingInt(e.aggregate)] += 1,
+            .convert => |cv| uses[@backingInt(cv.value)] += 1,
+            .decode_low_float, .encode_low_float => |cv| uses[@backingInt(cv.value)] += 1,
+            .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
+                uses[@backingInt(cv.value)] += 1;
+                uses[@backingInt(cv.block_scale)] += 1;
+                uses[@backingInt(cv.global_scale)] += 1;
+            },
+            .unary => |u| uses[@backingInt(u.value)] += 1,
+            .load => |l| {
+                uses[@backingInt(l.ptr)] += 1;
+                if (l.mask) |m| uses[@backingInt(m)] += 1;
+            },
+            .store => |st| {
+                uses[@backingInt(st.value)] += 1;
+                uses[@backingInt(st.ptr)] += 1;
+                if (st.mask) |m| uses[@backingInt(m)] += 1;
+            },
+            .prefetch => |pf| uses[@backingInt(pf.ptr)] += 1,
+            .va_start => |vs| uses[@backingInt(vs.list)] += 1,
+            .va_arg => |va| uses[@backingInt(va.list)] += 1,
+            .va_end => |ve| uses[@backingInt(ve.list)] += 1,
+            .dot => |d| {
+                uses[@backingInt(d.acc)] += 1;
+                uses[@backingInt(d.a)] += 1;
+                uses[@backingInt(d.b)] += 1;
+            },
+            .reduce => |red| uses[@backingInt(red.vector)] += 1,
+            .splat => |sp| uses[@backingInt(sp.scalar)] += 1,
+            .matmul => |mm| {
+                uses[@backingInt(mm.a)] += 1;
+                uses[@backingInt(mm.b)] += 1;
+                uses[@backingInt(mm.c)] += 1;
+            },
+            .struct_new => |sn| for (func.valueList(sn.fields)) |f| {
+                uses[@backingInt(f)] += 1;
+            },
+            .call => |c| {
+                for (func.valueList(c.args)) |arg| uses[@backingInt(arg)] += 1;
+                if (c.ret_dest) |rd| uses[@backingInt(rd)] += 1; // SM14 M4d-c T1: dest kept alive for the post-call store
+            },
+            .call_indirect => |c| {
+                uses[@backingInt(c.target)] += 1;
+                for (func.valueList(c.args)) |arg| uses[@backingInt(arg)] += 1;
+                if (c.ret_dest) |rd| uses[@backingInt(rd)] += 1; // SM14 M4d-c T1: dest kept alive for the post-call store
+            },
+            .@"if" => |cf| {
+                uses[@backingInt(cf.cond)] += 1;
+                for (func.blockArgs(cf.then)) |arg| uses[@backingInt(arg)] += 1;
+                for (func.blockArgs(cf.@"else")) |arg| uses[@backingInt(arg)] += 1;
+            },
         }
-        if (func.terminator(block)) |term| switch (term) {
-            .ret => |r| for (r.slice()) |vv| {
-                uses[@backingInt(vv)] += 1;
-            },
-            .jump => |j| for (func.blockArgs(j)) |arg| {
-                uses[@backingInt(arg)] += 1;
-            },
-        };
     }
+    if (func.terminator(block)) |term| switch (term) {
+        .ret => |r| for (r.slice()) |vv| {
+            uses[@backingInt(vv)] += 1;
+        },
+        .jump => |j| for (func.blockArgs(j)) |arg| {
+            uses[@backingInt(arg)] += 1;
+        },
+    };
 }
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {

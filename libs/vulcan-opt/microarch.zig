@@ -20,6 +20,7 @@ const rangecheck = @import("rangecheck.zig");
 const bitset = @import("bitset.zig");
 const samewidth = @import("samewidth.zig");
 const constedge = @import("constedge.zig");
+const jointail = @import("jointail.zig");
 const knownbits = @import("knownbits.zig");
 const joinconst = @import("joinconst.zig");
 const ifconvert = @import("ifconvert.zig");
@@ -178,11 +179,12 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
         try pass.runToFixpoint(allocator, func, &.{ samewidth.pass_def, constedge.pass_def, dce.pass_def }, 4)
     else
         false;
+    const joined = m.arch == .x86_64 and try pass.run(allocator, func, &.{jointail.pass_def});
     var gate = try score.IRGate.init(allocator, func, m);
     defer gate.deinit();
     const changed = try pass.run(allocator, gate.candidateFunction(), passes);
-    if (!changed) return shared;
-    return try gate.commit(func) or shared;
+    if (!changed) return shared or joined;
+    return try gate.commit(func) or shared or joined;
 }
 
 test {
