@@ -21,6 +21,7 @@ const bitset = @import("bitset.zig");
 const samewidth = @import("samewidth.zig");
 const constedge = @import("constedge.zig");
 const jointail = @import("jointail.zig");
+const lftr = @import("lftr.zig");
 const knownbits = @import("knownbits.zig");
 const joinconst = @import("joinconst.zig");
 const ifconvert = @import("ifconvert.zig");
@@ -173,6 +174,8 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
         .x86_64 => &.{ rangediv.pass_def, offsetcombine.pass_def, dce.pass_def },
         else => return false,
     };
+    // A loop that walks a pointer and a counter in step keeps only the pointer.
+    const tested = m.arch == .x86_64 and try pass.runToFixpoint(allocator, func, &.{ lftr.pass_def, dce.pass_def }, 16);
     // Sharing one side of a same-width convert removes a register copy, and a constant rebuilt at
     // its edge frees a register. Neither adds work, so they need no score.
     const shared = if (m.arch == .x86_64)
@@ -185,8 +188,8 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
     var gate = try score.IRGate.init(allocator, func, m);
     defer gate.deinit();
     const changed = try pass.run(allocator, gate.candidateFunction(), passes);
-    if (!changed) return shared or joined;
-    return try gate.commit(func) or shared or joined;
+    if (!changed) return shared or joined or tested;
+    return try gate.commit(func) or shared or joined or tested;
 }
 
 test {
