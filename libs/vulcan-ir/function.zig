@@ -1878,7 +1878,7 @@ pub const Function = struct {
     /// unchanged. Exhaustive over every `Opcode` variant (no `else` prong) so a newly added
     /// Value-carrying field cannot silently escape the remap. It mirrors the operand walks in
     /// `replaceAllUses` and `verify.zig`'s dominance check above.
-    fn remapOpcode(self: *Function, allocator: std.mem.Allocator, op: Opcode, map: *const std.AutoHashMapUnmanaged(Value, Value)) std.mem.Allocator.Error!Opcode {
+    pub fn remapOpcode(self: *Function, allocator: std.mem.Allocator, op: Opcode, map: *const std.AutoHashMapUnmanaged(Value, Value)) std.mem.Allocator.Error!Opcode {
         return switch (op) {
             // A barrier's only field is its scope, which is not a Value, so the whole
             // opcode copies unchanged.

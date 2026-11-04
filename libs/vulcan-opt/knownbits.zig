@@ -433,6 +433,127 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     return changed;
 }
 
+/// A mask `x & k` reads only the bits of `x` that `k` keeps. An `xor` or `or` whose other side
+/// is known 0 on those bits, or an `and` that keeps them, gives the same bits without that op, and
+/// a logical right shift passes the question on to its operand. The mask then reads an older
+/// value, which shortens a chain such as the steps of an unrolled CRC.
+pub const demanded_pass_def = pass.Pass{ .name = "demandedbits", .run = runDemanded };
+
+fn runDemanded(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    if (!hasRewriteCandidate(func)) return false;
+    const bits = try analyzeInOrder(allocator, func, try analyses.reversePostorder());
+    defer allocator.free(bits);
+    var changed = false;
+    var out: std.ArrayList(Inst) = .empty;
+    defer out.deinit(allocator);
+    for (0..func.blockCount()) |bi| {
+        const block: ir.function.Block = @fromBackingInt(@intCast(bi));
+        out.clearRetainingCapacity();
+        var block_changed = false;
+        for (func.blockInsts(block)) |inst| {
+            if (maskOf(func, inst)) |m| if (intWidth(func, m.x)) |w| if (w <= 64) {
+                const keep = @as(u64, @bitCast(m.k)) & widthMask(w);
+                if (try demanded(func, bits, m.x, keep, &out, allocator, 0)) |r| {
+                    func.opcodeMut(inst).* = .{ .arith_imm = .{ .op = .bit_and, .lhs = r, .imm = m.k } };
+                    block_changed = true;
+                }
+            };
+            try out.append(allocator, inst);
+        }
+        if (!block_changed) continue;
+        const list = func.blockInstsMut(block);
+        list.clearRetainingCapacity();
+        try list.appendSlice(func.allocator, out.items);
+        changed = true;
+    }
+    if (changed) analyses.invalidate();
+    return changed;
+}
+
+/// A value equal to `v` on the bits in `keep`, built from older values, or null when there is
+/// none. New shifts go to `out`.
+fn demanded(func: *Function, bits: []const Bits, v: Value, keep: u64, out: *std.ArrayList(Inst), allocator: std.mem.Allocator, depth: u8) pass.Error!?Value {
+    if (depth == 12 or keep == 0) return null;
+    const inst = func.definingInst(v) orelse return null;
+    if (@backingInt(v) >= bits.len) return null;
+    switch (func.opcode(inst)) {
+        .arith => |a| switch (a.op) {
+            .shr => if (constValue(func, a.rhs)) |c| return shiftDemanded(func, bits, v, a.lhs, c, keep, out, allocator, depth),
+            .bit_xor, .bit_or => for ([_][2]Value{ .{ a.lhs, a.rhs }, .{ a.rhs, a.lhs } }) |pair| {
+                if (@backingInt(pair[1]) >= bits.len) continue;
+                if (bits[@backingInt(pair[1])].zeros & keep != keep) continue;
+                return try demanded(func, bits, pair[0], keep, out, allocator, depth + 1) orelse pair[0];
+            },
+            .bit_and => for ([_][2]Value{ .{ a.lhs, a.rhs }, .{ a.rhs, a.lhs } }) |pair| {
+                if (@backingInt(pair[1]) >= bits.len) continue;
+                if (bits[@backingInt(pair[1])].ones & keep != keep) continue;
+                return try demanded(func, bits, pair[0], keep, out, allocator, depth + 1) orelse pair[0];
+            },
+            else => {},
+        },
+        .arith_imm => |a| switch (a.op) {
+            .bit_xor, .bit_or => if (@as(u64, @bitCast(a.imm)) & keep == 0) {
+                return try demanded(func, bits, a.lhs, keep, out, allocator, depth + 1) orelse a.lhs;
+            },
+            .bit_and => if (@as(u64, @bitCast(a.imm)) & keep == keep) {
+                return try demanded(func, bits, a.lhs, keep, out, allocator, depth + 1) orelse a.lhs;
+            },
+            .shr => return shiftDemanded(func, bits, v, a.lhs, a.imm, keep, out, allocator, depth),
+            else => {},
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn shiftDemanded(func: *Function, bits: []const Bits, v: Value, lhs: Value, amount: i64, keep: u64, out: *std.ArrayList(Inst), allocator: std.mem.Allocator, depth: u8) pass.Error!?Value {
+    if (!isUnsigned(func, v)) return null;
+    const w = intWidth(func, v) orelse return null;
+    if (amount <= 0 or amount >= w) return null;
+    const s: u6 = @intCast(amount);
+    const inner = try demanded(func, bits, lhs, (keep << s) & widthMask(w), out, allocator, depth + 1) orelse return null;
+    // Two logical shifts of the same width become one.
+    var base = inner;
+    var total = amount;
+    if (logicalShift(func, inner)) |sh| if (sh.amount + amount < w) {
+        base = sh.x;
+        total += sh.amount;
+    };
+    const shifted = try func.createInst(func.valueType(v), .{ .arith_imm = .{ .op = .shr, .lhs = base, .imm = total } });
+    try out.append(allocator, func.definingInst(shifted).?);
+    return shifted;
+}
+
+const Operand = struct { x: Value, k: i64 };
+
+fn constValue(func: *const Function, v: Value) ?i64 {
+    const inst = func.definingInst(v) orelse return null;
+    return switch (func.opcode(inst)) {
+        .iconst => |c| c,
+        else => null,
+    };
+}
+
+/// `x & k` in either form.
+fn maskOf(func: *const Function, inst: Inst) ?Operand {
+    return switch (func.opcode(inst)) {
+        .arith_imm => |a| if (a.op == .bit_and) .{ .x = a.lhs, .k = a.imm } else null,
+        .arith => |a| if (a.op != .bit_and) null else if (constValue(func, a.rhs)) |k| .{ .x = a.lhs, .k = k } else if (constValue(func, a.lhs)) |k| .{ .x = a.rhs, .k = k } else null,
+        else => null,
+    };
+}
+
+/// `x >> amount` on an unsigned value in either form.
+fn logicalShift(func: *const Function, v: Value) ?struct { x: Value, amount: i64 } {
+    if (!isUnsigned(func, v)) return null;
+    const inst = func.definingInst(v) orelse return null;
+    return switch (func.opcode(inst)) {
+        .arith_imm => |a| if (a.op == .shr and a.imm > 0) .{ .x = a.lhs, .amount = a.imm } else null,
+        .arith => |a| if (a.op != .shr) null else if (constValue(func, a.rhs)) |c| (if (c > 0) .{ .x = a.lhs, .amount = c } else null) else null,
+        else => null,
+    };
+}
+
 fn hasRewriteCandidate(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
@@ -1483,4 +1604,34 @@ test "a logical shift that drops every possible set bit becomes zero" {
     defer analyses.deinit();
     try testing.expect(try run(allocator, &func, &analyses));
     try testing.expectEqual(ir.function.Opcode{ .iconst = 0 }, func.opcode(func.definingInst(top).?));
+}
+
+test "demandedbits: a low-bit mask reads past an xor with a high-bit mask and through shifts" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, u32_t);
+    const y = try func.appendBlockParam(entry, u32_t);
+    const half = try func.appendArithImm(entry, u32_t, .shr, x, 1);
+    const poly = try func.appendArithImm(entry, u32_t, .bit_and, y, 0xedb88320);
+    const step = try func.appendInst(entry, u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = half, .rhs = poly } });
+    const low = try func.appendArithImm(entry, u32_t, .bit_and, step, 1);
+    const next = try func.appendArithImm(entry, u32_t, .shr, step, 1);
+    const second = try func.appendArithImm(entry, u32_t, .bit_and, next, 1);
+    const sum = try func.appendInst(entry, u32_t, .{ .arith = .{ .op = .add, .lhs = low, .rhs = second } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try testing.expect(try runDemanded(allocator, &func, &analyses));
+    try testing.expectEqual(half, func.opcode(func.definingInst(low).?).arith_imm.lhs);
+    const shifted = func.opcode(func.definingInst(second).?).arith_imm.lhs;
+    const shift = func.opcode(func.definingInst(shifted).?).arith_imm;
+    try testing.expectEqual(x, shift.lhs);
+    try testing.expectEqual(@as(i64, 2), shift.imm);
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
 }

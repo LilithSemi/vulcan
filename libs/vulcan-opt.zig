@@ -12,6 +12,7 @@ pub const uniform = @import("vulcan-opt/uniform.zig");
 pub const pass = @import("vulcan-opt/pass.zig");
 pub const mem2reg = @import("vulcan-opt/mem2reg.zig");
 pub const knownbits = @import("vulcan-opt/knownbits.zig");
+pub const fullunroll = @import("vulcan-opt/fullunroll.zig");
 pub const loadfwd = @import("vulcan-opt/loadfwd.zig");
 pub const jumpthread = @import("vulcan-opt/jumpthread.zig");
 pub const constfold = @import("vulcan-opt/constfold.zig");
@@ -50,9 +51,11 @@ pub const default_pipeline = [_]pass.Pass{
     simplify.pass_def,
     egraph.pass_def,
     knownbits.pass_def,
+    knownbits.demanded_pass_def,
     strength.pass_def,
     immform.pass_def,
     branchfold.pass_def,
+    fullunroll.pass_def,
     rangecheck.pass_def,
     bitset.pass_def,
     ifconvert.pass_def,
