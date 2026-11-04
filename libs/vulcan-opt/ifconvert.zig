@@ -32,6 +32,8 @@ fn runWithBudget(allocator: std.mem.Allocator, func: *Function, analyses: *pass.
         const block: Block = @fromBackingInt(@intCast(bi));
         const insts = func.blockInsts(block);
         if (insts.len == 0 or func.opcode(insts[insts.len - 1]) != .@"if") continue;
+        // A branch the source expects to go one way predicts well, so it stays a branch.
+        if (func.branchHint(insts[insts.len - 1]) != null) continue;
         if (func.terminator(block) != null) continue;
         const cf = func.opcode(insts[insts.len - 1]).@"if";
         if (cf.then.target == cf.@"else".target) continue;

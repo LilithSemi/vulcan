@@ -315,9 +315,13 @@ const L = struct {
     /// lowering. Only O(pointer-depth) of these are synthesized per `&`, so there is no
     /// growth concern.
     type_arena: std.mem.Allocator,
+    /// The value each `__builtin_expect` result is expected to be nonzero or zero, so a branch on it
+    /// carries that hint.
+    expected: std.AutoHashMapUnmanaged(Value, bool) = .empty,
 
     fn deinit(self: *L) void {
         self.env.deinit(self.allocator);
+        self.expected.deinit(self.allocator);
         self.loops.deinit(self.allocator);
         self.labels.deinit(self.allocator);
     }
@@ -1098,6 +1102,7 @@ fn lowerStmt(l: *L, stmt: parser.Stmt) Error!bool {
             const else_b = try l.func.appendBlock();
             const merge_b = try l.func.appendBlock();
             try l.func.appendIf(l.block, cond_b, .{ .target = then_b }, .{ .target = if (has_else) else_b else merge_b });
+            try hintBranch(l, l.block, cond_b);
 
             l.block = then_b;
             const then_term = try lowerBlock(l, iff.then);
@@ -1129,6 +1134,7 @@ fn lowerStmt(l: *L, stmt: parser.Stmt) Error!bool {
             l.block = header_b;
             const cond_b = try truthy(l, try lowerExpr(l, w.cond));
             try l.func.appendIf(l.block, cond_b, .{ .target = body_b }, .{ .target = exit_b });
+            try hintBranch(l, l.block, cond_b);
 
             try l.loops.append(l.allocator, .{ .brk = exit_b, .cont = header_b });
             l.block = body_b;
@@ -1154,6 +1160,7 @@ fn lowerStmt(l: *L, stmt: parser.Stmt) Error!bool {
             if (ff.cond) |c| {
                 const cond_b = try truthy(l, try lowerExpr(l, c));
                 try l.func.appendIf(l.block, cond_b, .{ .target = body_b }, .{ .target = exit_b });
+                try hintBranch(l, l.block, cond_b);
             } else {
                 try l.func.setJump(header_b, body_b, &.{}); // no cond = infinite (needs break)
             }
@@ -1199,6 +1206,7 @@ fn lowerStmt(l: *L, stmt: parser.Stmt) Error!bool {
             l.block = cond_b;
             const cb = try truthy(l, try lowerExpr(l, d.cond));
             try l.func.appendIf(l.block, cb, .{ .target = body_b }, .{ .target = exit_b });
+            try hintBranch(l, l.block, cb);
 
             l.block = exit_b;
             return false;
@@ -2432,6 +2440,15 @@ fn lowerExpr(l: *L, expr: *const parser.Expr) Error!TypedValue {
                 // `rev` instruction. VCC has no byteswap IR op, so it emits the equivalent
                 // shift/mask/or sequence, which every backend already supports. Glibc's
                 // `<bits/byteswap.h>` inline helpers use these.
+                // `__builtin_expect(x, c)` is `x`, with a hint that it equals `c`. A branch on it
+                // carries the hint so layout keeps the expected side in line.
+                if (std.mem.eql(u8, c.callee.name, "__builtin_expect")) {
+                    if (c.args.len != 2) break :blk error.Unsupported;
+                    const x = try l.convertTo(try lowerExpr(l, c.args[0]), ctype.long_t);
+                    const want = try lowerExpr(l, c.args[1]);
+                    if (constValue(l.func, want.value)) |k| try l.expected.put(l.allocator, x, k != 0);
+                    break :blk .{ .value = x, .ty = ctype.long_t };
+                }
                 if (bswapBytes(c.callee.name)) |bytes| {
                     if (c.args.len != 1) break :blk error.Unsupported;
                     const wide = bytes == 8;
@@ -2643,6 +2660,7 @@ fn lowerExpr(l: *L, expr: *const parser.Expr) Error!TypedValue {
             const rhs_b = try f.appendBlock();
             const merge_b = try f.appendBlock();
             try f.appendIf(l.block, lc, .{ .target = rhs_b }, .{ .target = merge_b });
+            try hintBranch(l, l.block, lc);
             l.block = rhs_b;
             const rc = try truthy(l, try lowerExpr(l, b.rhs));
             const ri = try f.appendInst(l.block, l.i32t, .{ .convert = .{ .value = rc } });
@@ -2659,6 +2677,7 @@ fn lowerExpr(l: *L, expr: *const parser.Expr) Error!TypedValue {
             const rhs_b = try f.appendBlock();
             const merge_b = try f.appendBlock();
             try f.appendIf(l.block, lc, .{ .target = merge_b }, .{ .target = rhs_b }); // lhs true -> merge(1); false -> eval rhs
+            try hintBranch(l, l.block, lc);
             l.block = rhs_b;
             const rc = try truthy(l, try lowerExpr(l, b.rhs));
             const ri = try f.appendInst(l.block, l.i32t, .{ .convert = .{ .value = rc } });
@@ -2682,6 +2701,7 @@ fn lowerExpr(l: *L, expr: *const parser.Expr) Error!TypedValue {
             const else_b = try f.appendBlock();
             const merge_b = try f.appendBlock();
             try f.appendIf(l.block, cc, .{ .target = then_b }, .{ .target = else_b });
+            try hintBranch(l, l.block, cc);
 
             l.block = then_b;
             const tv = try lowerExpr(l, t.then);
@@ -3363,4 +3383,45 @@ fn irCmpOp(op: parser.CmpOp) ir.function.CmpOp {
         .gt => .gt,
         .ge => .ge,
     };
+}
+
+/// The constant `v` holds, through widening and narrowing converts.
+fn constValue(func: *const Function, v: Value) ?i64 {
+    var cur = v;
+    while (func.definingInst(cur)) |inst| switch (func.opcode(inst)) {
+        .iconst => |c| return c,
+        .convert => |c| cur = c.value,
+        else => return null,
+    };
+    return null;
+}
+
+/// Mark the `if` that ends `block` with the hint its condition carries.
+fn hintBranch(l: *L, block: Block, cond: Value) Error!void {
+    const then_likely = expectedOf(l, cond) orelse return;
+    const insts = l.func.blockInsts(block);
+    try l.func.setBranchHint(insts[insts.len - 1], then_likely);
+}
+
+/// Whether `cond` is expected true, when it tests a `__builtin_expect` result.
+fn expectedOf(l: *L, cond: Value) ?bool {
+    var v = cond;
+    var flip = false;
+    var steps: u8 = 0;
+    while (steps < 8) : (steps += 1) {
+        if (l.expected.get(v)) |e| return e != flip;
+        const inst = l.func.definingInst(v) orelse return null;
+        switch (l.func.opcode(inst)) {
+            .convert => |c| v = c.value,
+            // `x != 0` keeps the sense and `x == 0` turns it over.
+            .icmp => |c| {
+                if (c.op != .ne and c.op != .eq) return null;
+                if (constValue(l.func, c.rhs) != 0) return null;
+                if (c.op == .eq) flip = !flip;
+                v = c.lhs;
+            },
+            else => return null,
+        }
+    }
+    return null;
 }

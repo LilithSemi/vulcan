@@ -867,6 +867,26 @@ pub const Function = struct {
         return self.attributes.items;
     }
 
+    /// The side of the `if` at `inst` the source expects to take, true for `then`, from a
+    /// `__builtin_expect` in C. Null when there is no hint.
+    pub fn branchHint(self: *const Function, inst: Inst) ?bool {
+        var attrs = self.attributesOf(.{ .inst = inst });
+        while (attrs.next()) |attr| switch (attr) {
+            .custom => |c| if (std.mem.eql(u8, c.namespace, "branch") and std.mem.eql(u8, c.key, "likely")) switch (c.value) {
+                .int => |side| return side != 0,
+                else => {},
+            },
+            else => {},
+        };
+        return null;
+    }
+
+    /// Record that the `if` at `inst` is expected to take its `then` side, or its `else` side.
+    pub fn setBranchHint(self: *Function, inst: Inst, then_likely: bool) std.mem.Allocator.Error!void {
+        if (self.branchHint(inst) != null) return;
+        try self.addAttr(.{ .inst = inst }, .{ .custom = .{ .namespace = "branch", .key = "likely", .value = .{ .int = @intFromBool(then_likely) } } });
+    }
+
     /// Move every attribute from one live IR entity to another. Attribute payload ownership does
     /// not change. This is for replacement passes which remove the old entity instead of cloning it.
     pub fn retargetAttrs(self: *Function, from: AttrTarget, to: AttrTarget) void {

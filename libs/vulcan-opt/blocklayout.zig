@@ -64,7 +64,9 @@ pub fn layout(allocator: std.mem.Allocator, func: *Function, profile: ?[]const u
     @memset(rpo_rank, rpo_sentinel);
     for (rpo, 0..) |b, i| rpo_rank[b] = @intCast(i);
 
-    const order = try greedyTrace(allocator, &cfg, &doms, &loop_info, rpo, rpo_rank, profile);
+    const cold = try coldBlocks(allocator, func, &cfg, &doms, rpo, profile);
+    defer allocator.free(cold);
+    const order = try greedyTrace(allocator, &cfg, &doms, &loop_info, rpo, rpo_rank, profile, cold);
     defer allocator.free(order);
 
     // IDENTITY: when the computed order is already the current order the pass is a byte-identical
@@ -102,6 +104,7 @@ fn greedyTrace(
     rpo: []const u32,
     rpo_rank: []const u32,
     profile: ?[]const u64,
+    cold: []const bool,
 ) std.mem.Allocator.Error![]u32 {
     const n = cfg.blockCount();
     std.debug.assert(n >= 2);
@@ -131,7 +134,11 @@ fn greedyTrace(
         std.debug.assert(guard < n); // progress guarantee: bounded by the block count
 
         // Try to extend the current trace: pick the best unplaced, placeable successor of `last`.
-        const extend = bestSuccessor(cfg, doms, loop_info, rpo_rank, placed, profile, last);
+        // A hot trace does not run on into cold code, which goes after every hot block.
+        const extend = if (bestSuccessor(cfg, doms, loop_info, rpo_rank, placed, profile, last, cold)) |s|
+            (if (cold[s] and !cold[last]) null else s)
+        else
+            null;
         if (extend) |s| {
             placed[s] = true;
             try order.append(allocator, s);
@@ -144,12 +151,15 @@ fn greedyTrace(
         // block's idom chain toward the entry reaches a placed ancestor, and the lowest unplaced block
         // on that chain has a placed idom.
         var seed: ?u32 = null;
-        for (rpo) |b| {
-            if (placed[b]) continue;
-            if (isPlaceable(doms, placed, b)) {
-                seed = b;
-                break;
+        for ([_]bool{ false, true }) |want_cold| {
+            for (rpo) |b| {
+                if (placed[b] or cold[b] != want_cold) continue;
+                if (isPlaceable(doms, placed, b)) {
+                    seed = b;
+                    break;
+                }
             }
+            if (seed != null) break;
         }
         const s = seed orelse break; // safety: should never happen, keep whatever is placed
         placed[s] = true;
@@ -167,6 +177,56 @@ fn greedyTrace(
 
 /// Whether block `b` is placeable: its immediate dominator is already placed. The entry dominates
 /// itself, so it is only ever placed explicitly at the start.
+/// The blocks only an unlikely edge reaches: the side a hinted `if` does not expect, and every
+/// block whose incoming edges all come from such blocks. With a profile, nothing is cold here.
+fn coldBlocks(allocator: std.mem.Allocator, func: *const Function, cfg: *const cfg_mod.Cfg, doms: *const dominators.Dominators, rpo: []const u32, profile: ?[]const u64) std.mem.Allocator.Error![]bool {
+    const n = cfg.blockCount();
+    const cold = try allocator.alloc(bool, n);
+    @memset(cold, false);
+    if (profile != null) return cold;
+    // The block each hinted `if` does not expect to reach, per block.
+    const unlikely = try allocator.alloc(?u32, n);
+    defer allocator.free(unlikely);
+    @memset(unlikely, null);
+    var any = false;
+    for (0..n) |b| {
+        const insts = func.blockInsts(@fromBackingInt(@intCast(b)));
+        if (insts.len == 0) continue;
+        const inst = insts[insts.len - 1];
+        const cf = switch (func.opcode(inst)) {
+            .@"if" => |c| c,
+            else => continue,
+        };
+        const then_likely = func.branchHint(inst) orelse continue;
+        if (cf.then.target == cf.@"else".target) continue;
+        unlikely[b] = @backingInt(if (then_likely) cf.@"else".target else cf.then.target);
+        any = true;
+    }
+    if (!any) return cold;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (rpo) |b| {
+            if (b == 0 or cold[b]) continue;
+            var all = true;
+            var count: usize = 0;
+            for (cfg.predecessors(b)) |p| {
+                if (!doms.isReachable(p)) continue;
+                count += 1;
+                if (!cold[p] and unlikely[p] != b) {
+                    all = false;
+                    break;
+                }
+            }
+            if (all and count != 0) {
+                cold[b] = true;
+                changed = true;
+            }
+        }
+    }
+    return cold;
+}
+
 fn isPlaceable(doms: *const dominators.Dominators, placed: []const bool, b: u32) bool {
     if (!doms.isReachable(b)) return false;
     return placed[doms.immediateDominator(b)];
@@ -184,12 +244,14 @@ fn bestSuccessor(
     placed: []const bool,
     profile: ?[]const u64,
     from: u32,
+    cold: []const bool,
 ) ?u32 {
     var best: ?u32 = null;
     var best_back: bool = true; // a back-edge candidate is worse than a forward one
     var best_weight: u64 = 0;
     var best_rank: u32 = std.math.maxInt(u32);
     var best_loop_depth: usize = 0;
+    var best_cold = true;
     var best_latch = false;
     for (cfg.successors(from)) |s| {
         if (placed[s]) continue;
@@ -208,14 +270,15 @@ fn bestSuccessor(
             // Profile mode: highest execution count first, RPO rank as the tie-break.
             (weight > best_weight or (weight == best_weight and rank < best_rank))
         else
-            // Structural mode: forward edges before back-edges, then keep a trace inside as many
-            // surrounding loops as possible. This places a loop body after its header instead of
-            // the cold exit, allowing the body edge to fall through. Then a latch goes first, so the
-            // short path around the loop takes one branch. RPO rank breaks the tie.
-            (@intFromBool(is_back) < @intFromBool(best_back) or
-                (is_back == best_back and (loop_depth > best_loop_depth or
-                    (loop_depth == best_loop_depth and (@intFromBool(latch) > @intFromBool(best_latch) or
-                        (latch == best_latch and rank < best_rank))))));
+            // Structural mode: hot before cold, forward edges before back-edges, then keep a trace
+            // inside as many surrounding loops as possible. This places a loop body after its
+            // header instead of the cold exit, allowing the body edge to fall through. Then a latch
+            // goes first, so the short path around the loop takes one branch. RPO rank breaks the tie.
+            (@intFromBool(cold[s]) < @intFromBool(best_cold) or (cold[s] == best_cold and
+                (@intFromBool(is_back) < @intFromBool(best_back) or
+                    (is_back == best_back and (loop_depth > best_loop_depth or
+                        (loop_depth == best_loop_depth and (@intFromBool(latch) > @intFromBool(best_latch) or
+                            (latch == best_latch and rank < best_rank))))))));
 
         if (better) {
             best = s;
@@ -224,6 +287,7 @@ fn bestSuccessor(
             best_rank = rank;
             best_loop_depth = loop_depth;
             best_latch = latch;
+            best_cold = cold[s];
         }
     }
     return best;
@@ -479,4 +543,22 @@ test "blocklayout: single-block function is a no-op" {
 
     const changed = try layout(allocator, &func, null);
     try testing.expect(!changed);
+}
+
+test "blocklayout: a hinted branch falls into its expected side and moves the other side last" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    _ = try buildDiamondMergeFirst(&func);
+    const entry_insts = func.blockInsts(@fromBackingInt(0));
+    try func.setBranchHint(entry_insts[entry_insts.len - 1], true);
+
+    try testing.expect(try layout(allocator, &func, null));
+    // Without the hint the else arm (const 2) falls through. The hint picks the then arm
+    // (const 1), and the else arm goes after the merge.
+    try testing.expectEqual(@as(i64, 1), blockConst(&func, @fromBackingInt(1)).?);
+    try testing.expectEqual(@as(i64, 2), blockConst(&func, @fromBackingInt(3)).?);
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
 }

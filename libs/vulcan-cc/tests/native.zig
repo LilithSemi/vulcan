@@ -3139,3 +3139,7 @@ test "struct-by-value integration: small int + large by-ref/sret + float HFA + m
 test "__builtin_offsetof through nested members and an array index matches gcc" {
     try expectAgreesBits("struct In { char c; int v[4]; }; struct Out { long a; struct In in; }; unsigned long f(void){ return __builtin_offsetof(struct Out, in.v[2]) * 100 + __builtin_offsetof(struct Out, in); }", &.{}, 64);
 }
+test "__builtin_expect yields its first argument in branches and values, matching gcc" {
+    try expectAgreesBits("long f(long x){ long r = 0; if (__builtin_expect(!!(x > 3), 0)) r += 100; if (!__builtin_expect(x == 7, 1)) r += 10; while (__builtin_expect(x > 0, 1)) { r += x; x -= 2; } return r + __builtin_expect(x, 5); }", &.{9}, 64);
+    try expectAgreesBits("long f(long x){ long r = 0; if (__builtin_expect(!!(x > 3), 0)) r += 100; if (!__builtin_expect(x == 7, 1)) r += 10; while (__builtin_expect(x > 0, 1)) { r += x; x -= 2; } return r + __builtin_expect(x, 5); }", &.{2}, 64);
+}
