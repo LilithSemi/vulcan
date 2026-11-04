@@ -41,12 +41,33 @@ fn boolRoundTrip(func: *const Function, lhs: Value, lc: ?i64, rhs: Value, rc: ?i
     return .none;
 }
 
-/// The boolean `v` is a widening `convert` of, or null if `v` is not a convert of a boolean.
+/// The boolean `v` is a chain of integer `convert`s of, or null. A 0 or 1 stays 0 or 1 through
+/// any integer convert.
 fn boolBehindConvert(func: *const Function, v: Value) ?Value {
-    const def = func.definingInst(v) orelse return null;
-    if (func.opcode(def) != .convert) return null;
-    const src = func.opcode(def).convert.value;
-    return if (func.types.type_kind(func.valueType(src)) == .bool) src else null;
+    var cur = v;
+    var steps: u8 = 0;
+    while (steps < 4) : (steps += 1) {
+        const def = func.definingInst(cur) orelse return null;
+        if (func.opcode(def) != .convert) return null;
+        const src = func.opcode(def).convert.value;
+        switch (func.types.type_kind(func.valueType(src))) {
+            .bool => return src,
+            .int => cur = src,
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn inverse(op: ir.function.CmpOp) ir.function.CmpOp {
+    return switch (op) {
+        .eq => .ne,
+        .ne => .eq,
+        .lt => .ge,
+        .ge => .lt,
+        .gt => .le,
+        .le => .gt,
+    };
 }
 
 fn isInt(func: *const Function, v: Value) bool {
@@ -179,10 +200,17 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                         .ne, .lt, .gt => @as(i64, 0),
                     } };
                     // `(convert-to-int b) != 0` recovers the boolean `b`.
-                    break :blk if (cmp.op == .ne)
-                        boolRoundTrip(func, lhs, consts[@backingInt(lhs)], rhs, consts[@backingInt(rhs)])
-                    else
-                        .none;
+                    if (cmp.op == .ne) break :blk boolRoundTrip(func, lhs, consts[@backingInt(lhs)], rhs, consts[@backingInt(rhs)]);
+                    // `(convert-to-int b) == 0` is the opposite compare of the one that made `b`.
+                    if (cmp.op == .eq and consts[@backingInt(rhs)] == 0) if (boolBehindConvert(func, lhs)) |b| if (func.definingInst(b)) |def| switch (func.opcode(def)) {
+                        // A float compare with a NaN is false both ways, so only an integer one turns over.
+                        .icmp => |inner| if (func.types.type_kind(func.valueType(inner.lhs)) == .int or func.types.type_kind(func.valueType(inner.lhs)) == .ptr) {
+                            func.opcodeMut(inst).* = .{ .icmp = .{ .op = inverse(inner.op), .lhs = canonical(replacements, inner.lhs), .rhs = canonical(replacements, inner.rhs) } };
+                            changed = true;
+                        },
+                        else => {},
+                    };
+                    break :blk .none;
                 },
                 // A load whose only use is a same-width integer convert loads that type itself.
                 // The bits are the same, and a later widening then extends the load directly.
@@ -416,4 +444,29 @@ test "self-comparison folds to a constant bool" {
         try testing.expect(try runOnce(allocator, &func));
         try testing.expectEqual(case.expect, func.opcode(func.definingInst(cmp).?).iconst);
     }
+}
+
+test "a double negation of a compare simplifies back to the compare" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const s = try oneParam(&func);
+    const bool_t = try func.types.intern(.bool);
+    const five = try func.appendInst(s.b, s.t, .{ .iconst = 5 });
+    const zero = try func.appendInst(s.b, s.t, .{ .iconst = 0 });
+    const gt = try func.appendInst(s.b, bool_t, .{ .icmp = .{ .op = .gt, .lhs = s.x, .rhs = five } });
+    const as_int = try func.appendInst(s.b, s.t, .{ .convert = .{ .value = gt } });
+    const not = try func.appendInst(s.b, bool_t, .{ .icmp = .{ .op = .eq, .lhs = as_int, .rhs = zero } });
+    const not_int = try func.appendInst(s.b, s.t, .{ .convert = .{ .value = not } });
+    const again = try func.appendInst(s.b, bool_t, .{ .icmp = .{ .op = .eq, .lhs = not_int, .rhs = zero } });
+    const out = try func.appendInst(s.b, s.t, .{ .convert = .{ .value = again } });
+    func.setTerminator(s.b, .{ .ret = ir.function.Ret.one(out) });
+
+    _ = try runOnce(allocator, &func);
+    _ = try runOnce(allocator, &func);
+    // `!x` became `x <= 5`, and `!!x` became `x > 5`.
+    try testing.expectEqual(ir.function.CmpOp.le, func.opcode(func.definingInst(not).?).icmp.op);
+    const final = func.opcode(func.definingInst(again).?).icmp;
+    try testing.expectEqual(ir.function.CmpOp.gt, final.op);
+    try testing.expectEqual(s.x, final.lhs);
 }
