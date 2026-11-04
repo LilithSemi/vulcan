@@ -447,6 +447,17 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     } else {
         try func.setJump(combine, plan.header, &.{cmi});
     }
+    branchLast(func, plan.preheader);
+}
+
+/// Move the `if` of `block` behind the splats that the vector body added after it, so the
+/// branch ends the block again.
+fn branchLast(func: *Function, block: Block) void {
+    const insts = func.blockInstsMut(block).items;
+    for (insts, 0..) |inst, at| if (func.opcode(inst) == .@"if") {
+        std.mem.rotate(Inst, insts[at..], 1);
+        return;
+    };
 }
 
 fn rv(vmap: *const std.AutoHashMapUnmanaged(Value, Value), v: Value) Value {
@@ -1468,6 +1479,7 @@ fn applyReduction(allocator: std.mem.Allocator, func: *Function, plan: *const Re
     rem_args[plan.induction] = cmi;
     rem_args[plan.accumulator] = sacc;
     try func.setJump(combine, plan.header, rem_args);
+    branchLast(func, plan.preheader);
 }
 
 /// Whether the V-group starting at `index` passes the exit test against `wide_bound`.
