@@ -3407,7 +3407,20 @@ fn threadedTarget(code: []const u8, block_start: []const usize, jump_at: *const 
     return t;
 }
 
-/// Split critical edges, then put each new forwarding block right after the block it leaves.
+/// Whether `from` has an edge to `to`.
+fn reaches(func: *const Function, from: Block, to: Block) bool {
+    for (func.blockInsts(from)) |inst| if (func.opcode(inst) == .@"if") {
+        const cf = func.opcode(inst).@"if";
+        if (cf.then.target == to or cf.@"else".target == to) return true;
+    };
+    if (func.terminator(from)) |term| switch (term) {
+        .jump => |j| return j.target == to,
+        .ret => {},
+    };
+    return false;
+}
+
+/// Split critical edges, then put each new forwarding block next to the block it leaves or enters.
 /// Appended at the end, a forwarding block on a loop back edge would sit outside the loop in
 /// the allocator's numbering, and the values live across the loop would be stored and
 /// reloaded on every iteration.
@@ -3429,13 +3442,34 @@ fn splitCriticalEdgesInPlace(allocator: std.mem.Allocator, func: *Function) Erro
             }
         };
     }
+    // A forward edge block goes right before its target when nothing falls into that target, so
+    // it needs no jump and the block it leaves can fall through to its other successor.
+    const before = try allocator.alloc(?u32, total - original);
+    defer allocator.free(before);
+    for (before, 0..) |*slot, k| {
+        slot.* = null;
+        const t = @backingInt(func.terminator(@fromBackingInt(@intCast(original + k))).?.jump.target);
+        if (t <= owner[k] or t >= original) continue;
+        if (!reaches(func, @fromBackingInt(@intCast(t - 1)), @fromBackingInt(@intCast(t)))) slot.* = t;
+    }
+    for (before, 0..) |slot, k| {
+        const t = slot orelse continue;
+        for (owner, 0..) |pred, j| if (pred == t - 1 and before[j] == null) {
+            const jt = @backingInt(func.terminator(@fromBackingInt(@intCast(original + j))).?.jump.target);
+            if (jt == t) before[k] = null;
+        };
+    }
     const order = try allocator.alloc(Block, total);
     defer allocator.free(order);
     var n: usize = 0;
     for (0..original) |bi| {
+        for (before, 0..) |slot, k| if (slot == @as(u32, @intCast(bi))) {
+            order[n] = @fromBackingInt(@intCast(original + k));
+            n += 1;
+        };
         order[n] = @fromBackingInt(@intCast(bi));
         n += 1;
-        for (owner, 0..) |pred, k| if (pred == bi) {
+        for (owner, 0..) |pred, k| if (pred == bi and before[k] == null) {
             order[n] = @fromBackingInt(@intCast(original + k));
             n += 1;
         };
