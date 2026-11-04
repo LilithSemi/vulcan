@@ -1228,7 +1228,7 @@ fn inlineSingleCallSites(allocator: std.mem.Allocator, mod: *cc.Module) !void {
     }
     if (lookup_state.names.count() == 0) return;
     const lookup = opt.inlining.Lookup{ .context = &lookup_state, .func = SingleSiteLookup.get };
-    for (mod.funcs) |*named| _ = try opt.inlining.run(allocator, &named.func, lookup);
+    for (mod.funcs) |*named| _ = try opt.inlining.runSingleSite(allocator, &named.func, lookup);
 }
 
 /// The bytes of a read-only data object in the module, for constant library calls.

@@ -99,10 +99,20 @@ pub fn runFiltered(allocator: std.mem.Allocator, caller: *Function, lookup: Look
 }
 
 fn runWithPolicy(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter, inline_cycles: bool, instruction_limit: ?usize) Error!bool {
+    return runWithCallPolicy(allocator, caller, lookup, filter, inline_cycles, instruction_limit, false);
+}
+
+/// Inline every callee `lookup` names, calls inside it included. For a function with one call site,
+/// which inlining moves rather than copies.
+pub fn runSingleSite(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup) Error!bool {
+    return runWithCallPolicy(allocator, caller, lookup, null, true, null, true);
+}
+
+fn runWithCallPolicy(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter, inline_cycles: bool, instruction_limit: ?usize, allow_calls: bool) Error!bool {
     var changed = false;
     var budget: usize = 256; // guard against pathological expansion
     while (budget > 0) : (budget -= 1) {
-        if (!try inlineOne(allocator, caller, lookup, filter, inline_cycles, instruction_limit)) break;
+        if (!try inlineOne(allocator, caller, lookup, filter, inline_cycles, instruction_limit, allow_calls)) break;
         changed = true;
     }
     return changed;
@@ -142,7 +152,7 @@ fn inlinable(callee: *const Function) bool {
 }
 
 /// Find and inline a single call, returning whether one was inlined.
-fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter, inline_cycles: bool, instruction_limit: ?usize) Error!bool {
+fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, filter: ?Filter, inline_cycles: bool, instruction_limit: ?usize, allow_calls: bool) Error!bool {
     for (0..caller.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
         for (caller.blockInsts(block), 0..) |inst, idx| {
@@ -165,7 +175,7 @@ fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, fi
             }
             const small_loop = instruction_limit != null and withinInstructionLimit(callee, small_loop_limit) and
                 cycleInlineSafe(callee) and try loopsWriteNoMemory(allocator, callee);
-            if (inlinableMulti(callee) and (inline_cycles or small_loop or !try hasCfgCycle(allocator, callee))) {
+            if (inlinableMultiPolicy(callee, allow_calls) and (inline_cycles or small_loop or !try hasCfgCycle(allocator, callee))) {
                 try inlineCallMulti(allocator, caller, @intCast(bi), idx, inst, callee);
                 return true;
             }
