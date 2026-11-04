@@ -61,13 +61,30 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         next += 1;
     };
 
+    // A loop that writes no memory leaves every value it was entered with in place, so its header
+    // takes what its entry edges hold and skips its back edges.
+    const entry_preds = try allocator.alloc(?[]u32, func.blockCount());
+    defer {
+        for (entry_preds) |list| if (list) |l| allocator.free(l);
+        allocator.free(entry_preds);
+    }
+    @memset(entry_preds, null);
+    for ((try analyses.loops()).loops) |*loop| {
+        if (writesMemory(func, loop)) continue;
+        var list: std.ArrayList(u32) = .empty;
+        errdefer list.deinit(allocator);
+        for (graph.predecessors(loop.header)) |p| if (reached[p] and !loop.contains(p)) try list.append(allocator, p);
+        if (entry_preds[loop.header]) |old| allocator.free(old);
+        entry_preds[loop.header] = try list.toOwnedSlice(allocator);
+    }
+
     for (order) |bi| {
         avail.clearRetainingCapacity();
         keep.clearRetainingCapacity();
         merges.clearRetainingCapacity();
         var preds: []const u32 = &.{};
         if (bi < graph.blockCount()) {
-            preds = graph.predecessors(bi);
+            preds = entry_preds[bi] orelse graph.predecessors(bi);
             const all_seen = for (preds) |p| {
                 if (p == bi or ends[p] == null) break false;
             } else preds.len != 0;
@@ -84,7 +101,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     const anywhere = for (preds[1..]) |p| {
                         if (exact(ends[p].?, func, entry.ptr, ty) == null) break false;
                     } else true;
-                    if (anywhere) try merges.append(allocator, entry);
+                    if (anywhere and entry_preds[bi] == null) try merges.append(allocator, entry);
                 }
             }
         }
@@ -285,6 +302,17 @@ fn withArg(allocator: std.mem.Allocator, func: *Function, args: []const Value, v
     @memcpy(list[0..args.len], args);
     list[args.len] = value;
     return func.internValues(list);
+}
+
+fn writesMemory(func: *const Function, loop: anytype) bool {
+    for (loop.body, 0..) |member, b| {
+        if (!member) continue;
+        for (func.blockInsts(@fromBackingInt(@intCast(b)))) |inst| switch (func.opcode(inst)) {
+            .store, .call, .call_indirect, .atomic_rmw, .matmul, .va_start, .va_arg, .va_end, .barrier => return true,
+            else => {},
+        };
+    }
+    return false;
 }
 
 fn holds(items: []const Avail, entry: Avail) bool {
@@ -983,4 +1011,36 @@ test "storing a different pointer to an unknown address drops what an address ho
 
     _ = try runOnce(allocator, &func);
     try testing.expect(func.terminator(b).?.ret.values[0] != next);
+}
+
+test "a load reaches past a loop that only reads memory, and not past one that stores" {
+    const allocator = testing.allocator;
+    for ([_]bool{ false, true }) |stores| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const t = try i32Ty(&func);
+        const bool_t = try func.types.intern(.bool);
+        const ptr_t = try func.types.ptrGlobal();
+        const entry = try func.appendBlock();
+        const header = try func.appendBlock();
+        const body = try func.appendBlock();
+        const done = try func.appendBlock();
+        const p = try func.appendBlockParam(entry, ptr_t);
+        const q = try func.appendBlockParam(entry, ptr_t);
+        const first = try func.appendInst(entry, t, .{ .load = .{ .ptr = p } });
+        try func.setJump(entry, header, &.{first});
+        const acc = try func.appendBlockParam(header, t);
+        const other = try func.appendInst(header, t, .{ .load = .{ .ptr = q } });
+        const more = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = acc, .rhs = other } });
+        try func.appendIf(header, more, .{ .target = body }, .{ .target = done });
+        const next = try func.appendArithImm(body, t, .add, acc, 1);
+        if (stores) try func.appendStore(body, next, q);
+        try func.setJump(body, header, &.{next});
+        const again = try func.appendInst(done, t, .{ .load = .{ .ptr = p } });
+        func.setTerminator(done, .{ .ret = ir.function.Ret.one(again) });
+
+        _ = try runOnce(allocator, &func);
+        const result = func.terminator(done).?.ret.values[0];
+        try testing.expectEqual(!stores, result == first);
+    }
 }
