@@ -3153,8 +3153,19 @@ const Ctx = struct {
         const wide = isWide(self.func, result);
         switch (self.func.opcode(arith_inst)) {
             .arith => |a| {
-                // The allocator omits an encodable logical immediate's register. Preserve that
-                // immediate form when the arithmetic operation is fused into this branch too.
+                // A constant the allocator treats as an immediate has no register, so it must
+                // take the same immediate form here. Preserve both add/sub and logical immediate
+                // folds when the arithmetic operation is fused into this branch.
+                if (addSubImmFold(self.func, a)) |f| {
+                    const rl = try self.loadOp(allocator, code, f.base, spill_op[0]);
+                    const add = (a.op == .add) == (f.imm >= 0);
+                    const imm: u12 = @intCast(@abs(f.imm));
+                    try code.append(allocator, if (add)
+                        (if (wide) encode.addsImm64(rd, rl, imm) else encode.addsImm(rd, rl, imm))
+                    else
+                        (if (wide) encode.subsImm64(rd, rl, imm) else encode.subsImm(rd, rl, imm)));
+                    return;
+                }
                 if (logicalImmFold(self.func, a, result)) |f| {
                     const rl = try self.loadOp(allocator, code, f.base, spill_op[0]);
                     try code.append(allocator, encode.andsImm(rd, rl, @bitCast(f.imm), wide).?);
@@ -3300,21 +3311,21 @@ const Ctx = struct {
             // move block into one direct backedge without clobbering either outcome.
             if (!common_moves and self.edgeMovesEmpty(cf.then)) if (self.speculatableEdgeMoves(cf.@"else")) |set| switch (branch) {
                 .cc => |cond| {
-                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
                     try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .cond = encode.invertCond(cond) });
                     try code.append(allocator, encode.bcc(encode.invertCond(cond), 0));
                     return;
                 },
                 .reg => |reg| if (edgeMovesPreserveReg(set, reg)) {
-                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
                     try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = false } });
                     try code.append(allocator, encode.cbz(reg, 0));
                     return;
                 },
                 .reg_eqz => |reg| if (edgeMovesPreserveReg(set, reg)) {
-                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
                     try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = true } });
                     try code.append(allocator, encode.cbnz(reg, 0));
@@ -3358,21 +3369,21 @@ const Ctx = struct {
         if (else_next) {
             if (!common_moves and self.edgeMovesEmpty(cf.@"else")) if (self.speculatableEdgeMoves(cf.then)) |set| switch (branch) {
                 .cc => |cond| {
-                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
                     try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .cond = cond });
                     try code.append(allocator, encode.bcc(cond, 0));
                     return;
                 },
                 .reg => |reg| if (edgeMovesPreserveReg(set, reg)) {
-                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
                     try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = true } });
                     try code.append(allocator, encode.cbnz(reg, 0));
                     return;
                 },
                 .reg_eqz => |reg| if (edgeMovesPreserveReg(set, reg)) {
-                    try self.emitEdgeMoves(allocator, code, set.pred, set.succ);
+                    try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
                     try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = false } });
                     try code.append(allocator, encode.cbz(reg, 0));
@@ -3577,6 +3588,16 @@ const Ctx = struct {
                 try self.dead_source_edge_moves.append(allocator, move_at);
             }
         }
+    }
+
+    /// Emit an edge's moves ahead of the branch that picks the edge. Their sources stay live on the
+    /// other edge, so no producer may write the destination in place of its source.
+    fn emitSpeculatedEdgeMoves(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), pred: Block, succ: Block) Error!void {
+        const coalescable = self.coalescable_edge_moves.items.len;
+        const dead_source = self.dead_source_edge_moves.items.len;
+        try self.emitEdgeMoves(allocator, code, pred, succ);
+        self.coalescable_edge_moves.shrinkRetainingCapacity(coalescable);
+        self.dead_source_edge_moves.shrinkRetainingCapacity(dead_source);
     }
 
     /// The precomputed move set for the edge `pred -> succ`, or null when the edge needs no shuffle.
@@ -5106,6 +5127,8 @@ fn fusesArithIntoBranch(func: *const Function, insts: []const ir.function.Inst, 
             // when it is off the shl IS materialized and this is merely conservative, and both
             // fold sites share this predicate so they still agree.
             if (if_idx >= 3 and fusesIntoNextShiftAdd(func, insts, if_idx - 3, true)) return false;
+            // A bitfield extract runs as `ubfx`, which sets no flags.
+            if (bitfieldExtractFold(func, a, arith_result) != null) return false;
             return a.op == .add or a.op == .sub or a.op == .bit_and;
         },
         .arith_imm => |a| {
