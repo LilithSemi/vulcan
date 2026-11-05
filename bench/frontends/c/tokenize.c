@@ -85,8 +85,7 @@ int main(void) {
       matches += count_matches(text, used, "value");
   }
   printf("%u %u %u %u %lu %u %zu\n", counts.kinds[0], counts.kinds[1],
-         counts.kinds[2], counts.kinds[3], counts.digits, counts.hash,
-         matches);
+         counts.kinds[2], counts.kinds[3], counts.digits, counts.hash, matches);
   return 0;
 }
 #endif

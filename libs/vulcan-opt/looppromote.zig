@@ -428,7 +428,6 @@ fn intSet(func: *const Function, v: Value, out: *IntSet, depth: u8) bool {
     return true;
 }
 
-
 fn paramPosition(func: *const Function, v: Value) ?struct { block: Block, index: u32 } {
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));

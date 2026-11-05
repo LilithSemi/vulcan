@@ -28,7 +28,8 @@ struct cache {
   uint32_t hits;
 };
 
-#define entry_of(l) ((struct entry *)((char *)(l) - offsetof(struct entry, lru)))
+#define entry_of(l)                                                            \
+  ((struct entry *)((char *)(l) - offsetof(struct entry, lru)))
 
 static void link_remove(struct link *l) {
   l->prev->next = l->next;

@@ -6,7 +6,13 @@
 
 enum { max_files = 64, buffer_size = 256, log_size = 1024 };
 enum { op_read, op_write, op_seek, op_stat, op_count };
-enum { err_badf = 9, err_acces = 13, err_fault = 14, err_inval = 22, err_nospc = 28 };
+enum {
+  err_badf = 9,
+  err_acces = 13,
+  err_fault = 14,
+  err_inval = 22,
+  err_nospc = 28
+};
 
 struct file {
   uint32_t mode;
@@ -50,8 +56,10 @@ static void log_number(uint32_t value) {
     log_put(digits[--count]);
 }
 
-/* Error reports run rarely but are large, like the kernel's pr_err and WARN_ON paths. */
-static inline long report(struct task *task, const char *what, uint32_t a, uint32_t b, int err) {
+/* Error reports run rarely but are large, like the kernel's pr_err and WARN_ON
+ * paths. */
+static inline long report(struct task *task, const char *what, uint32_t a,
+                          uint32_t b, int err) {
   task->errors++;
   for (const char *p = what; *p; ++p)
     log_put(*p);
@@ -65,9 +73,11 @@ static inline long report(struct task *task, const char *what, uint32_t a, uint3
   return -err;
 }
 
-static long do_read(struct task *task, struct file *file, uint8_t *out, uint32_t len) {
+static long do_read(struct task *task, struct file *file, uint8_t *out,
+                    uint32_t len) {
   if (unlikely(!(file->mode & 4)))
-    return report(task, "read: not readable", file->owner, file->mode, err_acces);
+    return report(task, "read: not readable", file->owner, file->mode,
+                  err_acces);
   if (unlikely(out == NULL))
     return report(task, "read: bad buffer", len, file->pos, err_fault);
   uint32_t avail = file->size - file->pos;
@@ -83,9 +93,11 @@ static long do_read(struct task *task, struct file *file, uint8_t *out, uint32_t
   return (long)(sum + len);
 }
 
-static long do_write(struct task *task, struct file *file, const uint8_t *in, uint32_t len) {
+static long do_write(struct task *task, struct file *file, const uint8_t *in,
+                     uint32_t len) {
   if (unlikely(!(file->mode & 2)))
-    return report(task, "write: not writable", file->owner, file->mode, err_acces);
+    return report(task, "write: not writable", file->owner, file->mode,
+                  err_acces);
   if (unlikely(in == NULL))
     return report(task, "write: bad buffer", len, file->pos, err_fault);
   if (unlikely(file->pos + len > buffer_size))
@@ -109,7 +121,8 @@ static long do_stat(struct file *file) {
   return (long)(file->size * 3u + file->mode + file->owner);
 }
 
-long dispatch(struct task *task, uint32_t op, uint32_t fd, uint32_t arg, uint8_t *buffer) {
+long dispatch(struct task *task, uint32_t op, uint32_t fd, uint32_t arg,
+              uint8_t *buffer) {
   task->calls++;
   if (unlikely(op >= op_count))
     return report(task, "dispatch: bad op", op, fd, err_inval);

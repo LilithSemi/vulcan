@@ -3100,7 +3100,7 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
     if (test_fold) |fold| {
         try emitTestFold(allocator, ctx, fold);
         cc = condOf(func.opcode(ctx.cur_insts[ctx.cur_idx - 1]).icmp.op, false);
-    } else     if (ctx.cur_idx >= 1 and ctx.caps.fuse_cmp_branch and fusesIntoNextIf(func, ctx.cur_insts, ctx.cur_idx - 1)) {
+    } else if (ctx.cur_idx >= 1 and ctx.caps.fuse_cmp_branch and fusesIntoNextIf(func, ctx.cur_insts, ctx.cur_idx - 1)) {
         const cmp = func.opcode(ctx.cur_insts[ctx.cur_idx - 1]).icmp;
         if (bitTest(func, cmp)) |b| {
             cc = try emitBitTest(allocator, ctx, b);
