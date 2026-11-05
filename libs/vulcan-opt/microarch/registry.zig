@@ -897,11 +897,23 @@ fn basedOn(comptime base: Model, comptime tag: Microarch) Model {
 
 const neoverse_n2 = basedOn(altra, .@"neoverse-n2");
 const zen5 = basedOn(zen4, .zen5);
+/// Zen 3 runs Zen 4's integer and AVX2 code, with no AVX-512 and a 256-entry reorder buffer.
+const zen3 = zen3: {
+    var derived = basedOn(zen4, .zen3);
+    derived.rob_size = 256;
+    derived.features.x86_64.avx512f = false;
+    derived.features.x86_64.avx512vl = false;
+    derived.features.x86_64.avx512dq = false;
+    derived.features.x86_64.avx512bw = false;
+    derived.features.x86_64.avx512vnni = false;
+    break :zen3 derived;
+};
 
 comptime {
     Model.validate(altra);
     Model.validate(neoverse_n2);
     Model.validate(zen5);
+    Model.validate(zen3);
     Model.validate(etsoc);
     Model.validate(river_n);
     Model.validate(river_mi);
@@ -924,6 +936,7 @@ pub fn modelFor(tag: Microarch) *const Model {
         .@"river-rc1.f" => &river_f,
         .@"river-rc1.ma" => &river_ma,
         .@"cascadelake-sp" => &cascadelake,
+        .zen3 => &zen3,
         .zen4 => &zen4,
         .zen5 => &zen5,
         .sm_120 => &sm_120,
@@ -1013,10 +1026,12 @@ pub fn detectHost() ?Microarch {
     return null;
 }
 
-/// Zen 4 is AMD family 19h with AVX-512, and Zen 5 is family 1Ah. Zen 3 shares family 19h but has no
-/// AVX-512.
+/// Zen 3 and Zen 4 are AMD family 19h, told apart by AVX-512, which only Zen 4 has. Zen 5 is family
+/// 1Ah with AVX-512.
 fn zenDiscriminator(amd: bool, family: u32, avx512f: bool) ?Microarch {
-    if (!amd or !avx512f) return null;
+    if (!amd) return null;
+    if (family == 0x19 and !avx512f) return .zen3;
+    if (!avx512f) return null;
     return switch (family) {
         0x19 => .zen4,
         0x1A => .zen5,
@@ -1060,7 +1075,8 @@ fn cpuid(leaf: u32) CpuidResult {
 test "zen discriminator needs AMD with AVX-512, and the family picks the part" {
     try std.testing.expectEqual(@as(?Microarch, .zen4), zenDiscriminator(true, 0x19, true));
     try std.testing.expectEqual(@as(?Microarch, .zen5), zenDiscriminator(true, 0x1A, true));
-    try std.testing.expectEqual(@as(?Microarch, null), zenDiscriminator(true, 0x19, false));
+    try std.testing.expectEqual(@as(?Microarch, .zen3), zenDiscriminator(true, 0x19, false));
+    try std.testing.expectEqual(@as(?Microarch, null), zenDiscriminator(true, 0x1A, false));
     try std.testing.expectEqual(@as(?Microarch, null), zenDiscriminator(true, 0x17, true));
     try std.testing.expectEqual(@as(?Microarch, null), zenDiscriminator(false, 0x1A, true));
 }

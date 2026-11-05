@@ -147,6 +147,7 @@ pub const Microarch = enum {
     @"river-rc1.f",
     @"river-rc1.ma",
     @"cascadelake-sp",
+    zen3,
     zen4,
     zen5,
     sm_120,
