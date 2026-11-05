@@ -22,6 +22,29 @@ const stddef = @import("stddef.zig");
 const stdarg = @import("stdarg.zig");
 const limits = @import("limits.zig");
 
+const darwin_stdio = "int printf(const char *restrict, ...);\n";
+const darwin_string =
+    "#include <stddef.h>\n" ++
+    "void *memcpy(void *restrict, const void *restrict, size_t);\n" ++
+    "void *memset(void *, int, size_t);\n" ++
+    "int memcmp(const void *, const void *, size_t);\n" ++
+    "size_t strlen(const char *);\n";
+const darwin_stdint =
+    "typedef signed char int8_t; typedef unsigned char uint8_t;\n" ++
+    "typedef short int16_t; typedef unsigned short uint16_t;\n" ++
+    "typedef int int32_t; typedef unsigned int uint32_t;\n" ++
+    "typedef long int64_t; typedef unsigned long uint64_t;\n" ++
+    "typedef long intptr_t; typedef unsigned long uintptr_t;\n";
+const darwin_inttypes = "#include <stdint.h>\n#define PRIu64 \"lu\"\n";
+
+fn resolveDarwinBuiltin(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "stdio.h")) return darwin_stdio;
+    if (std.mem.eql(u8, name, "string.h")) return darwin_string;
+    if (std.mem.eql(u8, name, "stdint.h")) return darwin_stdint;
+    if (std.mem.eql(u8, name, "inttypes.h")) return darwin_inttypes;
+    return null;
+}
+
 /// Serves this compiler's own built-in headers ahead of any disk search. See the module
 /// doc comment for the search order. Returns `null` for anything else, so a caller falls
 /// through to the disk search.
@@ -49,6 +72,9 @@ pub const FsResolver = struct {
     /// finding it can be slow (for example, a probe of the host C compiler).
     fallback: ?Fallback = null,
     fallback_dir: ?[]const u8 = null,
+    /// Use small parseable declarations for the libc headers needed by Darwin-hosted
+    /// generated programs; the declarations still link to the SDK's real libc.
+    darwin_compat: bool = false,
 
     pub const Fallback = struct {
         ctx: *anyopaque,
@@ -123,6 +149,7 @@ pub const FsResolver = struct {
         }
         if (is_system) {
             if (resolveBuiltin(name, is_system)) |b| return .{ .identity = name, .bytes = b };
+            if (self.darwin_compat) if (resolveDarwinBuiltin(name)) |b| return .{ .identity = name, .bytes = b };
         } else if (includer_dir) |dir| {
             if (try self.tryDir(dir, name)) |rf| return rf;
         }

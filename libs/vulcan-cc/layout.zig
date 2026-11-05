@@ -27,6 +27,8 @@ pub const TargetLayout = struct {
     /// `parser.zig` tests. Every real caller gets a `TargetLayout` through `host()` or
     /// `forTarget()` below, which always set this field.
     arch: Arch = .x86_64,
+    /// Apple arm64 uses a pointer-shaped va_list and signed plain char.
+    apple_abi: bool = false,
 };
 
 /// The layout that matches the build host. The host-JIT differential path uses this

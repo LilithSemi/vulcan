@@ -9,8 +9,8 @@ const samples = 7;
 /// The system this runs on, in the names Nix uses, such as `aarch64-darwin`.
 const system = @tagName(builtin.cpu.arch) ++ "-" ++ (if (builtin.os.tag == .macos) "darwin" else @tagName(builtin.os.tag));
 
-/// VCC links only ELF executables, so on any other system the generated code is not timed.
-const executes = builtin.os.tag == .linux;
+/// VCC links ELF on Linux and Mach-O through the system linker on Darwin.
+const executes = builtin.os.tag == .linux or builtin.os.tag.isDarwin();
 
 const Compiler = struct {
     name: []const u8,
@@ -264,7 +264,7 @@ fn writeGithub(writer: *std.Io.Writer, report: Report) !void {
         try writer.writeByte('.');
     }
     if (!executes) {
-        try writer.writeAll(" Generated code is not timed, since vcc cannot link executables on " ++ system ++ " yet. vcc compiles against Linux headers here, since it targets Linux.");
+        try writer.writeAll(" Generated code is not timed, since vcc cannot link executables on " ++ system ++ " yet.");
         try writer.writeAll("\n\n| compiler | compile (`-O2 -c`) | vs vcc |\n|---|---:|---:|\n");
         for (report.compilers, 0..) |compiler, index| {
             try writer.print("| {s} | ", .{compiler.name});

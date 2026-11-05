@@ -337,6 +337,15 @@ pub fn writeObjectDataForModel(allocator: std.mem.Allocator, target: link.Arch, 
     };
 }
 
+/// Emit an arm64 Mach-O object for Apple's system linker.
+pub fn writeMachObjectDataForModel(allocator: std.mem.Allocator, funcs: []const ModuleFunction, data: []const ObjData, model: ?*const mm.Model) Error![]u8 {
+    const B = @import("aarch64.zig");
+    var built = try buildBackendModule(B, allocator, funcs, data);
+    defer built.deinit(allocator);
+    built.module.model = model;
+    return B.macho.writeModule(allocator, &built.module);
+}
+
 /// `writeObjectDataWith`'s module-assembly step, factored out so a test can inspect
 /// the built module's `data.items[i].relocs` directly (see the regression test
 /// below) instead of only being able to observe it indirectly through whatever

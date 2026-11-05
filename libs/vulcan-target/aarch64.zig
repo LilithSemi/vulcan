@@ -9,6 +9,7 @@ pub const isel = @import("aarch64/isel.zig");
 pub const peephole = @import("aarch64/peephole.zig");
 pub const link = @import("aarch64/link.zig");
 pub const object = @import("aarch64/object.zig");
+pub const macho = @import("aarch64/macho.zig");
 pub const jit = @import("aarch64/jit.zig");
 
 /// Execution-test runners, one per backend (see each file). Skip when the

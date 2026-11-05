@@ -497,6 +497,7 @@ const va_list_aarch64_struct: CType = .{ .@"struct" = &va_list_aarch64_def };
 /// (`sizeInBytes`, `alignOf`, array-parameter decay) instead of a dedicated `CType`
 /// tag, so every existing exhaustive switch over `CType` needs zero new arms.
 pub fn builtinVaList(l: layout.TargetLayout) CType {
+    if (l.arch == .aarch64 and l.apple_abi) return .{ .ptr = .{ .pointee = &char_t } };
     return switch (l.arch) {
         // SysV x86-64: a 24-byte, 8-aligned struct, passed and decayed as `array[1]`,
         // matching glibc, so a bare `va_list` parameter or argument decays to a

@@ -249,7 +249,14 @@ fn roundToHalf(allocator: std.mem.Allocator, code: *std.ArrayList(u32), reg: Reg
 /// the AAPCS64 hidden result pointer. It travels in the indirect-result register
 /// `x8`, outside the x0-x7 argument pool. It consumes no ordinary argument register, so its
 /// `idx`/`class` are not read for register placement.
-const ArgLoc = struct { class: Class, idx: usize, sret_ptr: bool = false };
+const ArgLoc = struct {
+    class: Class,
+    idx: usize,
+    sret_ptr: bool = false,
+    /// Apple arm64 passes every unnamed variadic argument on the stack, even while
+    /// argument registers remain. This flag represents that independently of `idx`.
+    on_stack: bool = false,
+};
 
 /// Assign each of `values` its ABI argument location. When `sret` is true, the FIRST
 /// value is the hidden result pointer. It is marked `sret_ptr` (it rides in `x8`, not the x0-x7
@@ -271,6 +278,18 @@ fn computeArgLocs(func: *const Function, values: []const Value, out: []ArgLoc, s
             gi += 1;
         }
     }
+}
+
+fn computeCallArgLocs(func: *const Function, values: []const Value, out: []ArgLoc, sret: bool, abi: Abi, is_variadic: bool, num_fixed: u32) void {
+    computeArgLocs(func, values, out, sret);
+    if (abi != .apple or !is_variadic) return;
+    const hidden: usize = @intFromBool(sret);
+    const first_vararg = hidden + @min(@as(usize, num_fixed), values.len -| hidden);
+    for (out[first_vararg..]) |*loc| loc.on_stack = true;
+}
+
+fn argOnStack(loc: ArgLoc) bool {
+    return !loc.sret_ptr and (loc.on_stack or loc.idx >= 8);
 }
 
 /// The stack footprint (byte size and alignment) of an argument of `p`'s type under the Apple arm64
@@ -302,15 +321,18 @@ fn appleStackFootprint(func: *const Function, p: Value) struct { size: u15, alig
 /// outgoing/incoming argument area. Register arguments do not consume stack space. The arguments
 /// that overflow the independent x/v register banks nevertheless share ONE stack area, in source
 /// order; keeping separate gpr/fpr cursors makes a mixed signature alias two arguments at offset 0.
-fn computeAppleStackOffsets(func: *const Function, values: []const Value, locs: []const ArgLoc, out: []u15) usize {
+fn computeAppleStackOffsets(func: *const Function, values: []const Value, locs: []const ArgLoc, out: []u15, is_variadic: bool, num_fixed: u32, sret: bool) usize {
     std.debug.assert(values.len == locs.len and values.len == out.len);
     var run: u15 = 0;
+    const first_vararg = @as(usize, @intFromBool(sret)) + @as(usize, num_fixed);
     for (values, locs, 0..) |v, l, i| {
-        if (l.sret_ptr or l.idx < 8) continue;
+        if (!argOnStack(l)) continue;
         const fp = appleStackFootprint(func, v);
-        run = std.mem.alignForward(u15, run, fp.alignment);
+        const variadic = is_variadic and i >= first_vararg;
+        const alignment: u15 = if (variadic) @max(8, fp.alignment) else fp.alignment;
+        run = std.mem.alignForward(u15, run, alignment);
         out[i] = run;
-        run += fp.size;
+        run += if (variadic) std.mem.alignForward(u15, fp.size, 8) else fp.size;
     }
     return run;
 }
@@ -983,13 +1005,13 @@ fn maxCallArgs(func: *const Function) usize {
 /// fixed-slot calculation, Apple packs natural-width arguments and a vector/quad may consume 16
 /// bytes, so argument count alone can under-reserve the caller's outgoing area.
 fn maxAppleCallBytes(func: *const Function) usize {
-    const Call = struct { args: []const Value, sret: bool };
+    const Call = struct { args: []const Value, sret: bool, is_variadic: bool, num_fixed: u32 };
     var max: usize = 0;
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             const call: Call = switch (func.opcode(inst)) {
-                .call => |c| .{ .args = func.valueList(c.args), .sret = c.sret },
-                .call_indirect => |c| .{ .args = func.valueList(c.args), .sret = c.sret },
+                .call => |c| .{ .args = func.valueList(c.args), .sret = c.sret, .is_variadic = c.is_variadic, .num_fixed = c.num_fixed },
+                .call_indirect => |c| .{ .args = func.valueList(c.args), .sret = c.sret, .is_variadic = c.is_variadic, .num_fixed = c.num_fixed },
                 else => continue,
             };
             var gi: usize = 0;
@@ -1004,10 +1026,12 @@ fn maxAppleCallBytes(func: *const Function) usize {
                     defer gi += 1;
                     break :blk gi;
                 };
-                if (idx < 8) continue;
+                const hidden: usize = @intFromBool(call.sret);
+                const variadic = call.is_variadic and i >= hidden + call.num_fixed;
+                if (!variadic and idx < 8) continue;
                 const fp = appleStackFootprint(func, arg);
-                run = std.mem.alignForward(u15, run, fp.alignment);
-                run += fp.size;
+                run = std.mem.alignForward(u15, run, if (variadic) @max(8, fp.alignment) else fp.alignment);
+                run += if (variadic) std.mem.alignForward(u15, fp.size, 8) else fp.size;
             }
             max = @max(max, run);
         }
@@ -2132,7 +2156,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         const el = try ctx.loadOp(allocator, &code, s.@"else", scratch_imm);
                         const rd = ctx.resultReg(result);
                         if (fused_cmp == null) try code.append(allocator, encode.cmp(c, .zr));
-                        try code.append(allocator, encode.csel(rd, tr, el, cc));
+                        try code.append(allocator, if (isWide(func, result)) encode.csel64(rd, tr, el, cc) else encode.csel(rd, tr, el, cc));
                         try storeResult(allocator, &code, ctx, result, rd);
                     }
                 },
@@ -2488,7 +2512,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .call => |c| {
-                    try ctx.emitCallArgs(allocator, &code, func.valueList(c.args), c.sret);
+                    try ctx.emitCallArgs(allocator, &code, func.valueList(c.args), c.sret, c.is_variadic, c.num_fixed);
                     try relocs.append(allocator, .{ .offset = code.items.len, .symbol = func.symbolName(c.symbol) });
                     try code.append(allocator, encode.bl(0));
                     if (func.instResult(inst)) |result| {
@@ -2518,7 +2542,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // argument moves (x0..x7), then `blr`.
                     const tsrc = try ctx.loadOp(allocator, &code, c.target, spill_op[0]);
                     try code.append(allocator, encode.mov(scratch_imm, tsrc));
-                    try ctx.emitCallArgs(allocator, &code, func.valueList(c.args), c.sret);
+                    try ctx.emitCallArgs(allocator, &code, func.valueList(c.args), c.sret, c.is_variadic, c.num_fixed);
                     try code.append(allocator, encode.blr(scratch_imm));
                     if (func.instResult(inst)) |result| {
                         const rd = ctx.resultReg(result);
@@ -3738,13 +3762,13 @@ const Ctx = struct {
     /// register arguments reloaded straight into their ABI register, after the permutation has read
     /// every source. A slot-sourced argument holds its value in memory, so it is never clobbered by an
     /// earlier move and is safe to reload last.
-    fn emitCallArgs(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), args: []const Value, sret: bool) Error!void {
+    fn emitCallArgs(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), args: []const Value, sret: bool, is_variadic: bool, num_fixed: u32) Error!void {
         const locs = try allocator.alloc(ArgLoc, args.len);
         defer allocator.free(locs);
-        computeArgLocs(self.func, args, locs, sret);
+        computeCallArgLocs(self.func, args, locs, sret, self.abi, is_variadic, num_fixed);
         const apple_off = try allocator.alloc(u15, args.len);
         defer allocator.free(apple_off);
-        if (self.abi == .apple) _ = computeAppleStackOffsets(self.func, args, locs, apple_off);
+        if (self.abi == .apple) _ = computeAppleStackOffsets(self.func, args, locs, apple_off, is_variadic, num_fixed, sret);
 
         if (!self.alloc.edge_move_driven) {
             for (args, locs, 0..) |arg, loc, i| {
@@ -3758,7 +3782,7 @@ const Ctx = struct {
                 const target: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(loc.idx))));
                 if (loc.class == .fpr) {
                     const src = try self.loadOp(allocator, code, arg, fp_spill_op[0]);
-                    if (loc.idx >= 8) {
+                    if (argOnStack(loc)) {
                         if (self.abi != .apple) return error.Unsupported;
                         const off = apple_off[i];
                         if (isVector(self.func, arg) or isQuad(self.func, arg))
@@ -3773,7 +3797,7 @@ const Ctx = struct {
                     try code.append(allocator, encode.movVec(target, src));
                 } else {
                     const src = try self.loadOp(allocator, code, arg, spill_op[0]);
-                    if (loc.idx < 8) {
+                    if (!argOnStack(loc)) {
                         try code.append(allocator, encode.mov(target, src));
                     } else {
                         const off: u15 = if (self.abi == .apple) apple_off[i] else @intCast(8 * (loc.idx - 8));
@@ -3797,7 +3821,7 @@ const Ctx = struct {
                 try code.append(allocator, encode.mov(.x8, src));
                 continue;
             }
-            if (loc.idx < 8) continue;
+            if (!argOnStack(loc)) continue;
             const off: u15 = if (self.abi == .apple) apple_off[i] else @intCast(8 * (loc.idx - 8));
             if (loc.class == .fpr) {
                 if (self.abi != .apple) return error.Unsupported;
@@ -3822,7 +3846,7 @@ const Ctx = struct {
         defer fpr_moves.deinit(allocator);
         for (args, locs) |arg, loc| {
             if (loc.sret_ptr) continue; // already moved to x8 in phase 1
-            if (loc.idx >= 8) continue;
+            if (argOnStack(loc)) continue;
             const target: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(loc.idx))));
             switch (self.locationAt(arg)) {
                 .reg => |src| {
@@ -3843,7 +3867,7 @@ const Ctx = struct {
         // above has already read every source register, so overwriting one now is safe).
         for (args, locs) |arg, loc| {
             if (loc.sret_ptr) continue; // already moved to x8 in phase 1
-            if (loc.idx >= 8) continue;
+            if (argOnStack(loc)) continue;
             const target: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(loc.idx))));
             switch (self.locationAt(arg)) {
                 .slot => |slot| {
@@ -7309,7 +7333,7 @@ test "Apple ABI gives mixed overflow arguments one packed stack area" {
     var locs: [values.len]ArgLoc = undefined;
     var offsets: [values.len]u15 = undefined;
     computeArgLocs(&func, &values, &locs, false);
-    try std.testing.expectEqual(@as(usize, 16), computeAppleStackOffsets(&func, &values, &locs, &offsets));
+    try std.testing.expectEqual(@as(usize, 16), computeAppleStackOffsets(&func, &values, &locs, &offsets, false, 0, false));
     try std.testing.expectEqual(@as(u15, 0), offsets[16]);
     try std.testing.expectEqual(@as(u15, 1), offsets[17]);
     try std.testing.expectEqual(@as(u15, 8), offsets[18]);

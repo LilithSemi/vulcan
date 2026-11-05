@@ -22,6 +22,12 @@ const mm = @import("vulcan-opt").microarch;
 const opt = @import("vulcan-opt");
 const preproc = cc.preproc;
 
+const TargetOs = enum { linux, darwin };
+
+fn hostTargetOs() TargetOs {
+    return if (builtin.os.tag.isDarwin()) .darwin else .linux;
+}
+
 /// One positional input, in command-line order. It is a bare path (a `.c`/`.i` source, or
 /// an `.o`/`.a`/`.so` link input, classified by extension in `main`, see `classifyExt`), or
 /// a `-l<name>` library reference. The driver resolves a library reference against `-L`
@@ -85,6 +91,7 @@ const Options = struct {
     /// own arch, see `hostLinkArch`). Both compilation (which backend emits the `.o`) and
     /// linking (`writeExecutable`'s `arch`) use this value.
     target_arch: ?link.Arch = null,
+    target_os: ?TargetOs = null,
     emit_ir: bool = false,
     preprocess_only: bool = false,
     /// `-c`: compile to a relocatable ELF `.o` object instead of linking. See
@@ -194,13 +201,24 @@ const vcc_version = "15.0.0";
 /// The GNU-style target triple `-dumpmachine` reports: the same arch names
 /// `parseTargetArch` accepts, paired with a generic `unknown-linux-gnu` vendor, OS, and
 /// ABI suffix. VCC only targets Linux ELF hosts today.
-fn archTriple(arch: link.Arch) []const u8 {
+fn archTriple(arch: link.Arch, os: TargetOs) []const u8 {
+    if (os == .darwin) return switch (arch) {
+        .aarch64 => "arm64-apple-darwin",
+        .x86_64 => "x86_64-apple-darwin",
+        .x86, .riscv64 => "unknown-apple-darwin",
+    };
     return switch (arch) {
         .aarch64 => "aarch64-unknown-linux-gnu",
         .x86_64 => "x86_64-unknown-linux-gnu",
         .riscv64 => "riscv64-unknown-linux-gnu",
         .x86 => "i686-unknown-linux-gnu",
     };
+}
+
+fn parseTargetOs(spec: []const u8) ?TargetOs {
+    if (std.mem.indexOf(u8, spec, "darwin") != null or std.mem.indexOf(u8, spec, "apple") != null or std.mem.indexOf(u8, spec, "macos") != null) return .darwin;
+    if (std.mem.indexOf(u8, spec, "linux") != null) return .linux;
+    return null;
 }
 
 /// Classifies a positional path by its extension for the link step: `.c`/`.i` are
@@ -282,6 +300,7 @@ fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (e
             opts.target_triple = spec;
             opts.target_arch = parseTargetArch(spec) orelse
                 return fail(errw, "unknown -target architecture '{s}' (expected aarch64/x86_64/x86/riscv64, or a triple starting with one)", .{spec});
+            opts.target_os = parseTargetOs(spec);
         } else if (std.mem.eql(u8, arg, "--emit-ir")) {
             opts.emit_ir = true;
         } else if (std.mem.eql(u8, arg, "-E")) {
@@ -540,9 +559,19 @@ fn ccLayoutArch(arch: link.Arch) cc.layout.Arch {
 /// 4.6 makes gnulib emit the plain `_Static_assert` VCC now understands. It is also honest
 /// about VCC's real level: VCC already accepts `_Generic`/`_Alignof`/`_Noreturn`/`typeof`,
 /// all newer than gcc 4.2.
-fn systemPredefFor(arch: link.Arch) preproc.SystemPredef {
+fn targetLayout(arch: link.Arch, os: TargetOs) cc.layout.TargetLayout {
     const cc_arch = ccLayoutArch(arch);
-    const lay = cc.layout.forArch(cc_arch);
+    var lay = cc.layout.forArch(cc_arch);
+    if (os == .darwin and arch == .aarch64) {
+        lay.char_signed = true;
+        lay.apple_abi = true;
+    }
+    return lay;
+}
+
+fn systemPredefFor(arch: link.Arch, os: TargetOs) preproc.SystemPredef {
+    const cc_arch = ccLayoutArch(arch);
+    const lay = targetLayout(arch, os);
     return .{
         .arch = cc_arch,
         .gnuc_major = 4,
@@ -551,6 +580,7 @@ fn systemPredefFor(arch: link.Arch) preproc.SystemPredef {
         .long_bits = lay.long_bits,
         .ptr_bits = lay.ptr_bits,
         .char_signed = lay.char_signed,
+        .os = if (os == .darwin) .darwin else .linux,
     };
 }
 
@@ -630,6 +660,19 @@ fn findHostGlibcIncludeDir(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
     return shOutput(allocator, io, script);
 }
 
+fn findHostDarwinIncludeDir(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
+    const script =
+        \\for cc_ in cc clang; do
+        \\  command -v "$cc_" >/dev/null 2>&1 || continue
+        \\  for d in $(echo | LC_ALL=C "$cc_" -E -v -xc - 2>&1 | awk '/search starts here/{f=1;next} /End of search/{f=0} f{sub(/^ +/,"");print}'); do
+        \\    if [ -f "$d/stdio.h" ]; then echo "$d"; exit 0; fi
+        \\  done
+        \\done
+        \\exit 1
+    ;
+    return shOutput(allocator, io, script);
+}
+
 /// Locates a CROSS glibc dev include dir for `triple` (for example `riscv64-unknown-linux-
 /// gnu` from `archTriple`), for a `-target` that isn't the host's own arch. It skips when
 /// absent: this Nix profile may simply not have a given arch's cross glibc installed, which
@@ -660,6 +703,7 @@ const SysdirProbe = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     arch: link.Arch,
+    os: TargetOs = .linux,
     env: *const std.process.Environ.Map,
 
     fn find(ctx: *anyopaque) std.mem.Allocator.Error!?[]const u8 {
@@ -672,16 +716,16 @@ const SysdirProbe = struct {
         const cache_path = try self.cachePath(host);
         if (cache_path) |path| {
             if (std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(4096))) |dir| {
-                if (self.holds(dir, "features.h")) return dir;
+                if (self.holds(dir, if (self.os == .darwin) "stdio.h" else "features.h")) return dir;
             } else |err| switch (err) {
                 error.OutOfMemory => |e| return e,
                 else => {},
             }
         }
         const found = if (host)
-            try findHostGlibcIncludeDir(self.allocator, self.io)
+            (if (self.os == .darwin) try findHostDarwinIncludeDir(self.allocator, self.io) else try findHostGlibcIncludeDir(self.allocator, self.io))
         else
-            try findCrossGlibcIncludeDir(self.allocator, self.io, archTriple(self.arch));
+            try findCrossGlibcIncludeDir(self.allocator, self.io, archTriple(self.arch, self.os));
         if (found) |dir| if (cache_path) |path| self.store(path, dir);
         return found;
     }
@@ -696,7 +740,7 @@ const SysdirProbe = struct {
     /// Returns null when `VCC_NO_CACHE` is set, no C compiler is on PATH, or no cache dir is known.
     fn cachePath(self: *SysdirProbe, host: bool) std.mem.Allocator.Error!?[]const u8 {
         if (self.env.get("VCC_NO_CACHE")) |value| if (value.len > 0) return null;
-        const triple = archTriple(self.arch);
+        const triple = archTriple(self.arch, self.os);
         const host_names = [_][]const u8{ "cc", "gcc" };
         var cross_names: [2][]const u8 = undefined;
         cross_names[0] = try std.fmt.allocPrint(self.allocator, "{s}-gcc", .{triple});
@@ -1070,11 +1114,11 @@ fn buildModuleData(allocator: std.mem.Allocator, objs: []const cc.DataObject) st
 /// microarch model for `arch` (see `resolveModel`). It tunes both the IR layer and the
 /// backend for every function this call compiles. Used by both the `-c` path (a single
 /// source) and the link step (one call per `.c`/`.i` input, in command order).
-fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool, profile: ?*const opt.pgo.Profile) ![]u8 {
+fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, os: TargetOs, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool, profile: ?*const opt.pgo.Profile) ![]u8 {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
     var pp_opts = pp_base;
     pp_opts.filename = try filenameForPreproc(allocator, path);
-    return compileSourceToObject(allocator, io, source, pp_opts, arch, model, optimize, time_report, profile);
+    return compileSourceToObject(allocator, io, source, pp_opts, arch, os, model, optimize, time_report, profile);
 }
 
 /// Compiles in-memory `source` (already-read text, `pp_opts` carrying its filename and
@@ -1087,9 +1131,9 @@ fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, p
 /// `opt.optimizeLate` reduces a loop's addresses to loop-carried pointers, which changes the shape
 /// four microarch idiom recognizers match on, so it has to come after them. `opt.optimize` is the
 /// two halves back to back, for a caller with no microarch layer to fit in between.
-fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool, profile: ?*const opt.pgo.Profile) ![]u8 {
+fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, os: TargetOs, model: ?*const mm.Model, optimize: OptimizationLevel, time_report: bool, profile: ?*const opt.pgo.Profile) ![]u8 {
     const frontend_start = std.Io.Timestamp.now(io, .awake);
-    var mod = try cc.compileWithOpts(allocator, source, pp_opts);
+    var mod = try cc.compileForTarget(allocator, source, targetLayout(arch, os), pp_opts);
     defer mod.deinit(allocator);
     const frontend_end = std.Io.Timestamp.now(io, .awake);
 
@@ -1158,7 +1202,10 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
     var mfs: std.ArrayList(target.native.ModuleFunction) = .empty;
     for (mod.funcs) |*nf| try mfs.append(allocator, .{ .name = nf.name, .func = &nf.func });
     const codegen_start = std.Io.Timestamp.now(io, .awake);
-    const object = try target.native.writeObjectDataForModel(allocator, arch, mfs.items, data.items, model);
+    const object = if (os == .darwin)
+        try target.native.writeMachObjectDataForModel(allocator, mfs.items, data.items, model)
+    else
+        try target.native.writeObjectDataForModel(allocator, arch, mfs.items, data.items, model);
     const codegen_end = std.Io.Timestamp.now(io, .awake);
 
     if (time_report) {
@@ -1310,7 +1357,7 @@ fn synthDsoHandleObject(allocator: std.mem.Allocator, io: std.Io, pp_base: prepr
     var pp_opts = pp_base;
     pp_opts.filename = "<vcc-dso-handle>";
     // Data only, no functions, so optimization has nothing to act on: pass it off.
-    return compileSourceToObject(allocator, io, "void *__dso_handle = 0;\n", pp_opts, arch, null, .off, false, null);
+    return compileSourceToObject(allocator, io, "void *__dso_handle = 0;\n", pp_opts, arch, .linux, null, .off, false, null);
 }
 
 /// The `vcc` driver entry point: parse argv, then dispatch on mode. `-E` preprocesses and
@@ -1428,7 +1475,7 @@ pub fn main(init: std.process.Init) !void {
             .dumpmachine => {
                 const probe_arch: link.Arch = opts.target_arch orelse
                     (hostLinkArch() catch return fail(errw, "no native linker support for this host architecture (pass -target)", .{}));
-                try w.interface.print("{s}\n", .{archTriple(probe_arch)});
+                try w.interface.print("{s}\n", .{archTriple(probe_arch, opts.target_os orelse hostTargetOs())});
             },
             // The microarch model this compile tunes for, or the host CPU it has no model for.
             .cpu_model => {
@@ -1457,6 +1504,9 @@ pub fn main(init: std.process.Init) !void {
     // cross-emitted object always links against a matching-arch executable format.
     const arch: link.Arch = opts.target_arch orelse
         (hostLinkArch() catch return fail(errw, "no native linker support for this host architecture (pass -target)", .{}));
+    const target_os = opts.target_os orelse hostTargetOs();
+    if (target_os == .darwin and arch != .aarch64)
+        return fail(errw, "Darwin object emission currently supports only aarch64/arm64", .{});
 
     // The microarch model this whole invocation tunes for, or null when none applies (an
     // explicit opt-out, an unresolved implicit default, or a target with no model at all).
@@ -1484,7 +1534,7 @@ pub fn main(init: std.process.Init) !void {
     // just means no default dir is added. The compile only fails later, AT an actual
     // `#include <...>` that needed it, not here.
     // The probe spawns the host C compiler, so it runs only when an include misses all other dirs.
-    var sysdir_probe: SysdirProbe = .{ .allocator = allocator, .io = io, .arch = arch, .env = init.environ_map };
+    var sysdir_probe: SysdirProbe = .{ .allocator = allocator, .io = io, .arch = arch, .os = target_os, .env = init.environ_map };
 
     // The `FsResolver` wired into `pp_base.resolver` replaces the old disk-only
     // `diskResolve`. It serves this compiler's own built-in `<stddef.h>`/`<stdarg.h>` FIRST
@@ -1495,6 +1545,7 @@ pub fn main(init: std.process.Init) !void {
     // compile, the same way `disk_ctx` did before it.
     const system_dirs = try buildSystemDirs(allocator, &opts, null);
     var fs_resolver = cc.fs_resolver.FsResolver.init(allocator, io, system_dirs);
+    fs_resolver.darwin_compat = target_os == .darwin;
     if (!opts.no_stdinc) fs_resolver.fallback = .{ .ctx = &sysdir_probe, .findFn = SysdirProbe.find };
 
     // `-freproducible-compile` pins `__DATE__`/`__TIME__` to the epoch instead of reading
@@ -1511,7 +1562,7 @@ pub fn main(init: std.process.Init) !void {
         // layer on top afterward (`preseedMacros` applies `defines`/`undefines` AFTER the
         // system set, see `preproc.zig`), so for example `-U__GNUC__` still strips it
         // exactly as it did before this field existed.
-        .system = systemPredefFor(arch),
+        .system = systemPredefFor(arch, target_os),
         // Route `#warning` diagnostics to the driver's stderr sink so real warnings still
         // reach the user in production. Tests leave `diag` null, so they stay silent.
         .diag = errw,
@@ -1550,7 +1601,7 @@ pub fn main(init: std.process.Init) !void {
     if (opts.compile_only) {
         const input = single_source.?;
         if (classifyExt(input) != .c) return fail(errw, "-c requires a .c/.i source file, got '{s}'", .{input});
-        const obj = try compileToObject(allocator, io, input, pp_base, arch, model, opts.optimize, opts.time_report, profile);
+        const obj = try compileToObject(allocator, io, input, pp_base, arch, target_os, model, opts.optimize, opts.time_report, profile);
         const out = opts.output orelse try derivedOutputName(allocator, input);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = obj });
         if (opts.gen_depfile) {
@@ -1573,7 +1624,7 @@ pub fn main(init: std.process.Init) !void {
         const source = try std.Io.Dir.cwd().readFileAlloc(io, input, allocator, .limited(16 * 1024 * 1024));
         var pp_opts = pp_base;
         pp_opts.filename = try filenameForPreproc(allocator, input);
-        var mod = try cc.compileWithOpts(allocator, source, pp_opts);
+        var mod = try cc.compileForTarget(allocator, source, targetLayout(arch, target_os), pp_opts);
         defer mod.deinit(allocator);
         var w = std.Io.File.stdout().writer(io, &buf);
         // With an optimization level (`-O1`+), dump the IR the backend actually sees, not the raw
@@ -1593,6 +1644,48 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Darwin uses the native Mach-O writer above for each C translation unit and lets
+    // Apple's driver supply the SDK, startup files, system libraries, and final linker.
+    if (target_os == .darwin) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.append(allocator, "cc");
+        if (opts.shared) try argv.append(allocator, "-dynamiclib");
+        try argv.append(allocator, "-o");
+        try argv.append(allocator, opts.output orelse "a.out");
+        var temps: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (temps.items) |path| std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        }
+        for (opts.inputs.items, 0..) |spec, input_i| switch (spec) {
+            .path => |p| switch (classifyExt(p)) {
+                .c => {
+                    const obj = try compileToObject(allocator, io, p, pp_base, arch, target_os, model, opts.optimize, opts.time_report, profile);
+                    const tmp = try std.fmt.allocPrint(allocator, ".vcc-{x}-{d}.o", .{ @intFromPtr(&opts), input_i });
+                    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = obj });
+                    try temps.append(allocator, tmp);
+                    try argv.append(allocator, tmp);
+                },
+                .o, .a, .so => try argv.append(allocator, p),
+                .unknown => return fail(errw, "unrecognized Darwin link input '{s}'", .{p}),
+            },
+            .lib => |l| try argv.append(allocator, try std.fmt.allocPrint(allocator, "-l{s}", .{l.name})),
+        };
+        for (opts.lib_dirs.items) |dir| try argv.append(allocator, try std.fmt.allocPrint(allocator, "-L{s}", .{dir}));
+        if (opts.pthread) try argv.append(allocator, "-pthread");
+        const result = std.process.run(allocator, io, .{ .argv = argv.items }) catch
+            return fail(errw, "could not run the Darwin system C linker", .{});
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| if (code != 0) {
+                try errw.writeAll(result.stderr);
+                return fail(errw, "Darwin system link failed (exit {d})", .{code});
+            },
+            else => return fail(errw, "Darwin system linker terminated abnormally", .{}),
+        }
+        return;
+    }
+
     // LINK step: every input, in command order, becomes one `link.DynInput`.
     // `.c`/`.i` sources are compiled via `compileToObject` (for `arch`, composing with
     // `-target`). `.o`/`.a`/`.so` inputs are read straight off disk. `-l<name>` is resolved
@@ -1609,7 +1702,7 @@ pub fn main(init: std.process.Init) !void {
     for (opts.inputs.items) |spec| switch (spec) {
         .path => |p| switch (classifyExt(p)) {
             .c => {
-                const obj = try compileToObject(allocator, io, p, pp_base, arch, model, opts.optimize, opts.time_report, profile);
+                const obj = try compileToObject(allocator, io, p, pp_base, arch, target_os, model, opts.optimize, opts.time_report, profile);
                 try dyn_inputs.append(allocator, .{ .object = obj });
                 try display_names.append(allocator, "");
             },
@@ -2525,7 +2618,7 @@ test "buildSystemDirs: -I dirs come before -isystem dirs, which come before the 
 }
 
 test "systemPredefFor: long_bits/ptr_bits/char_signed match cc.layout.forArch per target" {
-    const aarch64_sp = systemPredefFor(.aarch64);
+    const aarch64_sp = systemPredefFor(.aarch64, .linux);
     try std.testing.expectEqual(cc.layout.Arch.aarch64, aarch64_sp.arch);
     try std.testing.expectEqual(@as(u16, 64), aarch64_sp.long_bits);
     try std.testing.expectEqual(@as(u16, 64), aarch64_sp.ptr_bits);
@@ -2533,13 +2626,13 @@ test "systemPredefFor: long_bits/ptr_bits/char_signed match cc.layout.forArch pe
     try std.testing.expectEqual(@as(u32, 4), aarch64_sp.gnuc_major);
     try std.testing.expectEqual(@as(u32, 6), aarch64_sp.gnuc_minor);
 
-    const x86_sp = systemPredefFor(.x86);
+    const x86_sp = systemPredefFor(.x86, .linux);
     try std.testing.expectEqual(cc.layout.Arch.x86, x86_sp.arch);
     try std.testing.expectEqual(@as(u16, 32), x86_sp.long_bits);
     try std.testing.expectEqual(@as(u16, 32), x86_sp.ptr_bits);
     try std.testing.expect(x86_sp.char_signed);
 
-    const x86_64_sp = systemPredefFor(.x86_64);
+    const x86_64_sp = systemPredefFor(.x86_64, .linux);
     try std.testing.expectEqual(cc.layout.Arch.x86_64, x86_64_sp.arch);
     try std.testing.expect(x86_64_sp.char_signed);
 }
@@ -2567,7 +2660,7 @@ test "driver wiring: built-in stddef.h resolves through FsResolver+buildSystemDi
     var fsr = cc.fs_resolver.FsResolver.init(allocator, std.testing.io, system_dirs);
     const toks = try preproc.preprocess(allocator, "#include <stddef.h>\nsize_t x;\n", .{
         .resolver = fsr.asResolver(),
-        .system = systemPredefFor(.aarch64),
+        .system = systemPredefFor(.aarch64, .linux),
     });
     defer cc.lexer.freeTokens(allocator, toks);
 
@@ -2697,7 +2790,7 @@ test "driver wiring: default system dir (host glibc) resolves #include <stdio.h>
             .riscv64 => .riscv64,
             .x86 => .x86,
             else => return error.SkipZigTest,
-        }),
+        }, .linux),
     });
     defer cc.lexer.freeTokens(allocator, toks);
 

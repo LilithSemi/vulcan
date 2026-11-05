@@ -95,6 +95,7 @@ pub const Define = struct { name: []const u8, value: []const u8 };
 /// macros and pick the LP64 vs ILP32 form of the `__SIZE_TYPE__`-family type macros.
 /// `char_signed` is carried for future use. No macro reads it yet.
 pub const SystemPredef = struct {
+    pub const Os = enum { linux, darwin };
     arch: layout.Arch,
     gnuc_major: u32,
     gnuc_minor: u32,
@@ -102,6 +103,7 @@ pub const SystemPredef = struct {
     long_bits: u16,
     ptr_bits: u16,
     char_signed: bool,
+    os: Os = .linux,
 };
 
 /// Preprocessor configuration. `filename`/`timestamp` back `__FILE__`/`__DATE__`/`__TIME__`.
@@ -2078,11 +2080,27 @@ fn seedSystemPredefs(allocator: std.mem.Allocator, macros: *MacroTable, sp: Syst
         .x86 => try defineSimple(allocator, macros, "__i386__", "1"),
     }
 
-    try defineSimple(allocator, macros, "__linux__", "1");
-    try defineSimple(allocator, macros, "__unix__", "1");
-    try defineSimple(allocator, macros, "__unix", "1");
-    try defineSimple(allocator, macros, "__ELF__", "1");
-    try defineSimple(allocator, macros, "__gnu_linux__", "1");
+    switch (sp.os) {
+        .linux => {
+            try defineSimple(allocator, macros, "__linux__", "1");
+            try defineSimple(allocator, macros, "__unix__", "1");
+            try defineSimple(allocator, macros, "__unix", "1");
+            try defineSimple(allocator, macros, "__ELF__", "1");
+            try defineSimple(allocator, macros, "__gnu_linux__", "1");
+        },
+        .darwin => {
+            try defineSimple(allocator, macros, "__APPLE__", "1");
+            try defineSimple(allocator, macros, "__MACH__", "1");
+            try defineSimple(allocator, macros, "__APPLE_CC__", "6000");
+            try defineSimple(allocator, macros, "__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__", "140000");
+            if (sp.arch == .aarch64) {
+                try defineSimple(allocator, macros, "__arm64", "1");
+                try defineSimple(allocator, macros, "__arm64__", "1");
+            }
+            try defineSimple(allocator, macros, "__unix__", "1");
+            try defineSimple(allocator, macros, "__unix", "1");
+        },
+    }
 
     try defineSimple(allocator, macros, "__ORDER_LITTLE_ENDIAN__", "1234");
     try defineSimple(allocator, macros, "__ORDER_BIG_ENDIAN__", "4321");

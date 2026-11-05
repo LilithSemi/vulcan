@@ -824,6 +824,11 @@ pub fn csel(rd: Reg, rn: Reg, rm: Reg, cond: Cond) u32 {
     return 0x1A800000 | (n(rm) << 16) | (@as(u32, @backingInt(cond)) << 12) | (n(rn) << 5) | n(rd);
 }
 
+/// `csel xd, xn, xm, cond` (64-bit).
+pub fn csel64(rd: Reg, rn: Reg, rm: Reg, cond: Cond) u32 {
+    return sf64 | csel(rd, rn, rm, cond);
+}
+
 /// `csinc wd, wn, wm, cond`: select `wn` when cond is true, otherwise `wm + 1`.
 pub fn csinc(rd: Reg, rn: Reg, rm: Reg, cond: Cond, wide: bool) u32 {
     return (if (wide) @as(u32, 1) << 31 else 0) |
@@ -1662,6 +1667,7 @@ test "conditional negate encoding" {
 test "parity select encodings" {
     try std.testing.expectEqual(@as(u32, 0x7200013F), andsImm(.zr, .x9, 1, false).?);
     try std.testing.expectEqual(@as(u32, 0x1A890589), csinc(.x9, .x12, .x9, .eq, false));
+    try std.testing.expectEqual(@as(u32, 0x9A821027), csel64(.x7, .x1, .x2, .ne));
 }
 
 test "aarch64 byte and halfword offset-form load/store encoders match the disassembler" {
