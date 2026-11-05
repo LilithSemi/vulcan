@@ -1,0 +1,76 @@
+name: bench
+
+on:
+  pull_request:
+
+concurrency:
+  group: bench-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: aarch64-darwin
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Run the benchmark
+        run: nix develop -c zig build bench -- --format github > bench.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.system }}
+          path: bench.md
+
+  comment:
+    needs: bench
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+
+      - name: Post the results on the pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # One comment per pull request, found again by this marker and edited in place.
+          marker='<!-- vulcan-bench -->'
+          {
+            echo "$marker"
+            for system in x86_64-linux aarch64-linux aarch64-darwin; do
+              if [ -s "bench-$system/bench.md" ]; then
+                cat "bench-$system/bench.md"
+              else
+                printf '## Vulcan benchmark on %s\n\nThe benchmark did not finish. See the [run log](%s).\n' "$system" "$RUN_URL"
+              fi
+              echo
+            done
+          } > comment.md
+          id="$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)"
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@comment.md > /dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@comment.md > /dev/null
+          fi

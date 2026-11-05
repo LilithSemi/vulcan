@@ -2,8 +2,15 @@
 //! VCC is supplied by the build graph. Clang, GCC, and TCC are included when present on PATH.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const samples = 7;
+
+/// The system this runs on, in the names Nix uses, such as `aarch64-darwin`.
+const system = @tagName(builtin.cpu.arch) ++ "-" ++ (if (builtin.os.tag == .macos) "darwin" else @tagName(builtin.os.tag));
+
+/// VCC links only ELF executables, so on any other system the generated code is not timed.
+const executes = builtin.os.tag == .linux;
 
 const Compiler = struct {
     name: []const u8,
@@ -109,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
             const object_path = try std.fs.path.join(allocator, &.{ output_dir, object_name });
             compiled.* = try benchmarkCompiler(allocator, io, compiler, source_path, object_path);
             executed.* = null;
-            if (compiler.compile_only) continue;
+            if (compiler.compile_only or !executes) continue;
 
             const exe_name = try std.fmt.allocPrint(allocator, "{s}.{s}.bench", .{ stem, compiler.name });
             const exe_path = try std.fs.path.join(allocator, &.{ output_dir, exe_name });
@@ -178,6 +185,10 @@ fn writeText(writer: *std.Io.Writer, report: Report) !void {
         try writer.print("  {d:>7}% of vcc\n", .{percent(report.compileTotal(index), report.compileTotal(0))});
     }
 
+    if (!executes) {
+        try writer.writeAll("\ngenerated code not timed: vcc cannot link executables on " ++ system ++ " yet\n");
+        return;
+    }
     try writer.print("\ngenerated-code execution (best/median of {d}; lower is better)\n", .{samples});
     try writer.writeAll("Checksums must match across compilers; process startup is included.\n\n");
     try writer.writeAll("workload             compiler       best       median   time/vcc  checksum\n");
@@ -205,12 +216,24 @@ fn writeText(writer: *std.Io.Writer, report: Report) !void {
 /// Markdown for a GitHub comment. The totals are visible, and the per-workload tables are
 /// in collapsed `<details>` blocks.
 fn writeGithub(writer: *std.Io.Writer, report: Report) !void {
-    try writer.writeAll("## Vulcan benchmark\n\n");
+    try writer.writeAll("## Vulcan benchmark on " ++ system ++ "\n\n");
     try writer.print("Best of {d} runs, lower is better. Process startup is included.", .{samples});
     if (report.skipped.len != 0) {
         try writer.writeAll(" Not found:");
         for (report.skipped) |name| try writer.print(" {s}", .{name});
         try writer.writeByte('.');
+    }
+    if (!executes) {
+        try writer.writeAll(" Generated code is not timed, since vcc cannot link executables on " ++ system ++ " yet.");
+        try writer.writeAll("\n\n| compiler | compile (`-O2 -c`) | vs vcc |\n|---|---:|---:|\n");
+        for (report.compilers, 0..) |compiler, index| {
+            try writer.print("| {s} | ", .{compiler.name});
+            try writeMs(writer, report.compileTotal(index));
+            try writer.print(" | {d}% |\n", .{percent(report.compileTotal(index), report.compileTotal(0))});
+        }
+        try writer.writeAll("\n<details>\n<summary>Compile time per workload</summary>\n\n");
+        try writeCompileDetails(writer, report);
+        return;
     }
     try writer.writeAll("\n\n| compiler | compile (`-O2 -c`) | vs vcc | generated code | vs vcc |\n");
     try writer.writeAll("|---|---:|---:|---:|---:|\n");
@@ -240,6 +263,11 @@ fn writeGithub(writer: *std.Io.Writer, report: Report) !void {
     }
 
     try writer.writeAll("\n</details>\n\n<details>\n<summary>Compile time per workload</summary>\n\n");
+    try writeCompileDetails(writer, report);
+}
+
+/// The per-workload compile time and object size tables, the first already opened.
+fn writeCompileDetails(writer: *std.Io.Writer, report: Report) !void {
     try writeGithubHeader(writer, report, false);
     for (report.workloads, report.compile) |workload, row| {
         try writer.print("| {s} |", .{workload});
