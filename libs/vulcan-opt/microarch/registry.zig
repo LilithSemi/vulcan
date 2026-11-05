@@ -888,8 +888,20 @@ const sm_120 = Model{
     .fusion = &.{},
 };
 
+/// A part tuned like an older part of the same family until it has its own description.
+fn basedOn(comptime base: Model, comptime tag: Microarch) Model {
+    var derived = base;
+    derived.tag = tag;
+    return derived;
+}
+
+const neoverse_n2 = basedOn(altra, .@"neoverse-n2");
+const zen5 = basedOn(zen4, .zen5);
+
 comptime {
     Model.validate(altra);
+    Model.validate(neoverse_n2);
+    Model.validate(zen5);
     Model.validate(etsoc);
     Model.validate(river_n);
     Model.validate(river_mi);
@@ -904,6 +916,7 @@ comptime {
 pub fn modelFor(tag: Microarch) *const Model {
     return switch (tag) {
         .@"ampere-altra" => &altra,
+        .@"neoverse-n2" => &neoverse_n2,
         .@"et-soc" => &etsoc,
         .@"river-rc1.n" => &river_n,
         .@"river-rc1.mi" => &river_mi,
@@ -912,23 +925,25 @@ pub fn modelFor(tag: Microarch) *const Model {
         .@"river-rc1.ma" => &river_ma,
         .@"cascadelake-sp" => &cascadelake,
         .zen4 => &zen4,
+        .zen5 => &zen5,
         .sm_120 => &sm_120,
     };
 }
 
-/// True when the aarch64 MIDR_EL1 names an ARM Neoverse N1 (implementer 0x41, part 0xd0c). Reads the
+/// The part number from the aarch64 MIDR_EL1 when the implementer is ARM (0x41), such as 0xd0c for a
+/// Neoverse N1 and 0xd49 for a Neoverse N2, else null. Reads the
 /// register directly, no I/O. On arm64 Linux the mrs read is emulated for EL0 and does not trap on
 /// any supported kernel, so detectHost stays a pure query with no injected dependencies. macOS traps
 /// the read as an illegal instruction, which killed the darwin CI as a SIGILL; a macOS host is Apple
 /// Silicon and never a Neoverse part, so false there is the right answer and not a fallback.
-fn midrPartIsN1() bool {
-    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return false;
+fn midrPart() ?u12 {
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return null;
     const midr = asm volatile ("mrs %[out], MIDR_EL1"
         : [out] "=r" (-> u64),
     );
     const implementer: u8 = @truncate(midr >> 24);
     const part: u12 = @truncate(midr >> 4);
-    return implementer == 0x41 and part == 0xd0c;
+    return if (implementer == 0x41) part else null;
 }
 
 /// The Cascade Lake-SP discriminator: family 6, model 85 (0x55), and AVX512-VNNI present. VNNI is the
@@ -939,7 +954,7 @@ fn cascadelakeDiscriminator(family: u32, disp_model: u32, vnni: bool) bool {
 }
 
 /// Read CPUID leaf 1 (family/model, with the extended-model combine) and leaf 7 subleaf 0 (ECX bit 11
-/// = AVX512-VNNI). x86_64-only, a pure query with no I/O, mirroring midrPartIsN1's shape. The x86
+/// = AVX512-VNNI). x86_64-only, a pure query with no I/O, mirroring midrPart's shape. The x86
 /// named-register asm below is only ever semantically analyzed under `comptime builtin.cpu.arch ==
 /// .x86_64`, so this function still compiles cleanly on a non-x86_64 host (e.g. aarch64), where it
 /// just returns false without the compiler ever looking at the `"={eax}"`-style constraints.
@@ -984,22 +999,32 @@ fn hostIsCascadeLake() bool {
 /// architectural part register, so this returns null and the caller selects by name.
 pub fn detectHost() ?Microarch {
     switch (builtin.cpu.arch) {
-        .aarch64 => if (midrPartIsN1()) return .@"ampere-altra",
+        .aarch64 => switch (midrPart() orelse 0) {
+            0xd0c => return .@"ampere-altra",
+            0xd49 => return .@"neoverse-n2",
+            else => {},
+        },
         .x86_64 => {
             if (hostIsCascadeLake()) return .@"cascadelake-sp";
-            if (hostIsZen4()) return .zen4;
+            if (hostZen()) |zen| return zen;
         },
         else => {},
     }
     return null;
 }
 
-/// Zen 4 is AMD family 19h with AVX-512. Zen 3 shares the family but has no AVX-512.
-fn zen4Discriminator(amd: bool, family: u32, avx512f: bool) bool {
-    return amd and family == 0x19 and avx512f;
+/// Zen 4 is AMD family 19h with AVX-512, and Zen 5 is family 1Ah. Zen 3 shares family 19h but has no
+/// AVX-512.
+fn zenDiscriminator(amd: bool, family: u32, avx512f: bool) ?Microarch {
+    if (!amd or !avx512f) return null;
+    return switch (family) {
+        0x19 => .zen4,
+        0x1A => .zen5,
+        else => null,
+    };
 }
 
-fn hostIsZen4() bool {
+fn hostZen() ?Microarch {
     if (comptime builtin.cpu.arch == .x86_64) {
         const vendor = cpuid(0);
         // "AuthenticAMD" is spread over ebx, edx, and ecx.
@@ -1008,9 +1033,9 @@ fn hostIsZen4() bool {
         const base_family = (version >> 8) & 0xF;
         const family = if (base_family == 0xF) base_family + ((version >> 20) & 0xFF) else base_family;
         const avx512f = (cpuid(7).ebx & (1 << 16)) != 0;
-        return zen4Discriminator(amd, family, avx512f);
+        return zenDiscriminator(amd, family, avx512f);
     } else {
-        return false;
+        return null;
     }
 }
 
@@ -1032,11 +1057,12 @@ fn cpuid(leaf: u32) CpuidResult {
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
-test "zen4 discriminator needs AMD family 19h with AVX-512" {
-    try std.testing.expect(zen4Discriminator(true, 0x19, true));
-    try std.testing.expect(!zen4Discriminator(true, 0x19, false));
-    try std.testing.expect(!zen4Discriminator(true, 0x17, true));
-    try std.testing.expect(!zen4Discriminator(false, 0x19, true));
+test "zen discriminator needs AMD with AVX-512, and the family picks the part" {
+    try std.testing.expectEqual(@as(?Microarch, .zen4), zenDiscriminator(true, 0x19, true));
+    try std.testing.expectEqual(@as(?Microarch, .zen5), zenDiscriminator(true, 0x1A, true));
+    try std.testing.expectEqual(@as(?Microarch, null), zenDiscriminator(true, 0x19, false));
+    try std.testing.expectEqual(@as(?Microarch, null), zenDiscriminator(true, 0x17, true));
+    try std.testing.expectEqual(@as(?Microarch, null), zenDiscriminator(false, 0x1A, true));
 }
 
 test "modelFor returns a self-consistent model for every Microarch" {
@@ -1139,15 +1165,15 @@ test "cascadelakeDiscriminator matches model 85 with VNNI, rejects Skylake-SP (n
     try std.testing.expect(!cascadelakeDiscriminator(15, 85, true)); // different family
 }
 
-test "midrPartIsN1 never traps off linux" {
+test "midrPart never traps off linux" {
     // On darwin the MRS would trap as a SIGILL, which is what the darwin CI died
-    // with. The gate must answer false there without ever reading the register.
+    // with. The gate must answer null there without ever reading the register.
     if (builtin.os.tag != .linux) {
-        try std.testing.expect(!midrPartIsN1());
+        try std.testing.expectEqual(@as(?u12, null), midrPart());
     }
 }
 
-test "detectHost identifies this box when it is a Neoverse N1, else null or a matching-arch tag" {
+test "detectHost identifies this box when it is a Neoverse N1 or N2, else null or a matching-arch tag" {
     const got = detectHost();
     if (got) |t| {
         // Never claim a tag whose arch does not match the host.
@@ -1158,6 +1184,7 @@ test "detectHost identifies this box when it is a Neoverse N1, else null or a ma
         }, modelFor(t).arch);
     }
     if (builtin.cpu.arch == .aarch64) {
-        if (midrPartIsN1()) try std.testing.expectEqual(Microarch.@"ampere-altra", got.?);
+        if (midrPart() == 0xd0c) try std.testing.expectEqual(Microarch.@"ampere-altra", got.?);
+        if (midrPart() == 0xd49) try std.testing.expectEqual(Microarch.@"neoverse-n2", got.?);
     }
 }

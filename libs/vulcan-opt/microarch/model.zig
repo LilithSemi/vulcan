@@ -139,6 +139,7 @@ pub const FusionRule = struct { kind: FuseKind };
 /// display name is the tag name and std.meta.stringToEnum parses them with no side table.
 pub const Microarch = enum {
     @"ampere-altra",
+    @"neoverse-n2",
     @"et-soc",
     @"river-rc1.n",
     @"river-rc1.mi",
@@ -147,6 +148,7 @@ pub const Microarch = enum {
     @"river-rc1.ma",
     @"cascadelake-sp",
     zen4,
+    zen5,
     sm_120,
 
     pub fn parse(name_: []const u8) ?Microarch {
