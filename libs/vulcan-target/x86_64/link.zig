@@ -279,9 +279,9 @@ test "links two functions and resolves the call" {
     defer linked.deinit(allocator);
     try std.testing.expect(linked.addressOf("main") != null);
     try std.testing.expect(linked.addressOf("helper").? != linked.addressOf("main").?);
-    // The call site holds a non-zero (resolved) displacement.
+    // The call site, a tail jump here, holds a non-zero (resolved) displacement.
     var any_call = false;
-    for (linked.code, 0..) |byte, i| if (byte == 0xE8 and i + 4 < linked.code.len) {
+    for (linked.code, 0..) |byte, i| if ((byte == 0xE8 or byte == 0xE9) and i + 4 < linked.code.len) {
         if (std.mem.readInt(u32, linked.code[i + 1 ..][0..4], .little) != 0) any_call = true;
     };
     try std.testing.expect(any_call);

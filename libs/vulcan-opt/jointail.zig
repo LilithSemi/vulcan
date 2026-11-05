@@ -13,6 +13,38 @@ const Block = ir.function.Block;
 const Value = ir.function.Value;
 
 pub const pass_def = pass.Pass{ .name = "jointail", .run = run };
+pub const returns_pass_def = pass.Pass{ .name = "jointail-returns", .run = copyReturns };
+
+/// A block that only returns is copied into each block that jumps to it. A call before the jump
+/// can then become a tail call, and the hot path skips a jump to a shared epilogue.
+pub fn copyReturns(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    _ = allocator;
+    _ = analyses;
+    var changed = false;
+    for (0..func.blockCount()) |pi| {
+        const pred: Block = @fromBackingInt(@intCast(pi));
+        const jump = switch (func.terminator(pred) orelse continue) {
+            .jump => |j| j,
+            .ret => continue,
+        };
+        const join = jump.target;
+        if (@backingInt(join) == 0 or func.blockInsts(join).len != 0) continue;
+        var r = switch (func.terminator(join) orelse continue) {
+            .ret => |r| r,
+            .jump => continue,
+        };
+        const params = func.blockParams(join);
+        const args = func.blockArgs(jump);
+        for (r.values[0..r.count]) |*value| {
+            for (params, args) |param, arg| {
+                if (value.* == param) value.* = arg;
+            }
+        }
+        func.setTerminator(pred, .{ .ret = r });
+        changed = true;
+    }
+    return changed;
+}
 
 const max_insts = 16;
 const max_preds = 4;

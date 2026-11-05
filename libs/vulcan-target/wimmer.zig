@@ -137,6 +137,12 @@ pub const RegDescription = struct {
     // across a call. Consulted once per value at interval-build time to set `Interval.narrow`. Null
     // (the default) flags nothing narrow, byte-identical to the prior behavior.
     isNarrow: ?*const fn (ctx: *const anyopaque, func: *const Function, v: Value) bool = null,
+    // OPTIONAL. True when the instruction that defines `v` writes it after its own clobber takes
+    // effect, like a call result, so `v` may take a register that instruction clobbers.
+    defAfterClobber: ?*const fn (ctx: *const anyopaque, func: *const Function, v: Value) bool = null,
+    // OPTIONAL. The register an instruction wants `operand` in, such as a call argument register.
+    // The scan takes it when it is free for the whole interval.
+    useHint: ?*const fn (ctx: *const anyopaque, func: *const Function, inst: Inst, operand: Value) ?u16 = null,
     // OPTIONAL block-argument coalescing. When true, the scan hints a block parameter toward the
     // register of an incoming argument that is already placed, so the edge move that feeds the
     // parameter becomes a same-register no-op the edge resolver drops. A parameter and its incoming
@@ -289,6 +295,11 @@ pub const Interval = struct {
     // set, so the clobber spares a `narrow` value. False by default (a full clobber, or a value
     // interval).
     preserves_narrow: bool = false,
+    // For a VALUE interval, true when its defining instruction writes it after that instruction's
+    // clobber, so the clobber at its first position does not cut it.
+    def_after_clobber: bool = false,
+    // For a VALUE interval, the register its first hinted use wants it in.
+    use_hint: ?u16 = null,
     // How many CONSECUTIVE registers this interval occupies, and the alignment its base register
     // must meet. Both come from the backend's `RegDescription.regWidth` for the interval's value.
     // They stay 1 and 1 for every backend that does not opt in, and for a CALL-CLOBBER fixed
@@ -773,6 +784,31 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
         }
     }
 
+    const use_hints = try allocator.alloc(?u16, nval);
+    defer allocator.free(use_hints);
+    @memset(use_hints, null);
+    if (desc.useHint) |hook| {
+        const Hints = struct {
+            func: *const Function,
+            ctx: *const anyopaque,
+            inst: Inst,
+            hook: @TypeOf(hook),
+            hints: []?u16,
+
+            fn visit(self: *@This(), v: Value, is_edge_arg: bool) void {
+                if (is_edge_arg) return;
+                const slot = &self.hints[@backingInt(v)];
+                if (slot.* == null) slot.* = self.hook(self.ctx, self.func, self.inst, v);
+            }
+        };
+        for (0..nblocks) |bi| {
+            for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+                var h = Hints{ .func = func, .ctx = desc.ctx, .inst = inst, .hook = hook, .hints = use_hints };
+                visitOperands(func, inst, &h, Hints.visit);
+            }
+        }
+    }
+
     // --- Assemble the result: value intervals first, then fixed intervals. ---
     var result: std.ArrayList(Interval) = .empty;
     errdefer {
@@ -817,6 +853,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             }
         }
         const narrow = if (desc.isNarrow) |hook| hook(desc.ctx, func, value) else false;
+        const def_after_clobber = if (desc.defAfterClobber) |hook| hook(desc.ctx, func, value) else false;
         // The register width is read ONCE here and carried on the interval, so every later site
         // (the scan, the splitter, the resolver, the verifier) reads one answer.
         const width = widthOf(desc, func, value);
@@ -830,6 +867,8 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             .destructive_src = destructive_src,
             .destructive_alt = destructive_alt,
             .narrow = narrow,
+            .def_after_clobber = def_after_clobber,
+            .use_hint = use_hints[v],
             .regs = width.regs,
             .reg_align = width.alignment,
         });
@@ -1172,6 +1211,7 @@ fn fixedClobberConflict(current: *const Interval, fixed: *const Interval) ?u32 {
     for (fixed.ranges) |r| {
         var c = r.from;
         while (c < r.to) : (c += 1) {
+            if (current.def_after_clobber and !current.split_child and c == current.start()) continue;
             if (current.covers(c) and current.covers(c + 1)) return c;
         }
     }
@@ -1254,6 +1294,14 @@ fn tryAllocateFreeReg(
             }
             continue;
         }
+        if (callOperandFreeAfter(current, it)) continue;
+        // A call result is written after the call's own clobber, so only a later clobber cuts it.
+        if (it.fixed_reg != null and it.value == null and current.def_after_clobber) {
+            if (fixedClobberConflict(current, it)) |x| {
+                if (r < limit and is_candidate[r] and x < free_until[r]) free_until[r] = x;
+            }
+            continue;
+        }
         // The occupant holds its WHOLE span right now, so every register of it is busy. Marking only
         // the base would leave the second register of a pair looking free.
         var k: u16 = 0;
@@ -1322,6 +1370,10 @@ fn tryAllocateFreeReg(
         if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
             spanMin(&free_until, h, current.regs) >= current.end()) chosen = h;
     };
+    if (chosen == null) if (current.use_hint) |h| {
+        if (h < limit and spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
+            spanMin(&free_until, h, current.regs) >= current.end()) chosen = h;
+    };
     if (chosen == null) if (alternate_hint) |h| {
         if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
             spanMin(&free_until, h, current.regs) >= current.end()) chosen = h;
@@ -1373,6 +1425,24 @@ fn copyDiesAt(dst: *const Interval, src: *const Interval) bool {
     return src.end() == dst.start() + 1;
 }
 
+/// A call result and a value the call reads last. The call reads its operands before it writes the
+/// result, so both may use one register.
+fn callOperandFreeAfter(dst: *const Interval, src: *const Interval) bool {
+    if (!dst.def_after_clobber or dst.split_child) return false;
+    if (src.fixed_reg != null or src.value == null) return false;
+    if (src.regs != dst.regs or src.reg_align != dst.reg_align) return false;
+    const def = dst.start();
+    var ends_at_def = false;
+    for (src.ranges) |r| {
+        if (r.from <= def and r.to == def + 1) ends_at_def = true;
+    }
+    if (!ends_at_def) return false;
+    for (src.ranges) |r| for (dst.ranges) |d| {
+        if (@max(r.from, d.from, def + 1) < @min(r.to, d.to)) return false;
+    };
+    return true;
+}
+
 /// Like `destructiveSourceDiesAt`, but the source may live again later: its range ends at the def,
 /// and it never overlaps the result after that.
 fn destructiveSourceFreeAfter(dst: *const Interval, src: *const Interval) bool {
@@ -1409,7 +1479,8 @@ fn isCopyCoalescePair(a: *const Interval, b: *const Interval) bool {
 }
 
 fn isDestructiveCoalescePair(a: *const Interval, b: *const Interval) bool {
-    return destructiveSourceFreeAfter(a, b) or destructiveSourceFreeAfter(b, a);
+    return destructiveSourceFreeAfter(a, b) or destructiveSourceFreeAfter(b, a) or
+        callOperandFreeAfter(a, b) or callOperandFreeAfter(b, a);
 }
 
 /// True iff both intervals describe the same value (used to skip a value's own entry-param hint
@@ -2296,6 +2367,7 @@ fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, chil
         .uses = tu,
         .location = null,
         .narrow = parent.narrow,
+        .use_hint = parent.use_hint,
         // A split cuts a LIFETIME, never a value's shape, so the child holds the same number of
         // registers under the same alignment as its parent.
         .regs = parent.regs,

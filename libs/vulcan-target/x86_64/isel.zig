@@ -220,6 +220,54 @@ fn hasCall(func: *const Function) bool {
     return false;
 }
 
+/// Close the frame and restore the callee-saved GPRs in reverse push order.
+fn emitEpilogue(allocator: std.mem.Allocator, ctx: *Ctx) Error!void {
+    if (ctx.frame > 0) try ctx.put(allocator, encode.aluImm(0, .rsp, ctx.frame, true)); // add rsp, frame
+    var si: usize = ctx.saved.len;
+    while (si > 0) {
+        si -= 1;
+        try ctx.put(allocator, encode.popReg(ctx.saved[si]));
+    }
+}
+
+/// A call that is the last instruction of a block that returns its result, or returns nothing.
+/// The callee can then return straight to our caller. The frame must hold nothing the callee
+/// can see, and every argument must fit in a register.
+fn tailCall(ctx: *const Ctx, block: Block, inst_idx: usize) bool {
+    const func = ctx.func;
+    const insts = func.blockInsts(block);
+    if (inst_idx + 1 != insts.len) return false;
+    if (func.is_variadic or ctx.alloca_off.count() != 0) return false;
+    const inst = insts[inst_idx];
+    const args, const ret_dest, const sret = switch (func.opcode(inst)) {
+        .call => |c| call: {
+            const name = func.symbolName(c.symbol);
+            for ([_][]const u8{ "setjmp", "_setjmp", "sigsetjmp", "__sigsetjmp", "vfork" }) |twice| {
+                if (std.mem.eql(u8, name, twice)) return false;
+            }
+            break :call .{ c.args, c.ret_dest, c.sret };
+        },
+        .call_indirect => |c| .{ c.args, c.ret_dest, c.sret },
+        else => return false,
+    };
+    if (ret_dest != null or sret) return false;
+    const r = switch (func.terminator(block) orelse return false) {
+        .ret => |r| r,
+        .jump => return false,
+    };
+    switch (r.count) {
+        0 => {},
+        1 => if (func.instResult(inst) != r.values[0]) return false,
+        else => return false,
+    }
+    var gp: usize = 0;
+    var xmm: usize = 0;
+    for (func.valueList(args)) |arg| {
+        if (isXmm(func, arg)) xmm += 1 else gp += 1;
+    }
+    return gp <= arg_regs.len and xmm <= xmm_arg_regs.len;
+}
+
 /// A rel32 branch displacement, or with `table` set, a jump table entry relative to the table.
 const Fixup = struct { at: usize, target: u32, table: ?usize = null };
 
@@ -338,6 +386,12 @@ const Ctx = struct {
     // either predicate without the loop setting real values first.
     cur_insts: []const ir.function.Inst = &.{},
     cur_idx: usize = 0,
+    // The callee-saved GPRs the prologue pushed, popped by each epilogue.
+    saved: []const Reg = &.{},
+    // The call being lowered ends the function, so it leaves through the epilogue and a jump.
+    tail: bool = false,
+    // Each compare that runs as a `test`, see `applyTestFolds`.
+    tests: ?*const std.AutoHashMapUnmanaged(ir.function.Inst, TestFold) = null,
 
     fn loc(self: *const Ctx, v: Value) Loc {
         if (self.segments.get(v)) |segs| {
@@ -674,6 +728,9 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
     var fold = try addrfold.analyze(allocator, &work, {}, x86_64FoldOffset);
     defer fold.deinit(allocator);
     applyFoldRewriteX86(&work, &fold);
+    var tests: std.AutoHashMapUnmanaged(ir.function.Inst, TestFold) = .{};
+    defer tests.deinit(allocator);
+    if (caps.fuse_cmp_branch) try applyTestFolds(allocator, &work, &tests);
 
     var desc = try x86_64RegDescription(allocator, &work);
     defer desc.deinit(allocator);
@@ -682,7 +739,7 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
 
     const reg_read = try registerReads(allocator, &work);
     defer allocator.free(reg_read);
-    var ctx = Ctx{ .func = &work, .fold = &fold, .caps = caps, .reg_read = reg_read };
+    var ctx = Ctx{ .func = &work, .fold = &fold, .caps = caps, .reg_read = reg_read, .tests = &tests };
     defer ctx.loc_of.deinit(allocator);
     defer ctx.code.deinit(allocator);
     defer ctx.fixups.deinit(allocator);
@@ -845,6 +902,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
     if (frame > 0) try ctx.put(allocator, encode.aluImm(5, .rsp, frame, true)); // sub rsp, frame (64-bit stack ptr)
     ctx.frame = frame; // threaded so `va_start` can address the first incoming stack arg
     ctx.saved_count = @intCast(saved.len); // pushed regs shift the incoming stack args up
+    ctx.saved = saved;
     // System V variadic register-save area: before the argument-homing move
     // below, which may overwrite the incoming arg registers, the code spills
     // every integer arg register into the save area, then conditionally spills
@@ -1038,7 +1096,10 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 }
                 terminated = true;
             } else {
+                ctx.tail = tailCall(ctx, block, inst_idx);
+                defer ctx.tail = false;
                 try lowerInst(allocator, ctx, inst);
+                if (ctx.tail) terminated = true;
             }
         }
         // The terminator shares the block-end position. An `.@"if"` terminator
@@ -1131,16 +1192,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                         }
                     },
                 }
-                if (frame > 0) try ctx.put(allocator, encode.aluImm(0, .rsp, frame, true)); // add rsp, frame (64-bit stack ptr)
-                // Epilogue: restore the callee-saved GPRs in reverse push order,
-                // empty for the default path, so the output stays the same, then
-                // return. The `add rsp` already closed the frame, so RSP now
-                // points at the topmost pushed register.
-                var si: usize = saved.len;
-                while (si > 0) {
-                    si -= 1;
-                    try ctx.put(allocator, encode.popReg(saved[si]));
-                }
+                try emitEpilogue(allocator, ctx);
                 try ctx.put(allocator, encode.ret());
             },
             .jump => |j| {
@@ -1677,6 +1729,12 @@ fn lowerDirectCall(allocator: std.mem.Allocator, ctx: *Ctx, c: ir.function.Call,
     // nothing live, and it sits right before the call. The rsp window does not
     // touch RAX, so setting AL here, before the call, is unaffected by it.
     if (c.is_variadic) try ctx.put(allocator, encode.movAlImm(@intCast(xi)));
+    if (ctx.tail) {
+        try emitEpilogue(allocator, ctx);
+        try ctx.put(allocator, encode.jmp(0));
+        try ctx.relocs.append(allocator, .{ .offset = ctx.code.items.len - 4, .symbol = func.symbolName(c.symbol) });
+        return;
+    }
     try ctx.put(allocator, encode.callRel(0));
     try ctx.relocs.append(allocator, .{ .offset = ctx.code.items.len - 4, .symbol = func.symbolName(c.symbol) });
     // Close the local rsp window. System V is caller-cleaned. The result is
@@ -1971,6 +2029,11 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 gi += 1;
                 if (ctx.loc(arg) == .spill) try ctx.put(allocator, encode.movFromStack(dst, slotDisp(ctx.loc(arg).spill) + stack_bytes));
             }
+        }
+        if (ctx.tail) {
+            try emitEpilogue(allocator, ctx);
+            try ctx.put(allocator, encode.jmpReg(scratch1));
+            return;
         }
         try ctx.put(allocator, encode.callReg(scratch1)); // call r10
         // Close the local rsp window. System V is caller-cleaned. The result
@@ -2995,7 +3058,11 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
     // arith's own possible flag-neutral spill-store `mov` (see
     // `Ctx.store`), leaving ZF intact at the branch.
     var cc: encode.Cond = .ne;
-    if (ctx.cur_idx >= 1 and ctx.caps.fuse_cmp_branch and fusesIntoNextIf(func, ctx.cur_insts, ctx.cur_idx - 1)) {
+    const test_fold: ?TestFold = if (ctx.cur_idx >= 1 and ctx.tests != null) ctx.tests.?.get(ctx.cur_insts[ctx.cur_idx - 1]) else null;
+    if (test_fold) |fold| {
+        try emitTestFold(allocator, ctx, fold);
+        cc = condOf(func.opcode(ctx.cur_insts[ctx.cur_idx - 1]).icmp.op, false);
+    } else     if (ctx.cur_idx >= 1 and ctx.caps.fuse_cmp_branch and fusesIntoNextIf(func, ctx.cur_insts, ctx.cur_idx - 1)) {
         const cmp = func.opcode(ctx.cur_insts[ctx.cur_idx - 1]).icmp;
         if (bitTest(func, cmp)) |b| {
             cc = try emitBitTest(allocator, ctx, b);
@@ -3607,7 +3674,11 @@ fn emitHeaderTest(allocator: std.mem.Allocator, ctx: *Ctx, header: Block, next_b
     ctx.pos = ctx.block_pos[h] + @as(u32, @intCast(n));
     ctx.cur_insts = insts;
     ctx.cur_idx = n - 1;
-    const cc = if (bitTest(func, cmp)) |b| try emitBitTest(allocator, ctx, b) else cc: {
+    const test_fold: ?TestFold = if (ctx.tests) |tests| tests.get(insts[n - 2]) else null;
+    const cc = if (test_fold) |fold| cc: {
+        try emitTestFold(allocator, ctx, fold);
+        break :cc condOf(cmp.op, false);
+    } else if (bitTest(func, cmp)) |b| try emitBitTest(allocator, ctx, b) else cc: {
         try emitCompare(allocator, ctx, cmp, try ctx.use(allocator, cmp.lhs, scratch1));
         break :cc condOf(cmp.op, isSigned(func, cmp.lhs));
     };
@@ -4659,6 +4730,38 @@ fn x86_64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.function
 ///     view change emits cvtss2sd/cvtsd2ss, both real conversions that change bits.
 /// Every other case (a cross-class int <-> float convert via cvtsi2ss/cvttss2si, a vector
 /// operand, or any non-convert) returns null. The unused `ctx` is the generic hook shape.
+/// A call argument wants the System V register it is passed in.
+fn x86_64UseHint(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) ?u16 {
+    _ = ctx;
+    const args = switch (func.opcode(inst)) {
+        .call => |c| c.args,
+        .call_indirect => |c| if (operand == c.target) return null else c.args,
+        else => return null,
+    };
+    var gp: usize = 0;
+    var xmm: usize = 0;
+    for (func.valueList(args)) |arg| {
+        if (isXmm(func, arg)) {
+            if (arg == operand) return if (xmm < xmm_arg_regs.len) @backingInt(xmm_arg_regs[xmm]) else null;
+            xmm += 1;
+        } else {
+            if (arg == operand) return if (gp < arg_regs.len) @backingInt(arg_regs[gp]) else null;
+            gp += 1;
+        }
+    }
+    return null;
+}
+
+/// A call writes its result after it clobbers the caller-saved registers.
+fn x86_64DefAfterClobber(ctx: *const anyopaque, func: *const Function, v: Value) bool {
+    _ = ctx;
+    const inst = func.definingInst(v) orelse return false;
+    return switch (func.opcode(inst)) {
+        .call, .call_indirect => true,
+        else => false,
+    };
+}
+
 fn x86_64CopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
     _ = ctx;
     const inst = func.definingInst(v) orelse return null;
@@ -4932,6 +5035,8 @@ pub fn x86_64RegDescription(allocator: std.mem.Allocator, func: *const Function)
         .classOf = x86_64ClassOf,
         .useKind = x86_64UseKind,
         .copySource = x86_64CopySource,
+        .defAfterClobber = x86_64DefAfterClobber,
+        .useHint = x86_64UseHint,
         .destructiveSource = x86_64DestructiveSource,
         .destructiveAlternate = x86_64DestructiveAlternate,
         .fusedOperands = x86_64FusedOperands,
@@ -5937,6 +6042,27 @@ test "a call's reloc still defaults to .call (existing call sites unaffected by 
     try std.testing.expectEqualStrings("callee", compiled.relocs[0].symbol);
 }
 
+test "a call whose result is returned leaves through a jump, and one whose result is used does not" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ true, false }) |tail| {
+        var caller = Function.init(allocator);
+        defer caller.deinit();
+        const t = try caller.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+        const b = try caller.appendBlock();
+        const x = try caller.appendBlockParam(b, t);
+        const y = try caller.appendBlockParam(b, t);
+        const r = try caller.appendCall(b, t, "callee", &.{ y, x });
+        const out = if (tail) r else try caller.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = r, .rhs = x } });
+        caller.setTerminator(b, .{ .ret = ir.function.Ret.one(out) });
+        var compiled = try compile(allocator, &caller);
+        defer compiled.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), compiled.relocs.len);
+        const opcode = compiled.code[compiled.relocs[0].offset - 1];
+        try std.testing.expectEqual(@as(u8, if (tail) 0xE9 else 0xE8), opcode);
+        if (tail) try std.testing.expectEqual(@as(usize, compiled.relocs[0].offset + 4), compiled.code.len);
+    }
+}
+
 test "a call keeps RSP 16-aligned at the call site (movaps-safe host calls)" {
     // A callee that reads its stack with movaps faults on real hardware
     // when the caller's RSP is misaligned. qemu-user does not enforce this,
@@ -6048,7 +6174,7 @@ test "a call_indirect that fits in the argument registers opens no stack window"
     const text = try @import("disasm.zig").format(allocator, code);
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "mov qword ptr [rsp], ") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "call r10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "jmp r10") != null);
 }
 
 test "a gp stack argument stored from a slot goes through the scratch" {
@@ -6540,6 +6666,127 @@ fn emitRmw(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst, st: 
     };
     const form: encode.MemForm = .{ .prefix = prefix, .w = bits == 64, .op = if (bits == 8) op - 1 else op, .byte_reg = bits == 8 };
     try ctx.put(allocator, encode.memIndexed(form, @backingInt(reg), base, index, scale, disp));
+}
+
+/// A branch on `(x & k) == 0` or `!= 0`, run as one `test`. With `load` set, `x` is a load that
+/// only this test reads, and the test reads memory at the load's address.
+const TestFold = struct { operand: Value, imm: i64, bits: u16, load: ?ir.function.Inst };
+
+fn testFold(func: *const Function, insts: []const ir.function.Inst, if_idx: usize) ?TestFold {
+    if (if_idx < 1 or !fusesIntoNextIf(func, insts, if_idx - 1)) return null;
+    const cmp = func.opcode(insts[if_idx - 1]).icmp;
+    if (cmp.op != .eq and cmp.op != .ne) return null;
+    const zero = func.definingInst(cmp.rhs) orelse return null;
+    switch (func.opcode(zero)) {
+        .iconst => |c| if (c != 0) return null,
+        else => return null,
+    }
+    if (bitTest(func, cmp) != null) return null;
+    if (func.types.type_kind(func.valueType(cmp.lhs)) != .int) return null;
+    const and_inst = func.definingInst(cmp.lhs) orelse return null;
+    if (std.mem.indexOfScalar(ir.function.Inst, insts[0 .. if_idx - 1], and_inst) == null) return null;
+    const x: Value, const k: i64 = switch (func.opcode(and_inst)) {
+        .arith => |a| mask: {
+            if (a.op != .bit_and) return null;
+            const c = func.definingInst(a.rhs) orelse return null;
+            break :mask switch (func.opcode(c)) {
+                .iconst => |v| .{ a.lhs, v },
+                else => return null,
+            };
+        },
+        .arith_imm => |a| if (a.op == .bit_and) .{ a.lhs, a.imm } else return null,
+        else => return null,
+    };
+    if (func.types.type_kind(func.valueType(x)) != .int) return null;
+    if (countUses(func, cmp.lhs) != 1) return null;
+    const bits = intBits(func, x);
+    if (bits > 64) return null;
+    const imm: i64 = if (bits == 64) k else k & ((@as(i64, 1) << @intCast(bits)) - 1);
+    var fold: TestFold = .{ .operand = x, .imm = imm, .bits = bits, .load = null };
+    if (testLoad(func, insts, x, if_idx)) |load| {
+        fold.load = load;
+        if (memTest(.rax, 0, fold) != null) return fold;
+        fold.load = null;
+    }
+    if (bits == 64 and std.math.cast(i32, imm) == null) return null;
+    return fold;
+}
+
+/// The load that defines `x` when a test may read its memory in place: only the test reads it,
+/// and nothing between the load and the branch writes memory.
+fn testLoad(func: *const Function, insts: []const ir.function.Inst, x: Value, if_idx: usize) ?ir.function.Inst {
+    const inst = func.definingInst(x) orelse return null;
+    const l = switch (func.opcode(inst)) {
+        .load => |l| l,
+        else => return null,
+    };
+    if (l.@"volatile" or l.mask != null or sibAddress(func, inst) != null) return null;
+    switch (intBits(func, x)) {
+        8, 16, 32, 64 => {},
+        else => return null,
+    }
+    const at = std.mem.indexOfScalar(ir.function.Inst, insts[0..if_idx], inst) orelse return null;
+    if (countUses(func, x) != 1) return null;
+    for (insts[at + 1 .. if_idx]) |between| switch (func.opcode(between)) {
+        .iconst, .arith, .arith_imm, .icmp, .convert, .select, .unary, .global_addr, .load, .extract => {},
+        else => return null,
+    };
+    return inst;
+}
+
+/// `test [base + disp], imm` for a test fold, or null when the mask has no encoding. A mask
+/// inside one byte tests only that byte.
+fn memTest(base: Reg, disp: i32, fold: TestFold) ?encode.Inst {
+    const bytes: u6 = @intCast(fold.bits / 8);
+    for (0..bytes) |j| {
+        const shift: u6 = @intCast(j * 8);
+        if (fold.imm & ~(@as(i64, 0xFF) << shift) == 0) {
+            const lane: i32 = @intCast((fold.imm >> shift) & 0xFF);
+            return encode.memIndexedImm(.{ .op = 0xF6 }, 0, base, null, 0, disp + @as(i32, @intCast(j)), lane, 1);
+        }
+    }
+    return switch (fold.bits) {
+        16 => encode.memIndexedImm(.{ .prefix = 0x66, .op = 0xF7 }, 0, base, null, 0, disp, @intCast(fold.imm), 2),
+        32 => encode.memIndexedImm(.{ .op = 0xF7 }, 0, base, null, 0, disp, @bitCast(@as(u32, @intCast(fold.imm))), 4),
+        64 => encode.memIndexedImm(.{ .w = true, .op = 0xF7 }, 0, base, null, 0, disp, std.math.cast(i32, fold.imm) orelse return null, 4),
+        else => null,
+    };
+}
+
+/// Turn each test fold into a compare of its operand with itself, the shape no other analysis
+/// reads, and drop the `and` and the load. `tests` maps each compare to its fold for emission.
+fn applyTestFolds(allocator: std.mem.Allocator, func: *Function, tests: *std.AutoHashMapUnmanaged(ir.function.Inst, TestFold)) Error!void {
+    for (0..func.blockCount()) |bi| {
+        const list = func.blockInstsMut(@fromBackingInt(@intCast(bi)));
+        if (list.items.len < 2) continue;
+        const last = list.items.len - 1;
+        if (func.opcode(list.items[last]) != .@"if") continue;
+        const fold = testFold(func, list.items, last) orelse continue;
+        const icmp_inst = list.items[last - 1];
+        const cmp = &func.opcodeMut(icmp_inst).icmp;
+        const and_inst = func.definingInst(cmp.lhs).?;
+        const operand = if (fold.load) |load| func.opcode(load).load.ptr else fold.operand;
+        cmp.lhs = operand;
+        cmp.rhs = operand;
+        try tests.put(allocator, icmp_inst, fold);
+        for ([_]?ir.function.Inst{ and_inst, fold.load }) |gone| {
+            const inst = gone orelse continue;
+            const at = std.mem.indexOfScalar(ir.function.Inst, list.items, inst).?;
+            _ = list.orderedRemove(at);
+        }
+    }
+}
+
+fn emitTestFold(allocator: std.mem.Allocator, ctx: *Ctx, fold: TestFold) Error!void {
+    if (fold.load) |load| {
+        const base = try ctx.use(allocator, ctx.fold.baseOf(ctx.func, load), scratch1);
+        const disp: i32 = @intCast(ctx.fold.offOf(load));
+        try ctx.put(allocator, memTest(base, disp, fold).?);
+        return;
+    }
+    const r = try ctx.use(allocator, fold.operand, scratch1);
+    const imm: i32 = if (fold.bits > 32) @intCast(fold.imm) else @bitCast(@as(u32, @intCast(fold.imm)));
+    try ctx.put(allocator, encode.testImm(r, imm, fold.bits > 32));
 }
 
 /// A compare of `(mask >> index) & 1` against zero with a constant mask: a set membership test,

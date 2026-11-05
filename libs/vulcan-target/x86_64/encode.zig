@@ -818,6 +818,32 @@ pub fn testReg(a: Reg, b: Reg, w: bool) Inst {
     return aluRR(0x85, b, a, w);
 }
 
+/// `test r, imm`: set flags from `r & imm`. A mask that fits the low byte takes the byte form
+/// (F6 /0 ib), otherwise F7 /0 id. `w` picks the 64-bit form, whose imm32 is sign-extended.
+pub fn testImm(r: Reg, imm: i32, w: bool) Inst {
+    const rn = n(r);
+    const u: u32 = @bitCast(imm);
+    if (imm >= 0 and imm <= 0xFF) {
+        const mrm: u8 = 0xC0 | (rn & 7);
+        if (rn >= 4) return Inst.of(&.{ 0x40 | @as(u8, @intFromBool(rn >= 8)), 0xF6, mrm, @truncate(u) });
+        return Inst.of(&.{ 0xF6, mrm, @truncate(u) });
+    }
+    const mrm: u8 = 0xC0 | (rn & 7);
+    if (rexOne(rn >= 8, w)) |rex| return Inst.of(&.{ rex, 0xF7, mrm, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
+    return Inst.of(&.{ 0xF7, mrm, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
+}
+
+test "testImm picks the byte form for a low mask" {
+    // test bl, 1
+    try std.testing.expectEqualSlices(u8, &.{ 0xF6, 0xC3, 0x01 }, testImm(.rbx, 1, false).slice());
+    // test sil, 0x80
+    try std.testing.expectEqualSlices(u8, &.{ 0x40, 0xF6, 0xC6, 0x80 }, testImm(.rsi, 0x80, false).slice());
+    // test r9d, 0x100
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0xF7, 0xC1, 0x00, 0x01, 0x00, 0x00 }, testImm(.r9, 0x100, false).slice());
+    // test byte [rax + 4], 2
+    try std.testing.expectEqualSlices(u8, &.{ 0xF6, 0x40, 0x04, 0x02 }, memIndexedImm(.{ .op = 0xF6 }, 0, .rax, null, 0, 4, 2, 1).slice());
+}
+
 /// `test al, al` (84 C0): set flags from the low byte of RAX only. The System V variadic
 /// prologue decides whether to save xmm registers based on AL, the count of vector registers
 /// the caller used. So it must test exactly AL, not EAX. The `mov al, imm8` caller convention
@@ -1110,9 +1136,15 @@ pub fn memIndexed(form: MemForm, reg: u8, base: Reg, index: ?Reg, scale: u2, dis
     len += 1;
     // rbp and r13 as a base have no mod=00 form, so they take a zero disp8.
     const mod: u8 = if (disp == 0 and b & 7 != 5) 0x00 else if (disp >= -128 and disp <= 127) 0x40 else 0x80;
-    buf[len] = mod | ((reg & 7) << 3) | 0x04;
-    buf[len + 1] = (@as(u8, scale) << 6) | ((x & 7) << 3) | (b & 7);
-    len += 2;
+    if (index == null and b & 7 != 4) {
+        // A base without an index needs no SIB byte, except rsp and r12.
+        buf[len] = mod | ((reg & 7) << 3) | (b & 7);
+        len += 1;
+    } else {
+        buf[len] = mod | ((reg & 7) << 3) | 0x04;
+        buf[len + 1] = (@as(u8, scale) << 6) | ((x & 7) << 3) | (b & 7);
+        len += 2;
+    }
     const u: u32 = @bitCast(disp);
     if (mod == 0x40) {
         buf[len] = @truncate(u);
@@ -1139,7 +1171,7 @@ test "memIndexedImm appends the immediate after the address" {
     // add dword [rdx + rax*4], 1
     try std.testing.expectEqualSlices(u8, &.{ 0x83, 0x04, 0x82, 0x01 }, memIndexedImm(.{ .op = 0x83 }, 0, .rdx, .rax, 2, 0, 1, 1).slice());
     // xor qword [rbx + 16], 0x1000
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x81, 0x74, 0x23, 0x10, 0x00, 0x10, 0x00, 0x00 }, memIndexedImm(.{ .w = true, .op = 0x81 }, 6, .rbx, null, 0, 16, 0x1000, 4).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x81, 0x73, 0x10, 0x00, 0x10, 0x00, 0x00 }, memIndexedImm(.{ .w = true, .op = 0x81 }, 6, .rbx, null, 0, 16, 0x1000, 4).slice());
 }
 
 pub fn memIndexedLea(dst: Reg, base: Reg, index: Reg, scale: u2) Inst {
@@ -1148,7 +1180,7 @@ pub fn memIndexedLea(dst: Reg, base: Reg, index: Reg, scale: u2) Inst {
 
 test "memIndexed encodes scaled-index loads and stores" {
     // mov [r11 + 4], eax with no index
-    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0x89, 0x44, 0x23, 0x04 }, memIndexed(mem_form.store32, 0, .r11, null, 0, 4).slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0x89, 0x43, 0x04 }, memIndexed(mem_form.store32, 0, .r11, null, 0, 4).slice());
     // lea r11, [r11 + r10*4]
     try std.testing.expectEqualSlices(u8, &.{ 0x4F, 0x8D, 0x1C, 0x93 }, memIndexedLea(.r11, .r11, .r10, 2).slice());
     // mov eax, [rdi + rcx*4]
