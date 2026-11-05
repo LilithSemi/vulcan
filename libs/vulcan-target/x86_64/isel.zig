@@ -800,7 +800,9 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
     // original `func`'s identical, longer-lived symbol string. The clone
     // re-interned symbols one to one, so the same name exists there. This keeps
     // the borrowed-name contract intact.
-    for (compiled.relocs) |*r| r.symbol = rebindSymbolName(func, r.symbol);
+    for ([_][]Reloc{ compiled.relocs, compiled.cold_relocs }) |relocs| for (relocs) |*r| {
+        if (r.kind != .to_cold and r.kind != .to_hot) r.symbol = rebindSymbolName(func, r.symbol);
+    };
     return compiled;
 }
 
@@ -6931,4 +6933,36 @@ fn emitBitTest(allocator: std.mem.Allocator, ctx: *Ctx, b: BitTest) Error!encode
     try ctx.put(allocator, encode.movImm64(scratch2, @bitCast(b.mask)));
     try ctx.put(allocator, encode.btReg(scratch2, index));
     return if (b.set) .b else .ae;
+}
+
+test "split_cold moves the unexpected side of a hinted branch to the cold part" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const work = try func.appendBlock();
+    const fail = try func.appendBlock();
+    const flag = try func.appendBlockParam(entry, bool_t);
+    const x = try func.appendBlockParam(entry, t);
+    try func.appendIf(entry, flag, .{ .target = work }, .{ .target = fail });
+    const if_inst = func.blockInsts(entry)[func.blockInsts(entry).len - 1];
+    try func.setBranchHint(if_inst, true);
+    const y = try func.appendArithImm(work, t, .add, x, 1);
+    func.setTerminator(work, .{ .ret = ir.function.Ret.one(y) });
+    const r = try func.appendCall(fail, t, "report", &.{x});
+    const z = try func.appendArithImm(fail, t, .mul, r, 3);
+    func.setTerminator(fail, .{ .ret = ir.function.Ret.one(z) });
+
+    var compiled = try compileWithCaps(allocator, &func, .{ .split_cold = true });
+    defer compiled.deinit(allocator);
+    try std.testing.expect(compiled.cold.len != 0);
+    var to_cold: usize = 0;
+    for (compiled.relocs) |rel| {
+        if (rel.kind == .to_cold) to_cold += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), to_cold);
+    try std.testing.expectEqual(@as(usize, 1), compiled.cold_relocs.len);
+    try std.testing.expectEqualStrings("report", compiled.cold_relocs[0].symbol);
 }

@@ -132,8 +132,13 @@ fn testOnly(func: *const Function, block: Block) bool {
 /// or the block heads a loop.
 fn jumpPreds(allocator: std.mem.Allocator, func: *const Function, doms: *const dominators.Dominators, block: Block, preds: *std.ArrayList(Block)) !bool {
     for (0..func.blockCount()) |pi| {
-        if (!doms.isReachable(pi)) continue;
         const pred: Block = @fromBackingInt(@intCast(pi));
+        // A copy made earlier in this run has no dominator facts, so a join it feeds stays put.
+        if (pi >= doms.reachable.len) {
+            if (feeds(func, pred, block)) return false;
+            continue;
+        }
+        if (!doms.isReachable(pi)) continue;
         for (func.blockInsts(pred)) |inst| if (func.opcode(inst) == .@"if") {
             const cf = func.opcode(inst).@"if";
             if (cf.then.target == block or cf.@"else".target == block) return false;
@@ -148,6 +153,19 @@ fn jumpPreds(allocator: std.mem.Allocator, func: *const Function, doms: *const d
         }
     }
     return true;
+}
+
+/// Whether `pred` branches or jumps to `block`.
+fn feeds(func: *const Function, pred: Block, block: Block) bool {
+    for (func.blockInsts(pred)) |inst| if (func.opcode(inst) == .@"if") {
+        const cf = func.opcode(inst).@"if";
+        if (cf.then.target == block or cf.@"else".target == block) return true;
+    };
+    const term = func.terminator(pred) orelse return false;
+    return switch (term) {
+        .jump => |j| j.target == block,
+        .ret => false,
+    };
 }
 
 const testing = std.testing;
