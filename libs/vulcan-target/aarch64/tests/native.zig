@@ -5068,6 +5068,41 @@ test "aarch64 arith_branch: and-and-branch (a&b; if !=0) folds to ands+b.ne" {
     try expectRun(allocator, &func, &.{ 7, 7 }, 100);
 }
 
+test "aarch64 arith_branch: logical immediate stays immediate when fused into a branch" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const even = try func.appendBlock();
+    const odd = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, t);
+    const mask = try func.appendInst(entry, t, .{ .iconst = 1 });
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const low_bit = try func.appendInst(entry, t, .{ .arith = .{ .op = .bit_and, .lhs = x, .rhs = mask } });
+    const is_even = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = low_bit, .rhs = zero } });
+    try func.appendIf(entry, is_even, .{ .target = even }, .{ .target = odd });
+    const even_value = try func.appendInst(even, t, .{ .iconst = 100 });
+    func.setTerminator(even, .{ .ret = ir.function.Ret.one(even_value) });
+    const odd_value = try func.appendInst(odd, t, .{ .iconst = 200 });
+    func.setTerminator(odd, .{ .ret = ir.function.Ret.one(odd_value) });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ands w") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#0x1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.eq ") != null);
+
+    try expectRun(allocator, &func, &.{0}, 100);
+    try expectRun(allocator, &func, &.{2}, 100);
+    try expectRun(allocator, &func, &.{1}, 200);
+    try expectRun(allocator, &func, &.{3}, 200);
+}
+
 test "aarch64 arith_branch off (flag false) emits arith+cmp+branch, no S-form for the branch" {
     const allocator = std.testing.allocator;
     var func = try buildArithBranchImm(allocator, 32, .sub, 1, .ne, 100, 200);

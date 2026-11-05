@@ -3153,6 +3153,13 @@ const Ctx = struct {
         const wide = isWide(self.func, result);
         switch (self.func.opcode(arith_inst)) {
             .arith => |a| {
+                // The allocator omits an encodable logical immediate's register. Preserve that
+                // immediate form when the arithmetic operation is fused into this branch too.
+                if (logicalImmFold(self.func, a, result)) |f| {
+                    const rl = try self.loadOp(allocator, code, f.base, spill_op[0]);
+                    try code.append(allocator, encode.andsImm(rd, rl, @bitCast(f.imm), wide).?);
+                    return;
+                }
                 const rl = try self.loadOp(allocator, code, a.lhs, spill_op[0]);
                 const rr = try self.loadOp(allocator, code, a.rhs, spill_op[1]);
                 try code.append(allocator, switch (a.op) {
