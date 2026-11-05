@@ -27,6 +27,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
 
+      # vcc targets Linux, so on macOS it compiles against Linux headers from the binary cache.
+      - name: Point vcc at Linux headers
+        if: runner.os == 'macOS'
+        run: echo "VCC_GLIBC_INCLUDE=$(nix build --inputs-from . --no-link --print-out-paths nixpkgs#legacyPackages.aarch64-linux.glibc.dev)/include" >> "$GITHUB_ENV"
+
       - name: Run the benchmark
         run: nix develop -c zig build bench -- --format github > bench.md
 

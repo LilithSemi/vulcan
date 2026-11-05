@@ -185,7 +185,7 @@ const Options = struct {
 /// Which autoconf-style version probe was requested. `main` answers these BEFORE running
 /// the normal compile/link pipeline, since none of them take an input file. `AC_PROG_CC`
 /// and similar macros run the compiler with only one of these flags.
-const Probe = enum { version, dumpversion, dumpmachine };
+const Probe = enum { version, dumpversion, dumpmachine, cpu_model };
 
 /// The version string `--version` / `-dumpversion` report: a plain `MAJOR.MINOR.PATCH`
 /// value. It does not pretend to be a particular GCC release.
@@ -398,6 +398,8 @@ fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (e
             opts.probe = .dumpversion;
         } else if (std.mem.eql(u8, arg, "-dumpmachine")) {
             opts.probe = .dumpmachine;
+        } else if (std.mem.eql(u8, arg, "-print-cpu-model")) {
+            opts.probe = .cpu_model;
         } else if (std.mem.eql(u8, arg, "-S")) {
             // `-S` asks for a textual assembly output, a codegen mode VCC does not have.
             // Ignoring it would silently produce the wrong output type (see the
@@ -1428,6 +1430,16 @@ pub fn main(init: std.process.Init) !void {
                     (hostLinkArch() catch return fail(errw, "no native linker support for this host architecture (pass -target)", .{}));
                 try w.interface.print("{s}\n", .{archTriple(probe_arch)});
             },
+            // The microarch model this compile tunes for, or the host CPU it has no model for.
+            .cpu_model => {
+                const probe_arch: link.Arch = opts.target_arch orelse
+                    (hostLinkArch() catch return fail(errw, "no native linker support for this host architecture (pass -target)", .{}));
+                if (try resolveModel(&opts, probe_arch, errw)) |m| {
+                    try w.interface.print("{s}\n", .{m.tag.name()});
+                } else {
+                    try w.interface.print("unsupported ({s})\n", .{builtin.cpu.model.name});
+                }
+            },
         }
         try w.interface.flush();
         return;
@@ -2000,6 +2012,14 @@ test "parseArgs: -falign-loops and -falign-functions read their alignment" {
     var it2 = SliceArgs{ .items = &.{ "-fno-align-loops", "foo.c" } };
     const o2 = try parseArgs(allocator, testErrw(), &it2);
     try std.testing.expectEqual(@as(?u16, 1), o2.align_loops);
+}
+
+test "parseArgs: -print-cpu-model sets its probe" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var it = SliceArgs{ .items = &.{"-print-cpu-model"} };
+    const o = try parseArgs(arena.allocator(), testErrw(), &it);
+    try std.testing.expectEqual(Probe.cpu_model, o.probe.?);
 }
 
 test "parseArgs: -dumpversion and -dumpmachine set their own probes" {

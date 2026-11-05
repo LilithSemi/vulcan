@@ -36,6 +36,8 @@ const ExecutionResult = struct {
 const Format = enum { text, github };
 
 const Report = struct {
+    /// The microarch model vcc tunes for here, from `vcc -print-cpu-model`.
+    cpu_model: []const u8,
     compilers: []const Compiler,
     skipped: []const []const u8,
     workloads: []const []const u8,
@@ -123,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
             try buildExecutable(allocator, io, compiler, source_path, exe_path);
             const result = try benchmarkExecutable(allocator, io, compiler, exe_path);
             if (expected_checksum) |expected| {
-                if (!std.mem.eql(u8, expected, result.checksum)) {
+                if (!sameChecksum(expected, result.checksum)) {
                     std.debug.print("checksum mismatch for {s}: vcc={s}, {s}={s}\n", .{ workload, expected, compiler.name, result.checksum });
                     return error.ChecksumMismatch;
                 }
@@ -134,7 +136,9 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    const cpu_model = try cpuModel(allocator, io, vcc);
     const report: Report = .{
+        .cpu_model = cpu_model,
         .compilers = compilers.items,
         .skipped = skipped.items,
         .workloads = workloads.items,
@@ -151,6 +155,40 @@ pub fn main(init: std.process.Init) !void {
     try writer.flush();
 }
 
+/// Whether two checksums agree. Integer output must match exactly. A floating point result may
+/// differ in its last bits, since C lets a compiler fuse a multiply and an add, so decimal output
+/// matches within a relative 1e-9.
+fn sameChecksum(expected: []const u8, actual: []const u8) bool {
+    if (std.mem.eql(u8, expected, actual)) return true;
+    var left = std.mem.tokenizeAny(u8, expected, " \t\r\n");
+    var right = std.mem.tokenizeAny(u8, actual, " \t\r\n");
+    while (true) {
+        const a = left.next();
+        const b = right.next();
+        if (a == null or b == null) return a == null and b == null;
+        if (std.mem.eql(u8, a.?, b.?)) continue;
+        if (std.mem.indexOfScalar(u8, a.?, '.') == null or std.mem.indexOfScalar(u8, b.?, '.') == null) return false;
+        const x = std.fmt.parseFloat(f64, a.?) catch return false;
+        const y = std.fmt.parseFloat(f64, b.?) catch return false;
+        if (@abs(x - y) > 1e-9 * @max(@abs(x), @abs(y))) return false;
+    }
+}
+
+test "sameChecksum allows a last-bits float difference and nothing else" {
+    try std.testing.expect(sameChecksum("12496323.004", "12496323.002"));
+    try std.testing.expect(!sameChecksum("12496323.004", "12496323.104"));
+    try std.testing.expect(!sameChecksum("918405997", "918405996"));
+    try std.testing.expect(sameChecksum("5 6 7", "5 6 7"));
+    try std.testing.expect(!sameChecksum("5 6", "5 6 7"));
+}
+
+/// The model vcc picks for this CPU, or `unsupported (<cpu>)` when it has none.
+fn cpuModel(allocator: std.mem.Allocator, io: std.Io, vcc: []const u8) ![]const u8 {
+    const result = std.process.run(allocator, io, .{ .argv = &.{ vcc, "-print-cpu-model" } }) catch return "unknown";
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    return if (trimmed.len == 0) "unknown" else trimmed;
+}
+
 fn percent(value: u64, base: u64) u64 {
     return @divTrunc(value * 100, @max(base, 1));
 }
@@ -161,6 +199,7 @@ fn writeText(writer: *std.Io.Writer, report: Report) !void {
             "VCC is built ReleaseFast; compiler process startup is included.\n",
         .{samples},
     );
+    try writer.print("CPU model: {s}\n", .{report.cpu_model});
     if (report.skipped.len != 0) {
         try writer.writeAll("optional compilers not found:");
         for (report.skipped) |name| try writer.print(" {s}", .{name});
@@ -217,6 +256,7 @@ fn writeText(writer: *std.Io.Writer, report: Report) !void {
 /// in collapsed `<details>` blocks.
 fn writeGithub(writer: *std.Io.Writer, report: Report) !void {
     try writer.writeAll("## Vulcan benchmark on " ++ system ++ "\n\n");
+    try writer.print("CPU model: `{s}`\n\n", .{report.cpu_model});
     try writer.print("Best of {d} runs, lower is better. Process startup is included.", .{samples});
     if (report.skipped.len != 0) {
         try writer.writeAll(" Not found:");
@@ -224,7 +264,7 @@ fn writeGithub(writer: *std.Io.Writer, report: Report) !void {
         try writer.writeByte('.');
     }
     if (!executes) {
-        try writer.writeAll(" Generated code is not timed, since vcc cannot link executables on " ++ system ++ " yet.");
+        try writer.writeAll(" Generated code is not timed, since vcc cannot link executables on " ++ system ++ " yet. vcc compiles against Linux headers here, since it targets Linux.");
         try writer.writeAll("\n\n| compiler | compile (`-O2 -c`) | vs vcc |\n|---|---:|---:|\n");
         for (report.compilers, 0..) |compiler, index| {
             try writer.print("| {s} | ", .{compiler.name});
