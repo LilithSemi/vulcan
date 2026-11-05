@@ -19,6 +19,7 @@ const loops_mod = @import("loops.zig");
 
 const Function = ir.function.Function;
 const Block = ir.function.Block;
+const Value = ir.function.Value;
 
 pub const pass_def = pass.Pass{ .name = "blocklayout", .run = run };
 
@@ -197,8 +198,8 @@ fn coldBlocks(allocator: std.mem.Allocator, func: *const Function, cfg: *const c
             .@"if" => |c| c,
             else => continue,
         };
-        const then_likely = func.branchHint(inst) orelse continue;
         if (cf.then.target == cf.@"else".target) continue;
+        const then_likely = func.branchHint(inst) orelse staticHint(func, cf) orelse continue;
         unlikely[b] = @backingInt(if (then_likely) cf.@"else".target else cf.then.target);
         any = true;
     }
@@ -225,6 +226,86 @@ fn coldBlocks(allocator: std.mem.Allocator, func: *const Function, cfg: *const c
         }
     }
     return cold;
+}
+
+/// Whether the `then` side of an unhinted branch is the likely one, by the static rules: a side
+/// that soon returns a negative constant or null, or calls a function that does not return, is
+/// the unlikely one. Null when the rules see no difference.
+fn staticHint(func: *const Function, cf: ir.function.If) ?bool {
+    const then_error = errorPath(func, cf.then);
+    const else_error = errorPath(func, cf.@"else");
+    if (then_error == else_error) return null;
+    return else_error;
+}
+
+/// Whether the path from `edge` runs straight to an error: a return of a negative constant or
+/// null, or a call that does not return, through at most four blocks.
+fn errorPath(func: *const Function, edge: ir.function.Jump) bool {
+    var path: [4]ir.function.Jump = undefined;
+    var len: usize = 0;
+    var next = edge;
+    while (len < path.len) {
+        path[len] = next;
+        len += 1;
+        const block = next.target;
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+            .call => |c| if (noReturn(func.symbolName(c.symbol))) return true,
+            .@"if" => return false,
+            else => {},
+        };
+        const term = func.terminator(block) orelse return false;
+        switch (term) {
+            .jump => |j| next = j,
+            .ret => |r| {
+                if (r.count != 1) return false;
+                return errorValue(func, passedValue(func, path[0..len], r.values[0]));
+            },
+        }
+    }
+    return false;
+}
+
+/// The value `v` names before the edges of `path` bind it to a block param.
+fn passedValue(func: *const Function, path: []const ir.function.Jump, v: Value) Value {
+    var value = v;
+    var k = path.len;
+    while (k > 0) {
+        k -= 1;
+        const params = func.blockParams(path[k].target);
+        const index = std.mem.indexOfScalar(Value, params, value) orelse continue;
+        value = func.blockArgs(path[k])[index];
+    }
+    return value;
+}
+
+/// A negative signed constant or a null pointer, the usual error results.
+fn errorValue(func: *const Function, v: Value) bool {
+    const inst = func.definingInst(v) orelse return false;
+    switch (func.opcode(inst)) {
+        .iconst => |c| return switch (func.types.type_kind(func.valueType(v))) {
+            .int => |i| i.signedness == .signed and c < 0,
+            .ptr => c == 0,
+            else => false,
+        },
+        .convert => |cv| {
+            if (func.types.type_kind(func.valueType(v)) == .ptr) {
+                const src = func.definingInst(cv.value) orelse return false;
+                return switch (func.opcode(src)) {
+                    .iconst => |c| c == 0,
+                    else => false,
+                };
+            }
+            return errorValue(func, cv.value);
+        },
+        else => return false,
+    }
+}
+
+/// A C library or kernel function that never returns.
+fn noReturn(name: []const u8) bool {
+    const names = [_][]const u8{ "abort", "exit", "_exit", "_Exit", "quick_exit", "__assert_fail", "__assert_rtn", "__stack_chk_fail", "__fortify_fail", "longjmp", "siglongjmp", "panic", "err", "errx" };
+    for (names) |known| if (std.mem.eql(u8, name, known)) return true;
+    return false;
 }
 
 fn isPlaceable(doms: *const dominators.Dominators, placed: []const bool, b: u32) bool {
@@ -561,4 +642,26 @@ test "blocklayout: a hinted branch falls into its expected side and moves the ot
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
     try testing.expect(diags.ok());
+}
+
+test "blocklayout: a branch side that returns a negative constant goes last" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const fail = try func.appendBlock();
+    const work = try func.appendBlock();
+    const flag = try func.appendBlockParam(entry, bool_t);
+    const x = try func.appendBlockParam(entry, i32_t);
+    try func.appendIf(entry, flag, .{ .target = fail }, .{ .target = work });
+    const err = try func.appendInst(fail, i32_t, .{ .iconst = -22 });
+    func.setTerminator(fail, .{ .ret = ir.function.Ret.one(err) });
+    const y = try func.appendArithImm(work, i32_t, .add, x, 1);
+    func.setTerminator(work, .{ .ret = ir.function.Ret.one(y) });
+
+    try testing.expect(try layout(allocator, &func, null));
+    try testing.expectEqual(@as(usize, 1), func.blockInsts(@fromBackingInt(1)).len);
+    try testing.expectEqual(@as(i64, -22), blockConst(&func, @fromBackingInt(2)).?);
 }
