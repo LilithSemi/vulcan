@@ -91,6 +91,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 candidate.ty,
                 .{ .iconst = candidate.imm },
             );
+            beforeBranch(func, @fromBackingInt(@intCast(candidate.preheader)));
             try materialized.append(allocator, .{
                 .preheader = candidate.preheader,
                 .ty = candidate.ty,
@@ -119,6 +120,14 @@ fn executesEveryIteration(loop: *const loops.Loop, graph: *const cfg_mod.Cfg, do
         }
     }
     return found_latch;
+}
+
+/// Move the instruction just appended to `block` in front of the `if` that ends it, since control
+/// leaves the block at that `if`.
+fn beforeBranch(func: *Function, block: ir.function.Block) void {
+    const insts = func.blockInstsMut(block).items;
+    if (insts.len < 2 or func.opcode(insts[insts.len - 2]) != .@"if") return;
+    std.mem.swap(Inst, &insts[insts.len - 1], &insts[insts.len - 2]);
 }
 
 fn findMaterialized(values: []const Materialized, preheader: u32, ty: Type, imm: i64) ?Value {
@@ -152,6 +161,34 @@ test "hoists a wide add immediate from a loop backbone" {
     try std.testing.expectEqual(state, rewritten.lhs);
     try std.testing.expectEqual(@as(i64, 1013904223), func.opcode(func.definingInst(rewritten.rhs).?).iconst);
     try std.testing.expect(std.mem.indexOfScalar(Inst, func.blockInsts(entry), func.definingInst(rewritten.rhs).?) != null);
+}
+
+test "a hoisted immediate goes before the branch that ends the preheader" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_ty = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const done = try func.appendBlock();
+    const seed = try func.appendInst(entry, ty, .{ .iconst = 1 });
+    const enter = try func.appendBlockParam(entry, bool_ty);
+    try func.appendIf(entry, enter, .{ .target = header, .args = &.{seed} }, .{ .target = done, .args = &.{seed} });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    const state = try func.appendBlockParam(header, ty);
+    const next = try func.appendInst(header, ty, .{ .arith_imm = .{ .op = .add, .lhs = state, .imm = 12345 } });
+    const keep_going = try func.appendInst(header, bool_ty, .{ .icmp = .{ .op = .ne, .lhs = next, .rhs = state } });
+    try func.appendIf(header, keep_going, .{ .target = header, .args = &.{next} }, .{ .target = done, .args = &.{next} });
+    func.setTerminator(header, .{ .ret = ir.function.Ret.none() });
+    const result = try func.appendBlockParam(done, ty);
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(result) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+    const insts = func.blockInsts(entry);
+    try std.testing.expect(func.opcode(insts[insts.len - 1]) == .@"if");
 }
 
 test "keeps a small loop immediate encoded in the operation" {

@@ -4120,6 +4120,28 @@ fn aarch64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Val
 /// Report the operands read by an instruction after AArch64 immediate folding. This keeps folded
 /// constants out of live ranges, matching emission where they occupy instruction bits instead of a
 /// register.
+/// A multiply or shift that fuses into the next add or sub is emitted at that add or sub, so its
+/// operands are read there. Keeping them live that one position longer is always safe, so a
+/// shift is treated as fused even when the model leaves shift-add fusion off.
+fn aarch64LateRead(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) bool {
+    _ = ctx;
+    _ = operand;
+    const op = switch (func.opcode(inst)) {
+        .arith => |a| a.op,
+        else => return false,
+    };
+    if (op != .mul and op != .shl and op != .shr) return false;
+    for (0..func.blockCount()) |bi| {
+        const insts = func.blockInsts(@fromBackingInt(@intCast(bi)));
+        const idx = std.mem.indexOfScalar(ir.function.Inst, insts, inst) orelse continue;
+        return switch (op) {
+            .mul => fusesIntoNextArith(func, insts, idx) or fusesIntegerMulIntoNextImmAdd(func, insts, idx),
+            else => fusesIntoNextShiftAdd(func, insts, idx, true),
+        };
+    }
+    return false;
+}
+
 fn aarch64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, out: *[wimmer.max_fused_operands]Value) ?u8 {
     _ = ctx;
     switch (func.opcode(inst)) {
@@ -4377,6 +4399,7 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
         .destructiveSource = aarch64DestructiveSource,
         .isNarrow = aarch64IsNarrow,
         .fusedOperands = aarch64FusedOperands,
+        .lateRead = aarch64LateRead,
         .coalesce_block_params = true,
         .coalesce_spill_slots = true,
         .entry_fixed = entry_fixed,
@@ -7137,4 +7160,21 @@ test "an atomic is rejected, not dropped like a prefetch" {
 
         try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
     }
+}
+
+test "a multiply fused into the next add keeps its operands live to the add" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f64_t = try func.types.intern(.{ .float = .f64 });
+    const block = try func.appendBlock();
+    const x = try func.appendBlockParam(block, f64_t);
+    const y = try func.appendBlockParam(block, f64_t);
+    const c = try func.appendBlockParam(block, f64_t);
+    const product = try func.appendInst(block, f64_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+    const sum = try func.appendInst(block, f64_t, .{ .arith = .{ .op = .sub, .lhs = product, .rhs = c } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(sum) });
+
+    try std.testing.expect(aarch64LateRead(&aarch64_reg_ctx, &func, func.definingInst(product).?, x));
+    try std.testing.expect(!aarch64LateRead(&aarch64_reg_ctx, &func, func.definingInst(sum).?, c));
 }
