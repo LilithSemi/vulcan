@@ -180,6 +180,18 @@ fn greedyTrace(
 /// itself, so it is only ever placed explicitly at the start.
 /// The blocks only an unlikely edge reaches: the side a hinted `if` does not expect, and every
 /// block whose incoming edges all come from such blocks. With a profile, nothing is cold here.
+/// The blocks that branch hints and the static rules expect to run rarely, one flag per block.
+/// The caller owns the result.
+pub fn coldSet(allocator: std.mem.Allocator, func: *const Function) pass.Error![]bool {
+    var cfg = try cfg_mod.build(allocator, func);
+    defer cfg.deinit(allocator);
+    var doms = try dominators.compute(allocator, func);
+    defer doms.deinit(allocator);
+    const rpo = try cfg.reversePostorder(allocator);
+    defer allocator.free(rpo);
+    return coldBlocks(allocator, func, &cfg, &doms, rpo, null);
+}
+
 fn coldBlocks(allocator: std.mem.Allocator, func: *const Function, cfg: *const cfg_mod.Cfg, doms: *const dominators.Dominators, rpo: []const u32, profile: ?[]const u64) std.mem.Allocator.Error![]bool {
     const n = cfg.blockCount();
     const cold = try allocator.alloc(bool, n);

@@ -178,6 +178,8 @@ pub fn applyGlobalReloc(image: anytype, r: isel.Reloc, site_addr: usize, target_
         // `compileModule` rejects it (the JIT path has no dynamic GOT), so it cannot reach
         // this map-time patch.
         .got_pcrel => unreachable,
+        // The JIT path never splits a function, so no cross-part relocation reaches here.
+        .to_cold, .to_hot => unreachable,
     }
 }
 
@@ -235,6 +237,7 @@ pub fn compileModule(allocator: std.mem.Allocator, module: *const Module) Error!
                 // `vulcan-link`), so it never reaches here; reject it fail-closed with the
                 // same tag aarch64 uses for its GOT forms.
                 .got_pcrel => return error.UnsupportedReloc,
+                .to_cold, .to_hot => return error.UnsupportedReloc,
             }
         }
     }

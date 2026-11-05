@@ -51,7 +51,7 @@ const PCREL_ADDEND: i64 = -4;
 fn relocTypeOf(kind: isel.Kind) u32 {
     return switch (kind) {
         .call => R_X86_64_PLT32,
-        .pcrel_lea => R_X86_64_PC32,
+        .pcrel_lea, .to_cold, .to_hot => R_X86_64_PC32,
         .got_pcrel => R_X86_64_GOTPCREL,
     };
 }
@@ -101,13 +101,14 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
 
     // A text relocation recorded by its owning section and target name. Its target symbol
     // index resolves after every symbol is known.
-    const TextReloc = struct { sec: usize, offset: u64, name: []const u8, r_type: u32 };
+    const TextReloc = struct { sec: usize, offset: u64, name: []const u8, r_type: u32, addend: i64 = PCREL_ADDEND };
     var text_relocs: std.ArrayList(TextReloc) = .empty;
     // A data pointer-init relocation, likewise resolved by name after every symbol exists.
     const DataR = struct { sec: usize, offset: u64, name: []const u8 };
     var data_pending: std.ArrayList(DataR) = .empty;
 
-    const caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
+    var caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
+    caps.split_cold = true;
     for (module.funcs.items) |entry| {
         var compiled = try isel.compileWithCaps(allocator, entry.func, caps);
         defer compiled.deinit(allocator);
@@ -128,7 +129,23 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
         try symbols.append(a, .{ .name = entry.name, .section = @intCast(sec_index), .value = 0, .size = code.len, .binding = binding, .sym_type = .func, .defined = true });
         // Each isel relocation offset is already a byte offset into this function's own
         // code, so it is section-relative once rebased to its owning section.
-        for (compiled.relocs) |r| try text_relocs.append(a, .{ .sec = sec_index, .offset = r.offset, .name = r.symbol, .r_type = relocTypeOf(r.kind) });
+        const cold_name = try std.fmt.allocPrint(a, "{s}.cold", .{entry.name});
+        for (compiled.relocs) |r| try text_relocs.append(a, .{ .sec = sec_index, .offset = r.offset, .name = if (r.kind == .to_cold) cold_name else r.symbol, .r_type = relocTypeOf(r.kind), .addend = PCREL_ADDEND + r.addend });
+        // The blocks expected to run rarely go to their own section, like gcc's `.cold` parts.
+        if (compiled.cold.len != 0) {
+            const cold_index = sections.items.len;
+            try sections.append(a, .{
+                .name = try std.fmt.allocPrint(a, ".text.unlikely.{s}", .{entry.name}),
+                .sh_type = SHT_PROGBITS,
+                .flags = SHF_ALLOC | SHF_EXECINSTR,
+                .bytes = try a.dupe(u8, compiled.cold),
+                .size = compiled.cold.len,
+                .addralign = 16,
+            });
+            try reloc_lists.append(a, .empty);
+            try symbols.append(a, .{ .name = cold_name, .section = @intCast(cold_index), .value = 0, .size = compiled.cold.len, .binding = .local, .sym_type = .func, .defined = true });
+            for (compiled.cold_relocs) |r| try text_relocs.append(a, .{ .sec = cold_index, .offset = r.offset, .name = if (r.kind == .to_hot) entry.name else r.symbol, .r_type = relocTypeOf(r.kind), .addend = PCREL_ADDEND + r.addend });
+        }
     }
 
     // One section per data global.
@@ -161,7 +178,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
     // relocation is PC-relative, so each carries the `-4` addend.
     for (text_relocs.items) |p| {
         const sym = oeIndex(symbols.items, p.name).?;
-        try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = sym, .r_type = p.r_type, .addend = PCREL_ADDEND });
+        try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = sym, .r_type = p.r_type, .addend = p.addend });
     }
     // Resolve every data pointer-init relocation. Its target is an internally defined
     // global. It is an error if the target is missing.

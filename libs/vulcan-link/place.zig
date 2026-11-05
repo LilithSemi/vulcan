@@ -149,10 +149,12 @@ pub fn computeDefaultPlacement(
     var rodata_total: u64 = 0;
     var data_total: u64 = 0;
     var bss_total: u64 = 0;
-    for (0..nobj) |oi| {
+    // Code expected to run rarely packs after all other code, so the hot code stays dense.
+    for ([_]bool{ false, true }) |cold_pass| for (0..nobj) |oi| {
         const obase = section_place_base[oi];
         for (objs[oi].sections, 0..) |sec, si| {
             const kind = classOf(sec);
+            if ((kind == .text and std.mem.startsWith(u8, sec.name, ".text.unlikely")) != cold_pass) continue;
             const gi = obase + si;
             // A GC-dead section counts as zero-size, so it takes no room and is not placed,
             // the same as a zero-size not-present section. `sz` is 0 for a dead section.
@@ -185,7 +187,7 @@ pub fn computeDefaultPlacement(
             sec_off[gi] = off;
             sec_present[gi] = present;
         }
-    }
+    };
 
     // Concatenate the regions: text at `base`, then rodata, then data, each aligned. The
     // file image ends after the last non-empty region (`data_end`).

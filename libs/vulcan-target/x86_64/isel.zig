@@ -288,7 +288,7 @@ const Pad = struct { at: usize, len: usize, alignment: u16 };
 /// the symbol's `.got` slot, which a real `ld.so` fills via `R_X86_64_GLOB_DAT`. So the
 /// `mov` loads the symbol's address rather than the `lea` computing it. The module uses
 /// `.got_pcrel` for a data import of a `.so`'s global.
-pub const Kind = enum { call, pcrel_lea, got_pcrel };
+pub const Kind = enum { call, pcrel_lea, got_pcrel, to_cold, to_hot };
 
 /// A relocation `kind` targeting `symbol`, whose disp32 field starts at byte `offset`
 /// within the compiled function's code. All three kinds share the same
@@ -296,7 +296,9 @@ pub const Kind = enum { call, pcrel_lea, got_pcrel };
 /// the resolution point differ: `.call` resolves intra-module at link time,
 /// `.pcrel_lea` resolves the symbol at map time, and `.got_pcrel` resolves the
 /// symbol's GOT slot, which the dynamic linker synthesizes.
-pub const Reloc = struct { offset: usize, symbol: []const u8, kind: Kind = .call };
+/// `.to_cold` and `.to_hot` cross between a function's hot and cold parts: `addend` is the target's
+/// offset in the other part, and `symbol` is unused.
+pub const Reloc = struct { offset: usize, symbol: []const u8, kind: Kind = .call, addend: i64 = 0 };
 
 /// A compiled function: machine code plus its unresolved call relocations.
 /// A source-line row: the byte offset where a source line's code begins, from
@@ -307,11 +309,16 @@ pub const Compiled = struct {
     code: []u8,
     relocs: []Reloc,
     lines: []LineEntry = &.{},
+    // The blocks expected to run rarely, split off for a separate section, and their relocations.
+    cold: []u8 = &.{},
+    cold_relocs: []Reloc = &.{},
 
     pub fn deinit(self: *Compiled, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
         allocator.free(self.relocs);
         allocator.free(self.lines);
+        allocator.free(self.cold);
+        allocator.free(self.cold_relocs);
     }
 };
 
@@ -392,6 +399,11 @@ const Ctx = struct {
     tail: bool = false,
     // Each compare that runs as a `test`, see `applyTestFolds`.
     tests: ?*const std.AutoHashMapUnmanaged(ir.function.Inst, TestFold) = null,
+    // The first block of the cold tail that moves to its own section, or null for none.
+    cold_block: ?usize = null,
+    // Where the cold part starts once relaxation settles, and each branch that crosses the cut.
+    cold_at: ?usize = null,
+    crossings: std.ArrayList(Crossing) = .empty,
 
     fn loc(self: *const Ctx, v: Value) Loc {
         if (self.segments.get(v)) |segs| {
@@ -507,6 +519,8 @@ pub const ModelCaps = struct {
     fetch_align: u16 = 0,
     /// Align each function start to this many bytes. Zero takes the target default.
     func_align: u16 = 0,
+    /// Move the blocks expected to run rarely to a separate cold part.
+    split_cold: bool = false,
 };
 
 /// Select x86-64 machine code for `func` (code only, call relocations dropped). Caller
@@ -757,6 +771,7 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
         ctx.segments.deinit(allocator);
     }
     defer ctx.actions.deinit(allocator);
+    defer ctx.crossings.deinit(allocator);
     // `def_pos` is always a heap-owned dupe. The `&.{}` sentinel is a zero-length
     // slice with no backing allocation, so freeing it is a no-op. So an
     // unconditional free is safe.
@@ -886,6 +901,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
         const block: Block = @fromBackingInt(@intCast(bi));
         if (forwardedBlock(ctx, block) != block) skip_dispatch[bi] = true;
     }
+    if (ctx.caps.split_cold) ctx.cold_block = coldTail(allocator, func, skip_dispatch);
     const loop_top = try loopTops(allocator, ctx);
     defer allocator.free(loop_top);
     const decided = try decidedBranches(allocator, func);
@@ -1088,7 +1104,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 // one emitted, or null at the last block. Whichever successor
                 // edge targets `next_block` can fall through, so `emitIf` elides
                 // that branch.
-                const next_block = nextEmitted(skip_dispatch, bi);
+                const next_block = nextInPart(ctx, skip_dispatch, bi);
                 const cf = func.opcode(inst).@"if";
                 if (dense_switches[bi]) |plan| {
                     try emitDenseSwitch(allocator, ctx, plan);
@@ -1202,7 +1218,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 // `next_block` is the next block emitted (`bi+1`), or null at
                 // the last block. A jump to it falls through, so `emitJump`
                 // elides the `jmp`.
-                const next_block = nextEmitted(skip_dispatch, bi);
+                const next_block = nextInPart(ctx, skip_dispatch, bi);
                 try emitJump(allocator, ctx, j, block, next_block);
             },
         };
@@ -1226,13 +1242,22 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
         try fields.append(allocator, .{ .at = f.at, .target = block_start[target], .table = f.table, .branch = f.table == null });
     }
     for (ctx.locals.items) |l| try fields.append(allocator, .{ .at = l.at, .target = l.target, .table = null, .branch = l.branch });
-    try relaxAndPatch(allocator, ctx, fields.items);
+    // A jump table entry is relative to its table, which no relocation can express across the cut.
+    var cut: ?usize = if (ctx.cold_block) |b| block_start[b] else null;
+    if (cut) |at| for (fields.items) |f| {
+        if (f.table != null and (f.at < at) != (f.target < at)) cut = null;
+    };
+    try relaxAndPatch(allocator, ctx, fields.items, cut);
+    if (ctx.cold_at) |at| return splitCold(allocator, ctx, at);
     return .{ .code = try ctx.code.toOwnedSlice(allocator), .relocs = try ctx.relocs.toOwnedSlice(allocator), .lines = try ctx.lines.toOwnedSlice(allocator) };
 }
 
 /// A rel32 field aimed at a code offset. A table entry counts from `table`, every other field
 /// from its own end. A `branch` field ends a jcc or jmp.
 const Field = struct { at: usize, target: usize, table: ?usize, branch: bool };
+
+/// A rel32 field at `at` whose `target` lies on the other side of the hot and cold cut.
+const Crossing = struct { at: usize, target: usize };
 
 /// A branch that may take its rel8 form, or alignment padding, in the order of the code.
 const Region = struct { start: usize, len: usize, field: ?usize, alignment: u16, short: bool = false, new_len: usize = 0, before: i64 = 0, after: i64 = 0 };
@@ -1273,12 +1298,14 @@ fn layoutRegions(regions: []Region) void {
 /// Give every branch that reaches its target within a signed byte the two-byte form, redo the
 /// alignment padding behind it, and patch every field. A branch that no longer fits once the
 /// padding grows goes back to rel32, and the loop stops when nothing changes.
-fn relaxAndPatch(allocator: std.mem.Allocator, ctx: *Ctx, fields: []Field) Error!void {
+fn relaxAndPatch(allocator: std.mem.Allocator, ctx: *Ctx, fields: []Field, cut: ?usize) Error!void {
     const code = ctx.code.items;
     var regions: std.ArrayList(Region) = .empty;
     defer regions.deinit(allocator);
     for (fields, 0..) |f, i| {
         if (!f.branch) continue;
+        // A branch across the cut becomes a relocation, which needs the rel32 form.
+        if (cut) |at| if ((f.at < at) != (f.target < at)) continue;
         const start = if (code[f.at - 1] == 0xE9)
             f.at - 1
         else if (f.at >= 2 and code[f.at - 2] == 0x0F and code[f.at - 1] & 0xF0 == 0x80)
@@ -1361,6 +1388,12 @@ fn relaxAndPatch(allocator: std.mem.Allocator, ctx: *Ctx, fields: []Field) Error
         const origin = if (f.table) |t| relaxedOffset(regions.items, t) else at + 4;
         const rel: i32 = @intCast(@as(i64, @intCast(target)) - @as(i64, @intCast(origin)));
         std.mem.writeInt(u32, out[at..][0..4], @bitCast(rel), .little);
+    }
+    if (cut) |at| {
+        ctx.cold_at = relaxedOffset(regions.items, at);
+        for (fields) |f| if ((f.at < at) != (f.target < at)) {
+            try ctx.crossings.append(allocator, .{ .at = relaxedOffset(regions.items, f.at), .target = relaxedOffset(regions.items, f.target) });
+        };
     }
     for (ctx.relocs.items) |*r| r.offset = relaxedOffset(regions.items, r.offset);
     for (ctx.lines.items) |*l| l.offset = @intCast(relaxedOffset(regions.items, l.offset));
@@ -3710,6 +3743,77 @@ fn emitHeaderTest(allocator: std.mem.Allocator, ctx: *Ctx, header: Block, next_b
         try emitBranchTo(allocator, ctx, encode.jmp(0), @backingInt(e));
     }
     return true;
+}
+
+/// The next block that emits code, or null when it starts the cold part and `bi` is hot, since
+/// the cold part moves to another section.
+fn nextInPart(ctx: *const Ctx, skip: []const bool, bi: usize) ?Block {
+    const next = nextEmitted(skip, bi) orelse return null;
+    if (ctx.cold_block) |cold| {
+        if (bi < cold and @backingInt(next) >= cold) return null;
+    }
+    return next;
+}
+
+/// The first block of the run of rarely run blocks that ends the layout, or null when there is
+/// none to split off.
+fn coldTail(allocator: std.mem.Allocator, func: *const Function, skip: []const bool) ?usize {
+    const cold = vopt.blocklayout.coldSet(allocator, func) catch return null;
+    defer allocator.free(cold);
+    const n = func.blockCount();
+    var start = n;
+    while (start > 1) : (start -= 1) {
+        const b = start - 1;
+        if (!cold[b] and !skip[b] and !emptyBlock(func, b)) break;
+    }
+    while (start < n and (skip[start] or emptyBlock(func, start))) start += 1;
+    return if (start < n) start else null;
+}
+
+fn emptyBlock(func: *const Function, b: usize) bool {
+    const block: Block = @fromBackingInt(@intCast(b));
+    return func.blockInsts(block).len == 0 and func.terminator(block) == null;
+}
+
+/// Split the finished code at `cut` into its hot and cold parts. A branch across the cut and each
+/// relocation in the cold part move to relocations of the part they live in.
+fn splitCold(allocator: std.mem.Allocator, ctx: *Ctx, cut: usize) Error!Compiled {
+    const code = ctx.code.items;
+    var hot_relocs: std.ArrayList(Reloc) = .empty;
+    errdefer hot_relocs.deinit(allocator);
+    var cold_relocs: std.ArrayList(Reloc) = .empty;
+    errdefer cold_relocs.deinit(allocator);
+    for (ctx.relocs.items) |r| {
+        if (r.offset < cut) {
+            try hot_relocs.append(allocator, r);
+        } else {
+            var moved = r;
+            moved.offset -= cut;
+            try cold_relocs.append(allocator, moved);
+        }
+    }
+    for (ctx.crossings.items) |c| {
+        @memset(code[c.at..][0..4], 0);
+        if (c.at < cut) {
+            try hot_relocs.append(allocator, .{ .offset = c.at, .symbol = "", .kind = .to_cold, .addend = @intCast(c.target - cut) });
+        } else {
+            try cold_relocs.append(allocator, .{ .offset = c.at - cut, .symbol = "", .kind = .to_hot, .addend = @intCast(c.target) });
+        }
+    }
+    var lines: std.ArrayList(LineEntry) = .empty;
+    errdefer lines.deinit(allocator);
+    for (ctx.lines.items) |l| if (l.offset < cut) try lines.append(allocator, l);
+    const hot = try allocator.dupe(u8, code[0..cut]);
+    errdefer allocator.free(hot);
+    const cold = try allocator.dupe(u8, code[cut..]);
+    errdefer allocator.free(cold);
+    return .{
+        .code = hot,
+        .relocs = try hot_relocs.toOwnedSlice(allocator),
+        .lines = try lines.toOwnedSlice(allocator),
+        .cold = cold,
+        .cold_relocs = try cold_relocs.toOwnedSlice(allocator),
+    };
 }
 
 /// The next block after `bi` that emits code, which is where execution falls through.
