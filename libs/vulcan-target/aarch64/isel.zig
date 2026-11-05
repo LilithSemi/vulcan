@@ -275,10 +275,18 @@ fn computeArgLocs(func: *const Function, values: []const Value, out: []ArgLoc, s
 
 /// The stack footprint (byte size and alignment) of an argument of `p`'s type under the Apple arm64
 /// ABI, which packs a stack argument at its natural size and alignment rather than padding it to an
-/// 8-byte slot. AAPCS64 always uses 8 bytes.
+/// 8-byte slot: in particular, spilled i8/i16/i32 values occupy 1/2/4 bytes. AAPCS64 always uses 8.
 fn appleStackFootprint(func: *const Function, p: Value) struct { size: u15, alignment: u15 } {
     return switch (func.types.type_kind(func.valueType(p))) {
-        .int => |i| if (i.bits > 32) .{ .size = 8, .alignment = 8 } else .{ .size = 4, .alignment = 4 },
+        .bool => .{ .size = 1, .alignment = 1 },
+        .int => |i| if (i.bits <= 8)
+            .{ .size = 1, .alignment = 1 }
+        else if (i.bits <= 16)
+            .{ .size = 2, .alignment = 2 }
+        else if (i.bits <= 32)
+            .{ .size = 4, .alignment = 4 }
+        else
+            .{ .size = 8, .alignment = 8 },
         .float => |f| switch (f) {
             .f64 => .{ .size = 8, .alignment = 8 },
             .f128 => .{ .size = 16, .alignment = 16 },
@@ -286,8 +294,25 @@ fn appleStackFootprint(func: *const Function, p: Value) struct { size: u15, alig
         },
         .vector => .{ .size = 16, .alignment = 16 },
         .ptr => .{ .size = 8, .alignment = 8 },
-        else => .{ .size = 8, .alignment = 8 }, // bool and anything else: a conservative 8-byte slot
+        else => .{ .size = 8, .alignment = 8 },
     };
+}
+
+/// Fill `out` with each stack argument's byte offset and return the unrounded size of the Apple
+/// outgoing/incoming argument area. Register arguments do not consume stack space. The arguments
+/// that overflow the independent x/v register banks nevertheless share ONE stack area, in source
+/// order; keeping separate gpr/fpr cursors makes a mixed signature alias two arguments at offset 0.
+fn computeAppleStackOffsets(func: *const Function, values: []const Value, locs: []const ArgLoc, out: []u15) usize {
+    std.debug.assert(values.len == locs.len and values.len == out.len);
+    var run: u15 = 0;
+    for (values, locs, 0..) |v, l, i| {
+        if (l.sret_ptr or l.idx < 8) continue;
+        const fp = appleStackFootprint(func, v);
+        run = std.mem.alignForward(u15, run, fp.alignment);
+        out[i] = run;
+        run += fp.size;
+    }
+    return run;
 }
 
 /// The byte offset, from the incoming argument-area base, of a stack-passed parameter `p` at ABI
@@ -300,16 +325,38 @@ fn incomingStackByteOff(caps: ModelCaps, apple_off: *const std.AutoHashMapUnmana
     };
 }
 
-/// Load a stack-passed gpr parameter `p` from `[sp + off]` into `dst`. Under the Apple ABI a 4-byte
-/// integer is packed into 4 stack bytes, so a 64-bit `ldr` would pull in the adjacent argument's
-/// bytes; load exactly the natural width, sign- or zero-extended by the value's signedness, instead.
-/// AAPCS64 keeps the plain 64-bit load (its 8-byte slot holds the value in the low bytes), so it
-/// stays byte-identical. A pointer or an i64 always loads 64-bit; a smaller integer loads narrow.
+/// Load a stack-passed gpr parameter `p` from `[sp + off]` into `dst`. Under the Apple ABI a narrow
+/// integer consumes only its natural 1/2/4 bytes, so a 64-bit `ldr` would pull in adjacent arguments;
+/// load exactly that width, sign- or zero-extended by the value's signedness. AAPCS64 keeps the plain
+/// 64-bit load (its 8-byte slot holds the value in the low bytes), so it stays byte-identical.
 fn emitGprStackLoad(allocator: std.mem.Allocator, code: *std.ArrayList(u32), dst: Reg, off: usize, caps: ModelCaps, func: *const Function, p: Value) Error!void {
-    if (caps.abi == .apple and func.types.type_kind(func.valueType(p)) == .int and intBitsOf(func, p) <= 32) {
-        try code.append(allocator, if (isSignedInt(func, p)) encode.ldrsw(dst, sp, @intCast(off)) else encode.ldrW(dst, sp, @intCast(off)));
-    } else {
-        try code.append(allocator, encode.ldrOff(dst, sp, @intCast(off)));
+    if (caps.abi != .apple) return code.append(allocator, encode.ldrOff(dst, sp, @intCast(off)));
+    switch (func.types.type_kind(func.valueType(p))) {
+        .bool => try code.append(allocator, encode.ldrbOff(dst, sp, @intCast(off))),
+        .int => |i| if (i.bits <= 8)
+            try code.append(allocator, if (i.signedness == .signed) encode.ldrsbOff(dst, sp, @intCast(off)) else encode.ldrbOff(dst, sp, @intCast(off)))
+        else if (i.bits <= 16)
+            try code.append(allocator, if (i.signedness == .signed) encode.ldrshOff(dst, sp, @intCast(off)) else encode.ldrhOff(dst, sp, @intCast(off)))
+        else if (i.bits <= 32)
+            try code.append(allocator, if (i.signedness == .signed) encode.ldrsw(dst, sp, @intCast(off)) else encode.ldrW(dst, sp, @intCast(off)))
+        else
+            try code.append(allocator, encode.ldrOff(dst, sp, @intCast(off))),
+        else => try code.append(allocator, encode.ldrOff(dst, sp, @intCast(off))),
+    }
+}
+
+fn emitAppleGprStackStore(allocator: std.mem.Allocator, code: *std.ArrayList(u32), src: Reg, off: u15, func: *const Function, arg: Value) Error!void {
+    switch (func.types.type_kind(func.valueType(arg))) {
+        .bool => try code.append(allocator, encode.strbOff(src, sp, @intCast(off))),
+        .int => |i| if (i.bits <= 8)
+            try code.append(allocator, encode.strbOff(src, sp, @intCast(off)))
+        else if (i.bits <= 16)
+            try code.append(allocator, encode.strhOff(src, sp, @intCast(off)))
+        else if (i.bits <= 32)
+            try code.append(allocator, encode.strW(src, sp, @intCast(off)))
+        else
+            try code.append(allocator, encode.strOff(src, sp, off)),
+        else => try code.append(allocator, encode.strOff(src, sp, off)),
     }
 }
 
@@ -932,6 +979,42 @@ fn maxCallArgs(func: *const Function) usize {
     return max;
 }
 
+/// Exact Apple stack-argument requirement of the largest call. Unlike AAPCS64's historical
+/// fixed-slot calculation, Apple packs natural-width arguments and a vector/quad may consume 16
+/// bytes, so argument count alone can under-reserve the caller's outgoing area.
+fn maxAppleCallBytes(func: *const Function) usize {
+    const Call = struct { args: []const Value, sret: bool };
+    var max: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const call: Call = switch (func.opcode(inst)) {
+                .call => |c| .{ .args = func.valueList(c.args), .sret = c.sret },
+                .call_indirect => |c| .{ .args = func.valueList(c.args), .sret = c.sret },
+                else => continue,
+            };
+            var gi: usize = 0;
+            var fi: usize = 0;
+            var run: u15 = 0;
+            for (call.args, 0..) |arg, i| {
+                if (call.sret and i == 0) continue;
+                const idx = if (regClass(func, arg) == .fpr) blk: {
+                    defer fi += 1;
+                    break :blk fi;
+                } else blk: {
+                    defer gi += 1;
+                    break :blk gi;
+                };
+                if (idx < 8) continue;
+                const fp = appleStackFootprint(func, arg);
+                run = std.mem.alignForward(u15, run, fp.alignment);
+                run += fp.size;
+            }
+            max = @max(max, run);
+        }
+    }
+    return max;
+}
+
 fn alignUp(v: usize, a: usize) usize {
     return (v + a - 1) & ~(a - 1);
 }
@@ -1325,7 +1408,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     var alloca_off: std.AutoHashMapUnmanaged(Value, u32) = .empty;
     defer alloca_off.deinit(allocator);
     const alloca_bytes = try computeAllocaSlots(allocator, func, &alloca_off);
-    const outgoing_bytes = alignUp(8 * (maxCallArgs(func) -| 8), 16);
+    const outgoing_bytes = alignUp(if (caps.abi == .apple) maxAppleCallBytes(func) else 8 * (maxCallArgs(func) -| 8), 16);
     const lr_bytes: usize = if (leaf) 0 else 8;
     const gpr_saved_base = outgoing_bytes + lr_bytes;
     const fpr_saved_base = gpr_saved_base + 8 * alloc.saved_gpr.items.len;
@@ -1460,15 +1543,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     var apple_stack_off: std.AutoHashMapUnmanaged(Value, u15) = .empty;
     defer apple_stack_off.deinit(allocator);
     if (caps.abi == .apple) {
-        var gpr_run: u15 = 0;
-        var fpr_run: u15 = 0;
+        var run: u15 = 0;
         for (eparams, plocs) |p, l| {
             if (l.sret_ptr or l.idx < 8) continue;
             const fp = appleStackFootprint(func, p);
-            const run = if (l.class == .fpr) &fpr_run else &gpr_run;
-            run.* = std.mem.alignForward(u15, run.*, fp.alignment);
-            try apple_stack_off.put(allocator, p, run.*);
-            run.* += fp.size;
+            run = std.mem.alignForward(u15, run, fp.alignment);
+            try apple_stack_off.put(allocator, p, run);
+            run += fp.size;
         }
     }
     for (eparams, plocs) |p, l| {
@@ -1613,6 +1694,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         .frame = frame,
         .gr_save_off = gr_save_off,
         .vr_save_off = vr_save_off,
+        .abi = caps.abi,
         .fp16 = fp16,
         .fuse_cmp_branch = caps.fuse_cmp_branch,
         .fuse_arith_branch = caps.fuse_arith_branch,
@@ -2785,6 +2867,8 @@ const Ctx = struct {
     frame: usize = 0,
     gr_save_off: usize = 0,
     vr_save_off: usize = 0,
+    /// Host-call ABI. Call argument emission needs the same packed-stack rule as the prologue.
+    abi: Abi = .aapcs64,
     /// Whether to lower f16 with NATIVE FEAT_FP16 H-form ops instead of the emulation. Threaded
     /// from `compileFunction`'s `caps.fp16`. It is false for every non-model caller (byte-identical).
     fp16: bool = false,
@@ -3658,9 +3742,12 @@ const Ctx = struct {
         const locs = try allocator.alloc(ArgLoc, args.len);
         defer allocator.free(locs);
         computeArgLocs(self.func, args, locs, sret);
+        const apple_off = try allocator.alloc(u15, args.len);
+        defer allocator.free(apple_off);
+        if (self.abi == .apple) _ = computeAppleStackOffsets(self.func, args, locs, apple_off);
 
         if (!self.alloc.edge_move_driven) {
-            for (args, locs) |arg, loc| {
+            for (args, locs, 0..) |arg, loc, i| {
                 // The hidden result pointer goes to `x8`, outside the x0-x7 pool.
                 // Read its source (still intact, this runs before any x0-x7 move) and move it in.
                 if (loc.sret_ptr) {
@@ -3671,7 +3758,15 @@ const Ctx = struct {
                 const target: Reg = @fromBackingInt(@intCast(@as(u5, @intCast(loc.idx))));
                 if (loc.class == .fpr) {
                     const src = try self.loadOp(allocator, code, arg, fp_spill_op[0]);
-                    if (loc.idx >= 8) return error.Unsupported; // fp stack args not handled
+                    if (loc.idx >= 8) {
+                        if (self.abi != .apple) return error.Unsupported;
+                        const off = apple_off[i];
+                        if (isVector(self.func, arg) or isQuad(self.func, arg))
+                            try code.append(allocator, encode.strQ(src, sp, off))
+                        else
+                            try code.append(allocator, encode.strFp(src, sp, off, isDouble(self.func, arg)));
+                        continue;
+                    }
                     // Copy the whole 128-bit register (`movVec`), so an f128 argument reaches the
                     // callee's v-register with all 16 bytes; a scalar float's unused high lane is
                     // harmless. Mirrors the block-edge fpr move, which is `movVec` for the same reason.
@@ -3681,7 +3776,11 @@ const Ctx = struct {
                     if (loc.idx < 8) {
                         try code.append(allocator, encode.mov(target, src));
                     } else {
-                        try code.append(allocator, encode.strOff(src, sp, @intCast(8 * (loc.idx - 8))));
+                        const off: u15 = if (self.abi == .apple) apple_off[i] else @intCast(8 * (loc.idx - 8));
+                        if (self.abi == .apple)
+                            try emitAppleGprStackStore(allocator, code, src, off, self.func, arg)
+                        else
+                            try code.append(allocator, encode.strOff(src, sp, off));
                     }
                 }
             }
@@ -3692,16 +3791,28 @@ const Ctx = struct {
         // (idx >= 8) store first, both BEFORE the register permutation overwrites any ABI register
         // a store or the `x8` move still needs to read. `x8` is not an allocatable register, so no
         // value lives there and no later parallel move reads it as a source.
-        for (args, locs) |arg, loc| {
+        for (args, locs, 0..) |arg, loc, i| {
             if (loc.sret_ptr) {
                 const src = try self.loadOp(allocator, code, arg, spill_op[0]);
                 try code.append(allocator, encode.mov(.x8, src));
                 continue;
             }
             if (loc.idx < 8) continue;
-            if (loc.class == .fpr) return error.Unsupported; // fp stack args not handled (matches native)
-            const src = try self.loadOp(allocator, code, arg, spill_op[0]);
-            try code.append(allocator, encode.strOff(src, sp, @intCast(8 * (loc.idx - 8))));
+            const off: u15 = if (self.abi == .apple) apple_off[i] else @intCast(8 * (loc.idx - 8));
+            if (loc.class == .fpr) {
+                if (self.abi != .apple) return error.Unsupported;
+                const src = try self.loadOp(allocator, code, arg, fp_spill_op[0]);
+                if (isVector(self.func, arg) or isQuad(self.func, arg))
+                    try code.append(allocator, encode.strQ(src, sp, off))
+                else
+                    try code.append(allocator, encode.strFp(src, sp, off, isDouble(self.func, arg)));
+            } else {
+                const src = try self.loadOp(allocator, code, arg, spill_op[0]);
+                if (self.abi == .apple)
+                    try emitAppleGprStackStore(allocator, code, src, off, self.func, arg)
+                else
+                    try code.append(allocator, encode.strOff(src, sp, off));
+            }
         }
 
         // Phase 2a: register-resident register arguments as a parallel move into their ABI registers.
@@ -7177,4 +7288,48 @@ test "a multiply fused into the next add keeps its operands live to the add" {
 
     try std.testing.expect(aarch64LateRead(&aarch64_reg_ctx, &func, func.definingInst(product).?, x));
     try std.testing.expect(!aarch64LateRead(&aarch64_reg_ctx, &func, func.definingInst(sum).?, c));
+}
+
+test "Apple ABI gives mixed overflow arguments one packed stack area" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const f64_t = try func.types.intern(.{ .float = .f64 });
+    const block = try func.appendBlock();
+    var values: [19]Value = undefined;
+    for (values[0..8]) |*value| value.* = try func.appendBlockParam(block, i32_t);
+    for (values[8..16]) |*value| value.* = try func.appendBlockParam(block, f64_t);
+    values[16] = try func.appendBlockParam(block, i8_t); // first gpr overflow: +0, size 1
+    values[17] = try func.appendBlockParam(block, i8_t); // second gpr overflow: +1, size 1
+    values[18] = try func.appendBlockParam(block, f64_t); // first fpr overflow: +8, size 8
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(values[18]) });
+
+    var locs: [values.len]ArgLoc = undefined;
+    var offsets: [values.len]u15 = undefined;
+    computeArgLocs(&func, &values, &locs, false);
+    try std.testing.expectEqual(@as(usize, 16), computeAppleStackOffsets(&func, &values, &locs, &offsets));
+    try std.testing.expectEqual(@as(u15, 0), offsets[16]);
+    try std.testing.expectEqual(@as(u15, 1), offsets[17]);
+    try std.testing.expectEqual(@as(u15, 8), offsets[18]);
+}
+
+test "Apple ABI emits and reserves a packed ninth floating call argument" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const target = try func.appendBlockParam(block, ptr_t);
+    var args: [9]Value = undefined;
+    for (&args, 0..) |*arg, i| arg.* = try func.appendInst(block, f32_t, .{ .fconst = @floatFromInt(i + 1) });
+    const result = try func.appendCallIndirect(block, f32_t, target, &args);
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+
+    try std.testing.expectEqual(@as(usize, 4), maxAppleCallBytes(&func));
+    var compiled = try compileFunction(allocator, &func, .{ .abi = .apple });
+    defer compiled.deinit(allocator);
+    try std.testing.expect(compiled.code.len > 0);
 }

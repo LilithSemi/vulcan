@@ -2015,6 +2015,32 @@ test "native: a call with ten arguments (stack args)" {
     }, &.{}));
 }
 
+fn sumNineF32(a0: f32, a1: f32, a2: f32, a3: f32, a4: f32, a5: f32, a6: f32, a7: f32, a8: f32) callconv(.c) f32 {
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8;
+}
+
+test "Apple ABI: an indirect call delivers a ninth f32 on the packed stack" {
+    if (builtin.cpu.arch != .aarch64 or !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    const target = try func.appendBlockParam(block, ptr_t);
+    var args: [9]ir.function.Value = undefined;
+    for (&args, 0..) |*arg, i| arg.* = try func.appendInst(block, f32_t, .{ .fconst = @floatFromInt(i + 1) });
+    const result = try func.appendCallIndirect(block, f32_t, target, &args);
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+
+    var compiled = try isel.compileFunction(allocator, &func, .{ .abi = .apple });
+    defer compiled.deinit(allocator);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+    defer buf.deinit();
+    const call: *const fn (usize) callconv(.c) f32 = @ptrCast(buf.memory.ptr);
+    try std.testing.expectEqual(@as(f32, 45), call(@intFromPtr(&sumNineF32)));
+}
+
 test "native: alloca stores and reloads through a stack frame" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
