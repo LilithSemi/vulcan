@@ -172,6 +172,8 @@ pub const Model = struct {
     vector_bits: u16,
     cache_line: u16,
     fetch_align: u16,
+    /// The alignment of each function start, or 0 for the target default.
+    func_align: u16 = 0,
     features: Features,
     /// Per-IR-opcode issue latency in cycles: the time from an op's issue to its result being
     /// available to a DEPENDENT op. This is what the list scheduler (schedule.zig) uses to hide

@@ -505,6 +505,8 @@ pub const ModelCaps = struct {
     fuse_arith_branch: bool = false,
     /// Align loop tops to this many bytes. Zero or one leaves the code unpadded.
     fetch_align: u16 = 0,
+    /// Align each function start to this many bytes. Zero takes the target default.
+    func_align: u16 = 0,
 };
 
 /// Select x86-64 machine code for `func` (code only, call relocations dropped). Caller
@@ -538,6 +540,7 @@ pub fn capsForModel(model: *const mm.Model) ModelCaps {
         .fuse_cmp_branch = model.fuses(.cmp_branch),
         .fuse_arith_branch = model.fuses(.arith_branch),
         .fetch_align = model.fetch_align,
+        .func_align = model.func_align,
     };
 }
 

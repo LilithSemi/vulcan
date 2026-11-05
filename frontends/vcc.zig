@@ -175,6 +175,10 @@ const Options = struct {
     time_report: bool = false,
     /// `-fprofile-use=<file>`: use Vulcan's binary block-count profile.
     profile_use: ?[]const u8 = null,
+    /// `-falign-loops=<n>` and `-falign-functions=<n>`: override the model's loop and function
+    /// alignment. Zero keeps the model's value, and one turns the padding off.
+    align_loops: ?u16 = null,
+    align_functions: ?u16 = null,
     optimize: OptimizationLevel = .off,
 };
 
@@ -286,6 +290,10 @@ fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (e
             opts.reproducible = true;
         } else if (std.mem.eql(u8, arg, "-ftime-report")) {
             opts.time_report = true;
+        } else if (alignFlag(arg, "loops")) |n| {
+            opts.align_loops = n;
+        } else if (alignFlag(arg, "functions")) |n| {
+            opts.align_functions = n;
         } else if (std.mem.startsWith(u8, arg, "-fprofile-use=")) {
             const path = arg["-fprofile-use=".len..];
             if (path.len == 0) return fail(errw, "-fprofile-use requires a profile file", .{});
@@ -958,6 +966,31 @@ fn warn(errw: *std.Io.Writer, comptime fmt: []const u8, args: anytype) void {
     errw.flush() catch return;
 }
 
+/// The alignment an `-falign-<what>` flag asks for: `=<n>` or `=<n>:<skip>...` rounds `n` up to
+/// a power of two, the bare flag keeps the default (0), and `-fno-align-<what>` is 1.
+fn alignFlag(arg: []const u8, comptime what: []const u8) ?u16 {
+    if (std.mem.eql(u8, arg, "-fno-align-" ++ what)) return 1;
+    if (std.mem.eql(u8, arg, "-falign-" ++ what)) return 0;
+    const prefix = "-falign-" ++ what ++ "=";
+    if (!std.mem.startsWith(u8, arg, prefix)) return null;
+    const value = arg[prefix.len..];
+    const end = std.mem.indexOfScalar(u8, value, ':') orelse value.len;
+    const n = std.fmt.parseInt(u16, value[0..end], 10) catch return null;
+    if (n <= 1) return n;
+    return std.math.ceilPowerOfTwo(u16, n) catch null;
+}
+
+/// The model with any `-falign-loops` or `-falign-functions` override applied, built in `out`.
+fn tuneModel(model: *const mm.Model, opts: *const Options, out: *mm.Model) *const mm.Model {
+    const loops = opts.align_loops orelse 0;
+    const functions = opts.align_functions orelse 0;
+    if (loops == 0 and functions == 0) return model;
+    out.* = model.*;
+    if (loops != 0) out.fetch_align = loops;
+    if (functions != 0) out.func_align = functions;
+    return out;
+}
+
 /// Resolves the effective microarch model for this compile, or null when none applies.
 /// Reads the host's detected part (`mm.detectHost`) and this build's own host arch, then
 /// applies `pickModel`'s pure decision. An opt-out or an unresolved implicit default warns
@@ -1418,7 +1451,8 @@ pub fn main(init: std.process.Init) !void {
     // A native build with no `-mcpu`/`-mtune` resolves the detected host part BY DEFAULT,
     // so `compileToObject` below runs the IR microarch layer and hands the backend a model
     // even with no flags given. See `resolveModel`.
-    const model = try resolveModel(&opts, arch, errw);
+    var tuned_model: mm.Model = undefined;
+    const model = if (try resolveModel(&opts, arch, errw)) |m| tuneModel(m, &opts, &tuned_model) else null;
 
     var profile_storage: ?opt.pgo.Profile = null;
     defer if (profile_storage) |*profile| profile.deinit();
@@ -1953,6 +1987,19 @@ test "parseArgs: --version and -v both set the version probe" {
     var it2 = SliceArgs{ .items = &.{"-v"} };
     const o2 = try parseArgs(allocator, testErrw(), &it2);
     try std.testing.expectEqual(Probe.version, o2.probe.?);
+}
+
+test "parseArgs: -falign-loops and -falign-functions read their alignment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var it = SliceArgs{ .items = &.{ "-falign-loops=1", "-falign-functions=24:8", "foo.c" } };
+    const o = try parseArgs(allocator, testErrw(), &it);
+    try std.testing.expectEqual(@as(?u16, 1), o.align_loops);
+    try std.testing.expectEqual(@as(?u16, 32), o.align_functions);
+    var it2 = SliceArgs{ .items = &.{ "-fno-align-loops", "foo.c" } };
+    const o2 = try parseArgs(allocator, testErrw(), &it2);
+    try std.testing.expectEqual(@as(?u16, 1), o2.align_loops);
 }
 
 test "parseArgs: -dumpversion and -dumpmachine set their own probes" {

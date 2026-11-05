@@ -119,7 +119,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
             .flags = SHF_ALLOC | SHF_EXECINSTR,
             .bytes = code,
             .size = code.len,
-            .addralign = @max(16, caps.fetch_align),
+            .addralign = if (caps.func_align != 0) @max(caps.func_align, caps.fetch_align) else @max(16, caps.fetch_align),
         });
         try reloc_lists.append(a, .empty);
         // A `static` function has internal linkage. So does a `.`-prefixed compiler-local
