@@ -227,15 +227,14 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     // across split edges. The native max tests below prove the same results.
     try expectAsm(&func,
         \\0000: 6b01001f  cmp w0, w1
-        \\0004: 5400004c  b.gt .+8
-        \\0008: 14000006  b .+24
-        \\000c: 14000003  b .+12
-        \\0010: aa0203e0  mov x0, x2
-        \\0014: d65f03c0  ret
-        \\0018: aa0003e2  mov x2, x0
-        \\001c: 17fffffd  b .-12
-        \\0020: aa0103e2  mov x2, x1
-        \\0024: 17fffffb  b .-20
+        \\0004: 5400008c  b.gt .+16
+        \\0008: 14000005  b .+20
+        \\000c: aa0203e0  mov x0, x2
+        \\0010: d65f03c0  ret
+        \\0014: aa0003e2  mov x2, x0
+        \\0018: 17fffffd  b .-12
+        \\001c: aa0103e2  mov x2, x1
+        \\0020: 17fffffb  b .-20
         \\
     );
 }
@@ -1014,7 +1013,7 @@ test "fused: structural - if(icmp) emits a conditional branch and no cset boolea
     defer allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "cmp w0, w1") != null); // the compare
-    try std.testing.expect(std.mem.indexOf(u8, text, "b.gt ") != null); // fused conditional branch
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.le ") != null); // fused conditional branch
     try std.testing.expect(std.mem.indexOf(u8, text, "cset") == null); // no boolean materialized
     try std.testing.expect(std.mem.indexOf(u8, text, "cbnz") == null); // no re-test of a boolean
 }
@@ -1118,10 +1117,10 @@ test "caps.fuse_cmp_branch = false falls back to cset;cbnz, not the fused cmp;b.
     const text = try disasm.format(allocator, compiled.code);
     defer allocator.free(text);
     // The gate declined the fusion. The icmp materializes its boolean (`cset`), and the if
-    // re-tests it (`cbnz`). This is not the fused `cmp` then `b.lt` that this same shape produces
+    // re-tests it (`cbz` to the cold edge). This is not the fused `cmp` then `b.ge` that this shape produces
     // when the flag is on. See the byte-identical-default test right below.
     try std.testing.expect(std.mem.indexOf(u8, text, "cset") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "cbnz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cbz") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "b.lt ") == null);
 
     if (builtin.cpu.arch == .aarch64) {
@@ -1145,7 +1144,7 @@ test "caps.fuse_cmp_branch = true (the default) emits the fused cmp;b.lt with no
 
     const text = try disasm.format(allocator, compiled.code);
     defer allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "b.lt ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.ge ") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cset") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cbnz") == null);
 
@@ -5019,7 +5018,7 @@ test "aarch64 arith_branch: decrement-and-branch (n-1; if n!=0) folds to subs+b.
     // Folded: the immediate S-form sets Z = (n-1 == 0), and `b.ne` branches on it, with no
     // separate `cmp`. The plain compare-and-branch would emit `cmp` before the `b.ne`.
     try std.testing.expect(std.mem.indexOf(u8, text, "subs w") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.eq ") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cmp") == null);
 
     try expectRun(allocator, &func, &.{1}, 200); // 1-1 == 0 -> else
@@ -5068,7 +5067,7 @@ test "aarch64 arith_branch: add-and-branch (a+b; if ==0) folds to adds+b.eq" {
     const text = try disasm.format(allocator, code);
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "adds w") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "b.eq ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cmp") == null);
 
     try expectRun(allocator, &func, &.{ 3, -3 }, 100); // sum 0 -> then
@@ -5086,7 +5085,7 @@ test "aarch64 arith_branch: and-and-branch (a&b; if !=0) folds to ands+b.ne" {
     const text = try disasm.format(allocator, code);
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "ands w") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.eq ") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cmp") == null);
 
     try expectRun(allocator, &func, &.{ 6, 3 }, 100); // 6&3 == 2 != 0 -> then
@@ -5121,7 +5120,7 @@ test "aarch64 arith_branch: logical immediate stays immediate when fused into a 
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "ands w") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "#0x1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "b.eq ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
 
     try expectRun(allocator, &func, &.{0}, 100);
     try expectRun(allocator, &func, &.{2}, 100);
@@ -5146,7 +5145,7 @@ test "aarch64 arith_branch off (flag false) emits arith+cmp+branch, no S-form fo
     // directly (no separate `cmp`), so no S-form is used for the branch.
     try std.testing.expect(std.mem.indexOf(u8, text, "subs") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "sub w") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "cbnz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cbz") != null);
 
     if (builtin.cpu.arch == .aarch64) {
         var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
@@ -5185,7 +5184,7 @@ test "aarch64 arith_branch: arith result used twice is NOT folded (plain add + c
     const text = try disasm.format(allocator, code);
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "adds w") == null); // not folded
-    try std.testing.expect(std.mem.indexOf(u8, text, "cbz") != null); // eq-vs-0 branches with cbz, no separate cmp
+    try std.testing.expect(std.mem.indexOf(u8, text, "cbnz") != null); // eq-vs-0 branches with cbnz, no separate cmp
 
     try expectRun(allocator, &func, &.{ 3, 4 }, 7);
     try expectRun(allocator, &func, &.{ 3, -3 }, 0);
@@ -5204,7 +5203,7 @@ test "aarch64 arith_branch: lt comparison is NOT folded (needs N/V), plain cmp;b
     // compare-and-branch path (`cmp; b.lt`), so no flag-setting `subs` Rd is used for the branch.
     try std.testing.expect(std.mem.indexOf(u8, text, "subs") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cmp") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "b.lt ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.ge ") != null);
 
     try expectRun(allocator, &func, &.{ 1, 5 }, 100); // 1-5 = -4 < 0 -> then
     try expectRun(allocator, &func, &.{ 5, 1 }, 200); // 5-1 = 4 -> else
@@ -5240,7 +5239,7 @@ test "aarch64 arith_branch: an instruction between the arith and the icmp blocks
     const text = try disasm.format(allocator, code);
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "adds w") == null); // not folded (non-adjacent)
-    try std.testing.expect(std.mem.indexOf(u8, text, "cbz") != null); // eq-vs-0 branches with cbz, no separate cmp
+    try std.testing.expect(std.mem.indexOf(u8, text, "cbnz") != null); // eq-vs-0 branches with cbnz, no separate cmp
 
     try expectRun(allocator, &func, &.{ 5, 3 }, 2); // returns a - b
     try expectRun(allocator, &func, &.{ 2, 10 }, -8);
@@ -5325,7 +5324,7 @@ test "aarch64 arith_branch: 64-bit decrement folds to subs64+b.ne and computes c
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "subs") != null); // folded flag-setting S-form
     try std.testing.expect(std.mem.indexOf(u8, text, "cmp") == null); // no separate compare
-    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.eq ") != null);
 
     if (builtin.cpu.arch == .aarch64) {
         var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
@@ -5411,7 +5410,7 @@ test "aarch64 arith_branch: 64-bit and-and-branch folds to ands64+b.ne" {
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "ands") != null); // folded flag-setting S-form
     try std.testing.expect(std.mem.indexOf(u8, text, "cmp") == null); // no separate compare
-    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.eq ") != null);
 
     if (builtin.cpu.arch == .aarch64) {
         var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
@@ -5680,10 +5679,10 @@ test "aarch64 fallthrough: conditional then-edge next elides b-then" {
     defer allocator.free(code);
     const text = try disasm.format(allocator, code);
     defer allocator.free(text);
-    // The fused `b.gt`, which branches to the then-label, stays, and the `b else` stays too. The
-    // trailing `b then` is elided, so exactly one unconditional branch remains.
-    try std.testing.expect(std.mem.indexOf(u8, text, "b.gt ") != null);
-    try std.testing.expectEqual(@as(usize, 1), countSubstr(text, "  b ."));
+    // Branch directly to ELSE with the inverted condition; THEN falls through.
+    // Neither outcome needs an unconditional branch.
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.le ") != null);
+    try std.testing.expectEqual(@as(usize, 0), countSubstr(text, "  b ."));
 
     const cases = [_][2]i32{ .{ 3, 1 }, .{ 1, 3 }, .{ 5, 5 }, .{ -2, -7 }, .{ -7, -2 } };
     for (cases) |cc| {
@@ -5694,8 +5693,7 @@ test "aarch64 fallthrough: conditional then-edge next elides b-then" {
 test "aarch64 fallthrough: conditional else-edge next inverts and falls through" {
     const allocator = std.testing.allocator;
 
-    // Fused path: the else-edge is next, so the fused `b.gt then` inverts to `b.le else` and the
-    // else-moves fall through. Exactly one unconditional branch (`b then`) remains.
+    // Fused path: ELSE is next, so branch directly to THEN and let ELSE fall through.
     {
         var func = Function.init(allocator);
         defer func.deinit();
@@ -5717,9 +5715,9 @@ test "aarch64 fallthrough: conditional else-edge next inverts and falls through"
         defer allocator.free(code);
         const text = try disasm.format(allocator, code);
         defer allocator.free(text);
-        try std.testing.expect(std.mem.indexOf(u8, text, "b.le ") != null); // inverted condition
-        try std.testing.expect(std.mem.indexOf(u8, text, "b.gt ") == null);
-        try std.testing.expectEqual(@as(usize, 1), countSubstr(text, "  b ."));
+        try std.testing.expect(std.mem.indexOf(u8, text, "b.gt ") != null); // direct then-edge condition
+        try std.testing.expect(std.mem.indexOf(u8, text, "b.le ") == null);
+        try std.testing.expectEqual(@as(usize, 0), countSubstr(text, "  b ."));
 
         const cases = [_][2]i32{ .{ 3, 1 }, .{ 1, 3 }, .{ 5, 5 }, .{ -2, -7 }, .{ -7, -2 } };
         for (cases) |cc| {
@@ -5727,9 +5725,7 @@ test "aarch64 fallthrough: conditional else-edge next inverts and falls through"
         }
     }
 
-    // Boolean (non-fused) path: a bare bool condition normally branches with `cbnz then`. Inverting
-    // for the else-fall-through emits `cbz else`. This test checks the cbz encoder on the inverted
-    // boolean path.
+    // Boolean path: branch directly to THEN with cbnz and let ELSE fall through.
     {
         var func = Function.init(allocator);
         defer func.deinit();
@@ -5749,8 +5745,8 @@ test "aarch64 fallthrough: conditional else-edge next inverts and falls through"
         defer allocator.free(code);
         const text = try disasm.format(allocator, code);
         defer allocator.free(text);
-        try std.testing.expect(std.mem.indexOf(u8, text, "cbz ") != null); // inverted boolean branch
-        try std.testing.expect(std.mem.indexOf(u8, text, "cbnz ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "cbnz ") != null); // direct boolean branch
+        try std.testing.expect(std.mem.indexOf(u8, text, "cbz ") == null);
 
         for ([_]i32{ 0, 1 }) |flag_val| {
             try expectRun(allocator, &func, &.{flag_val}, if (flag_val != 0) 1 else 0);
@@ -6207,4 +6203,38 @@ test "native: a sixty four bit immediate operation keeps the whole immediate" {
         const call: Fn = @ptrCast(buf.memory.ptr);
         try std.testing.expectEqual(each.want, call(each.given));
     }
+}
+
+test "native: shifted add subtract immediates preserve width" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    for ([_]u16{ 32, 64 }) |bits| for ([_]i64{ 4096, 65536, 4095 << 12, -4096, -65536, -(4095 << 12) }) |imm| {
+        for ([_]ir.function.BinOp{ .add, .sub }) |op| {
+            var f = Function.init(allocator);
+            defer f.deinit();
+            const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = bits } });
+            const b = try f.appendBlock();
+            const input = try f.appendBlockParam(b, t);
+            const c = try f.appendInst(b, t, .{ .iconst = imm });
+            const value = try f.appendInst(b, t, .{ .arith = .{ .op = op, .lhs = input, .rhs = c } });
+            f.setTerminator(b, .{ .ret = ir.function.Ret.one(value) });
+            const want = if (op == .add) 17 + imm else 17 - imm;
+            const code = try isel.selectFunction(allocator, &f);
+            defer allocator.free(code);
+            var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+            defer buf.deinit();
+            if (bits == 64) {
+                const call: *const fn (i64) callconv(.c) i64 = @ptrCast(buf.memory.ptr);
+                try std.testing.expectEqual(want, call(17));
+            } else {
+                const call: *const fn (i32) callconv(.c) i32 = @ptrCast(buf.memory.ptr);
+                try std.testing.expectEqual(@as(i32, @intCast(want)), call(17));
+            }
+            var shifted: usize = 0;
+            for (code) |word| if (word & 0x1f400000 == 0x11400000) {
+                shifted += 1;
+            };
+            try std.testing.expectEqual(@as(usize, 1), shifted);
+        }
+    };
 }

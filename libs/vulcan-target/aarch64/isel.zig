@@ -40,10 +40,15 @@ const empty_fold: addrfold.Analysis = addrfold.Analysis.empty;
 /// The byte-scaled access granule of `v`'s memory form, matching EXACTLY the encoder bucket that
 /// `emitLoad`/`emitStore` select for it. A folded displacement must be a whole multiple of this
 /// granule (the base+offset encoders scale the immediate by it), so `aarch64FoldOffset` uses it for
-/// both the divisibility and the range check. Vector is a 16-byte Q access, an fp half a 2-byte H,
+/// both the divisibility and the range check. Vector is a 4/8/16-byte S/D/Q access, an fp half a 2-byte H,
 /// fp single/double a 4/8-byte S/D, and an integer its 1/2/4/8-byte bucket.
 fn aarch64AccessScale(func: *const Function, v: Value) usize {
-    if (isVector(func, v) or isQuad(func, v)) return 16; // a 16-byte Q access (f128 too)
+    if (isQuad(func, v)) return 16;
+    if (isVector(func, v)) return switch (typeSize(func, func.valueType(v))) {
+        4 => 4,
+        8 => 8,
+        else => 16, // other widths are rejected by memory emission
+    };
     if (regClass(func, v) == .fpr) {
         if (isHalf(func, v)) return 2;
         return if (isDouble(func, v)) 8 else 4;
@@ -151,14 +156,19 @@ fn laneKind(func: *const Function, vector_value: Value) ?LaneKind {
 /// element kinds `laneKind` supports; integer XOR reduction is native too. Other reduce ops, and
 /// any unsupported element kind, still need expansion (its `extract`/`struct_new` output goes
 /// through this same `laneKind` gate further down, so it is rejected there instead, not here).
+fn isByteVector(func: *const Function, value: Value) bool {
+    const ty = func.types.type_kind(func.valueType(value));
+    return ty == .vector and ty.vector.len == 16 and func.types.type_kind(ty.vector.elem) == .int and func.types.type_kind(ty.vector.elem).int.bits == 8 and func.types.type_kind(ty.vector.elem).int.signedness == .unsigned;
+}
+
 fn hasNativeVectorLaneOp(func: *const Function, inst: ir.function.Inst) bool {
     return switch (func.opcode(inst)) {
         .reduce => |red| switch (red.op) {
-            .add => laneKind(func, red.vector) != null,
+            .add => laneKind(func, red.vector) != null or isByteVector(func, red.vector),
             .bit_xor => laneKind(func, red.vector) == .i32,
             else => false,
         },
-        .splat => laneKind(func, func.instResult(inst).?) != null,
+        .splat => laneKind(func, func.instResult(inst).?) != null or isByteVector(func, func.instResult(inst).?),
         else => false,
     };
 }
@@ -391,6 +401,8 @@ pub const Fixup = struct {
     /// Word index named by an `adr` placeholder. Unlike a branch fixup, this names emitted code
     /// directly instead of an IR block.
     adr_target: ?usize = null,
+    /// Local branch label, remapped alongside code when peepholes shrink it.
+    word_target: ?usize = null,
     /// Word index used as the base of a dense-switch offset table. Null identifies an ordinary
     /// branch fixup. A table row stores `(target - table_base)` in instruction words.
     table_base: ?usize = null,
@@ -784,6 +796,9 @@ pub const ModelCaps = struct {
     /// f16 lowering is byte-identical to the pre-FEAT_FP16 emulation.
     fp16: bool = false,
     machine_model: peephole.MachineModel = .{},
+    /// Let move-free edges fall through outside loops too. Emission retries
+    /// with the conservative layout if a direct conditional is out of range.
+    direct_fallthrough: bool = true,
     /// Fuse a compare into its consumer branch (CMP+Bcc becomes a single conditional branch on flags).
     /// Base-ISA on every aarch64 core, so true by default. Gates `fusesIntoNextIf` (see its doc
     /// comment). When false, it falls back to materializing the boolean with `cset` then testing it with
@@ -1100,6 +1115,7 @@ fn restoreLoopAlignment(
         fixup.at += added[fixup.at];
         if (fixup.table_base) |base| fixup.table_base = base + added[base];
         if (fixup.adr_target) |target| fixup.adr_target = target + added[target];
+        if (fixup.word_target) |target| fixup.word_target = target + added[target];
     }
     for (relocs) |*reloc| reloc.offset += added[reloc.offset];
     for (lines) |*line| {
@@ -1124,11 +1140,14 @@ fn restoreLoopAlignment(
 /// adds are removed, never a mem inst, so the offsets survive. Runs on the CLONE, after critical-edge
 /// splitting and BEFORE `wimmer.allocate`. Sound cross-block: base dominated the add and the add
 /// dominated the load, so base dominates the load.
-fn applyFoldRewrite(func: *Function, fold: *const addrfold.Analysis) void {
+fn applyFoldRewrite(func: *Function, fold: *const addrfold.Analysis) Error!void {
     var it = fold.folds.iterator();
     while (it.next()) |entry| {
         const mem_inst = entry.key_ptr.*;
         const base = entry.value_ptr.base;
+        // The displacement lives in the fold side table after ptr is rewritten.
+        // Do not let a second indexed-address match discard that displacement.
+        if (entry.value_ptr.off != 0) try func.addAttr(.{ .inst = mem_inst }, .{ .custom = .{ .namespace = "vulcan.aarch64", .key = "immediate-address", .value = .flag } });
         const op = func.opcodeMut(mem_inst);
         switch (op.*) {
             .load => |*l| l.ptr = base,
@@ -1192,6 +1211,8 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // public *const signature (`selectFunction`, `selectFunctionForModel`, link/object) unchanged.
     var work = try func.clone(allocator);
     defer work.deinit();
+    try lowerPopcounts(allocator, &work);
+    try lowerWideningShifts(allocator, &work);
 
     _ = try ir.expand.expandNvFp4(allocator, &work);
     _ = try ir.expand.expandLowFloat(allocator, &work);
@@ -1231,7 +1252,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // the (now raw) ptr = base and `offOf` the displacement, staying consistent with the rewritten IR.
     var fold = try addrfold.analyze(allocator, &work, {}, aarch64FoldOffset);
     defer fold.deinit(allocator);
-    applyFoldRewrite(&work, &fold);
+    try applyFoldRewrite(&work, &fold);
 
     var desc = try aarch64RegDescription(allocator, &work);
     defer desc.deinit(allocator);
@@ -1371,23 +1392,34 @@ fn emitStructRetStore(allocator: std.mem.Allocator, code: *std.ArrayList(u32), p
 /// (`fetch_align`, `fp16`). An inert `.{}` reproduces `selectFunction`'s output exactly. `nblocks`
 /// and `leaf` are recomputed from `func` (identical to the values `compileFunction` passed to
 /// `allocate`), so the extraction is byte-identical for every existing caller.
-const EmitError = Error || error{CompactTableOverflow};
+const EmitError = Error || error{ CompactTableOverflow, ConditionalBranchOverflow };
 
 /// Prefer packed dense-switch tables, then repeat emission with full-width rows if final block
 /// placement needs an offset larger than one byte. Allocation is unchanged by either attempt.
 fn emitBestFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, alloc: *Allocation, fold: *const addrfold.Analysis) Error!Compiled {
-    return emitFromAllocation(allocator, func, caps, alloc, fold, true) catch |err| switch (err) {
-        error.CompactTableOverflow => emitFromAllocation(allocator, func, caps, alloc, fold, false) catch |retry_err| switch (retry_err) {
-            error.CompactTableOverflow => unreachable,
+    var attempt = caps;
+    var compact = true;
+    while (true) {
+        return emitFromAllocation(allocator, func, attempt, alloc, fold, compact) catch |err| switch (err) {
+            error.CompactTableOverflow => {
+                if (!compact) return error.Unsupported;
+                compact = false;
+                continue;
+            },
+            error.ConditionalBranchOverflow => {
+                if (!attempt.direct_fallthrough) return error.Unsupported;
+                attempt.direct_fallthrough = false;
+                continue;
+            },
             error.OutOfMemory => return error.OutOfMemory,
             error.Unsupported => return error.Unsupported,
-        },
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Unsupported => return error.Unsupported,
-    };
+        };
+    }
 }
 
 fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, alloc: *Allocation, fold: *const addrfold.Analysis, compact_switch_tables: bool) EmitError!Compiled {
+    // Emission can retry table widths or branch layout with the same allocation.
+    for (alloc.edge_moves) |*set| set.consumed = false;
     const fetch_align = caps.fetch_align;
     // Native half arithmetic (FEAT_FP16) vs the base-ISA emulation, gated on the model feature.
     // `fp16 == false` (every non-model caller) keeps the emulation, byte-identical to before this
@@ -1895,6 +1927,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (a.op == .mul and (fusesIntoNextArith(func, insts, inst_idx) or fusesIntegerMulIntoNextImmAdd(func, insts, inst_idx))) continue;
                     if ((a.op == .shl or a.op == .shr) and fusesIntoNextShiftAdd(func, insts, inst_idx, caps.fuse_shift_add)) continue;
                     const result = func.instResult(inst).?;
+                    if (a.op == .add and isIndexedIntegerAddress(func, result)) continue;
                     if (a.op == .sub and cnegProducerForLaterSelect(func, insts, inst_idx, caps.machine_model)) continue;
                     if ((a.op == .add or a.op == .bit_and) and parityForLaterSelect(func, insts, result, caps.machine_model)) continue;
                     if ((a.op == .shl or a.op == .shr) and foldsAsBitfieldExtractSource(func, result)) continue;
@@ -2038,6 +2071,16 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         continue;
                     }
                     const result = func.instResult(inst).?;
+                    if (isByteVector(func, cmp.lhs)) {
+                        if (cmp.op != .eq and cmp.op != .ne) return error.Unsupported;
+                        const lhs = try ctx.loadOp(allocator, &code, cmp.lhs, fp_spill_op[0]);
+                        const rhs = try ctx.loadOp(allocator, &code, cmp.rhs, fp_spill_op[1]);
+                        const rd = ctx.resultReg(result);
+                        try code.append(allocator, encode.cmeqVecI8(rd, lhs, rhs));
+                        if (cmp.op == .ne) try code.append(allocator, encode.mvnVec(rd, rd));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     if (isVector(func, cmp.lhs)) {
                         // Vectorized compare (widened FS): produce a per-lane MASK
                         // (all-ones where the relation holds, else all-zeros) in a
@@ -2046,6 +2089,14 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, fp_spill_op[0]);
                         const rr = try ctx.loadOp(allocator, &code, cmp.rhs, fp_spill_op[1]);
                         const rd = ctx.resultReg(result);
+                        if (laneKind(func, cmp.lhs) == .i32) {
+                            if (cmp.op != .eq and cmp.op != .ne) return error.Unsupported;
+                            try code.append(allocator, encode.cmeqVecI32(rd, rl, rr));
+                            if (cmp.op == .ne) try code.append(allocator, encode.mvnVec(rd, rd));
+                            try storeResult(allocator, &code, ctx, result, rd);
+                            continue;
+                        }
+                        if (laneKind(func, cmp.lhs) != .f32) return error.Unsupported;
                         switch (cmp.op) {
                             .eq => try code.append(allocator, encode.fcmeqVec(rd, rl, rr)),
                             .ne => {
@@ -2173,6 +2224,23 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const dc = regClass(func, result);
                     const src = try ctx.loadOp(allocator, &code, cv.value, if (sc == .fpr) fp_spill_op[0] else spill_op[0]);
                     const rd = ctx.resultReg(result);
+                    if (isVector(func, cv.value) or isVector(func, result)) {
+                        if (!isVector(func, cv.value) or !isVector(func, result)) return error.Unsupported;
+                        const sv = func.types.type_kind(func.valueType(cv.value)).vector;
+                        const dv = func.types.type_kind(func.valueType(result)).vector;
+                        if (sv.len != dv.len) return error.Unsupported;
+                        const sk = func.types.type_kind(sv.elem);
+                        const dk = func.types.type_kind(dv.elem);
+                        if (sv.elem == dv.elem or (sk == .int and dk == .int and sk.int.bits == dk.int.bits)) {
+                            if (rd != src) try code.append(allocator, encode.movVec(rd, src));
+                        } else if (sv.len == 4 and sk == .int and dk == .int and dk.int.bits == 32 and (sk.int.bits == 8 or sk.int.bits == 16)) {
+                            const signed = sk.int.signedness == .signed;
+                            try code.append(allocator, encode.extendVec(rd, src, sk.int.bits, signed));
+                            if (sk.int.bits == 8) try code.append(allocator, encode.extendVec(rd, rd, 16, signed));
+                        } else return error.Unsupported;
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     if (sc == .gpr and dc == .fpr) {
                         // int -> float: scvtf/ucvtf. NATIVE (fp16) converts straight into the H
                         // view (single-rounded, no fixup). EMULATION lands an int->f16 in the S
@@ -2233,7 +2301,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         // bits, byte-identical to the previous unconditional mov for those cases.
                         const src_bits = intBitsOf(func, cv.value);
                         const dst_bits = intBitsOf(func, result);
-                        if (dst_bits > src_bits and src_bits < 64) {
+                        if (dst_bits > src_bits and src_bits < 64 and !integerAlreadyZeroExtended(func, cv.value, 6)) {
                             const imms: u6 = @intCast(src_bits - 1);
                             try code.append(allocator, if (isSignedInt(func, cv.value))
                                 encode.sbfm(rd, src, 0, imms)
@@ -2264,11 +2332,20 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // `__sqrttf2` before isel. A reinterpret to/from f128 would also need a 128-bit
                     // move, not the scalar `fmov`. Reject any f128 operand or result defensively.
                     if (isQuad(func, result) or isQuad(func, u.value)) return error.Unsupported;
+                    if (wideningShiftAmount(func, inst) != null and isFoldedIndexedScale(func, result)) continue;
                     const sc = regClass(func, u.value);
                     const dc = regClass(func, result);
                     const src = try ctx.loadOp(allocator, &code, u.value, if (sc == .fpr) fp_spill_op[0] else spill_op[0]);
                     const rd = ctx.resultReg(result);
-                    if (u.op == .reinterpret) {
+                    if (isPopcount(func, inst)) {
+                        const tmp = fp_spill_op[0];
+                        try code.append(allocator, encode.fmovFromGpr(tmp, src, isWide(func, u.value)));
+                        try code.append(allocator, encode.cnt8B(tmp, tmp));
+                        try code.append(allocator, encode.addv8B(tmp, tmp));
+                        try code.append(allocator, encode.fmovToGpr(rd, tmp, false));
+                    } else if (wideningShiftAmount(func, inst)) |amount| {
+                        try code.append(allocator, encode.ubfm(rd, src, @intCast(@as(u7, 64) - amount), @intCast(intBitsOf(func, u.value) - 1)));
+                    } else if (u.op == .reinterpret) {
                         if (sc == .gpr and dc == .fpr) {
                             try code.append(allocator, encode.fmovFromGpr(rd, src, isDouble(func, result)));
                         } else if (sc == .fpr and dc == .gpr) {
@@ -2345,6 +2422,14 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // (the add's lhs) and `offOf` the displacement. Both are the raw ptr and 0 when
                     // unfolded, so the non-folding case is byte-identical.
                     const result = func.instResult(inst).?;
+                    if (indexedIntegerLoad(func, inst)) |address| {
+                        const base = try ctx.loadOp(allocator, &code, address.base, spill_op[0]);
+                        const index = try ctx.loadOp(allocator, &code, address.index, spill_op[1]);
+                        const rd = ctx.resultReg(result);
+                        try code.append(allocator, if (address.scaled_u32) encode.ldrWRegUxtw(rd, base, index) else if (intBitsOf(func, result) == 32) encode.ldrWRegUnscaled(rd, base, index) else if (isSignedInt(func, result)) encode.ldrsbReg(rd, base, index) else encode.ldrbReg(rd, base, index));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     const base = try ctx.loadOp(allocator, &code, fold.baseOf(func, inst), spill_op[0]); // ptr is a gpr
                     const rd = ctx.resultReg(result);
                     try emitLoad(allocator, &code, func, result, rd, base, @intCast(fold.offOf(inst)), fp16);
@@ -2459,6 +2544,15 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // still rewrites those into extracts and a tree of scalar ops before isel runs,
                     // and this arm never sees them.
                     if (!isVector(func, red.vector)) return error.Unsupported;
+                    if (isByteVector(func, red.vector) and red.op == .add) {
+                        const src = try ctx.loadOp(allocator, &code, red.vector, fp_spill_op[0]);
+                        const result = func.instResult(inst).?;
+                        const rd = ctx.resultReg(result);
+                        try code.append(allocator, encode.addv16B(fp_spill_op[1], src));
+                        try code.append(allocator, encode.fmovToGpr(rd, fp_spill_op[1], false));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     const elem = laneKind(func, red.vector) orelse return error.Unsupported;
                     const result = func.instResult(inst).?;
                     const src = try ctx.loadOp(allocator, &code, red.vector, fp_spill_op[0]);
@@ -2500,6 +2594,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // `struct_new` arm above already uses for an all-same-field vector.
                     const result = func.instResult(inst).?;
                     if (foldsAsVectorShiftImmSplat(func, result)) continue;
+                    if (isByteVector(func, result)) {
+                        const src = try ctx.loadOp(allocator, &code, spv.scalar, spill_op[0]);
+                        const rd = ctx.resultReg(result);
+                        try code.append(allocator, encode.dupByteFromGpr(rd, src));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     if (!isVector(func, result)) return error.Unsupported;
                     const elem = laneKind(func, result) orelse return error.Unsupported;
                     const rd = ctx.resultReg(result);
@@ -2614,7 +2715,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         insts,
                         inst_idx,
                         next_block,
-                        is_loop_header[bi] or (next_block != null and is_loop_header[@backingInt(next_block.?)]),
+                        caps.direct_fallthrough,
                     );
                     terminated = true;
                 },
@@ -2828,13 +2929,16 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             }
             continue;
         }
-        const off: i28 = @intCast((@as(i64, @intCast(block_start[target])) - @as(i64, @intCast(f.at))) * 4);
-        code.items[f.at] = if (f.cond) |cond|
-            encode.bcc(cond, @intCast(off))
-        else if (f.test_reg) |test_reg|
-            if (test_reg.nonzero) encode.cbnz(test_reg.reg, @intCast(off)) else encode.cbz(test_reg.reg, @intCast(off))
-        else
-            encode.b(off);
+        const off = std.math.cast(i28, (@as(i64, @intCast(f.word_target orelse block_start[target])) - @as(i64, @intCast(f.at))) * 4) orelse return error.Unsupported;
+        if (f.cond != null or f.test_reg != null) {
+            const short = std.math.cast(i21, off) orelse return error.ConditionalBranchOverflow;
+            code.items[f.at] = if (f.cond) |cond|
+                encode.bcc(cond, short)
+            else if (f.test_reg.?.nonzero)
+                encode.cbnz(f.test_reg.?.reg, short)
+            else
+                encode.cbz(f.test_reg.?.reg, short);
+        } else code.items[f.at] = encode.b(off);
     }
 
     return .{
@@ -3071,11 +3175,9 @@ const Ctx = struct {
     ///   sub(c, mul(a,b)) = c-a*b  -> fmsub:  Rd = Ra - Rn*Rm
     ///
     /// Vector NEON FMLA/FMLS ACCUMULATE into their destination register (Vd = Vd (+/-)
-    /// Vn*Vm), so `c` must be resident in the destination before either executes. Mirrors
-    /// the `dot` lowering: move `c` into the fixed scratch `fp_move` (v27, outside every
-    /// allocation pool) first, so it never aliases `a`/`b` (a naive `movVec(rd, c)` would
-    /// clobber `a` or `b` if the allocator reused either's register as `rd`), then move
-    /// the scratch into the result register only if they differ.
+    /// Vn*Vm), so `c` must be resident in the destination before either executes. Use
+    /// the result register when it already holds c or cannot overwrite a multiplicand;
+    /// otherwise use the reserved scratch and copy the result back.
     ///   add(mul(a,b), c) = a*b+c -> fmla: Vd = Vd + Vn*Vm, Vd preloaded with c
     ///   sub(c, mul(a,b)) = c-a*b -> fmls: Vd = Vd - Vn*Vm, Vd preloaded with c
     /// (`fusesIntoNextArith` never fuses the third vector shape, sub(mul,c) = a*b-c, since
@@ -3097,6 +3199,16 @@ const Ctx = struct {
         mul_result: Value,
     ) Error!void {
         const ra_val = if (lhs == mul_result) rhs else lhs; // the add/sub's non-mul operand
+        if (!isVector(self.func, result) and regClass(self.func, result) == .gpr) {
+            const a = try self.loadOp(allocator, code, mul.lhs, spill_op[0]);
+            const b = try self.loadOp(allocator, code, mul.rhs, spill_op[1]);
+            const c = try self.loadOp(allocator, code, ra_val, scratch_imm);
+            const rd = self.resultReg(result);
+            const wide = isWide(self.func, result);
+            try code.append(allocator, if (op == .add) encode.madd(rd, a, b, c, wide) else encode.msubInt(rd, a, b, c, wide));
+            try storeResult(allocator, code, self, result, rd);
+            return;
+        }
         const a = try self.loadOp(allocator, code, mul.lhs, fp_spill_op[0]);
         const b = try self.loadOp(allocator, code, mul.rhs, fp_spill_op[1]);
         const c = try self.loadOp(allocator, code, ra_val, fp_spill_res);
@@ -3118,13 +3230,14 @@ const Ctx = struct {
             }
             // `op == .sub` here only ever means `sub(c, mul)` (`fusesIntoNextArith` rejects
             // `sub(mul, c)` for a vector), so fmls's `Vd - Vn*Vm` is always the right shape.
-            try code.append(allocator, encode.movVec(fp_move, c));
+            const accumulator = if (rd == c or (rd != a and rd != b)) rd else fp_move;
+            if (accumulator != c) try code.append(allocator, encode.movVec(accumulator, c));
             try code.append(allocator, switch (op) {
-                .add => encode.fmlaVec(fp_move, a, b),
-                .sub => encode.fmlsVec(fp_move, a, b),
+                .add => encode.fmlaVec(accumulator, a, b),
+                .sub => encode.fmlsVec(accumulator, a, b),
                 else => unreachable, // the caller only routes .add/.sub here (see the switch above)
             });
-            if (@backingInt(rd) != @backingInt(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
+            if (rd != accumulator) try code.append(allocator, encode.movVec(rd, accumulator));
             try storeResult(allocator, code, self, result, rd);
             return;
         }
@@ -3267,11 +3380,13 @@ const Ctx = struct {
                 if (addSubImmFold(self.func, a)) |f| {
                     const rl = try self.loadOp(allocator, code, f.base, spill_op[0]);
                     const add = (a.op == .add) == (f.imm >= 0);
-                    const imm: u12 = @intCast(@abs(f.imm));
-                    try code.append(allocator, if (add)
+                    const encoded = addSubImmediate(f.imm).?;
+                    const imm = encoded.value;
+                    const word = if (add)
                         (if (wide) encode.addsImm64(rd, rl, imm) else encode.addsImm(rd, rl, imm))
                     else
-                        (if (wide) encode.subsImm64(rd, rl, imm) else encode.subsImm(rd, rl, imm)));
+                        (if (wide) encode.subsImm64(rd, rl, imm) else encode.subsImm(rd, rl, imm));
+                    try code.append(allocator, word | encoded.shift);
                     return;
                 }
                 if (logicalImmFold(self.func, a, result)) |f| {
@@ -3417,7 +3532,7 @@ const Ctx = struct {
             // A move on the taken edge may execute before a flag-based branch when allocation
             // proved its destination unused on the fallthrough edge. This turns a loop-edge
             // move block into one direct backedge without clobbering either outcome.
-            if (!common_moves and self.edgeMovesEmpty(cf.then)) if (self.speculatableEdgeMoves(cf.@"else")) |set| switch (branch) {
+            if (direct_fallthrough and !common_moves and self.edgeMovesEmpty(cf.then)) if (self.speculatableEdgeMoves(cf.@"else")) |set| switch (branch) {
                 .cc => |cond| {
                     try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
@@ -3442,14 +3557,20 @@ const Ctx = struct {
             };
             // With no moves on the cold ELSE edge, branch there directly and let THEN fall through.
             // This removes the local label plus unconditional branch from the hot loop-header shape.
-            if ((direct_fallthrough or common_moves) and (common_moves or self.edgeMovesEmpty(cf.@"else"))) switch (branch) {
+            if (direct_fallthrough and (common_moves or self.edgeMovesEmpty(cf.@"else"))) switch (branch) {
                 .cc => |cond| {
                     try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target), .cond = encode.invertCond(cond) });
                     try code.append(allocator, encode.bcc(encode.invertCond(cond), 0));
                     if (!common_moves) try self.emitMoves(allocator, code, cf.then);
                     return;
                 },
-                else => {},
+                .reg, .reg_eqz => |reg| {
+                    const nonzero = branch == .reg_eqz;
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target), .test_reg = .{ .reg = reg, .nonzero = nonzero } });
+                    try code.append(allocator, if (nonzero) encode.cbnz(reg, 0) else encode.cbz(reg, 0));
+                    if (!common_moves) try self.emitMoves(allocator, code, cf.then);
+                    return;
+                },
             };
             // THEN falls through. Keep the not-inverted branch to the then-label, emit the ELSE-moves +
             // `b ELSE` inline, then the THEN-moves last and FALL THROUGH to THEN (elide the trailing
@@ -3464,18 +3585,17 @@ const Ctx = struct {
             try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target) });
             try code.append(allocator, encode.b(0));
             const then_at = code.items.len;
-            const disp: i21 = @intCast((@as(i64, @intCast(then_at)) - @as(i64, @intCast(bcc_at))) * 4);
-            code.items[bcc_at] = switch (branch) {
-                .cc => |cond| encode.bcc(cond, disp),
-                .reg => |reg| encode.cbnz(reg, disp),
-                .reg_eqz => |reg| encode.cbz(reg, disp),
-            };
+            try fixups.append(allocator, switch (branch) {
+                .cc => |cond| .{ .at = bcc_at, .target = 0, .word_target = then_at, .cond = cond },
+                .reg => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = true } },
+                .reg_eqz => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = false } },
+            });
             if (!common_moves) try self.emitMoves(allocator, code, cf.then); // THEN-moves, then fall through to THEN
             return;
         }
 
         if (else_next) {
-            if (!common_moves and self.edgeMovesEmpty(cf.@"else")) if (self.speculatableEdgeMoves(cf.then)) |set| switch (branch) {
+            if (direct_fallthrough and !common_moves and self.edgeMovesEmpty(cf.@"else")) if (self.speculatableEdgeMoves(cf.then)) |set| switch (branch) {
                 .cc => |cond| {
                     try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
@@ -3499,14 +3619,20 @@ const Ctx = struct {
                 },
             };
             // Symmetric move-free fast path: branch directly to THEN and let ELSE fall through.
-            if ((direct_fallthrough or common_moves) and (common_moves or self.edgeMovesEmpty(cf.then))) switch (branch) {
+            if (direct_fallthrough and (common_moves or self.edgeMovesEmpty(cf.then))) switch (branch) {
                 .cc => |cond| {
                     try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target), .cond = cond });
                     try code.append(allocator, encode.bcc(cond, 0));
                     if (!common_moves) try self.emitMoves(allocator, code, cf.@"else");
                     return;
                 },
-                else => {},
+                .reg, .reg_eqz => |reg| {
+                    const nonzero = branch == .reg;
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target), .test_reg = .{ .reg = reg, .nonzero = nonzero } });
+                    try code.append(allocator, if (nonzero) encode.cbnz(reg, 0) else encode.cbz(reg, 0));
+                    if (!common_moves) try self.emitMoves(allocator, code, cf.@"else");
+                    return;
+                },
             };
             // ELSE falls through. INVERT the branch so it targets the else-label when the ELSE edge is
             // taken (bcc on invertCond, or `cbz` for the boolean path), emit the THEN-moves + `b THEN`
@@ -3522,17 +3648,34 @@ const Ctx = struct {
             try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target) });
             try code.append(allocator, encode.b(0));
             const else_at = code.items.len;
-            const disp: i21 = @intCast((@as(i64, @intCast(else_at)) - @as(i64, @intCast(bcc_at))) * 4);
-            code.items[bcc_at] = switch (branch) {
-                .cc => |cond| encode.bcc(encode.invertCond(cond), disp),
-                .reg => |reg| encode.cbz(reg, disp),
-                .reg_eqz => |reg| encode.cbnz(reg, disp),
-            };
+            try fixups.append(allocator, switch (branch) {
+                .cc => |cond| .{ .at = bcc_at, .target = 0, .word_target = else_at, .cond = encode.invertCond(cond) },
+                .reg => |reg| .{ .at = bcc_at, .target = 0, .word_target = else_at, .test_reg = .{ .reg = reg, .nonzero = false } },
+                .reg_eqz => |reg| .{ .at = bcc_at, .target = 0, .word_target = else_at, .test_reg = .{ .reg = reg, .nonzero = true } },
+            });
             if (!common_moves) try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves, then fall through to ELSE
             return;
         }
 
         // Neither edge is NEXT (or this is the last block): emit both branches as before.
+        // Neither successor is physically next. A move-free taken edge can
+        // still branch directly, avoiding a local conditional plus another B.
+        if (direct_fallthrough and (common_moves or self.edgeMovesEmpty(cf.then))) {
+            try fixups.append(allocator, switch (branch) {
+                .cc => |cond| .{ .at = code.items.len, .target = @backingInt(then_target), .cond = cond },
+                .reg => |reg| .{ .at = code.items.len, .target = @backingInt(then_target), .test_reg = .{ .reg = reg, .nonzero = true } },
+                .reg_eqz => |reg| .{ .at = code.items.len, .target = @backingInt(then_target), .test_reg = .{ .reg = reg, .nonzero = false } },
+            });
+            try code.append(allocator, switch (branch) {
+                .cc => |cond| encode.bcc(cond, 0),
+                .reg => |reg| encode.cbnz(reg, 0),
+                .reg_eqz => |reg| encode.cbz(reg, 0),
+            });
+            if (!common_moves) try self.emitMoves(allocator, code, cf.@"else");
+            try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target) });
+            try code.append(allocator, encode.b(0));
+            return;
+        }
         const bcc_at = code.items.len;
         try code.append(allocator, switch (branch) {
             .cc => |cond| encode.bcc(cond, 0),
@@ -3543,12 +3686,11 @@ const Ctx = struct {
         try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target) });
         try code.append(allocator, encode.b(0));
         const then_at = code.items.len;
-        const disp: i21 = @intCast((@as(i64, @intCast(then_at)) - @as(i64, @intCast(bcc_at))) * 4);
-        code.items[bcc_at] = switch (branch) {
-            .cc => |cond| encode.bcc(cond, disp),
-            .reg => |reg| encode.cbnz(reg, disp),
-            .reg_eqz => |reg| encode.cbz(reg, disp),
-        };
+        try fixups.append(allocator, switch (branch) {
+            .cc => |cond| .{ .at = bcc_at, .target = 0, .word_target = then_at, .cond = cond },
+            .reg => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = true } },
+            .reg_eqz => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = false } },
+        });
         if (!common_moves) try self.emitMoves(allocator, code, cf.then);
         try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target) });
         try code.append(allocator, encode.b(0));
@@ -4187,6 +4329,259 @@ fn aarch64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.functio
 ///     and the emulated f16 mode, so this needs no `fp16` flag.
 /// Every other case (a cross-class int <-> float convert, or any non-convert) returns null. The
 /// unused `ctx` is the generic hook shape.
+const PopcountFold = struct {
+    source: Value,
+};
+
+fn popArith(func: *const Function, value: Value, op: ir.function.BinOp) ?ir.function.Arith {
+    const inst = func.definingInst(value) orelse return null;
+    const a = switch (func.opcode(inst)) {
+        .arith => |a| a,
+        else => return null,
+    };
+    return if (a.op == op) a else null;
+}
+fn popConst(func: *const Function, value: Value, k: i64) bool {
+    const inst = func.definingInst(value) orelse return false;
+    return func.opcode(inst) == .iconst and func.opcode(inst).iconst == k;
+}
+fn popImmediate(func: *const Function, value: Value, op: ir.function.BinOp, k: i64) ?Value {
+    const a = popArith(func, value, op) orelse return null;
+    if (popConst(func, a.rhs, k)) return a.lhs;
+    if ((op == .mul or op == .bit_and) and popConst(func, a.lhs, k)) return a.rhs;
+    return null;
+}
+
+/// Recognize the complete unsigned SWAR population-count expression. Dead-code
+/// elimination preserves intermediates that also have independent users.
+fn popcountFold(func: *const Function, result: Value) ?PopcountFold {
+    const kind = func.types.type_kind(func.valueType(result));
+    if (kind != .int or kind.int.signedness != .unsigned or (kind.int.bits != 32 and kind.int.bits != 64)) return null;
+    const wide = kind.int.bits == 64;
+    const product = popImmediate(func, result, .shr, if (wide) 56 else 24) orelse return null;
+    const bytes = popImmediate(func, product, .mul, if (wide) 0x0101010101010101 else 0x01010101) orelse return null;
+    const sum4 = popImmediate(func, bytes, .bit_and, if (wide) 0x0f0f0f0f0f0f0f0f else 0x0f0f0f0f) orelse return null;
+    const a4 = popArith(func, sum4, .add) orelse return null;
+    const pair4: [2]Value = if (popImmediate(func, a4.rhs, .shr, 4) == a4.lhs)
+        .{ a4.lhs, a4.rhs }
+    else if (popImmediate(func, a4.lhs, .shr, 4) == a4.rhs)
+        .{ a4.rhs, a4.lhs }
+    else
+        return null;
+    const sum2 = pair4[0];
+    const a2 = popArith(func, sum2, .add) orelse return null;
+    const left = popImmediate(func, a2.lhs, .bit_and, if (wide) 0x3333333333333333 else 0x33333333) orelse return null;
+    const right = popImmediate(func, a2.rhs, .bit_and, if (wide) 0x3333333333333333 else 0x33333333) orelse return null;
+    const pair2: [2]Value = if (popImmediate(func, right, .shr, 2) == left)
+        .{ left, right }
+    else if (popImmediate(func, left, .shr, 2) == right)
+        .{ right, left }
+    else
+        return null;
+    const difference = pair2[0];
+    const sub = popArith(func, difference, .sub) orelse return null;
+    const shift1 = popImmediate(func, sub.rhs, .bit_and, if (wide) 0x5555555555555555 else 0x55555555) orelse return null;
+    if (popImmediate(func, shift1, .shr, 1) != sub.lhs) return null;
+    const nodes = [12]Value{ result, product, bytes, sum4, pair4[1], sum2, a2.lhs, a2.rhs, pair2[1], difference, sub.rhs, shift1 };
+    if (func.valueType(sub.lhs) != func.valueType(result)) return null;
+    for (nodes) |node| if (func.valueType(node) != func.valueType(result)) return null;
+    return .{ .source = sub.lhs };
+}
+
+const IndexedIntegerLoad = struct { base: Value, index: Value, scaled_u32: bool = false };
+
+fn indexedIntegerAddress(func: *const Function, base: Value, index: Value, bits: u16) IndexedIntegerLoad {
+    if (bits == 32) if (func.definingInst(index)) |inst| {
+        if (wideningShiftAmount(func, inst) == 2 and func.opcode(inst) == .unary) {
+            const source = func.opcode(inst).unary.value;
+            if (intBitsOf(func, source) == 32) return .{ .base = base, .index = source, .scaled_u32 = true };
+        }
+    };
+    return .{ .base = base, .index = index };
+}
+
+/// Omit the scaled value only if every use is an address folded into a load.
+/// Independent uses keep its materialization, while each load still folds it.
+fn isFoldedIndexedScale(func: *const Function, value: Value) bool {
+    const uses = countUses(func, value);
+    if (uses == 0) return false;
+    var folded: usize = 0;
+    for (0..func.blockCount()) |bi| for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+        const address = indexedIntegerLoad(func, inst) orelse continue;
+        if (!address.scaled_u32) continue;
+        const ptr = func.opcode(inst).load.ptr;
+        const add = func.opcode(func.definingInst(ptr).?).arith;
+        if (add.lhs == value or add.rhs == value) folded += 1;
+    };
+    return uses == folded;
+}
+
+/// Read an address sum directly in an integer load. Only a single-use address can disappear;
+/// both original inputs are reported to allocation at the load itself.
+fn indexedIntegerLoad(func: *const Function, inst: ir.function.Inst) ?IndexedIntegerLoad {
+    var attrs = func.attributesOf(.{ .inst = inst });
+    while (attrs.next()) |attr| switch (attr) {
+        .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.aarch64") and std.mem.eql(u8, c.key, "immediate-address")) return null,
+        else => {},
+    };
+    const load = switch (func.opcode(inst)) {
+        .load => |l| l,
+        else => return null,
+    };
+    if (load.mask != null) return null;
+    const result = func.instResult(inst) orelse return null;
+    const ty = func.types.type_kind(func.valueType(result));
+    if (ty != .int or !(ty.int.bits == 32 or ty.int.bits == 8)) return null;
+    const producer = func.definingInst(load.ptr) orelse return null;
+    const add = switch (func.opcode(producer)) {
+        .arith => |a| a,
+        else => return null,
+    };
+    if (add.op != .add or countUses(func, load.ptr) != 1 or addSubImmFold(func, add) != null) return null;
+    // Existing shift/multiply fusion may omit an input of the address add.
+    // Leave those combined arithmetic forms to their current producer rules.
+    for ([_]Value{ add.lhs, add.rhs }) |operand| if (func.definingInst(operand)) |def| {
+        if (constantShift(func, def) != null) return null;
+        if (func.opcode(def) == .arith and func.opcode(def).arith.op == .mul) return null;
+    };
+    if (func.types.type_kind(func.valueType(add.lhs)) == .ptr and func.types.type_kind(func.valueType(add.rhs)) == .int and intBitsOf(func, add.rhs) == 64)
+        return indexedIntegerAddress(func, add.lhs, add.rhs, ty.int.bits);
+    if (func.types.type_kind(func.valueType(add.rhs)) == .ptr and func.types.type_kind(func.valueType(add.lhs)) == .int and intBitsOf(func, add.lhs) == 64)
+        return indexedIntegerAddress(func, add.rhs, add.lhs, ty.int.bits);
+    return null;
+}
+
+fn isIndexedIntegerAddress(func: *const Function, value: Value) bool {
+    if (func.types.type_kind(func.valueType(value)) != .ptr) return false;
+    for (0..func.blockCount()) |bi| for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+        if (func.opcode(inst) == .load and func.opcode(inst).load.ptr == value and indexedIntegerLoad(func, inst) != null) return true;
+    };
+    return false;
+}
+
+fn wideningShiftAmount(func: *const Function, inst: ir.function.Inst) ?u6 {
+    var attrs = func.attributesOf(.{ .inst = inst });
+    while (attrs.next()) |attr| switch (attr) {
+        .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.aarch64") and std.mem.eql(u8, c.key, "widening-shift")) {
+            return switch (c.value) {
+                .int => |n| @intCast(n),
+                else => null,
+            };
+        },
+        else => {},
+    };
+    return null;
+}
+
+/// UBFIZ performs an unsigned widening conversion and constant left shift in
+/// one instruction. Expose its original narrow operand before allocation, so
+/// its lifetime and any independent users of the conversion remain correct.
+fn lowerWideningShifts(allocator: std.mem.Allocator, func: *Function) Error!void {
+    var changed = false;
+    for (0..func.blockCount()) |bi| for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+        const shift = constantShift(func, inst) orelse continue;
+        if (shift.op != .shl or shift.imm < 1 or shift.imm > 63) continue;
+        const result = func.instResult(inst) orelse continue;
+        const result_ty = func.types.type_kind(func.valueType(result));
+        if (result_ty != .int or result_ty.int.bits != 64) continue;
+        const cv_inst = func.definingInst(shift.lhs) orelse continue;
+        const cv = switch (func.opcode(cv_inst)) {
+            .convert => |c| c,
+            else => continue,
+        };
+        const source_ty = func.types.type_kind(func.valueType(cv.value));
+        if (source_ty != .int or source_ty.int.signedness != .unsigned) continue;
+        const bits = source_ty.int.bits;
+        if ((bits != 8 and bits != 16 and bits != 32) or bits + shift.imm > 64) continue;
+        if (intBitsOf(func, shift.lhs) != 64) continue;
+        func.opcodeMut(inst).* = .{ .unary = .{ .op = .reinterpret, .value = cv.value } };
+        try func.addAttr(.{ .inst = inst }, .{ .custom = .{ .namespace = "vulcan.aarch64", .key = "widening-shift", .value = .{ .int = shift.imm } } });
+        changed = true;
+    };
+    if (changed) _ = try @import("vulcan-opt").pass.run(allocator, func, &.{@import("vulcan-opt").dce.pass_def});
+}
+
+fn isPopcount(func: *const Function, inst: ir.function.Inst) bool {
+    var attrs = func.attributesOf(.{ .inst = inst });
+    while (attrs.next()) |attr| switch (attr) {
+        .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.aarch64") and std.mem.eql(u8, c.key, "popcount")) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// Lower the whole expression before allocation, so the source stays live to
+/// CNT and dead software intermediates and mask constants consume no registers.
+/// The tagged unary is private to this selector, like its structure-load tags.
+fn lowerPopcounts(allocator: std.mem.Allocator, func: *Function) Error!void {
+    var changed = false;
+    for (0..func.blockCount()) |bi| for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+        const result = func.instResult(inst) orelse continue;
+        const fold = popcountFold(func, result) orelse continue;
+        func.opcodeMut(inst).* = .{ .unary = .{ .op = .reinterpret, .value = fold.source } };
+        try func.addAttr(.{ .inst = inst }, .{ .custom = .{ .namespace = "vulcan.aarch64", .key = "popcount", .value = .{ .int = 1 } } });
+        changed = true;
+    };
+    if (changed) _ = try @import("vulcan-opt").pass.run(allocator, func, &.{@import("vulcan-opt").dce.pass_def});
+}
+
+/// Unsigned byte/halfword loads zero-extend to W, which also clears the upper
+/// half of X. Unsigned word loads do the same. Widening can reuse that value.
+/// Parameters and arithmetic results have no such narrow-width guarantee.
+fn loadAlreadyExtended(func: *const Function, value: Value) bool {
+    const inst = func.definingInst(value) orelse return false;
+    if (func.opcode(inst) != .load) return false;
+    const kind = func.types.type_kind(func.valueType(value));
+    if (kind != .int or kind.int.signedness != .unsigned) return false;
+    return switch (kind.int.bits) {
+        8, 16, 32 => true,
+        else => false,
+    };
+}
+
+/// W-register arithmetic clears the upper half. Propagate that fact through block
+/// parameters only when every incoming edge proves it; bounded recursion makes
+/// cyclic forwarding and externally supplied parameters conservatively unknown.
+fn integerAlreadyZeroExtended(func: *const Function, value: Value, depth: u8) bool {
+    if (loadAlreadyExtended(func, value)) return true;
+    if (depth == 0) return false;
+    const ty = func.types.type_kind(func.valueType(value));
+    if (ty != .int or ty.int.bits != 32 or ty.int.signedness != .unsigned) return false;
+    if (func.definingInst(value)) |inst| return switch (func.opcode(inst)) {
+        .iconst => true,
+        .arith => |a| a.op != .mulh,
+        .arith_imm => |a| a.op != .mulh,
+        else => false,
+    };
+    const param = switch (func.values.items[@backingInt(value)].def) {
+        .block_param => |p| p,
+        else => return false,
+    };
+    if (@backingInt(param.block) == 0) return false;
+    var incoming: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| switch (func.opcode(inst)) {
+            .@"if" => |c| for ([_]ir.function.Jump{ c.then, c.@"else" }) |edge| {
+                if (edge.target != param.block) continue;
+                incoming += 1;
+                const args = func.valueList(edge.args);
+                if (param.index >= args.len or !integerAlreadyZeroExtended(func, args[param.index], depth - 1)) return false;
+            },
+            else => {},
+        };
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |edge| if (edge.target == param.block) {
+                incoming += 1;
+                const args = func.valueList(edge.args);
+                if (param.index >= args.len or !integerAlreadyZeroExtended(func, args[param.index], depth - 1)) return false;
+            },
+            else => {},
+        };
+    }
+    return incoming != 0;
+}
+
 fn aarch64CopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
     _ = ctx;
     const inst = func.definingInst(v) orelse return null;
@@ -4197,14 +4592,25 @@ fn aarch64CopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Va
     const sc = regClass(func, cv.value);
     const dc = regClass(func, v);
     if (sc == .gpr and dc == .gpr) {
-        // Same width or narrowing lowers to a full-register `mov`. Only widening (a wider result
-        // from a source under 64 bits) transforms bits, so exclude it, matching the emission.
+        // Same width or narrowing lowers to a full-register copy. Widening is
+        // also a copy when the unsigned load has already cleared the high bits.
         const src_bits = intBitsOf(func, cv.value);
         const dst_bits = intBitsOf(func, v);
-        if (dst_bits > src_bits and src_bits < 64) return null;
+        if (dst_bits > src_bits and src_bits < 64 and !integerAlreadyZeroExtended(func, cv.value, 6)) return null;
         return cv.value;
     }
     if (sc == .fpr and dc == .fpr) {
+        // The vector conversion emitter copies all 128 bits when lane widths
+        // agree. Signedness-only conversions can therefore share a register.
+        if (isVector(func, cv.value) and isVector(func, v)) {
+            const source = func.types.type_kind(func.valueType(cv.value)).vector;
+            const dest = func.types.type_kind(func.valueType(v)).vector;
+            if (source.len != dest.len) return null;
+            const sk = func.types.type_kind(source.elem);
+            const dk = func.types.type_kind(dest.elem);
+            if (source.elem == dest.elem or (sk == .int and dk == .int and sk.int.bits == dk.int.bits)) return cv.value;
+            return null;
+        }
         // Only a same-view SCALAR float copy (f32 -> f32 or f64 -> f64, no f16) is a bare `fmov`. Any
         // f16, or a single/double view change, is a real `fcvt` that changes bits. A 128-bit SIMD
         // vector also reports `.fpr`, and `fmov` would copy only its low 64 bits, so a vector operand
@@ -4227,6 +4633,11 @@ fn aarch64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Val
             .arith => |a| a,
             else => return null,
         };
+        if (arith.op == .add and laneKind(func, v) == .f32) {
+            if (func.definingInst(arith.lhs)) |producer| {
+                if (func.opcode(producer) == .arith and func.opcode(producer).arith.op == .mul) return arith.rhs;
+            }
+        }
         return switch (laneKind(func, v) orelse return null) {
             .f32 => switch (arith.op) {
                 .add, .sub, .mul, .div => arith.lhs,
@@ -4236,6 +4647,25 @@ fn aarch64DestructiveSource(ctx: *const anyopaque, func: *const Function, v: Val
                 .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl => arith.lhs,
                 else => null,
             },
+        };
+    }
+    if (regClass(func, v) == .fpr) {
+        const a = switch (func.opcode(inst)) {
+            .arith => |a| a,
+            else => return null,
+        };
+        // Scalar FP instructions can overwrite a dead input just as NEON can.
+        // Prefer the accumulator over the product of a potentially fused FMA,
+        // avoiding a register copy on a loop-carried floating-point sum.
+        if (a.op == .add or a.op == .sub) {
+            if (func.definingInst(a.lhs)) |producer| {
+                if (func.opcode(producer) == .arith and func.opcode(producer).arith.op == .mul)
+                    return a.rhs;
+            }
+        }
+        return switch (a.op) {
+            .add, .sub, .mul, .div => a.lhs,
+            else => null,
         };
     }
     if (regClass(func, v) != .gpr) return null;
@@ -4280,8 +4710,14 @@ fn aarch64LateRead(ctx: *const anyopaque, func: *const Function, inst: ir.functi
 fn aarch64FusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, out: *[wimmer.max_fused_operands]Value) ?u8 {
     _ = ctx;
     switch (func.opcode(inst)) {
+        .load => if (indexedIntegerLoad(func, inst)) |address| {
+            out[0] = address.base;
+            out[1] = address.index;
+            return 2;
+        },
         .arith => |arith| {
             const result = func.instResult(inst) orelse return null;
+            if (isIndexedIntegerAddress(func, result)) return 0;
             if (addSubImmFold(func, arith)) |fold| {
                 out[0] = fold.base;
                 return 1;
@@ -4593,6 +5029,8 @@ pub fn compileFunctionWimmerAbi(allocator: std.mem.Allocator, func: *Function, c
     // whole Q register), emitted below unchanged; any f128 arith/compare/convert that slips through
     // is rejected per-op rather than miscompiled.
     _ = try ir.softfp.lower(allocator, func);
+    try lowerPopcounts(allocator, func);
+    try lowerWideningShifts(allocator, func);
 
     // Split critical edges FIRST (mutating `func`), before any numbering is built, so the resolver's
     // no-critical-edge precondition holds and the RegDescription/scan/emission all see one CFG.
@@ -4881,7 +5319,10 @@ fn forEachOperand(
         // raw ptr, so the base's live range reaches the mem op (including cross-block) and the dead
         // add's own result gets no use. `baseOf` returns the raw ptr when unfolded, so the
         // non-folding case is byte-identical.
-        .load => f(ctx, fold.baseOf(func, inst), false),
+        .load => if (indexedIntegerLoad(func, inst)) |address| {
+            f(ctx, address.base, false);
+            f(ctx, address.index, false);
+        } else f(ctx, fold.baseOf(func, inst), false),
         .store => |st| {
             f(ctx, st.value, false);
             f(ctx, fold.baseOf(func, inst), false);
@@ -5328,7 +5769,7 @@ fn isFloatVector(func: *const Function, v: Value) bool {
 /// fmla/fmls (vector) on the mul's own operands (see `Ctx.emitFusedArith`). This is the ONE
 /// eligibility predicate shared by the mul-skip and the fused add/sub emission, so they
 /// never disagree (no dangling or doubled multiply). It mirrors `fusesIntoNextIf`. Gated to
-/// float operands (scalar or vector), plus i32 vectors that select MLA. For a float
+/// float operands (scalar or vector), scalar integers, and i32 vectors that select MLA. For a float
 /// vector mul, only the two shapes a single NEON instruction can
 /// express are allowed: `add(mul,c)` = a*b+c -> FMLA, and `sub(c,mul)` = c-a*b -> FMLS.
 /// `sub(mul,c)` = a*b-c has no matching NEON op (FMLA/FMLS only ever add or subtract the
@@ -5346,12 +5787,12 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     if (mul.op != .mul) return false;
     const vector = isVector(func, mul.lhs);
     const integer_vector = vector and !isFloatVector(func, mul.lhs);
-    // Float operands only: regClass != .fpr means an integer scalar mul (no rounding to
-    // fuse away). A vector mul must have a float element (see `isFloatVector`).
+    // Scalar integer contraction is exact wrapping arithmetic. Scalar half
+    // floats retain their per-operation rounding; vector support is narrower.
     if (vector) {
         if (integer_vector and laneKind(func, mul.lhs) != .i32) return false;
     } else if (regClass(func, mul.lhs) != .fpr) {
-        return false;
+        if (regClass(func, mul.lhs) != .gpr) return false;
     } else if (isHalf(func, mul.lhs)) {
         // f16 arithmetic must round to nearest-even half after EACH op (the emulation holds a
         // half as its f32 widening). A fused fmadd rounds the product-sum only once, at f32
@@ -5368,6 +5809,14 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     if (addsub.op != .add and addsub.op != .sub) return false;
     const result = func.instResult(insts[idx]) orelse return false;
     if (addsub.lhs != result and addsub.rhs != result) return false; // must consume this mul's result
+    if (!vector and regClass(func, mul.lhs) == .gpr) {
+        if (addsub.op == .sub and addsub.lhs == result) return false;
+        // Immediate and flag-setting consumers have their own producer-skip
+        // rules. Keep those paths in agreement with the ordinary emission.
+        if (addSubImmFold(func, addsub) != null) return false;
+        if (isArithBranchProducer(func, insts, idx + 1, true)) return false;
+        if (addsub.op == .sub and isConstZero(func, addsub.lhs)) return false;
+    }
     if (integer_vector) {
         if (addsub.op != .add) return false;
     }
@@ -5460,8 +5909,17 @@ fn addSubImmConst(func: *const Function, v: Value) ?i64 {
     const def = func.definingInst(v) orelse return null;
     if (func.opcode(def) != .iconst) return null;
     const c = func.opcode(def).iconst;
-    if (c < -4095 or c > 4095) return null;
+    if (addSubImmediate(c) == null) return null;
     return c;
+}
+
+/// A64 add/sub immediates optionally shift their unsigned twelve bits by twelve.
+fn addSubImmediate(imm: i64) ?struct { value: u12, shift: u32 } {
+    const magnitude = @abs(imm);
+    if (magnitude <= 4095) return .{ .value = @intCast(magnitude), .shift = 0 };
+    if (magnitude & 4095 == 0 and magnitude >> 12 <= 4095)
+        return .{ .value = @intCast(magnitude >> 12), .shift = 1 << 22 };
+    return null;
 }
 
 /// For an `add`/`sub` with one constant operand that fits the immediate, the OTHER operand (the
@@ -5960,7 +6418,10 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, fold: *const ad
         .unary => |u| setUsed(row, u.value),
         // Same fold reroute as `forEachOperand`: a folded mem op's pointer use is the fold base, so
         // the base's cross-block liveness reaches the mem op. `baseOf` is the raw ptr when unfolded.
-        .load => setUsed(row, fold.baseOf(func, inst)),
+        .load => if (indexedIntegerLoad(func, inst)) |address| {
+            setUsed(row, address.base);
+            setUsed(row, address.index);
+        } else setUsed(row, fold.baseOf(func, inst)),
         .store => |st| {
             setUsed(row, st.value);
             setUsed(row, fold.baseOf(func, inst));
@@ -6185,7 +6646,17 @@ fn emitLoad(
     // A folded load addresses `[base, #off]`. A non-folded load passes off = 0, which every encoder
     // below reproduces byte-identically to its old zero-displacement form. `aarch64FoldOffset`
     // guarantees off fits the per-size scaled range, so the `@intCast`es cannot truncate.
-    if (isVector(func, result) or isQuad(func, result)) {
+    if (isVector(func, result)) {
+        // A four-byte lane group must not read sixteen bytes past its guard.
+        switch (typeSize(func, func.valueType(result))) {
+            4 => try code.append(allocator, encode.ldrFp(rd, base, @intCast(off), false)),
+            8 => try code.append(allocator, encode.ldrFp(rd, base, @intCast(off), true)),
+            16 => try code.append(allocator, encode.ldrQ(rd, base, @intCast(off))),
+            else => return error.Unsupported,
+        }
+        return;
+    }
+    if (isQuad(func, result)) {
         try code.append(allocator, encode.ldrQ(rd, base, @intCast(off))); // 128-bit NEON / f128 load
         return;
     }
@@ -6227,7 +6698,16 @@ fn emitStore(
     // A folded store addresses `[base, #off]`. A non-folded store passes off = 0, which every encoder
     // below reproduces byte-identically to its old zero-displacement form. `aarch64FoldOffset`
     // guarantees off fits the per-size scaled range, so the `@intCast`es cannot truncate.
-    if (isVector(func, value) or isQuad(func, value)) {
+    if (isVector(func, value)) {
+        switch (typeSize(func, func.valueType(value))) {
+            4 => try code.append(allocator, encode.strFp(val, base, @intCast(off), false)),
+            8 => try code.append(allocator, encode.strFp(val, base, @intCast(off), true)),
+            16 => try code.append(allocator, encode.strQ(val, base, @intCast(off))),
+            else => return error.Unsupported,
+        }
+        return;
+    }
+    if (isQuad(func, value)) {
         try code.append(allocator, encode.strQ(val, base, @intCast(off))); // 128-bit NEON / f128 store
         return;
     }
@@ -6337,15 +6817,16 @@ fn tryShiftImm(
 /// into the opposite op) is handled here; anything else falls back to the materialized register form.
 fn tryAddSubImm(allocator: std.mem.Allocator, code: *std.ArrayList(u32), op: ir.function.BinOp, rd: Reg, rn: Reg, imm: i64, wide: bool) Error!bool {
     if (op != .add and op != .sub) return false;
-    if (imm < -4095 or imm > 4095) return false;
+    const encoded = addSubImmediate(imm) orelse return false;
     // `add rn, #-k` is `sub rn, #k`, and vice versa, so a negative constant flips the op.
     const o: ir.function.BinOp = if (imm < 0) (if (op == .add) .sub else .add) else op;
-    const u: u12 = @intCast(if (imm < 0) -imm else imm);
-    try code.append(allocator, switch (o) {
+    const u = encoded.value;
+    const word = switch (o) {
         .add => if (wide) encode.addImm64(rd, rn, u) else encode.addImm(rd, rn, u),
         .sub => if (wide) encode.subImm64(rd, rn, u) else encode.subImm(rd, rn, u),
         else => unreachable,
-    });
+    };
+    try code.append(allocator, word | encoded.shift);
     return true;
 }
 
@@ -6949,7 +7430,7 @@ test "machine shrinking cannot invalidate loop header alignment" {
     defer words.deinit(allocator);
     try words.appendSlice(allocator, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
     var starts = [_]usize{ 0, 7 };
-    var fixups = [_]Fixup{.{ .at = 7, .target = 1, .adr_target = 7 }};
+    var fixups = [_]Fixup{ .{ .at = 7, .target = 1, .adr_target = 7 }, .{ .at = 0, .target = 0, .word_target = 7, .cond = .eq } };
     var relocs = [_]Reloc{.{ .offset = 7, .symbol = "callee" }};
     var lines = [_]LineEntry{.{ .offset = 28, .line = 9 }};
 
@@ -6961,6 +7442,7 @@ test "machine shrinking cannot invalidate loop header alignment" {
     try std.testing.expectEqual(@as(usize, 8), starts[1]);
     try std.testing.expectEqual(@as(usize, 8), fixups[0].at);
     try std.testing.expectEqual(@as(?usize, 8), fixups[0].adr_target);
+    try std.testing.expectEqual(@as(?usize, 8), fixups[1].word_target);
     try std.testing.expectEqual(@as(usize, 8), relocs[0].offset);
     try std.testing.expectEqual(@as(u32, 32), lines[0].offset);
 }
@@ -7356,4 +7838,486 @@ test "Apple ABI emits and reserves a packed ninth floating call argument" {
     var compiled = try compileFunction(allocator, &func, .{ .abi = .apple });
     defer compiled.deinit(allocator);
     try std.testing.expect(compiled.code.len > 0);
+}
+
+test "SWAR population count selects NEON and preserves independent users" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    for ([_]u16{ 32, 64 }) |bits| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = bits } });
+        const b = try f.appendBlock();
+        const input = try f.appendBlockParam(b, t);
+        const h = struct {
+            fn imm(func: *Function, block: Block, ty: ir.types.Type, op: ir.function.BinOp, x: Value, k: i64) !Value {
+                const c = try func.appendInst(block, ty, .{ .iconst = k });
+                return func.appendInst(block, ty, .{ .arith = .{ .op = op, .lhs = x, .rhs = c } });
+            }
+            fn bin(func: *Function, block: Block, ty: ir.types.Type, op: ir.function.BinOp, x: Value, y: Value) !Value {
+                return func.appendInst(block, ty, .{ .arith = .{ .op = op, .lhs = x, .rhs = y } });
+            }
+        };
+        const wide = bits == 64;
+        const shift1 = try h.imm(&f, b, t, .shr, input, 1);
+        const masked = try h.imm(&f, b, t, .bit_and, shift1, if (wide) 0x5555555555555555 else 0x55555555);
+        var x = try h.bin(&f, b, t, .sub, input, masked);
+        const lo = try h.imm(&f, b, t, .bit_and, x, if (wide) 0x3333333333333333 else 0x33333333);
+        const hi = try h.imm(&f, b, t, .bit_and, try h.imm(&f, b, t, .shr, x, 2), if (wide) 0x3333333333333333 else 0x33333333);
+        x = try h.bin(&f, b, t, .add, lo, hi);
+        x = try h.bin(&f, b, t, .add, x, try h.imm(&f, b, t, .shr, x, 4));
+        x = try h.imm(&f, b, t, .bit_and, x, if (wide) 0x0f0f0f0f0f0f0f0f else 0x0f0f0f0f);
+        x = try h.imm(&f, b, t, .mul, x, if (wide) 0x0101010101010101 else 0x01010101);
+        const pop = try h.imm(&f, b, t, .shr, x, if (wide) 56 else 24);
+        // The source remains live too, and a software intermediate has a
+        // separate user. Lowering must retain both dependencies.
+        const total = try h.bin(&f, b, t, .add, pop, shift1);
+        const result = try h.bin(&f, b, t, .bit_xor, total, input);
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(result) });
+        var compiled = try compileFunction(allocator, &f, .{});
+        defer compiled.deinit(allocator);
+        try testing.expect(std.mem.indexOfScalar(u32, compiled.code, encode.cnt8B(fp_spill_op[0], fp_spill_op[0])) != null);
+        if (@import("builtin").cpu.arch == .aarch64) {
+            var buffer = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+            defer buffer.deinit();
+            const Fn = *const fn (u64) callconv(.c) u64;
+            const call = buffer.entry(Fn, 0);
+            const mask: u64 = if (wide) std.math.maxInt(u64) else std.math.maxInt(u32);
+            var rng: u64 = 1;
+            for (0..10000) |i| {
+                rng = rng *% 6364136223846793005 +% 1;
+                const n = (if (i == 0) 0 else if (i == 1) mask else rng) & mask;
+                const expected = ((@as(u64, @popCount(n)) +% (n >> 1)) ^ n) & mask;
+                try testing.expectEqual(expected, call(n));
+            }
+        }
+    }
+}
+
+test "integer multiply-add and multiply-subtract preserve scalar operands" {
+    const allocator = std.testing.allocator;
+    for ([_]u16{ 32, 64 }) |bits| {
+        for ([_]ir.function.BinOp{ .add, .sub }) |op| {
+            var f = Function.init(allocator);
+            defer f.deinit();
+            const t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = bits } });
+            const b = try f.appendBlock();
+            const x = try f.appendBlockParam(b, t);
+            const y = try f.appendBlockParam(b, t);
+            const c = try f.appendBlockParam(b, t);
+            const product = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+            const result = try f.appendInst(b, t, .{ .arith = .{ .op = op, .lhs = c, .rhs = product } });
+            f.setTerminator(b, .{ .ret = ir.function.Ret.one(result) });
+            try std.testing.expect(fusesIntoNextArith(&f, f.blockInsts(b), 0));
+            var compiled = try compileFunction(allocator, &f, .{});
+            defer compiled.deinit(allocator);
+            if (@import("builtin").cpu.arch == .aarch64) {
+                var buffer = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+                defer buffer.deinit();
+                const Fn = *const fn (u64, u64, u64) callconv(.c) u64;
+                const call = buffer.entry(Fn, 0);
+                const mask: u64 = if (bits == 64) std.math.maxInt(u64) else std.math.maxInt(u32);
+                var rng: u64 = 1;
+                for (0..1000) |_| {
+                    rng = rng *% 6364136223846793005 +% 1;
+                    const a = rng & mask;
+                    const d = (rng >> 17) & mask;
+                    const acc = (rng *% 17) & mask;
+                    const expected = (if (op == .add) acc +% (a *% d) else acc -% (a *% d)) & mask;
+                    try std.testing.expectEqual(expected, call(a, d, acc));
+                }
+            }
+        }
+    }
+}
+
+test "move-free non-loop conditionals fall through for flags and boolean branches" {
+    const allocator = std.testing.allocator;
+    for (0..4) |mode| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const i32t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bt = try f.types.intern(.bool);
+        const entry = try f.appendBlock();
+        const yes = try f.appendBlock();
+        const no = try f.appendBlock();
+        const predicate = try f.appendBlockParam(entry, if (mode == 1) bt else i32t);
+        const value = try f.appendBlockParam(entry, i32t);
+        const condition = if (mode == 1) predicate else cmp: {
+            const zero = try f.appendInst(entry, i32t, .{ .iconst = 0 });
+            break :cmp try f.appendInst(entry, bt, .{ .icmp = .{ .op = if (mode == 0) .lt else if (mode == 2) .eq else .ne, .lhs = predicate, .rhs = zero } });
+        };
+        try f.appendIf(entry, condition, .{ .target = yes }, .{ .target = no });
+        const plus = try f.appendArithImm(yes, i32t, .add, value, 5);
+        const minus = try f.appendArithImm(no, i32t, .sub, value, 7);
+        f.setTerminator(yes, .{ .ret = ir.function.Ret.one(plus) });
+        f.setTerminator(no, .{ .ret = ir.function.Ret.one(minus) });
+        var direct = try compileFunction(allocator, &f, .{});
+        defer direct.deinit(allocator);
+        var conservative = try compileFunction(allocator, &f, .{ .direct_fallthrough = false });
+        defer conservative.deinit(allocator);
+        try std.testing.expect(direct.code.len < conservative.code.len);
+        if (@import("builtin").cpu.arch == .aarch64) {
+            var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(direct.code));
+            defer code.deinit();
+            const Fn = *const fn (u32, i32) callconv(.c) i32;
+            const call = code.entry(Fn, 0);
+            for ([_]u32{ 0, 1, 0xffffffff }) |pred| {
+                if (mode == 1 and pred > 1) continue;
+                const taken = if (mode == 0) @as(i32, @bitCast(pred)) < 0 else if (mode == 2) pred == 0 else pred != 0;
+                for ([_]i32{ -100, 0, 100 }) |input| {
+                    try std.testing.expectEqual(if (taken) input + 5 else input - 7, call(pred, input));
+                }
+            }
+        }
+    }
+}
+
+test "unsigned load widening reuses zero extension while signed loads retain sign extension" {
+    const allocator = std.testing.allocator;
+    for ([_]u16{ 8, 16, 32 }) |bits| for ([_]bool{ false, true }) |signed| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const small = try f.types.intern(.{ .int = .{ .signedness = if (signed) .signed else .unsigned, .bits = bits } });
+        const wide = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+        const ptr = try f.types.ptrGlobal();
+        const b = try f.appendBlock();
+        const address = try f.appendBlockParam(b, ptr);
+        const loaded = try f.appendInst(b, small, .{ .load = .{ .ptr = address } });
+        const extended = try f.appendInst(b, wide, .{ .convert = .{ .value = loaded } });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(extended) });
+        try std.testing.expectEqual(!signed, loadAlreadyExtended(&f, loaded));
+        var compiled = try compileFunction(allocator, &f, .{});
+        defer compiled.deinit(allocator);
+        if (!signed) {
+            // No bitfield extension remains after the already-extending load.
+            for (compiled.code) |word| try std.testing.expect(word & 0x1f800000 != 0x13000000);
+        }
+        if (@import("builtin").cpu.arch == .aarch64) {
+            var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+            defer code.deinit();
+            const call = code.entry(*const fn (*const u64) callconv(.c) i64, 0);
+            for ([_]u64{ 0, 1, 0x7f, 0x80, 0xff, 0x7fff, 0x8000, 0xffff, 0x7fffffff, 0x80000000, 0xffffffff, 0xffffffffffffffff }) |input| {
+                const shift: u6 = @intCast(64 - bits);
+                const expected = if (signed) @as(i64, @bitCast(input << shift)) >> shift else @as(i64, @intCast(input & ((@as(u64, 1) << @intCast(bits)) - 1)));
+                try std.testing.expectEqual(expected, call(&input));
+            }
+        }
+    };
+}
+
+test "zero extension through block parameters requires every incoming edge" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |raw_edge| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const u64t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const bt = try f.types.intern(.bool);
+        const entry = try f.appendBlock();
+        const yes = try f.appendBlock();
+        const no = try f.appendBlock();
+        const join = try f.appendBlock();
+        const seed = try f.appendBlockParam(entry, u32t);
+        const flag = try f.appendBlockParam(entry, bt);
+        try f.appendIf(entry, flag, .{ .target = yes }, .{ .target = no });
+        const first = try f.appendArithImm(yes, u32t, .bit_and, seed, 65535);
+        const second = try f.appendArithImm(no, u32t, .bit_and, seed, 255);
+        try f.setJump(yes, join, &.{first});
+        try f.setJump(no, join, &.{if (raw_edge) seed else second});
+        const merged = try f.appendBlockParam(join, u32t);
+        const extended = try f.appendInst(join, u64t, .{ .convert = .{ .value = merged } });
+        f.setTerminator(join, .{ .ret = ir.function.Ret.one(extended) });
+        try std.testing.expectEqual(!raw_edge, integerAlreadyZeroExtended(&f, merged, 6));
+        try std.testing.expect(!integerAlreadyZeroExtended(&f, seed, 6));
+        var compiled = try compileFunction(allocator, &f, .{});
+        defer compiled.deinit(allocator);
+        if (@import("builtin").cpu.arch == .aarch64) {
+            var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+            defer code.deinit();
+            // Deliberately poison the ABI parameter's upper bits. They are not
+            // part of the u32 value and must never leak into the widened result.
+            const call = code.entry(*const fn (u64, u64) callconv(.c) u64, 0);
+            for ([_]u64{ 0, 0x12345678, 0x80000000, 0xffffffffffffffff }) |input| for ([_]u64{ 0, 1 }) |flag_value| {
+                const mask: u64 = if (flag_value != 0) 65535 else if (raw_edge) 0xffffffff else 255;
+                try std.testing.expectEqual(input & mask, call(input, flag_value));
+            };
+        }
+    }
+}
+
+test "widening shifts ignore poisoned upper bits and preserve independent converts" {
+    const allocator = std.testing.allocator;
+    for ([_]u16{ 8, 16, 32 }) |bits| for ([_]bool{ false, true }) |signed| for ([_]u6{ 1, 2, 8, 31, 32, 55, 63 }) |amount| for ([_]bool{ false, true }) |independent| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const small = try f.types.intern(.{ .int = .{ .signedness = if (signed) .signed else .unsigned, .bits = bits } });
+        const wide = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const b = try f.appendBlock();
+        const input = try f.appendBlockParam(b, small);
+        const extended = try f.appendInst(b, wide, .{ .convert = .{ .value = input } });
+        const shifted = if (independent) try f.appendArithImm(b, wide, .shl, extended, amount) else blk: {
+            const count = try f.appendInst(b, wide, .{ .iconst = amount });
+            break :blk try f.appendInst(b, wide, .{ .arith = .{ .op = .shl, .lhs = extended, .rhs = count } });
+        };
+        const result = if (independent) try f.appendInst(b, wide, .{ .arith = .{ .op = .add, .lhs = shifted, .rhs = extended } }) else shifted;
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(result) });
+        var lowered = try f.clone(allocator);
+        defer lowered.deinit();
+        try lowerWideningShifts(allocator, &lowered);
+        try std.testing.expectEqual(!signed and @as(u16, amount) + bits <= 64, wideningShiftAmount(&lowered, lowered.definingInst(shifted).?) != null);
+        var compiled = try compileFunction(allocator, &f, .{});
+        defer compiled.deinit(allocator);
+        if (@import("builtin").cpu.arch == .aarch64) {
+            var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+            defer code.deinit();
+            const call = code.entry(*const fn (u64) callconv(.c) u64, 0);
+            for ([_]u64{ 0, 1, 0x80, 0xffff, 0x80000000, 0xffffffff, 0xdeadbeef12345678, 0xffffffffffffffff }) |value| {
+                const distance: u6 = @intCast(64 - bits);
+                const ext = if (signed) @as(u64, @bitCast(@as(i64, @bitCast(value << distance)) >> distance)) else value & ((@as(u64, 1) << @intCast(bits)) - 1);
+                const expected = (ext << amount) +% (if (independent) ext else 0);
+                try std.testing.expectEqual(expected, call(value));
+            }
+        }
+    };
+}
+
+test "indexed byte loads keep both inputs live and preserve shared addresses" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |shared| for ([_]bool{ false, true }) |reverse| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const ptr = try f.types.ptrGlobal();
+        const u8t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const u64t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const b = try f.appendBlock();
+        const base = try f.appendBlockParam(b, ptr);
+        const index = try f.appendBlockParam(b, u64t);
+        const address = try f.appendInst(b, ptr, .{ .arith = .{ .op = .add, .lhs = if (reverse) index else base, .rhs = if (reverse) base else index } });
+        const loaded = try f.appendInst(b, u8t, .{ .load = .{ .ptr = address } });
+        const extended = try f.appendInst(b, u64t, .{ .convert = .{ .value = loaded } });
+        const result = if (shared) blk: {
+            const second = try f.appendInst(b, u8t, .{ .load = .{ .ptr = address } });
+            const second_wide = try f.appendInst(b, u64t, .{ .convert = .{ .value = second } });
+            break :blk try f.appendInst(b, u64t, .{ .arith = .{ .op = .add, .lhs = extended, .rhs = second_wide } });
+        } else extended;
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(result) });
+        try std.testing.expectEqual(!shared, indexedIntegerLoad(&f, f.definingInst(loaded).?) != null);
+        var compiled = try compileFunction(allocator, &f, .{});
+        defer compiled.deinit(allocator);
+        var indexed: usize = 0;
+        for (compiled.code) |word| if (word & 0xffe0fc00 == 0x38606800) {
+            indexed += 1;
+        };
+        try std.testing.expectEqual(@as(usize, if (shared) 0 else 1), indexed);
+        if (@import("builtin").cpu.arch == .aarch64) {
+            var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+            defer code.deinit();
+            const call = code.entry(*const fn ([*]const u8, u64) callconv(.c) u64, 0);
+            var data: [256]u8 = undefined;
+            for (&data, 0..) |*byte, i| byte.* = @truncate(i * 71 + 129);
+            for (0..data.len) |i| try std.testing.expectEqual(@as(u64, data[i]) * (if (shared) @as(u64, 2) else 1), call(&data, i));
+        }
+    };
+}
+
+test "indexed word loads preserve signed and unsigned widening" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |signed| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const ptr = try f.types.ptrGlobal();
+        const word = try f.types.intern(.{ .int = .{ .signedness = if (signed) .signed else .unsigned, .bits = 32 } });
+        const wide = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const b = try f.appendBlock();
+        const base = try f.appendBlockParam(b, ptr);
+        const index = try f.appendBlockParam(b, wide);
+        const address = try f.appendInst(b, ptr, .{ .arith = .{ .op = .add, .lhs = base, .rhs = index } });
+        const loaded = try f.appendInst(b, word, .{ .load = .{ .ptr = address } });
+        const extended = try f.appendInst(b, wide, .{ .convert = .{ .value = loaded } });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(extended) });
+        var compiled = try compileFunction(allocator, &f, .{});
+        defer compiled.deinit(allocator);
+        var indexed: usize = 0;
+        for (compiled.code) |instruction| if (instruction & 0xffe0fc00 == 0xb8606800) {
+            indexed += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), indexed);
+        if (@import("builtin").cpu.arch == .aarch64) {
+            var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+            defer code.deinit();
+            const call = code.entry(*const fn ([*]const u32, u64) callconv(.c) u64, 0);
+            const data = [_]u32{ 0, 1, 0x12345678, 0x7fffffff, 0x80000000, 0xffffffff };
+            for (data, 0..) |value, i| {
+                const expected = if (signed) @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(value))))) else @as(u64, value);
+                try std.testing.expectEqual(expected, call(&data, i * 4));
+            }
+        }
+    }
+}
+
+test "unsigned word arithmetic widening ignores poisoned upper input bits" {
+    const allocator = std.testing.allocator;
+    for ([_]ir.function.BinOp{ .add, .sub, .mul, .div, .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr }) |op| for ([_]bool{ false, true }) |immediate| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const word = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const wide = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const b = try f.appendBlock();
+        const a = try f.appendBlockParam(b, word);
+        const rhs = try f.appendBlockParam(b, word);
+        const result = if (immediate) try f.appendArithImm(b, word, op, a, 7) else try f.appendInst(b, word, .{ .arith = .{ .op = op, .lhs = a, .rhs = rhs } });
+        const extended = try f.appendInst(b, wide, .{ .convert = .{ .value = result } });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(extended) });
+        try std.testing.expect(integerAlreadyZeroExtended(&f, result, 6));
+        var compiled = try compileFunction(allocator, &f, .{});
+        defer compiled.deinit(allocator);
+        if (@import("builtin").cpu.arch == .aarch64) {
+            var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+            defer code.deinit();
+            const call = code.entry(*const fn (u64, u64) callconv(.c) u64, 0);
+            for ([_]u64{ 0, 1, 0x80000000, 0xffffffff, 0xdeadbeef12345678, 0xffffffffffffffff }) |input| {
+                const x: u32 = @truncate(input);
+                const shift: u5 = 7;
+                const expected: u32 = switch (op) {
+                    .add => x +% 7,
+                    .sub => x -% 7,
+                    .mul => x *% 7,
+                    .div => x / 7,
+                    .rem => x % 7,
+                    .bit_and => x & 7,
+                    .bit_or => x | 7,
+                    .bit_xor => x ^ 7,
+                    .shl => x << shift,
+                    .shr => x >> shift,
+                    else => unreachable,
+                };
+                try std.testing.expectEqual(@as(u64, expected), call(input, 0xdeadbeef00000007));
+            }
+        }
+    };
+}
+
+test "scaled word loads ignore upper index bits and retain independent scaled uses" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |independent| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const ptr = try f.types.ptrGlobal();
+        const word = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const wide = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const b = try f.appendBlock();
+        const base = try f.appendBlockParam(b, ptr);
+        const index = try f.appendBlockParam(b, word);
+        const extended = try f.appendInst(b, wide, .{ .convert = .{ .value = index } });
+        const scaled = try f.appendArithImm(b, wide, .shl, extended, 2);
+        const address = try f.appendInst(b, ptr, .{ .arith = .{ .op = .add, .lhs = base, .rhs = scaled } });
+        const loaded = try f.appendInst(b, word, .{ .load = .{ .ptr = address } });
+        const loaded_wide = try f.appendInst(b, wide, .{ .convert = .{ .value = loaded } });
+        const result = if (independent) try f.appendInst(b, wide, .{ .arith = .{ .op = .add, .lhs = loaded_wide, .rhs = scaled } }) else loaded_wide;
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(result) });
+        var compiled = try compileFunction(allocator, &f, .{});
+        defer compiled.deinit(allocator);
+        var indexed: usize = 0;
+        for (compiled.code) |instruction| if (instruction & 0xffe0fc00 == 0xb8605800) {
+            indexed += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), indexed);
+        if (@import("builtin").cpu.arch == .aarch64) {
+            var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+            defer code.deinit();
+            const call = code.entry(*const fn ([*]const u32, u64) callconv(.c) u64, 0);
+            const data = [_]u32{ 0, 1, 0x12345678, 0x7fffffff, 0x80000000, 0xffffffff };
+            for (data, 0..) |value, i| try std.testing.expectEqual(@as(u64, value) + (if (independent) i * 4 else 0), call(&data, 0xdeadbeef00000000 | i));
+        }
+    }
+}
+
+test "indexed folding preserves an existing folded immediate displacement" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const ptr = try f.types.ptrGlobal();
+    const word = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const wide = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const b = try f.appendBlock();
+    const base = try f.appendBlockParam(b, ptr);
+    const index = try f.appendBlockParam(b, wide);
+    const sum = try f.appendInst(b, ptr, .{ .arith = .{ .op = .add, .lhs = base, .rhs = index } });
+    const address = try f.appendArithImm(b, ptr, .add, sum, 8);
+    const loaded = try f.appendInst(b, word, .{ .load = .{ .ptr = address } });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(loaded) });
+    var compiled = try compileFunction(allocator, &f, .{});
+    defer compiled.deinit(allocator);
+    if (@import("builtin").cpu.arch == .aarch64) {
+        var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+        defer code.deinit();
+        const call = code.entry(*const fn ([*]const u32, u64) callconv(.c) u32, 0);
+        const data = [_]u32{ 11, 22, 33, 44, 55, 66, 77, 88 };
+        for (0..6) |i| try std.testing.expectEqual(data[i + 2], call(&data, i * 4));
+    }
+}
+
+test "signed indexed bytes preserve negative values across widening" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const ptr = try f.types.ptrGlobal();
+    const byte = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const wide = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const b = try f.appendBlock();
+    const base = try f.appendBlockParam(b, ptr);
+    const index = try f.appendBlockParam(b, wide);
+    const address = try f.appendInst(b, ptr, .{ .arith = .{ .op = .add, .lhs = base, .rhs = index } });
+    const loaded = try f.appendInst(b, byte, .{ .load = .{ .ptr = address } });
+    const extended = try f.appendInst(b, wide, .{ .convert = .{ .value = loaded } });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(extended) });
+    var compiled = try compileFunction(allocator, &f, .{});
+    defer compiled.deinit(allocator);
+    var indexed: usize = 0;
+    for (compiled.code) |instruction| if (instruction & 0xffe0fc00 == 0x38e06800) {
+        indexed += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), indexed);
+    if (@import("builtin").cpu.arch == .aarch64) {
+        var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+        defer code.deinit();
+        const call = code.entry(*const fn ([*]const i8, i64) callconv(.c) i64, 0);
+        var data: [256]i8 = undefined;
+        for (&data, 0..) |*v, i| v.* = @bitCast(@as(u8, @intCast(i)));
+        for (data, 0..) |value, i| try std.testing.expectEqual(@as(i64, value), call(&data, @intCast(i)));
+    }
+}
+
+test "move-free taken edges branch directly when neither successor is next" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .bits = 32, .signedness = .signed } });
+    const bt = try f.types.intern(.bool);
+    const entry = try f.appendBlock();
+    const tail = try f.appendBlock();
+    const yes = try f.appendBlock();
+    const no = try f.appendBlock();
+    const value = try f.appendBlockParam(entry, t);
+    const flag = try f.appendBlockParam(entry, bt);
+    try f.appendIf(entry, flag, .{ .target = yes }, .{ .target = no });
+    const minus = try f.appendArithImm(tail, t, .sub, value, 7);
+    f.setTerminator(tail, .{ .ret = ir.function.Ret.one(minus) });
+    const plus = try f.appendArithImm(yes, t, .add, value, 5);
+    f.setTerminator(yes, .{ .ret = ir.function.Ret.one(plus) });
+    try f.setJump(no, tail, &.{});
+    var direct = try compileFunction(allocator, &f, .{});
+    defer direct.deinit(allocator);
+    var conservative = try compileFunction(allocator, &f, .{ .direct_fallthrough = false });
+    defer conservative.deinit(allocator);
+    try std.testing.expect(direct.code.len < conservative.code.len);
+    if (@import("builtin").cpu.arch == .aarch64) {
+        var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(direct.code));
+        defer code.deinit();
+        const call = code.entry(*const fn (i32, u32) callconv(.c) i32, 0);
+        for ([_]i32{ -100, 0, 100 }) |input| for ([_]u32{ 0, 1 }) |condition| {
+            try std.testing.expectEqual(if (condition != 0) input + 5 else input - 7, call(input, condition));
+        };
+    }
 }

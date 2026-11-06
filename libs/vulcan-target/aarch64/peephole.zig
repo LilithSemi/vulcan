@@ -691,10 +691,11 @@ fn moveRunHasCycle(words: []const u32, move_indices: []const usize) bool {
 /// empty blocks share a code offset. No branch or dense-switch row may enter at that offset before a
 /// producer from the fallthrough path is rewritten across it.
 fn hasOnlyFallthroughEntry(move_at: usize, block_start: []const usize, fixups: []const Fixup) bool {
+    for (fixups) |fixup| if (fixup.word_target == move_at) return false;
     for (block_start, 0..) |start, block_index| {
         if (start != move_at) continue;
         for (fixups) |fixup| {
-            if (fixup.adr_target == null and fixup.target == block_index) return false;
+            if (fixup.adr_target == null and fixup.word_target == null and fixup.target == block_index) return false;
         }
     }
     return true;
@@ -754,6 +755,9 @@ fn narrowUnsignedMagic(
     for (block_start) |start| if (start < len) {
         is_block_start[start] = true;
     };
+    for (fixups) |fixup| if (fixup.word_target) |target| {
+        if (target < len) is_block_start[target] = true;
+    };
     var is_data = try allocator.alloc(bool, len);
     defer allocator.free(is_data);
     @memset(is_data, false);
@@ -799,6 +803,7 @@ fn narrowUnsignedMagic(
     for (fixups) |*fixup| {
         if (fixup.table_base) |base| fixup.table_base = base - removed_before[base];
         if (fixup.adr_target) |target| fixup.adr_target = target - removed_before[target];
+        if (fixup.word_target) |target| fixup.word_target = target - removed_before[target];
         fixup.at -= removed_before[fixup.at];
     }
     for (relocs) |*reloc| reloc.offset -= removed_before[reloc.offset];
@@ -885,6 +890,9 @@ pub fn pairMemoryForModelWithMoveProofs(
         std.debug.assert(bs <= len);
         if (bs < len) is_block_start[bs] = true; // a block start == len emits nothing to fuse into
     }
+    for (fixups) |fixup| if (fixup.word_target) |target| {
+        if (target < len) is_block_start[target] = true;
+    };
     var is_data = try allocator.alloc(bool, len);
     defer allocator.free(is_data);
     @memset(is_data, false);
@@ -1206,6 +1214,7 @@ pub fn pairMemoryForModelWithMoveProofs(
     for (fixups) |*f| {
         if (f.table_base) |base| f.table_base = base - removed_before[base];
         if (f.adr_target) |target| f.adr_target = target - removed_before[target];
+        if (f.word_target) |target| f.word_target = target - removed_before[target];
         f.at -= removed_before[f.at];
         std.debug.assert(f.at < write);
     }
@@ -1885,4 +1894,26 @@ test "tryFuse rejects non-consecutive, different-base, rt1==rn, rt1==rt2 (load),
     // Out of range: imm7 = a.off / size = 512 / 8 = 64, over the 63 upper bound.
     const far = MemInsn{ .kind = .ldr_x, .rt = 0, .rn = 2, .off = 512 };
     try std.testing.expectEqual(@as(?u32, null), tryFuse(far, MemInsn{ .kind = .ldr_x, .rt = 1, .rn = 2, .off = 520 }));
+}
+
+test "local conditional labels follow paired stores during compaction" {
+    const allocator = std.testing.allocator;
+    var words: std.ArrayList(u32) = .empty;
+    defer words.deinit(allocator);
+    try words.appendSlice(allocator, &.{
+        encode.bcc(.eq, 0),
+        encode.strQ(.x8, .zr, 0),
+        encode.strQ(.x9, .zr, 16),
+        encode.b(0),
+        encode.ldrb(.x0, .x1),
+        encode.ret(),
+    });
+    var starts = [_]usize{0};
+    var fixups = [_]Fixup{.{ .at = 0, .target = 0, .word_target = 4, .cond = .eq }};
+    var relocs: [0]Reloc = .{};
+    var lines: [0]LineEntry = .{};
+    try pairMemory(allocator, &words, &starts, &fixups, &relocs, &lines);
+    try std.testing.expectEqual(@as(usize, 5), words.items.len);
+    try std.testing.expectEqual(@as(?usize, 3), fixups[0].word_target);
+    try std.testing.expectEqual(encode.ldrb(.x0, .x1), words.items[fixups[0].word_target.?]);
 }

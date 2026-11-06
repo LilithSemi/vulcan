@@ -109,6 +109,7 @@ fn rewrite(allocator: std.mem.Allocator, func: *Function, a: Block, a_if: Inst, 
         try func.appendInst(a, unsigned_ty, .{ .convert = .{ .value = first.x } })
     else
         first.x;
+    if (try rewriteIntervals(func, a, x, unsigned_ty, bool_t, first, to_f, t_args, f_args, lo, mask)) return;
     const offset = try func.appendArithImm(a, unsigned_ty, .sub, x, @truncate(lo));
     const width = try func.appendInst(a, unsigned_ty, .{ .iconst = @truncate(hi - lo) });
     const inside = try func.appendInst(a, bool_t, .{ .icmp = .{ .op = .le, .lhs = offset, .rhs = width } });
@@ -124,6 +125,52 @@ fn rewrite(allocator: std.mem.Allocator, func: *Function, a: Block, a_if: Inst, 
     const hit = try func.appendInst(test_block, bool_t, .{ .icmp = .{ .op = .ne, .lhs = bit, .rhs = zero } });
     try func.appendIf(test_block, hit, .{ .target = first.to_t.target, .args = t_args }, .{ .target = to_f.target, .args = f_args });
     func.setTerminator(test_block, .{ .ret = ir.function.Ret.none() });
+}
+
+const Run = struct { first: u8, last: u8 };
+
+fn intervalTest(func: *Function, block: Block, x: Value, ty: ir.types.Type, bool_ty: ir.types.Type, lo: i128, interval: Run) pass.Error!Value {
+    const start = lo + interval.first;
+    if (interval.first == interval.last) {
+        const constant = try func.appendInst(block, ty, .{ .iconst = @truncate(start) });
+        return func.appendInst(block, bool_ty, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = constant } });
+    }
+    const offset = try func.appendArithImm(block, ty, .sub, x, @truncate(start));
+    const width = try func.appendInst(block, ty, .{ .iconst = interval.last - interval.first });
+    return func.appendInst(block, bool_ty, .{ .icmp = .{ .op = .le, .lhs = offset, .rhs = width } });
+}
+
+/// One or two contiguous runs need no variable shift or wide mask constant.
+/// Check the run containing the original first equality first.
+fn rewriteIntervals(func: *Function, a: Block, x: Value, ty: ir.types.Type, bool_ty: ir.types.Type, first: Member, to_f: Jump, t_args: []const Value, f_args: []const Value, lo: i128, mask: u64) pass.Error!bool {
+    var runs: [2]Run = undefined;
+    var count: usize = 0;
+    var bit: u7 = 0;
+    while (bit < 64) {
+        if ((mask & (@as(u64, 1) << @intCast(bit))) == 0) {
+            bit += 1;
+            continue;
+        }
+        if (count == runs.len) return false;
+        const start: u8 = bit;
+        while (bit < 64 and (mask & (@as(u64, 1) << @intCast(bit))) != 0) bit += 1;
+        runs[count] = .{ .first = start, .last = @intCast(bit - 1) };
+        count += 1;
+    }
+    if (count == 0) return false;
+    if (count == 2 and first.k - lo >= runs[1].first and first.k - lo <= runs[1].last) std.mem.swap(Run, &runs[0], &runs[1]);
+    const condition = try intervalTest(func, a, x, ty, bool_ty, lo, runs[0]);
+    if (count == 1) {
+        try func.appendIf(a, condition, .{ .target = first.to_t.target, .args = t_args }, .{ .target = to_f.target, .args = f_args });
+    } else {
+        const second = try func.appendBlock();
+        try func.appendIf(a, condition, .{ .target = first.to_t.target, .args = t_args }, .{ .target = second });
+        const other = try intervalTest(func, second, x, ty, bool_ty, lo, runs[1]);
+        try func.appendIf(second, other, .{ .target = first.to_t.target, .args = t_args }, .{ .target = to_f.target, .args = f_args });
+        func.setTerminator(second, .{ .ret = ir.function.Ret.none() });
+    }
+    func.setTerminator(a, .{ .ret = ir.function.Ret.none() });
+    return true;
 }
 
 /// The `x == k` test of an `if`, with the edge taken on a match and the other edge.
@@ -166,7 +213,7 @@ fn lastIf(func: *const Function, block: Block) ?Inst {
 
 const testing = std.testing;
 
-test "three equality tests of one byte become a range check and a bit test" {
+test "whitespace equality tests become a singleton and contiguous interval" {
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -194,15 +241,13 @@ test "three equality tests of one byte become a range check and a bit test" {
     try testing.expect(try run(allocator, &func, &analyses));
     try testing.expectEqual(@as(usize, 0), func.blockInsts(b).len);
     try testing.expectEqual(@as(usize, 0), func.blockInsts(c).len);
-    // '\t' is 9, '\n' is 10, ' ' is 32: bits 0, 1 and 23 above the low end.
-    var mask: ?i64 = null;
-    for (func.blockInsts(@fromBackingInt(5))) |inst| switch (func.opcode(inst)) {
-        .iconst => |k| if (k > 1) {
-            mask = k;
-        },
-        else => {},
+    // The first test remains the hot space singleton; the other two share a range.
+    const first_test = func.opcode(func.definingInst(func.opcode(lastIf(&func, a).?).@"if".cond).?).icmp;
+    try testing.expectEqual(ir.function.CmpOp.eq, first_test.op);
+    try testing.expectEqual(@as(i64, 32), func.opcode(func.definingInst(first_test.rhs).?).iconst);
+    for (func.blockInsts(@fromBackingInt(5))) |inst| if (func.opcode(inst) == .arith) {
+        try testing.expect(func.opcode(inst).arith.op != .shr);
     };
-    try testing.expectEqual(@as(?i64, (1 << 0) | (1 << 1) | (1 << 23)), mask);
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
     try testing.expect(diags.ok());

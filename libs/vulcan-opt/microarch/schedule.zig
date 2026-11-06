@@ -380,11 +380,9 @@ fn restoreMultiplyAddPairs(func: *Function, block: Block, uses: []const u32) voi
             else => false,
         };
         if (!scalar_integer and !scalar_float and !vector) continue;
-        // Integer MSUB is not part of the strict post-allocation rewrite yet. Scalar floating-point
-        // and vector selection both support their legal subtract orientations directly in isel.
-        if (scalar_integer and consumer.op != .add) continue;
-
         for (consumer.candidates[0..consumer.candidate_count]) |product| {
+            // Integer MSUB subtracts the product from the other operand.
+            if (scalar_integer and consumer.op == .sub and consumer.candidates[0] == product) continue;
             if (uses[@backingInt(product)] != 1) continue;
             const producer = func.definingInst(product) orelse continue;
             const multiply = switch (func.opcode(producer)) {

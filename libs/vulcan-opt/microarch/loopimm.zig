@@ -55,7 +55,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     else => continue,
                 };
                 if ((arith.op != .add and arith.op != .sub) or
-                    (arith.imm >= -4095 and arith.imm <= 4095)) continue;
+                    encodableAddSub(arith.imm)) continue;
                 const result = func.instResult(inst).?;
                 switch (func.types.type_kind(func.valueType(result))) {
                     .int => {},
@@ -107,6 +107,11 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         } };
     }
     return true;
+}
+
+fn encodableAddSub(imm: i64) bool {
+    const magnitude = @abs(imm);
+    return magnitude <= 4095 or (magnitude & 4095 == 0 and magnitude >> 12 <= 4095);
 }
 
 fn executesEveryIteration(loop: *const loops.Loop, graph: *const cfg_mod.Cfg, doms: *const dominators.Dominators, block: usize) bool {

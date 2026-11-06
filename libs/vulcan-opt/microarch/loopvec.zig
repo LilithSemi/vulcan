@@ -32,6 +32,8 @@ const MapReduction = struct {
     update_inst: Inst,
     increment: Value,
     op: BinOp,
+    ordered: bool = false,
+    acc_on_left: bool = true,
 };
 
 const Plan = struct {
@@ -131,6 +133,9 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         try func.types.intern(.{ .vector = .{ .len = @intCast(V), .elem = elem } })
     else
         null;
+    const ordered = if (plan.reduction) |red| red.ordered else false;
+    const acc_count: u32 = if (ordered) 1 else plan.groups;
+    const acc_ty = if (ordered) reduction_ty else reduction_vec_ty;
     const bool_t = try func.types.intern(.bool);
     const ind_int = switch (func.types.type_kind(ind_ty)) {
         .int => |int| int,
@@ -154,8 +159,8 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     const mremaining = if (countdown) try func.appendBlockParam(mainheader, ind_ty) else null;
     const mvi = if (index_vec_ty) |vec_ty| try func.appendBlockParam(mainheader, vec_ty) else null;
     var maccs: [2]?Value = @splat(null);
-    if (reduction_vec_ty) |vec_ty| {
-        for (0..plan.groups) |group| maccs[group] = try func.appendBlockParam(mainheader, vec_ty);
+    if (acc_ty) |ty| {
+        for (0..acc_count) |group| maccs[group] = try func.appendBlockParam(mainheader, ty);
     }
     const mptrs = try allocator.alloc(Value, pointer_families.items.len);
     defer allocator.free(mptrs);
@@ -181,11 +186,12 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     } else null;
     const init_acc = if (plan.reduction) |red| pre_args[red.accumulator] else null;
     const vector_identity = if (plan.reduction) |red| identity: {
+        if (ordered) break :identity init_acc.?;
         const scalar = try identityConst(func, plan.preheader, red.op, reduction_ty.?);
         break :identity try func.appendSplat(plan.preheader, reduction_vec_ty.?, scalar);
     } else null;
     var initial_accs: [2]?Value = @splat(null);
-    for (0..plan.groups) |group| initial_accs[group] = vector_identity;
+    for (0..acc_count) |group| initial_accs[group] = vector_identity;
     const initial_ptrs = try allocator.alloc(Value, pointer_families.items.len);
     defer allocator.free(initial_ptrs);
     for (pointer_families.items, initial_ptrs) |family, *pointer| {
@@ -287,8 +293,8 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     var baccs: [2]?Value = @splat(null);
     if (rotated) {
         baccs = maccs;
-    } else if (reduction_vec_ty) |vec_ty| {
-        for (0..plan.groups) |group| baccs[group] = try func.appendBlockParam(mainbody, vec_ty);
+    } else if (acc_ty) |ty| {
+        for (0..acc_count) |group| baccs[group] = try func.appendBlockParam(mainbody, ty);
     }
     const bptrs = try allocator.alloc(Value, pointer_families.items.len);
     defer allocator.free(bptrs);
@@ -411,7 +417,20 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
             increments[lane] = vm.get(red.increment) orelse red.increment;
         }
         const increment_vector = try func.appendInst(mainbody, reduction_vec_ty.?, .{ .struct_new = .{ .fields = try func.internValues(increments[0..V]) } });
-        next_accs[group_index] = try func.appendInst(mainbody, reduction_vec_ty.?, .{ .arith = .{ .op = red.op, .lhs = baccs[group_index].?, .rhs = increment_vector } });
+        if (ordered) {
+            // Widen independent work, but add each lane in source order. No
+            // reassociation, vector accumulator, or extra identity addition.
+            var acc = next_accs[0] orelse baccs[0].?;
+            for (0..V) |lane| {
+                const item = try func.appendInst(mainbody, reduction_ty.?, .{ .extract = .{ .aggregate = increment_vector, .index = @intCast(lane) } });
+                acc = try func.appendInst(mainbody, reduction_ty.?, .{ .arith = .{
+                    .op = red.op,
+                    .lhs = if (red.acc_on_left) acc else item,
+                    .rhs = if (red.acc_on_left) item else acc,
+                } });
+            }
+            next_accs[0] = acc;
+        } else next_accs[group_index] = try func.appendInst(mainbody, reduction_vec_ty.?, .{ .arith = .{ .op = red.op, .lhs = baccs[group_index].?, .rhs = increment_vector } });
     };
     const nmi = if (countdown) bmi else try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(U)));
     const next_vi = if (bvi) |vi| try func.appendInst(mainbody, index_vec_ty.?, .{ .arith = .{ .op = .add, .lhs = vi, .rhs = index_step.? } }) else null;
@@ -434,12 +453,14 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     const cmi = try func.appendBlockParam(combine, ind_ty);
     if (plan.reduction) |red| {
         var caccs: [2]Value = undefined;
-        for (0..plan.groups) |group| caccs[group] = try func.appendBlockParam(combine, reduction_vec_ty.?);
-        var combined = caccs[0];
-        for (caccs[1..plan.groups]) |cacc|
-            combined = try func.appendInst(combine, reduction_vec_ty.?, .{ .arith = .{ .op = red.op, .lhs = combined, .rhs = cacc } });
-        const horizontal = try func.appendReduce(combine, red.op, combined);
-        const scalar_acc = try func.appendInst(combine, reduction_ty.?, .{ .arith = .{ .op = red.op, .lhs = init_acc.?, .rhs = horizontal } });
+        for (0..acc_count) |group| caccs[group] = try func.appendBlockParam(combine, acc_ty.?);
+        const scalar_acc = if (ordered) caccs[0] else reduced: {
+            var combined = caccs[0];
+            for (caccs[1..plan.groups]) |cacc|
+                combined = try func.appendInst(combine, reduction_vec_ty.?, .{ .arith = .{ .op = red.op, .lhs = combined, .rhs = cacc } });
+            const horizontal = try func.appendReduce(combine, red.op, combined);
+            break :reduced try func.appendInst(combine, reduction_ty.?, .{ .arith = .{ .op = red.op, .lhs = init_acc.?, .rhs = horizontal } });
+        };
         var rem_args: [2]Value = undefined;
         rem_args[plan.induction] = cmi;
         rem_args[red.accumulator] = scalar_acc;
@@ -620,13 +641,18 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
             return null;
         if (countUses(func, bodyb, acc_alias) != 1) return null;
         const elem_kind = func.types.type_kind(func.valueType(acc_alias));
-        if (elem_kind != .int or byteSize(func, func.valueType(acc_alias)) * 8 != ELEM_BITS) return null;
-        if (!reorderable(func, back_args[accumulator], update.op, false)) return null;
+        const ordered = model.arch == .aarch64 and elem_kind == .float and elem_kind.float == .f32 and update.op == .add and !functionHasFastMath(func);
+        if (!ordered) {
+            if (elem_kind != .int or byteSize(func, func.valueType(acc_alias)) * 8 != ELEM_BITS) return null;
+            if (!reorderable(func, back_args[accumulator], update.op, false)) return null;
+        }
         break :red .{
             .accumulator = accumulator,
             .update_inst = update_inst,
             .increment = increment,
             .op = update.op,
+            .ordered = ordered,
+            .acc_on_left = update.lhs == acc_alias,
         };
     } else null;
     // Every load/store address must be unit-stride contiguous; other ops must be pure compute.
@@ -977,11 +1003,14 @@ fn definedInLoop(func: *const Function, loop: *const loops.Loop, v: Value) bool 
 /// The most body instructions a widened reduction increment may hold, load included.
 const MAX_TREE: usize = 8;
 /// The most vector accumulators a widened reduction carries.
-const MAX_GROUPS: u32 = 2;
+const MAX_GROUPS: u32 = 4;
 
 /// A recognized `s op= f(a[i])` reduction over contiguous memory, vectorizable to a vector
 /// accumulator. `f` is the load itself or a short pure expression over it (`tree`).
+const ByteCount = struct { needle: Value, compare: CmpOp };
+
 const RedPlan = struct {
+    byte_count: ?ByteCount = null,
     header: Block,
     preheader: Block,
     exit_cond: CmpOp,
@@ -1166,9 +1195,8 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
     var tree = IncrementTree{ .func = func, .loop = loop };
     if (!tree.visit(incr)) return null;
     const load_inst = tree.load orelse return null;
-    // Only x86_64 lowers the narrow loads, widening converts and integer lane compares a
-    // longer increment needs.
-    if (tree.len > 1 and model.arch != .x86_64) return null;
+    // x86 and NEON lower narrow loads, widening converts and integer equality masks.
+    if (tree.len > 1 and model.arch != .x86_64 and model.arch != .aarch64) return null;
     const load = func.opcode(load_inst).load;
     const load_ty = func.valueType(func.instResult(load_inst).?);
     const sa = unitAddress(func, load.ptr, ind_alias) orelse return null;
@@ -1192,9 +1220,11 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         .tree_len = 0,
         .increment = incr,
         .factor = V,
-        // Two accumulators hide the vector add latency and halve the loop overhead per element.
-        .groups = if (model.arch == .x86_64) MAX_GROUPS else 1,
+        // Independent accumulators hide add latency and amortize loop overhead.
+        // M1 uses four for reduction trees; other targets retain their prior policy.
+        .groups = if (model.tag == .@"apple-m1" and tree.len > 1) 4 else if (model.arch == .x86_64 or (model.arch == .aarch64 and tree.len > 1)) 2 else 1,
     };
+    if (model.arch == .aarch64) plan.byte_count = recognizeByteCount(func, &plan);
     // Keep the body order, so each operand is emitted before its readers.
     for (func.blockInsts(bodyb)) |inst| {
         if (!tree.contains(inst)) continue;
@@ -1348,7 +1378,106 @@ fn identityConst(func: *Function, block: Block, op: BinOp, ty: ir.types.Type) Er
     };
 }
 
+fn convertedFrom(func: *const Function, value: Value, source: Value) bool {
+    var current = value;
+    for (0..4) |_| {
+        if (current == source) return true;
+        const ty = func.types.type_kind(func.valueType(current));
+        if (ty != .int or ty.int.bits < 8 or (ty.int.bits == 8 and ty.int.signedness == .signed)) return false;
+        const inst = func.definingInst(current) orelse return false;
+        current = switch (func.opcode(inst)) {
+            .convert => |c| c.value,
+            else => return false,
+        };
+    }
+    return false;
+}
+
+fn recognizeByteCount(func: *const Function, plan: *const RedPlan) ?ByteCount {
+    if (plan.op != .add or plan.stride != 1) return null;
+    const loaded = func.instResult(plan.load).?;
+    const ty = func.types.type_kind(func.valueType(loaded));
+    if (ty != .int or ty.int.bits != 8 or ty.int.signedness != .unsigned) return null;
+    var condition = plan.increment;
+    for (0..4) |_| {
+        const inst = func.definingInst(condition) orelse return null;
+        if (func.opcode(inst) == .icmp) break;
+        const cv = switch (func.opcode(inst)) {
+            .convert => |c| c,
+            else => return null,
+        };
+        const ct = func.types.type_kind(func.valueType(condition));
+        if (ct != .int or ct.int.bits < 2) return null;
+        condition = cv.value;
+    }
+    const cmp_inst = func.definingInst(condition) orelse return null;
+    const cmp = switch (func.opcode(cmp_inst)) {
+        .icmp => |c| c,
+        else => return null,
+    };
+    if (cmp.op != .eq and cmp.op != .ne) return null;
+    const other = if (convertedFrom(func, cmp.lhs, loaded)) cmp.rhs else if (convertedFrom(func, cmp.rhs, loaded)) cmp.lhs else return null;
+    var needle = other;
+    for (0..4) |_| {
+        const nt = func.types.type_kind(func.valueType(needle));
+        if (nt != .int) return null;
+        if (nt.int.bits == 8 and nt.int.signedness == .unsigned) return .{ .needle = needle, .compare = cmp.op };
+        if (nt.int.bits <= 8) return null;
+        const inst = func.definingInst(needle) orelse return null;
+        switch (func.opcode(inst)) {
+            .iconst => |n| if (n >= 0 and n <= 255) return .{ .needle = needle, .compare = cmp.op } else return null,
+            .convert => |c| needle = c.value,
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn applyByteCount(allocator: std.mem.Allocator, func: *Function, plan: *const RedPlan, count: ByteCount) Error!void {
+    const params = func.blockParams(plan.header);
+    const ind_ty = func.valueType(params[plan.induction]);
+    const acc_ty = func.valueType(params[plan.accumulator]);
+    const pre_args = try allocator.dupe(Value, func.blockArgs(func.terminator(plan.preheader).?.jump));
+    defer allocator.free(pre_args);
+    const byte_ty = try func.types.intern(.{ .int = .{ .bits = 8, .signedness = .unsigned } });
+    const vt = try func.types.intern(.{ .vector = .{ .len = 16, .elem = byte_ty } });
+    const wide_ty = if (intBitsOf(func, pre_args[plan.induction]) < 64) try func.types.intern(.{ .int = .{ .bits = 64, .signedness = func.types.type_kind(ind_ty).int.signedness } }) else ind_ty;
+    const bound = if (func.valueType(plan.bound) == wide_ty) plan.bound else try func.appendInst(plan.preheader, wide_ty, .{ .convert = .{ .value = plan.bound } });
+    const needle = if (func.valueType(count.needle) == byte_ty) count.needle else try func.appendInst(plan.preheader, byte_ty, .{ .convert = .{ .value = count.needle } });
+    const splat = try func.appendSplat(plan.preheader, vt, needle);
+    const zero = try func.appendInst(plan.preheader, byte_ty, .{ .iconst = 0 });
+    const body = try func.appendBlock();
+    const combine = try func.appendBlock();
+    const fits = try groupFits(func, plan.preheader, pre_args[plan.induction], wide_ty, bound, plan.exit_cond, 16);
+    const initial = [_]Value{ pre_args[plan.induction], pre_args[plan.accumulator] };
+    try func.appendIf(plan.preheader, fits, .{ .target = body, .args = &initial }, .{ .target = combine, .args = &initial });
+    const i = try func.appendBlockParam(body, ind_ty);
+    const acc = try func.appendBlockParam(body, acc_ty);
+    const wi = if (ind_ty == wide_ty) i else try func.appendInst(body, wide_ty, .{ .convert = .{ .value = i } });
+    const pointer_ty = func.valueType(plan.load_base);
+    const sum = try func.appendInst(body, pointer_ty, .{ .arith = .{ .op = .add, .lhs = plan.load_base, .rhs = wi } });
+    const address = if (plan.offset == 0) sum else try func.appendArithImm(body, pointer_ty, .add, sum, plan.offset);
+    const values = try func.appendInst(body, vt, .{ .load = .{ .ptr = address } });
+    const mask = try func.appendInst(body, vt, .{ .icmp = .{ .op = count.compare, .lhs = values, .rhs = splat } });
+    const reduced = try func.appendReduce(body, .add, mask);
+    // Mask bytes are -1 for each match. Byte negation recovers the exact
+    // population (0..16), including the modulo-byte sum of sixteen masks.
+    const population = try func.appendInst(body, byte_ty, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = reduced } });
+    const increment = try func.appendInst(body, acc_ty, .{ .convert = .{ .value = population } });
+    const next_acc = try func.appendInst(body, acc_ty, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = increment } });
+    const next_i = try func.appendArithImm(body, ind_ty, .add, i, 16);
+    const again = try groupFits(func, body, next_i, wide_ty, bound, plan.exit_cond, 16);
+    const next = [_]Value{ next_i, next_acc };
+    try func.appendIf(body, again, .{ .target = body, .args = &next }, .{ .target = combine, .args = &next });
+    var rem_args: [2]Value = undefined;
+    rem_args[plan.induction] = try func.appendBlockParam(combine, ind_ty);
+    rem_args[plan.accumulator] = try func.appendBlockParam(combine, acc_ty);
+    try func.setJump(combine, plan.header, &rem_args);
+    branchLast(func, plan.preheader);
+}
+
 fn applyReduction(allocator: std.mem.Allocator, func: *Function, plan: *const RedPlan) Error!void {
+    if (plan.byte_count) |count| return applyByteCount(allocator, func, plan, count);
     const V = plan.factor;
     const G = plan.groups;
     const U = V * G;
@@ -2172,7 +2301,8 @@ test "widens a byte match count only where the target lowers its lane compares" 
 
     var info = try loops.analyze(allocator, &func);
     defer info.deinit(allocator);
-    try testing.expect(recognizeReduction(&func, registry.modelFor(.@"ampere-altra"), &info.loops[0], false) == null);
+    const neon_plan = recognizeReduction(&func, registry.modelFor(.@"apple-m1"), &info.loops[0], false) orelse return error.NotRecognized;
+    try testing.expectEqual(@as(usize, 4), neon_plan.tree_len);
     const plan = recognizeReduction(&func, registry.modelFor(.zen4), &info.loops[0], false) orelse return error.NotRecognized;
     try testing.expectEqual(@as(usize, 4), plan.tree_len);
     try testing.expectEqual(@as(i64, 1), plan.stride);
@@ -2189,4 +2319,20 @@ test "widens a byte match count only where the target lowers its lane compares" 
         else => {},
     };
     try testing.expectEqual(@as(usize, 2), lane_compares); // one per accumulator group
+}
+
+test "byte-count matching rejects an intervening signed-byte reinterpretation" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8t = try func.types.intern(.{ .int = .{ .bits = 8, .signedness = .unsigned } });
+    const i8t = try func.types.intern(.{ .int = .{ .bits = 8, .signedness = .signed } });
+    const i32t = try func.types.intern(.{ .int = .{ .bits = 32, .signedness = .signed } });
+    const b = try func.appendBlock();
+    const source = try func.appendBlockParam(b, u8t);
+    const signed_byte = try func.appendInst(b, i8t, .{ .convert = .{ .value = source } });
+    const negative = try func.appendInst(b, i32t, .{ .convert = .{ .value = signed_byte } });
+    const positive = try func.appendInst(b, i32t, .{ .convert = .{ .value = source } });
+    try std.testing.expect(!convertedFrom(&func, negative, source));
+    try std.testing.expect(convertedFrom(&func, positive, source));
 }

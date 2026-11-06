@@ -14,6 +14,65 @@ const Value = ir.function.Value;
 const Inst = ir.function.Inst;
 
 pub const pass_def = pass.Pass{ .name = "constedge", .run = run };
+pub const calls_pass_def = pass.Pass{ .name = "constant-call-arguments", .run = runCalls, .preserves_cfg = true };
+
+/// A literal argument defined outside a call's block need not occupy a register
+/// across intervening loops and calls. Rebuild it immediately before its call.
+pub fn runCalls(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    const homes = try allocator.dupe(u32, try analyses.definingBlocks());
+    defer allocator.free(homes);
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        var rebuilt: std.ArrayList(Inst) = .empty;
+        defer rebuilt.deinit(allocator);
+        var local_changed = false;
+        for (original) |inst| {
+            const list = switch (func.opcode(inst)) {
+                .call => |c| c.args,
+                .call_indirect => |c| c.args,
+                else => {
+                    try rebuilt.append(allocator, inst);
+                    continue;
+                },
+            };
+            const args = try allocator.dupe(Value, func.valueList(list));
+            defer allocator.free(args);
+            var call_changed = false;
+            for (args) |*arg| {
+                if (@backingInt(arg.*) >= homes.len or homes[@backingInt(arg.*)] == bi) continue;
+                const def = func.definingInst(arg.*) orelse continue;
+                const literal = switch (func.opcode(def)) {
+                    .iconst => |c| c,
+                    else => continue,
+                };
+                const copy = try func.createInst(func.valueType(arg.*), .{ .iconst = literal });
+                try rebuilt.append(allocator, func.definingInst(copy).?);
+                arg.* = copy;
+                call_changed = true;
+            }
+            if (call_changed) {
+                const updated = try func.internValues(args);
+                switch (func.opcodeMut(inst).*) {
+                    .call => |*c| c.args = updated,
+                    .call_indirect => |*c| c.args = updated,
+                    else => unreachable,
+                }
+                local_changed = true;
+            }
+            try rebuilt.append(allocator, inst);
+        }
+        if (local_changed) {
+            const body = func.blockInstsMut(block);
+            body.clearRetainingCapacity();
+            try body.appendSlice(func.allocator, rebuilt.items);
+            changed = true;
+        }
+    }
+    return changed;
+}
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
@@ -127,4 +186,26 @@ test "a constant passed on a conditional edge is rebuilt on that edge alone" {
     var diags = try ir.verify.verify(allocator, &func, .high);
     defer diags.deinit();
     try testing.expect(diags.ok());
+}
+
+test "call constants are rebuilt locally without changing other users" {
+    const allocator = testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const entry = try f.appendBlock();
+    const body = try f.appendBlock();
+    const c = try f.appendInst(entry, t, .{ .iconst = 65536 });
+    try f.setJump(entry, body, &.{});
+    const call = try f.appendCall(body, t, "callee", &.{c});
+    const result = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = call, .rhs = c } });
+    f.setTerminator(body, .{ .ret = ir.function.Ret.one(result) });
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &f };
+    defer analyses.deinit();
+    try testing.expect(try runCalls(allocator, &f, &analyses));
+    const arg = f.valueList(f.opcode(f.definingInst(call).?).call.args)[0];
+    try testing.expect(arg != c);
+    try testing.expectEqual(@as(i64, 65536), f.opcode(f.definingInst(arg).?).iconst);
+    try testing.expectEqual(f.definingInst(arg).?, f.blockInsts(body)[0]);
+    try testing.expectEqual(c, f.opcode(f.definingInst(result).?).arith.rhs);
 }

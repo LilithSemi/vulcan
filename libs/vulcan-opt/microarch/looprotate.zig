@@ -3,6 +3,7 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const pass = @import("../pass.zig");
+const dce = @import("../dce.zig");
 
 const Function = ir.function.Function;
 const Block = ir.function.Block;
@@ -15,6 +16,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     const doms = try analyses.dominators();
     const loop_info = try analyses.loops();
     const def_blocks = try analyses.definingBlocks();
+    const uses = try allocator.alloc(u32, func.valueCount());
+    defer allocator.free(uses);
 
     for (loop_info.loops) |loop| {
         const header: Block = @fromBackingInt(@intCast(loop.header));
@@ -31,13 +34,20 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             else => continue,
         };
         if (branch.cond != compare_result) continue;
+        dce.countUses(func, uses);
+        if (uses[@backingInt(compare_result)] != 1) continue;
 
         const body = branch.then.target;
         const exit = branch.@"else".target;
         if (!loop.contains(@backingInt(body)) or loop.contains(@backingInt(exit))) continue;
         if (graph.predecessors(@backingInt(body)).len != 1 or graph.predecessors(@backingInt(body))[0] != loop.header) continue;
-        if (graph.predecessors(@backingInt(exit)).len != 1 or graph.predecessors(@backingInt(exit))[0] != loop.header) continue;
-        if (graph.successors(@backingInt(exit)).len != 0) continue;
+        // A nested loop may continue after its exit, and a body guard may
+        // reach the same exit. Every such edge must carry the current values.
+        var exit_is_local = true;
+        for (graph.predecessors(@backingInt(exit))) |pred| {
+            if (!loop.contains(pred)) exit_is_local = false;
+        }
+        if (!exit_is_local) continue;
 
         var latch_index: ?u32 = null;
         for (graph.predecessors(loop.header)) |pred| {
@@ -68,6 +78,18 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 
         const header_params = try allocator.dupe(Value, func.blockParams(header));
         defer allocator.free(header_params);
+        // Uses reached through some other exit cannot be repaired by params
+        // on this exit. Refuse those shapes rather than leave stale values.
+        @memset(uses, 0);
+        for (0..func.blockCount()) |bi| {
+            if (loop.contains(bi) or doms.dominates(@backingInt(exit), bi)) continue;
+            dce.countBlockUses(func, @fromBackingInt(@intCast(bi)), uses);
+        }
+        var escaping_elsewhere = false;
+        for (header_params) |param| if (uses[@backingInt(param)] != 0) {
+            escaping_elsewhere = true;
+        };
+        if (escaping_elsewhere) continue;
         if (func.blockArgs(latch_jump).len != header_params.len) continue;
         if (!operandAvailableAtLatch(header_params, def_blocks, loop.header, compare.lhs) or
             !operandAvailableAtLatch(header_params, def_blocks, loop.header, compare.rhs)) continue;
@@ -91,7 +113,35 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             const block: Block = @fromBackingInt(@intCast(block_index));
             for (header_params, body_params) |param, replacement| func.replaceUsesIn(block, param, replacement);
         }
-        for (header_params, exit_params) |param, replacement| func.replaceUsesIn(exit, param, replacement);
+        for (0..func.blockCount()) |bi| {
+            if (loop.contains(bi) or !doms.dominates(@backingInt(exit), bi)) continue;
+            for (header_params, exit_params) |param, replacement|
+                func.replaceUsesIn(@fromBackingInt(@intCast(bi)), param, replacement);
+        }
+
+        // A body-side early exit observes the current iteration, while the
+        // latch exit below observes its updated back-edge values.
+        for (loop.body, 0..) |inside, bi| {
+            if (!inside or bi == loop.header) continue;
+            const block: Block = @fromBackingInt(@intCast(bi));
+            for (func.blockInsts(block)) |inst| {
+                var cf = switch (func.opcode(inst)) {
+                    .@"if" => |cf| cf,
+                    else => continue,
+                };
+                if (cf.then.target == exit) cf.then.args = try appendArgs(allocator, func, cf.then, body_params);
+                if (cf.@"else".target == exit) cf.@"else".args = try appendArgs(allocator, func, cf.@"else", body_params);
+                func.opcodeMut(inst).* = .{ .@"if" = cf };
+            }
+            if (func.terminator(block)) |term| switch (term) {
+                .jump => |jump| if (jump.target == exit) {
+                    var updated = jump;
+                    updated.args = try appendArgs(allocator, func, jump, body_params);
+                    func.setTerminator(block, .{ .jump = updated });
+                },
+                .ret => {},
+            };
+        }
 
         const next_jump = func.terminator(latch).?.jump;
         const next_args = try allocator.dupe(Value, func.blockArgs(next_jump));
@@ -127,6 +177,12 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         return true;
     }
     return false;
+}
+
+fn appendArgs(allocator: std.mem.Allocator, func: *Function, jump: ir.function.Jump, extra: []const Value) !ir.function.ValueList {
+    const args = try concat(allocator, func.blockArgs(jump), extra);
+    defer allocator.free(args);
+    return func.internValues(args);
 }
 
 fn operandAvailableAtLatch(header_params: []const Value, def_blocks: []const u32, header: u32, value: Value) bool {
@@ -188,4 +244,84 @@ test "rotates a top tested loop through its latch" {
     var diagnostics = try ir.verify.verify(allocator, &func, .high);
     defer diagnostics.deinit();
     try std.testing.expect(diagnostics.ok());
+}
+
+test "rotation preserves early exits and values used after a nested loop" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bt = try f.types.intern(.bool);
+    const entry = try f.appendBlock();
+    const header = try f.appendBlock();
+    const body = try f.appendBlock();
+    const latch = try f.appendBlock();
+    const done = try f.appendBlock();
+    const after = try f.appendBlock();
+    const n = try f.appendBlockParam(entry, t);
+    const stop = try f.appendBlockParam(entry, t);
+    const zero = try f.appendInst(entry, t, .{ .iconst = 0 });
+    const i = try f.appendBlockParam(header, t);
+    try f.setJump(entry, header, &.{zero});
+    const more = try f.appendInst(header, bt, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try f.appendIf(header, more, .{ .target = body }, .{ .target = done });
+    const early = try f.appendInst(body, bt, .{ .icmp = .{ .op = .eq, .lhs = i, .rhs = stop } });
+    try f.appendIf(body, early, .{ .target = done }, .{ .target = latch });
+    const next = try f.appendArithImm(latch, t, .add, i, 1);
+    try f.setJump(latch, header, &.{next});
+    try f.setJump(done, after, &.{});
+    const result = try f.appendArithImm(after, t, .add, i, 10);
+    f.setTerminator(after, .{ .ret = ir.function.Ret.one(result) });
+    var original = try f.clone(allocator);
+    defer original.deinit();
+    try std.testing.expect(try pass.run(allocator, &f, &.{pass_def}));
+    var diags = try ir.verify.verify(allocator, &f, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+    for ([_]i64{ -1, 0, 1, 2, 7, 20 }) |limit| {
+        for ([_]i64{ -1, 0, 1, 3, 19, 30 }) |stop_at| {
+            try std.testing.expectEqual(try evalRotation(&original, &.{ limit, stop_at }), try evalRotation(&f, &.{ limit, stop_at }));
+        }
+    }
+}
+
+fn evalRotation(f: *const Function, inputs: []const i64) !i64 {
+    const allocator = std.testing.allocator;
+    const values = try allocator.alloc(i64, f.valueCount());
+    defer allocator.free(values);
+    const pending = try allocator.alloc(i64, f.valueCount());
+    defer allocator.free(pending);
+    for (f.blockParams(@fromBackingInt(0)), inputs) |param, input| values[@backingInt(param)] = input;
+    var block: Block = @fromBackingInt(0);
+    for (0..1000) |_| {
+        var edge: ?ir.function.Jump = null;
+        for (f.blockInsts(block)) |inst| {
+            const op = f.opcode(inst);
+            if (op == .@"if") {
+                edge = if (values[@backingInt(op.@"if".cond)] != 0) op.@"if".then else op.@"if".@"else";
+                break;
+            }
+            const result = f.instResult(inst).?;
+            values[@backingInt(result)] = switch (op) {
+                .iconst => |c| c,
+                .arith_imm => |a| values[@backingInt(a.lhs)] + a.imm,
+                .icmp => |c| switch (c.op) {
+                    .lt => @intFromBool(values[@backingInt(c.lhs)] < values[@backingInt(c.rhs)]),
+                    .eq => @intFromBool(values[@backingInt(c.lhs)] == values[@backingInt(c.rhs)]),
+                    else => unreachable,
+                },
+                else => unreachable,
+            };
+        }
+        if (edge == null) switch (f.terminator(block).?) {
+            .ret => |r| return values[@backingInt(r.values[0])],
+            .jump => |jump| edge = jump,
+        };
+        const jump = edge.?;
+        const args = f.blockArgs(jump);
+        for (args, 0..) |arg, index| pending[index] = values[@backingInt(arg)];
+        for (f.blockParams(jump.target), pending[0..args.len]) |param, arg| values[@backingInt(param)] = arg;
+        block = jump.target;
+    }
+    return error.TestUnexpectedResult;
 }

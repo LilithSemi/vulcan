@@ -35,9 +35,91 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     for (0..func.blockCount()) |ai| {
         const a: Block = @fromBackingInt(@intCast(ai));
         if (try fuse(allocator, func, graph, a)) changed = true;
+        if (!changed and try fuseBitRanges(allocator, func, graph, a)) {
+            analyses.invalidate();
+            return true;
+        }
     }
     if (changed) analyses.invalidate();
     return changed;
+}
+
+const BitRange = struct { x: Value, offset: Inst, width_inst: Inst, cmp: Inst, lo: u64, width: u64, bits: u16 };
+
+fn bitRange(func: *const Function, cond: Value) ?BitRange {
+    const cmp_inst = func.definingInst(cond) orelse return null;
+    const cmp = switch (func.opcode(cmp_inst)) {
+        .icmp => |c| c,
+        else => return null,
+    };
+    if (cmp.op != .le) return null;
+    const int = switch (func.types.type_kind(func.valueType(cmp.lhs))) {
+        .int => |i| i,
+        else => return null,
+    };
+    if (int.signedness != .unsigned or int.bits == 0 or int.bits > 64) return null;
+    const offset = func.definingInst(cmp.lhs) orelse return null;
+    const sub = switch (func.opcode(offset)) {
+        .arith_imm => |a| a,
+        else => return null,
+    };
+    if (sub.op != .sub or sub.imm < 0) return null;
+    const width_inst = func.definingInst(cmp.rhs) orelse return null;
+    const width = switch (func.opcode(width_inst)) {
+        .iconst => |k| k,
+        else => return null,
+    };
+    if (width < 0) return null;
+    const lo: u64 = @intCast(sub.imm);
+    const w: u64 = @intCast(width);
+    const max = if (int.bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(int.bits)) - 1;
+    if (lo > max or w > max - lo) return null;
+    return .{ .x = sub.lhs, .offset = offset, .width_inst = width_inst, .cmp = cmp_inst, .lo = lo, .width = w, .bits = int.bits };
+}
+
+/// Two equal unsigned ranges differing in one bit can clear that bit before
+/// one range check. For example [A,Z] or [a,z] becomes (x & ~32)-'A' <= 25.
+fn fuseBitRanges(allocator: std.mem.Allocator, func: *Function, graph: anytype, a: Block) pass.Error!bool {
+    const ai = lastIf(func, a) orelse return false;
+    const acf = func.opcode(ai).@"if";
+    const ar = bitRange(func, acf.cond) orelse return false;
+    const b = acf.@"else".target;
+    if (b == a or b == acf.then.target or func.blockParams(b).len != 0 or func.blockArgs(acf.@"else").len != 0) return false;
+    const preds = graph.predecessors(@backingInt(b));
+    if (preds.len != 1 or preds[0] != @backingInt(a)) return false;
+    const bi = lastIf(func, b) orelse return false;
+    const bcf = func.opcode(bi).@"if";
+    if (bcf.then.target != acf.then.target or !sameArgs(func, acf.then, bcf.then)) return false;
+    const br = bitRange(func, bcf.cond) orelse return false;
+    if (ar.x != br.x or ar.bits != br.bits or ar.width != br.width) return false;
+    const bit = ar.lo ^ br.lo;
+    if (bit == 0 or !std.math.isPowerOfTwo(bit)) return false;
+    const lo = @min(ar.lo, br.lo);
+    // Neither interval may cross the bit being cleared.
+    if (ar.width >= bit or (lo & (bit - 1)) > bit - 1 - ar.width) return false;
+    for (func.blockInsts(b)) |inst| {
+        if (inst != bi and inst != br.offset and inst != br.width_inst and inst != br.cmp) return false;
+    }
+    const yes = try allocator.dupe(Value, func.blockArgs(acf.then));
+    defer allocator.free(yes);
+    const no = try allocator.dupe(Value, func.blockArgs(bcf.@"else"));
+    defer allocator.free(no);
+    var rebuilt: std.ArrayList(Inst) = .empty;
+    defer rebuilt.deinit(allocator);
+    for (func.blockInsts(a)) |inst| if (inst != ai) try rebuilt.append(allocator, inst);
+    // Retain any independently used pure definitions from the bypassed block.
+    for (func.blockInsts(b)) |inst| if (inst != bi) try rebuilt.append(allocator, inst);
+    try func.setBlockInsts(a, rebuilt.items);
+    try func.setBlockInsts(b, &.{});
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    const ty = func.valueType(ar.x);
+    const mask = try func.appendInst(a, ty, .{ .iconst = @bitCast(~bit) });
+    const folded = try func.appendInst(a, ty, .{ .arith = .{ .op = .bit_and, .lhs = ar.x, .rhs = mask } });
+    const offset = try func.appendArithImm(a, ty, .sub, folded, @intCast(lo));
+    const width = try func.appendInst(a, ty, .{ .iconst = @intCast(ar.width) });
+    const cond = try func.appendInst(a, func.valueType(acf.cond), .{ .icmp = .{ .op = .le, .lhs = offset, .rhs = width } });
+    try func.appendIf(a, cond, .{ .target = acf.then.target, .args = yes }, .{ .target = bcf.@"else".target, .args = no });
+    return true;
 }
 
 fn fuse(allocator: std.mem.Allocator, func: *Function, graph: anytype, a: Block) pass.Error!bool {
@@ -303,4 +385,59 @@ test "an inner block with other work is left alone" {
     @memcpy(with_work[1..], insts);
     try func.setBlockInsts(chain.inner, with_work);
     try testing.expect(!try runOnce(allocator, &func));
+}
+
+test "one-bit range unions match every byte and reject crossing ranges" {
+    const allocator = testing.allocator;
+    for ([_]struct { lo: i64, width: i64, bit: i64, accepts: bool }{
+        .{ .lo = 65, .width = 25, .bit = 32, .accepts = true },
+        .{ .lo = 4, .width = 3, .bit = 8, .accepts = true },
+        .{ .lo = 3, .width = 6, .bit = 8, .accepts = false },
+        .{ .lo = 1, .width = 7, .bit = 8, .accepts = false },
+    }) |case| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const bt = try f.types.intern(.bool);
+        const a = try f.appendBlock();
+        const b = try f.appendBlock();
+        const yes = try f.appendBlock();
+        const no = try f.appendBlock();
+        const x = try f.appendBlockParam(a, t);
+        for ([_]Block{ a, b }, 0..) |block, index| {
+            const off = try f.appendArithImm(block, t, .sub, x, case.lo + if (index == 0) @as(i64, 0) else case.bit);
+            const w = try f.appendInst(block, t, .{ .iconst = case.width });
+            const cmp = try f.appendInst(block, bt, .{ .icmp = .{ .op = .le, .lhs = off, .rhs = w } });
+            try f.appendIf(block, cmp, .{ .target = yes }, .{ .target = if (index == 0) b else no });
+            f.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+        }
+        const one = try f.appendInst(yes, t, .{ .iconst = 1 });
+        const zero = try f.appendInst(no, t, .{ .iconst = 0 });
+        f.setTerminator(yes, .{ .ret = ir.function.Ret.one(one) });
+        f.setTerminator(no, .{ .ret = ir.function.Ret.one(zero) });
+        try testing.expectEqual(case.accepts, try runOnce(allocator, &f));
+        if (!case.accepts) continue;
+        var diags = try ir.verify.verify(allocator, &f, .high);
+        defer diags.deinit();
+        try testing.expect(diags.ok());
+        const values = try allocator.alloc(u8, f.valueCount());
+        defer allocator.free(values);
+        for (0..256) |input| {
+            values[@backingInt(x)] = @intCast(input);
+            for (f.blockInsts(a)) |inst| {
+                const result = f.instResult(inst) orelse continue;
+                values[@backingInt(result)] = switch (f.opcode(inst)) {
+                    .iconst => |k| @truncate(@as(u64, @bitCast(k))),
+                    .arith_imm => |ar| values[@backingInt(ar.lhs)] -% @as(u8, @truncate(@as(u64, @bitCast(ar.imm)))),
+                    .arith => |ar| values[@backingInt(ar.lhs)] & values[@backingInt(ar.rhs)],
+                    .icmp => |cmp| @intFromBool(values[@backingInt(cmp.lhs)] <= values[@backingInt(cmp.rhs)]),
+                    else => unreachable,
+                };
+            }
+            const iff = f.opcode(lastIf(&f, a).?).@"if";
+            const n: i64 = @intCast(input);
+            const expected = (n >= case.lo and n <= case.lo + case.width) or (n >= case.lo + case.bit and n <= case.lo + case.bit + case.width);
+            try testing.expectEqual(expected, values[@backingInt(iff.cond)] != 0);
+        }
+    }
 }
