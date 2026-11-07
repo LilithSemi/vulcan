@@ -691,10 +691,11 @@ fn moveRunHasCycle(words: []const u32, move_indices: []const usize) bool {
 /// empty blocks share a code offset. No branch or dense-switch row may enter at that offset before a
 /// producer from the fallthrough path is rewritten across it.
 fn hasOnlyFallthroughEntry(move_at: usize, block_start: []const usize, fixups: []const Fixup) bool {
+    for (fixups) |fixup| if (fixup.word_target == move_at) return false;
     for (block_start, 0..) |start, block_index| {
         if (start != move_at) continue;
         for (fixups) |fixup| {
-            if (fixup.adr_target == null and fixup.target == block_index) return false;
+            if (fixup.adr_target == null and fixup.word_target == null and fixup.target == block_index) return false;
         }
     }
     return true;
@@ -754,6 +755,9 @@ fn narrowUnsignedMagic(
     for (block_start) |start| if (start < len) {
         is_block_start[start] = true;
     };
+    for (fixups) |fixup| if (fixup.word_target) |target| {
+        if (target < len) is_block_start[target] = true;
+    };
     var is_data = try allocator.alloc(bool, len);
     defer allocator.free(is_data);
     @memset(is_data, false);
@@ -799,6 +803,7 @@ fn narrowUnsignedMagic(
     for (fixups) |*fixup| {
         if (fixup.table_base) |base| fixup.table_base = base - removed_before[base];
         if (fixup.adr_target) |target| fixup.adr_target = target - removed_before[target];
+        if (fixup.word_target) |target| fixup.word_target = target - removed_before[target];
         fixup.at -= removed_before[fixup.at];
     }
     for (relocs) |*reloc| reloc.offset -= removed_before[reloc.offset];
@@ -885,6 +890,9 @@ pub fn pairMemoryForModelWithMoveProofs(
         std.debug.assert(bs <= len);
         if (bs < len) is_block_start[bs] = true; // a block start == len emits nothing to fuse into
     }
+    for (fixups) |fixup| if (fixup.word_target) |target| {
+        if (target < len) is_block_start[target] = true;
+    };
     var is_data = try allocator.alloc(bool, len);
     defer allocator.free(is_data);
     @memset(is_data, false);
@@ -908,6 +916,12 @@ pub fn pairMemoryForModelWithMoveProofs(
     const removed_distant = try allocator.alloc(bool, len);
     defer allocator.free(removed_distant);
     @memset(removed_distant, false);
+    // A 64-bit register move to itself has no effect. Keep W-register moves:
+    // even a self move clears the upper 32 bits. Jump-table words are data.
+    for (words.items, 0..) |word, at| {
+        if (!is_data[at] and word & 0xFFE0FFE0 == 0xAA0003E0 and
+            (word & 31) == ((word >> 16) & 31)) removed_distant[at] = true;
+    }
     const cyclic_move = try allocator.alloc(bool, len);
     defer allocator.free(cyclic_move);
     @memset(cyclic_move, false);
@@ -1120,8 +1134,13 @@ pub fn pairMemoryForModelWithMoveProofs(
     var i: usize = 0;
     while (i < len) {
         if (removed_distant[i]) {
+            const word = words.items[i];
+            const self_move = word & 0xFFE0FFE0 == 0xAA0003E0 and
+                (word & 31) == ((word >> 16) & 31);
+            // An entry at a deleted no-op must reach the following word,
+            // rather than the preceding producer of a coalesced result move.
+            removed_before[i] = if (self_move) removed else removed + 1;
             removed += 1;
-            removed_before[i] = removed;
             i += 1;
             continue;
         }
@@ -1206,6 +1225,7 @@ pub fn pairMemoryForModelWithMoveProofs(
     for (fixups) |*f| {
         if (f.table_base) |base| f.table_base = base - removed_before[base];
         if (f.adr_target) |target| f.adr_target = target - removed_before[target];
+        if (f.word_target) |target| f.word_target = target - removed_before[target];
         f.at -= removed_before[f.at];
         std.debug.assert(f.at < write);
     }
@@ -1412,6 +1432,19 @@ test "tryCoalesceResultMove forwards scalar ALU results into the move destinatio
     );
     try std.testing.expectEqual(@as(?u32, null), tryCoalesceResultMove(encode.ldrW(.x24, .x20, 0), encode.mov(.x21, .x24)));
     try std.testing.expectEqual(@as(?u32, null), tryCoalesceResultMove(encode.add(.x23, .x20, .x22), encode.mov(.x21, .x24)));
+}
+
+test "pairMemory removes X self moves and preserves W zero extension" {
+    const alloc = std.testing.allocator;
+    const w_self = @as(u32, 0x2A0003E0) | (3 << 16) | 3;
+    var words = try wordsFrom(alloc, &.{ encode.mov(.x0, .x0), w_self, encode.b(0), encode.mov(.x2, .x2), encode.ret() });
+    defer words.deinit(alloc);
+    var starts = [_]usize{ 0, 3 };
+    var fixups = [_]Fixup{.{ .at = 2, .target = 1 }};
+    try pairMemory(alloc, &words, &starts, &fixups, &.{}, &.{});
+    try std.testing.expectEqualSlices(u32, &.{ w_self, encode.b(0), encode.ret() }, words.items);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, &starts);
+    try std.testing.expectEqual(@as(usize, 1), fixups[0].at);
 }
 
 test "pairMemory coalesces an ALU result move and remaps following control flow" {
@@ -1885,4 +1918,26 @@ test "tryFuse rejects non-consecutive, different-base, rt1==rn, rt1==rt2 (load),
     // Out of range: imm7 = a.off / size = 512 / 8 = 64, over the 63 upper bound.
     const far = MemInsn{ .kind = .ldr_x, .rt = 0, .rn = 2, .off = 512 };
     try std.testing.expectEqual(@as(?u32, null), tryFuse(far, MemInsn{ .kind = .ldr_x, .rt = 1, .rn = 2, .off = 520 }));
+}
+
+test "local conditional labels follow paired stores during compaction" {
+    const allocator = std.testing.allocator;
+    var words: std.ArrayList(u32) = .empty;
+    defer words.deinit(allocator);
+    try words.appendSlice(allocator, &.{
+        encode.bcc(.eq, 0),
+        encode.strQ(.x8, .zr, 0),
+        encode.strQ(.x9, .zr, 16),
+        encode.b(0),
+        encode.ldrb(.x0, .x1),
+        encode.ret(),
+    });
+    var starts = [_]usize{0};
+    var fixups = [_]Fixup{.{ .at = 0, .target = 0, .word_target = 4, .cond = .eq }};
+    var relocs: [0]Reloc = .{};
+    var lines: [0]LineEntry = .{};
+    try pairMemory(allocator, &words, &starts, &fixups, &relocs, &lines);
+    try std.testing.expectEqual(@as(usize, 5), words.items.len);
+    try std.testing.expectEqual(@as(?usize, 3), fixups[0].word_target);
+    try std.testing.expectEqual(encode.ldrb(.x0, .x1), words.items[fixups[0].word_target.?]);
 }

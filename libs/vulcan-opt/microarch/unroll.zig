@@ -297,31 +297,34 @@ pub fn cloneBlocks(
         }
     }
 
-    // Pass 2: clone each instruction and the terminator, with every Value
-    // operand mapped through value_map and every Block target through
-    // block_map.
-    var args_buf: std.ArrayList(Value) = .empty;
-    defer args_buf.deinit(allocator);
-
+    // Reserve every result before rebuilding any operand. Block storage order
+    // need not be dominance order: an earlier latch may read a value defined
+    // in a later-numbered block. Leaving that operand unmapped would silently
+    // reuse the previous iteration's value in the cloned back edge.
+    var inst_map: std.AutoHashMapUnmanaged(Inst, Inst) = .empty;
+    defer inst_map.deinit(allocator);
     for (blocks, 0..) |b, i| {
         const cloned = clones[i];
         for (func.blockInsts(b)) |inst| {
-            const rebuilt = try rebuildOpcode(func, func.opcode(inst), value_map, block_map, &args_buf, allocator);
+            const cloned_inst = if (func.instResult(inst)) |result| create: {
+                const value = try func.appendInst(cloned, func.valueType(result), .{ .iconst = 0 });
+                try value_map.put(allocator, result, value);
+                try value_pairs.append(allocator, .{ .old = result, .new = value });
+                break :create func.definingInst(value).?;
+            } else try func.appendStmtRaw(cloned, func.opcode(inst));
+            try inst_map.put(allocator, inst, cloned_inst);
+            try inst_pairs.append(allocator, .{ .old = inst, .new = cloned_inst });
+        }
+    }
 
-            // Ask the INSTRUCTION whether it defines a result, rather than naming the
-            // result-less opcodes in a list. A hand-kept list has to be updated for every new
-            // opcode, and it also missed a VOID `call` and a void `call_indirect`, which the
-            // `else` then sent into an `orelse unreachable`. `instResult` is right for every
-            // opcode, now and later.
-            if (func.instResult(inst)) |result| {
-                const cloned_result = try func.appendInst(cloned, func.valueType(result), rebuilt);
-                try value_map.put(allocator, result, cloned_result);
-                try value_pairs.append(allocator, .{ .old = result, .new = cloned_result });
-                try inst_pairs.append(allocator, .{ .old = inst, .new = func.definingInst(cloned_result).? });
-            } else {
-                const cloned_inst = try func.appendStmtRaw(cloned, rebuilt);
-                try inst_pairs.append(allocator, .{ .old = inst, .new = cloned_inst });
-            }
+    // All block params and instruction results now have mappings, including
+    // forward references in the source's physical block order.
+    var args_buf: std.ArrayList(Value) = .empty;
+    defer args_buf.deinit(allocator);
+    for (blocks, 0..) |b, i| {
+        const cloned = clones[i];
+        for (func.blockInsts(b)) |inst| {
+            func.opcodeMut(inst_map.get(inst).?).* = try rebuildOpcode(func, func.opcode(inst), value_map, block_map, &args_buf, allocator);
         }
 
         if (func.terminator(b)) |term| {
@@ -2760,4 +2763,33 @@ test "a guard keeps the header's orientation when the body is on the else edge" 
         guards += 1;
     }
     try std.testing.expect(guards >= 2);
+}
+
+test "clone maps instruction results from later-numbered dominating blocks" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const entry = try f.appendBlock();
+    const latch = try f.appendBlock();
+    const body = try f.appendBlock();
+    const x = try f.appendBlockParam(entry, t);
+    try f.setJump(entry, body, &.{});
+    const next = try f.appendArithImm(body, t, .add, x, 1);
+    try f.setJump(body, latch, &.{});
+    f.setTerminator(latch, .{ .ret = ir.function.Ret.one(next) });
+    var values: ValueMap = .empty;
+    defer values.deinit(allocator);
+    var blocks: BlockMap = .empty;
+    defer blocks.deinit(allocator);
+    const clones = try cloneBlocks(allocator, &f, &.{ latch, body }, &values, &blocks);
+    defer allocator.free(clones);
+    try std.testing.expect(f.terminator(clones[0]).?.ret.values[0] != next);
+    try std.testing.expectEqual(values.get(next).?, f.terminator(clones[0]).?.ret.values[0]);
+    try std.testing.expectEqual(clones[0], f.terminator(clones[1]).?.jump.target);
+    // Make the clone reachable so verification also checks operand dominance.
+    try f.setJump(entry, clones[1], &.{});
+    var diags = try ir.verify.verify(allocator, &f, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
 }

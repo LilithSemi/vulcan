@@ -623,9 +623,24 @@ pub fn ldrWReg(rt: Reg, rn: Reg, rm: Reg) u32 {
     return 0xB8607800 | (n(rm) << 16) | (n(rn) << 5) | n(rt);
 }
 
+/// `ldr wt, [xn, wm, uxtw #2]` (unsigned word index scaled by four).
+pub fn ldrWRegUxtw(rt: Reg, rn: Reg, rm: Reg) u32 {
+    return 0xB8605800 | (n(rm) << 16) | (n(rn) << 5) | n(rt);
+}
+
+/// `ldr wt, [xn, xm]` (word load with an unscaled byte offset).
+pub fn ldrWRegUnscaled(rt: Reg, rn: Reg, rm: Reg) u32 {
+    return 0xB8606800 | (n(rm) << 16) | (n(rn) << 5) | n(rt);
+}
+
 /// `ldrb wt, [xn, xm]` (byte load with an unscaled register offset).
 pub fn ldrbReg(rt: Reg, rn: Reg, rm: Reg) u32 {
     return 0x38606800 | (n(rm) << 16) | (n(rn) << 5) | n(rt);
+}
+
+/// `ldrsb wt, [xn, xm]` (signed byte, extended to the 32-bit register).
+pub fn ldrsbReg(rt: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x38E06800 | (n(rm) << 16) | (n(rn) << 5) | n(rt);
 }
 
 /// `ldrsw xt, [xn, #off]` (load a 32-bit word, sign-extended into the 64-bit register). `off`
@@ -1004,6 +1019,36 @@ pub fn fcmeqVec(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x4E20E400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
+/// `cmeq vd.4s, vn.4s, vm.4s`: integer equality masks.
+pub fn cmeqVecI32(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6EA08C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+pub fn cmeqVecI8(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6E208C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+pub fn dupByteFromGpr(rd: Reg, rn: Reg) u32 {
+    return 0x4E010C00 | (n(rn) << 5) | n(rd);
+}
+pub fn addv16B(rd: Reg, rn: Reg) u32 {
+    return 0x4E31B800 | (n(rn) << 5) | n(rd);
+}
+
+/// Widen the low byte or halfword lanes with SSHLL/USHLL #0.
+pub fn extendVec(rd: Reg, rn: Reg, from_bits: u16, signed: bool) u32 {
+    std.debug.assert(from_bits == 8 or from_bits == 16);
+    return (if (signed) @as(u32, 0x0F00A400) else 0x2F00A400) |
+        (@as(u32, from_bits) << 16) | (n(rn) << 5) | n(rd);
+}
+
+test "integer lane equality and widening encodings" {
+    try std.testing.expectEqual(@as(u32, 0x6EA28C20), cmeqVecI32(.x0, .x1, .x2));
+    try std.testing.expectEqual(@as(u32, 0x2F08A420), extendVec(.x0, .x1, 8, false));
+    try std.testing.expectEqual(@as(u32, 0x0F08A462), extendVec(.x2, .x3, 8, true));
+    try std.testing.expectEqual(@as(u32, 0x2F10A4A4), extendVec(.x4, .x5, 16, false));
+    try std.testing.expectEqual(@as(u32, 0x0F10A4E6), extendVec(.x6, .x7, 16, true));
+}
+
 /// NEON `fcmgt Vd.4S, Vn.4S, Vm.4S`: per-lane greater-than mask (Vn > Vm).
 pub fn fcmgtVec(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x6EA0E400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
@@ -1077,6 +1122,23 @@ pub fn insLaneFromGpr(rd: Reg, lane: u2, rn: Reg) u32 {
 /// aarch64 host: 0x4EB1B820, with `n(rn) << 5` (0x20) subtracted for the zero-register base.
 pub fn addv(rd: Reg, rn: Reg) u32 {
     return 0x4EB1B800 | (n(rn) << 5) | n(rd);
+}
+
+/// `cnt vd.8b, vn.8b`: count set bits in each byte of the low 64 bits.
+pub fn cnt8B(rd: Reg, rn: Reg) u32 {
+    return 0x0E205800 | (n(rn) << 5) | n(rd);
+}
+
+/// `addv bd, vn.8b`: sum the eight byte lanes into the low byte.
+pub fn addv8B(rd: Reg, rn: Reg) u32 {
+    return 0x0E31B800 | (n(rn) << 5) | n(rd);
+}
+
+test "byte population-count and horizontal-sum encodings" {
+    try std.testing.expectEqual(@as(u32, 0x0E205820), cnt8B(.x0, .x1));
+    try std.testing.expectEqual(@as(u32, 0x0E205B18), cnt8B(.x24, .x24));
+    try std.testing.expectEqual(@as(u32, 0x0E31B820), addv8B(.x0, .x1));
+    try std.testing.expectEqual(@as(u32, 0x0E31BB18), addv8B(.x24, .x24));
 }
 
 /// `faddp vd.4s, vn.4s, vm.4s`: pairwise-add lanes across the two operands. With `vn` and `vm`
@@ -1656,7 +1718,10 @@ test "ldp/stp offset-form encoders match known bytes" {
 
 test "scaled register-offset word load encoding" {
     try std.testing.expectEqual(@as(u32, 0xB8747A11), ldrWReg(.x17, .x16, .x20));
+    try std.testing.expectEqual(@as(u32, 0xB8746A11), ldrWRegUnscaled(.x17, .x16, .x20));
+    try std.testing.expectEqual(@as(u32, 0xB8745A11), ldrWRegUxtw(.x17, .x16, .x20));
     try std.testing.expectEqual(@as(u32, 0x38746811), ldrbReg(.x17, .x0, .x20));
+    try std.testing.expectEqual(@as(u32, 0x38F46811), ldrsbReg(.x17, .x0, .x20));
 }
 
 test "conditional negate encoding" {
@@ -1714,4 +1779,10 @@ test "aarch64 byte and halfword offset-form load/store encoders match the disass
     try std.testing.expectEqual(strh(.x0, .x1), strhOff(.x0, .x1, 0));
     try std.testing.expectEqual(ldrh(.x0, .x1), ldrhOff(.x0, .x1, 0));
     try std.testing.expectEqual(ldrsh(.x0, .x1), ldrshOff(.x0, .x1, 0));
+}
+
+test "byte comparison broadcast and reduction encodings" {
+    try std.testing.expectEqual(@as(u32, 0x6E228C20), cmeqVecI8(.x0, .x1, .x2));
+    try std.testing.expectEqual(@as(u32, 0x4E010C20), dupByteFromGpr(.x0, .x1));
+    try std.testing.expectEqual(@as(u32, 0x4E31B820), addv16B(.x0, .x1));
 }

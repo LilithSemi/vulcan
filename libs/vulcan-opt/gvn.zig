@@ -64,7 +64,11 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
             const result = func.instResult(inst) orelse continue;
             const key = keyOf(func, canon, inst, result) orelse continue; // not numberable
             if (table.get(key)) |leader| {
-                if (doms.dominates(def_block[@backingInt(leader)], bi)) {
+                // Share integer literals locally. Sharing across blocks can keep a cheap
+                // constant live through a loop or call and create spills; duplicates in
+                // the same setup block instead waste registers holding identical bits.
+                const local_literal = func.opcode(inst) != .iconst or def_block[@backingInt(leader)] == bi;
+                if (local_literal and doms.dominates(def_block[@backingInt(leader)], bi)) {
                     canon[@backingInt(result)] = leader; // redundant: reuse the leader
                     changed = true;
                     continue;
@@ -127,7 +131,7 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         // Previously every `iconst`/`fconst` this frontend emitted shared one `Type` handle
         // (e.g. plain `int`), so the omission was latent; SM4 Task 5 (typed integer-literal
         // suffixes) is the first place a same-valued constant can carry a different type.
-        .iconst => null, // SPIKE: do not common constants (rematerializable; commoning creates long-lived spills)
+        .iconst => |v| .{ .kind = .iconst, .a = @bitCast(v), .sub = @backingInt(func.valueType(result)) },
         .fconst => |v| .{ .kind = .fconst, .a = @bitCast(v), .sub = @backingInt(func.valueType(result)) },
         // The 128-bit pattern needs two of the key's three slots; `c` stays zero.
         .fconst128 => |v| .{ .kind = .fconst128, .a = @truncate(v), .b = @truncate(v >> 64), .sub = @backingInt(func.valueType(result)) },
@@ -532,4 +536,27 @@ test "gvn canonicalizes an atomic's three operands onto the leaders" {
     try std.testing.expectEqual(addr_a, a.ptr);
     try std.testing.expectEqual(val_a, a.value);
     try std.testing.expectEqual(cmp_a, a.compare.?);
+}
+
+test "gvn shares integer literals within a block and keeps edge literals local" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const entry = try f.appendBlock();
+    const next = try f.appendBlock();
+    const a = try f.appendInst(entry, t, .{ .iconst = 2146121005 });
+    const b = try f.appendInst(entry, t, .{ .iconst = 2146121005 });
+    const sum = try f.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    try f.setJump(entry, next, &.{});
+    const c = try f.appendInst(next, t, .{ .iconst = 2146121005 });
+    const total = try f.appendInst(next, t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = c } });
+    f.setTerminator(next, .{ .ret = ir.function.Ret.one(total) });
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &f };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &f, &analyses));
+    const added = f.opcode(f.definingInst(sum).?).arith;
+    try std.testing.expectEqual(a, added.lhs);
+    try std.testing.expectEqual(a, added.rhs);
+    try std.testing.expectEqual(c, f.opcode(f.definingInst(total).?).arith.rhs);
 }

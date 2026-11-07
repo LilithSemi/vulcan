@@ -1143,9 +1143,10 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
 
     const early_start = inline_end;
     if (optimize.optimizes()) {
-        // An x86 model keeps expression latency: its wide out-of-order core hides an extra
+        // Wide x86, Firestorm, and A76 cores keep expression latency: they hide an extra
         // instruction better than a longer multiply chain.
-        const latency_aware = optimize.runsMicroarch() and model != null and model.?.arch == .x86_64;
+        const latency_aware = optimize.runsMicroarch() and model != null and
+            (model.?.arch == .x86_64 or model.?.tag == .@"apple-m1" or model.?.tag == .@"cortex-a76");
         const constants = if (optimize.inlinesCalls()) libraryConstants(&mod) else null;
         for (mod.funcs) |*nf| {
             _ = try opt.optimizeEarlyFor(allocator, &nf.func, latency_aware);
@@ -1163,7 +1164,10 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
     const early_end = std.Io.Timestamp.now(io, .awake);
 
     const microarch_start = early_end;
-    if (optimize.inlinesCalls() and profile == null) try inlineHotLoopBodies(allocator, &mod);
+    if (optimize.inlinesCalls() and profile == null) {
+        try inlineHotLoopBodies(allocator, &mod);
+        try foldLateLibraryCalls(allocator, &mod);
+    }
     if (optimize.runsMicroarch()) if (model) |m| {
         for (mod.funcs) |*nf| _ = try mm.optimizeTransforms(allocator, &nf.func, m);
     };
@@ -1172,7 +1176,10 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
     // hoist every case constant into the loop entry, creating needless live ranges and register
     // pressure. A scored constant-only LICM follows the inline, then the late pipeline performs
     // scalar cleanup.
-    if (optimize.inlinesCalls() and profile == null) try inlineHotLoopCalls(allocator, &mod);
+    if (optimize.inlinesCalls() and profile == null) {
+        try inlineHotLoopCalls(allocator, &mod);
+        try foldLateLibraryCalls(allocator, &mod);
+    }
     if (optimize.runsMicroarch()) if (model) |m| {
         for (mod.funcs) |*nf| _ = try mm.optimizePostInline(allocator, &nf.func, m);
     };
@@ -1253,6 +1260,19 @@ fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module, profile:
     const lookup = opt.inlining.Lookup{ .context = mod, .func = ModuleLookup.get };
     if (profile == null) {
         for (mod.funcs) |*named| _ = try opt.optimizePreInline(allocator, &named.func);
+        for (mod.funcs) |*named| _ = try opt.pass.runToFixpoint(allocator, &named.func, &.{
+            opt.constfold.pass_def,
+            opt.simplify.pass_def,
+            opt.immform.pass_def,
+            opt.licm.pass_def,
+            opt.dce.pass_def,
+        }, 4);
+        // Preserve repeated read-only calls long enough to hoist them before
+        // inlining turns each call into a separate nested loop.
+        for (mod.funcs) |*named| {
+            var budget: usize = 16;
+            while (budget > 0 and try opt.readonly.run(allocator, &named.func, lookup)) : (budget -= 1) {}
+        }
     }
     for (mod.funcs) |*named| {
         if (profile) |p| {
@@ -1340,7 +1360,34 @@ fn inlineHotLoopCalls(allocator: std.mem.Allocator, mod: *cc.Module) !void {
 
 fn inlineHotLoopBodies(allocator: std.mem.Allocator, mod: *cc.Module) !void {
     const lookup = opt.inlining.Lookup{ .context = mod, .func = ModuleLookup.get };
-    for (mod.funcs) |*named| _ = try opt.inlining.runLoopCycles(allocator, &named.func, lookup);
+    for (mod.funcs) |*named| {
+        if (!try opt.inlining.runLoopCycles(allocator, &named.func, lookup)) continue;
+        _ = try opt.pass.runToFixpoint(allocator, &named.func, &.{
+            opt.jumpthread.single_edge_params_pass_def,
+            opt.constfold.pass_def,
+            opt.simplify.pass_def,
+            opt.immform.pass_def,
+            opt.gvn.pass_def,
+            opt.dce.pass_def,
+        }, 4);
+    }
+}
+
+/// Late inlining exposes literal string arguments too. Fold their library
+/// calls before scheduling, with scalar cleanup that does not hoist a large
+/// inlined dispatch tree's constants into the surrounding loop.
+fn foldLateLibraryCalls(allocator: std.mem.Allocator, mod: *cc.Module) !void {
+    const constants = libraryConstants(mod) orelse return;
+    for (mod.funcs) |*named| {
+        if (!try opt.libcall.run(allocator, &named.func, constants)) continue;
+        _ = try opt.pass.runToFixpoint(allocator, &named.func, &.{
+            opt.constfold.pass_def,
+            opt.simplify.pass_def,
+            opt.immform.pass_def,
+            opt.gvn.pass_def,
+            opt.dce.pass_def,
+        }, 4);
+    }
 }
 
 fn profileHotThreshold(counts: []const u64) u64 {
@@ -2363,6 +2410,30 @@ test "translation-unit inlining gives loop calls a larger growth budget" {
     }
 }
 
+test "read-only scans are hoisted before inlining repeated C loop calls" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\long scan(const long *p, int n) { long s = 0; for (int i = 0; i < n; ++i) s += p[i]; return s; }
+        \\long repeat(const long *p, int n) { long total = 0; for (int j = 0; j < 100; ++j) total += scan(p, n); return total; }
+    );
+    defer mod.deinit(allocator);
+    try inlineTranslationUnit(allocator, &mod, null);
+    const f = mod.find("repeat").?;
+    var loops = try opt.loops.analyze(allocator, f);
+    defer loops.deinit(allocator);
+    for (loops.loops) |outer| {
+        for (loops.loops) |inner| {
+            try std.testing.expect(inner.header == outer.header or !outer.contains(inner.header));
+        }
+        for (0..f.blockCount()) |bi| {
+            if (!outer.contains(bi)) continue;
+            for (f.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+                try std.testing.expect(f.opcode(inst) != .call);
+            }
+        }
+    }
+}
+
 test "translation-unit inlining admits a bounded loop callee at a hot loop site" {
     const allocator = std.testing.allocator;
     var mod = try cc.compile(allocator,
@@ -2801,4 +2872,56 @@ test "driver wiring: default system dir (host glibc) resolves #include <stdio.h>
         try joined.append(allocator, ' ');
     }
     try std.testing.expect(std.mem.indexOf(u8, joined.items, "printf") != null);
+}
+
+test "late loop inlining folds newly exposed constant string calls" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\unsigned long strlen(const char *);
+        \\int memcmp(const void *, const void *, unsigned long);
+        \\unsigned matches(const char *text, const char *word) {
+        \\  unsigned n = 0;
+        \\  for (unsigned i = 0; i < 10; ++i)
+        \\    n += memcmp(text + i, word, strlen(word)) == 0;
+        \\  return n;
+        \\}
+        \\unsigned driver(const char *text) {
+        \\  unsigned n = 0;
+        \\  for (unsigned i = 0; i < 10; ++i) n += matches(text, "ok");
+        \\  return n;
+        \\}
+    );
+    defer mod.deinit(allocator);
+    try inlineTranslationUnit(allocator, &mod, null);
+    for (mod.funcs) |*named| _ = try opt.optimizeEarly(allocator, &named.func);
+    try inlineHotLoopBodies(allocator, &mod);
+    try foldLateLibraryCalls(allocator, &mod);
+    const driver = mod.find("driver").?;
+    for (0..driver.blockCount()) |bi| {
+        for (driver.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            if (driver.opcode(inst) == .call) {
+                const name = driver.symbolName(driver.opcode(inst).call.symbol);
+                try std.testing.expect(!std.mem.eql(u8, name, "strlen"));
+                try std.testing.expect(!std.mem.eql(u8, name, "memcmp"));
+                try std.testing.expect(!std.mem.eql(u8, name, "matches"));
+            }
+        }
+    }
+}
+
+test "hot nested memory loops inline for independent concrete arrays" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\static int source[64], output[64];
+        \\void kernel(int *x, int *y) { for (int i=0;i<8;++i) for(int j=0;j<8;++j) y[i*8+j]=x[i*8+j]+i; }
+        \\int main(void) { for(int r=0;r<100;++r) kernel(source, output); return output[63]; }
+    );
+    defer mod.deinit(allocator);
+    try inlineTranslationUnit(allocator, &mod, null);
+    for (mod.funcs) |*named| _ = try opt.optimizeEarly(allocator, &named.func);
+    try inlineHotLoopBodies(allocator, &mod);
+    const main_func = mod.find("main") orelse return error.TestUnexpectedResult;
+    for (0..main_func.blockCount()) |bi| for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+        try std.testing.expect(main_func.opcode(inst) != .call);
+    };
 }

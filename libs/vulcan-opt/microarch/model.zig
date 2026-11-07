@@ -138,7 +138,10 @@ pub const FusionRule = struct { kind: FuseKind };
 /// The predefined parts Vulcan ships a model for. The tags are the canonical names, quoted, so the
 /// display name is the tag name and std.meta.stringToEnum parses them with no side table.
 pub const Microarch = enum {
+    @"apple-m1",
     @"ampere-altra",
+    @"cortex-a76",
+    @"cortex-a55",
     @"neoverse-n2",
     @"et-soc",
     @"river-rc1.n",

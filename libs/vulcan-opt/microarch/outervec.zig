@@ -5,8 +5,9 @@
 //! evaluation order, so the result is exact, floats included.
 //!
 //! The vector loop runs while V more columns remain. The original loop then finishes the rest.
-//! A store must not share a root pointer with any load. Accesses through different pointers are
-//! taken not to overlap, the same rule the innermost-loop vectorizer applies.
+//! A store must not share a root pointer with any load. The AArch64 path also proves that
+//! roots denote distinct allocation objects; unknown pointer parameters remain scalar.
+//! The x86 path retains the existing distinct-root policy.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -46,17 +47,17 @@ const Plan = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const mm.Model) Error!bool {
-    if (model.arch != .x86_64 or model.simdBits() < 128) return false;
+    if ((model.arch != .x86_64 and model.arch != .aarch64) or model.simdBits() < 128) return false;
     var changed = false;
     // Each rewrite adds blocks, so the loop structure is read again after one.
     for (0..8) |_| {
-        if (!try runOnce(allocator, func)) break;
+        if (!try runOnce(allocator, func, model.arch == .aarch64)) break;
         changed = true;
     }
     return changed;
 }
 
-fn runOnce(allocator: std.mem.Allocator, func: *Function) Error!bool {
+fn runOnce(allocator: std.mem.Allocator, func: *Function, prove_disjoint: bool) Error!bool {
     var info = try loops.analyze(allocator, func);
     defer info.deinit(allocator);
     for (info.loops) |*loop| {
@@ -68,7 +69,7 @@ fn runOnce(allocator: std.mem.Allocator, func: *Function) Error!bool {
         const order = try bodyOrder(allocator, func, &plan, entry);
         defer allocator.free(order);
         if (!try classify(func, &plan, order, kinds)) continue;
-        if (!memorySafe(func, &plan, kinds)) continue;
+        if (!memorySafe(func, &plan, kinds, prove_disjoint)) continue;
         try rewrite(allocator, func, &plan, kinds);
         return true;
     }
@@ -257,7 +258,7 @@ fn instKind(func: *const Function, inst: Inst, kinds: []const Kind) ?Kind {
 }
 
 /// Every store goes through a root pointer no load in the loop also uses.
-fn memorySafe(func: *const Function, plan: *const Plan, kinds: []const Kind) bool {
+fn memorySafe(func: *const Function, plan: *const Plan, kinds: []const Kind, prove_disjoint: bool) bool {
     _ = kinds;
     var store_roots: [8]Value = undefined;
     var store_count: usize = 0;
@@ -277,12 +278,24 @@ fn memorySafe(func: *const Function, plan: *const Plan, kinds: []const Kind) boo
         for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| switch (func.opcode(inst)) {
             .load => |l| {
                 const root = pointerRoot(func, l.ptr);
-                for (store_roots[0..store_count]) |s| if (s == root) return false;
+                for (store_roots[0..store_count]) |s| {
+                    if (s == root or (prove_disjoint and !distinctObjects(func, s, root))) return false;
+                }
             },
             else => {},
         };
     }
     return true;
+}
+
+fn distinctObjects(func: *const Function, a: Value, b: Value) bool {
+    const ai = func.definingInst(a) orelse return false;
+    const bi = func.definingInst(b) orelse return false;
+    const ao = func.opcode(ai);
+    const bo = func.opcode(bi);
+    if (ao == .alloca) return (bo == .alloca and ai != bi) or bo == .global_addr;
+    if (ao == .global_addr) return bo == .alloca or (bo == .global_addr and ao.global_addr.symbol != bo.global_addr.symbol);
+    return false;
 }
 
 fn pointerRoot(func: *const Function, ptr: Value) Value {

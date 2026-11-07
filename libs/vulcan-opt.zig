@@ -23,6 +23,7 @@ pub const immform = @import("vulcan-opt/immform.zig");
 pub const branchfold = @import("vulcan-opt/branchfold.zig");
 pub const rangecheck = @import("vulcan-opt/rangecheck.zig");
 pub const bitset = @import("vulcan-opt/bitset.zig");
+pub const popcount = @import("vulcan-opt/popcount.zig");
 pub const looppromote = @import("vulcan-opt/looppromote.zig");
 pub const samewidth = @import("vulcan-opt/samewidth.zig");
 pub const libcall = @import("vulcan-opt/libcall.zig");
@@ -31,6 +32,7 @@ pub const joinconst = @import("vulcan-opt/joinconst.zig");
 pub const ifconvert = @import("vulcan-opt/ifconvert.zig");
 pub const gvn = @import("vulcan-opt/gvn.zig");
 pub const licm = @import("vulcan-opt/licm.zig");
+pub const readonly = @import("vulcan-opt/readonly.zig");
 pub const ivsr = @import("vulcan-opt/ivsr.zig");
 pub const inlining = @import("vulcan-opt/inline.zig");
 pub const dce = @import("vulcan-opt/dce.zig");
@@ -58,6 +60,7 @@ pub const default_pipeline = [_]pass.Pass{
     fullunroll.pass_def,
     rangecheck.pass_def,
     bitset.pass_def,
+    popcount.pass_def,
     ifconvert.pass_def,
     joinconst.pass_def,
     jumpthread.pass_def,

@@ -95,11 +95,15 @@ fn buildSquare(func: *Function) !void {
 /// `s = 0; for (i = 0; i < n; i += 1) s += a[i]; return s;` over f32. Marked fast_math so the FP
 /// reduction may reassociate (vector partial sums + horizontal reduce).
 fn buildSumReduction(func: *Function) !void {
+    try buildFloatSum(func, true, 0);
+}
+
+fn buildFloatSum(func: *Function, fast_math: bool, initial: f64) !void {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
-    try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan", .key = "fast_math", .value = .flag } });
+    if (fast_math) try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan", .key = "fast_math", .value = .flag } });
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
     const body = try func.appendBlock();
@@ -107,7 +111,7 @@ fn buildSumReduction(func: *Function) !void {
     const a = try func.appendBlockParam(entry, ptr_t);
     const n = try func.appendBlockParam(entry, i32_t);
     const zero_i = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
-    const zero_f = try func.appendInst(entry, f32_t, .{ .fconst = 0 });
+    const zero_f = try func.appendInst(entry, f32_t, .{ .fconst = initial });
     try func.setJump(entry, loop, &.{ zero_i, zero_f });
     const i = try func.appendBlockParam(loop, i32_t);
     const s = try func.appendBlockParam(loop, f32_t);
@@ -511,7 +515,7 @@ fn buildMatmulNest(func: *Function) !void {
     func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 }
 
-test "zen4 differential: an outer-vectorized matmul nest matches at every column count" {
+test "native differential: an outer-vectorized matmul nest matches at every column count" {
     if (comptime !hasJit()) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var orig = Function.init(allocator);
@@ -567,4 +571,207 @@ test "the full ampere pipeline vectorizes saxpy (splat-aware cost model)" {
     // The invariant multiplier `a` is a splat (one `dup`, not a 4-lane pack), so the SLP cost model
     // judges the saxpy group profitable on the wide OoO ampere and vectorizes it, like gcc -O3's fmla.
     try std.testing.expect(hasVectorValue(&func));
+}
+
+test "aarch64 ordered float reductions preserve cancellation and signed zero" {
+    if (comptime builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const model = opt.microarch.modelFor(.@"apple-m1");
+    for ([_]bool{ false, true }) |reverse| for ([_]f64{ 0.0, -0.0, 1.0 }) |initial| {
+        var orig = Function.init(allocator);
+        defer orig.deinit();
+        try buildFloatSum(&orig, false, initial);
+        if (reverse) {
+            for (0..orig.blockCount()) |bi| for (orig.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+                const a = switch (orig.opcode(inst)) {
+                    .arith => |a| a,
+                    else => continue,
+                };
+                if (a.op == .add and orig.types.type_kind(orig.valueType(a.lhs)) == .float)
+                    orig.opcodeMut(inst).* = .{ .arith = .{ .op = .add, .lhs = a.rhs, .rhs = a.lhs } };
+            };
+        }
+        var tuned = try orig.clone(allocator);
+        defer tuned.deinit();
+        try std.testing.expect(try opt.microarch.optimize(allocator, &tuned, model));
+        try std.testing.expect(hasVectorValue(&tuned));
+        var diags = try ir.verify.verify(allocator, &tuned, .low);
+        defer diags.deinit();
+        try std.testing.expect(diags.ok());
+        var original_code = try target.native.jitFunction(allocator, &orig);
+        defer original_code.deinit();
+        var tuned_code = try target.native.jitFunction(allocator, &tuned);
+        defer tuned_code.deinit();
+        const original_fn = original_code.entry(SumFn, 0);
+        const tuned_fn = tuned_code.entry(SumFn, 0);
+        for ([_][4]f32{
+            .{ 16777216.0, 1.0, -16777216.0, 1.0 },
+            .{ -0.0, -0.0, -0.0, -0.0 },
+            .{ 1.0, 0x1p-24, 0x1p-24, -1.0 },
+            .{ @bitCast(@as(u32, 0x7fc01234)), 1.0, @bitCast(@as(u32, 0xffc05678)), 0.0 },
+        }) |pattern| {
+            var values: [128]f32 = undefined;
+            for (&values, 0..) |*value, index| value.* = pattern[index % pattern.len];
+            for ([_]i32{ -1, 0, 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 100 }) |n| {
+                try std.testing.expectEqual(@as(u32, @bitCast(original_fn(&values, n))), @as(u32, @bitCast(tuned_fn(&values, n))));
+            }
+        }
+    };
+}
+
+fn buildNarrowCount(f: *Function, bits: u16, signed: bool, compare: ir.function.CmpOp, bounded: bool) !void {
+    const ptr = try f.types.ptrGlobal();
+    const u32t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const i32t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const elem = try f.types.intern(.{ .int = .{ .signedness = if (signed) .signed else .unsigned, .bits = bits } });
+    const bt = try f.types.intern(.bool);
+    const entry = try f.appendBlock();
+    const header = try f.appendBlock();
+    const body = try f.appendBlock();
+    const done = try f.appendBlock();
+    const input = try f.appendBlockParam(entry, ptr);
+    const count = try f.appendBlockParam(entry, u32t);
+    const needle_param = try f.appendBlockParam(entry, if (bounded) elem else i32t);
+    const needle = if (bounded) try f.appendInst(entry, i32t, .{ .convert = .{ .value = needle_param } }) else needle_param;
+    const zero = try f.appendInst(entry, u32t, .{ .iconst = 0 });
+    try f.setJump(entry, header, &.{ zero, zero });
+    const index = try f.appendBlockParam(header, u32t);
+    const sum = try f.appendBlockParam(header, u32t);
+    const more = try f.appendInst(header, bt, .{ .icmp = .{ .op = .lt, .lhs = index, .rhs = count } });
+    try f.appendIf(header, more, .{ .target = body }, .{ .target = done });
+    const wide_index = try f.appendInst(body, i64t, .{ .convert = .{ .value = index } });
+    const offset = if (bits == 8) wide_index else try f.appendArithImm(body, i64t, .mul, wide_index, 2);
+    const address = try f.appendInst(body, ptr, .{ .arith = .{ .op = .add, .lhs = input, .rhs = offset } });
+    const loaded = try f.appendInst(body, elem, .{ .load = .{ .ptr = address } });
+    const wide = try f.appendInst(body, i32t, .{ .convert = .{ .value = loaded } });
+    const equal = try f.appendInst(body, bt, .{ .icmp = .{ .op = compare, .lhs = wide, .rhs = needle } });
+    const contribution = try f.appendInst(body, u32t, .{ .convert = .{ .value = equal } });
+    const next_sum = try f.appendInst(body, u32t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = contribution } });
+    const next_index = try f.appendArithImm(body, u32t, .add, index, 1);
+    try f.setJump(body, header, &.{ next_index, next_sum });
+    f.setTerminator(done, .{ .ret = ir.function.Ret.one(sum) });
+}
+
+test "NEON narrow equality counts preserve signedness and stop at a guard page" {
+    if (comptime builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const psize = std.heap.pageSize();
+    const memory = try std.heap.page_allocator.alloc(u8, psize * 2);
+    defer std.heap.page_allocator.free(memory);
+    const pattern = [_]u16{ 0, 1, 127, 128, 255, 256, 32767, 32768, 65535, 65408, 65407 };
+    for (0..psize / 2) |index| {
+        const value = pattern[index % pattern.len];
+        memory[index * 2] = @truncate(value);
+        memory[index * 2 + 1] = @truncate(value >> 8);
+    }
+    const linux = std.os.linux;
+    try std.testing.expect(linux.errno(linux.mprotect(memory.ptr + psize, psize, .{})) == .SUCCESS);
+    defer _ = linux.mprotect(memory.ptr + psize, psize, .{ .READ = true, .WRITE = true });
+    for ([_]bool{ false, true }) |bounded| for ([_]u16{ 8, 16 }) |bits| for ([_]bool{ false, true }) |signed| for ([_]ir.function.CmpOp{ .eq, .ne }) |compare| {
+        if (bounded and (bits != 8 or signed)) continue;
+        var orig = Function.init(allocator);
+        defer orig.deinit();
+        try buildNarrowCount(&orig, bits, signed, compare, bounded);
+        var tuned = try orig.clone(allocator);
+        defer tuned.deinit();
+        try std.testing.expect(try opt.microarch.optimize(allocator, &tuned, opt.microarch.modelFor(.@"apple-m1")));
+        try std.testing.expect(hasVectorValue(&tuned));
+        if (bounded) {
+            var byte_native = false;
+            for (tuned.values.items) |value| {
+                const kind = tuned.types.type_kind(value.ty);
+                if (kind == .vector and kind.vector.len == 16) byte_native = true;
+            }
+            try std.testing.expect(byte_native);
+        }
+        var diags = try ir.verify.verify(allocator, &tuned, .low);
+        defer diags.deinit();
+        try std.testing.expect(diags.ok());
+        var original_code = try target.native.jitFunction(allocator, &orig);
+        defer original_code.deinit();
+        var tuned_code = try target.native.jitFunction(allocator, &tuned);
+        defer tuned_code.deinit();
+        const Fn = *const fn ([*]const u8, u32, i32) callconv(.c) u32;
+        const original_fn = original_code.entry(Fn, 0);
+        const tuned_fn = tuned_code.entry(Fn, 0);
+        for ([_]u32{ 0, 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 255 }) |n| {
+            const input = memory.ptr + psize - n * (bits / 8);
+            for ([_]i32{ -32768, -129, -128, -1, 0, 1, 127, 128, 255, 256, 32767, 32768, 65535, 65536 }) |needle| {
+                try std.testing.expectEqual(original_fn(input, n, needle), tuned_fn(input, n, needle));
+            }
+        }
+    };
+}
+
+test "AArch64 outer vectorization refuses potentially overlapping parameters" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildMatmulNest(&func);
+    try std.testing.expect(!try opt.microarch.outervec.run(allocator, &func, ampere()));
+}
+
+test "AArch64 outer vectorization proves distinct globals and rejects shared objects" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |overlap| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        try buildMatmulNest(&func);
+        const entry: ir.function.Block = @fromBackingInt(0);
+        const params = func.blockParams(entry);
+        const ptr = try func.types.ptrGlobal();
+        const a = try func.appendGlobalAddr(entry, ptr, "matrix_a");
+        const b = try func.appendGlobalAddr(entry, ptr, "matrix_b");
+        const c = try func.appendGlobalAddr(entry, ptr, if (overlap) "matrix_a" else "matrix_c");
+        func.replaceAllUses(params[0], a);
+        func.replaceAllUses(params[1], b);
+        func.replaceAllUses(params[2], c);
+        try std.testing.expectEqual(!overlap, try opt.microarch.outervec.run(allocator, &func, ampere()));
+        var diags = try ir.verify.verify(allocator, &func, .low);
+        defer diags.deinit();
+        try std.testing.expect(diags.ok());
+    }
+}
+
+test "interval set membership matches equality chains over negative and byte inputs" {
+    if (comptime !hasJit()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    for ([_][3]i64{ .{ 32, 9, 10 }, .{ -2, -3, 2 }, .{ 0, 1, 2 }, .{ 3, 5, 7 } }) |members| {
+        var original = Function.init(allocator);
+        defer original.deinit();
+        const t = try original.types.intern(.{ .int = .{ .bits = 32, .signedness = .signed } });
+        const bt = try original.types.intern(.bool);
+        const entry = try original.appendBlock();
+        const second = try original.appendBlock();
+        const third = try original.appendBlock();
+        const yes = try original.appendBlock();
+        const no = try original.appendBlock();
+        const input = try original.appendBlockParam(entry, t);
+        const blocks = [_]ir.function.Block{ entry, second, third, no };
+        for (members, 0..) |value, i| {
+            const constant = try original.appendInst(blocks[i], t, .{ .iconst = value });
+            const equal = try original.appendInst(blocks[i], bt, .{ .icmp = .{ .op = .eq, .lhs = input, .rhs = constant } });
+            try original.appendIf(blocks[i], equal, .{ .target = yes }, .{ .target = blocks[i + 1] });
+        }
+        const one = try original.appendInst(yes, t, .{ .iconst = 1 });
+        const zero = try original.appendInst(no, t, .{ .iconst = 0 });
+        original.setTerminator(yes, .{ .ret = ir.function.Ret.one(one) });
+        original.setTerminator(no, .{ .ret = ir.function.Ret.one(zero) });
+        var tuned = try original.clone(allocator);
+        defer tuned.deinit();
+        try std.testing.expect(try opt.pass.run(allocator, &tuned, &.{opt.bitset.pass_def}));
+        var original_code = try target.native.jitFunction(allocator, &original);
+        defer original_code.deinit();
+        var tuned_code = try target.native.jitFunction(allocator, &tuned);
+        defer tuned_code.deinit();
+        const Fn = *const fn (i32) callconv(.c) i32;
+        const a = original_code.entry(Fn, 0);
+        const b = tuned_code.entry(Fn, 0);
+        for (0..512) |i| {
+            const value: i32 = @as(i32, @intCast(i)) - 256;
+            try std.testing.expectEqual(a(value), b(value));
+        }
+        for ([_]i32{ -2147483648, 2147483647 }) |value| try std.testing.expectEqual(a(value), b(value));
+    }
 }

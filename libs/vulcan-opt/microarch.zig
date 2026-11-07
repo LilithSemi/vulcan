@@ -8,6 +8,7 @@ const pass = @import("pass.zig");
 const vectorize = @import("vectorize.zig"); // vulcan-opt root module
 const ivsr = @import("ivsr.zig");
 const constfold = @import("constfold.zig");
+const gvn = @import("gvn.zig");
 const simplify = @import("simplify.zig");
 const strength = @import("strength.zig");
 const immform = @import("immform.zig");
@@ -113,7 +114,12 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
         }, 16)
     else
         false;
-    const unrolled = try unroll.run(allocator, func, m);
+    const unrolled = if (m.tag == .@"apple-m1" or m.tag == .@"cortex-a76") scored: {
+        var gate = try score.IRGate.init(allocator, func, m);
+        defer gate.deinit();
+        if (!try unroll.run(allocator, gate.candidateFunction(), m)) break :scored false;
+        break :scored try gate.commit(func);
+    } else try unroll.run(allocator, func, m);
     const vectorized = try vectorize.runModel(allocator, func, m);
     const if_converted = if (m.arch == .aarch64) converted: {
         var gate = try score.IRGate.init(allocator, func, m);
@@ -170,29 +176,35 @@ pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Funct
 pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Function, m: *const Model) pass.Error!bool {
     // x86 encodes any imm32 in place, so hoisting loop immediates only adds register pressure.
     const passes: []const pass.Pass = switch (m.arch) {
-        .aarch64 => &.{ rangediv.pass_def, offsetcombine.pass_def, loopimm.pass_def, looprotate.pass_def, dce.pass_def },
+        .aarch64 => &.{ rangediv.pass_def, offsetcombine.pass_def, loopimm.pass_def, looprotate.pass_def, gvn.pass_def, dce.pass_def },
         .x86_64 => &.{ rangediv.pass_def, offsetcombine.pass_def, dce.pass_def },
         else => return false,
     };
     // A pointer made from an integer constant, such as null, is that constant, so a compare with
     // it takes an immediate.
-    const nulls = m.arch == .x86_64 and pointerConstants(func);
+    const nulls = pointerConstants(func);
     // A loop that walks a pointer and a counter in step keeps only the pointer.
-    const tested = m.arch == .x86_64 and try pass.runToFixpoint(allocator, func, &.{ lftr.pass_def, dce.pass_def }, 16);
+    const tested = (m.arch == .x86_64 or m.arch == .aarch64) and try pass.runToFixpoint(allocator, func, &.{ lftr.pass_def, dce.pass_def }, 16);
     // Sharing one side of a same-width convert removes a register copy, and a constant rebuilt at
     // its edge frees a register. Neither adds work, so they need no score.
-    const shared = if (m.arch == .x86_64)
+    const shared = if (m.arch == .x86_64 or m.arch == .aarch64)
         try pass.runToFixpoint(allocator, func, &.{ samewidth.pass_def, constedge.pass_def, dce.pass_def }, 4)
     else
         false;
+    const call_constants = m.arch == .aarch64 and try pass.run(allocator, func, &.{ constedge.calls_pass_def, dce.pass_def });
     // Each copy of a join has one predecessor, so its params fold to the values passed in.
-    const joined = m.arch == .x86_64 and try pass.run(allocator, func, &.{ jointail.returns_pass_def, jointail.pass_def });
+    const joined = (m.arch == .x86_64 or m.tag == .@"cortex-a76") and try pass.run(allocator, func, &.{ jointail.returns_pass_def, jointail.pass_def });
     if (joined) _ = try pass.runToFixpoint(allocator, func, &.{ jumpthread.single_edge_params_pass_def, constfold.pass_def, simplify.pass_def, immform.pass_def, dce.pass_def }, 4);
     var gate = try score.IRGate.init(allocator, func, m);
     defer gate.deinit();
-    const changed = try pass.run(allocator, gate.candidateFunction(), passes);
-    if (!changed) return shared or joined or tested or nulls;
-    return try gate.commit(func) or shared or joined or tested or nulls;
+    // Rotation handles one loop per analysis snapshot. Recompute analyses so
+    // inner and outer loops can both lose their recurring header branch.
+    const changed = if (m.arch == .aarch64)
+        try pass.runToFixpoint(allocator, gate.candidateFunction(), passes, 8)
+    else
+        try pass.run(allocator, gate.candidateFunction(), passes);
+    if (!changed) return shared or joined or tested or nulls or call_constants;
+    return try gate.commit(func) or shared or joined or tested or nulls or call_constants;
 }
 
 fn pointerConstants(func: *ir.function.Function) bool {

@@ -174,7 +174,7 @@ fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, fi
                 return true;
             }
             const small_loop = instruction_limit != null and withinInstructionLimit(callee, small_loop_limit) and
-                cycleInlineSafe(callee) and try loopsWriteNoMemory(allocator, callee);
+                cycleInlineSafe(callee) and (try loopsWriteNoMemory(allocator, callee) or (siteHasDistinctObjects(caller, inst) and try hasLoopNest(allocator, callee)));
             if (inlinableMultiPolicy(callee, allow_calls) and (inline_cycles or small_loop or !try hasCfgCycle(allocator, callee))) {
                 try inlineCallMulti(allocator, caller, @intCast(bi), idx, inst, callee);
                 return true;
@@ -225,7 +225,7 @@ fn inlineOneInLoops(
             const callee = lookup.get(name) orelse continue;
             const size = instructionCount(callee);
             if (size == 0 or size > instruction_limit) continue;
-            if (require_cycle and !(cycleInlineSafe(callee) and try loopsWriteNoMemory(allocator, callee))) continue;
+            if (require_cycle and !(cycleInlineSafe(callee) and (try loopsWriteNoMemory(allocator, callee) or (siteHasDistinctObjects(caller, inst) and try hasLoopNest(allocator, callee))))) continue;
             if (inlinable(callee)) {
                 if (require_cycle) continue;
                 try inlineCall(allocator, caller, @intCast(bi), idx, inst, callee);
@@ -242,6 +242,37 @@ fn inlineOneInLoops(
 
 /// Whether no store in `callee` is inside one of its loops. A loop that writes memory stays a
 /// separate function, where it is vectorized on its own. A store outside the loops is fine.
+/// Concrete independent objects expose memory independence in nested loops after inlining.
+/// Unknown pointer arguments retain the normal memory-writing-loop limit.
+fn siteHasDistinctObjects(caller: *const Function, site: Inst) bool {
+    var roots: [16]Inst = undefined;
+    var count: usize = 0;
+    for (caller.valueList(caller.opcode(site).call.args)) |arg| {
+        if (caller.types.type_kind(caller.valueType(arg)) != .ptr) continue;
+        if (count == roots.len) return false;
+        const def = caller.definingInst(arg) orelse return false;
+        const op = caller.opcode(def);
+        if (op != .global_addr and op != .alloca) return false;
+        for (roots[0..count]) |prior| {
+            if (prior == def) return false;
+            const other = caller.opcode(prior);
+            if (op == .global_addr and other == .global_addr and op.global_addr.symbol == other.global_addr.symbol) return false;
+        }
+        roots[count] = def;
+        count += 1;
+    }
+    return count >= 2;
+}
+
+fn hasLoopNest(allocator: std.mem.Allocator, callee: *const Function) Error!bool {
+    var info = try loops.analyze(allocator, callee);
+    defer info.deinit(allocator);
+    for (info.loops) |outer| for (info.loops) |inner| {
+        if (outer.header != inner.header and outer.contains(inner.header)) return true;
+    };
+    return false;
+}
+
 fn loopsWriteNoMemory(allocator: std.mem.Allocator, callee: *const Function) Error!bool {
     var info = try loops.analyze(allocator, callee);
     defer info.deinit(allocator);

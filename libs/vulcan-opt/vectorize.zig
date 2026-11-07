@@ -147,6 +147,7 @@ fn canBuildPackedVector(func: *const Function, block: Block, scalars: []const Va
     const first_inst = func.definingInst(scalars[0]) orelse return false;
     switch (func.opcode(first_inst)) {
         .arith_imm => |first| {
+            if (!isScalarI32(func, scalars[0])) return false;
             if (!modelSupportsI32ImmOp(model, first.op)) return false;
             var lhs: [MAX_LANES]Value = undefined;
             lhs[0] = first.lhs;
@@ -162,7 +163,9 @@ fn canBuildPackedVector(func: *const Function, block: Block, scalars: []const Va
             return canBuildPackedVector(func, block, lhs[0..scalars.len], group_pos, model, depth + 1, saw_load);
         },
         .arith => |first| {
-            if (!modelSupportsI32Op(model, first.op)) return false;
+            if (isScalarF32(func, scalars[0])) {
+                if (first.op != .add and first.op != .sub and first.op != .mul and first.op != .div) return false;
+            } else if (!modelSupportsI32Op(model, first.op)) return false;
             var lhs: [MAX_LANES]Value = undefined;
             var rhs: [MAX_LANES]Value = undefined;
             lhs[0] = first.lhs;
@@ -354,7 +357,7 @@ fn foldArithmeticVectorPacks(
                 .vector => |candidate| candidate,
                 else => continue,
             };
-            if (vector.len != lanes or !isScalarI32(func, fields[0])) continue;
+            if (vector.len != lanes or (!isScalarI32(func, fields[0]) and !isScalarF32(func, fields[0]))) continue;
             var copied: [MAX_LANES]Value = undefined;
             @memcpy(copied[0..lanes], fields);
             var saw_load = false;
@@ -694,7 +697,41 @@ pub fn runModel(allocator: std.mem.Allocator, func: *Function, model: *const mm.
     // Both CORE-ET's packed-integer unit and AArch64 NEON lower integer vectors. The per-op gate
     // below accounts for their different instruction sets.
     const allow_i32 = model.vpu() or model.arch == .aarch64 or model.arch == .x86_64;
+    if (model.arch == .aarch64) {
+        // A structure instruction transfers all four fields together. Partial
+        // SLP must not commit one field with ordinary vector-load semantics.
+        var candidate = try func.clone(allocator);
+        var committed = false;
+        defer if (!committed) candidate.deinit();
+        const changed = try runLanesGated(allocator, &candidate, lanes, allow_i32, model);
+        if (!changed or !completeInterleavedGroups(&candidate)) return false;
+        func.deinit();
+        func.* = candidate;
+        committed = true;
+        return true;
+    }
     return runLanesGated(allocator, func, lanes, allow_i32, model);
+}
+
+fn completeInterleavedGroups(func: *const Function) bool {
+    for (0..func.blockCount()) |bi| {
+        const insts = func.blockInsts(@fromBackingInt(@intCast(bi)));
+        for (insts, 0..) |inst, index| {
+            const lane = interleaveLane(func, inst) orelse continue;
+            if (index < lane) return false;
+            const start = index - lane;
+            if (start + 4 > insts.len) return false;
+            const load = func.opcode(inst) == .load;
+            const ptr = if (load) func.opcode(inst).load.ptr else if (func.opcode(inst) == .store) func.opcode(inst).store.ptr else return false;
+            for (insts[start .. start + 4], 0..) |member, expected| {
+                if (interleaveLane(func, member) != @as(u2, @intCast(expected))) return false;
+                if (load) {
+                    if (func.opcode(member) != .load or func.opcode(member).load.ptr != ptr) return false;
+                } else if (func.opcode(member) != .store or func.opcode(member).store.ptr != ptr) return false;
+            }
+        }
+    }
+    return true;
 }
 
 fn isScalarF32(func: *const Function, v: Value) bool {
@@ -797,7 +834,8 @@ fn vectorizeImmediateOne(
             const coalesced_ops: u8 = if (load_run != null) 1 else 0;
             const chained_ops: u8 = if (chained_lhs) 1 else 0;
             const splat_ops: u8 = 1 + @as(u8, @intFromBool(progression_lhs));
-            if (!cost.slpProfitableMem(m, head.arith_imm.op, false, lanes, 2, coalesced_ops, chained_ops, splat_ops, result_store, result_chained)) continue :scan;
+            const continues_interleaved = m.arch == .aarch64 and chained_lhs and chainIsInterleaved(func, vmap, lhs[0..lanes]);
+            if (!cost.slpProfitableMem(m, head.arith_imm.op, false, lanes, 2, coalesced_ops, chained_ops, splat_ops, result_store, result_chained) and !continues_interleaved) continue :scan;
         }
         pos = g;
         op = head.arith_imm.op;
@@ -944,7 +982,7 @@ fn vectorizeOne(
                 else
                     (if (splat_a) @as(u8, 1) else 0) + (if (splat_b) @as(u8, 1) else 0);
                 const profitable = cost.slpProfitableMem(m, head.arith.op, is_f32, lanes, distinct, coalesced_ops, chained_ops, splat_ops, result_store, result_chained);
-                const continues_interleaved = m.arch == .aarch64 and result_chained and
+                const continues_interleaved = m.arch == .aarch64 and
                     ((chain_a and chainIsInterleaved(func, vmap, ca[0..lanes])) or
                         (chain_b and chainIsInterleaved(func, vmap, cb[0..lanes])));
                 if (!profitable and !continues_interleaved) continue :scan;
@@ -1163,8 +1201,17 @@ fn chainVector(vmap: *const VMap, scalars: []const Value) ?Value {
 
 fn chainIsInterleaved(func: *const Function, vmap: *const VMap, scalars: []const Value) bool {
     const vector = chainVector(vmap, scalars) orelse return false;
-    const inst = func.definingInst(vector) orelse return false;
-    return interleaveLane(func, inst) != null;
+    return dependsOnInterleave(func, vector, 0);
+}
+
+fn dependsOnInterleave(func: *const Function, value: Value, depth: u8) bool {
+    if (depth > 16) return false;
+    const inst = func.definingInst(value) orelse return false;
+    if (interleaveLane(func, inst) != null) return true;
+    return switch (func.opcode(inst)) {
+        .arith => |a| dependsOnInterleave(func, a.lhs, depth + 1) or dependsOnInterleave(func, a.rhs, depth + 1),
+        else => false,
+    };
 }
 
 /// Pack scalars into a vector with a `struct_new` (lowered to one insert per lane). A pure
@@ -2679,4 +2726,29 @@ test "an atomic inside a store window stops the wide store" {
     var diags = try ir.verify.verify(allocator, &func, .low);
     defer diags.deinit();
     try std.testing.expect(diags.ok());
+}
+
+test "partial interleaved field vectorization is rolled back" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr = try f.types.intern(.{ .ptr = .global });
+    const b = try f.appendBlock();
+    const base = try f.appendBlockParam(b, ptr);
+    const scale = try f.appendBlockParam(b, t);
+    var loads: [4]Value = undefined;
+    var addresses: [4]Value = undefined;
+    for (&loads, &addresses, 0..) |*loaded, *address, lane| {
+        address.* = try f.appendArithImm(b, ptr, .add, base, @intCast(lane * 16));
+        loaded.* = try f.appendInst(b, t, .{ .load = .{ .ptr = address.* } });
+    }
+    var results: [4]Value = undefined;
+    for (&results, loads) |*result, loaded| result.* = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = loaded, .rhs = scale } });
+    for (results, addresses) |result, address| try f.appendStore(b, result, address);
+    f.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    const original_count = f.blockInsts(b).len;
+    try std.testing.expect(!try runModel(allocator, &f, @import("microarch/registry.zig").modelFor(.@"apple-m1")));
+    try std.testing.expectEqual(original_count, f.blockInsts(b).len);
+    for (f.blockInsts(b)) |inst| try std.testing.expect(interleaveLane(&f, inst) == null);
 }

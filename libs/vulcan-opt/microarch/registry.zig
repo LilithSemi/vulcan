@@ -896,6 +896,95 @@ fn basedOn(comptime base: Model, comptime tag: Microarch) Model {
 }
 
 const neoverse_n2 = basedOn(altra, .@"neoverse-n2");
+// Start with the existing N1 tuning rather than bypassing model-driven transforms
+// on Cortex-A76 (including RK3588's performance cores). These costs remain N1
+// estimates until specialized by measurements on A76.
+const cortex_a76 = basedOn(altra, .@"cortex-a76");
+// ARM-EPM-128372 issue 4 (Cortex-A55 r2p0), sections 3 and 4:
+// https://documentation-service.arm.com/static/6385cb83ff39817c1136abd8
+// The scheduler's opcode-only latency cannot distinguish integer widths or FP
+// arithmetic. Use conservative 64-bit timings for mul/div and the four-cycle FP
+// bound for shared add/sub opcodes. Throughput can distinguish FP elements.
+const cortex_a55 = a55: {
+    var m = basedOn(altra, .@"cortex-a55");
+    m.exec = .in_order;
+    m.issue_width = 2;
+    m.rob_size = 0;
+    // One load and one store pipe share the IR's memory class. One memory
+    // operation per cycle conservatively models same-kind accesses.
+    m.units = .{ .alu = 2, .muldiv = 1, .mem = 1, .branch = 1, .fpsimd = 1 };
+    m.fetch_align = 16;
+    m.latency = a55Latency;
+    m.throughput = a55Throughput;
+    break :a55 m;
+};
+
+fn a55Latency(op: ir.function.Opcode) u32 {
+    return switch (op) {
+        .arith => |a| switch (a.op) {
+            .mul => 5,
+            .mulh => 6,
+            .div, .rem => 20,
+            .add, .sub => 4,
+            else => 1,
+        },
+        .arith_imm => |a| switch (a.op) {
+            .mul => 5,
+            .mulh => 6,
+            .div, .rem => 20,
+            .add, .sub => 4,
+            else => 1,
+        },
+        .convert, .unary => 4,
+        .splat => 2,
+        else => altraLatency(op),
+    };
+}
+
+fn a55ArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
+    return switch (op) {
+        .mul, .mulh => if (elem_float) 2 else 3,
+        .div, .rem => 20,
+        .add, .sub => if (elem_float) 2 else 1,
+        else => 1,
+    };
+}
+
+fn a55Throughput(op: ir.function.Opcode, elem_float: bool) u32 {
+    return switch (op) {
+        .arith => |a| a55ArithThroughput(a.op, elem_float),
+        .arith_imm => |a| a55ArithThroughput(a.op, elem_float),
+        .convert, .unary, .dot, .reduce, .splat => 2,
+        else => altraThroughput(op, elem_float),
+    };
+}
+// Firestorm resource widths from https://dougallj.github.io/applecpu/firestorm.html.
+// The IR model has one memory class, so use the three load-capable pipes rather
+// than treating the store-only pipe as a fourth load pipe. Latencies not yet
+// specialized below retain the conservative AArch64 estimates.
+const apple_m1 = apple: {
+    var m = basedOn(altra, .@"apple-m1");
+    m.issue_width = 8;
+    m.rob_size = 623; // rename retire queue, not the coalesced retire group count
+    m.units = .{ .alu = 6, .muldiv = 2, .mem = 3, .branch = 1, .fpsimd = 4 };
+    m.cache_line = 128;
+    m.throughput = appleThroughput;
+    break :apple m;
+};
+
+fn appleThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
+    return switch (op) {
+        .arith => |a| switch (a.op) {
+            .mul, .mulh => 1,
+            else => altraArithThroughput(a.op, elem_float),
+        },
+        .arith_imm => |a| switch (a.op) {
+            .mul, .mulh => 1,
+            else => altraArithThroughput(a.op, elem_float),
+        },
+        else => altraThroughput(op, elem_float),
+    };
+}
 const zen5 = basedOn(zen4, .zen5);
 /// Zen 3 runs Zen 4's integer and AVX2 code, with no AVX-512 and a 256-entry reorder buffer.
 const zen3 = zen3: {
@@ -910,7 +999,10 @@ const zen3 = zen3: {
 };
 
 comptime {
+    Model.validate(apple_m1);
     Model.validate(altra);
+    Model.validate(cortex_a76);
+    Model.validate(cortex_a55);
     Model.validate(neoverse_n2);
     Model.validate(zen5);
     Model.validate(zen3);
@@ -927,7 +1019,10 @@ comptime {
 /// The model for a predefined part. Total, one arm per Microarch.
 pub fn modelFor(tag: Microarch) *const Model {
     return switch (tag) {
+        .@"apple-m1" => &apple_m1,
         .@"ampere-altra" => &altra,
+        .@"cortex-a76" => &cortex_a76,
+        .@"cortex-a55" => &cortex_a55,
         .@"neoverse-n2" => &neoverse_n2,
         .@"et-soc" => &etsoc,
         .@"river-rc1.n" => &river_n,
@@ -944,7 +1039,7 @@ pub fn modelFor(tag: Microarch) *const Model {
 }
 
 /// The part number from the aarch64 MIDR_EL1 when the implementer is ARM (0x41), such as 0xd0c for a
-/// Neoverse N1 and 0xd49 for a Neoverse N2, else null. Reads the
+/// Neoverse N1, 0xd05 for Cortex-A55, 0xd0b for Cortex-A76, and 0xd49 for a Neoverse N2, else null. Reads the
 /// register directly, no I/O. On arm64 Linux the mrs read is emulated for EL0 and does not trap on
 /// any supported kernel, so detectHost stays a pure query with no injected dependencies. macOS traps
 /// the read as an illegal instruction, which killed the darwin CI as a SIGILL; a macOS host is Apple
@@ -957,6 +1052,16 @@ fn midrPart() ?u12 {
     const implementer: u8 = @truncate(midr >> 24);
     const part: u12 = @truncate(midr >> 4);
     return if (implementer == 0x41) part else null;
+}
+
+fn armPartModel(part: u12) ?Microarch {
+    return switch (part) {
+        0xd0b => .@"cortex-a76",
+        0xd05 => .@"cortex-a55",
+        0xd0c => .@"ampere-altra",
+        0xd49 => .@"neoverse-n2",
+        else => null,
+    };
 }
 
 /// The Cascade Lake-SP discriminator: family 6, model 85 (0x55), and AVX512-VNNI present. VNNI is the
@@ -1011,12 +1116,13 @@ fn hostIsCascadeLake() bool {
 /// Identify the host part, or null when Vulcan does not recognize it. On riscv there is no
 /// architectural part register, so this returns null and the caller selects by name.
 pub fn detectHost() ?Microarch {
+    // Zig's native CPU model is stable across migration between this SoC's
+    // efficiency and performance cores. MIDR alone describes the current core.
+    if (comptime builtin.cpu.arch == .aarch64) {
+        if (std.mem.eql(u8, builtin.cpu.model.name, "apple_m1")) return .@"apple-m1";
+    }
     switch (builtin.cpu.arch) {
-        .aarch64 => switch (midrPart() orelse 0) {
-            0xd0c => return .@"ampere-altra",
-            0xd49 => return .@"neoverse-n2",
-            else => {},
-        },
+        .aarch64 => return armPartModel(midrPart() orelse 0),
         .x86_64 => {
             if (hostIsCascadeLake()) return .@"cascadelake-sp";
             if (hostZen()) |zen| return zen;
@@ -1202,5 +1308,43 @@ test "detectHost identifies this box when it is a Neoverse N1 or N2, else null o
     if (builtin.cpu.arch == .aarch64) {
         if (midrPart() == 0xd0c) try std.testing.expectEqual(Microarch.@"ampere-altra", got.?);
         if (midrPart() == 0xd49) try std.testing.expectEqual(Microarch.@"neoverse-n2", got.?);
+    }
+}
+
+test "ARM part detection distinguishes the RK3588 performance and efficiency cores" {
+    try std.testing.expectEqual(Microarch.@"cortex-a76", armPartModel(0xd0b).?);
+    try std.testing.expectEqual(Microarch.@"ampere-altra", armPartModel(0xd0c).?);
+    try std.testing.expectEqual(Microarch.@"neoverse-n2", armPartModel(0xd49).?);
+    try std.testing.expectEqual(Microarch.@"cortex-a55", armPartModel(0xd05).?);
+    try std.testing.expectEqual(@as(?Microarch, null), armPartModel(0));
+    const m = modelFor(Microarch.parse("cortex-a76").?);
+    try std.testing.expectEqual(model.Arch.aarch64, m.arch);
+    try std.testing.expect(m.features.aarch64.neon);
+    try std.testing.expect(m.features.aarch64.dotprod);
+}
+
+test "Cortex A55 has an in-order dual-issue NEON model" {
+    const m = modelFor(Microarch.parse("cortex-a55").?);
+    try std.testing.expectEqual(model.Arch.aarch64, m.arch);
+    try std.testing.expectEqual(model.ExecMode.in_order, m.exec);
+    try std.testing.expectEqual(@as(u8, 2), m.issue_width);
+    try std.testing.expectEqual(@as(u16, 0), m.rob_size);
+    try std.testing.expectEqual(@as(u16, 128), m.vector_bits);
+    try std.testing.expect(m.features.aarch64.neon);
+    try std.testing.expect(!m.reorders());
+}
+
+test "Apple M1 model is selectable and describes Firestorm resources" {
+    const tag = Microarch.parse("apple-m1").?;
+    const m = modelFor(tag);
+    try std.testing.expectEqual(Microarch.@"apple-m1", m.tag);
+    try std.testing.expectEqual(model.Arch.aarch64, m.arch);
+    try std.testing.expectEqual(@as(u8, 8), m.issue_width);
+    try std.testing.expectEqual(@as(u16, 128), m.vector_bits);
+    try std.testing.expectEqual(@as(u16, 128), m.cache_line);
+    try std.testing.expect(m.features.aarch64.neon);
+    if (comptime builtin.cpu.arch == .aarch64) {
+        if (std.mem.eql(u8, builtin.cpu.model.name, "apple_m1"))
+            try std.testing.expectEqual(tag, detectHost().?);
     }
 }
