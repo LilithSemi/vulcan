@@ -114,7 +114,7 @@ pub fn optimizeTransforms(allocator: std.mem.Allocator, func: *ir.function.Funct
         }, 16)
     else
         false;
-    const unrolled = if (m.tag == .@"apple-m1") scored: {
+    const unrolled = if (m.tag == .@"apple-m1" or m.tag == .@"cortex-a76") scored: {
         var gate = try score.IRGate.init(allocator, func, m);
         defer gate.deinit();
         if (!try unroll.run(allocator, gate.candidateFunction(), m)) break :scored false;
@@ -193,7 +193,7 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
         false;
     const call_constants = m.arch == .aarch64 and try pass.run(allocator, func, &.{ constedge.calls_pass_def, dce.pass_def });
     // Each copy of a join has one predecessor, so its params fold to the values passed in.
-    const joined = m.arch == .x86_64 and try pass.run(allocator, func, &.{ jointail.returns_pass_def, jointail.pass_def });
+    const joined = (m.arch == .x86_64 or m.tag == .@"cortex-a76") and try pass.run(allocator, func, &.{ jointail.returns_pass_def, jointail.pass_def });
     if (joined) _ = try pass.runToFixpoint(allocator, func, &.{ jumpthread.single_edge_params_pass_def, constfold.pass_def, simplify.pass_def, immform.pass_def, dce.pass_def }, 4);
     var gate = try score.IRGate.init(allocator, func, m);
     defer gate.deinit();

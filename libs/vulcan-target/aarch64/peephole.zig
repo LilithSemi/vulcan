@@ -916,6 +916,12 @@ pub fn pairMemoryForModelWithMoveProofs(
     const removed_distant = try allocator.alloc(bool, len);
     defer allocator.free(removed_distant);
     @memset(removed_distant, false);
+    // A 64-bit register move to itself has no effect. Keep W-register moves:
+    // even a self move clears the upper 32 bits. Jump-table words are data.
+    for (words.items, 0..) |word, at| {
+        if (!is_data[at] and word & 0xFFE0FFE0 == 0xAA0003E0 and
+            (word & 31) == ((word >> 16) & 31)) removed_distant[at] = true;
+    }
     const cyclic_move = try allocator.alloc(bool, len);
     defer allocator.free(cyclic_move);
     @memset(cyclic_move, false);
@@ -1128,8 +1134,13 @@ pub fn pairMemoryForModelWithMoveProofs(
     var i: usize = 0;
     while (i < len) {
         if (removed_distant[i]) {
+            const word = words.items[i];
+            const self_move = word & 0xFFE0FFE0 == 0xAA0003E0 and
+                (word & 31) == ((word >> 16) & 31);
+            // An entry at a deleted no-op must reach the following word,
+            // rather than the preceding producer of a coalesced result move.
+            removed_before[i] = if (self_move) removed else removed + 1;
             removed += 1;
-            removed_before[i] = removed;
             i += 1;
             continue;
         }
@@ -1421,6 +1432,19 @@ test "tryCoalesceResultMove forwards scalar ALU results into the move destinatio
     );
     try std.testing.expectEqual(@as(?u32, null), tryCoalesceResultMove(encode.ldrW(.x24, .x20, 0), encode.mov(.x21, .x24)));
     try std.testing.expectEqual(@as(?u32, null), tryCoalesceResultMove(encode.add(.x23, .x20, .x22), encode.mov(.x21, .x24)));
+}
+
+test "pairMemory removes X self moves and preserves W zero extension" {
+    const alloc = std.testing.allocator;
+    const w_self = @as(u32, 0x2A0003E0) | (3 << 16) | 3;
+    var words = try wordsFrom(alloc, &.{ encode.mov(.x0, .x0), w_self, encode.b(0), encode.mov(.x2, .x2), encode.ret() });
+    defer words.deinit(alloc);
+    var starts = [_]usize{ 0, 3 };
+    var fixups = [_]Fixup{.{ .at = 2, .target = 1 }};
+    try pairMemory(alloc, &words, &starts, &fixups, &.{}, &.{});
+    try std.testing.expectEqualSlices(u32, &.{ w_self, encode.b(0), encode.ret() }, words.items);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, &starts);
+    try std.testing.expectEqual(@as(usize, 1), fixups[0].at);
 }
 
 test "pairMemory coalesces an ALU result move and remaps following control flow" {

@@ -32,6 +32,7 @@ pub const joinconst = @import("vulcan-opt/joinconst.zig");
 pub const ifconvert = @import("vulcan-opt/ifconvert.zig");
 pub const gvn = @import("vulcan-opt/gvn.zig");
 pub const licm = @import("vulcan-opt/licm.zig");
+pub const readonly = @import("vulcan-opt/readonly.zig");
 pub const ivsr = @import("vulcan-opt/ivsr.zig");
 pub const inlining = @import("vulcan-opt/inline.zig");
 pub const dce = @import("vulcan-opt/dce.zig");

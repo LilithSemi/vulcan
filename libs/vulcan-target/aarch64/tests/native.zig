@@ -444,13 +444,19 @@ test "module disasm: linked functions get labels and a resolved, named call" {
     const text = try disasm.formatModule(a, linked.code, syms);
     defer a.free(text);
 
-    // The `bl` in main resolves back to helper and is annotated with its name. The displacement is
-    // -32 under the Wimmer allocator. Main's prologue fuses its link-register and callee-saved
-    // stores into stp pairs (the ldp/stp peephole). The shared allocator's frame lands the backward
-    // branch to helper nine words back.
+    // The `bl` in main resolves back to helper and is annotated with its name.
+    // Its displacement depends on register allocation and peephole optimizations,
+    // so check the call's annotation without fixing the instruction layout.
     try std.testing.expect(std.mem.indexOf(u8, text, "helper:\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "main:\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "bl .-32  <helper>") != null);
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    var named_call = false;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "  bl .") != null and
+            std.mem.endsWith(u8, line, "  <helper>")) named_call = true;
+    }
+    if (!named_call) std.debug.print("expected a resolved call to helper in:\n{s}\n", .{text});
+    try std.testing.expect(named_call);
 }
 
 /// A named function for `runModule`. The entry must be first.
