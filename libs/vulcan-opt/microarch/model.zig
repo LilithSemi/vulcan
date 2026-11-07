@@ -140,6 +140,8 @@ pub const FusionRule = struct { kind: FuseKind };
 pub const Microarch = enum {
     @"apple-m1",
     @"ampere-altra",
+    @"cortex-a76",
+    @"cortex-a55",
     @"neoverse-n2",
     @"et-soc",
     @"river-rc1.n",

@@ -22,7 +22,14 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     for (loop_info.loops) |loop| {
         const header: Block = @fromBackingInt(@intCast(loop.header));
         const header_insts = func.blockInsts(header);
-        if (header_insts.len != 2 or func.terminator(header) != null) continue;
+        if (header_insts.len != 2) continue;
+        // C lowering leaves an unreachable `ret void` after an `if`. Its two
+        // edges transfer control before that return, so it is still a canonical
+        // test header. A real jump or value-return is outside this shape.
+        if (func.terminator(header)) |term| switch (term) {
+            .ret => |ret| if (ret.count != 0) continue,
+            .jump => continue,
+        };
 
         const compare_result = func.instResult(header_insts[0]) orelse continue;
         const compare = switch (func.opcode(header_insts[0])) {
@@ -225,6 +232,7 @@ test "rotates a top tested loop through its latch" {
     const index = try func.appendBlockParam(header, i32_t);
     const more = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = index, .rhs = limit } });
     try func.appendIf(header, more, .{ .target = body }, .{ .target = done });
+    func.setTerminator(header, .{ .ret = ir.function.Ret.none() });
     const contribution = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = index, .rhs = limit } });
     try func.setJump(body, latch, &.{});
     const next = try func.appendInst(latch, i32_t, .{ .arith_imm = .{ .op = .add, .lhs = index, .imm = 1 } });

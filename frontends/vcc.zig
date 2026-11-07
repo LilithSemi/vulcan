@@ -1143,10 +1143,10 @@ fn compileSourceToObject(allocator: std.mem.Allocator, io: std.Io, source: []con
 
     const early_start = inline_end;
     if (optimize.optimizes()) {
-        // Wide x86 and Firestorm cores keep expression latency: they hide an extra
+        // Wide x86, Firestorm, and A76 cores keep expression latency: they hide an extra
         // instruction better than a longer multiply chain.
         const latency_aware = optimize.runsMicroarch() and model != null and
-            (model.?.arch == .x86_64 or model.?.tag == .@"apple-m1");
+            (model.?.arch == .x86_64 or model.?.tag == .@"apple-m1" or model.?.tag == .@"cortex-a76");
         const constants = if (optimize.inlinesCalls()) libraryConstants(&mod) else null;
         for (mod.funcs) |*nf| {
             _ = try opt.optimizeEarlyFor(allocator, &nf.func, latency_aware);
@@ -1260,6 +1260,19 @@ fn inlineTranslationUnit(allocator: std.mem.Allocator, mod: *cc.Module, profile:
     const lookup = opt.inlining.Lookup{ .context = mod, .func = ModuleLookup.get };
     if (profile == null) {
         for (mod.funcs) |*named| _ = try opt.optimizePreInline(allocator, &named.func);
+        for (mod.funcs) |*named| _ = try opt.pass.runToFixpoint(allocator, &named.func, &.{
+            opt.constfold.pass_def,
+            opt.simplify.pass_def,
+            opt.immform.pass_def,
+            opt.licm.pass_def,
+            opt.dce.pass_def,
+        }, 4);
+        // Preserve repeated read-only calls long enough to hoist them before
+        // inlining turns each call into a separate nested loop.
+        for (mod.funcs) |*named| {
+            var budget: usize = 16;
+            while (budget > 0 and try opt.readonly.run(allocator, &named.func, lookup)) : (budget -= 1) {}
+        }
     }
     for (mod.funcs) |*named| {
         if (profile) |p| {
@@ -2393,6 +2406,30 @@ test "translation-unit inlining gives loop calls a larger growth budget" {
     for (0..main_func.blockCount()) |bi| {
         for (main_func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
             try std.testing.expect(main_func.opcode(inst) != .call);
+        }
+    }
+}
+
+test "read-only scans are hoisted before inlining repeated C loop calls" {
+    const allocator = std.testing.allocator;
+    var mod = try cc.compile(allocator,
+        \\long scan(const long *p, int n) { long s = 0; for (int i = 0; i < n; ++i) s += p[i]; return s; }
+        \\long repeat(const long *p, int n) { long total = 0; for (int j = 0; j < 100; ++j) total += scan(p, n); return total; }
+    );
+    defer mod.deinit(allocator);
+    try inlineTranslationUnit(allocator, &mod, null);
+    const f = mod.find("repeat").?;
+    var loops = try opt.loops.analyze(allocator, f);
+    defer loops.deinit(allocator);
+    for (loops.loops) |outer| {
+        for (loops.loops) |inner| {
+            try std.testing.expect(inner.header == outer.header or !outer.contains(inner.header));
+        }
+        for (0..f.blockCount()) |bi| {
+            if (!outer.contains(bi)) continue;
+            for (f.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+                try std.testing.expect(f.opcode(inst) != .call);
+            }
         }
     }
 }

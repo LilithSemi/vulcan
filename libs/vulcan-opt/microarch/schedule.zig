@@ -177,7 +177,11 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
         try simtSchedule(allocator, func);
         return;
     }
-    for (0..func.blockCount()) |bi| try scheduleBlock(allocator, func, @fromBackingInt(@intCast(bi)), model);
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        if (model.tag == .@"cortex-a76") hoistPointerLoads(func, block);
+        try scheduleBlock(allocator, func, block, model);
+    }
 
     const fuse_cmp = model.arch == .aarch64 or model.fuses(.cmp_branch);
     if (model.fuses(.shift_add) or fuse_cmp) {
@@ -195,6 +199,84 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
             if (model.arch == .x86_64) restoreCompareSelectPairs(func, block, uses);
         }
     }
+}
+
+/// Start a pointer chase before independent work on the current object. Ordinary
+/// reads may pass other ordinary reads, but never a write, volatile access,
+/// control transfer, or potentially trapping division. Keep pointer reads in
+/// their original relative order to avoid inflating several live pointer chains.
+fn hoistPointerLoads(func: *Function, block: Block) void {
+    const insts = func.blockInstsMut(block).items;
+    if (insts.len < 2) return;
+    for (1..insts.len) |index| {
+        const inst = insts[index];
+        const load = switch (func.opcode(inst)) {
+            .load => |load| load,
+            else => continue,
+        };
+        const result = func.instResult(inst) orelse continue;
+        if (func.types.type_kind(func.valueType(result)) != .ptr or
+            load.@"volatile" or load.mask != null or func.isByteOrderTagged(inst)) continue;
+        var first = index;
+        while (first > 0) {
+            const prior = insts[first - 1];
+            if (func.instResult(prior) == load.ptr) break;
+            switch (func.opcode(prior)) {
+                .load => |other| {
+                    if (other.@"volatile" or other.mask != null or func.isByteOrderTagged(prior)) break;
+                    const value = func.instResult(prior).?;
+                    if (func.types.type_kind(func.valueType(value)) == .ptr) break;
+                },
+                .arith => |a| if (a.op == .div or a.op == .rem) break,
+                .arith_imm => |a| if (a.op == .div or a.op == .rem) break,
+                else => |op| if (!movable(op)) break,
+            }
+            first -= 1;
+        }
+        if (first == index) continue;
+        std.mem.copyBackwards(Inst, insts[first + 1 .. index + 1], insts[first..index]);
+        insts[first] = inst;
+    }
+}
+
+test "pointer loads start before independent work without crossing writes or dependencies" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const ptr_t = try f.types.ptrGlobal();
+    const int_t = try f.types.intern(.{ .int = .{ .bits = 32, .signedness = .unsigned } });
+    const block = try f.appendBlock();
+    const base = try f.appendBlockParam(block, ptr_t);
+    const value = try f.appendInst(block, int_t, .{ .load = .{ .ptr = base } });
+    const sum = try f.appendArithImm(block, int_t, .add, value, 1);
+    const next = try f.appendInst(block, ptr_t, .{ .load = .{ .ptr = base } });
+    try f.appendStore(block, sum, base);
+    const after = try f.appendInst(block, ptr_t, .{ .load = .{ .ptr = next } });
+    f.setTerminator(block, .{ .ret = ir.function.Ret.one(after) });
+    const original = try allocator.dupe(Inst, f.blockInsts(block));
+    defer allocator.free(original);
+    hoistPointerLoads(&f, block);
+    try std.testing.expectEqualSlices(Inst, &.{ original[2], original[0], original[1], original[3], original[4] }, f.blockInsts(block));
+}
+
+test "pointer loads do not cross volatile reads or divisions" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const ptr_t = try f.types.ptrGlobal();
+    const int_t = try f.types.intern(.{ .int = .{ .bits = 32, .signedness = .unsigned } });
+    const block = try f.appendBlock();
+    const base = try f.appendBlockParam(block, ptr_t);
+    const divisor = try f.appendBlockParam(block, int_t);
+    const value = try f.appendInst(block, int_t, .{ .load = .{ .ptr = base, .@"volatile" = true } });
+    const next = try f.appendInst(block, ptr_t, .{ .load = .{ .ptr = base } });
+    _ = try f.appendInst(block, int_t, .{ .arith = .{ .op = .div, .lhs = value, .rhs = divisor } });
+    const after = try f.appendInst(block, ptr_t, .{ .load = .{ .ptr = next } });
+    f.setTerminator(block, .{ .ret = ir.function.Ret.one(after) });
+    const original = try allocator.dupe(Inst, f.blockInsts(block));
+    defer allocator.free(original);
+    hoistPointerLoads(&f, block);
+    try std.testing.expectEqualSlices(Inst, original, f.blockInsts(block));
 }
 
 const AffineAddress = struct { root: Value, offset: i64 };
