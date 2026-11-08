@@ -54,6 +54,10 @@ pub const Exit = enum(u32) {
 
 /// What a compiled kernel reads and writes. This layout is the agreement between lifted code and
 /// whoever runs it, so it is `extern` and every offset in it is part of that agreement.
+/// The widest warp any GC1 profile runs. The state carries room for all of them whatever the
+/// core has, so one engine serves every profile.
+pub const max_lanes = 16;
+
 pub const Warp = extern struct {
     /// The scalar registers. Register zero is here and never used, so an index needs no case of
     /// its own at run time.
@@ -104,7 +108,43 @@ pub const Warp = extern struct {
     /// claimed.
     away: ?*const fn (ctx: ?*anyopaque, at: u32, value: u32, kind: u32) callconv(.c) u64 = null,
     away_ctx: ?*anyopaque = null,
+
+    /// The lane registers, one word per lane. A mask register is not laid out like this: its bits
+    /// live in element zero, one bit per lane, which is where the core's mask unit reads them.
+    v: [32][max_lanes]u32 = @splat(@splat(0)),
+    /// Lanes the datapath has, and which of them this launch runs. Both are read by compiled code
+    /// rather than baked into it, so one engine serves every profile, and they are two fields
+    /// because a count and a mask are different things to get wrong.
+    lane_count: u32 = 0,
+    lane_mask: u32 = 0,
 };
+
+/// Where one lane register starts inside the warp state.
+fn registerAt(which: u5) i64 {
+    return @as(i64, @offsetOf(Warp, "v")) + @as(i64, which) * @sizeOf([max_lanes]u32);
+}
+
+/// The scalar arithmetic a lane word does, which is the same set the scalar side has.
+fn laneArithmetic(op: decode.VectorOp) ?decode.Alu {
+    return switch (op) {
+        .add_vv, .add_vx, .add_vi => .add,
+        .sub_vv, .sub_vx => .sub,
+        .and_vv, .and_vi => .@"and",
+        .or_vv, .or_vi => .@"or",
+        .xor_vv => .xor,
+        .sll_vv, .sll_vx, .sll_vi => .sll,
+        .srl_vv, .srl_vx, .srl_vi => .srl,
+        .sra_vv, .sra_vx, .sra_vi => .sra,
+        .mul_vv, .mul_vx => .mul,
+        .mulh_vv => .mul_high,
+        .mulhu_vv => .mul_high_unsigned,
+        .div_vv => .div,
+        .divu_vv => .div_unsigned,
+        .rem_vv => .rem,
+        .remu_vv => .rem_unsigned,
+        else => null,
+    };
+}
 
 /// What `Warp.away` is told, and what it answers with.
 ///
@@ -147,6 +187,10 @@ const Lifter = struct {
     /// A stack slot per scalar register. Register zero has none, because it reads zero and takes
     /// no writes.
     slots: [32]Value,
+    /// The lane a lane operation is on, and a value it carries across the lanes. One pair for the
+    /// whole function, because these loops never nest.
+    lane: Value,
+    carry: Value,
     /// Which words start a block, and which words the region reaches at all.
     leaders: []bool,
     reached: []bool,
@@ -573,6 +617,366 @@ const Lifter = struct {
     }
 
     /// Give the warp back: write where it is, write every register it holds, and return why.
+    /// One lane register, by index, as an address.
+    fn laneAt(self: *Lifter, which: u5, lane: Value) Error!Value {
+        const start = try self.func.appendArithImm(self.at, self.ptr_t, .add, self.ctx, registerAt(which));
+        const wide = try self.widen(lane, self.u64_t);
+        const bytes = try self.func.appendArithImm(self.at, self.u64_t, .mul, wide, 4);
+        return self.func.appendInst(self.at, self.ptr_t, .{ .arith = .{ .op = .add, .lhs = start, .rhs = bytes } });
+    }
+
+    /// Element zero of a lane register, which is also where a mask register keeps its bits.
+    fn elementZero(self: *Lifter, which: u5) Error!Value {
+        return self.func.appendArithImm(self.at, self.ptr_t, .add, self.ctx, registerAt(which));
+    }
+
+    fn laneLoad(self: *Lifter, which: u5, lane: Value) Error!Value {
+        return self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = try self.laneAt(which, lane) } });
+    }
+
+    fn maskLoad(self: *Lifter, which: u5) Error!Value {
+        return self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = try self.elementZero(which) } });
+    }
+
+    fn maskStore(self: *Lifter, which: u5, bits: Value) Error!void {
+        try self.func.appendStore(self.at, bits, try self.elementZero(which));
+    }
+
+    /// `value != 0`, which is how a bit test becomes a condition.
+    fn any(self: *Lifter, value: Value) Error!Value {
+        const zero = try self.constant(0);
+        return self.func.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .ne, .lhs = value, .rhs = zero } });
+    }
+
+    /// A loop over the lanes of the warp, which is what every lane operation runs inside.
+    const Lanes = struct {
+        head: Block,
+        next: Block,
+        done: Block,
+        /// The lane this pass is on, and its bit.
+        index: Value,
+        bit: Value,
+        /// Whether this lane takes the answer: the launch runs it, and v0 names it where the word
+        /// is predicated.
+        active: Value,
+    };
+
+    fn laneBegin(self: *Lifter, masked: bool) Error!Lanes {
+        const head = try self.func.appendBlock();
+        const body = try self.func.appendBlock();
+        const next = try self.func.appendBlock();
+        const done = try self.func.appendBlock();
+
+        try self.func.appendStore(self.at, try self.constant(0), self.lane);
+        try self.func.setJump(self.at, head, &.{});
+
+        self.at = head;
+        const index = try self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = self.lane } });
+        const count = try self.read("lane_count", self.u32_t);
+        const more = try self.func.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .lt, .lhs = index, .rhs = count } });
+        try self.func.appendIf(self.at, more, .{ .target = body }, .{ .target = done });
+
+        self.at = body;
+        const one = try self.constant(1);
+        const bit = try self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .shl, .lhs = one, .rhs = index } });
+        var gate = try self.read("lane_mask", self.u32_t);
+        if (masked) {
+            const v0 = try self.maskLoad(0);
+            gate = try self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_and, .lhs = gate, .rhs = v0 } });
+        }
+        const taken = try self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_and, .lhs = gate, .rhs = bit } });
+        return .{
+            .head = head,
+            .next = next,
+            .done = done,
+            .index = index,
+            .bit = bit,
+            .active = try self.any(taken),
+        };
+    }
+
+    fn laneEnd(self: *Lifter, loop: Lanes) Error!void {
+        try self.func.setJump(self.at, loop.next, &.{});
+        self.at = loop.next;
+        const index = try self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = self.lane } });
+        const stepped = try self.func.appendArithImm(self.at, self.u32_t, .add, index, 1);
+        try self.func.appendStore(self.at, stepped, self.lane);
+        try self.func.setJump(self.at, loop.head, &.{});
+        self.at = loop.done;
+    }
+
+    /// The second operand of a lane word, which is the one thing its three forms differ by.
+    fn laneOther(self: *Lifter, one: decode.Vector, index: Value) Error!Value {
+        return switch (one.op) {
+            .add_vx, .sub_vx, .sll_vx, .srl_vx, .sra_vx, .mul_vx, .mv_v_x, .merge_vxm, .mseq_vx, .msne_vx => self.get(one.rs),
+            .add_vi, .and_vi, .or_vi, .sll_vi, .srl_vi, .sra_vi, .mv_v_i, .merge_vim, .mseq_vi => self.constant(@bitCast(one.imm)),
+            else => self.laneLoad(one.vs1, index),
+        };
+    }
+
+    /// A lane word. Every lane runs it, and the lanes the launch left out keep what they had.
+    fn lowerVector(self: *Lifter, one: decode.Vector) Error!void {
+        switch (one.op) {
+            .mandn_mm, .mand_mm, .mor_mm, .mxor_mm, .morn_mm, .mnand_mm, .mnor_mm, .mxnor_mm => return self.lowerMaskLogical(one),
+            .mv_x_s => return self.set(one.rs, try self.maskLoad(one.vs2)),
+            .mv_s_x => return self.maskStore(one.vd, try self.get(one.rs)),
+            .cpop_m, .first_m => return self.lowerMaskRead(one),
+            .redor_vs => return self.lowerReduceOr(one),
+            .le32, .se32, .luxei32, .suxei32 => return self.lowerLaneMemory(one),
+            .mseq_vv, .mseq_vx, .mseq_vi, .msne_vv, .msne_vx, .msltu_vv, .mslt_vv, .msleu_vv, .msle_vv => return self.lowerLaneCompare(one),
+            else => {},
+        }
+
+        const loop = try self.laneBegin(one.masked);
+        const old = try self.laneLoad(one.vd, loop.index);
+        const other = try self.laneOther(one, loop.index);
+
+        const answer = switch (one.op) {
+            .mv_v_v, .mv_v_x, .mv_v_i => other,
+            .merge_vvm, .merge_vxm, .merge_vim => blk: {
+                // v0 is an operand here rather than a predicate, so every lane the warp holds
+                // takes one side or the other.
+                const v0 = try self.maskLoad(0);
+                const picked = try self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_and, .lhs = v0, .rhs = loop.bit } });
+                const from_one = try self.any(picked);
+                const from_two = try self.laneLoad(one.vs2, loop.index);
+                break :blk try self.func.appendInst(self.at, self.u32_t, .{ .select = .{
+                    .cond = from_one,
+                    .then = other,
+                    .@"else" = from_two,
+                } });
+            },
+            .id_v => loop.index,
+            else => blk: {
+                const base = try self.laneLoad(one.vs2, loop.index);
+                break :blk try self.arithmetic(laneArithmetic(one.op) orelse return error.Illegal, base, other);
+            },
+        };
+
+        const kept = try self.func.appendInst(self.at, self.u32_t, .{ .select = .{
+            .cond = loop.active,
+            .then = answer,
+            .@"else" = old,
+        } });
+        try self.func.appendStore(self.at, kept, try self.laneAt(one.vd, loop.index));
+        try self.laneEnd(loop);
+    }
+
+    /// A compare, which writes a mask register rather than lanes. The bits of a lane the launch
+    /// left out are clear, so a mask never names a lane that does not run.
+    fn lowerLaneCompare(self: *Lifter, one: decode.Vector) Error!void {
+        try self.func.appendStore(self.at, try self.constant(0), self.carry);
+        const loop = try self.laneBegin(false);
+        const a = try self.laneLoad(one.vs2, loop.index);
+        const b = try self.laneOther(one, loop.index);
+
+        // A relation the architecture has and the lift does not: `a <= b` is `b >= a`.
+        const holds = switch (one.op) {
+            .mseq_vv, .mseq_vx, .mseq_vi => try self.compare(.eq, a, b),
+            .msne_vv, .msne_vx => try self.compare(.ne, a, b),
+            .msltu_vv => try self.compare(.lt_unsigned, a, b),
+            .mslt_vv => try self.compare(.lt, a, b),
+            .msleu_vv => try self.compare(.ge_unsigned, b, a),
+            .msle_vv => try self.compare(.ge, b, a),
+            else => return error.Illegal,
+        };
+
+        const both = try self.func.appendInst(self.at, self.bool_t, .{ .select = .{
+            .cond = loop.active,
+            .then = holds,
+            .@"else" = try self.func.appendInst(self.at, self.bool_t, .{ .iconst = 0 }),
+        } });
+        const zero = try self.constant(0);
+        const add = try self.func.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = both, .then = loop.bit, .@"else" = zero } });
+        const held = try self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = self.carry } });
+        const joined = try self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_or, .lhs = held, .rhs = add } });
+        try self.func.appendStore(self.at, joined, self.carry);
+        try self.laneEnd(loop);
+
+        const bits = try self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = self.carry } });
+        try self.maskStore(one.vd, bits);
+    }
+
+    /// The mask logicals, which read and write whole mask words and need no lane loop. The answer
+    /// is cut to the lanes the core has, so a complement does not invent bits above them.
+    fn lowerMaskLogical(self: *Lifter, one: decode.Vector) Error!void {
+        const a = try self.maskLoad(one.vs2);
+        const b = try self.maskLoad(one.vs1);
+        const f = self.func;
+
+        const joined = switch (one.op) {
+            .mandn_mm => try f.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = try self.not(b) } }),
+            .mand_mm => try f.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } }),
+            .mor_mm => try f.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_or, .lhs = a, .rhs = b } }),
+            .mxor_mm => try f.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = b } }),
+            .morn_mm => try f.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_or, .lhs = a, .rhs = try self.not(b) } }),
+            .mnand_mm => try self.not(try f.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_and, .lhs = a, .rhs = b } })),
+            .mnor_mm => try self.not(try f.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_or, .lhs = a, .rhs = b } })),
+            .mxnor_mm => try self.not(try f.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = a, .rhs = b } })),
+            else => return error.Illegal,
+        };
+        try self.maskStore(one.vd, try self.toLanes(joined));
+    }
+
+    /// `~value`, as the exclusive or with every bit.
+    fn not(self: *Lifter, value: Value) Error!Value {
+        const ones = try self.constant(0xFFFF_FFFF);
+        return self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_xor, .lhs = value, .rhs = ones } });
+    }
+
+    /// Cut to the lanes the core has, which is how a mask stays a mask.
+    fn toLanes(self: *Lifter, bits: Value) Error!Value {
+        const count = try self.read("lane_count", self.u32_t);
+        const one = try self.constant(1);
+        const top = try self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .shl, .lhs = one, .rhs = count } });
+        const room = try self.func.appendArithImm(self.at, self.u32_t, .sub, top, 1);
+        return self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_and, .lhs = bits, .rhs = room } });
+    }
+
+    /// `vcpop.m` and `vfirst.m`: a mask back to the scalar side, which is how a kernel with one
+    /// program counter leaves a loop when no lane is left.
+    fn lowerMaskRead(self: *Lifter, one: decode.Vector) Error!void {
+        const start: i64 = if (one.op == .cpop_m) 0 else -1;
+        try self.func.appendStore(self.at, try self.constant(@bitCast(@as(i32, @intCast(start)))), self.carry);
+        const bits = try self.maskLoad(one.vs2);
+
+        const loop = try self.laneBegin(false);
+        const named = try self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_and, .lhs = bits, .rhs = loop.bit } });
+        const holds = try self.any(named);
+        const held = try self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = self.carry } });
+
+        const answer = if (one.op == .cpop_m) blk: {
+            const more = try self.func.appendArithImm(self.at, self.u32_t, .add, held, 1);
+            break :blk try self.func.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = holds, .then = more, .@"else" = held } });
+        } else blk: {
+            // The lowest set bit wins, so a later lane never replaces an answer already found.
+            const first = try self.func.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .eq, .lhs = held, .rhs = try self.constant(0xFFFF_FFFF) } });
+            const take = try self.func.appendInst(self.at, self.bool_t, .{ .select = .{
+                .cond = holds,
+                .then = first,
+                .@"else" = try self.func.appendInst(self.at, self.bool_t, .{ .iconst = 0 }),
+            } });
+            break :blk try self.func.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = take, .then = loop.index, .@"else" = held } });
+        };
+        try self.func.appendStore(self.at, answer, self.carry);
+        try self.laneEnd(loop);
+
+        try self.set(one.rs, try self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = self.carry } }));
+    }
+
+    /// `vredor.vs`: every lane of one register ored together, onto lane zero of another.
+    fn lowerReduceOr(self: *Lifter, one: decode.Vector) Error!void {
+        try self.func.appendStore(self.at, try self.maskLoad(one.vs1), self.carry);
+        const loop = try self.laneBegin(false);
+        const value = try self.laneLoad(one.vs2, loop.index);
+        const held = try self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = self.carry } });
+        const joined = try self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_or, .lhs = held, .rhs = value } });
+        const kept = try self.func.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = loop.active, .then = joined, .@"else" = held } });
+        try self.func.appendStore(self.at, kept, self.carry);
+        try self.laneEnd(loop);
+
+        const answer = try self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = self.carry } });
+        try self.maskStore(one.vd, answer);
+    }
+
+    /// A word per lane, from one address upwards or from an address the lane carries. A lane the
+    /// launch left out makes no access at all, so it cannot fault for a lane that is not running.
+    fn lowerLaneMemory(self: *Lifter, one: decode.Vector) Error!void {
+        const is_store = one.op == .se32 or one.op == .suxei32;
+        const indexed = one.op == .luxei32 or one.op == .suxei32;
+        const base = try self.get(one.rs);
+
+        const loop = try self.laneBegin(one.masked);
+        const work = try self.func.appendBlock();
+        try self.func.appendIf(self.at, loop.active, .{ .target = work }, .{ .target = loop.next });
+
+        self.at = work;
+        const offset = if (indexed)
+            try self.laneLoad(one.vs2, loop.index)
+        else
+            try self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .mul, .lhs = loop.index, .rhs = try self.constant(4) } });
+        const sum = try self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        // A word access ignores the low two bits of its address rather than trapping on them.
+        const at = try self.func.appendArithImm(self.at, self.u32_t, .bit_and, sum, ~@as(i64, 3));
+
+        if (is_store) {
+            try self.wordStore(at, try self.laneLoad(one.vd, loop.index));
+        } else {
+            const old = try self.laneLoad(one.vd, loop.index);
+            const value = try self.wordLoad(at, old);
+            try self.func.appendStore(self.at, value, try self.laneAt(one.vd, loop.index));
+        }
+        try self.laneEnd(loop);
+    }
+
+    /// One word off the bus, with the two runs of host memory taken directly and anything else
+    /// asked of the host. `old` is what the register keeps where nothing claimed the address.
+    fn wordLoad(self: *Lifter, at: Value, old: Value) Error!Value {
+        const fabric = try self.func.appendBlock();
+        const other = try self.func.appendBlock();
+        const scratch = try self.func.appendBlock();
+        const away_block = try self.func.appendBlock();
+        const merge = try self.func.appendBlock();
+        const answer = try self.func.appendBlockParam(merge, self.u32_t);
+
+        const in_fabric = try self.within(at, "fabric_at", "fabric_size");
+        try self.func.appendIf(self.at, in_fabric.inside, .{ .target = fabric }, .{ .target = other });
+
+        self.at = fabric;
+        const from_fabric = try self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = try self.hostAt("fabric", in_fabric.offset) } });
+        try self.func.setJump(self.at, merge, &.{from_fabric});
+
+        self.at = other;
+        const in_scratch = try self.within(at, "scratch_at", "scratch_size");
+        try self.func.appendIf(self.at, in_scratch.inside, .{ .target = scratch }, .{ .target = away_block });
+
+        self.at = scratch;
+        const from_scratch = try self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = try self.hostAt("scratch", in_scratch.offset) } });
+        try self.func.setJump(self.at, merge, &.{from_scratch});
+
+        self.at = away_block;
+        const answered = try self.asked(at, try self.constant(0), widthWord(.word));
+        const kept = try self.func.appendInst(self.at, self.u32_t, .{ .select = .{
+            .cond = answered.took,
+            .then = answered.value,
+            .@"else" = old,
+        } });
+        try self.func.setJump(self.at, merge, &.{kept});
+
+        self.at = merge;
+        return answer;
+    }
+
+    /// One word onto the bus, the same shape with nothing to bring back.
+    fn wordStore(self: *Lifter, at: Value, value: Value) Error!void {
+        const fabric = try self.func.appendBlock();
+        const other = try self.func.appendBlock();
+        const scratch = try self.func.appendBlock();
+        const away_block = try self.func.appendBlock();
+        const merge = try self.func.appendBlock();
+
+        const in_fabric = try self.within(at, "fabric_at", "fabric_size");
+        try self.func.appendIf(self.at, in_fabric.inside, .{ .target = fabric }, .{ .target = other });
+
+        self.at = fabric;
+        try self.func.appendStore(self.at, value, try self.hostAt("fabric", in_fabric.offset));
+        try self.func.setJump(self.at, merge, &.{});
+
+        self.at = other;
+        const in_scratch = try self.within(at, "scratch_at", "scratch_size");
+        try self.func.appendIf(self.at, in_scratch.inside, .{ .target = scratch }, .{ .target = away_block });
+
+        self.at = scratch;
+        try self.func.appendStore(self.at, value, try self.hostAt("scratch", in_scratch.offset));
+        try self.func.setJump(self.at, merge, &.{});
+
+        self.at = away_block;
+        _ = try self.asked(at, value, widthWord(.word) | away.store);
+        try self.func.setJump(self.at, merge, &.{});
+
+        self.at = merge;
+    }
+
     fn leave(self: *Lifter, why: Exit, pc: Value) Error!void {
         try self.writeField("pc", pc);
         for (1..self.slots.len) |which| {
@@ -647,6 +1051,7 @@ const Lifter = struct {
                     try self.set(each.rd, try self.arithmetic(each.op, a, b));
                 },
                 .csr => |each| try self.set(each.rd, try self.control(each.which)),
+                .vector => |each| try self.lowerVector(each),
                 .load => try self.lower(one),
                 .store => try self.lowerStore(one),
                 .atomic => try self.lowerAtomic(one),
@@ -756,6 +1161,8 @@ pub fn region(allocator: std.mem.Allocator, func: *Function, program: []const u3
         .ptr_t = try func.types.ptrGlobal(),
         .ctx = undefined,
         .slots = undefined,
+        .lane = undefined,
+        .carry = undefined,
         .leaders = leaders,
         .reached = reached,
         .blocks = blocks,
@@ -771,6 +1178,8 @@ pub fn region(allocator: std.mem.Allocator, func: *Function, program: []const u3
     for (1..self.slots.len) |which| {
         self.slots[which] = try func.appendInst(prologue, self.ptr_t, .{ .alloca = .{ .elem = self.u32_t } });
     }
+    self.lane = try func.appendInst(prologue, self.ptr_t, .{ .alloca = .{ .elem = self.u32_t } });
+    self.carry = try func.appendInst(prologue, self.ptr_t, .{ .alloca = .{ .elem = self.u32_t } });
     for (1..self.slots.len) |which| {
         const held = try func.appendInst(prologue, self.u32_t, .{ .load = .{ .ptr = try self.slotOf(which) } });
         try func.appendStore(prologue, held, self.slots[which]);

@@ -286,7 +286,7 @@ test "a core profile fixes the vector length, which is the warp width" {
     try std.testing.expectEqual(@as(u8, 4), glacier.Profile.@"gc1.n".lanes());
     try std.testing.expectEqual(@as(u8, 4), glacier.Profile.@"gc1.n".warps());
     try std.testing.expectEqual(@as(u8, 4), glacier.Profile.@"gc1.mi".lanes());
-    try std.testing.expectEqual(@as(u8, 8), glacier.Profile.@"gc1.mi".warps());
+    try std.testing.expectEqual(@as(u8, 16), glacier.Profile.@"gc1.mi".warps());
     try std.testing.expectEqual(@as(u8, 8), glacier.Profile.@"gc1.s".lanes());
     try std.testing.expectEqual(@as(u8, 16), glacier.Profile.@"gc1.f".lanes());
     try std.testing.expectEqual(@as(u8, 16), glacier.Profile.@"gc1.ma".warps());

@@ -397,6 +397,7 @@ fn emitBuiltin(
         // A shire is not divided into subgroups by the hardware. Every hart in the shire runs
         // its own stream, so a warp index would be a software partition this file invents.
         .warp_id => return error.Unsupported,
+        .local_invocation_index => return error.Unsupported,
         .subgroup_size => try appendSmallImm(allocator, code, dst, vpu_lanes),
         // A graphics builtin has no meaning in a compute kernel, and ET-SoC has no raster.
         .vertex_index, .instance_index, .frag_coord, .point_coord, .front_facing => return error.Unsupported,

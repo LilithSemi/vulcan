@@ -26,6 +26,7 @@ pub const ExtInst = 12;
 /// GLSL.std.450 extended-instruction numbers the frontend lowers (to select +
 /// compare). The set itself (OpExtInstImport "GLSL.std.450") is assumed present.
 pub const Glsl = struct {
+    pub const round = 1;
     pub const round_even = 2;
     pub const trunc = 3;
     pub const f_abs = 4;
@@ -58,6 +59,10 @@ pub const Glsl = struct {
     pub const f_clamp = 43;
     pub const u_clamp = 44;
     pub const s_clamp = 45;
+    pub const f_mix = 46;
+    pub const smooth_step = 49;
+    pub const fma = 50;
+    pub const find_ilsb = 73;
 };
 
 // Types.
@@ -132,6 +137,7 @@ pub const Dim = struct {
     pub const dim_2d = 1;
     pub const dim_3d = 2;
     pub const cube = 3;
+    pub const subpass_data = 6;
 };
 
 /// SPIR-V storage classes (subset the frontend recognizes).
@@ -177,6 +183,7 @@ pub const BuiltIn = struct {
     pub const workgroup_id = 26;
     pub const local_invocation_id = 27;
     pub const global_invocation_id = 28;
+    pub const local_invocation_index = 29;
     pub const vertex_index = 42; // gl_VertexIndex (a vertex-shader input)
     pub const instance_index = 43; // gl_InstanceIndex (a vertex-shader input)
 };
@@ -201,6 +208,11 @@ pub const ConstantTrue = 41;
 pub const ConstantFalse = 42;
 pub const Constant = 43;
 pub const ConstantComposite = 44;
+pub const SpecConstantTrue = 48;
+pub const SpecConstantFalse = 49;
+pub const SpecConstant = 50;
+pub const SpecConstantComposite = 51;
+pub const SpecConstantOp = 52;
 
 // Functions and control flow.
 pub const Function = 54;
@@ -232,6 +244,7 @@ pub const UMod = 137;
 pub const SRem = 138;
 pub const SMod = 139;
 pub const FRem = 140;
+pub const FMod = 141;
 pub const SNegate = 126;
 pub const FNegate = 127;
 
@@ -268,8 +281,12 @@ pub const ULessThan = 176;
 pub const SLessThan = 177;
 pub const ULessThanEqual = 178;
 pub const SLessThanEqual = 179;
+pub const Any = 154;
+pub const All = 155;
 pub const FOrdEqual = 180;
+pub const FUnordEqual = 181;
 pub const FOrdNotEqual = 182;
+pub const FUnordNotEqual = 183;
 pub const FOrdLessThan = 184;
 pub const FOrdGreaterThan = 186;
 pub const FOrdLessThanEqual = 188;
@@ -287,8 +304,11 @@ pub const Bitcast = 124;
 
 // Composites / vectors.
 pub const VectorShuffle = 79;
+pub const IsNan = 156;
+pub const IsInf = 157;
 pub const CompositeConstruct = 80;
 pub const CompositeExtract = 81;
+pub const CompositeInsert = 82;
 pub const VectorTimesScalar = 142;
 pub const MatrixTimesScalar = 143;
 pub const VectorTimesMatrix = 144;

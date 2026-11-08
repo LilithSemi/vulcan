@@ -40,6 +40,8 @@ pub const Builtin = enum(u16) {
     warp_id = 16,
     /// The number of lanes in a subgroup. 32 on NVIDIA, 8 on the ET-SoC VPU.
     subgroup_size = 17,
+    /// The flattened invocation index across every subgroup in one workgroup.
+    local_invocation_index = 18,
     /// The vertex index of a draw. SPIR-V VertexIndex.
     vertex_index = 32,
     /// The instance index of a draw. SPIR-V InstanceIndex.
@@ -54,7 +56,7 @@ pub const Builtin = enum(u16) {
     /// Whether this builtin belongs to the compute group. A graphics builtin on a compute
     /// kernel is a frontend error, and a backend uses this to reject it.
     pub fn isCompute(self: Builtin) bool {
-        return @backingInt(self) <= @backingInt(Builtin.subgroup_size);
+        return @backingInt(self) <= @backingInt(Builtin.local_invocation_index);
     }
 
     /// Whether every thread of ONE WORKGROUP reads the same value from this builtin.
@@ -77,7 +79,7 @@ pub const Builtin = enum(u16) {
         return switch (self) {
             .thread_id_x, .thread_id_y, .thread_id_z => false,
             .global_id_x, .global_id_y, .global_id_z => false,
-            .lane_id, .warp_id => false,
+            .lane_id, .warp_id, .local_invocation_index => false,
             .block_id_x, .block_id_y, .block_id_z => true,
             .block_dim_x, .block_dim_y, .block_dim_z => true,
             .grid_dim_x, .grid_dim_y, .grid_dim_z => true,
@@ -93,7 +95,7 @@ pub const Builtin = enum(u16) {
             .thread_id_x, .block_id_x, .block_dim_x, .grid_dim_x, .global_id_x => 0,
             .thread_id_y, .block_id_y, .block_dim_y, .grid_dim_y, .global_id_y => 1,
             .thread_id_z, .block_id_z, .block_dim_z, .grid_dim_z, .global_id_z => 2,
-            .lane_id, .warp_id, .subgroup_size => null,
+            .lane_id, .warp_id, .subgroup_size, .local_invocation_index => null,
             .vertex_index, .instance_index, .frag_coord, .point_coord, .front_facing => null,
         };
     }

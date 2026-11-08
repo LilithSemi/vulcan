@@ -936,6 +936,7 @@ fn compileShaderOwned(allocator: std.mem.Allocator, func: *Function, stage: Stag
                     .global_id_x,
                     .global_id_y,
                     .global_id_z,
+                    .local_invocation_index,
                     .lane_id,
                     .warp_id,
                     .subgroup_size,
@@ -3197,6 +3198,7 @@ fn emitComputeBuiltin(
         // needs the full workgroup shape and has no oracle to check it against, because the
         // host loop nest runs one thread at a time and has no subgroup. `subgroup_size` waits
         // with it, so the whole subgroup group lands together and gets tested together.
+        .local_invocation_index,
         .warp_id,
         .subgroup_size,
         => return error.Unsupported,

@@ -78,6 +78,12 @@ pub fn localSize(func: *const Function) [3]u32 {
     return out;
 }
 
+/// Whether the frontend recorded an explicit local size.
+pub fn hasLocalSize(func: *const Function) bool {
+    for (key_local_size) |key| if (intAttr(func, .func, key) != null) return true;
+    return false;
+}
+
 /// Record the workgroup shared memory the kernel needs, in bytes.
 pub fn setSharedBytes(func: *Function, bytes: u32) Error!void {
     try addInt(func, .func, key_shared_bytes, bytes);

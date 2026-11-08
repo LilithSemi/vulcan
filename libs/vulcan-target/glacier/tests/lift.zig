@@ -105,6 +105,146 @@ fn expectSame(program: []const u32) !void {
     try std.testing.expectEqual(@as(u32, 0), state.bus_error);
 }
 
+/// Run one program both ways on a warp of `lanes` lanes, and diff the lane registers as well.
+///
+/// The lane registers start where the model starts them, recognisably stale, so a write to a lane
+/// the launch never named shows up as a difference rather than as a zero that looks deliberate.
+fn expectSameLanes(program: []const u32, lanes: u8) !void {
+    const allocator = std.testing.allocator;
+
+    var model_memory: [words]u32 = @splat(0);
+    var memory: warp.Memory = .{ .base = base, .words = &model_memory };
+    var model: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = lanes };
+    _ = try warp.run(program, &memory, &model, 10_000);
+
+    var native_memory: [words]u32 = @splat(0);
+    var served: Served = .{ .words = &native_memory, .base = base };
+    var state: lift.Warp = .{
+        .hart_count = 1,
+        .fabric = @ptrCast(&native_memory),
+        .fabric_at = base,
+        .fabric_size = native_memory.len * 4,
+        .away = Served.answer,
+        .away_ctx = &served,
+        .lane_count = lanes,
+        .lane_mask = (@as(u32, 1) << @intCast(lanes)) - 1,
+        .v = @splat(@splat(warp.stale_lane)),
+    };
+    try std.testing.expectEqual(lift.Exit.retired, try native(allocator, program, 0, &state));
+
+    for (1..32) |which| {
+        if (model.x[which] == state.x[which]) continue;
+        std.debug.print(
+            "register x{d}: the model says {x}, the compiled code says {x}\n",
+            .{ which, model.x[which], state.x[which] },
+        );
+        return error.TestExpectedEqual;
+    }
+    for (0..32) |reg| {
+        for (0..lanes) |lane| {
+            if (model.v[reg][lane] == state.v[reg][lane]) continue;
+            std.debug.print(
+                "lane {d} of v{d}: the model says {x}, the compiled code says {x}\n",
+                .{ lane, reg, model.v[reg][lane], state.v[reg][lane] },
+            );
+            return error.TestExpectedEqual;
+        }
+    }
+    try std.testing.expectEqualSlices(u32, &model_memory, &native_memory);
+    try std.testing.expectEqual(@as(u32, 0), state.bus_error);
+}
+
+test "lane arithmetic: a splat, the lane indices, and a store of every lane" {
+    try expectSameLanes(&.{
+        rv.lui(.x1, base_high),
+        rv.addi(.x2, .x0, 100),
+        rv.addi(.x3, .x0, 3),
+        rv.vmv_v_x(.v1, .x2),
+        rv.vid_v(.v2),
+        rv.vadd_vv(.v3, .v1, .v2),
+        rv.vmul_vx(.v4, .v3, .x3),
+        rv.vse32(.v4, .x1),
+        target.glacier.encode.ebreak,
+    }, 4);
+}
+
+test "the lane arithmetic a lowering emits, every form of it" {
+    try expectSameLanes(&.{
+        rv.lui(.x1, base_high),
+        rv.addi(.x2, .x0, 0x2d),
+        rv.addi(.x3, .x0, 3),
+        rv.vid_v(.v1),
+        rv.vmv_v_x(.v2, .x2),
+        rv.vsub_vv(.v3, .v2, .v1),
+        rv.vand_vv(.v4, .v2, .v3),
+        rv.vor_vv(.v5, .v1, .v4),
+        rv.vxor_vv(.v6, .v5, .v2),
+        rv.vsll_vx(.v7, .v6, .x3),
+        rv.vsrl_vv(.v8, .v7, .v1),
+        rv.vsra_vi(.v9, .v8, 2),
+        rv.vmul_vv(.v10, .v9, .v2),
+        rv.vmulhu_vv(.v11, .v10, .v2),
+        rv.vdivu_vv(.v12, .v10, .v2),
+        rv.vremu_vv(.v13, .v10, .v2),
+        rv.vse32(.v13, .x1),
+        target.glacier.encode.ebreak,
+    }, 4);
+}
+
+test "a compare makes a mask, and the mask side carries it back to a scalar" {
+    try expectSameLanes(&.{
+        rv.lui(.x1, base_high),
+        rv.addi(.x2, .x0, 2),
+        rv.vid_v(.v1),
+        rv.vmv_v_x(.v2, .x2),
+        // Lanes 0 and 1, which is where the lane index is under two.
+        rv.vmsltu_vv(.v0, .v1, .v2),
+        rv.vmsleu_vv(.v3, .v1, .v2),
+        rv.vmnand_mm(.v4, .v0, .v3),
+        rv.vmand_mm(.v5, .v0, .v3),
+        rv.vcpop_m(.x4, .v0),
+        rv.vcpop_m(.x5, .v4),
+        rv.vmv_x_s(.x6, .v5),
+        // v0 names the lane that takes the second operand, and every lane takes one or the other.
+        rv.vmerge_vvm(.v6, .v1, .v2),
+        rv.vse32(.v6, .x1),
+        rv.sw(.x4, .x1, 16),
+        rv.sw(.x5, .x1, 20),
+        rv.sw(.x6, .x1, 24),
+        target.glacier.encode.ebreak,
+    }, 4);
+}
+
+test "a gather and a scatter, where each lane carries its own address" {
+    try expectSameLanes(&.{
+        rv.lui(.x1, base_high),
+        rv.addi(.x2, .x0, 4),
+        rv.addi(.x3, .x0, 70),
+        rv.vid_v(.v1),
+        // Four byte offsets, which is this lane's own word.
+        rv.vmul_vx(.v2, .v1, .x2),
+        rv.vmv_v_x(.v3, .x3),
+        rv.vadd_vv(.v4, .v3, .v1),
+        rv.vsuxei32(.v4, .x1, .v2),
+        rv.vluxei32(.v5, .x1, .v2),
+        rv.addi(.x4, .x1, 16),
+        rv.vse32(.v5, .x4),
+        target.glacier.encode.ebreak,
+    }, 4);
+}
+
+test "a narrower launch leaves the lanes it does not run alone" {
+    try expectSameLanes(&.{
+        rv.lui(.x1, base_high),
+        rv.addi(.x2, .x0, 9),
+        rv.vmv_v_x(.v1, .x2),
+        rv.vid_v(.v2),
+        rv.vadd_vv(.v3, .v1, .v2),
+        rv.vse32(.v3, .x1),
+        target.glacier.encode.ebreak,
+    }, 2);
+}
+
 test "arithmetic a compiler emits, run both ways" {
     try expectSame(&.{
         rv.lui(.x1, base_high),
@@ -467,7 +607,7 @@ test "a word the core does not decode is refused rather than ignored" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    // A vector word, which is real and not lifted yet.
-    const program = [_]u32{ 0x0000_0057, target.glacier.encode.ebreak };
+    // A float lane word, which is real and not lifted yet.
+    const program = [_]u32{ 0x0000_1057, target.glacier.encode.ebreak };
     try std.testing.expectError(error.Illegal, lift.region(allocator, &func, &program, 0));
 }
