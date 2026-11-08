@@ -255,6 +255,16 @@ pub fn vfcvt_rtz_xu_f_v(vd: VReg, vs2: VReg) u32 {
     return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (@as(u32, 0b00110) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010010) << 26);
 }
 
+/// `vfcvt.rtz.x.f.v vd, vs2`: per-lane float to signed integer, truncating toward zero.
+pub fn vfcvt_rtz_x_f_v(vd: VReg, vs2: VReg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (@as(u32, 0b00111) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010010) << 26);
+}
+
+/// `vfcvt.x.f.v vd, vs2`: per-lane float to signed integer, rounding to nearest even.
+pub fn vfcvt_x_f_v(vd: VReg, vs2: VReg) u32 {
+    return 0b1010111 | (vnum(vd) << 7) | (0b001 << 12) | (@as(u32, 0b00001) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, 0b010010) << 26);
+}
+
 /// `vfncvt.f.f.w vd, vs2`: per-lane NARROWING float to float, one width down. The third member of
 /// the same `funct6` family as the two converts above, again selected by the `vs1` field.
 pub fn vfncvt_f_f_w(vd: VReg, vs2: VReg) u32 {
@@ -307,6 +317,11 @@ fn opmvv(funct6: u6, vd: VReg, vs2: VReg, vs1: VReg) u32 {
 /// An OPMVX op (vector-scalar, the multiply/divide group, funct3=110).
 fn opmvx(funct6: u6, vd: VReg, vs2: VReg, rs1: Reg) u32 {
     return 0b1010111 | (vnum(vd) << 7) | (0b110 << 12) | (num(rs1) << 15) | (vnum(vs2) << 20) | (@as(u32, 1) << 25) | (@as(u32, funct6) << 26);
+}
+
+/// `vredor.vs`: reduce the active vector elements with bitwise OR into element zero of `vd`.
+pub fn vredor_vs(vd: VReg, vs2: VReg, vs1: VReg) u32 {
+    return opmvv(0b010000, vd, vs2, vs1);
 }
 
 pub fn vadd_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {

@@ -1,4 +1,4 @@
-//! Glacier ruction selection: a Vulcan IR kernel to a Glacier word stream.
+//! Glacier instruction selection: a Vulcan IR kernel to a Glacier word stream.
 //!
 //! A Glacier kernel is not a function. It has no caller, no arguments and no stack, so this
 //! lowering is narrower than a CPU backend on purpose:
@@ -112,14 +112,16 @@ const scratch: Reg = .x31;
 /// The stack pointer. Reserved by the Glacier ABI whether or not a kernel spills, and loaded from
 /// `mscratch`, which reads one past the top of the reading hart's own scratch region.
 const sp: Reg = .x2;
+/// A second reserved scalar register builds spill addresses beyond a signed 12-bit offset.
+const stack_addr_scratch: Reg = .x30;
 
-/// x1 and x3 to x30. A Glacier kernel has no call, so the return-address register carries data
-/// like any other. `x2` is the ABI stack pointer and `x31` is the lowering's scratch.
-const allocatable: [29]u16 = blk: {
-    var regs: [29]u16 = undefined;
+/// x1 and x3 to x29. x30 forms stack addresses beyond the signed 12-bit displacement range,
+/// `x2` is the ABI stack pointer, and `x31` is the lowering's scratch.
+const allocatable: [28]u16 = blk: {
+    var regs: [28]u16 = undefined;
     var n: usize = 0;
     for (1..31) |i| {
-        if (i == @backingInt(sp)) continue;
+        if (i == @backingInt(sp) or i == 30) continue;
         regs[n] = i;
         n += 1;
     }
@@ -170,20 +172,21 @@ pub const Options = struct {
     /// The core the kernel is built for. It fixes the lane count, which is what `block_dim_x`
     /// and `subgroup_size` read.
     profile: glacier.Profile,
+    /// Physical resident warps when the implementation differs from the standard profile.
+    /// Zero uses the profile's standard capacity; this is hardware configuration, not a profile.
+    resident_warps: u8 = 0,
+    /// Physical on-chip shared memory available to whole-core workgroups.
+    core_shared_bytes: u32 = 0,
     /// Absolute addresses for the symbols the kernel's `global_addr` instructions name. A name
     /// that is not here is refused rather than guessed.
     globals: []const Global = &.{},
     /// How many words the core's instruction aperture holds. A program longer than this is refused
     /// rather than truncated at load.
     ///
-    /// The default is the ARCHITECTURAL CEILING, 8192, and a given SoC may hold FEWER:
-    /// `GlacierPipelinedCoreSoc.programWords` defaults to the whole aperture and a board may lower
-    /// it to pay for less block RAM. That number is a per-BOARD area decision rather than a
-    /// property of the core's shape, so it is not in the profile and this compiler cannot derive
-    /// it: nothing is attached when a kernel is built. A caller that knows the device reads the
-    /// core's `PROG_WORDS` register and passes the real figure here; the ceiling is the honest
-    /// default for everyone else, and the runtime refuses a program the core cannot hold.
-    program_words: u32 = 8192,
+    /// Maximum code size admitted by the compiler. A local-RAM core enforces its smaller aperture
+    /// when the host loads the image; a cache-backed core can execute a much larger image from
+    /// system memory. The host allocator remains the final bound on those programs.
+    program_words: u32 = 16 * 1024 * 1024,
     /// Words ALREADY RESIDENT in the aperture beside this program, which this one has to fit
     /// around.
     ///
@@ -192,19 +195,120 @@ pub const Options = struct {
     /// inside a single compile can see the other stage, so the caller that composes the pipeline
     /// passes the first stage's length when it compiles the second.
     resident_words: u32 = 0,
+    /// Stride of Vulkan fragment input records. The runtime shrinks this to
+    /// the interpolant gradients used by the shader.
+    fragment_input_stride: u32 = 512,
+    /// Stride of fragment output records. 80 preserves the full color/depth/discard ABI.
+    fragment_output_stride: u32 = 80,
+    /// Byte order the generated rasteriser packs a colour into. It must agree with the format of
+    /// the image the rasteriser writes, because the store goes straight to the pixel.
+    raster_colour_order: RasterColourOrder = .bgra,
+    /// The depth test the generated rasteriser applies. Null builds a kernel with no depth buffer,
+    /// which takes no depth launch arguments and is what a draw with no depth attachment wants.
+    raster_depth: ?RasterDepth = null,
+    /// The colour blend the generated rasteriser applies. Null stores the shader's colour as it
+    /// is, which is what a draw with blending off wants.
+    raster_blend: ?RasterBlend = null,
+    /// Whether the generated rasteriser corrects its attributes for perspective. Without it they
+    /// step by a constant, which is exact only where w does not vary, so a draw with a projection
+    /// needs it or its attributes slide across the triangle.
+    raster_perspective: bool = false,
 };
 
-pub const vertex_input_stride = 256;
-pub const vertex_output_stride = 256;
+/// The colour blend the generated rasteriser applies, which is `src * src_factor + dst *
+/// dst_factor`. Only that one operation is built, so a draw with any other blend operation keeps
+/// the record path.
+pub const RasterBlend = struct {
+    src_colour: RasterBlendFactor,
+    dst_colour: RasterBlendFactor,
+    src_alpha: RasterBlendFactor,
+    dst_alpha: RasterBlendFactor,
+
+    /// The factor each of the four components multiplies by. Alpha has its own pair.
+    fn source(self: RasterBlend, component: usize) RasterBlendFactor {
+        return if (component == 3) self.src_alpha else self.src_colour;
+    }
+
+    fn destination(self: RasterBlend, component: usize) RasterBlendFactor {
+        return if (component == 3) self.dst_alpha else self.dst_colour;
+    }
+};
+
+/// What one side of a blend multiplies by. The order is Vulkan's `VkBlendFactor` for the ones
+/// built, and a draw asking for any other keeps the record path.
+pub const RasterBlendFactor = enum {
+    zero,
+    one,
+    src_colour,
+    one_minus_src_colour,
+    dst_colour,
+    one_minus_dst_colour,
+    src_alpha,
+    one_minus_src_alpha,
+    dst_alpha,
+    one_minus_dst_alpha,
+};
+
+/// The depth test the generated rasteriser applies, and whether a fragment that passes keeps its
+/// depth. The stored value is a 32-bit float, so the test is the float compare the core has.
+pub const RasterDepth = struct {
+    compare: Compare,
+    write: bool,
+
+    /// Which comparison of the new depth against the stored one keeps a fragment. The order is
+    /// Vulkan's `VkCompareOp`.
+    pub const Compare = enum(u3) {
+        never = 0,
+        less = 1,
+        equal = 2,
+        less_equal = 3,
+        greater = 4,
+        not_equal = 5,
+        greater_equal = 6,
+        always = 7,
+    };
+};
+
+// 512, not 256: generic attributes start at 0x80 and take 16 bytes each, so a 256-byte record
+// holds exactly 8 of them. Vulkan requires at least 16, and vkQuake builds a pipeline with 13.
+// The input and output strides must stay equal, which `smoke.c` asserts across the two sides.
+pub const vertex_input_stride = 512;
+pub const vertex_output_stride = 512;
 pub const vertex_input_vertex_index_offset = 0x60;
 pub const vertex_input_instance_index_offset = 0x64;
-pub const fragment_record_stride = 512;
+// Input records reserve the gradient table after the fixed builtin and varying slots.
+pub const fragment_input_stride = 512;
+// Four vec4 colors occupy bytes 0..63; depth and discard are at 64 and 68.
+pub const fragment_output_stride = 80;
 pub const fragment_output_depth_offset = 0x40;
 pub const fragment_output_discard_offset = 0x44;
 pub const fragment_input_point_coord_offset = 0x60;
 pub const fragment_input_front_facing_offset = 0x68;
 pub const fragment_input_coord_offset = 0x70;
 pub const fragment_input_gradient_offset = 0x100;
+
+/// Return a compact output stride when the shader writes only color outputs.
+/// Depth and discard retain their fixed offsets in the full 80-byte record.
+pub fn fragmentOutputStride(func: *const Function) u32 {
+    if (hasDiscardParam(func)) return fragment_output_stride;
+    var output_end: u32 = 0;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            const operation = func.opcode(inst);
+            if (operation != .store) continue;
+            const store = operation.store;
+            if (gpuIntAttr(func, store.ptr, "frag_depth") != null)
+                return fragment_output_stride;
+            if (gpuIntAttr(func, store.ptr, "color_out")) |component| {
+                if (component >= 16) return fragment_output_stride;
+                output_end = @max(output_end, (component / 4 + 1) * 16);
+            }
+        }
+    }
+    // Preserve the old ABI for shaders with no recognized color stores.
+    return if (output_end == 0) fragment_output_stride else output_end;
+}
 
 /// Lower `func` to a Glacier word stream. The caller owns the result.
 pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: Options) Error![]u32 {
@@ -251,7 +355,7 @@ pub fn compileFragmentExplained(
     if (why) |r| r.* = .{};
     var work = try func.clone(allocator);
     defer work.deinit();
-    try lowerFragmentIO(allocator, &work, why);
+    try lowerFragmentIO(allocator, &work, opts.fragment_input_stride, opts.fragment_output_stride, why);
     return compileKernelInternal(allocator, &work, opts, why);
 }
 
@@ -270,7 +374,7 @@ pub fn compileFragmentRasterExplained(
     if (why) |r| r.* = .{};
     var work = try func.clone(allocator);
     defer work.deinit();
-    try lowerFragmentRaster(allocator, &work, why);
+    try lowerFragmentRaster(allocator, &work, opts.raster_colour_order, opts.raster_depth, opts.raster_blend, opts.raster_perspective, why);
     return compileKernelInternal(allocator, &work, opts, why);
 }
 
@@ -291,20 +395,69 @@ fn compileKernelInternal(
     opts: Options,
     why: ?*Refusal,
 ) Error![]u32 {
+    var phase: []const u8 = "admission";
+    errdefer std.debug.print("Glacier kernel compile failed during {s}\n", .{phase});
     if (func.blockCount() == 0) return Refusal.whole(why, "a kernel with no blocks");
     if (func.is_variadic) return Refusal.whole(why, "a variadic kernel");
     if (func.sret) return Refusal.whole(why, "a kernel that returns a value through a pointer");
+
+    const local_size: [3]u32 = if (gpu.attrs.hasLocalSize(func)) gpu.attrs.localSize(func) else .{ opts.profile.lanes(), 1, 1 };
+    var local_invocations: u64 = 1;
+    for (local_size) |axis| {
+        if (axis == 0 or !std.math.isPowerOfTwo(axis))
+            return Refusal.whole(why, "a local size with a zero or non-power-of-two axis");
+        local_invocations *= axis;
+    }
+    // A workgroup smaller than a warp runs on one warp with the spare lanes masked off, so the
+    // host launches it with a narrow lane mask. Larger than a warp still has to be a whole
+    // number of them, because the lane mask is the only way to stop a lane.
+    const warp_lanes: u64 = opts.profile.lanes();
+    if (local_invocations > warp_lanes and local_invocations % warp_lanes != 0)
+        return Refusal.whole(why, "a local size past one warp that is not a whole number of physical warps");
+    const subgroup_count: u64 = if (local_invocations <= warp_lanes) 1 else local_invocations / warp_lanes;
+    const resident_warps = if (opts.resident_warps == 0) opts.profile.warps() else opts.resident_warps;
+    if (subgroup_count > resident_warps)
+        return Refusal.whole(why, "a workgroup larger than the core's resident warps");
+    if (subgroup_count > 1 and subgroup_count != resident_warps)
+        return Refusal.whole(why, "a multi-warp workgroup that does not occupy every resident warp");
 
     // The Wimmer resolver needs a block on every critical edge to put its shuffle moves on, and
     // splitting mutates the function, so split a clone and leave the caller's input alone.
     var work = try func.clone(allocator);
     defer work.deinit();
+    if (subgroup_count > 1) {
+        var barriers: u32 = gpu.attrs.clusterBarriers(&work) orelse 0;
+        for (0..work.blockCount()) |bi| {
+            const block: Block = @fromBackingInt(@intCast(bi));
+            for (work.blockInsts(block)) |inst| {
+                if (work.opcode(inst) == .barrier and work.opcode(inst).barrier.scope == .workgroup) {
+                    try gpu.attrs.setClusterBarrier(&work, inst);
+                    barriers += 1;
+                }
+            }
+        }
+        try gpu.attrs.setClusterBarriers(&work, barriers);
+    }
 
+    phase = "lowerImageSample";
+    phase = "lowerFloor";
+    try lowerFloor(allocator, &work);
+    phase = "lowerImageSample";
     try lowerImageSample(allocator, &work);
+    phase = "lowerTexelFetch";
     try lowerTexelFetch(allocator, &work);
+    phase = "lowerStorageImageWrite";
     try lowerStorageImageWrite(allocator, &work);
+    phase = "lowerImageSize";
     try lowerImageSize(allocator, &work);
+    phase = "lowerPow";
+    try lowerPow(allocator, &work);
+    phase = "lowerSquareRoot";
     try lowerSquareRoot(allocator, &work);
+    // After the lowerings above, so the converts they introduce are rewritten too.
+    phase = "lowerSignedFloatToInt";
+    try lowerSignedFloatToInt(allocator, &work);
+    phase = "unifyDiscardReturns";
     try unifyDiscardReturns(allocator, &work);
 
     // Promote every stack slot to an SSA value BEFORE anything else looks at the function. A
@@ -313,6 +466,7 @@ fn compileKernelInternal(
     // reason that has nothing to do with the hardware. This is also why the promotion belongs
     // here rather than in a frontend: it needs real phis, which only an SSA construction gives.
     {
+        phase = "mem2reg and strength reduction";
         var analyses: opt.pass.Analyses = .{ .allocator = allocator, .func = &work };
         defer analyses.deinit();
         _ = try opt.mem2reg.run(allocator, &work, &analyses);
@@ -376,7 +530,7 @@ fn compileKernelInternal(
         {
             const d = try analyzeDivergence(allocator, &work);
             defer allocator.free(d);
-            if (try rotateWhileLoops(allocator, &work, d)) moved = true;
+            if (try rotateWhileLoops(allocator, &work, d, loop_masks.items)) moved = true;
         }
         {
             const d = try analyzeDivergence(allocator, &work);
@@ -393,6 +547,7 @@ fn compileKernelInternal(
     // keeps the passes below off a block nothing reaches, and the allocator off a live range in
     // one: a value there is live nowhere and the allocation verifier reads that as unsound.
     {
+        phase = "broadcast uniform arguments";
         const rest = try ir.reachable.neutralizeUnreachable(allocator, &work);
         allocator.free(rest);
     }
@@ -405,6 +560,7 @@ fn compileKernelInternal(
     // No per-lane parameter may be fed a warp-uniform argument: see `broadcastUniformArgs` for
     // what the shared allocator does with a move that crosses the two register files.
     {
+        phase = "hoist lane addresses";
         const d = try analyzeDivergence(allocator, &work);
         defer allocator.free(d);
         _ = try broadcastUniformArgs(allocator, &work, d);
@@ -414,6 +570,7 @@ fn compileKernelInternal(
     // arithmetic that is left over. The divergence analysis runs again below, because the rewrite
     // adds values and moves work from the vector side to the scalar side.
     {
+        phase = "dead code elimination";
         const d = try analyzeDivergence(allocator, &work);
         defer allocator.free(d);
         _ = try hoistLaneAddresses(allocator, &work, d);
@@ -427,6 +584,13 @@ fn compileKernelInternal(
         var analyses: opt.pass.Analyses = .{ .allocator = allocator, .func = &work };
         defer analyses.deinit();
         _ = try opt.dce.run(allocator, &work, &analyses);
+    }
+
+    {
+        phase = "uniform boolean mask lowering";
+        const d = try analyzeDivergence(allocator, &work);
+        defer allocator.free(d);
+        try lowerUniformBoolMasks(allocator, &work, d);
     }
 
     const divergent = try analyzeDivergence(allocator, &work);
@@ -444,7 +608,8 @@ fn compileKernelInternal(
 
     var ctx: Ctx = .{ .divergent = divergent, .macs = &macs, .strides = &strides };
 
-    try checkSupported(&work, opts, divergent, &macs, &any_lane, why);
+    phase = "instruction admission";
+    try checkSupported(&work, opts, divergent, uses, &macs, &any_lane, why);
 
     // Workgroup shared memory lives in the hart's own scratch region, directly below `mscratch`,
     // with the spill slots under it. A workgroup is ONE WARP on this core and a hart owns its
@@ -468,13 +633,15 @@ fn compileKernelInternal(
         error.UnsupportedParamType => return Refusal.whole(why, "a parameter type this lowering cannot place"),
     };
     defer frame.deinit(allocator);
+    const core_shared = subgroup_count > 1;
     const shared_bytes = frame.bytes;
-    if (shared_bytes > opts.profile.scratchBytes()) {
+    const shared_limit = if (core_shared) opts.core_shared_bytes else opts.profile.scratchBytes();
+    if (shared_bytes > shared_limit) {
         return Refusal.tooBig(
             why,
-            "more workgroup memory than the hart's scratch region holds",
+            if (core_shared) "more workgroup memory than the core's shared region holds" else "more workgroup memory than the hart's scratch region holds",
             shared_bytes,
-            opts.profile.scratchBytes(),
+            shared_limit,
         );
     }
 
@@ -510,42 +677,29 @@ fn compileKernelInternal(
     // A spill goes into the hart's own scratch region, so the kernel must fit there. The region
     // belongs to one hart, which is why no other hart's slots are counted against it.
     const slots = walloc.slot_count_per_class[0];
-    if (shared_bytes + slots * 4 > opts.profile.scratchBytes()) {
+    const vector_atomics = hasVectorAtomic(&work, divergent);
+    if ((!core_shared and shared_bytes + slots * 4 > opts.profile.scratchBytes()) or (core_shared and slots * 4 > opts.profile.scratchBytes())) {
         return Refusal.tooBig(
             why,
             "more spill slots and workgroup memory than the hart's scratch region holds",
-            shared_bytes + @as(u64, slots) * 4,
+            (if (core_shared) @as(u64, 0) else @as(u64, shared_bytes)) + @as(u64, slots) * 4,
             opts.profile.scratchBytes(),
         );
     }
-    // The deepest slot is reached by one signed 12-bit displacement from `sp`, and the stack grows
-    // down, so 2048 bytes is all one displacement can name.
-    //
-    // At a 2048-byte region the two ceilings now MEET: 512 slots either way, so the check above
-    // never fires on its own. Raising the region again buys nothing until a deep slot is addressed
-    // with more than one instruction, which is the thing to change first rather than the number.
-    if (shared_bytes + slots * 4 > 2048) {
-        return Refusal.tooBig(why, "a spill slot past the one displacement that reaches it", shared_bytes + @as(u64, slots) * 4, 2048);
-    }
-
     // A spilled per-lane value goes under the scalar slots, one whole vector register each, and
     // both regions have to fit the hart's scratch. A mask spends a register's worth of space on
     // one bit per lane, which is the price of not having a narrower store.
-    const vector_bytes = walloc.slot_count_per_class[1] * @as(u32, opts.profile.lanes()) * 4;
-    if (shared_bytes + slots * 4 + vector_bytes > opts.profile.scratchBytes()) {
+    const vector_width = @as(u32, opts.profile.lanes()) * 4;
+    const vector_bytes = walloc.slot_count_per_class[1] * vector_width;
+    const atomic_bytes = if (vector_atomics) 2 * vector_width else 0;
+    if ((!core_shared and shared_bytes + slots * 4 + vector_bytes + atomic_bytes > opts.profile.scratchBytes()) or (core_shared and slots * 4 + vector_bytes + atomic_bytes > opts.profile.scratchBytes())) {
         return Refusal.tooBig(
             why,
             "more spill space and workgroup memory than the hart's scratch region holds",
-            @as(u64, shared_bytes) + slots * 4 + vector_bytes,
+            (if (core_shared) @as(u64, 0) else @as(u64, shared_bytes)) + slots * 4 + vector_bytes + atomic_bytes,
             opts.profile.scratchBytes(),
         );
     }
-    // The deepest per-lane slot is addressed by one signed 12-bit displacement from `sp`, the same
-    // ceiling the scalar slots have.
-    if (shared_bytes + slots * 4 + vector_bytes > 2048) {
-        return Refusal.tooBig(why, "a spill slot past the one displacement that reaches it", @as(u64, shared_bytes) + slots * 4 + vector_bytes, 2048);
-    }
-
     // Recomputed here rather than reused from above: the passes between have emptied blocks and
     // rewired edges, so what was reachable then is not what is reachable now. Emission skips the
     // rest, which is worth a word each: a dead block otherwise leaves an `ebreak` behind.
@@ -565,21 +719,24 @@ fn compileKernelInternal(
         .strides = &strides,
         .any_lane = &any_lane,
         .why = why,
-        .spills = slots != 0 or walloc.slot_count_per_class[1] != 0 or shared_bytes != 0,
+        .spills = slots != 0 or walloc.slot_count_per_class[1] != 0 or shared_bytes != 0 or vector_atomics,
         .shared = frame.slots,
         .shared_bytes = shared_bytes,
+        .core_shared = core_shared,
         .remat = remat,
         .elide = try elidableSlots(allocator, &walloc, remat, slots),
         .vector_slot_base = slots * 4,
+        .vector_atomics = vector_atomics,
     };
     defer e.deinit();
+    phase = "instruction emission";
     try e.run();
 
     // A cluster barrier rides on an INSTRUCTION attribute, which a pass that clones or rebuilds
     // the instruction can drop. Losing one would emit the narrower barrier, which on this target
     // is no instruction at all, so a kernel would run with its handshake silently gone. The count
     // the frontend recorded before any pass ran is what turns that into a refusal.
-    if (gpu.attrs.clusterBarriers(func)) |declared| {
+    if (gpu.attrs.clusterBarriers(&work)) |declared| {
         if (e.cluster_barriers < declared) {
             return Refusal.tooBig(why, "fewer core-wide barriers than the kernel declared, so a pass dropped one", e.cluster_barriers, declared);
         }
@@ -727,7 +884,13 @@ fn lowerVertexIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal) 
     }
 }
 
-fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal) Error!void {
+fn lowerFragmentIO(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    input_stride: u32,
+    output_stride: u32,
+    why: ?*Refusal,
+) Error!void {
     if (!hasGpuStage(func, "fragment")) {
         return Refusal.whole(why, "a fragment kernel from a function that is not a fragment stage");
     }
@@ -753,7 +916,7 @@ fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal
                 .key = "lowered_graphics_input",
                 .value = .flag,
             } });
-            const stride = try func.appendInst(entry, index_type, .{ .iconst = fragment_record_stride });
+            const stride = try func.appendInst(entry, index_type, .{ .iconst = input_stride });
             const row = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
             const offset = try func.appendInst(entry, index_type, .{ .iconst = fragment_input_gradient_offset });
             const byte_offset = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = offset } });
@@ -782,7 +945,7 @@ fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal
             .key = "lowered_graphics_input",
             .value = .flag,
         } });
-        const stride = try func.appendInst(entry, index_type, .{ .iconst = fragment_record_stride });
+        const stride = try func.appendInst(entry, index_type, .{ .iconst = input_stride });
         const row = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
         const slot = try func.appendInst(entry, index_type, .{ .iconst = offset });
         const byte_offset = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = slot } });
@@ -800,7 +963,7 @@ fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal
         for (original) |inst| {
             const operation = func.opcode(inst);
             if (operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "discard_fn")) {
-                const stride = try func.appendInst(block, index_type, .{ .iconst = fragment_record_stride });
+                const stride = try func.appendInst(block, index_type, .{ .iconst = output_stride });
                 const row = try func.appendInst(block, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
                 const offset = try func.appendInst(block, index_type, .{ .iconst = fragment_output_discard_offset });
                 const byte_offset = try func.appendInst(block, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = offset } });
@@ -822,7 +985,7 @@ fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal
                 try func.blockInstsMut(block).append(func.allocator, inst);
                 continue;
             };
-            const stride = try func.appendInst(block, index_type, .{ .iconst = fragment_record_stride });
+            const stride = try func.appendInst(block, index_type, .{ .iconst = output_stride });
             const row = try func.appendInst(block, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
             const slot = try func.appendInst(block, index_type, .{ .iconst = offset });
             const byte_offset = try func.appendInst(block, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = slot } });
@@ -869,13 +1032,159 @@ fn intToFloat(func: *Function, block: Block, value: Value, ty: Type) Error!Value
 pub const raster_vertex_x_offset = 0x70;
 pub const raster_vertex_y_offset = 0x74;
 
-/// Where each colour component sits in a framebuffer word. Red is the third byte and blue is the
-/// first, the way the display reads them, and alpha goes in the byte above, which it ignores.
-const raster_colour_shift: [4]i64 = .{ 16, 8, 0, 24 };
+/// Where the generated rasteriser reads a vertex depth, for the depth test. What sits there must
+/// be the value the depth buffer holds, so the viewport transform belongs to the caller the same
+/// way x and y do.
+pub const raster_vertex_z_offset = 0x78;
+
+/// Where the generated rasteriser reads a vertex `1/w`, for `gl_FragCoord.w`. The reciprocal is
+/// linear in screen space, so it interpolates like any other value here, and the caller writes
+/// the reciprocal rather than w itself.
+pub const raster_vertex_w_offset = 0x7C;
+
+/// Byte order of a framebuffer word the generated rasteriser writes.
+pub const RasterColourOrder = enum {
+    /// Red is the third byte and blue is the first, the way the display reads them.
+    bgra,
+    /// Red is the first byte, which an image the application made as RGBA wants.
+    rgba,
+
+    /// Where each colour component sits in a framebuffer word. Alpha goes in the byte above the
+    /// other three in both orders, and the display ignores it.
+    pub fn shifts(self: RasterColourOrder) [4]i64 {
+        return switch (self) {
+            .bgra => .{ 16, 8, 0, 24 },
+            .rgba => .{ 0, 8, 16, 24 },
+        };
+    }
+};
 
 /// How many interpolated attributes one generated loop carries. Each one is a loop-carried value in
-/// two blocks, and a vector register holds one per lane, so the ceiling is register pressure.
+/// two blocks and a vector register holds one per lane, so carrying many of them spills. The
+/// register allocator is the real gate and refuses what it cannot place: this is only where the
+/// lowering stops trying. A spill reaches device memory, which is still far cheaper than the
+/// record path it saves, so the number is set by what shaders ask for rather than by comfort.
+/// Quake's world shaders ask for nine, and nine is still too many. At nine every fused
+/// submission missed the kernel's completion deadline, because the shaders the ninth
+/// attribute admits are the heavy world ones and the fused kernel runs all of each per
+/// pixel. Eight keeps them on the host path, which is slower per pixel and finishes.
 const raster_max_attributes = 8;
+
+/// The attributes, any slot only a derivative names, and the depth the test reads. The loop
+/// carries all of them the same way.
+const raster_max_interpolants = 2 * raster_max_attributes + 1;
+
+/// The interpolant carrying this vertex record slot, appending one if nothing carries it yet.
+/// Null means the loop has no room left.
+fn rasterSlotIndex(slot: []u32, count: *usize, want: u32, limit: usize) ?usize {
+    for (0..count.*) |i| {
+        if (slot[i] == want) return i;
+    }
+    if (count.* == limit) return null;
+    slot[count.*] = want;
+    count.* += 1;
+    return count.* - 1;
+}
+
+/// Which varying and which axis each index of the gradient buffer names, recovered from the
+/// ordered `grad_slot` function attributes the frontend emits.
+///
+/// The generated rasteriser has no gradient buffer, and needs none: setup already solved both
+/// gradients of every attribute, so the value at the neighbouring pixel, which is what the record
+/// path puts in that buffer, is one add away.
+const RasterGradients = struct {
+    /// The `grad_buf` entry parameter, or null when the body takes no derivatives.
+    buffer: ?Value = null,
+    /// Per index, the attribute byte slot and the axis. Axis 0 is x.
+    slot: [raster_max_interpolants]u32 = undefined,
+    axis: [raster_max_interpolants]u1 = undefined,
+    count: usize = 0,
+    /// Every pointer that addresses an index, which is the buffer itself for index 0 and
+    /// `add(buffer, iconst index * 4)` for the rest. The arithmetic carries a tag and is never
+    /// emitted.
+    pointer: std.AutoHashMapUnmanaged(Value, u32) = .empty,
+
+    fn deinit(self: *RasterGradients, allocator: std.mem.Allocator) void {
+        self.pointer.deinit(allocator);
+    }
+
+    fn addresses(self: *const RasterGradients, func: *const Function, inst: Inst) ?u32 {
+        const operation = func.opcode(inst);
+        if (operation != .load) return null;
+        return self.pointer.get(operation.load.ptr);
+    }
+
+    /// Whether this instruction only computes a gradient address.
+    fn tags(self: *const RasterGradients, func: *const Function, inst: Inst) bool {
+        const buffer = self.buffer orelse return false;
+        const operation = func.opcode(inst);
+        if (operation != .arith or operation.arith.op != .add) return false;
+        return operation.arith.lhs == buffer;
+    }
+};
+
+/// Find the gradient buffer, its descriptor table, and every pointer into it.
+fn rasterScanGradients(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    entry: Block,
+    why: ?*Refusal,
+) Error!RasterGradients {
+    var found: RasterGradients = .{};
+    for (func.blockParams(entry)) |param| {
+        if (hasGpuKey(func, param, "grad_buf")) {
+            found.buffer = param;
+            break;
+        }
+    }
+    const buffer = found.buffer orelse return found;
+    errdefer found.deinit(allocator);
+
+    var attrs = func.attributesOf(.func);
+    while (attrs.next()) |attr| switch (attr) {
+        .custom => |custom| if (std.mem.eql(u8, custom.namespace, "vulcan.gpu") and
+            std.mem.eql(u8, custom.key, "grad_slot"))
+        {
+            const whole: i64 = switch (custom.value) {
+                .int => |n| n,
+                else => return Refusal.whole(why, "a rasteriser for a derivative whose slot is not a number"),
+            };
+            if (found.count == raster_max_interpolants) {
+                return Refusal.tooBig(why, "a rasteriser for more derivatives than one loop carries", found.count + 1, raster_max_interpolants);
+            }
+            const bits: u64 = @bitCast(whole);
+            found.slot[found.count] = @intCast(bits >> 1);
+            found.axis[found.count] = @intCast(bits & 1);
+            found.count += 1;
+        },
+        else => {},
+    };
+
+    var constants: std.AutoHashMapUnmanaged(Value, i64) = .empty;
+    defer constants.deinit(allocator);
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            if (func.opcode(inst) != .iconst) continue;
+            const result = func.instResult(inst) orelse continue;
+            try constants.put(allocator, result, func.opcode(inst).iconst);
+        }
+    }
+    try found.pointer.put(allocator, buffer, 0);
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            if (func.opcode(inst) != .arith) continue;
+            const operation = func.opcode(inst).arith;
+            if (operation.op != .add or operation.lhs != buffer) continue;
+            const offset = constants.get(operation.rhs) orelse
+                return Refusal.whole(why, "a rasteriser for a derivative read at an offset it cannot fold");
+            const result = func.instResult(inst) orelse continue;
+            try found.pointer.put(allocator, result, @intCast(@divTrunc(offset, 4)));
+        }
+    }
+    return found;
+}
 
 /// The colour a fragment body writes, on its way to the one pixel this lane owns.
 const RasterColour = struct {
@@ -886,10 +1195,29 @@ const RasterColour = struct {
     /// Which components of the colour being assembled have arrived, in this block.
     held_mask: u4 = 0,
     held: [4]Value = undefined,
+    shift: [4]i64,
+    /// Where this lane's depth goes, and the value, when the draw keeps depth. The store sits
+    /// beside the colour store so a discarded fragment writes neither.
+    depth_pixel: ?Value = null,
+    depth_value: ?Value = null,
+    /// The blend, and the pixel to read the destination from. That address is clamped into the
+    /// row, because the read is not masked the way the write is.
+    blend: ?RasterBlend = null,
+    blend_pixel: ?Value = null,
+    /// The gradient reads, whose results are already replaced. Their loads and the arithmetic
+    /// that addressed them are dead, and the buffer they name does not exist here.
+    gradients: ?*const RasterGradients = null,
     u32_t: Type,
     f32_t: Type,
     bool_t: Type,
 };
+
+/// Store this lane's depth, masked the same way its colour is. A draw that tests depth without
+/// keeping it leaves `depth_pixel` null and nothing is emitted.
+fn rasterStoreDepth(func: *Function, block: Block, colour: *const RasterColour) Error!void {
+    const at = colour.depth_pixel orelse return;
+    try func.appendStoreMasked(block, colour.depth_value.?, at, colour.covered);
+}
 
 /// Re-emit `insts` into `block`, turning the body's colour writes into a masked store of this
 /// lane's pixel.
@@ -915,12 +1243,17 @@ fn rasterColourInto(func: *Function, block: Block, insts: []const Inst, colour: 
     for (insts) |inst| {
         const operation = func.opcode(inst);
         if (operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "discard_fn")) continue;
+        if (colour.gradients) |found| {
+            if (found.addresses(func, inst) != null) continue;
+            if (found.tags(func, inst)) continue;
+        }
         if (operation == .store) {
             const store = operation.store;
             if (gpuIntAttr(func, store.ptr, "color_out")) |component| {
                 if (discards) continue;
                 if (colour.one_word) {
                     try func.appendStoreMasked(block, store.value, colour.pixel, colour.covered);
+                    try rasterStoreDepth(func, block, colour);
                 } else {
                     colour.held[component] = store.value;
                     colour.held_mask |= @as(u4, 1) << @intCast(component);
@@ -936,6 +1269,85 @@ fn rasterColourInto(func: *Function, block: Block, insts: []const Inst, colour: 
     }
 }
 
+/// One blend factor, as a value this lane multiplies by.
+///
+/// `zero` and `one` come back null, because a term that multiplies by either is better removed
+/// than emitted: almost every real blend uses one of them somewhere.
+fn rasterBlendFactor(
+    func: *Function,
+    block: Block,
+    factor: RasterBlendFactor,
+    component: usize,
+    src: [4]Value,
+    dst: [4]Value,
+    f32_t: Type,
+) Error!?Value {
+    const whole: Value = switch (factor) {
+        .zero, .one => return null,
+        .src_colour, .one_minus_src_colour => src[component],
+        .dst_colour, .one_minus_dst_colour => dst[component],
+        .src_alpha, .one_minus_src_alpha => src[3],
+        .dst_alpha, .one_minus_dst_alpha => dst[3],
+    };
+    return switch (factor) {
+        .one_minus_src_colour, .one_minus_dst_colour, .one_minus_src_alpha, .one_minus_dst_alpha => blk: {
+            const unit = try func.appendInst(block, f32_t, .{ .fconst = 1 });
+            break :blk try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = unit, .rhs = whole } });
+        },
+        else => whole,
+    };
+}
+
+/// `value * factor`, with the two factors that need no multiply folded away.
+fn rasterBlendTerm(
+    func: *Function,
+    block: Block,
+    factor: RasterBlendFactor,
+    component: usize,
+    value: Value,
+    src: [4]Value,
+    dst: [4]Value,
+    f32_t: Type,
+) Error!?Value {
+    if (factor == .zero) return null;
+    const scale = try rasterBlendFactor(func, block, factor, component, src, dst, f32_t) orelse
+        return value;
+    return try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = value, .rhs = scale } });
+}
+
+/// Blend this lane's colour with the pixel already there.
+///
+/// The destination arrives as the packed word, so each component is a shift, a mask and a scale
+/// back into the unit range. A byte is far below the point where the convert loses precision.
+fn rasterBlendColour(func: *Function, block: Block, colour: *const RasterColour, src: [4]Value) Error![4]Value {
+    const blend = colour.blend.?;
+    const f32_t = colour.f32_t;
+    const u32_t = colour.u32_t;
+    const word = try func.appendInst(block, u32_t, .{ .load = .{ .ptr = colour.blend_pixel.? } });
+    const scale = try func.appendInst(block, f32_t, .{ .fconst = 1.0 / 255.0 });
+    var dst: [4]Value = undefined;
+    for (0..4) |i| {
+        const shifted = try func.appendArithImm(block, u32_t, .shr, word, colour.shift[i]);
+        const byte = try func.appendArithImm(block, u32_t, .bit_and, shifted, 0xFF);
+        const as_float = try intToFloat(func, block, byte, f32_t);
+        dst[i] = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = as_float, .rhs = scale } });
+    }
+    var out: [4]Value = undefined;
+    for (0..4) |i| {
+        const from_src = try rasterBlendTerm(func, block, blend.source(i), i, src[i], src, dst, f32_t);
+        const from_dst = try rasterBlendTerm(func, block, blend.destination(i), i, dst[i], src, dst, f32_t);
+        if (from_src) |a| {
+            out[i] = if (from_dst) |b|
+                try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } })
+            else
+                a;
+        } else {
+            out[i] = from_dst orelse try func.appendInst(block, f32_t, .{ .fconst = 0 });
+        }
+    }
+    return out;
+}
+
 /// Pack four float components into a framebuffer word and store it, masked.
 ///
 /// A CONSTANT component folds here. The core has no scalar float unit, so the clamp on a
@@ -949,10 +1361,18 @@ fn rasterPackColour(func: *Function, block: Block, colour: *RasterColour) Error!
     var word: ?Value = null;
     var scale: ?Value = null;
     var range: ?[2]Value = null;
-    for (colour.held, 0..) |component, i| {
-        if (constantColourByte(func, component)) |value| {
-            constants |= value << @intCast(raster_colour_shift[i]);
-            continue;
+    // A blend reads the pixel already there, so nothing folds: even a colour the shader states
+    // outright has a destination term that only this lane knows.
+    const components = if (colour.blend != null)
+        try rasterBlendColour(func, block, colour, colour.held)
+    else
+        colour.held;
+    for (components, 0..) |component, i| {
+        if (colour.blend == null) {
+            if (constantColourByte(func, component)) |value| {
+                constants |= value << @intCast(colour.shift[i]);
+                continue;
+            }
         }
         if (range == null) {
             range = .{
@@ -970,7 +1390,7 @@ fn rasterPackColour(func: *Function, block: Block, colour: *RasterColour) Error!
         const clamped = try func.appendInst(block, f32_t, .{ .select = .{ .cond = over, .then = high, .@"else" = lifted } });
         const scaled = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = clamped, .rhs = scale.? } });
         const whole = try func.appendInst(block, u32_t, .{ .convert = .{ .value = scaled } });
-        const placed = try func.appendArithImm(block, u32_t, .shl, whole, raster_colour_shift[i]);
+        const placed = try func.appendArithImm(block, u32_t, .shl, whole, colour.shift[i]);
         word = if (word) |so_far|
             try func.appendInst(block, u32_t, .{ .arith = .{ .op = .bit_or, .lhs = so_far, .rhs = placed } })
         else
@@ -981,6 +1401,7 @@ fn rasterPackColour(func: *Function, block: Block, colour: *RasterColour) Error!
     else
         try func.appendInst(block, u32_t, .{ .iconst = constants });
     try func.appendStoreMasked(block, pixel_word, colour.pixel, colour.covered);
+    try rasterStoreDepth(func, block, colour);
 }
 
 /// Wrap a fragment body in a generated rasteriser, so the core walks the triangle itself.
@@ -1009,7 +1430,7 @@ fn rasterPackColour(func: *Function, block: Block, colour: *RasterColour) Error!
 /// sit between the span and the step, and every exit of the body is an edge to the step. A
 /// per-lane branch inside it is if-converted later by the pass that handles every other kernel, so
 /// nothing here has to know whether a branch varies per lane.
-fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal) Error!void {
+fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, colour_order: RasterColourOrder, depth: ?RasterDepth, blend: ?RasterBlend, perspective: bool, why: ?*Refusal) Error!void {
     if (!hasGpuStage(func, "fragment")) {
         return Refusal.whole(why, "a rasteriser around a function that is not a fragment stage");
     }
@@ -1042,6 +1463,11 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
         }
     }
 
+    if (depth) |d| switch (d.compare) {
+        .equal, .not_equal => return Refusal.whole(why, "a rasteriser for a depth test the compare unit cannot do"),
+        else => {},
+    };
+
     const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const f32_t = try func.types.intern(.{ .float = .f32 });
@@ -1049,16 +1475,25 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
 
     // Everything this lowering cannot do, named before the function is touched, so a refusal
     // leaves the caller's clone the way it arrived. The attributes are gathered on the way past.
-    var attr_param: [raster_max_attributes]Value = undefined;
-    var attr_slot: [raster_max_attributes]u32 = undefined;
+    var attr_param: [raster_max_interpolants]Value = undefined;
+    var attr_slot: [raster_max_interpolants]u32 = undefined;
     var attrs: usize = 0;
     var discard_param: ?Value = null;
+    var reads_frag_z = false;
+    var reads_frag_w = false;
     const original_params = try allocator.dupe(Value, func.blockParams(entry));
     defer allocator.free(original_params);
+    var gradients = try rasterScanGradients(allocator, func, entry, why);
+    defer gradients.deinit(allocator);
     for (original_params) |param| {
         if (isSamplerFunction(func, param)) continue;
         if (hasGpuKey(func, param, "grad_buf")) {
-            return Refusal.whole(why, "a rasteriser for a fragment body that reads derivatives");
+            try func.addAttr(.{ .value = param }, .{ .custom = .{
+                .namespace = "vulcan.gpu",
+                .key = "lowered_graphics_input",
+                .value = .flag,
+            } });
+            continue;
         }
         if (hasGpuKey(func, param, "discard_fn")) {
             discard_param = param;
@@ -1077,8 +1512,12 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
             continue;
         }
         if (gpu.attrs.builtinOf(func, param)) |builtin| switch (builtin) {
-            .frag_coord => if ((gpuIntAttr(func, param, "bicomp") orelse 0) > 1) {
-                return Refusal.whole(why, "a rasteriser that interpolates depth or the perspective divide");
+            // Depth and the reciprocal of w are both linear in screen space, so they interpolate
+            // the same way the attributes do.
+            .frag_coord => switch (gpuIntAttr(func, param, "bicomp") orelse 0) {
+                2 => reads_frag_z = true,
+                3 => reads_frag_w = true,
+                else => {},
             },
             else => return Refusal.whole(why, "a rasteriser for a fragment body that reads a builtin other than the coordinate"),
         };
@@ -1110,8 +1549,11 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
                 return Refusal.at(why, func, block, index, inst, "a rasteriser for a fragment body that writes depth");
             }
             const component = gpuIntAttr(func, store.ptr, "color_out") orelse continue;
-            if (component > 3 or store.mask != null) {
-                return Refusal.at(why, func, block, index, inst, "a rasteriser for a colour write it cannot place");
+            if (component > 3) {
+                return Refusal.at(why, func, block, index, inst, "a rasteriser for a body that writes more than one colour target");
+            }
+            if (store.mask != null) {
+                return Refusal.at(why, func, block, index, inst, "a rasteriser for a colour written under a condition");
             }
             switch (func.types.type_kind(func.valueType(store.value))) {
                 .int => |i| {
@@ -1142,6 +1584,9 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     if (one_word and as_components) {
         return Refusal.whole(why, "a rasteriser for a body that writes a colour as a word in one place and as components in another");
     }
+    if (one_word and blend != null) {
+        return Refusal.whole(why, "a rasteriser that blends a colour the body writes as one whole word");
+    }
     if (colours == 0) {
         return Refusal.whole(why, "a rasteriser for a fragment body that writes no colour");
     }
@@ -1165,12 +1610,25 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     try gpu.attrs.setBuiltin(func, lane, .thread_id_x);
     const lanes = try func.appendBlockParam(entry, u32_t);
     try gpu.attrs.setBuiltin(func, lanes, .block_dim_x);
+    // Which row this warp starts on and how far it jumps, so a dispatch of several warps splits
+    // the triangle by row rather than every warp walking all of it. One group leaves the walk
+    // exactly as it was.
+    const row_first = try func.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(func, row_first, .block_id_x);
+    const row_stride = try func.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(func, row_stride, .grid_dim_x);
     const ptr_t = try func.types.ptrGlobal();
     const frame = try func.appendBlockParam(entry, ptr_t);
     const vertices = try func.appendBlockParam(entry, ptr_t);
     const width = try func.appendBlockParam(entry, u32_t);
     const height = try func.appendBlockParam(entry, u32_t);
     const pitch = try func.appendBlockParam(entry, u32_t);
+    // The depth buffer, its row pitch and the bytes one of its elements takes. The element is
+    // wider than the value for a combined depth and stencil format, where the depth is the float
+    // at the bottom of it.
+    const depth_base = if (depth != null) try func.appendBlockParam(entry, ptr_t) else null;
+    const depth_pitch = if (depth != null) try func.appendBlockParam(entry, u32_t) else null;
+    const depth_bytes = if (depth != null) try func.appendBlockParam(entry, u32_t) else null;
 
     const row_loop = try func.appendBlock();
     const span = try func.appendBlock();
@@ -1202,7 +1660,8 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     // Each edge at the first pixel this lane owns, and the step for one whole warp along a row.
     const lane_signed = try func.appendInst(entry, i32_t, .{ .unary = .{ .op = .reinterpret, .value = lane } });
     const lanes_signed = try func.appendInst(entry, i32_t, .{ .unary = .{ .op = .reinterpret, .value = lanes } });
-    const origin = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const origin = try func.appendInst(entry, i32_t, .{ .unary = .{ .op = .reinterpret, .value = row_first } });
+    const rows_signed = try func.appendInst(entry, i32_t, .{ .unary = .{ .op = .reinterpret, .value = row_stride } });
     var first: [3]Value = undefined;
     var step_x: [3]Value = undefined;
     for (0..3) |i| {
@@ -1210,7 +1669,25 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
         const y_rel = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = origin, .rhs = vy[i] } });
         const along = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = x_rel, .rhs = dy[i] } });
         const down = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = y_rel, .rhs = dx[i] } });
-        first[i] = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = along, .rhs = down } });
+        const raw_first = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = along, .rhs = down } });
+        // Vulkan's fill rule. A pixel exactly on an edge belongs to the triangle only when that
+        // edge is the triangle's top or left one, or two triangles sharing an edge both paint the
+        // pixels along it. The edge function rises with x by dy, so the inside is to the right
+        // when dy is positive, which is a left edge; a horizontal edge has the inside below it
+        // when dx is negative, which is a top edge.
+        //
+        // The edges are integers, so one subtracted here turns the span's `e < 0` test into an
+        // exclusive one for the other two edges. The walk only ever adds to this value, so the
+        // bias carries across every pixel and every row at no cost per pixel.
+        const edge_zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+        const edge_one = try func.appendInst(entry, i32_t, .{ .iconst = 1 });
+        const goes_down = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = edge_zero, .rhs = dy[i] } });
+        const is_flat = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = dy[i], .rhs = edge_zero } });
+        const goes_left = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = dx[i], .rhs = edge_zero } });
+        const is_top = try func.appendInst(entry, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = is_flat, .rhs = goes_left } });
+        const top_left = try func.appendInst(entry, bool_t, .{ .arith = .{ .op = .bit_or, .lhs = goes_down, .rhs = is_top } });
+        const bias = try func.appendInst(entry, i32_t, .{ .select = .{ .cond = top_left, .then = edge_zero, .@"else" = edge_one } });
+        first[i] = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = raw_first, .rhs = bias } });
         step_x[i] = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = lanes_signed, .rhs = dy[i] } });
     }
 
@@ -1219,10 +1696,36 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     //   a2 - a0 = gx * wx + gy * wy
     // for the two gradients is the triangle's area under both, so the reciprocal is taken once and
     // every attribute multiplies by it.
-    var attr_first: [raster_max_attributes]Value = undefined;
-    var attr_step_x: [raster_max_attributes]Value = undefined;
-    var attr_step_y: [raster_max_attributes]Value = undefined;
-    if (attrs > 0) {
+    var attr_first: [raster_max_interpolants]Value = undefined;
+    var attr_step_x: [raster_max_interpolants]Value = undefined;
+    var attr_step_y: [raster_max_interpolants]Value = undefined;
+    var attr_grad_x: [raster_max_interpolants]Value = undefined;
+    var attr_grad_y: [raster_max_interpolants]Value = undefined;
+    // A derivative of a slot the body never reads directly still needs that slot interpolated,
+    // so those come next. Depth interpolates the same way and takes the slot above them all.
+    var extras = attrs;
+    const too_many = "a rasteriser for more interpolated values than one loop carries";
+    for (0..gradients.count) |g| {
+        _ = rasterSlotIndex(&attr_slot, &extras, gradients.slot[g], raster_max_interpolants) orelse
+            return Refusal.tooBig(why, too_many, extras + 1, raster_max_interpolants);
+    }
+    const frag_z = if (reads_frag_z)
+        rasterSlotIndex(&attr_slot, &extras, raster_vertex_z_offset, raster_max_interpolants) orelse
+            return Refusal.tooBig(why, too_many, extras + 1, raster_max_interpolants)
+    else
+        null;
+    const frag_w = if (reads_frag_w or (perspective and attrs > 0))
+        rasterSlotIndex(&attr_slot, &extras, raster_vertex_w_offset, raster_max_interpolants) orelse
+            return Refusal.tooBig(why, too_many, extras + 1, raster_max_interpolants)
+    else
+        null;
+    const depth_index = if (depth != null)
+        rasterSlotIndex(&attr_slot, &extras, raster_vertex_z_offset, raster_max_interpolants) orelse
+            return Refusal.tooBig(why, too_many, extras + 1, raster_max_interpolants)
+    else
+        0;
+    const interps = extras;
+    if (interps > 0) {
         const wx = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = vx[2], .rhs = vx[0] } });
         const wy = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = vy[2], .rhs = vy[0] } });
         const fux = try intToFloat(func, entry, dx[0], f32_t);
@@ -1240,11 +1743,32 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
         const fx = try intToFloat(func, entry, from_x, f32_t);
         const fy = try intToFloat(func, entry, from_y, f32_t);
         const flanes = try intToFloat(func, entry, lanes, f32_t);
-        for (0..attrs) |a| {
+        // The reciprocal of w at each corner, which the correction multiplies by. It is read
+        // once rather than per attribute.
+        var recip: [3]Value = undefined;
+        if (perspective) {
+            for (0..3) |i| {
+                const at = try appendOffset(func, entry, vertices, @intCast(i * vertex_output_stride + raster_vertex_w_offset), u32_t);
+                recip[i] = try func.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+            }
+        }
+        for (0..interps) |a| {
             var corner: [3]Value = undefined;
             for (0..3) |i| {
                 const at = try appendOffset(func, entry, vertices, @intCast(i * vertex_output_stride + attr_slot[a]), u32_t);
                 corner[i] = try func.appendInst(entry, f32_t, .{ .load = .{ .ptr = at } });
+            }
+            // An attribute divided by w is linear in screen space where the attribute itself is
+            // not, so the correction interpolates that and undoes the divide per pixel. Depth
+            // and the reciprocal itself are already linear and stay as they are.
+            if (perspective and attr_slot[a] != raster_vertex_z_offset and
+                attr_slot[a] != raster_vertex_w_offset)
+            {
+                for (0..3) |i| {
+                    corner[i] = try func.appendInst(entry, f32_t, .{
+                        .arith = .{ .op = .mul, .lhs = corner[i], .rhs = recip[i] },
+                    });
+                }
             }
             const d1 = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .sub, .lhs = corner[1], .rhs = corner[0] } });
             const d2 = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .sub, .lhs = corner[2], .rhs = corner[0] } });
@@ -1256,23 +1780,56 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
             attr_first[a] = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = corner_x, .rhs = at_y } });
             attr_step_x[a] = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = gx, .rhs = flanes } });
             attr_step_y[a] = gy;
+            // One pixel of each, which is what a derivative read asks for. The span steps a
+            // whole warp at a time, so the x one is not the step.
+            attr_grad_x[a] = gx;
+            attr_grad_y[a] = gy;
         }
     }
 
-    const top = try func.appendInst(entry, u32_t, .{ .iconst = 0 });
-    // The span tests after it writes, so a draw with no rows has to turn back here. The width
-    // needs no such test: a pixel past the end of a row drops out with the coverage.
-    const rows = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .ne, .lhs = height, .rhs = top } });
+    var dx_rows: [3]Value = undefined;
+    for (0..3) |i| {
+        dx_rows[i] = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = dx[i], .rhs = rows_signed } });
+    }
+    var attr_step_rows: [raster_max_interpolants]Value = undefined;
+    if (interps > 0) {
+        const frows = try intToFloat(func, entry, row_stride, f32_t);
+        for (0..interps) |a| {
+            attr_step_rows[a] = try func.appendInst(entry, f32_t, .{
+                .arith = .{ .op = .mul, .lhs = attr_step_y[a], .rhs = frows },
+            });
+        }
+    }
+    const pitch_rows = try func.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = pitch, .rhs = row_stride } });
+    const depth_pitch_rows = if (depth_pitch) |dp|
+        try func.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = dp, .rhs = row_stride } })
+    else
+        null;
+    // Where this warp's first row starts, in each buffer.
+    const frame_first = try func.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = pitch, .rhs = row_first } });
+    const frame_row = try func.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = frame, .rhs = frame_first } });
+    const depth_row_first = if (depth_base) |base| blk: {
+        const along = try func.appendInst(entry, u32_t, .{ .arith = .{ .op = .mul, .lhs = depth_pitch.?, .rhs = row_first } });
+        break :blk try func.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = along } });
+    } else null;
+
+    const top = row_first;
+    // The span tests after it writes, so a warp whose first row is already past the bottom has to
+    // turn back here. The width needs no such test: a pixel past the end of a row drops out with
+    // the coverage.
+    const rows = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = top, .rhs = height } });
     // A conditional carries both edges itself, so the block it ends may hold no terminator, and
     // the body left one on this block.
     func.terminatorPtr(entry).* = null;
-    var into_rows: [5 + raster_max_attributes]Value = undefined;
-    into_rows[0..5].* = .{ top, first[0], first[1], first[2], frame };
-    for (0..attrs) |a| into_rows[5 + a] = attr_first[a];
+    const carries = 5 + interps + @as(usize, if (depth != null) 1 else 0);
+    var into_rows: [6 + raster_max_interpolants]Value = undefined;
+    into_rows[0..5].* = .{ top, first[0], first[1], first[2], frame_row };
+    for (0..interps) |a| into_rows[5 + a] = attr_first[a];
+    if (depth_row_first) |at| into_rows[5 + interps] = at;
     try func.appendIf(
         entry,
         rows,
-        .{ .target = row_loop, .args = into_rows[0 .. 5 + attrs] },
+        .{ .target = row_loop, .args = into_rows[0..carries] },
         .{ .target = done, .args = &.{} },
     );
 
@@ -1283,13 +1840,14 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     const row1 = try func.appendBlockParam(row_loop, i32_t);
     const row2 = try func.appendBlockParam(row_loop, i32_t);
     const row_base = try func.appendBlockParam(row_loop, ptr_t);
-    var attr_row: [raster_max_attributes]Value = undefined;
-    for (0..attrs) |a| attr_row[a] = try func.appendBlockParam(row_loop, f32_t);
+    var attr_row: [raster_max_interpolants]Value = undefined;
+    for (0..interps) |a| attr_row[a] = try func.appendBlockParam(row_loop, f32_t);
+    const depth_row = if (depth != null) try func.appendBlockParam(row_loop, ptr_t) else null;
     const row_start = try func.appendInst(row_loop, u32_t, .{ .iconst = 0 });
-    var into_span: [4 + raster_max_attributes]Value = undefined;
+    var into_span: [4 + raster_max_interpolants]Value = undefined;
     into_span[0..4].* = .{ row_start, row0, row1, row2 };
-    for (0..attrs) |a| into_span[4 + a] = attr_row[a];
-    try func.setJump(row_loop, span, into_span[0 .. 4 + attrs]);
+    for (0..interps) |a| into_span[4 + a] = attr_row[a];
+    try func.setJump(row_loop, span, into_span[0 .. 4 + interps]);
 
     // One iteration per warp step along the row. Coverage is every edge non-negative, and the
     // lowering has `lt` and not `ge`, so it is three compares, two ORs and a NOT.
@@ -1297,15 +1855,29 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     const edge0 = try func.appendBlockParam(span, i32_t);
     const edge1 = try func.appendBlockParam(span, i32_t);
     const edge2 = try func.appendBlockParam(span, i32_t);
+    const attr_origin = attr_param;
+    for (0..interps) |a| {
+        attr_param[a] = try func.appendBlockParam(span, f32_t);
+    }
+    // Undoing the divide costs ONE reciprocal for the pixel rather than one per attribute. The
+    // loop carries the uncorrected value, which is the one that steps by a constant.
+    const here_w = if (perspective and attrs > 0) blk: {
+        const unit = try func.appendInst(span, f32_t, .{ .fconst = 1 });
+        break :blk try func.appendInst(span, f32_t, .{
+            .arith = .{ .op = .div, .lhs = unit, .rhs = attr_param[frag_w.?] },
+        });
+    } else null;
     for (0..attrs) |a| {
-        const here = try func.appendBlockParam(span, f32_t);
-        func.replaceAllUses(attr_param[a], here);
-        try func.addAttr(.{ .value = attr_param[a] }, .{ .custom = .{
+        const seen = if (here_w) |w|
+            try func.appendInst(span, f32_t, .{ .arith = .{ .op = .mul, .lhs = attr_param[a], .rhs = w } })
+        else
+            attr_param[a];
+        func.replaceAllUses(attr_origin[a], seen);
+        try func.addAttr(.{ .value = attr_origin[a] }, .{ .custom = .{
             .namespace = "vulcan.gpu",
             .key = "lowered_graphics_input",
             .value = .flag,
         } });
-        attr_param[a] = here;
     }
     const zero = try func.appendInst(span, i32_t, .{ .iconst = 0 });
     const left0 = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = edge0, .rhs = zero } });
@@ -1316,9 +1888,43 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     const inside = try func.appendArithImm(span, bool_t, .bit_xor, outside, 1);
     const px = try func.appendInst(span, u32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = lane } });
     const on_screen = try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = px, .rhs = width } });
-    const covered = try func.appendInst(span, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = inside, .rhs = on_screen } });
+    const on_frame = try func.appendInst(span, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = inside, .rhs = on_screen } });
     const offset = try func.appendArithImm(span, u32_t, .mul, px, 4);
     const pixel = try func.appendInst(span, ptr_t, .{ .arith = .{ .op = .add, .lhs = row_base, .rhs = offset } });
+
+    // The depth test. The load is not masked, so a lane past the end of the row reads the first
+    // pixel of its own row instead of past the buffer; its result is dropped with the coverage.
+    var covered = on_frame;
+    var depth_at: ?Value = null;
+    // A blend and a depth test both READ the pixel, and a read is not masked the way the write
+    // is, so a lane past the end of the row is sent to the start of its own row instead.
+    const safe_px = if (depth != null or blend != null) blk: {
+        const home = try func.appendInst(span, u32_t, .{ .iconst = 0 });
+        break :blk try func.appendInst(span, u32_t, .{ .select = .{ .cond = on_screen, .then = px, .@"else" = home } });
+    } else null;
+    const blend_at = if (blend != null) blk: {
+        const along = try func.appendArithImm(span, u32_t, .mul, safe_px.?, 4);
+        break :blk try func.appendInst(span, ptr_t, .{ .arith = .{ .op = .add, .lhs = row_base, .rhs = along } });
+    } else null;
+    if (depth) |d| {
+        const here = attr_param[depth_index];
+        const safe = safe_px.?;
+        const along = try func.appendInst(span, u32_t, .{ .arith = .{ .op = .mul, .lhs = safe, .rhs = depth_bytes.? } });
+        const at = try func.appendInst(span, ptr_t, .{ .arith = .{ .op = .add, .lhs = depth_row.?, .rhs = along } });
+        const stored = try func.appendInst(span, f32_t, .{ .load = .{ .ptr = at } });
+        // The compare unit has `lt` and `le` and no `gt`, so the greater tests swap their operands.
+        const passes = switch (d.compare) {
+            .never => try func.appendInst(span, bool_t, .{ .iconst = 0 }),
+            .always => try func.appendInst(span, bool_t, .{ .iconst = 1 }),
+            .less => try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = here, .rhs = stored } }),
+            .less_equal => try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .le, .lhs = here, .rhs = stored } }),
+            .greater => try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .lt, .lhs = stored, .rhs = here } }),
+            .greater_equal => try func.appendInst(span, bool_t, .{ .icmp = .{ .op = .le, .lhs = stored, .rhs = here } }),
+            .equal, .not_equal => unreachable,
+        };
+        covered = try func.appendInst(span, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = on_frame, .rhs = passes } });
+        if (d.write) depth_at = at;
+    }
 
     // The coordinate the body reads, before the body, since it is what the body is written around.
     for (original_params) |param| {
@@ -1329,25 +1935,88 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
             .key = "lowered_graphics_input",
             .value = .flag,
         } });
-        const whole = if ((gpuIntAttr(func, param, "bicomp") orelse 0) == 0) px else y;
-        const ty = func.valueType(param);
-        const coord = if (isFloat(func, ty))
-            try intToFloat(func, span, whole, ty)
-        else
-            whole;
+        const component = gpuIntAttr(func, param, "bicomp") orelse 0;
+        // Depth and 1/w arrive already interpolated and already float, so only x and y need the
+        // convert.
+        const coord = switch (component) {
+            2 => attr_param[frag_z.?],
+            3 => attr_param[frag_w.?],
+            else => blk: {
+                const whole = if (component == 0) px else y;
+                const ty = func.valueType(param);
+                break :blk if (isFloat(func, ty))
+                    try intToFloat(func, span, whole, ty)
+                else
+                    whole;
+            },
+        };
         func.replaceAllUses(param, coord);
     }
 
+    // Every derivative read, as the value at the neighbouring pixel. The span dominates the
+    // whole body, so a read in a later block sees these too.
+    // One reciprocal per axis serves every attribute's derivative on it.
+    var neighbour_w: [2]?Value = .{ null, null };
+    if (gradients.buffer != null) {
+        // The body's first block was emptied into `body`, so the function's own blocks no longer
+        // hold it. Walk what was taken out as well as the blocks still standing.
+        for (0..body_blocks) |bi| {
+            const block: Block = @fromBackingInt(@intCast(bi));
+            const insts = if (bi == 0) body else func.blockInsts(block);
+            for (insts) |inst| {
+                const index = gradients.addresses(func, inst) orelse continue;
+                if (index >= gradients.count) {
+                    return Refusal.whole(why, "a rasteriser for a derivative read past the slots the body declares");
+                }
+                const result = func.instResult(inst) orelse continue;
+                var which: ?usize = null;
+                for (0..extras) |a| {
+                    if (attr_slot[a] == gradients.slot[index]) which = a;
+                }
+                const a = which orelse
+                    return Refusal.whole(why, "a rasteriser for a derivative of a slot it does not interpolate");
+                const axis = gradients.axis[index];
+                const along = if (axis == 0) attr_grad_x[a] else attr_grad_y[a];
+                const stepped = try func.appendInst(span, f32_t, .{
+                    .arith = .{ .op = .add, .lhs = attr_param[a], .rhs = along },
+                });
+                var neighbour = stepped;
+                if (perspective and frag_w != null) {
+                    if (neighbour_w[axis] == null) {
+                        const w_along = if (axis == 0) attr_grad_x[frag_w.?] else attr_grad_y[frag_w.?];
+                        const den = try func.appendInst(span, f32_t, .{
+                            .arith = .{ .op = .add, .lhs = attr_param[frag_w.?], .rhs = w_along },
+                        });
+                        const unit = try func.appendInst(span, f32_t, .{ .fconst = 1 });
+                        neighbour_w[axis] = try func.appendInst(span, f32_t, .{
+                            .arith = .{ .op = .div, .lhs = unit, .rhs = den },
+                        });
+                    }
+                    neighbour = try func.appendInst(span, f32_t, .{
+                        .arith = .{ .op = .mul, .lhs = stepped, .rhs = neighbour_w[axis].? },
+                    });
+                }
+                func.replaceAllUses(result, neighbour);
+            }
+        }
+    }
+
     // What one warp step carries, which every exit of the body has to hand to the step.
-    var carried: [4 + raster_max_attributes]Value = undefined;
+    var carried: [4 + raster_max_interpolants]Value = undefined;
     carried[0..4].* = .{ x, edge0, edge1, edge2 };
-    for (0..attrs) |a| carried[4 + a] = attr_param[a];
-    const carry = carried[0 .. 4 + attrs];
+    for (0..interps) |a| carried[4 + a] = attr_param[a];
+    const carry = carried[0 .. 4 + interps];
 
     var colour: RasterColour = .{
         .pixel = pixel,
         .covered = covered,
         .one_word = one_word,
+        .shift = colour_order.shifts(),
+        .depth_pixel = depth_at,
+        .depth_value = if (depth != null) attr_param[depth_index] else null,
+        .blend = blend,
+        .blend_pixel = blend_at,
+        .gradients = if (gradients.buffer != null) &gradients else null,
         .u32_t = u32_t,
         .f32_t = f32_t,
         .bool_t = bool_t,
@@ -1377,21 +2046,21 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     // arrive as parameters rather than from the span directly.
     var at_x = x;
     var at_edge: [3]Value = .{ edge0, edge1, edge2 };
-    var at_attr: [raster_max_attributes]Value = attr_param;
+    var at_attr: [raster_max_interpolants]Value = attr_param;
     if (step != span) {
         at_x = try func.appendBlockParam(step, u32_t);
         for (0..3) |i| at_edge[i] = try func.appendBlockParam(step, i32_t);
-        for (0..attrs) |a| at_attr[a] = try func.appendBlockParam(step, f32_t);
+        for (0..interps) |a| at_attr[a] = try func.appendBlockParam(step, f32_t);
     }
     const next_x = try func.appendInst(step, u32_t, .{ .arith = .{ .op = .add, .lhs = at_x, .rhs = lanes } });
-    var along_span: [4 + raster_max_attributes]Value = undefined;
+    var along_span: [4 + raster_max_interpolants]Value = undefined;
     along_span[0] = next_x;
     for (0..3) |i| {
         along_span[1 + i] = try func.appendInst(step, i32_t, .{
             .arith = .{ .op = .add, .lhs = at_edge[i], .rhs = step_x[i] },
         });
     }
-    for (0..attrs) |a| {
+    for (0..interps) |a| {
         along_span[4 + a] = try func.appendInst(step, f32_t, .{
             .arith = .{ .op = .add, .lhs = at_attr[a], .rhs = attr_step_x[a] },
         });
@@ -1400,27 +2069,30 @@ fn lowerFragmentRaster(allocator: std.mem.Allocator, func: *Function, why: ?*Ref
     try func.appendIf(
         step,
         more_x,
-        .{ .target = span, .args = along_span[0 .. 4 + attrs] },
+        .{ .target = span, .args = along_span[0 .. 4 + interps] },
         .{ .target = next_row, .args = &.{} },
     );
 
-    const next_y = try func.appendArithImm(next_row, u32_t, .add, y, 1);
-    const down0 = try func.appendInst(next_row, i32_t, .{ .arith = .{ .op = .sub, .lhs = row0, .rhs = dx[0] } });
-    const down1 = try func.appendInst(next_row, i32_t, .{ .arith = .{ .op = .sub, .lhs = row1, .rhs = dx[1] } });
-    const down2 = try func.appendInst(next_row, i32_t, .{ .arith = .{ .op = .sub, .lhs = row2, .rhs = dx[2] } });
-    const next_base = try func.appendInst(next_row, ptr_t, .{ .arith = .{ .op = .add, .lhs = row_base, .rhs = pitch } });
-    var down_row: [5 + raster_max_attributes]Value = undefined;
+    const next_y = try func.appendInst(next_row, u32_t, .{ .arith = .{ .op = .add, .lhs = y, .rhs = row_stride } });
+    const down0 = try func.appendInst(next_row, i32_t, .{ .arith = .{ .op = .sub, .lhs = row0, .rhs = dx_rows[0] } });
+    const down1 = try func.appendInst(next_row, i32_t, .{ .arith = .{ .op = .sub, .lhs = row1, .rhs = dx_rows[1] } });
+    const down2 = try func.appendInst(next_row, i32_t, .{ .arith = .{ .op = .sub, .lhs = row2, .rhs = dx_rows[2] } });
+    const next_base = try func.appendInst(next_row, ptr_t, .{ .arith = .{ .op = .add, .lhs = row_base, .rhs = pitch_rows } });
+    var down_row: [6 + raster_max_interpolants]Value = undefined;
     down_row[0..5].* = .{ next_y, down0, down1, down2, next_base };
-    for (0..attrs) |a| {
+    for (0..interps) |a| {
         down_row[5 + a] = try func.appendInst(next_row, f32_t, .{
-            .arith = .{ .op = .add, .lhs = attr_row[a], .rhs = attr_step_y[a] },
+            .arith = .{ .op = .add, .lhs = attr_row[a], .rhs = attr_step_rows[a] },
         });
     }
+    if (depth_row) |at| down_row[5 + interps] = try func.appendInst(next_row, ptr_t, .{
+        .arith = .{ .op = .add, .lhs = at, .rhs = depth_pitch_rows.? },
+    });
     const more_y = try func.appendInst(next_row, bool_t, .{ .icmp = .{ .op = .lt, .lhs = next_y, .rhs = height } });
     try func.appendIf(
         next_row,
         more_y,
-        .{ .target = row_loop, .args = down_row[0 .. 5 + attrs] },
+        .{ .target = row_loop, .args = down_row[0..carries] },
         .{ .target = done, .args = &.{} },
     );
     func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
@@ -1466,7 +2138,7 @@ fn isSamplerFunction(func: *const Function, value: Value) bool {
 }
 
 fn isIgnoredEntryParam(func: *const Function, value: Value) bool {
-    return isSamplerFunction(func, value) or hasGpuKey(func, value, "lowered_graphics_input");
+    return isSamplerFunction(func, value) or hasGpuKey(func, value, "math_fn") or hasGpuKey(func, value, "lowered_graphics_input");
 }
 
 fn appendOffset(func: *Function, block: Block, ptr: Value, offset: i64, int_ty: Type) Error!Value {
@@ -1516,8 +2188,15 @@ const sampler_level_count_offset = 96;
 const sampler_valid_offset = 100;
 const sampler_read_fallback_offset = 104;
 const sampler_write_fallback_offset = 108;
-const sampler_descriptor_size = 100;
-const nullable_sampler_descriptor_size = 112;
+const sampler_depth_offset = 112;
+const sampler_depth_float_offset = 116;
+const sampler_depth_reciprocal_offset = 120;
+const sampler_address_w_offset = 124;
+/// 256 floats, sRGB decoded to linear, one per byte value. Pinned to the
+/// _Static_assert on `srgb_table` in mesa's gcv_cmd_buffer.c.
+const sampler_srgb_table_offset = 128;
+pub const sampler_descriptor_size = 144;
+const nullable_sampler_descriptor_size = 144;
 const rgba32f_texel_bytes = 16;
 
 const SampleCoordinate = struct {
@@ -1537,8 +2216,12 @@ const SampleImage = struct {
     row_pitch: Value,
     texel_bytes: Value,
     float_format: Value,
+    half_float_format: Value,
     depth_format: Value,
     bgra_format: Value,
+    int_format: Value,
+    srgb_format: Value,
+    r8_format: Value,
     integer_bias: Value,
     unorm_scale: Value,
     int_ty: Type,
@@ -1662,38 +2345,153 @@ fn selectSampleCoordinate(func: *Function, block: Block, linear: Value, filtered
     };
 }
 
-fn lowerSampleTexel(func: *Function, block: Block, image: SampleImage, x: SampleCoordinate, y: SampleCoordinate) Error![4]Value {
-    const outside = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = x.border, .rhs = y.border } });
-    const row = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = y.index, .rhs = image.row_pitch } });
-    const column = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = x.index, .rhs = image.texel_bytes } });
-    const byte_offset = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column } });
-    const texel = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = image.base, .rhs = byte_offset } });
-    const packed_texel = try func.appendInst(block, image.int_ty, .{ .load = .{ .ptr = texel } });
+/// Read the descriptor's format word and build the predicates and constants a texel decode
+/// needs. The caller supplies the base, which a cube face or a volume slice adjusts.
+fn sampleImageFormats(func: *Function, block: Block, desc: Value, base: Value, row_pitch: Value, texel_bytes: Value, int_ty: Type, ptr_ty: Type) Error!SampleImage {
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const bool_t = try func.types.intern(.bool);
+    const format_ptr = try appendOffset(func, block, desc, sampler_format_offset, int_ty);
+    const format = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = format_ptr } });
+    const float_format_value = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+    const half_float_format_value = try func.appendInst(block, int_ty, .{ .iconst = 4 });
+    const bgra_format_value = try func.appendInst(block, int_ty, .{ .iconst = 2 });
+    const depth_format_value = try func.appendInst(block, int_ty, .{ .iconst = 3 });
+    const int_format_value = try func.appendInst(block, int_ty, .{ .iconst = 5 });
+    // sRGB carries the same bytes as its UNORM twin, so it reuses the byte
+    // order predicate and differs only in the decode.
+    const r8_format_value = try func.appendInst(block, int_ty, .{ .iconst = 8 });
+    const srgb_rgba_value = try func.appendInst(block, int_ty, .{ .iconst = 6 });
+    const srgb_bgra_value = try func.appendInst(block, int_ty, .{ .iconst = 7 });
+    const is_srgb_rgba = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = srgb_rgba_value } });
+    const is_srgb_bgra = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = srgb_bgra_value } });
+    const is_bgra_unorm = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = bgra_format_value } });
+    return .{
+        .desc = desc,
+        .base = base,
+        .row_pitch = row_pitch,
+        .texel_bytes = texel_bytes,
+        .float_format = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = float_format_value } }),
+        .half_float_format = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = half_float_format_value } }),
+        .depth_format = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = depth_format_value } }),
+        .bgra_format = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_or, .lhs = is_bgra_unorm, .rhs = is_srgb_bgra } }),
+        .int_format = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = int_format_value } }),
+        .srgb_format = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_or, .lhs = is_srgb_rgba, .rhs = is_srgb_bgra } }),
+        .r8_format = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = r8_format_value } }),
+        .integer_bias = try func.appendInst(block, f32_t, .{ .fconst = 8388608 }),
+        .unorm_scale = try func.appendInst(block, f32_t, .{ .fconst = 1.0 / 255.0 }),
+        .int_ty = int_ty,
+        .ptr_ty = ptr_ty,
+        .f32_t = f32_t,
+        .bool_t = bool_t,
+    };
+}
+
+/// Decode one texel into four f32 components. The descriptor's format word picks the
+/// layout: four f32, four f16, RGBA8 or BGRA8 unorm, depth in the first word, or one
+/// 32 bit integer. A read takes the descriptor's fallback when the host bound no image.
+fn decodeTexel(func: *Function, block: Block, image: SampleImage, texel: Value, byte_offset: Value) Error![4]Value {
     const zero = try func.appendInst(block, image.int_ty, .{ .iconst = 0 });
+    // A one byte texel sits at any address, and the load unit answers a word load with the
+    // word that HOLDS the address, not the bytes from it. So the load goes back to the word
+    // boundary and the shift below picks the byte out of it.
+    const misalign = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .bit_and, .lhs = byte_offset, .imm = 3 } });
+    const step_back = try func.appendInst(block, image.int_ty, .{ .select = .{ .cond = image.r8_format, .then = misalign, .@"else" = zero } });
+    const aligned_texel = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .sub, .lhs = texel, .rhs = step_back } });
+    const r8_shift = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .shl, .lhs = misalign, .imm = 3 } });
+    const packed_ptr = try nullableImagePointer(func, block, image.desc, aligned_texel, false, 0, image.int_ty);
+    const packed_texel = try func.appendInst(block, image.int_ty, .{ .load = .{ .ptr = packed_ptr } });
+    const half_t = try func.types.intern(.{ .float = .f16 });
+    const is_float = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = image.float_format, .rhs = image.half_float_format } });
     var values: [4]Value = undefined;
     for (0..4) |component| {
         const offset: i64 = @intCast(component * 4);
         const float_offset = try func.appendInst(block, image.int_ty, .{ .iconst = offset });
+        // A one-word texel holds every component, so an offset past it is clamped away
+        // unless the format really is four separate words.
         const safe_float_offset = try func.appendInst(block, image.int_ty, .{ .select = .{ .cond = image.float_format, .then = float_offset, .@"else" = zero } });
         const source = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = texel, .rhs = safe_float_offset } });
-        const float_value = try func.appendInst(block, image.f32_t, .{ .load = .{ .ptr = source } });
+        const float_ptr = try nullableImagePointer(func, block, image.desc, source, false, offset, image.int_ty);
+        const float_value = try func.appendInst(block, image.f32_t, .{ .load = .{ .ptr = float_ptr } });
+        const pair_offset: i64 = @intCast((component / 2) * 4);
+        const half_pair_offset = try func.appendInst(block, image.int_ty, .{ .iconst = pair_offset });
+        const safe_half_pair_offset = try func.appendInst(block, image.int_ty, .{ .select = .{ .cond = image.half_float_format, .then = half_pair_offset, .@"else" = zero } });
+        const half_source = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = texel, .rhs = safe_half_pair_offset } });
+        const half_ptr = try nullableImagePointer(func, block, image.desc, half_source, false, pair_offset, image.int_ty);
+        const half_pair = try func.appendInst(block, image.int_ty, .{ .load = .{ .ptr = half_ptr } });
+        const half_shift = try func.appendInst(block, image.int_ty, .{ .iconst = if (component % 2 == 0) 0 else 16 });
+        const shifted_half = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .shr, .lhs = half_pair, .rhs = half_shift } });
+        const half_bits = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .bit_and, .lhs = shifted_half, .imm = 0xffff } });
+        const half_value = try func.appendInst(block, half_t, .{ .unary = .{ .op = .reinterpret, .value = half_bits } });
+        const wide_half_value = try func.appendInst(block, image.f32_t, .{ .convert = .{ .value = half_value } });
+        const selected_float = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = image.half_float_format, .then = wide_half_value, .@"else" = float_value } });
         const rgba_shift = try func.appendInst(block, image.int_ty, .{ .iconst = @as(i64, @intCast(component * 8)) });
         const bgra_shifts = [4]i64{ 16, 8, 0, 24 };
         const bgra_shift = try func.appendInst(block, image.int_ty, .{ .iconst = bgra_shifts[component] });
-        const shift = try func.appendInst(block, image.int_ty, .{ .select = .{ .cond = image.bgra_format, .then = bgra_shift, .@"else" = rgba_shift } });
+        const packed_shift = try func.appendInst(block, image.int_ty, .{ .select = .{ .cond = image.bgra_format, .then = bgra_shift, .@"else" = rgba_shift } });
+        const shift = if (component == 0)
+            try func.appendInst(block, image.int_ty, .{ .select = .{ .cond = image.r8_format, .then = r8_shift, .@"else" = packed_shift } })
+        else
+            packed_shift;
         const shifted = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .shr, .lhs = packed_texel, .rhs = shift } });
         const byte = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .bit_and, .lhs = shifted, .imm = 0xff } });
         const biased_bits = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .bit_or, .lhs = byte, .imm = 0x4b00_0000 } });
         const biased = try func.appendInst(block, image.f32_t, .{ .unary = .{ .op = .reinterpret, .value = biased_bits } });
         const integer_float = try func.appendInst(block, image.f32_t, .{ .arith = .{ .op = .sub, .lhs = biased, .rhs = image.integer_bias } });
-        const unorm_value = try func.appendInst(block, image.f32_t, .{ .arith = .{ .op = .mul, .lhs = integer_float, .rhs = image.unorm_scale } });
-        const color_value = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = image.float_format, .then = float_value, .@"else" = unorm_value } });
+        var unorm_value = try func.appendInst(block, image.f32_t, .{ .arith = .{ .op = .mul, .lhs = integer_float, .rhs = image.unorm_scale } });
+        // sRGB decodes its three COLOUR channels through a table the host
+        // filled, one entry per byte value, which is exact and costs no pow.
+        // Alpha is linear in an sRGB format and keeps the plain unorm scale.
+        if (component < 3) {
+            // The load runs whatever the format is, because a select picks the
+            // VALUE and not the branch, so both the pointer and the offset are
+            // chosen first. A format that is not sRGB holds no table and would
+            // otherwise dereference whatever that word happens to be.
+            const table_field = try appendOffset(func, block, image.desc, sampler_srgb_table_offset, image.int_ty);
+            const table = try func.appendInst(block, image.ptr_ty, .{ .load = .{ .ptr = table_field } });
+            const safe_table = try func.appendInst(block, image.ptr_ty, .{ .select = .{ .cond = image.srgb_format, .then = table, .@"else" = packed_ptr } });
+            const entry_shift = try func.appendInst(block, image.int_ty, .{ .iconst = 2 });
+            const table_offset = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .shl, .lhs = byte, .rhs = entry_shift } });
+            const safe_offset = try func.appendInst(block, image.int_ty, .{ .select = .{ .cond = image.srgb_format, .then = table_offset, .@"else" = zero } });
+            const entry_ptr = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = safe_table, .rhs = safe_offset } });
+            const decoded_srgb = try func.appendInst(block, image.f32_t, .{ .load = .{ .ptr = entry_ptr } });
+            unorm_value = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = image.srgb_format, .then = decoded_srgb, .@"else" = unorm_value } });
+        }
+        if (component != 0) {
+            const r8_default = try func.appendInst(block, image.f32_t, .{ .fconst = if (component == 3) 1 else 0 });
+            unorm_value = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = image.r8_format, .then = r8_default, .@"else" = unorm_value } });
+        }
+        const color_value = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = is_float, .then = selected_float, .@"else" = unorm_value } });
         const depth_default = try func.appendInst(block, image.f32_t, .{ .fconst = if (component == 3) 1 else 0 });
         const depth_value = if (component == 0) float_value else depth_default;
-        const value = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = image.depth_format, .then = depth_value, .@"else" = color_value } });
+        const decoded = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = image.depth_format, .then = depth_value, .@"else" = color_value } });
+        // A one channel integer texel keeps its bits. The fetch stores these four words and
+        // an integer result type loads them back as integers, so the value has to travel as
+        // the raw word and not as the number it would become in floating point. The other
+        // three components are the integer 0, 0 and 1 that Vulkan asks for.
+        const int_bits = if (component == 0)
+            packed_texel
+        else
+            try func.appendInst(block, image.int_ty, .{ .iconst = if (component == 3) 1 else 0 });
+        const int_value = try func.appendInst(block, image.f32_t, .{ .unary = .{ .op = .reinterpret, .value = int_bits } });
+        values[component] = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = image.int_format, .then = int_value, .@"else" = decoded } });
+    }
+    return values;
+}
+
+fn lowerSampleTexel(func: *Function, block: Block, image: SampleImage, x: SampleCoordinate, y: SampleCoordinate, z_border: Value) Error![4]Value {
+    const outside_xy = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = x.border, .rhs = y.border } });
+    const outside = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = outside_xy, .rhs = z_border } });
+    const row = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = y.index, .rhs = image.row_pitch } });
+    const column = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = x.index, .rhs = image.texel_bytes } });
+    const byte_offset = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column } });
+    const texel = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = image.base, .rhs = byte_offset } });
+    const decoded = try decodeTexel(func, block, image, texel, byte_offset);
+    var values: [4]Value = undefined;
+    for (0..4) |component| {
+        const offset: i64 = @intCast(component * 4);
         const border_ptr = try appendOffset(func, block, image.desc, sampler_border_offset + offset, image.int_ty);
         const border = try func.appendInst(block, image.f32_t, .{ .load = .{ .ptr = border_ptr } });
-        values[component] = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = outside, .then = border, .@"else" = value } });
+        values[component] = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = outside, .then = border, .@"else" = decoded[component] } });
     }
     return values;
 }
@@ -1837,6 +2635,276 @@ fn lowerInverseSquareRoot(func: *Function, block: Block, value: Value) Error!Val
     return estimate;
 }
 
+// Glacier has no transcendental unit or host-call ABI. Reduce pow to log2 and exp2
+// using f32 arithmetic. GLSL defines pow only for nonnegative bases (zero requires
+// a positive exponent). The core flushes subnormal inputs and outputs to zero.
+const PowBuilder = struct {
+    func: *Function,
+    block: Block,
+    ft: Type,
+    it: Type,
+    fn f(self: @This(), x: f64) Error!Value {
+        return self.func.appendInst(self.block, self.ft, .{ .fconst = x });
+    }
+    fn i(self: @This(), x: i64) Error!Value {
+        return self.func.appendInst(self.block, self.it, .{ .iconst = x });
+    }
+    fn bin(self: @This(), op: ir.function.BinOp, a: Value, b: Value) Error!Value {
+        return self.func.appendInst(self.block, self.func.valueType(a), .{ .arith = .{ .op = op, .lhs = a, .rhs = b } });
+    }
+    fn cast(self: @This(), ty: Type, x: Value, bits: bool) Error!Value {
+        return if (bits) self.func.appendInst(self.block, ty, .{ .unary = .{ .op = .reinterpret, .value = x } }) else self.func.appendInst(self.block, ty, .{ .convert = .{ .value = x } });
+    }
+    fn choose(self: @This(), op: ir.function.CmpOp, a: Value, b: Value, yes: Value, no: Value) Error!Value {
+        // Scalar floating comparisons have no hardware instruction. A signed
+        // integer key preserves f32 ordering, so this also works for uniform pow.
+        const lhs = try self.orderedBits(a);
+        const rhs = try self.orderedBits(b);
+        const cond = try self.func.appendInst(self.block, try self.func.types.intern(.bool), .{ .icmp = .{ .op = op, .lhs = lhs, .rhs = rhs } });
+        return self.func.appendInst(self.block, self.func.valueType(yes), .{ .select = .{ .cond = cond, .then = yes, .@"else" = no } });
+    }
+    fn orderedBits(self: @This(), x: Value) Error!Value {
+        const bits = try self.cast(self.it, x, true);
+        const sign = try self.bin(.shr, bits, try self.i(31));
+        return self.bin(.bit_xor, bits, try self.bin(.bit_and, sign, try self.i(0x7fffffff)));
+    }
+    fn floor(self: @This(), x: Value) Error!Value {
+        const zero = try self.f(0);
+        const one = try self.f(1);
+        const negative_one = try self.f(-1);
+        const bits = try self.cast(self.it, x, true);
+        const exponent = try self.bin(.sub, try self.bin(.bit_and, try self.bin(.shr, bits, try self.i(23)), try self.i(0xff)), try self.i(127));
+        const bool_ty = try self.func.types.intern(.bool);
+        const small = try self.func.appendInst(self.block, bool_ty, .{ .icmp = .{ .op = .lt, .lhs = exponent, .rhs = try self.i(0) } });
+        const large = try self.func.appendInst(self.block, bool_ty, .{ .icmp = .{ .op = .ge, .lhs = exponent, .rhs = try self.i(23) } });
+        const shift = try self.bin(.sub, try self.i(23), exponent);
+        const fraction_mask = try self.bin(.sub, try self.bin(.shl, try self.i(1), shift), try self.i(1));
+        const whole_bits = try self.bin(.bit_and, bits, try self.bin(.bit_xor, fraction_mask, try self.i(-1)));
+        const whole = try self.cast(self.ft, whole_bits, true);
+        const whole_key = try self.orderedBits(whole);
+        const x_key = try self.orderedBits(x);
+        const has_fraction = try self.func.appendInst(self.block, bool_ty, .{ .icmp = .{ .op = .ne, .lhs = whole_key, .rhs = x_key } });
+        const negative = try self.func.appendInst(self.block, bool_ty, .{ .icmp = .{ .op = .lt, .lhs = bits, .rhs = try self.i(0) } });
+        const decremented = try self.bin(.sub, whole, one);
+        const negative_rounded = try self.func.appendInst(self.block, self.ft, .{ .select = .{ .cond = negative, .then = decremented, .@"else" = whole } });
+        const truncated = try self.func.appendInst(self.block, self.ft, .{ .select = .{ .cond = has_fraction, .then = negative_rounded, .@"else" = whole } });
+        const small_result = try self.func.appendInst(self.block, self.ft, .{ .select = .{ .cond = negative, .then = negative_one, .@"else" = zero } });
+        const normal_result = try self.func.appendInst(self.block, self.ft, .{ .select = .{ .cond = small, .then = small_result, .@"else" = truncated } });
+        return self.func.appendInst(self.block, self.ft, .{ .select = .{ .cond = large, .then = x, .@"else" = normal_result } });
+    }
+    fn sin(self: @This(), x: Value) Error!Value {
+        const tau = try self.f(6.283185307179586);
+        const pi = try self.f(3.141592653589793);
+        const turns = try self.floor(try self.bin(.div, x, tau));
+        var reduced = try self.bin(.sub, x, try self.bin(.mul, turns, tau));
+        reduced = try self.choose(.gt, reduced, pi, try self.bin(.sub, reduced, tau), reduced);
+        const xx = try self.bin(.mul, reduced, reduced);
+        var p = try self.f(-1.0 / 39916800.0);
+        p = try self.bin(.add, try self.f(1.0 / 362880.0), try self.bin(.mul, xx, p));
+        p = try self.bin(.add, try self.f(-1.0 / 5040.0), try self.bin(.mul, xx, p));
+        p = try self.bin(.add, try self.f(1.0 / 120.0), try self.bin(.mul, xx, p));
+        p = try self.bin(.add, try self.f(-1.0 / 6.0), try self.bin(.mul, xx, p));
+        return self.bin(.add, reduced, try self.bin(.mul, try self.bin(.mul, reduced, xx), p));
+    }
+    fn log2(self: @This(), x: Value) Error!Value {
+        const one = try self.f(1);
+        const bits = try self.cast(self.it, x, true);
+        var exponent = try self.bin(.sub, try self.bin(.shr, bits, try self.i(23)), try self.i(127));
+        const mantissa_bits = try self.bin(.bit_or, try self.bin(.bit_and, bits, try self.i(0x7fffff)), try self.i(0x3f800000));
+        const raw_m = try self.cast(self.ft, mantissa_bits, true);
+        const threshold = try self.f(@sqrt(2.0));
+        const reduce = try self.choose(.gt, raw_m, threshold, try self.bin(.mul, raw_m, try self.f(0.5)), raw_m);
+        exponent = try self.choose(.gt, raw_m, threshold, try self.bin(.add, exponent, try self.i(1)), exponent);
+        const z = try self.bin(.div, try self.bin(.sub, reduce, one), try self.bin(.add, reduce, one));
+        const zz = try self.bin(.mul, z, z);
+        var poly = try self.f(1.0 / 15.0);
+        inline for (.{ 13, 11, 9, 7, 5, 3, 1 }) |d| {
+            poly = try self.bin(.add, try self.f(1.0 / @as(f64, d)), try self.bin(.mul, zz, poly));
+        }
+        return self.bin(.add, try self.cast(self.ft, exponent, false), try self.bin(.mul, try self.bin(.mul, z, poly), try self.f(2.0 / @log(2.0))));
+    }
+    fn pow(self: @This(), x: Value, y: Value) Error!Value {
+        const zero = try self.f(0);
+        const one = try self.f(1);
+        const bits = try self.cast(self.it, x, true);
+        var exponent = try self.bin(.sub, try self.bin(.shr, bits, try self.i(23)), try self.i(127));
+        const mantissa_bits = try self.bin(.bit_or, try self.bin(.bit_and, bits, try self.i(0x7fffff)), try self.i(0x3f800000));
+        const raw_m = try self.cast(self.ft, mantissa_bits, true);
+        const threshold = try self.f(@sqrt(2.0));
+        const m = try self.choose(.gt, raw_m, threshold, try self.bin(.mul, raw_m, try self.f(0.5)), raw_m);
+        exponent = try self.choose(.gt, raw_m, threshold, try self.bin(.add, exponent, try self.i(1)), exponent);
+        // Center the mantissa around one to avoid cancellation near powers of two.
+        // ln(m) = 2*(z + z^3/3 + ...), z=(m-1)/(m+1), |z| < 0.172.
+        const z = try self.bin(.div, try self.bin(.sub, m, one), try self.bin(.add, m, one));
+        const zz = try self.bin(.mul, z, z);
+        var poly = try self.f(1.0 / 15.0);
+        inline for (.{ 13, 11, 9, 7, 5, 3, 1 }) |d| {
+            poly = try self.bin(.add, try self.f(1.0 / @as(f64, d)), try self.bin(.mul, zz, poly));
+        }
+        const log = try self.bin(.add, try self.cast(self.ft, exponent, false), try self.bin(.mul, try self.bin(.mul, z, poly), try self.f(2.0 / @log(2.0))));
+        const t = try self.bin(.mul, y, log);
+        // Bound before conversion so extreme exponents never overflow an integer conversion.
+        var bounded = try self.choose(.lt, t, try self.f(-126), try self.f(-126), t);
+        bounded = try self.choose(.gt, bounded, try self.f(127.99999), try self.f(127.99999), bounded);
+        // The core converts f32 only to unsigned integers. Bias into a nonnegative
+        // range first; subtracting the bias gives floor(t), including for t < 0.
+        const uint_t = try self.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const biased = try self.cast(uint_t, try self.bin(.add, bounded, try self.f(126)), false);
+        const biased_signed = try self.cast(self.it, biased, true);
+        const max_biased = try self.i(253);
+        const at_limit = try self.func.appendInst(self.block, try self.func.types.intern(.bool), .{ .icmp = .{ .op = .gt, .lhs = biased_signed, .rhs = max_biased } });
+        // Adding the bias can round a value just below 128 up to 254.
+        const capped = try self.func.appendInst(self.block, self.it, .{ .select = .{ .cond = at_limit, .then = max_biased, .@"else" = biased_signed } });
+        const n = try self.bin(.sub, capped, try self.i(126));
+        const r = try self.bin(.mul, try self.bin(.sub, bounded, try self.cast(self.ft, n, false)), try self.f(@log(2.0)));
+        // exp(r), |r| < ln(2), with a ninth-degree Taylor polynomial.
+        var ep = try self.f(1.0 / 362880.0);
+        inline for (.{ 40320, 5040, 720, 120, 24, 6, 2, 1, 1 }) |d| {
+            ep = try self.bin(.add, try self.f(1.0 / @as(f64, d)), try self.bin(.mul, r, ep));
+        }
+        const scale = try self.cast(self.ft, try self.bin(.shl, try self.bin(.add, n, try self.i(127)), try self.i(23)), true);
+        var result = try self.bin(.mul, scale, ep);
+        result = try self.choose(.lt, t, try self.f(-126), zero, result);
+        result = try self.choose(.ge, t, try self.f(128), try self.f(std.math.inf(f32)), result);
+        result = try self.choose(.le, x, zero, zero, result);
+        return result;
+    }
+};
+
+fn lowerPow(allocator: std.mem.Allocator, func: *Function) Error!void {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const operation = func.opcode(inst);
+            if (operation != .call_indirect or !hasGpuKey(func, operation.call_indirect.target, "math_fn")) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const args = func.valueList(operation.call_indirect.args);
+            if (args.len != 3) return error.Unsupported;
+            const selector = func.definingInst(args[0]) orelse return error.Unsupported;
+            if (func.opcode(selector) != .iconst) return error.Unsupported;
+            const pb: PowBuilder = .{ .func = func, .block = block, .ft = func.valueType(args[1]), .it = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }) };
+            if (!isF32(func, pb.ft) or !isF32(func, func.valueType(args[2]))) return error.Unsupported;
+            const selector_value = func.opcode(selector).iconst;
+            if (selector_value == 5 or selector_value == 6) {
+                const angle = if (selector_value == 6)
+                    try pb.bin(.add, args[1], try pb.f(1.5707963267948966))
+                else
+                    args[1];
+                const result = try pb.sin(angle);
+                func.replaceAllUses(func.instResult(inst) orelse return error.Unsupported, result);
+                continue;
+            }
+            // Copy before appending: valueList storage can move as the function grows.
+            const x, const y = switch (func.opcode(selector).iconst) {
+                0 => .{ args[1], args[2] }, // pow(a, b)
+                1 => .{ try func.appendInst(block, pb.ft, .{ .fconst = 2.718281828459045 }), args[1] }, // exp(a) = e^a
+                3 => .{ try func.appendInst(block, pb.ft, .{ .fconst = 2 }), args[1] }, // exp2(a) = 2^a
+                2, 4 => .{ args[1], args[2] }, // log and log2 are lowered directly below.
+                else => return error.Unsupported,
+            };
+            const result = switch (func.opcode(selector).iconst) {
+                2 => try pb.bin(.mul, try pb.log2(args[1]), try pb.f(@log(2.0))), // log(a)
+                4 => try pb.log2(args[1]), // log2(a)
+                else => try pb.pow(x, y),
+            };
+            func.replaceAllUses(func.instResult(inst) orelse return error.Unsupported, result);
+        }
+    }
+}
+
+fn lowerFloor(allocator: std.mem.Allocator, func: *Function) Error!void {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const operation = func.opcode(inst);
+            const rounds = operation == .unary and
+                (operation.unary.op == .floor or operation.unary.op == .nearest);
+            if (!rounds) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const value = operation.unary.value;
+            const builder: PowBuilder = .{
+                .func = func,
+                .block = block,
+                .ft = func.valueType(value),
+                .it = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }),
+            };
+            if (!isF32(func, builder.ft)) return error.Unsupported;
+            // Nearest is floor(x + 0.5). The emitter's own sequence for it starts with
+            // vfcvt.x.f.v, which the core does not decode, so it returned the register's
+            // old contents. GLSL.std.450 leaves a half-way tie to the implementation, so
+            // rounding those toward positive infinity is a choice the spec allows.
+            //
+            // At 2 to the 23rd an f32 step is already 1, so the value is a whole number and
+            // adding a half rounds it UP to the next one. Those keep the source instead.
+            const result = if (operation.unary.op == .nearest) blk: {
+                const biased = try builder.floor(try builder.bin(.add, value, try builder.f(0.5)));
+                const bits = try builder.cast(builder.it, value, true);
+                const magnitude_bits = try builder.bin(.bit_and, bits, try builder.i(0x7fff_ffff));
+                const magnitude = try builder.cast(builder.ft, magnitude_bits, true);
+                break :blk try builder.choose(.ge, magnitude, try builder.f(8388608), value, biased);
+            } else try builder.floor(value);
+            func.replaceAllUses(func.instResult(inst) orelse return error.Unsupported, result);
+        }
+    }
+}
+
+/// Convert a mask ANDed with a warp-uniform boolean into a uniform select.
+/// A scalar bool broadcast as vector elements is not a valid lane mask, but
+/// selecting the divergent mask against false preserves the per-lane meaning.
+fn lowerUniformBoolMasks(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    divergent: []const bool,
+) Error!void {
+    var replacements: std.ArrayList(struct { old: Value, new: Value }) = .empty;
+    defer replacements.deinit(allocator);
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const operation = func.opcode(inst);
+            if (operation != .arith or operation.arith.op != .bit_and or
+                !isBool(func, func.valueType(operation.arith.lhs)))
+            {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const lhs = operation.arith.lhs;
+            const rhs = operation.arith.rhs;
+            const lhs_divergent = divergent[@backingInt(lhs)];
+            const rhs_divergent = divergent[@backingInt(rhs)];
+            if (lhs_divergent == rhs_divergent) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const uniform = if (lhs_divergent) rhs else lhs;
+            const mask = if (lhs_divergent) lhs else rhs;
+            const result = func.instResult(inst) orelse return error.Unsupported;
+            const false_value = try func.appendInst(block, func.valueType(result), .{ .iconst = 0 });
+            const selected = try func.appendInst(block, func.valueType(result), .{ .select = .{
+                .cond = uniform,
+                .then = mask,
+                .@"else" = false_value,
+            } });
+            try replacements.append(allocator, .{ .old = result, .new = selected });
+        }
+    }
+    for (replacements.items) |replacement|
+        func.replaceAllUses(replacement.old, replacement.new);
+}
+
 fn lowerSquareRoot(allocator: std.mem.Allocator, func: *Function) Error!void {
     for (0..func.blockCount()) |block_index| {
         const block: Block = @fromBackingInt(@intCast(block_index));
@@ -1895,13 +2963,14 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
             const regular_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_fn");
             const array_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_2darray_fn");
             const cube_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_cube_fn");
+            const volume_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_3d_fn");
             const shadow_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_shadow_fn");
-            if (!regular_sample and !array_sample and !cube_sample and !shadow_sample) {
+            if (!regular_sample and !array_sample and !cube_sample and !volume_sample and !shadow_sample) {
                 try func.blockInstsMut(block).append(func.allocator, inst);
                 continue;
             }
             const args = func.valueList(operation.call_indirect.args);
-            const expected_arg_count: usize = if (array_sample or cube_sample) 6 else 5;
+            const expected_arg_count: usize = if (array_sample or cube_sample or volume_sample) 6 else 5;
             if (args.len != expected_arg_count) return error.Unsupported;
             var desc = args[0];
             const nullable = hasGpuKey(func, desc, "nullable_desc");
@@ -1909,7 +2978,7 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
             const bool_t = try func.types.intern(.bool);
             const ptr_ty = func.valueType(desc);
             const f32_t = func.valueType(args[1]);
-            const lod_index: usize = if (array_sample or cube_sample) 4 else 3;
+            const lod_index: usize = if (array_sample or cube_sample or volume_sample) 4 else 3;
             const lod = args[lod_index];
             const zero_f = try func.appendInst(block, f32_t, .{ .fconst = 0 });
             const constant_lod: ?f64 = if (func.definingInst(lod)) |lod_inst| blk: {
@@ -1950,6 +3019,14 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
             const nearest_y = try lowerSampleCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_address_v_offset);
             const linear_x = try lowerLinearCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_width_reciprocal_offset, sampler_address_u_offset);
             const linear_y = try lowerLinearCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset, sampler_address_v_offset);
+            const nearest_z = if (volume_sample)
+                try lowerSampleCoordinate(func, block, desc, args[3], sampler_depth_offset, sampler_depth_float_offset, sampler_address_w_offset)
+            else
+                null;
+            const linear_z = if (volume_sample)
+                try lowerLinearCoordinate(func, block, desc, args[3], sampler_depth_offset, sampler_depth_float_offset, sampler_depth_reciprocal_offset, sampler_address_w_offset)
+            else
+                null;
             const mag_filter_ptr = try appendOffset(func, block, desc, sampler_mag_filter_offset, int_ty);
             const mag_filter = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = mag_filter_ptr } });
             const min_filter_ptr = try appendOffset(func, block, desc, sampler_min_filter_offset, int_ty);
@@ -1968,6 +3045,12 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
             const y1 = try selectSampleCoordinate(func, block, linear, linear_y.second, nearest_y);
             const x_weight = try func.appendInst(block, f32_t, .{ .select = .{ .cond = linear, .then = linear_x.weight, .@"else" = zero_f } });
             const y_weight = try func.appendInst(block, f32_t, .{ .select = .{ .cond = linear, .then = linear_y.weight, .@"else" = zero_f } });
+            const z0 = if (volume_sample) try selectSampleCoordinate(func, block, linear, linear_z.?.first, nearest_z.?) else null;
+            const z1 = if (volume_sample) try selectSampleCoordinate(func, block, linear, linear_z.?.second, nearest_z.?) else null;
+            const z_weight = if (volume_sample)
+                try func.appendInst(block, f32_t, .{ .select = .{ .cond = linear, .then = linear_z.?.weight, .@"else" = zero_f } })
+            else
+                zero_f;
             var base = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = desc } });
             if (array_sample) {
                 const half = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
@@ -1983,39 +3066,38 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
                 const face_offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = coordinate.face, .rhs = pitch } });
                 base = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = face_offset } });
             }
+            var second_base = base;
+            if (volume_sample) {
+                const pitch_ptr = try appendOffset(func, block, desc, sampler_array_pitch_offset, int_ty);
+                const pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = pitch_ptr } });
+                const first_offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = z0.?.index, .rhs = pitch } });
+                const second_offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = z1.?.index, .rhs = pitch } });
+                second_base = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = second_offset } });
+                base = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = first_offset } });
+            }
             const row_ptr = try appendOffset(func, block, desc, sampler_row_pitch_offset, int_ty);
             const row_pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = row_ptr } });
             const texel_bytes_ptr = try appendOffset(func, block, desc, sampler_texel_bytes_offset, int_ty);
             const texel_bytes = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = texel_bytes_ptr } });
-            const format_ptr = try appendOffset(func, block, desc, sampler_format_offset, int_ty);
-            const format = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = format_ptr } });
-            const float_format_value = try func.appendInst(block, int_ty, .{ .iconst = 0 });
-            const float_format = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = float_format_value } });
-            const bgra_format_value = try func.appendInst(block, int_ty, .{ .iconst = 2 });
-            const bgra_format = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = bgra_format_value } });
-            const depth_format_value = try func.appendInst(block, int_ty, .{ .iconst = 3 });
-            const depth_format = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = depth_format_value } });
-            const integer_bias = try func.appendInst(block, f32_t, .{ .fconst = 8388608 });
-            const unorm_scale = try func.appendInst(block, f32_t, .{ .fconst = 1.0 / 255.0 });
-            const image = SampleImage{
-                .desc = desc,
-                .base = base,
-                .row_pitch = row_pitch,
-                .texel_bytes = texel_bytes,
-                .float_format = float_format,
-                .depth_format = depth_format,
-                .bgra_format = bgra_format,
-                .integer_bias = integer_bias,
-                .unorm_scale = unorm_scale,
-                .int_ty = int_ty,
-                .ptr_ty = ptr_ty,
-                .f32_t = f32_t,
-                .bool_t = bool_t,
-            };
-            const texel00 = try lowerSampleTexel(func, block, image, x0, y0);
-            const texel10 = try lowerSampleTexel(func, block, image, x1, y0);
-            const texel01 = try lowerSampleTexel(func, block, image, x0, y1);
-            const texel11 = try lowerSampleTexel(func, block, image, x1, y1);
+            const image = try sampleImageFormats(func, block, desc, base, row_pitch, texel_bytes, int_ty, ptr_ty);
+            const z_border00 = if (volume_sample) z0.?.border else x0.border;
+            const z_border10 = if (volume_sample) z0.?.border else x1.border;
+            const texel00 = try lowerSampleTexel(func, block, image, x0, y0, z_border00);
+            const texel10 = try lowerSampleTexel(func, block, image, x1, y0, z_border10);
+            const texel01 = try lowerSampleTexel(func, block, image, x0, y1, z_border00);
+            const texel11 = try lowerSampleTexel(func, block, image, x1, y1, z_border10);
+            var second_texel00 = texel00;
+            var second_texel10 = texel10;
+            var second_texel01 = texel01;
+            var second_texel11 = texel11;
+            if (volume_sample) {
+                var second_image = image;
+                second_image.base = second_base;
+                second_texel00 = try lowerSampleTexel(func, block, second_image, x0, y0, z1.?.border);
+                second_texel10 = try lowerSampleTexel(func, block, second_image, x1, y0, z1.?.border);
+                second_texel01 = try lowerSampleTexel(func, block, second_image, x0, y1, z1.?.border);
+                second_texel11 = try lowerSampleTexel(func, block, second_image, x1, y1, z1.?.border);
+            }
             if (shadow_sample) {
                 const compare_ptr = try appendOffset(func, block, desc, sampler_compare_op_offset, int_ty);
                 const compare_op = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = compare_ptr } });
@@ -2029,9 +3111,9 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
                 if (nullable) {
                     const valid_ptr = try appendOffset(func, block, desc, sampler_valid_offset, int_ty);
                     const valid = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = valid_ptr } });
-                    const zero_u = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+                    const absent = try func.appendInst(block, int_ty, .{ .iconst = 0 });
                     const present = try func.appendInst(block, bool_t, .{
-                        .icmp = .{ .op = .ne, .lhs = valid, .rhs = zero_u },
+                        .icmp = .{ .op = .ne, .lhs = valid, .rhs = absent },
                     });
                     value = try func.appendInst(block, f32_t, .{
                         .select = .{ .cond = present, .then = value, .@"else" = zero_f },
@@ -2044,12 +3126,67 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
             for (0..4) |component| {
                 const top = try lerp(func, block, texel00[component], texel10[component], x_weight);
                 const bottom = try lerp(func, block, texel01[component], texel11[component], x_weight);
-                values[component] = try lerp(func, block, top, bottom, y_weight);
+                const first_slice = try lerp(func, block, top, bottom, y_weight);
+                const second_top = try lerp(func, block, second_texel00[component], second_texel10[component], x_weight);
+                const second_bottom = try lerp(func, block, second_texel01[component], second_texel11[component], x_weight);
+                const second_slice = try lerp(func, block, second_top, second_bottom, y_weight);
+                values[component] = try lerp(func, block, first_slice, second_slice, z_weight);
             }
-            const out_index: usize = if (array_sample or cube_sample) 5 else 4;
+            const out_index: usize = if (array_sample or cube_sample or volume_sample) 5 else 4;
             const out = args[out_index];
             try sampled.put(allocator, out, try lowerSampleSwizzle(func, block, desc, values));
             try elements.put(allocator, out, .{ .base = out, .component = 0 });
+        }
+    }
+}
+
+/// Rewrite every f32 to SIGNED 32-bit convert, because the core decodes only the unsigned
+/// one out of the float-to-integer family. The magnitude converts, and a negative source
+/// negates the result, which keeps the truncation toward zero that the signed convert owes.
+///
+/// Without this the encoder picks the VFUNARY0 variant the decoder never matches, so the
+/// instruction retires as nothing and the destination keeps whatever it held. That is a
+/// silent wrong answer rather than a refusal, which is why it is rewritten and not refused.
+fn lowerSignedFloatToInt(allocator: std.mem.Allocator, func: *Function) Error!void {
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const op = func.opcode(inst);
+            const keep = blk: {
+                if (op != .convert) break :blk true;
+                const result = func.instResult(inst) orelse break :blk true;
+                const to = func.types.type_kind(func.valueType(result));
+                const from = func.types.type_kind(func.valueType(op.convert.value));
+                if (from != .float or from.float != .f32) break :blk true;
+                if (to != .int or to.int.bits != 32 or to.int.signedness != .signed) break :blk true;
+                break :blk false;
+            };
+            if (keep) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const result = func.instResult(inst).?;
+            const ty = func.valueType(result);
+            const source = op.convert.value;
+            const f32_t = func.valueType(source);
+            const bits = try func.appendInst(block, u32_t, .{ .unary = .{ .op = .reinterpret, .value = source } });
+            const magnitude_bits = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .bit_and, .lhs = bits, .imm = 0x7fff_ffff } });
+            const magnitude = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = magnitude_bits } });
+            const unsigned = try func.appendInst(block, u32_t, .{ .convert = .{ .value = magnitude } });
+            const signed = try func.appendInst(block, ty, .{ .convert = .{ .value = unsigned } });
+            const zero = try func.appendInst(block, ty, .{ .iconst = 0 });
+            const negated = try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = signed } });
+            // The sign bit decides, so this needs no float compare the core does not have.
+            const sign = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .shr, .lhs = bits, .imm = 31 } });
+            const zero_u = try func.appendInst(block, u32_t, .{ .iconst = 0 });
+            const negative = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ne, .lhs = sign, .rhs = zero_u } });
+            const picked = try func.appendInst(block, ty, .{ .select = .{ .cond = negative, .then = negated, .@"else" = signed } });
+            func.replaceAllUses(result, picked);
         }
     }
 }
@@ -2059,7 +3196,8 @@ fn lowerTexelFetch(allocator: std.mem.Allocator, func: *Function) Error!void {
         const block: Block = @fromBackingInt(@intCast(bi));
         const original = try allocator.dupe(Inst, func.blockInsts(block));
         defer allocator.free(original);
-        var fetched = std.AutoHashMapUnmanaged(Value, [4]Value){};
+        const Fetch = struct { desc: Value, texel: Value, int_ty: Type, decoded: ?[4]Value };
+        var fetched = std.AutoHashMapUnmanaged(Value, Fetch){};
         defer fetched.deinit(allocator);
         const Element = struct { base: Value, component: u2 };
         var elements = std.AutoHashMapUnmanaged(Value, Element){};
@@ -2084,8 +3222,30 @@ fn lowerTexelFetch(allocator: std.mem.Allocator, func: *Function) Error!void {
             }
             if (op == .load) {
                 if (elements.get(op.load.ptr)) |element| {
-                    const values = fetched.get(element.base) orelse return error.Unsupported;
-                    func.replaceAllUses(func.instResult(inst).?, values[element.component]);
+                    const fetch = fetched.get(element.base) orelse return error.Unsupported;
+                    // The decode gives f32, so a narrower float result takes a convert. An
+                    // integer result is an integer image, which the decode does not describe,
+                    // so that one keeps the plain load below.
+                    if (fetch.decoded) |decoded| {
+                        const result_ty = func.valueType(func.instResult(inst).?);
+                        if (isFloat(func, result_ty)) {
+                            const value = if (isF32(func, result_ty))
+                                decoded[element.component]
+                            else
+                                try func.appendInst(block, result_ty, .{ .convert = .{ .value = decoded[element.component] } });
+                            func.replaceAllUses(func.instResult(inst).?, value);
+                            continue;
+                        }
+                    }
+                    const byte_offset: i64 = @intCast(@as(u32, element.component) * 4);
+                    const source = try appendOffset(func, block, fetch.texel, byte_offset, fetch.int_ty);
+                    const read_ptr = try nullableImagePointer(func, block, fetch.desc, source, false, byte_offset, fetch.int_ty);
+                    const result = try func.appendInst(block, func.valueType(func.instResult(inst).?), .{ .load = .{
+                        .ptr = read_ptr,
+                        .@"volatile" = op.load.@"volatile",
+                        .mask = op.load.mask,
+                    } });
+                    func.replaceAllUses(func.instResult(inst).?, result);
                     continue;
                 }
             }
@@ -2099,17 +3259,20 @@ fn lowerTexelFetch(allocator: std.mem.Allocator, func: *Function) Error!void {
             if (func.opcode(lod_inst) != .iconst or func.opcode(lod_inst).iconst != 0) return error.Unsupported;
 
             const desc = args[0];
-            const x = args[1];
-            const y = args[2];
             const out = args[4];
-            const int_ty = func.valueType(x);
             const ptr_ty = func.valueType(desc);
-            const float_ty = try func.types.intern(.{ .float = .f32 });
+            // Memory starts at 0x80000000, so every device address has bit 31 set. The
+            // address arithmetic is unsigned for that reason: a signed index sign-extends
+            // and the gather then reads outside memory. A signedness convert moves no bits.
+            const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+            const x = try func.appendInst(block, int_ty, .{ .convert = .{ .value = args[1] } });
+            const y = try func.appendInst(block, int_ty, .{ .convert = .{ .value = args[2] } });
             const base = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = desc } });
             const row_ptr = try appendOffset(func, block, desc, sampler_row_pitch_offset, int_ty);
             const row_pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = row_ptr } });
             const row = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = y, .rhs = row_pitch } });
-            const texel_bytes = try func.appendInst(block, int_ty, .{ .iconst = rgba32f_texel_bytes });
+            const texel_bytes_ptr = try appendOffset(func, block, desc, sampler_texel_bytes_offset, int_ty);
+            const texel_bytes = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = texel_bytes_ptr } });
             const column = try func.appendInst(block, int_ty, .{ .arith = .{
                 .op = .mul,
                 .lhs = x,
@@ -2117,14 +3280,11 @@ fn lowerTexelFetch(allocator: std.mem.Allocator, func: *Function) Error!void {
             } });
             const offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column } });
             const texel = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
-            var values: [4]Value = undefined;
-            for (0..4) |component| {
-                const byte_offset: i64 = @intCast(component * 4);
-                const source = try appendOffset(func, block, texel, byte_offset, int_ty);
-                const read_ptr = try nullableImagePointer(func, block, desc, source, false, byte_offset, int_ty);
-                values[component] = try func.appendInst(block, float_ty, .{ .load = .{ .ptr = read_ptr } });
-            }
-            try fetched.put(allocator, out, values);
+            // A fetch reads a packed texel, so it needs the same format decode a sample does.
+            // Without it an RGBA8 texel comes back as one denormal f32 and three neighbours.
+            const image = try sampleImageFormats(func, block, desc, base, row_pitch, texel_bytes, int_ty, ptr_ty);
+            const decoded = try decodeTexel(func, block, image, texel, offset);
+            try fetched.put(allocator, out, .{ .desc = desc, .texel = texel, .int_ty = int_ty, .decoded = decoded });
             try elements.put(allocator, out, .{ .base = out, .component = 0 });
         }
     }
@@ -2250,7 +3410,7 @@ const Ctx = struct { divergent: []const bool, macs: *const Macs, strides: *const
 /// lane; a lane or thread index is the point of the exercise.
 fn laneVarying(b: gpu.builtin.Builtin) bool {
     return switch (b) {
-        .thread_id_x, .lane_id, .global_id_x, .vertex_index => true,
+        .thread_id_x, .thread_id_y, .thread_id_z, .lane_id, .local_invocation_index, .global_id_x, .global_id_y, .global_id_z, .vertex_index => true,
         else => false,
     };
 }
@@ -2303,7 +3463,12 @@ fn forEachOperand(func: *const Function, inst: Inst, ctx: anytype, comptime f: f
 /// Which values are per-lane. Seeded from the lane-varying entry builtins and propagated forward
 /// to a fixpoint, because a loop can carry divergence backwards into a block parameter.
 ///
-/// This propagates through OPERANDS only. That is sound ONLY BECAUSE `checkSupported` refuses a
+/// Float comparisons always produce lane masks, including when both operands are uniform:
+/// Glacier has no scalar floating compare. Their operands can stay scalar and are broadcast by
+/// the compare emitter. Treating the result as per-lane also sends dependent branches through
+/// if-conversion and propagates the mask register class to its consumers.
+///
+/// Otherwise this propagates through OPERANDS only. That is sound ONLY BECAUSE `checkSupported` refuses a
 /// branch on a per-lane condition: with no divergent branch there is no control divergence, so a
 /// value cannot become per-lane by being defined on one side of a split. ADDING MASK SUPPORT
 /// WITHOUT ADDING THE CONTROL RULE HERE WOULD BE A SILENT MISCOMPILE.
@@ -2337,6 +3502,18 @@ fn analyzeDivergence(allocator: std.mem.Allocator, func: *const Function) Error!
             for (func.blockInsts(block)) |inst| {
                 var s: Spread = .{ .div = div };
                 forEachOperand(func, inst, &s, Spread.see);
+                const operation = func.opcode(inst);
+                // A warp occupies a contiguous, lane-count-sized range of the flattened local
+                // invocation indices. Shifting that index right by log2(lanes) or more yields
+                // the same value in every lane. This matters for shader atomics that address one
+                // word per 32 invocations while a Glacier warp has only four lanes.
+                const grouped_index = switch (operation) {
+                    .arith => |a| localIndexGroup(func, a.op, a.lhs, constantInt(func, a.rhs)),
+                    .arith_imm => |a| localIndexGroup(func, a.op, a.lhs, a.imm),
+                    else => false,
+                };
+                if (grouped_index) s.any = false;
+                if (operation == .icmp and isFloat(func, func.valueType(operation.icmp.lhs))) s.any = true;
                 // An operand that varies per lane makes the result vary too.
                 if (func.instResult(inst)) |r| {
                     if (s.any and !div[@backingInt(r)]) {
@@ -2361,6 +3538,37 @@ fn analyzeDivergence(allocator: std.mem.Allocator, func: *const Function) Error!
         }
     }
     return div;
+}
+
+/// Whether `inst` shifts the flattened local invocation index into a warp-uniform group number.
+fn constantInt(func: *const Function, value: Value) ?i64 {
+    const definition = func.definingInst(value) orelse return null;
+    return switch (func.opcode(definition)) {
+        .iconst => |n| n,
+        else => null,
+    };
+}
+
+fn localIndexGroup(func: *const Function, op: ir.function.BinOp, lhs: Value, shift: ?i64) bool {
+    if (op != .shr) return false;
+    const shift_amount = shift orelse return false;
+    // The largest supported Glacier warp has 16 lanes, so four discarded low bits suffice on
+    // every profile. Smaller profiles may conservatively keep some uniform groups vector-valued.
+    if (shift_amount < 4) return false;
+
+    var value = lhs;
+    var depth: usize = 0;
+    while (depth < 4) : (depth += 1) {
+        if (gpu.attrs.builtinOf(func, value) == .local_invocation_index) return true;
+        const definition = func.definingInst(value) orelse return false;
+        switch (func.opcode(definition)) {
+            .unary => |u| if (u.op == .reinterpret) {
+                value = u.value;
+            } else return false,
+            else => return false,
+        }
+    }
+    return false;
 }
 
 /// Mark each of `j`'s target parameters divergent when the argument feeding it is. Returns whether
@@ -2500,6 +3708,19 @@ fn isFloat(func: *const Function, ty: Type) bool {
     return func.types.type_kind(ty) == .float;
 }
 
+/// A per-lane pointer or operand needs two temporary vector slots when emitted as scalar AMOs.
+fn hasVectorAtomic(func: *const Function, divergent: []const bool) bool {
+    for (0..func.instCount()) |i| {
+        const inst: Inst = @fromBackingInt(@intCast(i));
+        const a = switch (func.opcode(inst)) {
+            .atomic_rmw => |x| x,
+            else => continue,
+        };
+        if (divergent[@backingInt(a.ptr)] or divergent[@backingInt(a.value)]) return true;
+    }
+    return false;
+}
+
 fn isSigned(func: *const Function, ty: Type) bool {
     return switch (func.types.type_kind(ty)) {
         .int => |i| i.signedness == .signed,
@@ -2546,6 +3767,8 @@ const ConvertKind = enum {
     uint_to_float,
     /// `vfcvt.rtz.xu.f.v`: an f32 to an UNSIGNED 32-bit integer, truncating toward zero.
     float_to_uint,
+    /// `vfcvt.rtz.x.f.v`: an f32 to a SIGNED 32-bit integer, truncating toward zero.
+    float_to_int,
     /// `vfncvt.f.f.w`: an f32 to an f16, rounding to nearest even, so an overflow gives infinity
     /// rather than the largest finite value.
     narrow_half,
@@ -2573,10 +3796,8 @@ fn convertKind(func: *const Function, inst: Inst, cv: ir.function.Convert) ?Conv
         };
     }
     if (from == .float and to == .int) {
-        // The instruction writes an unsigned result, so a signed destination would read a large
-        // value as negative.
-        if (from.float != .f32 or to.int.bits != 32 or to.int.signedness != .unsigned) return null;
-        return .float_to_uint;
+        if (from.float != .f32 or to.int.bits != 32) return null;
+        return if (to.int.signedness == .signed) .float_to_int else .float_to_uint;
     }
     if (from == .float and to == .float) {
         if (from.float == .f32 and to.float == .f16) return .narrow_half;
@@ -2595,6 +3816,7 @@ fn convertEncoder(kind: ConvertKind) *const fn (VReg, VReg) u32 {
         .int_to_float => rv.vfwcvt_f_x_v,
         .uint_to_float => rv.vfwcvt_f_xu_v,
         .float_to_uint => rv.vfcvt_rtz_xu_f_v,
+        .float_to_int => rv.vfcvt_rtz_x_f_v,
         .narrow_half => rv.vfncvt_f_f_w,
         .widen_half => rv.vfwcvt_f_f_v,
     };
@@ -2638,10 +3860,15 @@ fn ifConvert(
     masks: *std.ArrayList(LoopMask),
 ) Error!bool {
     var changed = false;
+    var uses = try allocator.alloc(u32, func.valueCount());
+    defer allocator.free(uses);
     for (0..func.blockCount()) |bi| {
+        if (uses.len < func.valueCount()) uses = try allocator.realloc(uses, func.valueCount());
+        opt.dce.countUses(func, uses);
         const a: Block = @fromBackingInt(@intCast(bi));
-        const found = region(func, a, divergent) orelse continue;
-        if (try flatten(allocator, func, found, divergent, masks)) changed = true;
+        const found = region(func, a, divergent, uses) orelse continue;
+        const did_flatten = try flatten(allocator, func, found, divergent, masks);
+        if (did_flatten) changed = true;
     }
     return changed;
 }
@@ -2662,6 +3889,16 @@ const LoopNode = struct {
     latch: Block,
     exit: Block,
     pre: Block,
+    body: [max_region_blocks]Block = undefined,
+    body_count: usize = 0,
+
+    fn include(self: *LoopNode, block: Block) bool {
+        for (self.body[0..self.body_count]) |old| if (old == block) return true;
+        if (self.body_count == self.body.len) return false;
+        self.body[self.body_count] = block;
+        self.body_count += 1;
+        return true;
+    }
 };
 
 /// The mask a loop runs its first iteration under, decided by the region flattened around it
@@ -2673,16 +3910,18 @@ const Region = struct {
     exit: Block,
     /// The blocks strictly inside, ordered so a block comes after every predecessor of it.
     inside: [max_region_blocks]Block = undefined,
-    /// Whether `inside[i]` runs after the loop, which decides where it is flattened to.
-    after: [max_region_blocks]bool = @splat(false),
+    /// Number of loops whose exits precede `inside[i]`. This decides which block receives it.
+    stage: [max_region_blocks]u8 = @splat(0),
     count: usize = 0,
-    /// The one loop inside, left as a loop. Its blocks are not in `inside`: nothing moves them,
-    /// and what the flattening gives it is the mask its first iteration runs under.
-    loop: ?LoopNode = null,
+    /// Loops inside the region, left as loops. Their blocks are not in `inside`: nothing moves
+    /// them, and the flattening gives each its first-iteration mask.
+    loops: [max_region_blocks]LoopNode = undefined,
+    loop_count: usize = 0,
 
     fn holds(self: *const Region, b: Block) bool {
-        if (self.loop) |l| {
+        for (self.loops[0..self.loop_count]) |l| {
             if (b == l.header or b == l.latch) return true;
+            for (l.body[0..l.body_count]) |x| if (b == x) return true;
         }
         for (self.inside[0..self.count]) |x| {
             if (x == b) return true;
@@ -2693,25 +3932,27 @@ const Region = struct {
     /// Where `b`'s instructions go: the head, or the block the loop leaves by for everything that
     /// runs after the loop.
     fn destOf(self: *const Region, b: Block) Block {
-        const l = self.loop orelse return self.head;
         for (self.inside[0..self.count], 0..) |x, i| {
-            if (x == b) return if (self.after[i]) l.exit else self.head;
+            if (x == b) return if (self.stage[i] == 0) self.head else self.loops[self.stage[i] - 1].exit;
         }
         return self.head;
+    }
+
+    fn loopAtExit(self: *const Region, b: Block) ?usize {
+        for (self.loops[0..self.loop_count], 0..) |l, i| if (l.exit == b) return i;
+        return null;
     }
 };
 
 /// The region the `if` ending `head` opens, or null when this cannot flatten it.
-fn region(func: *const Function, head: Block, divergent: []const bool) ?Region {
+fn region(func: *const Function, head: Block, divergent: []const bool, uses: []const u32) ?Region {
     const insts = func.blockInsts(head);
     if (insts.len == 0) return null;
     const cf = switch (func.opcode(insts[insts.len - 1])) {
         .@"if" => |x| x,
         else => return null,
     };
-    // A uniform branch is left alone: it costs one jump and runs one side, where flattening would
-    // run every block of the region.
-    if (!varies(divergent, cf.cond)) return null;
+    const branch_divergent = varies(divergent, cf.cond);
     if (cf.then.target == head or cf.@"else".target == head) return null;
 
     var r: Region = .{ .head = head, .exit = head };
@@ -2745,13 +3986,13 @@ fn region(func: *const Function, head: Block, divergent: []const bool) ?Region {
             // warp has to go round them. It is taken as one node, and what the flattening gives
             // it is the mask its first iteration runs under, which is the predicate of the block
             // that enters it. The walk carries on from the block the loop leaves by.
-            if (r.loop == null) {
-                if (loopNodeAt(func, &r, b, divergent)) |l| {
-                    r.loop = l;
-                    if (!push(&seen, &seen_count, l.exit)) return null;
-                    took = true;
-                    break;
-                }
+            if (loopNodeAt(func, &r, b, divergent)) |l| {
+                if (r.loop_count == r.loops.len) return null;
+                r.loops[r.loop_count] = l;
+                r.loop_count += 1;
+                if (!push(&seen, &seen_count, l.exit)) return null;
+                took = true;
+                break;
             }
             if (!readyIn(func, &r, b)) continue;
             // A block that leaves by `ret` takes a path out that the exit does not cover, so it
@@ -2764,7 +4005,9 @@ fn region(func: *const Function, head: Block, divergent: []const bool) ?Region {
             var pure = true;
             for (func.blockInsts(b)) |in_b| {
                 if (func.opcode(in_b) == .@"if") continue; // dropped: the predicates carry it
-                if (!convertible(func.opcode(in_b))) pure = false;
+                if (!convertibleInRegion(func, in_b, divergent, uses)) {
+                    pure = false;
+                }
             }
             if (!pure) continue;
             if (r.count == max_region_blocks) return null;
@@ -2779,7 +4022,9 @@ fn region(func: *const Function, head: Block, divergent: []const bool) ?Region {
             took = true;
             break;
         }
-        if (!took) return null; // nothing was ready, so the shape is not single-exit
+        if (!took) {
+            return null; // nothing was ready, so the shape is not single-exit
+        }
     }
     var exit: ?Block = null;
     for (seen[0..seen_count]) |b| {
@@ -2788,29 +4033,33 @@ fn region(func: *const Function, head: Block, divergent: []const bool) ?Region {
     }
     r.exit = exit orelse return null;
     if (r.count == 0) return null;
-    if (r.exit == head) return null;
-    if (@backingInt(r.exit) == 0) return null;
+    // Flatten only small uniform diamonds. This keeps their single shared path intact while
+    // removing tiny control-flow diamonds from the body of a loop being converted.
+    if (!branch_divergent and (r.loop_count != 0 or r.count > 2)) return null;
+    if (r.exit == head or @backingInt(r.exit) == 0) return null;
     // Every way into the region is the head's branch, and every way out is the exit. A block with
     // an outside predecessor would be reached on a path this does not control.
-    if (!readyIn(func, &r, r.exit)) return null;
+    if (!readyIn(func, &r, r.exit) and !emptyReturn(func, r.exit)) {
+        return null;
+    }
     // What runs after the loop: the block it leaves by, and everything inside that block reaches.
     // Those are flattened into it rather than into the head, because the head runs BEFORE the
     // loop and they run after it.
-    if (r.loop) |l| {
+    for (r.loops[0..r.loop_count], 0..) |l, li| {
         var growing = true;
         while (growing) {
             growing = false;
             for (r.inside[0..r.count], 0..) |b, i| {
-                if (r.after[i]) continue;
+                if (r.stage[i] >= li + 1) continue;
                 var reached = b == l.exit;
                 for (r.inside[0..r.count], 0..) |src, j| {
-                    if (!r.after[j]) continue;
-                    for (successorsOf(func, src)) |s| {
-                        if (s == b) reached = true;
-                    }
+                    if (r.stage[j] < li + 1) continue;
+                    for (successorsOf(func, src)) |s| if (s == b) {
+                        reached = true;
+                    };
                 }
                 if (!reached) continue;
-                r.after[i] = true;
+                r.stage[i] = @intCast(li + 1);
                 growing = true;
             }
         }
@@ -2818,9 +4067,36 @@ fn region(func: *const Function, head: Block, divergent: []const bool) ?Region {
     return r;
 }
 
+/// A return block with no payload is safe to share with a path outside the region. It has no
+/// values to merge and no instructions whose effects depend on which path entered it.
+fn emptyReturn(func: *const Function, b: Block) bool {
+    if (func.blockParams(b).len != 0 or func.blockInsts(b).len != 0) return false;
+    return switch (func.terminator(b) orelse return false) {
+        .ret => true,
+        .jump => false,
+    };
+}
+
 /// The loop `b` heads, when `b` heads one this region can hold, and null otherwise.
 fn loopNodeAt(func: *const Function, r: *const Region, b: Block, divergent: []const bool) ?LoopNode {
-    const dl = divergentLoop(func, b, divergent, &.{}) orelse return null;
+    const dl = divergentLoop(func, b, divergent, &.{}, true) orelse {
+        const ml = multiBlockLoop(func, b, divergent, &.{}, true) orelse return null;
+        if (ml.preheader != r.head and !r.holds(ml.preheader)) return null;
+        var node: LoopNode = .{ .header = ml.header, .latch = ml.latch, .exit = ml.exit, .pre = ml.preheader };
+        for (ml.body[0..ml.count]) |block| if (!node.include(block)) return null;
+        for (ml.owned[0..ml.owned_count]) |block| if (!node.include(block)) return null;
+        for (ml.inner[0..ml.inner_count]) |block| if (!node.include(block)) return null;
+        for (ml.inner_pre[0..ml.inner_count]) |block| if (!node.include(block)) return null;
+        // The empty forwarding blocks between the loop's leaving edge and the block it really
+        // leaves by belong to the loop. The EXIT does not: it runs after the loop under the
+        // loop's entry predicate, and the region flattens it like any other block after a loop.
+        // Taking it into the body hides it from the region walk, so nothing ever masks it.
+        if (ml.leaving.target != ml.exit and !node.include(ml.leaving.target)) return null;
+        for (ml.breaks[0..ml.break_count]) |br| {
+            if (!node.include(br.block) or !node.include(br.continue_edge.target) or !node.include(br.exit_edge.target)) return null;
+        }
+        return node;
+    };
     // The block that enters the loop has to be accounted for already, because the mask the loop
     // runs under is that block's predicate. The latch is the other way in and belongs to the loop.
     if (dl.preheader != r.head and !r.holds(dl.preheader)) return null;
@@ -2948,17 +4224,24 @@ fn flatten(
     flows.add(func, head);
     for (r.inside[0..r.count]) |b| flows.add(func, b);
 
-    // How the loop is entered, read before the branch above it goes away.
-    const enter: ?ir.function.Jump = if (r.loop) |l| blk: {
-        if (l.pre != head) break :blk switch (func.terminator(l.pre) orelse return false) {
-            .jump => |j| j,
-            .ret => return false,
-        };
-        const insts = func.blockInsts(head);
-        const cf = func.opcode(insts[insts.len - 1]).@"if";
-        const edge = if (cf.then.target == l.header) cf.then else cf.@"else";
-        break :blk .{ .target = l.header, .args = edge.args };
-    } else null;
+    // The jump entering each loop, read before the branch above it goes away. The first jump
+    // replaces the region head's branch; later jumps replace the preceding loop's exit branch.
+    var enters: [max_region_blocks]?ir.function.Jump = @splat(null);
+    for (r.loops[0..r.loop_count], 0..) |l, i| {
+        if (l.pre != head) {
+            enters[i] = switch (func.terminator(l.pre) orelse return false) {
+                .jump => |j| j,
+                .ret => {
+                    return false;
+                },
+            };
+        } else {
+            const head_insts = func.blockInsts(head);
+            const cf = func.opcode(head_insts[head_insts.len - 1]).@"if";
+            const edge = if (cf.then.target == l.header) cf.then else cf.@"else";
+            enters[i] = .{ .target = l.header, .args = edge.args };
+        }
+    }
     // Nothing is touched until every predicate is known to be usable as a mask, so a refusal
     // leaves the function alone. What a mask cannot be built from is a WARP-UNIFORM float compare:
     // there is no scalar FPU, and `asMask` rebuilds a uniform INTEGER compare per lane and has no
@@ -2976,61 +4259,60 @@ fn flatten(
 
     _ = func.blockInstsMut(head).pop().?;
 
-    var preds: [max_region_blocks]?Value = @splat(null);
-    var negated: [max_region_blocks + 1]?Value = @splat(null);
-    var masked: [max_region_blocks + 1]?Value = @splat(null);
+    var preds: [max_region_blocks]?Pred = @splat(null);
+    var negated: [max_region_blocks + 1]?Pred = @splat(null);
+    var masked: [max_region_blocks + 1]?Pred = @splat(null);
 
-    // The mask the loop's first iteration runs under: the predicate of the block that enters it.
-    // `predicateOf` gives exactly that, because the latch is not one of the flows, so the only
-    // path it finds into the header is the one from above.
-    var entry: ?Value = null;
-    if (r.loop) |l| {
+    // Each loop starts under the predicate of its preheader. The latch is not one of the region
+    // flows, so `predicateOf` finds only the path entering from above.
+    var entries: [max_region_blocks]?Pred = @splat(null);
+    for (r.loops[0..r.loop_count], 0..) |l, i| {
         if (l.pre == head) {
-            entry = try predicateOf(func, head, head, r, &flows, &preds, &negated, &masked, divergent, l.header, bool_ty);
+            entries[i] = try predicateOf(func, head, head, r, &flows, &preds, &negated, &masked, divergent, l.header, bool_ty);
         }
     }
 
     for (0..r.count) |i| {
         const b = r.inside[i];
         const dest = r.destOf(b);
-        if (r.loop) |l| {
-            if (b == l.exit) {
-                // The loop still jumps here with the values it carries, so the parameters stay and
-                // only the instructions take the predicate. This block is where everything after
-                // the loop is flattened to.
-                preds[i] = entry;
-                try maskInPlace(allocator, func, b, entry, true);
-                continue;
-            }
+        if (r.loopAtExit(b)) |li| {
+            // The loop still jumps here with the values it carries, so the parameters stay and
+            // only the instructions take its entry predicate. Later blocks in this stage flatten
+            // into the exit, up to the next loop.
+            preds[i] = entries[li];
+            const entry: ?Value = if (entries[li]) |e| try e.mask(func, b, divergent, bool_ty) else null;
+            try maskInPlace(allocator, func, b, entry, true);
+            continue;
         }
         preds[i] = try predicateOf(func, head, dest, r, &flows, &preds, &negated, &masked, divergent, b, bool_ty);
-        try moveBlock(allocator, func, head, dest, r, &flows, &preds, b, preds[i], bool_ty, .drop_branch);
-        if (r.loop) |l| {
-            if (b == l.pre) {
-                entry = try predicateOf(func, head, head, r, &flows, &preds, &negated, &masked, divergent, l.header, bool_ty);
-            }
+        try moveBlock(allocator, func, head, dest, r, &flows, &preds, b, preds[i], divergent, bool_ty, .drop_branch);
+        for (r.loops[0..r.loop_count], 0..) |l, li| {
+            if (b != l.pre) continue;
+            entries[li] = try predicateOf(func, head, dest, r, &flows, &preds, &negated, &masked, divergent, l.header, bool_ty);
         }
     }
 
-    // Everything after the loop was flattened into the block the loop leaves by, so that is where
+    // Everything after the final loop is flattened into the block it leaves by, so that is where
     // the region ends and where the exit is absorbed.
-    const last = if (r.loop) |l| l.exit else head;
+    const last = if (r.loop_count != 0) r.loops[r.loop_count - 1].exit else head;
     // The exit runs for every lane that entered the region, so it needs no predicate of its own.
     // Its own branch STAYS: the region ends there, so whatever it does next is not this region's
     // business. For a loop that branch is the latch, and dropping it would lose the loop.
-    try moveBlock(allocator, func, head, last, r, &flows, &preds, r.exit, null, bool_ty, .keep_branch);
+    try moveBlock(allocator, func, head, last, r, &flows, &preds, r.exit, null, divergent, bool_ty, .keep_branch);
 
     // The last destination takes the exit's terminator, so nothing branches anywhere inside.
     // Everything else is unreachable and `neutralizeUnreachable` takes it out.
     func.terminatorPtr(last).* = func.terminatorPtr(r.exit).*;
-    // With a loop in the region the head no longer branches: it enters the loop, and the lanes the
-    // predicate excludes enter it inactive.
-    if (enter) |j| {
-        func.terminatorPtr(head).* = .{ .jump = j };
-        if (entry) |m| try recordLoopMask(func, head, masks, r.loop.?.header, m, bool_ty);
+    // Restore the jumps into each loop. The head enters the first; each earlier loop exit enters
+    // the next. Their masks keep lanes that did not take the corresponding path inactive.
+    for (r.loops[0..r.loop_count], 0..) |l, li| {
+        const j = enters[li] orelse return false;
+        const at = if (li == 0) head else r.loops[li - 1].exit;
+        func.terminatorPtr(at).* = .{ .jump = j };
+        if (entries[li]) |m| try recordLoopMask(func, at, masks, l.header, try m.mask(func, at, divergent, bool_ty), bool_ty);
     }
     for (r.inside[0..r.count]) |b| {
-        if (b == last) continue;
+        if (b == last or r.loopAtExit(b) != null) continue;
         func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
     }
     if (r.exit != last) func.setTerminator(r.exit, .{ .ret = ir.function.Ret.none() });
@@ -3078,6 +4360,29 @@ fn maskInPlace(
     }
 }
 
+/// A predicate a flattened region runs a block under, and whether every lane agrees on it.
+///
+/// A WARP-UNIFORM predicate is a scalar bool, which a select reads as it stands. A memory
+/// operation needs one bit per lane instead, so `mask` rebuilds it per lane at the point of use.
+/// Rebuilding it earlier than that is what used to make a kernel per-lane that is not: the spread
+/// reads the lane id, so every value the predicate reached counted as per-lane, a loop counter
+/// and the state of a loop nest among them, and the nest was refused for a divergence it does
+/// not have.
+const Pred = struct {
+    value: Value,
+    uniform: bool,
+
+    fn of(value: Value, uniform: bool) Pred {
+        return .{ .value = value, .uniform = uniform };
+    }
+
+    /// The predicate as a per-lane mask.
+    fn mask(self: Pred, func: *Function, at: Block, divergent: []const bool, bool_ty: Type) Error!Value {
+        if (!self.uniform) return self.value;
+        return (try spreadMask(func, at, self.value, divergent, bool_ty)) orelse error.Unsupported;
+    }
+};
+
 /// The predicate for `b`: the paths into it, each the predicate of its source ANDed with what the
 /// edge tests, ORed together. Null means every lane that reached the region.
 fn predicateOf(
@@ -3086,35 +4391,41 @@ fn predicateOf(
     dest: Block,
     r: Region,
     flows: *const Flows,
-    preds: *const [max_region_blocks]?Value,
-    negated: *[max_region_blocks + 1]?Value,
-    masked: *[max_region_blocks + 1]?Value,
+    preds: *const [max_region_blocks]?Pred,
+    negated: *[max_region_blocks + 1]?Pred,
+    masked: *[max_region_blocks + 1]?Pred,
     divergent: []const bool,
     b: Block,
     bool_ty: Type,
-) Error!?Value {
-    var total: ?Value = null;
+) Error!?Pred {
+    var total: ?Pred = null;
     var any = false;
     for (flows.items[0..flows.count], 0..) |src, si| {
         const side = src.sideTo(b) orelse continue;
-        const from: ?Value = if (src.block == head) null else preds[indexIn(r, src.block).?];
+        const from: ?Pred = if (src.block == head) null else preds[indexIn(r, src.block).?];
         // What the edge itself tests. A jump tests nothing, a branch its condition one way and the
         // complement of it the other, and a branch whose two edges both land here tests nothing.
-        const edge: ?Value = blk: {
+        const edge: ?Pred = blk: {
             const cond = src.cond orelse break :blk null;
             if (src.edges[0] != null and src.edges[1] != null and
                 src.edges[0].?.target == src.edges[1].?.target) break :blk null;
             // Where the CONDITION is, which is where its block was flattened to.
             const at = r.destOf(src.block);
-            if (masked[si] == null) masked[si] = (try asMask(func, at, cond, divergent, bool_ty)).?;
+            // `flatten` checked `maskable` over every one of these before it moved anything, so
+            // a condition that cannot be spread here is the two having drifted apart. Refuse
+            // rather than panic.
+            if (masked[si] == null) masked[si] = Pred.of(cond, !varies(divergent, cond));
             if (side == 0) break :blk masked[si];
             if (negated[si] == null) {
-                negated[si] = (try appendComplement(func, at, masked[si].?, bool_ty)).?;
+                const inner = masked[si].?;
+                const flipped = (try appendComplement(func, at, inner.value, bool_ty)) orelse
+                    return error.Unsupported;
+                negated[si] = Pred.of(flipped, inner.uniform);
             }
             break :blk negated[si];
         };
-        const path: ?Value = if (from) |f|
-            (if (edge) |e| try maskAnd(func, dest, f, e, bool_ty) else f)
+        const path: ?Pred = if (from) |f|
+            (if (edge) |e| try maskBoth(func, dest, .bit_and, f, e, divergent, bool_ty) else f)
         else
             edge;
         if (!any) {
@@ -3122,19 +4433,35 @@ fn predicateOf(
         } else if (total) |a_mask| {
             // A path with no predicate of its own covers every lane, so the OR is everything.
             const b_mask = path orelse break;
-            total = try maskOr(func, dest, a_mask, b_mask, bool_ty);
+            total = try maskBoth(func, dest, .bit_or, a_mask, b_mask, divergent, bool_ty);
         }
         any = true;
     }
     return total;
 }
 
-fn maskAnd(func: *Function, at: Block, x: Value, y: Value, bool_ty: Type) Error!Value {
-    return func.appendInst(at, bool_ty, .{ .arith = .{ .op = .bit_and, .lhs = x, .rhs = y } });
+/// Two predicates combined. A uniform one stays uniform, and a uniform one meeting a per-lane one
+/// is spread first, because a scalar bool and a mask cannot be combined as they stand.
+fn maskBoth(
+    func: *Function,
+    at: Block,
+    op: ir.function.BinOp,
+    x: Pred,
+    y: Pred,
+    divergent: []const bool,
+    bool_ty: Type,
+) Error!Pred {
+    if (x.uniform and y.uniform) {
+        const joined = try func.appendInst(at, bool_ty, .{ .arith = .{ .op = op, .lhs = x.value, .rhs = y.value } });
+        return Pred.of(joined, true);
+    }
+    const lhs = try x.mask(func, at, divergent, bool_ty);
+    const rhs = try y.mask(func, at, divergent, bool_ty);
+    return Pred.of(try func.appendInst(at, bool_ty, .{ .arith = .{ .op = op, .lhs = lhs, .rhs = rhs } }), false);
 }
 
-fn maskOr(func: *Function, at: Block, x: Value, y: Value, bool_ty: Type) Error!Value {
-    return func.appendInst(at, bool_ty, .{ .arith = .{ .op = .bit_or, .lhs = x, .rhs = y } });
+fn maskAnd(func: *Function, at: Block, x: Value, y: Value, bool_ty: Type) Error!Value {
+    return func.appendInst(at, bool_ty, .{ .arith = .{ .op = .bit_and, .lhs = x, .rhs = y } });
 }
 
 /// Where `b` sits in the region's order, or null when it is not inside.
@@ -3153,9 +4480,10 @@ fn moveBlock(
     dest: Block,
     r: Region,
     flows: *const Flows,
-    preds: *const [max_region_blocks]?Value,
+    preds: *const [max_region_blocks]?Pred,
     b: Block,
-    mask: ?Value,
+    mask: ?Pred,
+    divergent: []const bool,
     bool_ty: Type,
     branch: enum { drop_branch, keep_branch },
 ) Error!void {
@@ -3180,8 +4508,10 @@ fn moveBlock(
                 value = arg; // a path that covers every lane wins outright
                 continue;
             };
+            // A select reads the predicate as it stands: a uniform one picks the same arm in
+            // every lane and stays on the scalar side.
             value = try func.appendInst(dest, func.valueType(p), .{ .select = .{
-                .cond = g,
+                .cond = g.value,
                 .then = arg,
                 .@"else" = value.?,
             } });
@@ -3203,9 +4533,13 @@ fn moveBlock(
             .load => |l| l.mask,
             else => null,
         };
+        // A memory operation is the one place the predicate has to be a mask, so a uniform one
+        // is spread here and nowhere else.
         const combined: ?Value = if (mask) |m| blk: {
-            if (carried) |inner| break :blk try maskAnd(func, dest, inner, m, bool_ty);
-            break :blk m;
+            if (carried == null and func.opcode(inst) != .store and func.opcode(inst) != .load) break :blk null;
+            const bits = try m.mask(func, dest, divergent, bool_ty);
+            if (carried) |inner| break :blk try maskAnd(func, dest, inner, bits, bool_ty);
+            break :blk bits;
         } else carried;
         try func.blockInstsMut(dest).append(allocator, inst);
         switch (func.opcodeMut(inst).*) {
@@ -3254,6 +4588,11 @@ fn varies(divergent: []const bool, v: Value) bool {
 /// compare this can rebuild per lane. See `asMask`.
 fn maskable(func: *const Function, cond: Value, divergent: []const bool) bool {
     if (varies(divergent, cond)) return true;
+    // A uniform compare is rebuilt per lane by spreading one operand against a lane-varying
+    // value. A kernel that reads no lane builtin has none to spread against, so its branch has
+    // to stay a branch. `asMask` needs the same value, and the two must agree or flatten walks
+    // into a region it cannot finish.
+    if (laneValue(func) == null) return false;
     const inst = func.definingInst(cond) orelse return false;
     switch (func.opcode(inst)) {
         .icmp => |c| return !isFloat(func, func.valueType(c.lhs)),
@@ -3276,19 +4615,22 @@ fn maskable(func: *const Function, cond: Value, divergent: []const bool) bool {
 /// Rebuilding the compare with one operand made per-lane gives the same answer in every lane and
 /// arrives as a real mask. Adding a per-lane zero is what makes the operand per-lane: the value is
 /// unchanged and the divergence analysis reads it off the operands.
-fn asMask(func: *Function, at: Block, cond: Value, divergent: []const bool, bool_ty: Type) Error!?Value {
-    if (varies(divergent, cond)) return cond;
+///
+/// An AND, an OR or a NOT is rebuilt from its parts, because a predicate is a tree of the
+/// region's branch conditions and only the compares at its leaves have an operand to spread.
+fn spreadMask(func: *Function, at: Block, cond: Value, divergent: []const bool, bool_ty: Type) Error!?Value {
     const inst = func.definingInst(cond) orelse return null;
     const c = switch (func.opcode(inst)) {
         .icmp => |x| x,
-        // A NOT: the mask of what it negates, flipped.
-        .arith, .arith_imm => switch (complementOf(func, cond) orelse return null) {
-            .have => |v| {
-                const inner = (try asMask(func, at, v, divergent, bool_ty)) orelse return null;
-                return try appendComplement(func, at, inner, bool_ty);
+        .arith => |a| switch (a.op) {
+            .bit_and, .bit_or => {
+                const lhs = (try spreadMask(func, at, a.lhs, divergent, bool_ty)) orelse return null;
+                const rhs = (try spreadMask(func, at, a.rhs, divergent, bool_ty)) orelse return null;
+                return try func.appendInst(at, bool_ty, .{ .arith = .{ .op = a.op, .lhs = lhs, .rhs = rhs } });
             },
-            .compare => return null,
+            else => return try spreadComplement(func, at, cond, divergent, bool_ty),
         },
+        .arith_imm => return try spreadComplement(func, at, cond, divergent, bool_ty),
         else => return null,
     };
     const ty = func.valueType(c.lhs);
@@ -3301,6 +4643,17 @@ fn asMask(func: *Function, at: Block, cond: Value, divergent: []const bool, bool
     } });
     const spread = try func.appendInst(at, ty, .{ .arith = .{ .op = .add, .lhs = c.lhs, .rhs = zero } });
     return try func.appendInst(at, bool_ty, .{ .icmp = .{ .op = c.op, .lhs = spread, .rhs = c.rhs } });
+}
+
+/// A NOT: the mask of what it negates, flipped.
+fn spreadComplement(func: *Function, at: Block, cond: Value, divergent: []const bool, bool_ty: Type) Error!?Value {
+    switch (complementOf(func, cond) orelse return null) {
+        .have => |v| {
+            const inner = (try spreadMask(func, at, v, divergent, bool_ty)) orelse return null;
+            return try appendComplement(func, at, inner, bool_ty);
+        },
+        .compare => return null,
+    }
 }
 
 /// How the complement of a bool can be had, when it can.
@@ -3389,6 +4742,26 @@ fn convertible(code: ir.function.Opcode) bool {
         // which is a mask op and exact at any lane count. See `maskBinOp`.
         .store, .load => true,
         else => false,
+    };
+}
+
+/// A dead-result bitwise-OR atomic may be executed by inactive lanes if their operand is replaced
+/// with zero. Its pointer must be warp-uniform and valid for every lane; all other atomics remain
+/// side effects that cannot move out of their selected branch.
+fn convertibleInRegion(func: *const Function, inst: Inst, divergent: []const bool, uses: []const u32) bool {
+    return switch (func.opcode(inst)) {
+        .atomic_rmw => |a| blk: {
+            const ptr = func.types.type_kind(func.valueType(a.ptr));
+            // A per-lane add is serialized by the emitter. A region's inactive lanes get a
+            // zero operand, so their atomic operation is a no-op; the descriptor lowering has
+            // already routed invalid addresses to its safe fallback pointer.
+            if (a.op == .add and ptr == .ptr) break :blk true;
+            const result_unused = if (func.instResult(inst)) |result| uses[@backingInt(result)] == 0 else true;
+            if (a.op != .bit_or or !result_unused) break :blk false;
+            if (divergent[@backingInt(a.ptr)] or ptr != .ptr) break :blk false;
+            break :blk true;
+        },
+        else => convertible(func.opcode(inst)),
     };
 }
 
@@ -3743,6 +5116,7 @@ fn divergentLoop(
     block: Block,
     divergent: []const bool,
     masks: []const LoopMask,
+    allow_uniform: bool,
 ) ?DivergentLoop {
     const insts = func.blockInsts(block);
     if (insts.len == 0) return null;
@@ -3750,7 +5124,12 @@ fn divergentLoop(
         .@"if" => |x| x,
         else => return null,
     };
-    if (!varies(divergent, cf.cond)) return null;
+    var has_mask = false;
+    for (masks) |m| if (m.header == block) {
+        has_mask = true;
+        break;
+    };
+    if (!varies(divergent, cf.cond) and !has_mask and !allow_uniform) return null;
     const then_latch = isLatchOf(func, cf.then.target, block);
     const else_latch = isLatchOf(func, cf.@"else".target, block);
     // One edge round and the other out. Both or neither is not a loop this reads.
@@ -3890,11 +5269,11 @@ fn isLatchOf(func: *const Function, maybe: Block, header: Block) bool {
 /// body moves into the header under the test and the body's block, now empty, becomes the latch.
 ///
 /// Only a divergent loop needs this. A warp-uniform one branches and costs nothing.
-fn rotateWhileLoops(allocator: std.mem.Allocator, func: *Function, divergent: []const bool) Error!bool {
+fn rotateWhileLoops(allocator: std.mem.Allocator, func: *Function, divergent: []const bool, masks: []const LoopMask) Error!bool {
     var changed = false;
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
-        if (try rotateWhileLoop(allocator, func, block, divergent)) changed = true;
+        if (try rotateWhileLoop(allocator, func, block, divergent, masks)) changed = true;
     }
     return changed;
 }
@@ -3924,6 +5303,7 @@ fn rotateWhileLoop(
     func: *Function,
     header: Block,
     divergent: []const bool,
+    masks: []const LoopMask,
 ) Error!bool {
     const insts = func.blockInsts(header);
     if (insts.len == 0) return false;
@@ -3931,7 +5311,12 @@ fn rotateWhileLoop(
         .@"if" => |x| x,
         else => return false,
     };
-    if (!varies(divergent, cf.cond)) return false;
+    var has_mask = false;
+    for (masks) |m| if (m.header == header) {
+        has_mask = true;
+        break;
+    };
+    if (!varies(divergent, cf.cond) and !has_mask) return false;
     // One edge into the body and the other out. Both or neither is not a loop this reads.
     const then_body = whileBodyOf(func, cf.then.target, header);
     const else_body = whileBodyOf(func, cf.@"else".target, header);
@@ -4024,6 +5409,11 @@ fn appendMasked(
     switch (func.opcodeMut(inst).*) {
         .store => |*st| st.mask = both,
         .load => |*l| l.mask = both,
+        .atomic_rmw => |*a| {
+            const ty = func.valueType(a.value);
+            const zero = try func.appendInst(block, ty, .{ .iconst = 0 });
+            a.value = try func.appendInst(block, ty, .{ .select = .{ .cond = mask, .then = a.value, .@"else" = zero } });
+        },
         else => {},
     }
 }
@@ -4057,6 +5447,10 @@ const MultiLoop = struct {
     /// own, and its accesses still belong to the lanes the test admitted.
     owned: [max_body_blocks]Block = undefined,
     owned_count: usize = 0,
+    /// A per-lane `break` in the body. Its failing lanes are removed from the active mask at the
+    /// tail, and following body blocks run under the surviving mask.
+    breaks: [max_body_blocks]LoopBreak = undefined,
+    break_count: usize = 0,
     /// The body block the iteration ends in. With the test at the top it goes round by a jump this
     /// turns into the reduction branch; with the test at the bottom it already branches.
     tail: Block,
@@ -4077,6 +5471,15 @@ const MultiLoop = struct {
     leaving: ir.function.Jump,
 };
 
+const LoopBreak = struct {
+    block: Block,
+    cond: Value,
+    continue_edge: ir.function.Jump,
+    exit_edge: ir.function.Jump,
+    exits_on_true: bool,
+    stay: ?Value = null,
+};
+
 /// Whether `header` heads a loop whose body spans blocks. Every condition is a reason it would
 /// otherwise be wrong rather than a simplification of convenience.
 fn multiBlockLoop(
@@ -4084,6 +5487,7 @@ fn multiBlockLoop(
     header: Block,
     divergent: []const bool,
     masks: []const LoopMask,
+    allow_uniform: bool,
 ) ?MultiLoop {
     if (predCount(func, header) != 2) return null;
     for (func.blockInsts(header)) |inst| {
@@ -4091,7 +5495,7 @@ fn multiBlockLoop(
         if (!convertible(func.opcode(inst))) return null;
     }
     const m = if (endsInIf(func, header))
-        topTestLoop(func, header, divergent, masks) orelse return null
+        topTestLoop(func, header, divergent, masks, allow_uniform) orelse return null
     else
         bottomTestLoop(func, header, divergent, masks) orelse return null;
     // Where the loop is entered from: the other way into the header.
@@ -4119,10 +5523,11 @@ fn topTestLoop(
     header: Block,
     divergent: []const bool,
     masks: []const LoopMask,
+    allow_uniform: bool,
 ) ?MultiLoop {
     const insts = func.blockInsts(header);
     const cf = func.opcode(insts[insts.len - 1]).@"if";
-    if (!varies(divergent, cf.cond)) return null;
+    if (!loopConditionCanVary(func, header, divergent, masks, cf.cond, allow_uniform)) return null;
     // One side enters the body and the other leaves. The body is the side that comes back.
     for ([_]bool{ true, false }) |on_true| {
         const entering = if (on_true) cf.then else cf.@"else";
@@ -4132,7 +5537,7 @@ fn topTestLoop(
             .preheader = header,
             .tail = header,
             .latch = header,
-            .exit = leaving.target,
+            .exit = forwardsTo(func, leaving.target),
             .cond = cf.cond,
             .test_at_top = true,
             .enter_on_true = on_true,
@@ -4151,6 +5556,20 @@ fn topTestLoop(
         return m;
     }
     return null;
+}
+
+fn loopConditionCanVary(
+    func: *const Function,
+    header: Block,
+    divergent: []const bool,
+    masks: []const LoopMask,
+    cond: Value,
+    allow_uniform: bool,
+) bool {
+    if (varies(divergent, cond) or allow_uniform) return true;
+    for (masks) |m| if (m.header == header) return true;
+    _ = func;
+    return false;
 }
 
 /// The loop `header` heads when the test is in the block the iteration ends in, which is a
@@ -4281,7 +5700,6 @@ fn walkBody(
     divergent: []const bool,
     masks: []const LoopMask,
 ) bool {
-    _ = divergent;
     _ = masks;
     var cur = first;
     while (true) {
@@ -4304,7 +5722,27 @@ fn walkBody(
                 m.tail = cur;
                 m.body[m.count] = cur;
                 m.count += 1;
-                return m.inner_count != 0;
+                return m.count != 0;
+            }
+            if (m.break_count < max_body_blocks) {
+                const exit = forwardsTo(func, m.exit);
+                const then_exits = forwardsTo(func, cf.then.target) == exit;
+                const else_exits = forwardsTo(func, cf.@"else".target) == exit;
+                if (then_exits != else_exits and varies(divergent, cf.cond) and predCount(func, cur) == 1) {
+                    const continue_edge = if (then_exits) cf.@"else" else cf.then;
+                    m.breaks[m.break_count] = .{
+                        .block = cur,
+                        .cond = cf.cond,
+                        .continue_edge = continue_edge,
+                        .exit_edge = if (then_exits) cf.then else cf.@"else",
+                        .exits_on_true = then_exits,
+                    };
+                    m.break_count += 1;
+                    m.body[m.count] = cur;
+                    m.count += 1;
+                    cur = continue_edge.target;
+                    continue;
+                }
             }
             const inner = innerLoop(func, cur) orelse return false;
             if (m.inner_count == max_body_blocks) return false;
@@ -4330,9 +5768,7 @@ fn walkBody(
             .jump => |j| {
                 if (j.target == m.header) {
                     m.tail = cur;
-                    // Without an inner loop the body would have been flattened into the header,
-                    // and `divergentLoop` reads that shape. This path is for the one it cannot.
-                    return m.inner_count != 0;
+                    return m.count != 0;
                 }
                 cur = j.target;
             },
@@ -4399,7 +5835,21 @@ fn convertMultiBlockLoop(
     // loop's own blocks take it too: a uniform inner loop gets no mask of its own, and a divergent
     // one ANDs what it adds with this.
     const body_mask = next;
-    for (m.body[0..m.count]) |b| try maskInPlace(allocator, func, b, body_mask, false);
+    var path_mask = body_mask;
+    var break_info = m.breaks;
+    for (m.body[0..m.count]) |b| {
+        try maskInPlace(allocator, func, b, path_mask, false);
+        for (break_info[0..m.break_count]) |*br| {
+            if (br.block != b) continue;
+            _ = func.blockInstsMut(br.block).pop().?;
+            func.terminatorPtr(br.block).* = .{ .jump = br.continue_edge };
+            br.stay = if (br.exits_on_true)
+                (try appendComplement(func, br.block, br.cond, bool_ty)) orelse return false
+            else
+                br.cond;
+            path_mask = try maskAnd(func, br.block, path_mask, br.stay.?, bool_ty);
+        }
+    }
     for (m.owned[0..m.owned_count]) |b| try maskInPlace(allocator, func, b, body_mask, false);
 
     // An inner loop takes the body's mask ON TOP of the one it already had, which is what says a
@@ -4426,6 +5876,9 @@ fn convertMultiBlockLoop(
         else
             (try appendComplement(func, m.tail, m.cond, bool_ty)).?;
         next = try maskAnd(func, m.tail, active, again, bool_ty);
+    }
+    for (break_info[0..m.break_count]) |br| {
+        next = try maskAnd(func, m.tail, next, br.stay orelse return false, bool_ty);
     }
 
     // What goes round is named by the block the back edge leaves from.
@@ -4527,13 +5980,13 @@ fn convertDivergentLoops(
         // A loop this already converted, which the rounds would otherwise convert again: the
         // reduction branch is both the marker and the thing that would be rewritten.
         if (alreadyConverted(func, block, latches.items)) continue;
-        if (divergentLoop(func, block, divergent, masks.items)) |loop| {
+        if (divergentLoop(func, block, divergent, masks.items, false)) |loop| {
             if (try convertLoop(allocator, func, loop, latches)) changed = true;
             continue;
         }
         // A body that spans blocks, which an inner loop makes. The outer one goes first, so the
         // mask it hands the inner one is in place before the inner one is rewritten.
-        const wide = multiBlockLoop(func, block, divergent, masks.items) orelse continue;
+        const wide = multiBlockLoop(func, block, divergent, masks.items, false) orelse continue;
         // With the test at the bottom the marker sits on the TAIL, so the check above looked at
         // the wrong block. Without this the rounds convert the same loop again and again.
         if (alreadyConverted(func, wide.tail, latches.items)) continue;
@@ -5546,6 +6999,7 @@ fn checkSupported(
     func: *const Function,
     opts: Options,
     divergent: []const bool,
+    uses: []const u32,
     macs: *const Macs,
     any_lane: *const AnyLane,
     why: ?*Refusal,
@@ -5573,7 +7027,7 @@ fn checkSupported(
         };
         // A lane-varying builtin comes from `vid.v` rather than from a CSR, so it has no
         // `builtinSource`. See `lanewiseBuiltin`.
-        if (!laneVarying(b)) _ = builtinSource(b) orelse
+        if (!laneVarying(b) and !emitterBuiltin(b)) _ = builtinSource(b) orelse
             return Refusal.whole(why, "a builtin the core cannot answer");
     }
     for (0..func.blockCount()) |bi| {
@@ -5583,7 +7037,7 @@ fn checkSupported(
             // The multiply and the two converts a MAC absorbs are emitted by the `add`, so the
             // rules below do not apply to them: on their own the core has neither instruction.
             if (macs.isFolded(inst)) continue;
-            try checkInst(func, opts, divergent, macs, any_lane, block, insts, inst, i, why);
+            try checkInst(func, opts, divergent, uses, macs, any_lane, block, insts, inst, i, why);
         }
         if (func.terminator(block)) |term| switch (term) {
             .ret => |r| if (r.count != 0) {
@@ -5598,6 +7052,7 @@ fn checkInst(
     func: *const Function,
     opts: Options,
     divergent: []const bool,
+    uses: []const u32,
     macs: *const Macs,
     any_lane: *const AnyLane,
     block: Block,
@@ -5625,9 +7080,8 @@ fn checkInst(
             // than quietly read as a mask.
             if (isBool(func, ty) and resultDivergent(func, inst, divergent)) {
                 _ = maskBinOp(a.op) orelse return Refusal.at(why, func, block, i, inst, "a bitwise operation between per-lane bools that has no mask op");
-                if (!divergent[@backingInt(a.lhs)] or !divergent[@backingInt(a.rhs)]) {
+                if (!divergent[@backingInt(a.lhs)] or !divergent[@backingInt(a.rhs)])
                     return Refusal.at(why, func, block, i, inst, "a mask combined with a warp-uniform bool");
-                }
                 return;
             }
             // Float arithmetic runs on the vector unit either way, so the table is nearly the same
@@ -5635,8 +7089,9 @@ fn checkInst(
             // `floatVectorBinOp`.
             if (floatVectorBinOp(func, a.op, ty, resultDivergent(func, inst, divergent)) == null) {
                 if (resultDivergent(func, inst, divergent)) {
-                    _ = vectorBinOp(func, a.op, ty) orelse
+                    _ = vectorBinOp(func, a.op, ty) orelse {
                         return Refusal.at(why, func, block, i, inst, "a per-lane arithmetic operation the core has no instruction for");
+                    };
                 } else {
                     _ = binOp(func, a.op, ty) orelse
                         return Refusal.at(why, func, block, i, inst, "a warp-uniform arithmetic operation the core has no instruction for");
@@ -5663,10 +7118,9 @@ fn checkInst(
         // A per-lane compare writes a MASK, one bit per lane, and a per-lane select reads one.
         .icmp => |c| {
             const ty = func.valueType(c.lhs);
-            // A WARP-UNIFORM float compare has nothing to do it: the compares write a mask, so
-            // they are vector instructions, and the scalar path has no float compare at all. An
-            // integer compare over float bits answers a different relation and is wrong for a
-            // negative value and for NaN, so it is a refusal rather than a substitution.
+            // Float comparisons must have a mask result, even with uniform operands.
+            // analyzeDivergence assigns that register class; keep the scalar refusal as
+            // an invariant check, since the scalar emitter only compares integers.
             if (resultDivergent(func, inst, divergent)) {
                 _ = vectorCmpOp(func, c.op, ty) orelse
                     return Refusal.at(why, func, block, i, inst, "a per-lane compare the core has no instruction for");
@@ -5726,11 +7180,12 @@ fn checkInst(
         .atomic_rmw => |a| {
             _ = amoOp(func, a.op, func.valueType(a.value)) orelse
                 return Refusal.at(why, func, block, i, inst, "an atomic the core has no AMO for, compare-and-swap among them");
-            // Every lane would need its own read-modify-write, and the core has one bus. A per-lane
-            // atomic is a loop over the lanes, which is not this. The vector emitter would refuse
-            // it too; this is here because admission is where a refusal belongs.
             if (divergent[@backingInt(a.ptr)] or divergent[@backingInt(a.value)]) {
-                return Refusal.at(why, func, block, i, inst, "a per-lane atomic, which would be a loop over the lanes");
+                const pointer = func.types.type_kind(func.valueType(a.ptr));
+                const result_unused = if (func.instResult(inst)) |result| uses[@backingInt(result)] == 0 else true;
+                if (a.op != .add and (a.op != .bit_or or !result_unused or pointer != .ptr)) {
+                    return Refusal.at(why, func, block, i, inst, "a per-lane atomic other than add or an unused bitwise OR through a uniform pointer");
+                }
             }
             if (!isWord(func, func.valueType(a.value))) {
                 return Refusal.at(why, func, block, i, inst, "an atomic on a value wider than a word");
@@ -5738,7 +7193,7 @@ fn checkInst(
         },
         .global_addr => |g| _ = addressOf(opts, func.symbolName(g.symbol)) orelse
             return Refusal.at(why, func, block, i, inst, "a global the host did not place at an address"),
-        .unary => |u| if (u.op != .reinterpret)
+        .unary => |u| if (u.op != .reinterpret and u.op != .nearest)
             return Refusal.at(why, func, block, i, inst, "a unary operation that is not a reinterpret"),
         // A widening convert has no instruction of its own; the recognizer turns one into a MAC.
         .convert => |cv| if (macs.at(inst) == null) {
@@ -5806,11 +7261,26 @@ fn launchArgOf(index: usize) ?u12 {
 /// A warp is the workgroup: it owns a program counter and a register file. The dispatch CSR adds
 /// the virtual batch offset to the physical hart id. The lanes inside a warp are the threads, so
 /// a thread or lane index differs between the lanes and comes from `vid.v` instead.
-fn builtinSource(b: gpu.builtin.Builtin) ?union(enum) { csr: u12, lanes } {
+/// Builtins the emitter materializes from its own state instead of from `builtinSource`: the
+/// workgroup shape, which comes from the profile or the module, and the warp index, which comes
+/// from the workgroup-id CSR. Admission has to accept these or it refuses what the emitter can
+/// already emit. See the builtin switch in `Emitter.prologue`.
+fn emitterBuiltin(b: gpu.builtin.Builtin) bool {
     return switch (b) {
-        .block_id_x => .{ .csr = glacier.Csr.workgroup_id },
+        .block_dim_x, .block_dim_y, .block_dim_z, .warp_id => true,
+        else => false,
+    };
+}
+
+fn builtinSource(b: gpu.builtin.Builtin) ?union(enum) { csr: u12, lanes, constant: u32 } {
+    return switch (b) {
         .grid_dim_x => .{ .csr = glacier.Csr.grid_dim },
-        .block_dim_x, .subgroup_size => .lanes,
+        // The emitter's block-id path derives this from the workgroup-id CSR. Admission
+        // must recognize the same hardware source before that specialized emission runs.
+        .block_id_x => .{ .csr = glacier.Csr.workgroup_id },
+        .block_id_y, .block_id_z => .{ .constant = 0 },
+        .grid_dim_y, .grid_dim_z => .{ .constant = 1 },
+        .subgroup_size => .lanes,
         else => null,
     };
 }
@@ -6115,6 +7585,8 @@ const Emitter = struct {
     why: ?*Refusal,
     /// Whether the allocation uses the scratch region, so the prologue must load `sp`.
     spills: bool,
+    /// Per-lane atomic operands are staged in two extra vector slots below allocator spills.
+    vector_atomics: bool = false,
     /// What each value rematerialises to. See `rematTable`.
     remat: []const ?i32,
     /// Which spill slots hold nothing. See `elidableSlots`.
@@ -6131,6 +7603,8 @@ const Emitter = struct {
     shared: []const gpu.abi.SharedSlot,
     /// The bytes the workgroup window takes directly below `sp`. The spill slots start under it.
     shared_bytes: u32,
+    /// Workgroup slots are in core-shared SRAM instead of the private scratch stack.
+    core_shared: bool = false,
     /// Where the per-lane spill slots start, in bytes below `sp`. The scalar slots take the top of
     /// the region one word each, so the vector slots sit under them, one whole register each.
     vector_slot_base: u32,
@@ -6273,7 +7747,10 @@ const Emitter = struct {
                 pos += 2 + @as(u32, @intCast(self.func.blockInsts(block).len));
                 continue;
             }
-            if (bi == 0) try self.prologue(block) else try self.edgeMovesInto(block);
+            if (bi == 0) self.prologue(block) catch |err| {
+                std.debug.print("Glacier builtin prologue failed: {s}\n", .{@errorName(err)});
+                return err;
+            } else try self.edgeMovesInto(block);
 
             try self.actionsAt(pos); // the block-parameter position
             pos += 1;
@@ -6329,7 +7806,11 @@ const Emitter = struct {
             if (arg != null and self.uses[@backingInt(p)] == 0) continue;
             const home = self.locAt(p, 0) orelse continue;
             if (self.isDivergent(p)) {
-                try self.lanewiseBuiltin(b orelse return error.Unsupported, try self.vreg(p, 0));
+                const builtin = b orelse return error.Unsupported;
+                self.lanewiseBuiltin(builtin, try self.vreg(p, 0)) catch |err| {
+                    std.debug.print("Glacier lane builtin {t} failed for shape {any}: {s}\n", .{ builtin, self.localSize(), @errorName(err) });
+                    return err;
+                };
                 continue;
             }
             const dst: Reg = switch (home) {
@@ -6338,12 +7819,35 @@ const Emitter = struct {
             };
             if (arg) |csr| {
                 try self.put(glacier.csrr(dst, csr));
-            } else switch (builtinSource(b.?) orelse return error.Unsupported) {
-                .csr => |c| try self.put(glacier.csrr(dst, c)),
-                .lanes => try self.constant(dst, self.opts.profile.lanes()),
+            } else switch (b.?) {
+                .block_id_x, .block_id_y => try self.groupCoordinate(dst, if (b.? == .block_id_x) 0 else 1),
+                .warp_id => {
+                    const factor = self.subgroupsPerWorkgroup();
+                    if (factor == 1) {
+                        try self.constant(dst, 0);
+                    } else {
+                        try self.put(glacier.csrr(dst, glacier.Csr.workgroup_id));
+                        try self.put(rv.andi(dst, dst, @intCast(factor - 1)));
+                    }
+                },
+                .block_dim_x, .block_dim_y, .block_dim_z => {
+                    const shape = self.localSize();
+                    const axis: usize = switch (b.?) {
+                        .block_dim_x => 0,
+                        .block_dim_y => 1,
+                        .block_dim_z => 2,
+                        else => unreachable,
+                    };
+                    try self.constant(dst, @intCast(shape[axis]));
+                },
+                else => switch (builtinSource(b.?) orelse return error.Unsupported) {
+                    .csr => |c| try self.put(glacier.csrr(dst, c)),
+                    .lanes => try self.constant(dst, self.opts.profile.lanes()),
+                    .constant => |value| try self.constant(dst, @intCast(value)),
+                },
             }
             switch (home) {
-                .slot => |n| try self.put(rv.sw(dst, sp, try self.slotOffset(n))),
+                .slot => |n| try self.putStackStore(dst, try self.slotOffset(n)),
                 .reg => {},
             }
         }
@@ -6357,14 +7861,75 @@ const Emitter = struct {
     /// NOT safe to reduce across, which is why a lane count comes from the profile.
     fn lanewiseBuiltin(self: *Emitter, b: gpu.builtin.Builtin, dst: VReg) Error!void {
         try self.put(rv.vid_v(dst));
-        if (b != .global_id_x and b != .vertex_index) return;
-        // A global index is this workgroup's base plus the lane: `workgroup_id * lanes + vid`. The lane
-        // count is a power of two, so the multiply is a shift.
+        if (b == .local_invocation_index) {
+            const factor = self.subgroupsPerWorkgroup();
+            if (factor > 1) {
+                try self.put(glacier.csrr(scratch, glacier.Csr.workgroup_id));
+                try self.put(rv.andi(scratch, scratch, @intCast(factor - 1)));
+                try self.put(rv.slli(scratch, scratch, @intCast(std.math.log2_int(u8, self.opts.profile.lanes()))));
+                try self.put(rv.vmv_v_x(vscratch, scratch));
+                try self.put(rv.vadd_vv(dst, dst, vscratch));
+            }
+            return;
+        }
+        const axis: ?usize = switch (b) {
+            .thread_id_x, .global_id_x, .vertex_index => 0,
+            .thread_id_y, .global_id_y => 1,
+            .thread_id_z, .global_id_z => 2,
+            else => null,
+        };
+        if (axis == null) return;
+        const shape = self.localSize();
+        const factor = self.subgroupsPerWorkgroup();
         const lanes = self.opts.profile.lanes();
-        try self.put(glacier.csrr(scratch, glacier.Csr.workgroup_id));
-        try self.put(rv.slli(scratch, scratch, @intCast(std.math.log2_int(u8, lanes))));
+        if (factor > 1) {
+            try self.put(glacier.csrr(scratch, glacier.Csr.workgroup_id));
+            try self.put(rv.andi(scratch, scratch, @intCast(factor - 1)));
+            try self.put(rv.slli(scratch, scratch, @intCast(std.math.log2_int(u8, lanes))));
+            try self.put(rv.vmv_v_x(vscratch, scratch));
+            try self.put(rv.vadd_vv(dst, dst, vscratch));
+        }
+
+        var bit_offset: u5 = 0;
+        for (0..axis.?) |prior| bit_offset += @intCast(std.math.log2_int(u32, shape[prior]));
+        if (bit_offset != 0) try self.put(rv.vsrl_vi(dst, dst, bit_offset));
+        const mask = shape[axis.?] - 1;
+        try self.constant(scratch, @intCast(mask));
         try self.put(rv.vmv_v_x(vscratch, scratch));
-        try self.put(rv.vadd_vv(dst, dst, vscratch));
+        try self.put(rv.vand_vv(dst, dst, vscratch));
+
+        if (b == .global_id_x or b == .global_id_y or b == .vertex_index) {
+            try self.groupCoordinate(scratch, if (axis.? == 0) 0 else 1);
+            const axis_shift: u6 = @intCast(std.math.log2_int(u32, shape[axis.?]));
+            if (axis_shift != 0) try self.put(rv.slli(scratch, scratch, axis_shift));
+            try self.put(rv.vmv_v_x(vscratch, scratch));
+            try self.put(rv.vadd_vv(dst, dst, vscratch));
+        }
+    }
+
+    /// Decode flattened physical warp ids into X/Y workgroup coordinates.
+    /// Mesa passes the Vulkan X group count in grid_dim and flattens X fastest.
+    fn groupCoordinate(self: *Emitter, dst: Reg, axis: u1) Error!void {
+        try self.put(glacier.csrr(dst, glacier.Csr.workgroup_id));
+        const factor = self.subgroupsPerWorkgroup();
+        if (factor > 1)
+            try self.put(rv.srli(dst, dst, @intCast(std.math.log2_int(u32, factor))));
+        try self.put(glacier.csrr(stack_addr_scratch, glacier.Csr.grid_dim));
+        try self.put(if (axis == 0)
+            rv.remu(dst, dst, stack_addr_scratch)
+        else
+            rv.divu(dst, dst, stack_addr_scratch));
+    }
+
+    fn localSize(self: *const Emitter) [3]u32 {
+        return if (gpu.attrs.hasLocalSize(self.func)) gpu.attrs.localSize(self.func) else .{ self.opts.profile.lanes(), 1, 1 };
+    }
+
+    fn subgroupsPerWorkgroup(self: *const Emitter) u32 {
+        const shape = self.localSize();
+        const invocations = @as(u64, shape[0]) * shape[1] * shape[2];
+        const warp_lanes: u64 = self.opts.profile.lanes();
+        return if (invocations <= warp_lanes) 1 else @intCast(invocations / warp_lanes);
     }
 
     /// The parallel copies on the edges that END at `block`, for the edges the predecessor cannot
@@ -6469,22 +8034,22 @@ const Emitter = struct {
                 .reg => |s| switch (m.dst) {
                     .reg => |d| try self.move(regOf(d), regOf(s)),
                     .slot => |d| if (!self.elide[d]) {
-                        try self.put(rv.sw(regOf(s), sp, try self.slotOffset(d)));
+                        try self.putStackStore(regOf(s), try self.slotOffset(d));
                     },
                 },
                 .slot => |s| switch (m.dst) {
                     .reg => |d| if (self.elide[s]) {
                         try self.rematerialise(regOf(d), m.value);
                     } else {
-                        try self.put(rv.lw(regOf(d), sp, try self.slotOffset(s)));
+                        try self.putStackLoad(regOf(d), try self.slotOffset(s));
                     },
                     .slot => |d| if (!self.elide[d]) {
                         if (self.elide[s]) {
                             try self.rematerialise(scratch, m.value);
                         } else {
-                            try self.put(rv.lw(scratch, sp, try self.slotOffset(s)));
+                            try self.putStackLoad(scratch, try self.slotOffset(s));
                         }
-                        try self.put(rv.sw(scratch, sp, try self.slotOffset(d)));
+                        try self.putStackStore(scratch, try self.slotOffset(d));
                     },
                 },
             }
@@ -6532,11 +8097,35 @@ const Emitter = struct {
     /// Refusing when `spills` is clear is not redundant. `spills` decides whether the prologue
     /// loads `sp` at all, so a slot reference without it would address off an uninitialized
     /// register, and that is a silent wrong answer rather than a refusal.
-    fn slotOffset(self: *const Emitter, n: u32) Error!i12 {
+    fn slotOffset(self: *const Emitter, n: u32) Error!i64 {
         if (!self.spills) return error.Unsupported;
-        const off: i64 = -(@as(i64, self.shared_bytes) + (@as(i64, n) + 1) * 4);
-        if (off < std.math.minInt(i12)) return error.Unsupported;
-        return @intCast(off);
+        return -(@as(i64, if (self.core_shared) 0 else self.shared_bytes) + (@as(i64, n) + 1) * 4);
+    }
+
+    const StackAddress = struct { base: Reg, displacement: i12 };
+
+    /// Form `sp + offset`, splitting a deep offset between a materialized base and the signed
+    /// 12-bit load/store displacement. The per-hart stack is in SDRAM and can be larger than one
+    /// immediate; x30 is reserved for this address while x31 remains the data/immediate scratch.
+    fn stackAddress(self: *Emitter, offset: i64) Error!StackAddress {
+        if (offset >= std.math.minInt(i12) and offset <= std.math.maxInt(i12)) {
+            return .{ .base = sp, .displacement = @intCast(offset) };
+        }
+        const low: i12 = @truncate(offset);
+        const high = offset - low;
+        try self.constant(stack_addr_scratch, @intCast(high));
+        try self.put(rv.add(stack_addr_scratch, stack_addr_scratch, sp));
+        return .{ .base = stack_addr_scratch, .displacement = low };
+    }
+
+    fn putStackLoad(self: *Emitter, dst: Reg, offset: i64) Error!void {
+        const addr = try self.stackAddress(offset);
+        try self.put(rv.lw(dst, addr.base, addr.displacement));
+    }
+
+    fn putStackStore(self: *Emitter, src: Reg, offset: i64) Error!void {
+        const addr = try self.stackAddress(offset);
+        try self.put(rv.sw(src, addr.base, addr.displacement));
     }
 
     /// Fault unless the hart's scratch slice is as large as this kernel was built for.
@@ -6550,10 +8139,19 @@ const Emitter = struct {
     /// `scratch` is the only register this needs: the subtraction turns the comparison into a
     /// sign test, and the whole sequence runs before any value is live.
     fn checkScratch(self: *Emitter) Error!void {
+        if (self.core_shared and self.shared_bytes != 0) {
+            try self.put(glacier.csrr(scratch, glacier.Csr.shmsize));
+            try self.constant(stack_addr_scratch, @intCast(self.shared_bytes));
+            try self.put(rv.sub(scratch, scratch, stack_addr_scratch));
+            try self.put(rv.bge(scratch, .x0, 12));
+            try self.put(rv.addi(scratch, .x0, 29));
+            try self.put(glacier.ecall(scratch));
+        }
         const need = self.scratchNeeded();
         if (need == 0) return;
         try self.put(glacier.csrr(scratch, glacier.Csr.scratchsize));
-        try self.put(rv.addi(scratch, scratch, -@as(i12, @intCast(need))));
+        try self.constant(stack_addr_scratch, @intCast(need));
+        try self.put(rv.sub(scratch, scratch, stack_addr_scratch));
         // Two words ahead: past the code and past the fault itself.
         try self.put(rv.bge(scratch, .x0, 12));
         try self.put(rv.addi(scratch, .x0, glacier.fault_scratch_too_small));
@@ -6564,7 +8162,7 @@ const Emitter = struct {
     /// classes of spill slot.
     fn scratchNeeded(self: *const Emitter) u32 {
         const vector_bytes = self.alloc.slot_count_per_class[1] * @as(u32, self.opts.profile.lanes()) * 4;
-        return self.shared_bytes + self.alloc.slot_count_per_class[0] * 4 + vector_bytes;
+        return (if (self.core_shared) 0 else self.shared_bytes) + self.alloc.slot_count_per_class[0] * 4 + vector_bytes;
     }
 
     /// The window offset of the workgroup slot `value` names, or null when it names none, which
@@ -6579,18 +8177,17 @@ const Emitter = struct {
     /// The offset of PER-LANE spill slot `n` from `sp`, below the scalar slots. A whole vector
     /// register wide, because a spill of one stores every lane: a MASK only uses the first element,
     /// and storing the rest costs nothing but the space.
-    fn vectorSlotOffset(self: *const Emitter, n: u32) Error!i12 {
+    fn vectorSlotOffset(self: *const Emitter, n: u32) Error!i64 {
         if (!self.spills) return error.Unsupported;
         const width: i64 = @as(i64, self.opts.profile.lanes()) * 4;
-        const off: i64 = -(@as(i64, self.shared_bytes) + @as(i64, self.vector_slot_base) + (@as(i64, n) + 1) * width);
-        if (off < std.math.minInt(i12)) return error.Unsupported;
-        return @intCast(off);
+        return -(@as(i64, if (self.core_shared) 0 else self.shared_bytes) + @as(i64, self.vector_slot_base) + (@as(i64, n) + 1) * width);
     }
 
     /// Put the address of per-lane slot `n` in the scalar scratch, because a vector access takes
     /// its address from a register and has no displacement field of its own.
     fn vectorSlotAddress(self: *Emitter, n: u32) Error!void {
-        try self.put(rv.addi(scratch, sp, try self.vectorSlotOffset(n)));
+        const addr = try self.stackAddress(try self.vectorSlotOffset(n));
+        try self.put(rv.addi(scratch, addr.base, addr.displacement));
     }
 
     /// The allocator's own spills, reloads and moves at `pos`.
@@ -6606,6 +8203,16 @@ const Emitter = struct {
     /// Whether `inst` operates on lanes rather than on one warp-wide value. A result that varies
     /// per lane decides it; a store has no result, so its address and its value decide instead.
     fn isVector(self: *const Emitter, inst: Inst) bool {
+        if (self.func.opcode(inst) == .atomic_rmw) {
+            const a = self.func.opcode(inst).atomic_rmw;
+            if (a.op == .add and (self.isDivergent(a.ptr) or self.isDivergent(a.value))) return true;
+            if (self.isDivergent(a.ptr)) return true;
+            if (self.isDivergent(a.value)) {
+                const result = self.func.instResult(inst) orelse return false;
+                return self.uses[@backingInt(result)] != 0;
+            }
+            return false;
+        }
         if (self.func.instResult(inst)) |r| return self.isDivergent(r);
         return switch (self.func.opcode(inst)) {
             // A masked store is per-lane by definition: the mask decides which lanes write, so it
@@ -6662,10 +8269,15 @@ const Emitter = struct {
                 try self.predicate(mask, pos);
                 try self.put(rv.vsuxei32_m(val, .x0, addr));
             },
-            .unary => |u| try self.vmove(
-                try self.vreg(self.func.instResult(inst).?, pos),
-                try self.vectorOperand(u.value, pos),
-            ),
+            .unary => |u| {
+                const dst = try self.vreg(self.func.instResult(inst).?, pos);
+                const src = try self.vectorOperand(u.value, pos);
+                if (u.op == .nearest) {
+                    try self.put(rv.vfcvt_x_f_v(dst, src));
+                    return self.put(rv.vfcvt_f_x_v(dst, dst));
+                }
+                return self.vmove(dst, src);
+            },
             .convert => |cv| {
                 if (self.macs.at(inst)) |m| return self.emitVectorMac(m, inst, pos);
                 const dst = try self.vreg(self.func.instResult(inst).?, pos);
@@ -6710,7 +8322,66 @@ const Emitter = struct {
                 if (cmp.negate) try self.put(rv.vmnand_mm(dst, dst, dst));
             },
             .select => |s| try self.emitVectorSelect(s, inst, pos),
+            .atomic_rmw => |a| try self.emitVectorAtomic(inst, a, pos),
             else => return error.Unsupported,
+        }
+    }
+
+    /// Serialize a warp's per-lane atomic operations through scalar AMOs. The lane order is a
+    /// valid serialization for every Vulkan atomic scope supported by this core. Divergent
+    /// operands are staged in this hart's scratch so each lane can be loaded into scalar registers
+    /// without a vector gather instruction.
+    fn emitVectorAtomic(self: *Emitter, inst: Inst, a: ir.function.AtomicRmw, pos: u32) Error!void {
+        if (a.op != .add or !self.vector_atomics) return error.Unsupported;
+        const ptr_vector = self.isDivergent(a.ptr);
+        const value_vector = self.isDivergent(a.value);
+        const ptr_slot: u32 = self.alloc.slot_count_per_class[1];
+        const value_slot: u32 = ptr_slot + 1;
+        if (ptr_vector) {
+            try self.vectorSlotAddress(ptr_slot);
+            try self.put(rv.vse32(try self.vreg(a.ptr, pos), scratch));
+        }
+        if (value_vector) {
+            try self.vectorSlotAddress(value_slot);
+            try self.put(rv.vse32(try self.vreg(a.value, pos), scratch));
+        }
+
+        const result = self.func.instResult(inst);
+        const result_used = if (result) |r| self.uses[@backingInt(r)] != 0 else false;
+        const dst = if (result_used) try self.vreg(result.?, pos) else vscratch3;
+        if (result_used) {
+            try self.put(rv.vmv_v_x(dst, .x0));
+            try self.put(rv.vid_v(vscratch));
+        }
+        const op = amoOp(self.func, a.op, self.func.valueType(a.value)) orelse return error.Unsupported;
+        const lanes = self.opts.profile.lanes();
+        for (0..lanes) |lane| {
+            if (ptr_vector) {
+                const offset = (try self.vectorSlotOffset(ptr_slot)) + @as(i64, @intCast(lane * 4));
+                try self.putStackLoad(stack_addr_scratch, offset);
+            } else {
+                try self.put(rv.addi(stack_addr_scratch, try self.reg(a.ptr, pos), 0));
+            }
+            if (value_vector) {
+                const offset = (try self.vectorSlotOffset(value_slot)) + @as(i64, @intCast(lane * 4));
+                try self.putStackLoad(scratch, offset);
+            } else {
+                try self.put(rv.addi(scratch, try self.reg(a.value, pos), 0));
+            }
+            try self.put(rv.amo(
+                op,
+                scratch,
+                stack_addr_scratch,
+                scratch,
+                a.ordering == .acquire or a.ordering == .acq_rel or a.ordering == .seq_cst,
+                a.ordering == .release or a.ordering == .acq_rel or a.ordering == .seq_cst,
+            ));
+            if (result_used) {
+                try self.constant(stack_addr_scratch, @intCast(lane));
+                try self.put(rv.vmseq_vx(.v0, vscratch, stack_addr_scratch));
+                self.v0_mask = null;
+                try self.put(rv.vmerge_vxm(dst, dst, scratch));
+            }
         }
     }
 
@@ -6898,13 +8569,13 @@ const Emitter = struct {
         // consumer was removed (an eliminated bounds check leaves the array length behind) would
         // otherwise cost a word per launch for a register nobody reads.
         if (self.func.instResult(inst)) |r| {
-            if (self.uses[@backingInt(r)] == 0) return;
+            if (self.uses[@backingInt(r)] == 0 and self.func.opcode(inst) != .atomic_rmw) return;
         }
         if (self.isVector(inst)) return self.emitVectorInst(inst, pos);
         // A pure instruction nothing reads has no home, so it is dropped. An instruction with no
         // result at all (a store) has no home either, and must NOT be dropped.
         const home: ?wimmer.Location = if (self.func.instResult(inst)) |r|
-            (self.locAt(r, pos) orelse return)
+            (if (self.uses[@backingInt(r)] == 0 and self.func.opcode(inst) == .atomic_rmw) null else self.locAt(r, pos) orelse return)
         else
             null;
         // A result that lives in a spill slot is computed in the scratch register and stored
@@ -6926,7 +8597,10 @@ const Emitter = struct {
                 dst,
                 @bitCast(addressOf(self.opts, self.func.symbolName(g.symbol)) orelse return error.Unsupported),
             ),
-            .unary => |u| try self.move(dst, try self.reg(u.value, pos)),
+            .unary => |u| if (u.op == .nearest)
+                try self.emitNearest(u.value, dst, pos)
+            else
+                try self.move(dst, try self.reg(u.value, pos)),
             .convert => |cv| if (self.macs.at(inst)) |m|
                 try self.emitScalarMac(m, dst, pos)
             else
@@ -6959,17 +8633,28 @@ const Emitter = struct {
                 return error.Unsupported
             else
                 try self.put(rv.sw(try self.reg(st.value, pos), try self.reg(st.ptr, pos), 0)),
-            // The old value goes to `dst`, or to the lowering's scratch when nobody reads it: the
-            // core has no reduction form that writes no register, so the read-modify-write happens
-            // either way and the answer is thrown away.
-            .atomic_rmw => |a| try self.put(rv.amo(
-                amoOp(self.func, a.op, self.func.valueType(a.value)) orelse return error.Unsupported,
-                dst,
-                try self.reg(a.ptr, pos),
-                try self.reg(a.value, pos),
-                a.ordering == .acquire or a.ordering == .acq_rel or a.ordering == .seq_cst,
-                a.ordering == .release or a.ordering == .acq_rel or a.ordering == .seq_cst,
-            )),
+            // A dead-result bitwise-OR through a uniform pointer may collect lane contributions with RVV's
+            // reduction, then issue one warp-uniform AMO. Inactive lanes already carry zero from
+            // if-conversion, so this is exactly the OR the selected lanes would have performed.
+            .atomic_rmw => |a| {
+                const value_reg = if (self.isDivergent(a.value)) blk: {
+                    if (a.op != .bit_or) return error.Unsupported;
+                    if (self.func.instResult(inst)) |result| if (self.uses[@backingInt(result)] != 0) return error.Unsupported;
+                    const lanes = try self.vreg(a.value, pos);
+                    try self.put(rv.vmv_v_x(vscratch2, .x0));
+                    try self.put(rv.vredor_vs(vscratch, lanes, vscratch2));
+                    try self.put(rv.vmv_x_s(scratch, vscratch));
+                    break :blk scratch;
+                } else try self.reg(a.value, pos);
+                try self.put(rv.amo(
+                    amoOp(self.func, a.op, self.func.valueType(a.value)) orelse return error.Unsupported,
+                    dst,
+                    try self.reg(a.ptr, pos),
+                    value_reg,
+                    a.ordering == .acquire or a.ordering == .acq_rel or a.ordering == .seq_cst,
+                    a.ordering == .release or a.ordering == .acq_rel or a.ordering == .seq_cst,
+                ));
+            },
             // A barrier over a workgroup or a subgroup emits NOTHING, and that is the answer
             // rather than a shortcut. A workgroup here is one warp, and the lanes of a warp are
             // elements of one instruction stream, so they cannot reach different points in the
@@ -7004,16 +8689,35 @@ const Emitter = struct {
             .alloca => {
                 const res = self.func.instResult(inst).?;
                 const off = self.sharedOffset(res) orelse return error.Unsupported;
-                const from_sp: i64 = @as(i64, off) - @as(i64, self.shared_bytes);
-                if (from_sp < std.math.minInt(i12)) return error.Unsupported;
-                try self.put(rv.addi(dst, sp, @intCast(from_sp)));
+                if (self.core_shared) {
+                    try self.put(glacier.csrr(dst, glacier.Csr.shmaddr));
+                    if (off != 0) {
+                        try self.constant(scratch, @intCast(off));
+                        try self.put(rv.add(dst, dst, scratch));
+                    }
+                } else {
+                    const from_sp: i64 = @as(i64, off) - @as(i64, self.shared_bytes);
+                    const addr = try self.stackAddress(from_sp);
+                    try self.put(rv.addi(dst, addr.base, addr.displacement));
+                }
             },
             else => return error.Unsupported,
         }
         if (home) |h| switch (h) {
-            .slot => |n| try self.put(rv.sw(dst, sp, try self.slotOffset(n))),
+            .slot => |n| try self.putStackStore(dst, try self.slotOffset(n)),
             .reg => {},
         };
+    }
+
+    /// Round one warp-uniform f32 to the nearest integer, then convert that exact integer back to
+    /// f32. GLSL.std.450 Round leaves half-way ties implementation-dependent, so RISC-V's
+    /// round-to-nearest-even mode is a valid choice. Both conversions use the vector unit because
+    /// Glacier has no scalar convert instruction.
+    fn emitNearest(self: *Emitter, value: Value, dst: Reg, pos: u32) Error!void {
+        try self.put(rv.vmv_v_x(vscratch, try self.reg(value, pos)));
+        try self.put(rv.vfcvt_x_f_v(vscratch, vscratch));
+        try self.put(rv.vfcvt_f_x_v(vscratch, vscratch));
+        try self.put(rv.vmv_x_s(dst, vscratch));
     }
 
     /// A warp-uniform convert. Glacier has no scalar convert of any kind, so the value goes out

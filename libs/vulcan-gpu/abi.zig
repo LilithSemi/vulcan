@@ -80,6 +80,7 @@ fn needsLaunchShape(func: *const Function, a: Abi) bool {
             .block_dim_x,
             .block_dim_y,
             .block_dim_z,
+            .local_invocation_index,
             .lane_id,
             .warp_id,
             .subgroup_size,

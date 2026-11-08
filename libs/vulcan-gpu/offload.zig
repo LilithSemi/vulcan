@@ -65,6 +65,7 @@ fn nestSource(b: Builtin) ?NestSource {
         .lane_id,
         .warp_id,
         .subgroup_size,
+        .local_invocation_index,
         .vertex_index,
         .instance_index,
         .frag_coord,

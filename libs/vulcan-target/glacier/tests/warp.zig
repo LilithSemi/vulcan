@@ -50,8 +50,14 @@ pub const Error = error{
 /// reads one is relying on hardware this model cannot stand in for.
 const csr_mhartid: u12 = 0xF14;
 const csr_hart_count: u12 = 0xFC0;
-const csr_workgroup_id: u12 = 0xFC9;
-const csr_grid_dim: u12 = 0xFCA;
+const csr_workgroup_id: u12 = 0xFD3;
+const csr_grid_dim: u12 = 0xFD4;
+
+/// The shared memory window: where this core's slice starts, and how many bytes it holds. Both
+/// read zero on a core built with no shared SRAM, which is what a kernel checks before it uses
+/// the window.
+const csr_shmaddr: u12 = 0xFD0;
+const csr_shmsize: u12 = 0xFD1;
 
 const csr_mscratch: u12 = 0x340;
 const csr_scratchsize: u12 = 0xFD2;
@@ -60,10 +66,10 @@ const csr_scratchsize: u12 = 0xFD2;
 /// this file is the independent side of the check.
 const glacier_warp_barrier: u32 = 0x1000000F;
 
-/// The launch arguments, 0xFC1 through 0xFC8. The strobe latches them, so every warp of one
+/// The launch arguments, 0xF80 through 0xF8F. The strobe latches them, so every warp of one
 /// dispatch reads the same values and a read is constant for the whole of it.
-const csr_launch_arg_first: u12 = 0xFC1;
-const csr_launch_arg_last: u12 = 0xFC8;
+const csr_launch_arg_first: u12 = 0xF80;
+const csr_launch_arg_last: u12 = 0xF8F;
 
 const ebreak: u32 = 0x00100073;
 
@@ -148,7 +154,10 @@ pub const Warp = struct {
     scratch_bytes: u32 = 0,
     /// What the launch argument CSRs read. A dispatch gives every warp the same values, so a test
     /// that runs several warps sets these once.
-    launch_args: [8]u32 = @splat(0),
+    launch_args: [16]u32 = @splat(0),
+    /// What `shmaddr` and `shmsize` read. Zero stands in for a core with no shared SRAM.
+    shm_addr: u32 = 0,
+    shm_bytes: u32 = 0,
 
     fn set(self: *Warp, rd: u5, value: u32) void {
         if (rd != 0) self.x[rd] = value;
@@ -396,6 +405,8 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
                 csr_grid_dim => if (warp.grid_dim == 0) warp.hart_count else warp.grid_dim,
                 csr_mscratch => warp.stack_top,
                 csr_scratchsize => warp.scratch_bytes,
+                csr_shmaddr => warp.shm_addr,
+                csr_shmsize => warp.shm_bytes,
                 else => return error.Illegal,
             });
         },
@@ -589,14 +600,19 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
     if (funct3 == 0b010 and funct6 >= 0b011000 and funct6 <= 0b011111) {
         const a = warp.mask(vs2);
         const b = warp.mask(src);
-        warp.setMask(vd, switch (funct6) {
+        const joined = switch (funct6) {
             0b011000 => a & ~b, // vmandn
             0b011001 => a & b, // vmand
             0b011010 => a | b, // vmor
             0b011011 => a ^ b, // vmxor
             0b011101 => ~(a & b), // vmnand
             else => return error.Illegal,
-        });
+        };
+        // Cut to the lanes the warp has. The mask unit in the core is as wide as the warp, so a
+        // complement sets no bit above it, and `vcpop.m` below counts only those lanes for the
+        // same reason: a bit above them belongs to no lane.
+        const room: u32 = (@as(u32, 1) << @intCast(warp.lanes)) - 1;
+        warp.setMask(vd, joined & room);
         return;
     }
     // vmerge: the one masked instruction here, so `vm` is clear and v0 is implicit.

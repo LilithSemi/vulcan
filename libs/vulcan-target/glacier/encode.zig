@@ -107,15 +107,17 @@ pub const Csr = struct {
     pub const hart_count: u12 = 0xFC0;
 
     /// Virtual workgroup id for this launch.
-    pub const workgroup_id: u12 = 0xFC9;
+    pub const workgroup_id: u12 = 0xFD3;
 
     /// Workgroups in the full dispatch.
-    pub const grid_dim: u12 = 0xFCA;
+    pub const grid_dim: u12 = 0xFD4;
+    pub const shmaddr: u12 = 0xFD0;
+    pub const shmsize: u12 = 0xFD1;
 
     /// How many launch arguments a GC1 core carries.
-    pub const launch_args: usize = 8;
+    pub const launch_args: usize = 16;
 
-    /// The custom read-only CSR holding launch argument `i`, 0xFC1 through 0xFC8, or null when the
+    /// The custom read-only CSR holding launch argument `i`, 0xF80 through 0xF8F, or null when the
     /// core has no such argument.
     ///
     /// These belong to the CORE and not to a warp: one dispatch gives every warp the same values,
@@ -133,7 +135,7 @@ pub const Csr = struct {
     /// BUILD to bind a different buffer, which no graphics driver can do between draws.
     pub fn launchArg(i: usize) ?u12 {
         if (i >= launch_args) return null;
-        return @intCast(0xFC1 + i);
+        return @intCast(0xF80 + i);
     }
 
     /// Standard machine scratch CSR, read only here: the INITIAL STACK POINTER of the hart doing
@@ -216,8 +218,8 @@ pub const Profile = enum {
     pub fn warps(self: Profile) u8 {
         return switch (self) {
             .@"gc1.n" => 4,
-            .@"gc1.mi", .@"gc1.s", .@"gc1.f" => 8,
-            .@"gc1.ma" => 16,
+            .@"gc1.s", .@"gc1.f" => 8,
+            .@"gc1.mi", .@"gc1.ma" => 16,
         };
     }
 
@@ -230,7 +232,7 @@ pub const Profile = enum {
     /// quietly move it.
     /// Two kilobytes on every GC1 profile. The region is carved from the top of the largest memory
     /// device, SDRAM or DDR3 and not on-chip SRAM, so the size costs address space and no logic:
-    /// eight resident warps on gc1.mi reserve 16 KiB out of 32 MiB. A board whose largest memory
+    /// sixteen resident warps on gc1.mi reserve 128 KiB out of 32 MiB. A board whose largest memory
     /// IS on-chip pays visibly, and the answer there is fewer resident warps rather than a smaller
     /// region.
     ///
@@ -245,7 +247,7 @@ pub const Profile = enum {
     /// would help. Pairing a kernel with the core generation it was built for is the host's job.
     pub fn scratchBytes(self: Profile) u32 {
         return switch (self) {
-            .@"gc1.n", .@"gc1.mi", .@"gc1.s", .@"gc1.f", .@"gc1.ma" => 2048,
+            .@"gc1.n", .@"gc1.mi", .@"gc1.s", .@"gc1.f", .@"gc1.ma" => 8192,
         };
     }
 };

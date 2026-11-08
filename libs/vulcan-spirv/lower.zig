@@ -81,7 +81,7 @@ const Vec = struct { comps: [4]Value = undefined, len: u8 = 0 };
 /// (`comps[col*rows + row]`), so a matrix SSA id maps to scalars exactly like a vector,
 /// and no backend needs matrix support. `OpMatrixTimesVector` etc. become FMul/FAdd over
 /// these scalars.
-const Mat = struct { comps: [16]Value = undefined, cols: u8 = 0, rows: u8 = 0 };
+const Mat = struct { comps: [64]Value = undefined, cols: u8 = 0, rows: u8 = 0 };
 
 /// A pointer to a matrix laid out in a buffer (UBO / SSBO / push-constant). An
 /// `OpAccessChain` ending at a matrix member records this so the following `OpLoad`
@@ -101,6 +101,7 @@ const VecPtr = struct { base: Value, descriptor: ?Value, len: u8, elem: Type };
 /// the local variable id and the constant component index. A following `OpLoad` yields that
 /// component of the local's last-stored vector. An `OpStore` writes it back into the Vec.
 const LocalComp = struct { local: u32, comp: u8 };
+const LocalArrayIndex = struct { local: u32, index: Value };
 
 /// One struct member's type and byte offset (from its `OpMemberDecorate Offset`), plus
 /// the matrix layout decorations a matrix member carries: `MatrixStride` (bytes between
@@ -118,6 +119,7 @@ fn memberKey(struct_id: u32, member: u32) u64 {
 }
 
 const Const = struct { type_id: u32, bits: u64 };
+const CompositeConst = struct { type_id: u32, components: []const u32 };
 
 /// One fragment-shader gradient-buffer slot: the attribute `slot` of the varying scalar
 /// whose screen-space derivative this is, and which `axis` (dFdx / dFdy). Recorded per
@@ -134,7 +136,7 @@ pub const GradDesc = struct { slot: u32, axis: enum { x, y } };
 /// gl_InstanceIndex): each becomes a synthesized i32 entry param the dispatch supplies
 /// per vertex, exactly like the compute `global_id`. `sampler_state` is an opaque
 /// `OpTypeSampler`. The host merges its state into the image descriptor before launch.
-const VarKind = enum { buffer, sampler, sampler_state, shared, global_id, workgroup_id, num_workgroups, local_id, workgroup_size, vertex_index, instance_index, input, output, other };
+const VarKind = enum { buffer, sampler, sampler_state, shared, global_id, workgroup_id, num_workgroups, local_id, local_invocation_index, workgroup_size, vertex_index, instance_index, input, output, other };
 
 /// The shader stage an `OpEntryPoint` selects. Lowering produces the attribute interface
 /// for graphics stages, the kernel ABI for compute.
@@ -168,7 +170,11 @@ const Module = struct {
     // argument-passing pattern), so tracking the last stored value is correct.
     local_is_vec: []bool, // id -> whether it is a tracked Function-storage vector local
     local_vec: []Vec, // local var id -> the scalarized vector last stored to it
+    local_vec_slots: []Vec, // local var id -> one scalar alloca per vector component
     local_comp_of: []?LocalComp, // access-chain result id -> (local var id, component index)
+    local_vec_index_of: []?LocalArrayIndex, // dynamic component access into a vector local
+    local_is_array: []bool, // immutable Function-storage array locals
+    local_array_index_of: []?LocalArrayIndex, // dynamic array element access
     // A Function-storage local whose pointee is a flat (all-scalar-member) struct scalarizes to
     // one alloca per field, in member order, so mem2reg promotes each field exactly like a plain
     // scalar local. A constant-index access chain into it resolves straight to that field's
@@ -183,13 +189,14 @@ const Module = struct {
     /// Workgroup-storage var ids in declaration order. Each becomes a shared `alloca` in the
     /// entry block, which is what `gpu.abi.layoutSharedFrame` places.
     shared_vars: std.ArrayList(u32) = .empty,
-    has_global_id: bool = false,
+    has_global_id: [3]bool = .{ false, false, false },
     // A compute kernel that divides work by WARP rather than by thread reads WorkgroupId and
     // NumWorkgroups instead of GlobalInvocationID. Glacier is that shape: one warp is the
     // workgroup, so these two are how a kernel finds its own share.
     has_workgroup_id: bool = false,
     has_num_workgroups: bool = false,
     has_local_id: bool = false,
+    has_local_invocation_index: bool = false,
     has_workgroup_size: bool = false,
     value_of: []?Value, // id -> the Vulcan value it lowers to (scalars)
     vec_of: []Vec, // id -> a scalarized vector value's components (len 0 = not a vector)
@@ -202,6 +209,7 @@ const Module = struct {
     // previous chain's result and not a variable. 0 means unknown.
     chain_pointee: []u32,
     is_builtin_ptr: []bool, // id -> a pointer into the gl_GlobalInvocationID builtin
+    global_id_component_of: []?u32, // access-chain result -> component of GlobalInvocationId
     // Combined-image-sampler descriptor pointer per value: an OpLoad of a sampler
     // variable, or an OpSampledImage, records here the descriptor pointer Value the
     // following OpImageSample* reads. Vec/scalar value_of stays unset for these.
@@ -283,6 +291,12 @@ const Module = struct {
     // struct addressing its BuiltIn Position member records the output variable + that it
     // is the position member, so the following OpStore routes to ATTR_POSITION.
     pos_chain_var: []u32, // access-chain result id -> gl_PerVertex Output var id (0 = no)
+    // A component access into that member (for example gl_Position.w) is loaded as a
+    // scalar rather than as the complete position vector.
+    pos_chain_component: []u32, // access-chain result id -> component, maxInt = whole member
+    output_chain_var: []u32, // output component access chain -> output var (0 = none)
+    output_chain_component: []u32, // output component access chain -> component
+    output_vec: []Vec, // last value stored to each output, for component loads/stores
     // The clip-space position last stored to gl_Position, as a scalarized Vec. A shader
     // may read its own gl_Position back (e.g. vkcube's VS does `frag_pos =
     // gl_Position.xyz`), so an OpLoad of the gl_PerVertex Position member access chain
@@ -307,15 +321,17 @@ const Module = struct {
     grad_descs: std.ArrayList(GradDesc) = .empty, // index -> (attr slot, axis)
     grad_buf_param: ?Value = null, // the synthesized grad_buf pointer param (lazy)
     grad_entry: Block = undefined, // the entry block, for appending the grad_buf param
+    input_attachment_coord: ?[2]Value = null, // synthesized FragCoord x/y for SubpassData reads
     ptr_t: Type,
     /// A pointer into the workgroup window. The address space is in the TYPE, so it survives the
     /// pointer arithmetic an access chain builds.
     shared_ptr_t: Type,
     i32_t: Type,
-    global_id_value: ?Value = null,
+    global_id_values: [3]?Value = .{ null, null, null },
     workgroup_id_value: ?Value = null,
     num_workgroups_value: ?Value = null,
     local_id_value: ?Value = null,
+    local_invocation_index_value: ?Value = null,
     workgroup_size_value: ?Value = null,
     has_vertex_index: bool = false,
     vertex_index_value: ?Value = null,
@@ -325,6 +341,7 @@ const Module = struct {
     members: std.AutoHashMapUnmanaged(u64, Member) = .empty, // (struct,member) -> type+offset
     array_stride: []u32, // type id -> ArrayStride decoration (0 = derive from element)
     const_val: []i64, // id -> the integer value of an OpConstant (for struct indices)
+    const_known: []bool,
     var_type: []u32, // variable id -> its (pointer) type id
 
     // Graphics interface (only used for vertex/fragment stages).
@@ -359,8 +376,10 @@ const Module = struct {
 /// Whether variable `id` is a combined-image-sampler: its pointee type is an
 /// `OpTypeSampledImage` (or a bare `OpTypeImage`, for a sampled separate image).
 fn isSamplerVar(module: *const Module, id: u32) bool {
-    const pointee = module.var_pointee(id) orelse return false;
+    var pointee = module.var_pointee(id) orelse return false;
     if (pointee >= module.types.len) return false;
+    const info = module.types[pointee] orelse return false;
+    if (info == .array) pointee = info.array.elem;
     return switch (module.types[pointee] orelse return false) {
         .sampled_image, .image => true,
         else => false,
@@ -465,6 +484,9 @@ test "literalString decodes a SPIR-V packed name" {
 }
 
 pub const Options = struct {
+    /// Byte stride of a sampled-image descriptor record. The Glacier runtime
+    /// ABI uses the 128-byte `gcv_device_sampler_descriptor` layout.
+    image_descriptor_stride: u32 = 128,
     /// Lower each storage buffer to a `global_addr` naming the variable, instead of to a pointer
     /// entry parameter.
     ///
@@ -535,6 +557,9 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
     const const_val = try allocator.alloc(i64, bound);
     defer allocator.free(const_val);
     @memset(const_val, 0);
+    const const_known = try allocator.alloc(bool, bound);
+    defer allocator.free(const_known);
+    @memset(const_known, false);
     const var_type = try allocator.alloc(u32, bound);
     defer allocator.free(var_type);
     @memset(var_type, 0);
@@ -586,11 +611,13 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
     var consts = std.AutoHashMapUnmanaged(u32, Const){};
     defer consts.deinit(allocator);
     // OpConstantComposite values: id -> the component constant ids (vectors only).
-    var composite_consts = std.AutoHashMapUnmanaged(u32, []const u32){};
+    var composite_consts = std.AutoHashMapUnmanaged(u32, CompositeConst){};
+    var composite_order: std.ArrayList(u32) = .empty;
     defer {
         var it = composite_consts.iterator();
-        while (it.next()) |e| allocator.free(e.value_ptr.*);
+        while (it.next()) |e| allocator.free(e.value_ptr.components);
         composite_consts.deinit(allocator);
+        composite_order.deinit(allocator);
     }
     var insts: std.ArrayList(binary.Instruction) = .empty;
     defer insts.deinit(allocator);
@@ -617,17 +644,27 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         .chain_pointee = undefined,
         .local_is_vec = undefined,
         .local_vec = undefined,
+        .local_vec_slots = undefined,
         .local_comp_of = undefined,
+        .local_vec_index_of = undefined,
+        .local_is_array = undefined,
+        .local_array_index_of = undefined,
         .local_struct = undefined,
         .is_builtin_ptr = undefined,
+        .global_id_component_of = undefined,
         .sampler_ptr_of = undefined,
         .input_comp_of = undefined,
         .pos_chain_var = undefined,
+        .pos_chain_component = undefined,
+        .output_chain_var = undefined,
+        .output_chain_component = undefined,
+        .output_vec = undefined,
         .ptr_t = try func.types.ptrGlobal(),
         .shared_ptr_t = try func.types.intern(.{ .ptr = .shared }),
         .i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }),
         .array_stride = array_stride,
         .const_val = const_val,
+        .const_known = const_known,
         .var_type = var_type,
         .location = location,
         .has_location = has_location,
@@ -709,6 +746,8 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
                 // pass can read. Keeping the id is what lets a workgroup object be SIZED.
                 const len_id: u32 = if (inst.opcode == op.TypeArray) try idOperandAt(inst.operands, 2, bound) else 0;
                 types[id] = .{ .array = .{ .elem = elem, .len_id = len_id } };
+                module.type_image_dim[id] = module.type_image_dim[elem];
+                module.type_image_arrayed[id] = module.type_image_arrayed[elem];
             },
             op.TypeVector => {
                 const id = try idOperandAt(inst.operands, 0, bound);
@@ -846,10 +885,41 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
                 const bits = constBits(inst.operands[2..]);
                 try consts.put(allocator, result, .{ .type_id = type_id, .bits = bits });
                 const_val[result] = @bitCast(bits); // for struct member indices
+                const_known[result] = true;
             },
             // The const result ids index value_of / vec_of when the constants are materialized.
             op.ConstantTrue => try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 1 }),
             op.ConstantFalse => try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 0 }),
+            op.SpecConstant => {
+                const type_id = try operandAt(inst.operands, 0);
+                const result = try idOperandAt(inst.operands, 1, bound);
+                const bits = constBits(inst.operands[2..]);
+                try consts.put(allocator, result, .{ .type_id = type_id, .bits = bits });
+                const_val[result] = @bitCast(bits);
+                const_known[result] = true;
+            },
+            op.SpecConstantTrue => try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 1 }),
+            op.SpecConstantFalse => try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 0 }),
+            op.SpecConstantComposite => {
+                const type_id = try operandAt(inst.operands, 0);
+                const result = try idOperandAt(inst.operands, 1, bound);
+                const comps = try allocator.dupe(u32, inst.operands[2..]);
+                try composite_consts.put(allocator, result, .{ .type_id = type_id, .components = comps });
+                try composite_order.append(allocator, result);
+            },
+            op.SpecConstantOp => {
+                const type_id = try operandAt(inst.operands, 0);
+                const result = try idOperandAt(inst.operands, 1, bound);
+                const operation = try operandAt(inst.operands, 2);
+                if (operation != op.Select or inst.operands.len < 6) return error.Unsupported;
+                const condition_id = try idOperandAt(inst.operands, 3, bound);
+                const true_id = try idOperandAt(inst.operands, 4, bound);
+                const false_id = try idOperandAt(inst.operands, 5, bound);
+                const condition = consts.get(condition_id) orelse return error.Unsupported;
+                const selected = consts.get(if (condition.bits != 0) true_id else false_id) orelse return error.Unsupported;
+                try consts.put(allocator, result, .{ .type_id = type_id, .bits = selected.bits });
+                const_val[result] = @bitCast(selected.bits);
+            },
             // `OpUndef` is legal at MODULE scope as well as in a body, and spirv-opt hoists one
             // there when it rewrites a dead loop-carried phi. A module-scope one is not a body
             // instruction, so it registers as the zero constant it lowers to; nothing reads an
@@ -862,9 +932,11 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
                 // [type, result, comp0, comp1, ...]: a vector constant whose components
                 // are themselves OpConstants. Record the component ids, materialized
                 // component-wise in lowerFunction.
+                const type_id = try operandAt(inst.operands, 0);
                 const result = try idOperandAt(inst.operands, 1, bound);
                 const comps = try allocator.dupe(u32, inst.operands[2..]);
-                try composite_consts.put(allocator, result, comps);
+                try composite_consts.put(allocator, result, .{ .type_id = type_id, .components = comps });
+                try composite_order.append(allocator, result);
             },
             op.Variable => {
                 const type_id = try operandAt(inst.operands, 0); // [type, result, storageClass]
@@ -938,7 +1010,7 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
             try module.buffers.append(allocator, id);
         } else if (builtin_decor[id] == op.BuiltIn.global_invocation_id) {
             var_kind[id] = .global_id;
-            module.has_global_id = true;
+            module.has_global_id = .{ true, true, true };
         } else if (builtin_decor[id] == op.BuiltIn.workgroup_id) {
             var_kind[id] = .workgroup_id;
             module.has_workgroup_id = true;
@@ -951,6 +1023,9 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
         } else if (builtin_decor[id] == op.BuiltIn.local_invocation_id) {
             var_kind[id] = .local_id;
             module.has_local_id = true;
+        } else if (builtin_decor[id] == op.BuiltIn.local_invocation_index) {
+            var_kind[id] = .local_invocation_index;
+            module.has_local_invocation_index = true;
         } else if (class == op.StorageClass.workgroup) {
             // Per-workgroup shared memory. It becomes a shared `alloca` in the entry block, so the
             // placement rule in `gpu.abi.layoutSharedFrame` serves every target, and a backend
@@ -965,11 +1040,12 @@ pub fn lowerModuleFor(allocator: std.mem.Allocator, words: []const u32, opts: Op
             // kernel reaches for, and no target here has a region to put it in yet. Saying so is
             // the point: falling through left the variable with no value, and the first reader of
             // it reported a MALFORMED MODULE, which sends the author to a shader that is correct.
+            std.debug.print("Vulcan unsupported variable storage class: id={d} class={d} type={d}\n", .{ id, class, var_type[id] });
             return error.Unsupported;
         }
     }
 
-    try lowerFunction(allocator, &func, &module, &consts, &composite_consts, insts.items, func_ret_type.?);
+    try lowerFunction(allocator, &func, &module, &consts, &composite_consts, composite_order.items, insts.items, func_ret_type.?);
 
     // Tag the function with its shader stage so the backend selects the right lowering
     // (compute kernel ABI vs the graphics attribute interface).
@@ -1009,8 +1085,105 @@ fn constBits(operands: []const u32) u64 {
     return 0;
 }
 
-fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module, consts: *const std.AutoHashMapUnmanaged(u32, Const), composite_consts: *const std.AutoHashMapUnmanaged(u32, []const u32), insts: []const binary.Instruction, ret_type_id: u32) Error!void {
+/// Narrow `module.has_global_id` to the axes the body can reach.
+///
+/// A parameter per axis costs a register and, on a GPU, one hardware read, so an axis nothing
+/// looks at gets none. Two shapes are followed: an access chain with a constant component index,
+/// and a load of the whole vector whose result goes into an `OpCompositeExtract`. Anything else
+/// that touches the loaded vector marks EVERY axis, because an axis read through a parameter that
+/// was never made reports a malformed module rather than a missing optimization.
+fn narrowGlobalIdAxes(
+    allocator: std.mem.Allocator,
+    module: *Module,
+    insts: []const binary.Instruction,
+    bound: usize,
+) Error!void {
+    if (!module.has_global_id[0] and !module.has_global_id[1] and !module.has_global_id[2]) return;
+
+    // Ids that name the variable or a pointer into the whole of it, and ids holding the vector a
+    // load of it produced.
+    const points = try allocator.alloc(bool, bound);
+    defer allocator.free(points);
+    @memset(points, false);
+    const loaded = try allocator.alloc(bool, bound);
+    defer allocator.free(loaded);
+    @memset(loaded, false);
+    for (0..@min(bound, module.var_kind.len)) |id| {
+        if (module.var_kind[id] == .global_id) points[id] = true;
+    }
+
+    var used: [3]bool = .{ false, false, false };
+    var every = false;
+    for (insts) |inst| switch (inst.opcode) {
+        op.AccessChain, op.InBoundsAccessChain => {
+            if (inst.operands.len < 3) {
+                every = true;
+                continue;
+            }
+            const base = inst.operands[2];
+            if (base >= bound or !points[base]) continue;
+            if (inst.operands.len == 3) {
+                const result = inst.operands[1];
+                if (result < bound) points[result] = true else every = true;
+                continue;
+            }
+            if (inst.operands.len != 4) {
+                every = true;
+                continue;
+            }
+            const component = constValOf(module, inst.operands[3]) catch {
+                every = true;
+                continue;
+            };
+            if (component < 0 or component >= 3) {
+                every = true;
+                continue;
+            }
+            used[@intCast(component)] = true;
+        },
+        op.Load => {
+            if (inst.operands.len < 3) {
+                every = true;
+                continue;
+            }
+            const ptr = inst.operands[2];
+            if (ptr >= bound or !points[ptr]) continue;
+            const result = inst.operands[1];
+            if (result < bound) loaded[result] = true else every = true;
+        },
+        op.CompositeExtract => {
+            if (inst.operands.len < 4) {
+                every = true;
+                continue;
+            }
+            const base = inst.operands[2];
+            if (base >= bound or !loaded[base]) continue;
+            const component = inst.operands[3];
+            if (component >= 3) {
+                every = true;
+                continue;
+            }
+            used[component] = true;
+        },
+        else => for (inst.operands) |o| {
+            if (o < bound and loaded[o]) every = true;
+        },
+    };
+
+    module.has_global_id = if (every) .{ true, true, true } else used;
+    // A module that names the variable and reads nothing out of it still gets x, so
+    // `builtinScalarOf` has a value to answer a load of the whole vector with.
+    if (!module.has_global_id[0] and !module.has_global_id[1] and !module.has_global_id[2])
+        module.has_global_id[0] = true;
+}
+
+fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module, consts: *const std.AutoHashMapUnmanaged(u32, Const), composite_consts: *const std.AutoHashMapUnmanaged(u32, CompositeConst), composite_order: []const u32, insts: []const binary.Instruction, ret_type_id: u32) Error!void {
     const bound = module.types.len;
+    var diagnostic_index: usize = 0;
+    var diagnostic_opcode: u32 = 0;
+    var diagnostic_operands: []const u32 = &.{};
+    var diagnostic_phase: []const u8 = "function setup";
+    errdefer std.debug.print("Vulcan lowerFunction failed in {s}, near body instruction {d}, opcode {d}, operands={any}\n", .{ diagnostic_phase, diagnostic_index, diagnostic_opcode, diagnostic_operands });
     const value_of = try allocator.alloc(?Value, bound);
     defer allocator.free(value_of);
     @memset(value_of, null);
@@ -1047,10 +1220,26 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     defer allocator.free(local_vec);
     @memset(local_vec, .{});
     module.local_vec = local_vec;
+    const local_vec_slots = try allocator.alloc(Vec, bound);
+    defer allocator.free(local_vec_slots);
+    @memset(local_vec_slots, .{});
+    module.local_vec_slots = local_vec_slots;
     const local_comp_of = try allocator.alloc(?LocalComp, bound);
     defer allocator.free(local_comp_of);
     @memset(local_comp_of, null);
     module.local_comp_of = local_comp_of;
+    const local_vec_index_of = try allocator.alloc(?LocalArrayIndex, bound);
+    defer allocator.free(local_vec_index_of);
+    @memset(local_vec_index_of, null);
+    module.local_vec_index_of = local_vec_index_of;
+    const local_is_array = try allocator.alloc(bool, bound);
+    defer allocator.free(local_is_array);
+    @memset(local_is_array, false);
+    module.local_is_array = local_is_array;
+    const local_array_index_of = try allocator.alloc(?LocalArrayIndex, bound);
+    defer allocator.free(local_array_index_of);
+    @memset(local_array_index_of, null);
+    module.local_array_index_of = local_array_index_of;
     const local_struct = try allocator.alloc(?[]Value, bound);
     defer {
         for (local_struct) |maybe_fields| if (maybe_fields) |fields| allocator.free(fields);
@@ -1065,7 +1254,13 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         while (id < module.var_storage.len) : (id += 1) {
             if (module.var_storage[id] == op.StorageClass.function and module.var_kind[id] == .other) {
                 if (module.var_pointee(id)) |pt| {
-                    if (vectorInfo(module.types, pt) != null) local_is_vec[id] = true;
+                    if (vectorInfo(module.types, pt) != null) {
+                        local_is_vec[id] = true;
+                    } else if (pt < module.types.len) {
+                        if (module.types[pt]) |ti| {
+                            if (ti == .array) local_is_array[id] = true;
+                        }
+                    }
                 }
             }
         }
@@ -1074,6 +1269,10 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     defer allocator.free(is_builtin_ptr);
     @memset(is_builtin_ptr, false);
     module.is_builtin_ptr = is_builtin_ptr;
+    const global_id_component_of = try allocator.alloc(?u32, bound);
+    defer allocator.free(global_id_component_of);
+    @memset(global_id_component_of, null);
+    module.global_id_component_of = global_id_component_of;
     const sampler_ptr_of = try allocator.alloc(?Value, bound);
     defer allocator.free(sampler_ptr_of);
     @memset(sampler_ptr_of, null);
@@ -1100,6 +1299,22 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     defer allocator.free(pos_chain_var);
     @memset(pos_chain_var, 0);
     module.pos_chain_var = pos_chain_var;
+    const pos_chain_component = try allocator.alloc(u32, bound);
+    defer allocator.free(pos_chain_component);
+    @memset(pos_chain_component, std.math.maxInt(u32));
+    module.pos_chain_component = pos_chain_component;
+    const output_chain_var = try allocator.alloc(u32, bound);
+    defer allocator.free(output_chain_var);
+    @memset(output_chain_var, 0);
+    module.output_chain_var = output_chain_var;
+    const output_chain_component = try allocator.alloc(u32, bound);
+    defer allocator.free(output_chain_component);
+    @memset(output_chain_component, std.math.maxInt(u32));
+    module.output_chain_component = output_chain_component;
+    const output_vec = try allocator.alloc(Vec, bound);
+    defer allocator.free(output_vec);
+    @memset(output_vec, .{});
+    module.output_vec = output_vec;
 
     // Discover blocks (each OpLabel) and their phis.
     var blocks: std.ArrayList(BlockInfo) = .empty;
@@ -1133,13 +1348,18 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
 
     // Synthesized entry parameters: invocation id (if used), then each storage buffer
     // (a base pointer), then the explicit function parameters.
-    if (module.has_global_id) {
+    try narrowGlobalIdAxes(allocator, module, insts, bound);
+    const global_id_builtins = [_]gpu.builtin.Builtin{
+        .global_id_x,
+        .global_id_y,
+        .global_id_z,
+    };
+    for (module.has_global_id, global_id_builtins, 0..) |used, builtin, axis| {
+        if (!used) continue;
         const gid = try func.appendBlockParam(entry, module.i32_t);
-        module.global_id_value = gid;
-        // Tag the invocation-id parameter so a GPU backend sources it from the hardware
-        // thread id (S2R) rather than a uniform kernel argument. CPU backends ignore the
-        // tag and treat it as an ordinary register parameter.
-        try gpu.attrs.setBuiltin(func, gid, .global_id_x);
+        module.global_id_values[axis] = gid;
+        // Each GlobalInvocationId component is a per-lane hardware builtin.
+        try gpu.attrs.setBuiltin(func, gid, builtin);
     }
     // A kernel that divides work by workgroup rather than by thread reads these two instead of
     // the invocation id. They come after it so a module that reads both keeps the invocation id
@@ -1161,6 +1381,11 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         const l = try func.appendBlockParam(entry, module.i32_t);
         module.local_id_value = l;
         try gpu.attrs.setBuiltin(func, l, .thread_id_x);
+    }
+    if (module.has_local_invocation_index) {
+        const l = try func.appendBlockParam(entry, module.i32_t);
+        module.local_invocation_index_value = l;
+        try gpu.attrs.setBuiltin(func, l, .local_invocation_index);
     }
     // The workgroup WIDTH. A kernel reads it to stride its own inner loop, and a backend answers
     // it from the shape it is building for, so the same kernel fits a wider or narrower one
@@ -1189,7 +1414,11 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     // stride + the component's 4-byte offset). An OpLoad of the variable yields the
     // recorded Vec. The backend emits one ALD/IPA per scalar.
     module.grad_entry = entry;
-    if (module.stage != .compute) try synthInputAttribs(allocator, func, module, entry);
+    if (module.stage != .compute) {
+        diagnostic_phase = "synthesizing graphics inputs";
+        try synthInputAttribs(allocator, func, module, entry);
+    }
+    diagnostic_phase = "synthesizing descriptor parameters";
     for (module.buffers.items) |buf_id| {
         // A buffer the backend resolves by symbol rather than receives at launch. A sampler is
         // never this: it is an opaque descriptor the host binds, not memory at an address.
@@ -1254,6 +1483,7 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
             try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "binding", .value = .{ .int = block_binding } } });
         }
     }
+    diagnostic_phase = "allocating workgroup objects";
     // Workgroup objects. Each becomes a shared `alloca` in the entry block, AFTER the parameters
     // so a backend reading the entry params by position is unaffected. Its address is the same in
     // every invocation of the workgroup, which is what makes the object shared.
@@ -1300,10 +1530,28 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         }
     }
 
+    diagnostic_phase = "materializing constants";
     // Materialize constants into the entry block.
     var it = consts.iterator();
     while (it.next()) |e| {
-        const ty = scalarType(module.types, e.value_ptr.type_id) orelse return error.Unsupported;
+        if (vectorInfo(module.types, e.value_ptr.type_id)) |vi| {
+            // A module-scope OpUndef vector is represented as a zero constant by
+            // the declaration pass. Materialize its lanes as an arbitrary valid
+            // value; SPIR-V leaves every lane undefined.
+            const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
+            var out: Vec = .{ .len = vi.len };
+            for (0..vi.len) |i| {
+                out.comps[i] = if (func.types.type_kind(elem) == .float)
+                    try func.appendInst(entry, elem, .{ .fconst = 0 })
+                else
+                    try func.appendInst(entry, elem, .{ .iconst = 0 });
+            }
+            module.vec_of[e.key_ptr.*] = out;
+            continue;
+        }
+        const ty = scalarType(module.types, e.value_ptr.type_id) orelse {
+            return error.Unsupported;
+        };
         const bits = e.value_ptr.bits;
         value_of[e.key_ptr.*] = switch (func.types.type_kind(ty)) {
             // `fconst` holds an f64 regardless of the value's own type (the widest common
@@ -1322,27 +1570,86 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         };
     }
 
+    diagnostic_phase = "materializing composite constants";
     // Materialize OpConstantComposite vectors: a scalarized Vec of the already-
     // materialized component scalar values (e.g. a constant fragment color).
-    var ci = composite_consts.iterator();
-    while (ci.next()) |e| {
-        var out: Vec = .{ .len = 0 };
-        for (e.value_ptr.*) |comp_id| {
-            if (comp_id < module.vec_of.len and module.vec_of[comp_id].len > 0) {
-                for (module.vec_of[comp_id].comps[0..module.vec_of[comp_id].len]) |c| {
-                    if (out.len >= out.comps.len) return error.MalformedModule;
-                    out.comps[out.len] = c;
-                    out.len += 1;
+    for (composite_order) |result_id| {
+        const composite = composite_consts.get(result_id) orelse return error.MalformedModule;
+        if (composite.type_id < module.types.len) {
+            if (module.types[composite.type_id]) |type_info| {
+                if (type_info == .array) {
+                    const count_signed = try constValOf(module, type_info.array.len_id);
+                    if (count_signed <= 0 or count_signed > 16) return error.Unsupported;
+                    const count: u8 = @intCast(count_signed);
+                    const rows: u8 = if (vectorInfo(module.types, type_info.array.elem)) |v|
+                        v.len
+                    else if (scalarType(module.types, type_info.array.elem) != null)
+                        1
+                    else
+                        return error.Unsupported;
+                    if (@as(usize, count) * rows > 64) return error.Unsupported;
+                    var out: Mat = .{ .cols = count, .rows = rows };
+                    var item: usize = 0;
+                    for (composite.components) |comp_id| {
+                        if (module.vec_of[comp_id].len != 0) {
+                            if (module.vec_of[comp_id].len != rows) return error.MalformedModule;
+                            for (module.vec_of[comp_id].comps[0..module.vec_of[comp_id].len]) |value| {
+                                if (item >= out.comps.len) return error.MalformedModule;
+                                out.comps[item] = value;
+                                item += 1;
+                            }
+                        } else {
+                            if (rows != 1 or item >= out.comps.len) return error.MalformedModule;
+                            out.comps[item] = try valueOf(module, comp_id);
+                            item += 1;
+                        }
+                    }
+                    if (item != @as(usize, count) * rows) return error.MalformedModule;
+                    module.mat_of[result_id] = out;
+                    continue;
                 }
-            } else {
-                if (out.len >= out.comps.len) return error.MalformedModule;
-                out.comps[out.len] = try valueOf(module, comp_id);
-                out.len += 1;
+                if (type_info.asMatrix()) |matrix_type| {
+                    const rows = (vectorInfo(module.types, matrix_type.col_vec) orelse return error.Unsupported).len;
+                    var out: Mat = .{ .cols = matrix_type.cols, .rows = rows };
+                    var item: usize = 0;
+                    for (composite.components) |comp_id| {
+                        const vector = module.vec_of[comp_id];
+                        if (vector.len != rows) return error.MalformedModule;
+                        for (vector.comps[0..vector.len]) |value| {
+                            if (item >= out.comps.len) return error.MalformedModule;
+                            out.comps[item] = value;
+                            item += 1;
+                        }
+                    }
+                    if (item != @as(usize, out.cols) * out.rows) return error.MalformedModule;
+                    module.mat_of[result_id] = out;
+                    continue;
+                }
+                if (vectorInfo(module.types, composite.type_id)) |vi| {
+                    var out: Vec = .{ .len = 0 };
+                    for (composite.components) |comp_id| {
+                        if (module.vec_of[comp_id].len > 0) {
+                            for (module.vec_of[comp_id].comps[0..module.vec_of[comp_id].len]) |value| {
+                                if (out.len >= out.comps.len) return error.MalformedModule;
+                                out.comps[out.len] = value;
+                                out.len += 1;
+                            }
+                        } else {
+                            if (out.len >= out.comps.len) return error.MalformedModule;
+                            out.comps[out.len] = try valueOf(module, comp_id);
+                            out.len += 1;
+                        }
+                    }
+                    if (out.len != vi.len) return error.MalformedModule;
+                    module.vec_of[result_id] = out;
+                    continue;
+                }
             }
         }
-        module.vec_of[e.key_ptr.*] = out;
+        return error.Unsupported;
     }
 
+    diagnostic_phase = "lowering body instructions";
     // Pass 1: lower each block's body (everything but the terminator), so all result ids
     // have Values before terminators read phi arguments.
     var bi: usize = std.math.maxInt(usize);
@@ -1352,7 +1659,10 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
             continue;
         }
         if (bi == std.math.maxInt(usize)) continue;
+        diagnostic_opcode = inst.opcode;
+        diagnostic_operands = inst.operands;
         try lowerBodyInst(allocator, func, module, blocks.items[bi].block, inst);
+        diagnostic_index += 1;
     }
 
     // Pass 2: wire each block's terminator, computing phi edge arguments.
@@ -1460,6 +1770,10 @@ fn synthInputAttribs(allocator: std.mem.Allocator, func: *Function, module: *Mod
 /// R0..R3).
 fn storeOutputAttrib(func: *Function, module: *Module, block: Block, var_id: u32, value_id: u32) Error!void {
     const comps = scalarComps(module, value_id) catch return error.MalformedModule;
+    try storeOutputAttribComponents(func, module, block, var_id, comps);
+}
+
+fn storeOutputAttribComponents(func: *Function, module: *Module, block: Block, var_id: u32, comps: []const Value) Error!void {
     const n = comps.len;
 
     // gl_FragDepth: a scalar fragment DEPTH output (not a render-target color). Tag it
@@ -1555,10 +1869,11 @@ fn definesResult(opcode: u16) bool {
 fn builtinScalarOf(module: *const Module, id: u32) ?Value {
     if (id >= module.var_kind.len) return null;
     return switch (module.var_kind[id]) {
-        .global_id => module.global_id_value,
+        .global_id => module.global_id_values[0],
         .workgroup_id => module.workgroup_id_value,
         .num_workgroups => module.num_workgroups_value,
         .local_id => module.local_id_value,
+        .local_invocation_index => module.local_invocation_index_value,
         .workgroup_size => module.workgroup_size_value,
         else => null,
     };
@@ -1677,6 +1992,17 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
     // Vectors are scalarized: composite/shuffle/vector-arith operate per component.
     if (try lowerVectorInst(allocator, func, module, block, inst)) return;
 
+    if (inst.opcode == op.FMod) {
+        const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+        const lhs = try valueOf(module, try operandAt(inst.operands, 2));
+        const rhs = try valueOf(module, try operandAt(inst.operands, 3));
+        const quotient = try appendArith(func, block, ty, .div, lhs, rhs);
+        const rounded = try func.appendInst(block, ty, .{ .unary = .{ .op = .floor, .value = quotient } });
+        const multiple = try appendArith(func, block, ty, .mul, rhs, rounded);
+        value_of[inst.operands[1]] = try appendArith(func, block, ty, .sub, lhs, multiple);
+        return;
+    }
+
     if (binOpOf(inst.opcode)) |bop| {
         const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
         const lhs = try valueOf(module, try operandAt(inst.operands, 2));
@@ -1698,6 +2024,21 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             const a = try valueOf(module, try operandAt(inst.operands, 3));
             const b = try valueOf(module, try operandAt(inst.operands, 4));
             value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .select = .{ .cond = cond, .then = a, .@"else" = b } });
+        },
+        op.Any, op.All => {
+            const result_ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            const vector_id = try idOperandAt(inst.operands, 2, bound);
+            const vector = module.vec_of[vector_id];
+            if (vector.len == 0) return error.Unsupported;
+            var acc = vector.comps[0];
+            for (1..vector.len) |i| {
+                acc = try func.appendInst(block, result_ty, .{ .icmp = .{
+                    .op = if (inst.opcode == op.Any) .ne else .eq,
+                    .lhs = acc,
+                    .rhs = vector.comps[i],
+                } });
+            }
+            value_of[inst.operands[1]] = acc;
         },
         op.ConvertFToU, op.ConvertFToS, op.ConvertSToF, op.ConvertUToF, op.UConvert, op.SConvert, op.FConvert => {
             const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
@@ -1788,6 +2129,14 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 try func.appendInst(block, ty, .{ .iconst = 0 });
             value_of[inst.operands[1]] = try appendArith(func, block, ty, .sub, zero, v);
         },
+        op.IsNan, op.IsInf => {
+            const source_id = try idOperandAt(inst.operands, 2, bound);
+            const source = try valueOf(module, source_id);
+            value_of[inst.operands[1]] = if (inst.opcode == op.IsNan)
+                try lowerIsNan(func, block, source)
+            else
+                try lowerIsInf(func, block, source);
+        },
         op.Not => {
             // Bitwise complement: x ^ -1 (all ones).
             const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
@@ -1835,17 +2184,69 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         op.Load => {
             const result = inst.operands[1];
             const ptr_id = try idOperandAt(inst.operands, 2, bound); // indexes many per-id arrays below
-            if (ptr_id < module.local_is_vec.len and module.local_is_vec[ptr_id]) {
-                // A whole-vector load of a tracked Function-storage vector local: yield the
-                // scalarized vector last stored to it.
-                module.vec_of[result] = module.local_vec[ptr_id];
+            if (ptr_id < module.local_array_index_of.len and module.local_array_index_of[ptr_id] != null) {
+                const access = module.local_array_index_of[ptr_id].?;
+                const array = module.mat_of[access.local];
+                if (array.cols == 0 or array.rows == 0) return error.MalformedModule;
+                const result_type = try operandAt(inst.operands, 0);
+                const elem_type = scalarType(module.types, if (vectorInfo(module.types, result_type)) |vi| vi.elem else result_type) orelse return error.Unsupported;
+                const cond_type = try func.types.intern(.bool);
+                if (vectorInfo(module.types, result_type)) |vi| {
+                    if (vi.len != array.rows) return error.MalformedModule;
+                    var out: Vec = .{ .len = array.rows };
+                    for (0..array.rows) |row| {
+                        var selected = array.comps[row];
+                        for (1..array.cols) |column| {
+                            const index_value = try func.appendInst(block, module.i32_t, .{ .iconst = @intCast(column) });
+                            const matches = try func.appendInst(block, cond_type, .{ .icmp = .{ .op = .eq, .lhs = access.index, .rhs = index_value } });
+                            selected = try func.appendInst(block, elem_type, .{ .select = .{ .cond = matches, .then = array.comps[column * array.rows + row], .@"else" = selected } });
+                        }
+                        out.comps[row] = selected;
+                    }
+                    module.vec_of[result] = out;
+                } else {
+                    if (array.rows != 1) return error.MalformedModule;
+                    var selected = array.comps[0];
+                    for (1..array.cols) |column| {
+                        const index_value = try func.appendInst(block, module.i32_t, .{ .iconst = @intCast(column) });
+                        const matches = try func.appendInst(block, cond_type, .{ .icmp = .{ .op = .eq, .lhs = access.index, .rhs = index_value } });
+                        selected = try func.appendInst(block, elem_type, .{ .select = .{ .cond = matches, .then = array.comps[column], .@"else" = selected } });
+                    }
+                    value_of[result] = selected;
+                }
+            } else if (ptr_id < module.local_is_array.len and module.local_is_array[ptr_id]) {
+                module.mat_of[result] = module.mat_of[ptr_id];
+            } else if (ptr_id < module.local_is_vec.len and module.local_is_vec[ptr_id]) {
+                const slots = module.local_vec_slots[ptr_id];
+                if (slots.len == 0) return error.MalformedModule;
+                var loaded: Vec = .{ .len = slots.len };
+                for (0..slots.len) |component| {
+                    const elem_type = scalarType(module.types, (vectorInfo(module.types, try operandAt(inst.operands, 0)) orelse return error.MalformedModule).elem) orelse return error.Unsupported;
+                    loaded.comps[component] = try func.appendInst(block, elem_type, .{ .load = .{ .ptr = slots.comps[component] } });
+                }
+                module.vec_of[result] = loaded;
             } else if (ptr_id < module.local_comp_of.len and module.local_comp_of[ptr_id] != null) {
                 // A scalar load of a constant-index access chain into a tracked vector local:
                 // yield that component of the local's last-stored vector.
                 const lc = module.local_comp_of[ptr_id].?;
-                const lv = module.local_vec[lc.local];
-                if (lc.comp >= lv.len) return error.MalformedModule;
-                value_of[result] = lv.comps[lc.comp];
+                const slots = module.local_vec_slots[lc.local];
+                if (lc.comp >= slots.len) return error.MalformedModule;
+                const elem_type = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+                value_of[result] = try func.appendInst(block, elem_type, .{ .load = .{ .ptr = slots.comps[lc.comp] } });
+            } else if (ptr_id < module.local_vec_index_of.len and module.local_vec_index_of[ptr_id] != null) {
+                const access = module.local_vec_index_of[ptr_id].?;
+                const slots = module.local_vec_slots[access.local];
+                if (slots.len == 0) return error.MalformedModule;
+                const elem_type = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+                const cond_type = try func.types.intern(.bool);
+                var selected = try func.appendInst(block, elem_type, .{ .load = .{ .ptr = slots.comps[0] } });
+                for (1..slots.len) |component| {
+                    const component_value = try func.appendInst(block, elem_type, .{ .load = .{ .ptr = slots.comps[component] } });
+                    const component_index = try func.appendInst(block, module.i32_t, .{ .iconst = @intCast(component) });
+                    const matches = try func.appendInst(block, cond_type, .{ .icmp = .{ .op = .eq, .lhs = access.index, .rhs = component_index } });
+                    selected = try func.appendInst(block, elem_type, .{ .select = .{ .cond = matches, .then = component_value, .@"else" = selected } });
+                }
+                value_of[result] = selected;
             } else if (ptr_id < module.local_struct.len and module.local_struct[ptr_id] != null) {
                 // A whole-struct load of a tracked Function-storage struct local: fetch each
                 // field's current value and scalarize them into a Vec, exactly like a whole
@@ -1876,23 +2277,35 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 out.comps[0] = try coerceTo(func, block, elem, builtinScalarOf(module, ptr_id).?);
                 for (1..vi.len) |i| out.comps[i] = try func.appendInst(block, elem, .{ .iconst = 0 });
                 module.vec_of[result] = out;
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .global_id and vectorInfo(module.types, inst.operands[0]) != null) {
+                const vi = vectorInfo(module.types, inst.operands[0]).?;
+                if (vi.len > 3) return error.Unsupported;
+                const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
+                var out: Vec = .{ .len = @intCast(vi.len) };
+                for (0..vi.len) |i| {
+                    out.comps[i] = try coerceTo(func, block, elem, module.global_id_values[i] orelse return error.MalformedModule);
+                }
+                module.vec_of[result] = out;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .sampler) {
                 // A load of a combined-image-sampler variable yields its descriptor
                 // pointer (the synthesized pointer entry param). The following
                 // OpSampledImage / OpImageSample* reads it.
-                module.sampler_ptr_of[result] = value_of[ptr_id] orelse return error.MalformedModule;
+                module.sampler_ptr_of[result] = module.sampler_ptr_of[ptr_id] orelse
+                    value_of[ptr_id] orelse return error.MalformedModule;
+                module.sampler_dim_of[result] = module.sampler_dim_of[ptr_id];
+                module.sampler_arrayed_of[result] = module.sampler_arrayed_of[ptr_id];
                 // Carry the sampler's image Dim (from the loaded variable's POINTER TYPE) so
                 // lowerImageSample can pick the 3D vs cube host tag.
                 if (ptr_id < module.var_type.len) {
                     const pt = module.var_type[ptr_id];
-                    if (pt < module.type_image_dim.len) module.sampler_dim_of[result] = module.type_image_dim[pt];
-                    if (pt < module.type_image_arrayed.len) module.sampler_arrayed_of[result] = module.type_image_arrayed[pt];
+                    if (pt < module.type_image_dim.len and module.sampler_dim_of[result] == 0) module.sampler_dim_of[result] = module.type_image_dim[pt];
+                    if (pt < module.type_image_arrayed.len and module.sampler_arrayed_of[result] == 0) module.sampler_arrayed_of[result] = module.type_image_arrayed[pt];
                 }
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .sampler_state) {
                 return;
             } else if (module.is_builtin_ptr[ptr_id]) {
-                // A load of gl_GlobalInvocationID.x is the synthesized invocation id.
-                value_of[result] = module.global_id_value orelse return error.MalformedModule;
+                const component = module.global_id_component_of[ptr_id] orelse return error.MalformedModule;
+                value_of[result] = module.global_id_values[component] orelse return error.MalformedModule;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .workgroup_id) {
                 // A load of gl_WorkGroupID.x is the synthesized workgroup index param.
                 value_of[result] = module.workgroup_id_value orelse return error.MalformedModule;
@@ -1900,6 +2313,8 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 value_of[result] = module.num_workgroups_value orelse return error.MalformedModule;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .local_id) {
                 value_of[result] = module.local_id_value orelse return error.MalformedModule;
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .local_invocation_index) {
+                value_of[result] = module.local_invocation_index_value orelse return error.MalformedModule;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .workgroup_size) {
                 value_of[result] = module.workgroup_size_value orelse return error.MalformedModule;
             } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .vertex_index) {
@@ -1935,7 +2350,23 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 // VS does this (`frag_pos = gl_Position.xyz`). The position must already
                 // have been stored (glslang writes gl_Position before reading it back).
                 if (module.position_vec.len == 0) return error.MalformedModule;
-                module.vec_of[result] = module.position_vec;
+                const component = module.pos_chain_component[ptr_id];
+                if (component != std.math.maxInt(u32)) {
+                    if (component >= module.position_vec.len) return error.MalformedModule;
+                    value_of[result] = module.position_vec.comps[component];
+                } else {
+                    module.vec_of[result] = module.position_vec;
+                }
+            } else if (ptr_id < module.output_chain_var.len and module.output_chain_var[ptr_id] != 0) {
+                const output = module.output_chain_var[ptr_id];
+                const component = module.output_chain_component[ptr_id];
+                if (module.output_vec[output].len == 0) return error.MalformedModule;
+                if (component >= module.output_vec[output].len) return error.MalformedModule;
+                value_of[result] = module.output_vec[output].comps[component];
+            } else if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .output and module.output_vec[ptr_id].len != 0) {
+                // glslang may read a fragment output vector back after its initial store
+                // before replacing individual channels.
+                module.vec_of[result] = module.output_vec[ptr_id];
             } else {
                 const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
                 var ptr = value_of[ptr_id] orelse return error.MalformedModule;
@@ -1978,25 +2409,48 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         op.Store => {
             const ptr_id = try idOperandAt(inst.operands, 0, bound); // indexes per-id arrays below
             const val_id = try operandAt(inst.operands, 1);
-            // A whole-vector store to a tracked Function-storage vector local: record the
-            // scalarized vector as the local's current value (subsequent loads read it).
-            if (ptr_id < module.local_is_vec.len and module.local_is_vec[ptr_id]) {
-                const comps = scalarComps(module, val_id) catch return error.MalformedModule;
-                var v: Vec = .{ .len = @intCast(comps.len) };
-                for (comps, 0..) |cv, ci| v.comps[ci] = cv;
-                module.local_vec[ptr_id] = v;
+            if (ptr_id < module.local_array_index_of.len and module.local_array_index_of[ptr_id] != null) {
+                return error.Unsupported;
+            }
+            if (ptr_id < module.local_is_array.len and module.local_is_array[ptr_id]) {
+                const value = module.mat_of[val_id];
+                if (value.cols == 0 or value.rows == 0) return error.MalformedModule;
+                module.mat_of[ptr_id] = value;
                 return;
             }
-            // A component store through a constant-index access chain into a tracked vector
-            // local: update that one component of the local's current vector.
+            // Store a scalarized vector into the component slots. mem2reg builds the loop
+            // phis for locals that cross block boundaries.
+            if (ptr_id < module.local_is_vec.len and module.local_is_vec[ptr_id]) {
+                const comps = scalarComps(module, val_id) catch return error.MalformedModule;
+                const slots = module.local_vec_slots[ptr_id];
+                if (comps.len != slots.len) return error.MalformedModule;
+                for (comps, 0..) |cv, ci| try func.appendStore(block, cv, slots.comps[ci]);
+                return;
+            }
+            // A component store through a constant-index access chain into a tracked vector.
             if (ptr_id < module.local_comp_of.len and module.local_comp_of[ptr_id] != null) {
                 const lc = module.local_comp_of[ptr_id].?;
                 const sv = try valueOf(module, val_id);
-                if (lc.comp >= module.local_vec[lc.local].len) {
-                    if (lc.comp >= module.local_vec[lc.local].comps.len) return error.MalformedModule;
-                    module.local_vec[lc.local].len = lc.comp + 1;
+                const slots = module.local_vec_slots[lc.local];
+                if (lc.comp >= slots.len) return error.MalformedModule;
+                try func.appendStore(block, sv, slots.comps[lc.comp]);
+                return;
+            }
+            if (ptr_id < module.local_vec_index_of.len and module.local_vec_index_of[ptr_id] != null) {
+                const access = module.local_vec_index_of[ptr_id].?;
+                const slots = module.local_vec_slots[access.local];
+                if (slots.len == 0) return error.MalformedModule;
+                const pointee = module.var_pointee(access.local) orelse return error.MalformedModule;
+                const vi = vectorInfo(module.types, pointee) orelse return error.MalformedModule;
+                const elem_type = scalarType(module.types, vi.elem) orelse return error.Unsupported;
+                const stored = try coerceTo(func, block, elem_type, try valueOf(module, val_id));
+                for (0..slots.len) |component| {
+                    const previous = try func.appendInst(block, elem_type, .{ .load = .{ .ptr = slots.comps[component] } });
+                    const component_index = try func.appendInst(block, module.i32_t, .{ .iconst = @intCast(component) });
+                    const matches = try func.appendInst(block, try func.types.intern(.bool), .{ .icmp = .{ .op = .eq, .lhs = access.index, .rhs = component_index } });
+                    const updated = try func.appendInst(block, elem_type, .{ .select = .{ .cond = matches, .then = stored, .@"else" = previous } });
+                    try func.appendStore(block, updated, slots.comps[component]);
                 }
-                module.local_vec[lc.local].comps[lc.comp] = sv;
                 return;
             }
             // A whole-struct store to a tracked Function-storage struct local: write each
@@ -2024,9 +2478,37 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 try storeOutputAttrib(func, module, block, gpv, val_id);
                 return;
             }
+            if (ptr_id < module.output_chain_var.len and module.output_chain_var[ptr_id] != 0) {
+                const output = module.output_chain_var[ptr_id];
+                const component = module.output_chain_component[ptr_id];
+                var values = module.output_vec[output];
+                if (values.len == 0) {
+                    const pointee = module.var_pointee(output) orelse return error.MalformedModule;
+                    const vi = vectorInfo(module.types, pointee) orelse return error.Unsupported;
+                    const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
+                    values.len = vi.len;
+                    for (0..vi.len) |i| {
+                        values.comps[i] = if (func.types.type_kind(elem) == .float)
+                            try func.appendInst(block, elem, .{ .fconst = 0 })
+                        else
+                            try func.appendInst(block, elem, .{ .iconst = 0 });
+                    }
+                }
+                if (component >= values.len) return error.MalformedModule;
+                values.comps[component] = try valueOf(module, val_id);
+                module.output_vec[output] = values;
+                try storeOutputAttribComponents(func, module, block, output, values.comps[0..values.len]);
+                return;
+            }
             // A graphics Output variable: scalarize the stored vector and tag each
             // component store with its output attribute slot.
             if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .output) {
+                const components = scalarComps(module, val_id) catch return error.MalformedModule;
+                if (components.len <= module.output_vec[ptr_id].comps.len) {
+                    var values: Vec = .{ .len = @intCast(components.len) };
+                    for (components, 0..) |cv, ci| values.comps[ci] = cv;
+                    module.output_vec[ptr_id] = values;
+                }
                 try storeOutputAttrib(func, module, block, ptr_id, val_id);
                 return;
             }
@@ -2076,11 +2558,24 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         },
         op.Variable => {
             const result = try idOperandAt(inst.operands, 1, bound);
-            // A tracked Function-storage vector local is scalarized via local_vec (its
-            // store/load/access-chain are handled below). Its declaration needs no IR.
-            if (module.local_is_vec[result]) return;
+            if (module.local_is_array[result]) return;
             if (try operandAt(inst.operands, 2) != op.StorageClass.function) return error.Unsupported;
             const pointee = module.var_pointee(result) orelse return error.Unsupported;
+            if (module.local_is_vec[result]) {
+                const vi = vectorInfo(module.types, pointee) orelse return error.MalformedModule;
+                const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
+                var slots: Vec = .{ .len = vi.len };
+                for (0..vi.len) |component| {
+                    slots.comps[component] = try func.appendInst(block, module.ptr_t, .{ .alloca = .{ .elem = elem } });
+                }
+                module.local_vec_slots[result] = slots;
+                if (inst.operands.len >= 4) {
+                    const initial = scalarComps(module, inst.operands[3]) catch return error.MalformedModule;
+                    if (initial.len != vi.len) return error.MalformedModule;
+                    for (0..vi.len) |component| try func.appendStore(block, initial[component], slots.comps[component]);
+                }
+                return;
+            }
             // A flat (all-scalar-member) struct local scalarizes to one alloca per field (see
             // structFieldAllocas); an initializer would need decomposing into per-field stores,
             // which no caller here needs, so it is refused rather than guessed at.
@@ -2115,6 +2610,29 @@ fn vectorInfo(types: []const ?TypeInfo, type_id: u32) ?VecType {
     return (types[type_id] orelse return null).asVector();
 }
 
+/// Detect a quiet or signaling NaN from the IEEE-754 payload bits. The core has
+/// no floating-point compare instruction, but integer masking and comparison
+/// are available for this predicate.
+fn lowerIsNan(func: *Function, block: Block, value: Value) Error!Value {
+    const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_ty = try func.types.intern(.bool);
+    const bits = try func.appendInst(block, int_ty, .{ .unary = .{ .op = .reinterpret, .value = value } });
+    const exponent = try func.appendInst(block, int_ty, .{ .arith_imm = .{ .op = .bit_and, .lhs = bits, .imm = 0x7f800000 } });
+    const mantissa = try func.appendInst(block, int_ty, .{ .arith_imm = .{ .op = .bit_and, .lhs = bits, .imm = 0x007fffff } });
+    const exponent_all_ones = try func.appendInst(block, bool_ty, .{ .icmp = .{ .op = .eq, .lhs = exponent, .rhs = try func.appendInst(block, int_ty, .{ .iconst = 0x7f800000 }) } });
+    const mantissa_nonzero = try func.appendInst(block, bool_ty, .{ .icmp = .{ .op = .ne, .lhs = mantissa, .rhs = try func.appendInst(block, int_ty, .{ .iconst = 0 }) } });
+    return func.appendInst(block, bool_ty, .{ .select = .{ .cond = exponent_all_ones, .then = mantissa_nonzero, .@"else" = try func.appendInst(block, bool_ty, .{ .iconst = 0 }) } });
+}
+
+/// Detect either sign of infinity from its IEEE-754 exponent and mantissa.
+fn lowerIsInf(func: *Function, block: Block, value: Value) Error!Value {
+    const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_ty = try func.types.intern(.bool);
+    const bits = try func.appendInst(block, int_ty, .{ .unary = .{ .op = .reinterpret, .value = value } });
+    const magnitude = try func.appendInst(block, int_ty, .{ .arith_imm = .{ .op = .bit_and, .lhs = bits, .imm = 0x7fffffff } });
+    return func.appendInst(block, bool_ty, .{ .icmp = .{ .op = .eq, .lhs = magnitude, .rhs = try func.appendInst(block, int_ty, .{ .iconst = 0x7f800000 }) } });
+}
+
 /// Lower vector instructions by scalarizing: a vector value is a list of scalar component
 /// values, a vector operation becomes one scalar operation per component. Returns true if
 /// `inst` was a vector op (handled here), false if it is a scalar op for the caller. No
@@ -2123,7 +2641,104 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
     const v_of = module.vec_of;
     const bound = v_of.len; // == the id bound; every per-id array is this length
     switch (inst.opcode) {
+        op.IsNan, op.IsInf => {
+            const result_vi = vectorInfo(module.types, try operandAt(inst.operands, 0)) orelse return false;
+            const source = v_of[try idOperandAt(inst.operands, 2, bound)];
+            if (source.len != result_vi.len) return error.MalformedModule;
+            _ = scalarType(module.types, result_vi.elem) orelse return error.Unsupported;
+            var out: Vec = .{ .len = result_vi.len };
+            for (0..result_vi.len) |i| out.comps[i] = if (inst.opcode == op.IsNan)
+                try lowerIsNan(func, block, source.comps[i])
+            else
+                try lowerIsInf(func, block, source.comps[i]);
+            v_of[inst.operands[1]] = out;
+            return true;
+        },
+        op.SNegate, op.FNegate => {
+            const vi = vectorInfo(module.types, try operandAt(inst.operands, 0)) orelse return false;
+            const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
+            const source = v_of[try idOperandAt(inst.operands, 2, bound)];
+            if (source.len != vi.len) return error.MalformedModule;
+            var out: Vec = .{ .len = vi.len };
+            for (0..vi.len) |i| {
+                const zero = if (inst.opcode == op.FNegate)
+                    try func.appendInst(block, elem, .{ .fconst = 0 })
+                else
+                    try func.appendInst(block, elem, .{ .iconst = 0 });
+                out.comps[i] = try appendArith(func, block, elem, .sub, zero, source.comps[i]);
+            }
+            v_of[inst.operands[1]] = out;
+            return true;
+        },
         op.CompositeConstruct => {
+            const result_type = try operandAt(inst.operands, 0);
+            if (result_type < module.types.len) {
+                if (module.types[result_type]) |type_info| {
+                    if (type_info == .array) {
+                        const array_type = type_info.array;
+                        const count_signed = try constValOf(module, array_type.len_id);
+                        if (count_signed <= 0 or count_signed > 16) return error.Unsupported;
+                        const count: u8 = @intCast(count_signed);
+                        const rows: u8 = if (vectorInfo(module.types, array_type.elem)) |v|
+                            v.len
+                        else if (scalarType(module.types, array_type.elem) != null)
+                            1
+                        else
+                            return error.Unsupported;
+                        if (@as(usize, count) * rows > 64) return error.Unsupported;
+                        var out: Mat = .{ .cols = count, .rows = rows };
+                        var item: usize = 0;
+                        for (try operandsFrom(inst.operands, 2)) |id_raw| {
+                            const id = try checkId(id_raw, bound);
+                            if (v_of[id].len != 0) {
+                                if (v_of[id].len != rows) return error.MalformedModule;
+                                for (v_of[id].comps[0..v_of[id].len]) |value| {
+                                    if (item >= out.comps.len) return error.MalformedModule;
+                                    out.comps[item] = value;
+                                    item += 1;
+                                }
+                            } else {
+                                if (rows != 1 or item >= out.comps.len) return error.MalformedModule;
+                                out.comps[item] = module.value_of[id] orelse return error.MalformedModule;
+                                item += 1;
+                            }
+                        }
+                        if (item != @as(usize, count) * rows) return error.MalformedModule;
+                        module.mat_of[inst.operands[1]] = out;
+                        return true;
+                    }
+                    if (type_info.asMatrix()) |matrix_type| {
+                        const column = vectorInfo(module.types, matrix_type.col_vec) orelse return error.Unsupported;
+                        const rows = column.len;
+                        var out: Mat = .{ .cols = matrix_type.cols, .rows = rows };
+                        var count: usize = 0;
+                        for (try operandsFrom(inst.operands, 2)) |id_raw| {
+                            const id = try checkId(id_raw, bound);
+                            if (module.mat_of[id].cols != 0) {
+                                const nested = module.mat_of[id];
+                                for (nested.comps[0 .. @as(usize, nested.cols) * nested.rows]) |value| {
+                                    if (count >= out.comps.len) return error.MalformedModule;
+                                    out.comps[count] = value;
+                                    count += 1;
+                                }
+                            } else if (v_of[id].len != 0) {
+                                for (v_of[id].comps[0..v_of[id].len]) |value| {
+                                    if (count >= out.comps.len) return error.MalformedModule;
+                                    out.comps[count] = value;
+                                    count += 1;
+                                }
+                            } else {
+                                if (count >= out.comps.len) return error.MalformedModule;
+                                out.comps[count] = module.value_of[id] orelse return error.MalformedModule;
+                                count += 1;
+                            }
+                        }
+                        if (count != @as(usize, out.cols) * out.rows) return error.MalformedModule;
+                        module.mat_of[inst.operands[1]] = out;
+                        return true;
+                    }
+                }
+            }
             const vi = vectorInfo(module.types, try operandAt(inst.operands, 0)) orelse return false; // struct construct: not here
             var out: Vec = .{ .len = 0 };
             for ((try operandsFrom(inst.operands, 2))) |cid_raw| {
@@ -2148,11 +2763,53 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
         op.CompositeExtract => {
             // [type, result, composite, index...]. The indices are literals. A single
             // index into a vector yields the component scalar.
-            const cv = v_of[try idOperandAt(inst.operands, 2, bound)];
+            const composite_id = try idOperandAt(inst.operands, 2, bound);
+            const aggregate = module.mat_of[composite_id];
+            if (aggregate.cols != 0) {
+                const indexes = try operandsFrom(inst.operands, 3);
+                if (indexes.len == 1) {
+                    const column = indexes[0];
+                    if (column >= aggregate.cols) return error.MalformedModule;
+                    if (vectorInfo(module.types, try operandAt(inst.operands, 0))) |vi| {
+                        if (vi.len != aggregate.rows) return error.MalformedModule;
+                        var out: Vec = .{ .len = aggregate.rows };
+                        for (0..aggregate.rows) |row|
+                            out.comps[row] = aggregate.comps[@as(usize, column) * aggregate.rows + row];
+                        module.vec_of[inst.operands[1]] = out;
+                    } else if (aggregate.rows == 1) {
+                        module.value_of[inst.operands[1]] = aggregate.comps[column];
+                    } else return error.Unsupported;
+                } else if (indexes.len == 2) {
+                    const column = indexes[0];
+                    const row = indexes[1];
+                    if (column >= aggregate.cols or row >= aggregate.rows) return error.MalformedModule;
+                    module.value_of[inst.operands[1]] = aggregate.comps[@as(usize, column) * aggregate.rows + row];
+                } else return error.Unsupported;
+                return true;
+            }
+            const cv = v_of[composite_id];
             if (cv.len == 0) return false; // extracting from a struct/array: not here
             const idx = try operandAt(inst.operands, 3);
             if (idx >= cv.len) return error.MalformedModule;
             module.value_of[inst.operands[1]] = cv.comps[idx];
+            return true;
+        },
+        op.CompositeInsert => {
+            // [type, result, object, composite, index...]. Vector composites
+            // are scalarized in `vec_of`, so an insertion is just a component
+            // replacement. Nested composite paths and struct insertion remain
+            // unsupported until their values have a scalarized representation.
+            const vi = vectorInfo(module.types, try operandAt(inst.operands, 0)) orelse return false;
+            const cv = v_of[try idOperandAt(inst.operands, 3, bound)];
+            if (cv.len == 0) return false;
+            if (cv.len != vi.len) return error.MalformedModule;
+            const indexes = try operandsFrom(inst.operands, 4);
+            if (indexes.len != 1 or indexes[0] >= cv.len) return error.Unsupported;
+            const object = try idOperandAt(inst.operands, 2, bound);
+            if (v_of[object].len != 0) return error.Unsupported;
+            var out = cv;
+            out.comps[indexes[0]] = module.value_of[object] orelse return error.MalformedModule;
+            v_of[inst.operands[1]] = out;
             return true;
         },
         op.VectorShuffle => {
@@ -2191,6 +2848,7 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
             const vi = vectorInfo(module.types, try operandAt(inst.operands, 0)) orelse return false;
             const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
             const vec = v_of[try idOperandAt(inst.operands, 2, bound)];
+            if (vec.len != vi.len) return error.MalformedModule;
             const s = try valueOf(module, try operandAt(inst.operands, 3));
             var out: Vec = .{ .len = vi.len };
             for (0..vi.len) |i| out.comps[i] = try appendArith(func, block, elem, .mul, vec.comps[i], s);
@@ -2233,6 +2891,45 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
             v_of[inst.operands[1]] = out;
             return true;
         },
+        op.ConvertFToU, op.ConvertFToS, op.ConvertSToF, op.ConvertUToF, op.UConvert, op.SConvert, op.FConvert, op.Bitcast => {
+            const result_type = try operandAt(inst.operands, 0);
+            const vi = vectorInfo(module.types, result_type) orelse return false;
+            const source_id = try idOperandAt(inst.operands, 2, bound);
+            const source = v_of[source_id];
+            if (source.len != vi.len) return error.MalformedModule;
+            const elem_ty = scalarType(module.types, vi.elem) orelse return error.Unsupported;
+            var out: Vec = .{ .len = vi.len };
+            for (0..vi.len) |i| {
+                const input = source.comps[i];
+                if (inst.opcode == op.Bitcast) {
+                    out.comps[i] = try func.appendInst(block, elem_ty, .{ .unary = .{ .op = .reinterpret, .value = input } });
+                    continue;
+                }
+                const converted_input = if (inst.opcode == op.ConvertSToF)
+                    try restated(func, block, input, .signed)
+                else if (inst.opcode == op.ConvertUToF)
+                    try restated(func, block, input, .unsigned)
+                else
+                    input;
+                const want: ?std.builtin.Signedness = switch (inst.opcode) {
+                    op.ConvertFToS => .signed,
+                    op.ConvertFToU => .unsigned,
+                    else => null,
+                };
+                if (want) |signedness| {
+                    const kind = func.types.type_kind(elem_ty);
+                    if (kind == .int and kind.int.signedness != signedness) {
+                        const as_asked = try func.types.intern(.{ .int = .{ .signedness = signedness, .bits = kind.int.bits } });
+                        const converted = try func.appendInst(block, as_asked, .{ .convert = .{ .value = converted_input } });
+                        out.comps[i] = try func.appendInst(block, elem_ty, .{ .convert = .{ .value = converted } });
+                        continue;
+                    }
+                }
+                out.comps[i] = try func.appendInst(block, elem_ty, .{ .convert = .{ .value = converted_input } });
+            }
+            v_of[inst.operands[1]] = out;
+            return true;
+        },
         op.Dot => {
             // A scalar result: sum of component products.
             const elem = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
@@ -2248,6 +2945,37 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
             return true;
         },
         else => {
+            if (inst.opcode == op.FMod) {
+                if (vectorInfo(module.types, try operandAt(inst.operands, 0))) |vi| {
+                    const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
+                    const a = v_of[try idOperandAt(inst.operands, 2, bound)];
+                    const b = v_of[try idOperandAt(inst.operands, 3, bound)];
+                    if (a.len != vi.len or b.len != vi.len) return error.MalformedModule;
+                    var out: Vec = .{ .len = vi.len };
+                    for (0..vi.len) |i| {
+                        const quotient = try appendArith(func, block, elem, .div, a.comps[i], b.comps[i]);
+                        const rounded = try func.appendInst(block, elem, .{ .unary = .{ .op = .floor, .value = quotient } });
+                        const multiple = try appendArith(func, block, elem, .mul, b.comps[i], rounded);
+                        out.comps[i] = try appendArith(func, block, elem, .sub, a.comps[i], multiple);
+                    }
+                    v_of[inst.operands[1]] = out;
+                    return true;
+                }
+            }
+            if (cmpOpOf(inst.opcode)) |cmp_op| {
+                if (vectorInfo(module.types, try operandAt(inst.operands, 0))) |vi| {
+                    const a = v_of[try idOperandAt(inst.operands, 2, bound)];
+                    const b = v_of[try idOperandAt(inst.operands, 3, bound)];
+                    if (a.len != vi.len or b.len != vi.len) return error.MalformedModule;
+                    const bool_ty = scalarType(module.types, vi.elem) orelse return error.Unsupported;
+                    var out: Vec = .{ .len = vi.len };
+                    for (0..vi.len) |i| {
+                        out.comps[i] = try func.appendInst(block, bool_ty, .{ .icmp = .{ .op = cmp_op, .lhs = a.comps[i], .rhs = b.comps[i] } });
+                    }
+                    v_of[inst.operands[1]] = out;
+                    return true;
+                }
+            }
             // Component-wise arithmetic on a vector result (OpFAdd/OpIMul/...).
             if (binOpOf(inst.opcode)) |bop| {
                 if (vectorInfo(module.types, try operandAt(inst.operands, 0))) |vi| {
@@ -2341,18 +3069,236 @@ fn loadGradient(allocator: std.mem.Allocator, func: *Function, module: *Module, 
 /// normalize) to native arithmetic over scalarized components. Returns true if `which`
 /// was one of these (and the result was recorded), false to fall through to the scalar
 /// select/compare set.
-fn lowerMathExtInst(func: *Function, module: *Module, block: Block, which: u32, result: u32, args: []const u32) Error!bool {
+fn lowerMathExtInst(func: *Function, module: *Module, block: Block, which: u32, result: u32, result_type_id: u32, args: []const u32) Error!bool {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     switch (which) {
+        op.Glsl.fma => {
+            const a_id = try operandAt(args, 0);
+            const b_id = try operandAt(args, 1);
+            const c_id = try operandAt(args, 2);
+            const a = try vecOf(module, a_id);
+            const b = try vecOf(module, b_id);
+            const c = try vecOf(module, c_id);
+            const n: usize = @max(@as(usize, a.len), @max(@as(usize, b.len), @as(usize, c.len)));
+            if (n == 0 or (a.len != 0 and a.len != n) or (b.len != 0 and b.len != n) or (c.len != 0 and c.len != n)) return false;
+            const scalar = struct {
+                fn get(m: *Module, vec: Vec, id: u32, index: usize) Error!Value {
+                    return if (vec.len == 0) valueOf(m, id) else vec.comps[index];
+                }
+            };
+            const elem = scalarType(module.types, (vectorInfo(module.types, result_type_id) orelse return error.Unsupported).elem) orelse return error.Unsupported;
+            var out: Vec = .{ .len = @intCast(n) };
+            for (0..n) |i| {
+                const av = try scalar.get(module, a, a_id, i);
+                const bv = try scalar.get(module, b, b_id, i);
+                const cv = try scalar.get(module, c, c_id, i);
+                const product = try func.appendInst(block, elem, .{ .arith = .{ .op = .mul, .lhs = av, .rhs = bv } });
+                out.comps[i] = try func.appendInst(block, elem, .{ .arith = .{ .op = .add, .lhs = product, .rhs = cv } });
+            }
+            module.vec_of[result] = out;
+            return true;
+        },
+        // FMix is x * (1 - a) + y * a. The factor may be scalar or vector;
+        // scalarized arithmetic handles both without a separate vector opcode.
+        op.Glsl.f_mix => {
+            const x_id = try operandAt(args, 0);
+            const y_id = try operandAt(args, 1);
+            const a_id = try operandAt(args, 2);
+            const x = try vecOf(module, x_id);
+            const y = try vecOf(module, y_id);
+            const a = try vecOf(module, a_id);
+            const n: usize = @max(@as(usize, x.len), @max(@as(usize, y.len), @as(usize, a.len)));
+            if (n == 0) {
+                const xv = try valueOf(module, x_id);
+                const yv = try valueOf(module, y_id);
+                const av = try valueOf(module, a_id);
+                const one = try func.appendInst(block, f32_t, .{ .fconst = 1 });
+                const one_minus_a = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = one, .rhs = av } });
+                const left = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = xv, .rhs = one_minus_a } });
+                const right = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = yv, .rhs = av } });
+                module.value_of[result] = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = left, .rhs = right } });
+                return true;
+            }
+            if ((x.len != 0 and x.len != n) or (y.len != 0 and y.len != n) or (a.len != 0 and a.len != n)) return error.Unsupported;
+            const one = try func.appendInst(block, f32_t, .{ .fconst = 1 });
+            var out: Vec = .{ .len = @intCast(n) };
+            for (0..n) |i| {
+                const xv = if (x.len == 0) try valueOf(module, x_id) else x.comps[i];
+                const yv = if (y.len == 0) try valueOf(module, y_id) else y.comps[i];
+                const av = if (a.len == 0) try valueOf(module, a_id) else a.comps[i];
+                const one_minus_a = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = one, .rhs = av } });
+                const left = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = xv, .rhs = one_minus_a } });
+                const right = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = yv, .rhs = av } });
+                out.comps[i] = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = left, .rhs = right } });
+            }
+            module.vec_of[result] = out;
+            return true;
+        },
+        op.Glsl.smooth_step => {
+            const edge0_id = try operandAt(args, 0);
+            const edge1_id = try operandAt(args, 1);
+            const x_id = try operandAt(args, 2);
+            const edge0 = try vecOf(module, edge0_id);
+            const edge1 = try vecOf(module, edge1_id);
+            const x = try vecOf(module, x_id);
+            const n: usize = @max(@as(usize, edge0.len), @max(@as(usize, edge1.len), @as(usize, x.len)));
+            const bool_t = try func.types.intern(.bool);
+            const scalar = struct {
+                fn get(m: *Module, v: Vec, id: u32, i: usize) Error!Value {
+                    return if (v.len == 0) valueOf(m, id) else v.comps[i];
+                }
+            };
+            if (n == 0) {
+                const e0 = try valueOf(module, edge0_id);
+                const e1 = try valueOf(module, edge1_id);
+                const xv = try valueOf(module, x_id);
+                const width = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = e1, .rhs = e0 } });
+                const offset = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = xv, .rhs = e0 } });
+                const raw = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .div, .lhs = offset, .rhs = width } });
+                const zero = try func.appendInst(block, f32_t, .{ .fconst = 0 });
+                const one = try func.appendInst(block, f32_t, .{ .fconst = 1 });
+                const low = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = raw, .rhs = zero } });
+                const raised = try func.appendInst(block, f32_t, .{ .select = .{ .cond = low, .then = zero, .@"else" = raw } });
+                const high = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = one, .rhs = raised } });
+                const t = try func.appendInst(block, f32_t, .{ .select = .{ .cond = high, .then = one, .@"else" = raised } });
+                const two_t = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = try func.appendInst(block, f32_t, .{ .fconst = 2 }), .rhs = t } });
+                const curve = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = try func.appendInst(block, f32_t, .{ .fconst = 3 }), .rhs = two_t } });
+                const square = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = t, .rhs = t } });
+                module.value_of[result] = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = square, .rhs = curve } });
+                return true;
+            }
+            if ((edge0.len != 0 and edge0.len != n) or (edge1.len != 0 and edge1.len != n) or (x.len != 0 and x.len != n)) return error.Unsupported;
+            const elem = scalarType(module.types, (vectorInfo(module.types, result_type_id) orelse return error.Unsupported).elem) orelse return error.Unsupported;
+            var out: Vec = .{ .len = @intCast(n) };
+            for (0..n) |i| {
+                const e0 = try scalar.get(module, edge0, edge0_id, i);
+                const e1 = try scalar.get(module, edge1, edge1_id, i);
+                const xv = try scalar.get(module, x, x_id, i);
+                const width = try func.appendInst(block, elem, .{ .arith = .{ .op = .sub, .lhs = e1, .rhs = e0 } });
+                const offset = try func.appendInst(block, elem, .{ .arith = .{ .op = .sub, .lhs = xv, .rhs = e0 } });
+                const raw = try func.appendInst(block, elem, .{ .arith = .{ .op = .div, .lhs = offset, .rhs = width } });
+                const zero = try func.appendInst(block, elem, .{ .fconst = 0 });
+                const one = try func.appendInst(block, elem, .{ .fconst = 1 });
+                const low = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = raw, .rhs = zero } });
+                const raised = try func.appendInst(block, elem, .{ .select = .{ .cond = low, .then = zero, .@"else" = raw } });
+                const high = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = one, .rhs = raised } });
+                const t = try func.appendInst(block, elem, .{ .select = .{ .cond = high, .then = one, .@"else" = raised } });
+                const two_t = try func.appendInst(block, elem, .{ .arith = .{ .op = .mul, .lhs = try func.appendInst(block, elem, .{ .fconst = 2 }), .rhs = t } });
+                const curve = try func.appendInst(block, elem, .{ .arith = .{ .op = .sub, .lhs = try func.appendInst(block, elem, .{ .fconst = 3 }), .rhs = two_t } });
+                const square = try func.appendInst(block, elem, .{ .arith = .{ .op = .mul, .lhs = t, .rhs = t } });
+                out.comps[i] = try func.appendInst(block, elem, .{ .arith = .{ .op = .mul, .lhs = square, .rhs = curve } });
+            }
+            module.vec_of[result] = out;
+            return true;
+        },
+        op.Glsl.f_abs, op.Glsl.s_abs => {
+            const x = try vecOf(module, try operandAt(args, 0));
+            if (x.len == 0) return false;
+            const elem = scalarType(module.types, (vectorInfo(module.types, result_type_id) orelse return error.Unsupported).elem) orelse return error.Unsupported;
+            const bool_t = try func.types.intern(.bool);
+            const zero = if (func.types.type_kind(elem) == .float)
+                try func.appendInst(block, elem, .{ .fconst = 0 })
+            else
+                try func.appendInst(block, elem, .{ .iconst = 0 });
+            var out: Vec = .{ .len = x.len };
+            for (0..x.len) |i| {
+                const negative = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x.comps[i], .rhs = zero } });
+                const negated = try func.appendInst(block, elem, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = x.comps[i] } });
+                out.comps[i] = try func.appendInst(block, elem, .{ .select = .{ .cond = negative, .then = negated, .@"else" = x.comps[i] } });
+            }
+            module.vec_of[result] = out;
+            return true;
+        },
+        // GLSL min/max accept vectors; scalarize them with the same comparison
+        // and select used by the scalar path.
+        op.Glsl.f_min, op.Glsl.u_min, op.Glsl.s_min, op.Glsl.f_max, op.Glsl.u_max, op.Glsl.s_max => {
+            const a = try vecOf(module, try operandAt(args, 0));
+            if (a.len == 0) return false;
+            const b = try vecOf(module, try operandAt(args, 1));
+            if (a.len != b.len) return error.Unsupported;
+            const elem = scalarType(module.types, (vectorInfo(module.types, result_type_id) orelse return error.Unsupported).elem) orelse return error.Unsupported;
+            const bool_t = try func.types.intern(.bool);
+            var out: Vec = .{ .len = a.len };
+            for (0..a.len) |i| {
+                const is_min = which == op.Glsl.f_min or which == op.Glsl.u_min or which == op.Glsl.s_min;
+                const lhs = if (is_min) b.comps[i] else a.comps[i];
+                const rhs = if (is_min) a.comps[i] else b.comps[i];
+                const lt = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = lhs, .rhs = rhs } });
+                out.comps[i] = try func.appendInst(block, elem, .{ .select = .{ .cond = lt, .then = b.comps[i], .@"else" = a.comps[i] } });
+            }
+            module.vec_of[result] = out;
+            return true;
+        },
+        // The vector overloads of GLSL.std.450 Clamp are also scalarized here;
+        // SPIR-V producers may supply scalar bounds for a vector value.
+        op.Glsl.f_clamp, op.Glsl.u_clamp, op.Glsl.s_clamp => {
+            const x = try vecOf(module, try operandAt(args, 0));
+            if (x.len == 0) return false;
+            const elem = scalarType(module.types, (vectorInfo(module.types, result_type_id) orelse return error.Unsupported).elem) orelse return error.Unsupported;
+            const lo_id = try operandAt(args, 1);
+            const hi_id = try operandAt(args, 2);
+            const lo_vec = try vecOf(module, lo_id);
+            const hi_vec = try vecOf(module, hi_id);
+            if ((lo_vec.len != 0 and lo_vec.len != x.len) or
+                (hi_vec.len != 0 and hi_vec.len != x.len)) return error.Unsupported;
+            const bool_t = try func.types.intern(.bool);
+            var out: Vec = .{ .len = x.len };
+            for (0..x.len) |i| {
+                const lo = if (lo_vec.len == 0) try valueOf(module, lo_id) else lo_vec.comps[i];
+                const hi = if (hi_vec.len == 0) try valueOf(module, hi_id) else hi_vec.comps[i];
+                const below = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x.comps[i], .rhs = lo } });
+                const raised = try func.appendInst(block, elem, .{ .select = .{ .cond = below, .then = lo, .@"else" = x.comps[i] } });
+                const above = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = hi, .rhs = raised } });
+                out.comps[i] = try func.appendInst(block, elem, .{ .select = .{ .cond = above, .then = hi, .@"else" = raised } });
+            }
+            module.vec_of[result] = out;
+            return true;
+        },
+        op.Glsl.round, op.Glsl.round_even, op.Glsl.floor, op.Glsl.ceil, op.Glsl.trunc, op.Glsl.fract => {
+            const x = try vecOf(module, try operandAt(args, 0));
+            if (x.len == 0) return false;
+            const elem = scalarType(module.types, (vectorInfo(module.types, result_type_id) orelse return error.Unsupported).elem) orelse return error.Unsupported;
+            var out: Vec = .{ .len = x.len };
+            for (0..x.len) |i| {
+                const op_kind: ir.function.UnaryOp = switch (which) {
+                    op.Glsl.round, op.Glsl.round_even => .nearest,
+                    op.Glsl.floor => .floor,
+                    op.Glsl.ceil => .ceil,
+                    op.Glsl.trunc => .trunc,
+                    else => .floor,
+                };
+                const rounded = try func.appendInst(block, elem, .{ .unary = .{ .op = op_kind, .value = x.comps[i] } });
+                out.comps[i] = if (which == op.Glsl.fract)
+                    try func.appendInst(block, elem, .{ .arith = .{ .op = .sub, .lhs = x.comps[i], .rhs = rounded } })
+                else
+                    rounded;
+            }
+            module.vec_of[result] = out;
+            return true;
+        },
         // Transcendentals without a portable closed form (pow / exp / log / sin / cos and
         // their base-2 variants) are dispatched to a host math function pointer, exactly like
         // the image sampler: a `f32 math_fn(op:i32, a:f32, b:f32)` entry param the CPU backend
         // binds (a GPU backend emits a MUFU instead). `a` is the primary operand, `b` is the
         // exponent for pow (0 otherwise).
         op.Glsl.pow => {
-            const a = try valueOf(module, try operandAt(args, 0));
-            const b = try valueOf(module, try operandAt(args, 1));
-            module.value_of[result] = try callMathFn(func, module, block, MATH_POW, a, b);
+            const a_id = try operandAt(args, 0);
+            const b_id = try operandAt(args, 1);
+            const a_vec = try vecOf(module, a_id);
+            if (a_vec.len != 0) {
+                const b_vec = try vecOf(module, b_id);
+                if (b_vec.len != 0 and a_vec.len != b_vec.len) return error.Unsupported;
+                var out: Vec = .{ .len = a_vec.len };
+                for (0..a_vec.len) |i| {
+                    const b = if (b_vec.len == 0) try valueOf(module, b_id) else b_vec.comps[i];
+                    out.comps[i] = try callMathFn(func, module, block, MATH_POW, a_vec.comps[i], b);
+                }
+                module.vec_of[result] = out;
+            } else {
+                const a = try valueOf(module, a_id);
+                const b = try valueOf(module, b_id);
+                module.value_of[result] = try callMathFn(func, module, block, MATH_POW, a, b);
+            }
             return true;
         },
         op.Glsl.exp => {
@@ -2396,6 +3342,43 @@ fn lowerMathExtInst(func: *Function, module: *Module, block: Block, which: u32, 
             const s = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .sqrt, .value = x } });
             const one = try func.appendInst(block, f32_t, .{ .fconst = 1.0 });
             module.value_of[result] = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .div, .lhs = one, .rhs = s } });
+            return true;
+        },
+        op.Glsl.find_ilsb => {
+            const arg_id = try operandAt(args, 0);
+            const arg_vec = try vecOf(module, arg_id);
+            const elem = scalarType(module.types, if (vectorInfo(module.types, result_type_id)) |vi| vi.elem else result_type_id) orelse return error.Unsupported;
+            const elem_kind = func.types.type_kind(elem);
+            if (elem_kind != .int or elem_kind.int.bits != 32) return error.Unsupported;
+            const uint_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+            const bool_t = try func.types.intern(.bool);
+            const zero = try func.appendInst(block, uint_t, .{ .iconst = 0 });
+            const minus_one = try func.appendInst(block, uint_t, .{ .iconst = -1 });
+            const one = try func.appendInst(block, uint_t, .{ .iconst = 1 });
+            const scalar = struct {
+                fn lower(f: *Function, b: Block, value: Value, uint_ty: Type, bool_ty: Type, zero_value: Value, one_value: Value, minus_one_value: Value) Error!Value {
+                    var remaining = try coerceTo(f, b, uint_ty, value);
+                    var count = zero_value;
+                    inline for (.{ 16, 8, 4, 2, 1 }) |shift| {
+                        const mask = try f.appendInst(b, uint_ty, .{ .iconst = (@as(i64, 1) << shift) - 1 });
+                        const lower_bits = try f.appendInst(b, uint_ty, .{ .arith = .{ .op = .bit_and, .lhs = remaining, .rhs = mask } });
+                        const is_zero = try f.appendInst(b, bool_ty, .{ .icmp = .{ .op = .eq, .lhs = lower_bits, .rhs = zero_value } });
+                        const increment = try f.appendInst(b, uint_ty, .{ .select = .{ .cond = is_zero, .then = try f.appendInst(b, uint_ty, .{ .iconst = shift }), .@"else" = zero_value } });
+                        count = try f.appendInst(b, uint_ty, .{ .arith = .{ .op = .add, .lhs = count, .rhs = increment } });
+                        remaining = try f.appendInst(b, uint_ty, .{ .select = .{ .cond = is_zero, .then = try f.appendInst(b, uint_ty, .{ .arith = .{ .op = .shr, .lhs = remaining, .rhs = try f.appendInst(b, uint_ty, .{ .iconst = shift }) } }), .@"else" = remaining } });
+                    }
+                    const was_zero = try f.appendInst(b, bool_ty, .{ .icmp = .{ .op = .eq, .lhs = try coerceTo(f, b, uint_ty, value), .rhs = zero_value } });
+                    _ = one_value;
+                    return f.appendInst(b, uint_ty, .{ .select = .{ .cond = was_zero, .then = minus_one_value, .@"else" = count } });
+                }
+            }.lower;
+            if (arg_vec.len != 0) {
+                var out: Vec = .{ .len = arg_vec.len };
+                for (0..arg_vec.len) |i| out.comps[i] = try coerceTo(func, block, elem, try scalar(func, block, arg_vec.comps[i], uint_t, bool_t, zero, one, minus_one));
+                module.vec_of[result] = out;
+            } else {
+                module.value_of[result] = try coerceTo(func, block, elem, try scalar(func, block, try valueOf(module, arg_id), uint_t, bool_t, zero, one, minus_one));
+            }
             return true;
         },
         op.Glsl.length => {
@@ -2502,7 +3485,7 @@ fn lowerExtInst(allocator: std.mem.Allocator, func: *Function, module: *Module, 
     // Vector / float-math ext-insts (cross / normalize / length / sqrt / inversesqrt):
     // these operate on scalarized vectors or need an fsqrt, so they are lowered here
     // before the scalar select/compare set.
-    if (try lowerMathExtInst(func, module, block, which, result, args)) return;
+    if (try lowerMathExtInst(func, module, block, which, result, inst.operands[0], args)) return;
 
     const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
     const bool_t = try func.types.intern(.bool);
@@ -2515,6 +3498,13 @@ fn lowerExtInst(allocator: std.mem.Allocator, func: *Function, module: *Module, 
 
     value_of: {
         const out = switch (which) {
+            op.Glsl.fma => blk: {
+                const a = try arg(module, args, 0);
+                const b = try arg(module, args, 1);
+                const c = try arg(module, args, 2);
+                const product = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+                break :blk try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = product, .rhs = c } });
+            },
             op.Glsl.f_abs, op.Glsl.s_abs => blk: {
                 const x = try arg(module, args, 0);
                 const zero = if (func.types.type_kind(ty) == .float)
@@ -2552,7 +3542,7 @@ fn lowerExtInst(allocator: std.mem.Allocator, func: *Function, module: *Module, 
                 const x = try arg(module, args, 0);
                 break :blk try func.appendInst(block, ty, .{ .unary = .{ .op = .trunc, .value = x } });
             },
-            op.Glsl.round_even => blk: {
+            op.Glsl.round, op.Glsl.round_even => blk: {
                 const x = try arg(module, args, 0);
                 break :blk try func.appendInst(block, ty, .{ .unary = .{ .op = .nearest, .value = x } });
             },
@@ -2623,15 +3613,61 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     const indices = try operandsFrom(inst.operands, 3);
 
     if (base < module.var_kind.len and module.var_kind[base] == .global_id) {
+        if (indices.len == 0) {
+            module.var_kind[result] = .global_id;
+            return;
+        }
+        if (indices.len != 1) return error.Unsupported;
+        const component: u32 = @intCast(try constValOf(module, indices[0]));
+        if (component >= 3) return error.MalformedModule;
         module.is_builtin_ptr[result] = true;
+        module.global_id_component_of[result] = component;
         return;
     }
-    // A constant-index chain into a tracked Function-storage vector local: record (local,
-    // component) so the following OpLoad/OpStore reads/updates that component of the local's
-    // scalarized vector.
+    // An image descriptor array is one Vulkan binding whose element address is
+    // the binding base plus the descriptor index times the 128-byte sampler
+    // record ABI. Keep the selected record as the sampled-image pointer so
+    // OpLoad / OpImageFetch can pass it through to the image operation.
+    if (base < module.var_kind.len and module.var_kind[base] == .sampler and indices.len == 1) {
+        if (module.var_pointee(base)) |pointee| {
+            const pointee_info = module.types[pointee] orelse return error.Unsupported;
+            if (pointee_info == .array) {
+                const base_ptr = try valueOf(module, base);
+                const idx = try coerceTo(func, block, module.i32_t, try valueOf(module, indices[0]));
+                if (module.opts.image_descriptor_stride == 0) return error.MalformedModule;
+                const stride = try func.appendInst(block, module.i32_t, .{ .iconst = module.opts.image_descriptor_stride });
+                const offset = try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .mul, .lhs = idx, .rhs = stride } });
+                const pointer = try func.appendInst(block, func.valueType(base_ptr), .{ .arith = .{ .op = .add, .lhs = base_ptr, .rhs = offset } });
+                module.value_of[result] = pointer;
+                module.var_kind[result] = .sampler;
+                module.sampler_ptr_of[result] = pointer;
+                module.sampler_dim_of[result] = module.type_image_dim[pointee];
+                module.sampler_arrayed_of[result] = module.type_image_arrayed[pointee];
+                module.chain_pointee[result] = pointee_info.array.elem;
+                return;
+            }
+        }
+    }
+    // An indexed chain into a tracked Function-storage vector local.
     if (base < module.local_is_vec.len and module.local_is_vec[base] and indices.len == 1) {
-        const comp: u32 = @intCast(try constValOf(module, indices[0]));
-        module.local_comp_of[result] = .{ .local = base, .comp = @intCast(comp) };
+        if (indices[0] < module.const_known.len and module.const_known[indices[0]]) {
+            const comp: u32 = @intCast(module.const_val[indices[0]]);
+            const vi = vectorInfo(module.types, module.var_pointee(base) orelse return error.MalformedModule) orelse return error.MalformedModule;
+            if (comp >= vi.len) return error.MalformedModule;
+            module.local_comp_of[result] = .{ .local = base, .comp = @intCast(comp) };
+        } else {
+            module.local_vec_index_of[result] = .{
+                .local = base,
+                .index = try coerceTo(func, block, module.i32_t, try valueOf(module, indices[0])),
+            };
+        }
+        return;
+    }
+    if (base < module.local_is_array.len and module.local_is_array[base] and indices.len == 1) {
+        module.local_array_index_of[result] = .{
+            .local = base,
+            .index = try valueOf(module, indices[0]),
+        };
         return;
     }
     // A constant-index chain into a tracked Function-storage struct local: the member index
@@ -2657,7 +3693,7 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     // A chain into gl_WorkGroupID / gl_NumWorkGroups. These ARE uvec3, so a kernel reads `.x`
     // through a chain rather than loading the variable, which makes this the normal path and not
     // the defensive one above.
-    if (base < module.var_kind.len and (module.var_kind[base] == .workgroup_id or module.var_kind[base] == .num_workgroups or module.var_kind[base] == .local_id or module.var_kind[base] == .workgroup_size)) {
+    if (base < module.var_kind.len and (module.var_kind[base] == .workgroup_id or module.var_kind[base] == .num_workgroups or module.var_kind[base] == .local_id or module.var_kind[base] == .local_invocation_index or module.var_kind[base] == .workgroup_size)) {
         if (result < module.var_kind.len) module.var_kind[result] = module.var_kind[base];
         return;
     }
@@ -2684,13 +3720,31 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     // block is an Output struct with a member decorated BuiltIn Position. Addressing that
     // member records the position output so the OpStore routes to ATTR_POSITION. (A store
     // to a PointSize/ClipDistance member is dropped at the store - we model position only.)
+    // A direct component access into a Location output vector is tracked separately: the
+    // following load/store reads or updates the last scalarized output value.
     if (base < module.var_kind.len and module.var_kind[base] == .output and indices.len == 1) {
+        if (module.var_pointee(base)) |pointee| {
+            if (vectorInfo(module.types, pointee)) |vi| {
+                const component: u32 = @intCast(try constValOf(module, indices[0]));
+                if (component >= vi.len or component >= 4) return error.MalformedModule;
+                module.output_chain_var[result] = base;
+                module.output_chain_component[result] = component;
+                return;
+            }
+        }
+    }
+    if (base < module.var_kind.len and module.var_kind[base] == .output and (indices.len == 1 or indices.len == 2)) {
         if (module.var_pointee(base)) |struct_ty| {
             if (module.types[struct_ty]) |ti| if (ti == .@"struct") {
                 const member: u32 = @intCast(try constValOf(module, indices[0]));
                 if (module.members.get(memberKey(struct_ty, member))) |m| {
                     if (m.builtin == op.BuiltIn.position) {
                         module.pos_chain_var[result] = base;
+                        if (indices.len == 2) {
+                            const component: u32 = @intCast(try constValOf(module, indices[1]));
+                            if (component >= 4) return error.MalformedModule;
+                            module.pos_chain_component[result] = component;
+                        }
                     } else {
                         // A non-position gl_PerVertex member (PointSize etc.): mark it so
                         // the OpStore is dropped rather than treated as a buffer store.
@@ -2736,6 +3790,21 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
                 const term = try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .mul, .lhs = idx, .rhs = stride_c } });
                 offset_val = if (offset_val) |o| try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .add, .lhs = o, .rhs = term } }) else term;
                 cur_type = arr.elem;
+            },
+            .vector => |vec| {
+                // Vectors inside UBOs and push-constant blocks are addressable
+                // components too. SPIR-V represents `pc.offset.xy` as a
+                // struct-member step followed by a vector-index step, so the
+                // second index contributes one scalar element's byte size.
+                const stride: u32 = @intCast(vulcanScalarSize(
+                    func,
+                    scalarType(module.types, vec.elem) orelse return error.Unsupported,
+                ));
+                const idx = try coerceTo(func, block, module.i32_t, try valueOf(module, idx_id));
+                const stride_c = try func.appendInst(block, module.i32_t, .{ .iconst = stride });
+                const term = try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .mul, .lhs = idx, .rhs = stride_c } });
+                offset_val = if (offset_val) |o| try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .add, .lhs = o, .rhs = term } }) else term;
+                cur_type = vec.elem;
             },
             else => return error.Unsupported, // indexing a scalar
         }
@@ -3184,8 +4253,46 @@ fn lowerImageFetch(func: *Function, module: *Module, block: Block, inst: binary.
     if (result_vector.len != 4) return error.Unsupported;
     const element_type = scalarType(module.types, result_vector.elem) orelse return error.Unsupported;
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const x: Value = if (cv.len >= 1) cv.comps[0] else (module.value_of[coord] orelse return error.MalformedModule);
-    const y: Value = if (cv.len >= 2) cv.comps[1] else try func.appendInst(block, i32_t, .{ .iconst = 0 });
+    var x: Value = if (cv.len >= 1) cv.comps[0] else (module.value_of[coord] orelse return error.MalformedModule);
+    var y: Value = if (cv.len >= 2) cv.comps[1] else try func.appendInst(block, i32_t, .{ .iconst = 0 });
+    // OpImageRead on a SubpassData image is Vulkan's subpassLoad. Its SPIR-V
+    // coordinate is the constant (0, 0); Vulkan selects the current fragment's
+    // pixel implicitly. The Glacier target emulates that input attachment with
+    // a texel fetch, so supply the rasterizer's FragCoord instead.
+    //
+    // gl_FragCoord is a vec4 of f32 and the graphics ABI delivers every fragment
+    // input in an FP register, so the param is f32 and the fetch coordinate needs
+    // a truncating convert. An i32 param reads the coordinate's IEEE bits and
+    // moves the input to a GPR, which shifts the argument registers.
+    if (image < module.sampler_dim_of.len and
+        module.sampler_dim_of[image] == op.Dim.subpass_data)
+    {
+        const coords = if (module.input_attachment_coord) |cached| cached else blk: {
+            const f32_t = try func.types.intern(.{ .float = .f32 });
+            // The convert targets an UNSIGNED int because the core decodes only
+            // vfcvt.rtz.xu.f.v out of the float-to-integer family. A signed result
+            // selects vfcvt.rtz.x.f.v, which the decoder never matches, so the
+            // instruction retires as nothing and the register keeps the raw bits.
+            // A pixel coordinate is never negative, so unsigned is also the right type.
+            const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+            var synthesized: [2]Value = undefined;
+            for (0..2) |component| {
+                const param = try func.appendBlockParam(module.grad_entry, f32_t);
+                try gpu.attrs.setBuiltin(func, param, .frag_coord);
+                try func.addAttr(.{ .value = param }, .{ .custom = .{
+                    .namespace = "vulcan.gpu",
+                    .key = "bicomp",
+                    .value = .{ .int = @intCast(component) },
+                } });
+                // The entry block dominates every later subpassLoad that reuses this.
+                synthesized[component] = try func.appendInst(module.grad_entry, u32_t, .{ .convert = .{ .value = param } });
+            }
+            module.input_attachment_coord = synthesized;
+            break :blk synthesized;
+        };
+        x = coords[0];
+        y = coords[1];
+    }
     // The Lod image operand: operands = [type, result, image, coord, imageOperands, lodValue].
     const lod: Value = blk: {
         if (inst.operands.len >= 6 and (inst.operands[4] & 0x2) != 0) {
@@ -3678,8 +4785,8 @@ fn binOpOf(opcode: u16) ?ir.function.BinOp {
 
 fn cmpOpOf(opcode: u16) ?ir.function.CmpOp {
     return switch (opcode) {
-        op.IEqual, op.FOrdEqual => .eq,
-        op.INotEqual, op.FOrdNotEqual => .ne,
+        op.IEqual, op.FOrdEqual, op.FUnordEqual => .eq,
+        op.INotEqual, op.FOrdNotEqual, op.FUnordNotEqual => .ne,
         op.SLessThan, op.ULessThan, op.FOrdLessThan => .lt,
         op.SLessThanEqual, op.ULessThanEqual, op.FOrdLessThanEqual => .le,
         op.SGreaterThan, op.UGreaterThan, op.FOrdGreaterThan => .gt,

@@ -88,6 +88,102 @@ pub const Instruction = union(enum) {
     /// `ecall`, which retires it as faulted. The code is the value the register holds at the time
     /// and not the register number.
     fault: struct { rs1: Reg },
+    /// A lane word. The core's vector length IS its lane count, so no word sets a length and the
+    /// shape comes from the core rather than from the program.
+    vector: Vector,
+};
+
+/// What a lane word names. The operand a form takes sits in `vs1`, in `rs` or in `imm`, and
+/// which one is part of the operation rather than a field to read twice.
+pub const Vector = struct {
+    op: VectorOp,
+    /// A lane register, or a mask register where the operation writes one.
+    vd: u5,
+    vs1: u5,
+    vs2: u5,
+    /// The scalar side of an `x` form: a source for most, the destination for a read back.
+    rs: Reg,
+    /// The immediate of an `i` form, already extended from its five bits.
+    imm: i32,
+    /// The `vm` bit is clear, so v0 says which lanes take the answer. A merge reads v0 as an
+    /// operand rather than as a predicate, so this is never set for one.
+    masked: bool,
+};
+
+/// The lane operations the core decodes. A word outside this is refused rather than ignored,
+/// which keeps the float set a refusal until it is lifted too.
+pub const VectorOp = enum {
+    add_vv,
+    add_vx,
+    add_vi,
+    sub_vv,
+    sub_vx,
+    and_vv,
+    and_vi,
+    or_vv,
+    or_vi,
+    xor_vv,
+    sll_vv,
+    sll_vx,
+    sll_vi,
+    srl_vv,
+    srl_vx,
+    srl_vi,
+    sra_vv,
+    sra_vx,
+    sra_vi,
+    mul_vv,
+    mul_vx,
+    mulh_vv,
+    mulhu_vv,
+    div_vv,
+    divu_vv,
+    rem_vv,
+    remu_vv,
+    /// Every lane takes the second operand. The three forms differ only in where it comes from.
+    mv_v_v,
+    mv_v_x,
+    mv_v_i,
+    /// Per lane, the second operand where v0 is set and `vs2` where it is clear. Every lane the
+    /// warp holds is written, which is how two divergent answers are joined.
+    merge_vvm,
+    merge_vxm,
+    merge_vim,
+    /// A compare, which writes a mask register.
+    mseq_vv,
+    mseq_vx,
+    mseq_vi,
+    msne_vv,
+    msne_vx,
+    msltu_vv,
+    mslt_vv,
+    msleu_vv,
+    msle_vv,
+    /// The mask logicals, which read and write mask registers alone.
+    mandn_mm,
+    mand_mm,
+    mor_mm,
+    mxor_mm,
+    morn_mm,
+    mnand_mm,
+    mnor_mm,
+    mxnor_mm,
+    /// Across the mask and back to the scalar side.
+    cpop_m,
+    first_m,
+    /// Lane zero to a scalar register, and a scalar to lane zero.
+    mv_x_s,
+    mv_s_x,
+    /// Each lane takes its own index.
+    id_v,
+    /// Every lane of `vs2` ored together, into lane zero of `vd`.
+    redor_vs,
+    /// A word per lane from one address upwards.
+    le32,
+    se32,
+    /// A word per lane, each from the address in its own lane of the index register.
+    luxei32,
+    suxei32,
 };
 
 const opcode_load = 0x03;
@@ -191,11 +287,182 @@ fn alu(which: u3, seven: u7, immediate: bool) Error!Alu {
     };
 }
 
+const opcode_vector = 0x57;
+const opcode_vector_load = 0x07;
+const opcode_vector_store = 0x27;
+
+fn vd(word: u32) u5 {
+    return @truncate(word >> 7);
+}
+
+fn vs1(word: u32) u5 {
+    return @truncate(word >> 15);
+}
+
+fn vs2(word: u32) u5 {
+    return @truncate(word >> 20);
+}
+
+fn funct6(word: u32) u6 {
+    return @truncate(word >> 26);
+}
+
+/// The `vm` bit, which is set where an operation writes every lane.
+fn unmasked(word: u32) bool {
+    return (word >> 25) & 1 == 1;
+}
+
+/// The five bit immediate of an `i` form, which is signed.
+fn immediateV(word: u32) i32 {
+    return @as(i5, @bitCast(@as(u5, @truncate(word >> 15))));
+}
+
+/// A lane word. The form in `funct3` says where the second operand comes from, and the operation
+/// is that form together with `funct6`.
+fn vector(word: u32) Error!Instruction {
+    const form = funct3(word);
+    const six = funct6(word);
+    const vm = unmasked(word);
+
+    const op: VectorOp = switch (form) {
+        // vs1 holds the second operand.
+        0 => switch (six) {
+            0x00 => .add_vv,
+            0x02 => .sub_vv,
+            0x09 => .and_vv,
+            0x0a => .or_vv,
+            0x0b => .xor_vv,
+            0x17 => if (vm) .mv_v_v else .merge_vvm,
+            0x18 => .mseq_vv,
+            0x19 => .msne_vv,
+            0x1a => .msltu_vv,
+            0x1b => .mslt_vv,
+            0x1c => .msleu_vv,
+            0x1d => .msle_vv,
+            0x25 => .sll_vv,
+            0x28 => .srl_vv,
+            0x29 => .sra_vv,
+            else => return error.Illegal,
+        },
+        // The mask set, the lane multiplies and divides, and the reads back to the scalar side.
+        2 => switch (six) {
+            0x0a => .redor_vs,
+            0x10 => switch (vs1(word)) {
+                0 => .mv_x_s,
+                16 => .cpop_m,
+                17 => .first_m,
+                else => return error.Illegal,
+            },
+            0x14 => switch (vs1(word)) {
+                17 => .id_v,
+                else => return error.Illegal,
+            },
+            0x18 => .mandn_mm,
+            0x19 => .mand_mm,
+            0x1a => .mor_mm,
+            0x1b => .mxor_mm,
+            0x1c => .morn_mm,
+            0x1d => .mnand_mm,
+            0x1e => .mnor_mm,
+            0x1f => .mxnor_mm,
+            0x20 => .divu_vv,
+            0x21 => .div_vv,
+            0x22 => .remu_vv,
+            0x23 => .rem_vv,
+            0x24 => .mulhu_vv,
+            0x25 => .mul_vv,
+            0x27 => .mulh_vv,
+            else => return error.Illegal,
+        },
+        // An immediate holds the second operand.
+        3 => switch (six) {
+            0x00 => .add_vi,
+            0x09 => .and_vi,
+            0x0a => .or_vi,
+            0x17 => if (vm) .mv_v_i else .merge_vim,
+            0x18 => .mseq_vi,
+            0x25 => .sll_vi,
+            0x28 => .srl_vi,
+            0x29 => .sra_vi,
+            else => return error.Illegal,
+        },
+        // A scalar register holds the second operand.
+        4 => switch (six) {
+            0x00 => .add_vx,
+            0x02 => .sub_vx,
+            0x17 => if (vm) .mv_v_x else .merge_vxm,
+            0x18 => .mseq_vx,
+            0x19 => .msne_vx,
+            0x25 => .sll_vx,
+            0x28 => .srl_vx,
+            0x29 => .sra_vx,
+            else => return error.Illegal,
+        },
+        6 => switch (six) {
+            0x10 => switch (vs1(word)) {
+                0 => .mv_s_x,
+                else => return error.Illegal,
+            },
+            0x25 => .mul_vx,
+            else => return error.Illegal,
+        },
+        // The float forms, which nothing lifts yet.
+        else => return error.Illegal,
+    };
+
+    // A merge reads v0 as an operand rather than as a predicate, so it is never predicated and
+    // every lane the warp holds takes one side or the other.
+    const predicated = switch (op) {
+        .merge_vvm, .merge_vxm, .merge_vim => false,
+        else => !vm,
+    };
+
+    // A read back to the scalar side puts its destination where a lane word puts `vd`, so the
+    // scalar register is read from there and `rs` means the scalar side either way.
+    const scalar: Reg = switch (op) {
+        .mv_x_s, .cpop_m, .first_m => vd(word),
+        else => rs1(word),
+    };
+
+    return .{ .vector = .{
+        .op = op,
+        .vd = vd(word),
+        .vs1 = vs1(word),
+        .vs2 = vs2(word),
+        .rs = scalar,
+        .imm = immediateV(word),
+        .masked = predicated,
+    } };
+}
+
+/// A lane load or store. Only the 32-bit width exists on this core, unit stride and indexed.
+fn vectorMemory(word: u32, is_store: bool) Error!Instruction {
+    if (funct3(word) != 0b110) return error.Illegal;
+    const mop: u2 = @truncate(word >> 26);
+    const op: VectorOp = switch (mop) {
+        0 => if (vs2(word) != 0) return error.Illegal else if (is_store) .se32 else .le32,
+        1, 3 => if (is_store) .suxei32 else .luxei32,
+        else => return error.Illegal,
+    };
+    return .{ .vector = .{
+        .op = op,
+        .vd = vd(word),
+        .vs1 = 0,
+        .vs2 = vs2(word),
+        .rs = rs1(word),
+        .imm = 0,
+        .masked = !unmasked(word),
+    } };
+}
+
 /// What one word does, or `error.Illegal` where the core decodes nothing for it.
 pub fn one(word: u32) Error!Instruction {
     if (word == barrier_word) return .barrier;
 
     return switch (@as(u7, @truncate(word))) {
+        opcode_vector => vector(word),
+        opcode_vector_load => vectorMemory(word, false),
+        opcode_vector_store => vectorMemory(word, true),
         opcode_lui => .{ .lui = .{ .rd = rd(word), .value = word & 0xffff_f000 } },
         opcode_auipc => .{ .auipc = .{ .rd = rd(word), .value = word & 0xffff_f000 } },
         opcode_jal => .{ .jal = .{ .rd = rd(word), .offset = immediateJ(word) } },
@@ -426,6 +693,6 @@ test "a word outside what the core decodes is refused rather than ignored" {
     try std.testing.expectEqual(@as(Instruction, .fence), try one(0x0ff0_000f));
     try std.testing.expectError(error.Illegal, one(0x0000_0000));
     try std.testing.expectError(error.Illegal, one(0xffff_ffff));
-    // A vector word. Real, and not decoded here yet, which is a refusal and not a no-op.
-    try std.testing.expectError(error.Illegal, one(0x0000_0057));
+    // A float lane word. Real, and not lifted yet, which is a refusal and not a no-op.
+    try std.testing.expectError(error.Illegal, one(0x0000_1057));
 }
