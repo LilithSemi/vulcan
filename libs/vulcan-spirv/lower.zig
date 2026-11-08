@@ -2344,15 +2344,69 @@ fn loadGradient(allocator: std.mem.Allocator, func: *Function, module: *Module, 
 fn lowerMathExtInst(func: *Function, module: *Module, block: Block, which: u32, result: u32, args: []const u32) Error!bool {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     switch (which) {
+        // GLSL.std.450 FMax accepts vectors. The scalar ext-inst path below can
+        // only type scalar results, so lower each vector component here.
+        op.Glsl.f_max => {
+            const a = try vecOf(module, try operandAt(args, 0));
+            if (a.len == 0) return false;
+            const b = try vecOf(module, try operandAt(args, 1));
+            if (a.len != b.len) return error.Unsupported;
+            const bool_t = try func.types.intern(.bool);
+            var out: Vec = .{ .len = a.len };
+            for (0..a.len) |i| {
+                const lt = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a.comps[i], .rhs = b.comps[i] } });
+                out.comps[i] = try func.appendInst(block, f32_t, .{ .select = .{ .cond = lt, .then = b.comps[i], .@"else" = a.comps[i] } });
+            }
+            module.vec_of[result] = out;
+            return true;
+        },
+        // The vector overloads of GLSL.std.450 Clamp are also scalarized here;
+        // SPIR-V producers may supply scalar bounds for a vector value.
+        op.Glsl.f_clamp => {
+            const x = try vecOf(module, try operandAt(args, 0));
+            if (x.len == 0) return false;
+            const lo_id = try operandAt(args, 1);
+            const hi_id = try operandAt(args, 2);
+            const lo_vec = try vecOf(module, lo_id);
+            const hi_vec = try vecOf(module, hi_id);
+            if ((lo_vec.len != 0 and lo_vec.len != x.len) or
+                (hi_vec.len != 0 and hi_vec.len != x.len)) return error.Unsupported;
+            const bool_t = try func.types.intern(.bool);
+            var out: Vec = .{ .len = x.len };
+            for (0..x.len) |i| {
+                const lo = if (lo_vec.len == 0) try valueOf(module, lo_id) else lo_vec.comps[i];
+                const hi = if (hi_vec.len == 0) try valueOf(module, hi_id) else hi_vec.comps[i];
+                const below = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x.comps[i], .rhs = lo } });
+                const raised = try func.appendInst(block, f32_t, .{ .select = .{ .cond = below, .then = lo, .@"else" = x.comps[i] } });
+                const above = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = hi, .rhs = raised } });
+                out.comps[i] = try func.appendInst(block, f32_t, .{ .select = .{ .cond = above, .then = hi, .@"else" = raised } });
+            }
+            module.vec_of[result] = out;
+            return true;
+        },
         // Transcendentals without a portable closed form (pow / exp / log / sin / cos and
         // their base-2 variants) are dispatched to a host math function pointer, exactly like
         // the image sampler: a `f32 math_fn(op:i32, a:f32, b:f32)` entry param the CPU backend
         // binds (a GPU backend emits a MUFU instead). `a` is the primary operand, `b` is the
         // exponent for pow (0 otherwise).
         op.Glsl.pow => {
-            const a = try valueOf(module, try operandAt(args, 0));
-            const b = try valueOf(module, try operandAt(args, 1));
-            module.value_of[result] = try callMathFn(func, module, block, MATH_POW, a, b);
+            const a_id = try operandAt(args, 0);
+            const b_id = try operandAt(args, 1);
+            const a_vec = try vecOf(module, a_id);
+            if (a_vec.len != 0) {
+                const b_vec = try vecOf(module, b_id);
+                if (b_vec.len != 0 and a_vec.len != b_vec.len) return error.Unsupported;
+                var out: Vec = .{ .len = a_vec.len };
+                for (0..a_vec.len) |i| {
+                    const b = if (b_vec.len == 0) try valueOf(module, b_id) else b_vec.comps[i];
+                    out.comps[i] = try callMathFn(func, module, block, MATH_POW, a_vec.comps[i], b);
+                }
+                module.vec_of[result] = out;
+            } else {
+                const a = try valueOf(module, a_id);
+                const b = try valueOf(module, b_id);
+                module.value_of[result] = try callMathFn(func, module, block, MATH_POW, a, b);
+            }
             return true;
         },
         op.Glsl.exp => {

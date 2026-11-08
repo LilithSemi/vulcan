@@ -963,13 +963,12 @@ test "a warp-uniform float divide becomes the one scalar divide" {
 
 test "the backend refuses the float work Glacier cannot do" {
     const allocator = std.testing.allocator;
-    const Shape = enum { half_arith, compare, half_store };
-    for ([_]Shape{ .half_arith, .compare, .half_store }) |shape| {
+    const Shape = enum { half_arith, half_compare, half_store };
+    for ([_]Shape{ .half_arith, .half_compare, .half_store }) |shape| {
         var f = Function.init(allocator);
         defer f.deinit();
         const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
         const bool_t = try f.types.intern(.bool);
-        const f32_t = try f.types.intern(.{ .float = .f32 });
         const f16_t = try f.types.intern(.{ .float = .f16 });
         const ptr_t = try f.types.ptrGlobal();
 
@@ -977,8 +976,8 @@ test "the backend refuses the float work Glacier cannot do" {
         const tid = try f.appendBlockParam(entry, u32_t);
         try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
         const base = try f.appendGlobalAddr(entry, ptr_t, "data");
-        const a = try f.appendInst(entry, f32_t, .{ .fconst = 3.0 });
-        const b = try f.appendInst(entry, f32_t, .{ .fconst = 5.0 });
+        const a = try f.appendInst(entry, f16_t, .{ .fconst = 3.0 });
+        const b = try f.appendInst(entry, f16_t, .{ .fconst = 5.0 });
         const stored = switch (shape) {
             // f32 arithmetic works; f16 arithmetic does not. The element width is fixed at 32 bits,
             // so a plain float op reads whole lanes, and an f16 is the low half of one. Arithmetic
@@ -990,9 +989,8 @@ test "the backend refuses the float work Glacier cannot do" {
                 const sum = try f.appendInst(entry, f16_t, .{ .arith = .{ .op = .add, .lhs = h, .rhs = h } });
                 break :blk try f.appendInst(entry, u32_t, .{ .unary = .{ .op = .reinterpret, .value = sum } });
             },
-            // There is no float compare, and an integer compare over the bits is a different
-            // relation.
-            .compare => blk: {
+            // The float compare reads f32 lanes; it cannot compare packed halves.
+            .half_compare => blk: {
                 const lt = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
                 const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
                 const zero = try f.appendInst(entry, u32_t, .{ .iconst = 0 });
@@ -2342,7 +2340,7 @@ test "a per-lane compare takes its signedness from the operand type" {
     }
 }
 
-test "a per-lane float compare answers false where it should" {
+test "float compares use lane masks with uniform and per-lane operands" {
     // Checking only the TRUE cases cannot see a compare that always says true, which is exactly
     // how a mis-wired one fails: the peer's lane read the fp32 operands as fp16 in their low bits,
     // both zero there, so every compare returned an all-ones mask and looked plausible. So every
@@ -2364,8 +2362,14 @@ test "a per-lane float compare answers false where it should" {
         .{ .op = .gt, .lhs = 3.0, .rhs = 5.0, .taken = false },
         .{ .op = .ge, .lhs = 3.0, .rhs = 3.0, .taken = true },
         .{ .op = .ge, .lhs = 3.0, .rhs = 5.0, .taken = false },
+        .{ .op = .eq, .lhs = -0.0, .rhs = 0.0, .taken = true },
+        .{ .op = .eq, .lhs = std.math.nan(f64), .rhs = 0.0, .taken = false },
+        .{ .op = .lt, .lhs = -5.0, .rhs = -3.0, .taken = true },
+        .{ .op = .lt, .lhs = std.math.nan(f64), .rhs = 0.0, .taken = false },
     };
-    for (cases) |c| {
+    for (0..cases.len * 2) |case_index| {
+        const c = cases[case_index / 2];
+        const uniform = case_index % 2 == 0;
         var f = Function.init(allocator);
         defer f.deinit();
         const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
@@ -2379,13 +2383,12 @@ test "a per-lane float compare answers false where it should" {
         const base = try f.appendGlobalAddr(entry, ptr_t, "data");
         const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
         const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
-        // Made per-lane by adding a zeroed lane index, so the compare is a vector one rather than
-        // something a uniform path could answer.
+        // Exercise both broadcasts of uniform operands and already per-lane operands.
         const zero = try f.appendArithImm(entry, u32_t, .mul, tid, 0);
         const bias = try f.appendInst(entry, f32_t, .{ .unary = .{ .op = .reinterpret, .value = zero } });
         const kl = try f.appendInst(entry, f32_t, .{ .fconst = c.lhs });
         const kr = try f.appendInst(entry, f32_t, .{ .fconst = c.rhs });
-        const lhs = try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = kl, .rhs = bias } });
+        const lhs = if (uniform) kl else try f.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = kl, .rhs = bias } });
         const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = c.op, .lhs = lhs, .rhs = kr } });
         const hit = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
         const miss = try f.appendInst(entry, u32_t, .{ .iconst = 0 });

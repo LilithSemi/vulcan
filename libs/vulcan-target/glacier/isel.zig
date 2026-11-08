@@ -192,19 +192,50 @@ pub const Options = struct {
     /// inside a single compile can see the other stage, so the caller that composes the pipeline
     /// passes the first stage's length when it compiles the second.
     resident_words: u32 = 0,
+    /// Stride of Vulkan fragment input records. The runtime shrinks this to
+    /// the interpolant gradients used by the shader.
+    fragment_input_stride: u32 = 512,
+    /// Stride of fragment output records. 80 preserves the full color/depth/discard ABI.
+    fragment_output_stride: u32 = 80,
 };
 
 pub const vertex_input_stride = 256;
 pub const vertex_output_stride = 256;
 pub const vertex_input_vertex_index_offset = 0x60;
 pub const vertex_input_instance_index_offset = 0x64;
-pub const fragment_record_stride = 512;
+// Input records reserve the gradient table after the fixed builtin and varying slots.
+pub const fragment_input_stride = 512;
+// Four vec4 colors occupy bytes 0..63; depth and discard are at 64 and 68.
+pub const fragment_output_stride = 80;
 pub const fragment_output_depth_offset = 0x40;
 pub const fragment_output_discard_offset = 0x44;
 pub const fragment_input_point_coord_offset = 0x60;
 pub const fragment_input_front_facing_offset = 0x68;
 pub const fragment_input_coord_offset = 0x70;
 pub const fragment_input_gradient_offset = 0x100;
+
+/// Return a compact output stride when the shader writes only color outputs.
+/// Depth and discard retain their fixed offsets in the full 80-byte record.
+pub fn fragmentOutputStride(func: *const Function) u32 {
+    if (hasDiscardParam(func)) return fragment_output_stride;
+    var output_end: u32 = 0;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            const operation = func.opcode(inst);
+            if (operation != .store) continue;
+            const store = operation.store;
+            if (gpuIntAttr(func, store.ptr, "frag_depth") != null)
+                return fragment_output_stride;
+            if (gpuIntAttr(func, store.ptr, "color_out")) |component| {
+                if (component >= 16) return fragment_output_stride;
+                output_end = @max(output_end, (component / 4 + 1) * 16);
+            }
+        }
+    }
+    // Preserve the old ABI for shaders with no recognized color stores.
+    return if (output_end == 0) fragment_output_stride else output_end;
+}
 
 /// Lower `func` to a Glacier word stream. The caller owns the result.
 pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: Options) Error![]u32 {
@@ -251,7 +282,7 @@ pub fn compileFragmentExplained(
     if (why) |r| r.* = .{};
     var work = try func.clone(allocator);
     defer work.deinit();
-    try lowerFragmentIO(allocator, &work, why);
+    try lowerFragmentIO(allocator, &work, opts.fragment_input_stride, opts.fragment_output_stride, why);
     return compileKernelInternal(allocator, &work, opts, why);
 }
 
@@ -304,6 +335,7 @@ fn compileKernelInternal(
     try lowerTexelFetch(allocator, &work);
     try lowerStorageImageWrite(allocator, &work);
     try lowerImageSize(allocator, &work);
+    try lowerPow(allocator, &work);
     try lowerSquareRoot(allocator, &work);
     try unifyDiscardReturns(allocator, &work);
 
@@ -727,7 +759,13 @@ fn lowerVertexIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal) 
     }
 }
 
-fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal) Error!void {
+fn lowerFragmentIO(
+    allocator: std.mem.Allocator,
+    func: *Function,
+    input_stride: u32,
+    output_stride: u32,
+    why: ?*Refusal,
+) Error!void {
     if (!hasGpuStage(func, "fragment")) {
         return Refusal.whole(why, "a fragment kernel from a function that is not a fragment stage");
     }
@@ -753,7 +791,7 @@ fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal
                 .key = "lowered_graphics_input",
                 .value = .flag,
             } });
-            const stride = try func.appendInst(entry, index_type, .{ .iconst = fragment_record_stride });
+            const stride = try func.appendInst(entry, index_type, .{ .iconst = input_stride });
             const row = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
             const offset = try func.appendInst(entry, index_type, .{ .iconst = fragment_input_gradient_offset });
             const byte_offset = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = offset } });
@@ -782,7 +820,7 @@ fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal
             .key = "lowered_graphics_input",
             .value = .flag,
         } });
-        const stride = try func.appendInst(entry, index_type, .{ .iconst = fragment_record_stride });
+        const stride = try func.appendInst(entry, index_type, .{ .iconst = input_stride });
         const row = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
         const slot = try func.appendInst(entry, index_type, .{ .iconst = offset });
         const byte_offset = try func.appendInst(entry, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = slot } });
@@ -800,7 +838,7 @@ fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal
         for (original) |inst| {
             const operation = func.opcode(inst);
             if (operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "discard_fn")) {
-                const stride = try func.appendInst(block, index_type, .{ .iconst = fragment_record_stride });
+                const stride = try func.appendInst(block, index_type, .{ .iconst = output_stride });
                 const row = try func.appendInst(block, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
                 const offset = try func.appendInst(block, index_type, .{ .iconst = fragment_output_discard_offset });
                 const byte_offset = try func.appendInst(block, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = offset } });
@@ -822,7 +860,7 @@ fn lowerFragmentIO(allocator: std.mem.Allocator, func: *Function, why: ?*Refusal
                 try func.blockInstsMut(block).append(func.allocator, inst);
                 continue;
             };
-            const stride = try func.appendInst(block, index_type, .{ .iconst = fragment_record_stride });
+            const stride = try func.appendInst(block, index_type, .{ .iconst = output_stride });
             const row = try func.appendInst(block, index_type, .{ .arith = .{ .op = .mul, .lhs = fragment_index, .rhs = stride } });
             const slot = try func.appendInst(block, index_type, .{ .iconst = offset });
             const byte_offset = try func.appendInst(block, index_type, .{ .arith = .{ .op = .add, .lhs = row, .rhs = slot } });
@@ -1466,7 +1504,7 @@ fn isSamplerFunction(func: *const Function, value: Value) bool {
 }
 
 fn isIgnoredEntryParam(func: *const Function, value: Value) bool {
-    return isSamplerFunction(func, value) or hasGpuKey(func, value, "lowered_graphics_input");
+    return isSamplerFunction(func, value) or hasGpuKey(func, value, "math_fn") or hasGpuKey(func, value, "lowered_graphics_input");
 }
 
 fn appendOffset(func: *Function, block: Block, ptr: Value, offset: i64, int_ty: Type) Error!Value {
@@ -1516,8 +1554,12 @@ const sampler_level_count_offset = 96;
 const sampler_valid_offset = 100;
 const sampler_read_fallback_offset = 104;
 const sampler_write_fallback_offset = 108;
-const sampler_descriptor_size = 100;
-const nullable_sampler_descriptor_size = 112;
+const sampler_depth_offset = 112;
+const sampler_depth_float_offset = 116;
+const sampler_depth_reciprocal_offset = 120;
+const sampler_address_w_offset = 124;
+const sampler_descriptor_size = 128;
+const nullable_sampler_descriptor_size = 128;
 const rgba32f_texel_bytes = 16;
 
 const SampleCoordinate = struct {
@@ -1662,8 +1704,9 @@ fn selectSampleCoordinate(func: *Function, block: Block, linear: Value, filtered
     };
 }
 
-fn lowerSampleTexel(func: *Function, block: Block, image: SampleImage, x: SampleCoordinate, y: SampleCoordinate) Error![4]Value {
-    const outside = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = x.border, .rhs = y.border } });
+fn lowerSampleTexel(func: *Function, block: Block, image: SampleImage, x: SampleCoordinate, y: SampleCoordinate, z_border: Value) Error![4]Value {
+    const outside_xy = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = x.border, .rhs = y.border } });
+    const outside = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = outside_xy, .rhs = z_border } });
     const row = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = y.index, .rhs = image.row_pitch } });
     const column = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = x.index, .rhs = image.texel_bytes } });
     const byte_offset = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column } });
@@ -1837,6 +1880,114 @@ fn lowerInverseSquareRoot(func: *Function, block: Block, value: Value) Error!Val
     return estimate;
 }
 
+// Glacier has no transcendental unit or host-call ABI. Reduce pow to log2 and exp2
+// using f32 arithmetic. GLSL defines pow only for nonnegative bases (zero requires
+// a positive exponent). The core flushes subnormal inputs and outputs to zero.
+const PowBuilder = struct {
+    func: *Function,
+    block: Block,
+    ft: Type,
+    it: Type,
+    fn f(self: @This(), x: f64) Error!Value {
+        return self.func.appendInst(self.block, self.ft, .{ .fconst = x });
+    }
+    fn i(self: @This(), x: i64) Error!Value {
+        return self.func.appendInst(self.block, self.it, .{ .iconst = x });
+    }
+    fn bin(self: @This(), op: ir.function.BinOp, a: Value, b: Value) Error!Value {
+        return self.func.appendInst(self.block, self.func.valueType(a), .{ .arith = .{ .op = op, .lhs = a, .rhs = b } });
+    }
+    fn cast(self: @This(), ty: Type, x: Value, bits: bool) Error!Value {
+        return if (bits) self.func.appendInst(self.block, ty, .{ .unary = .{ .op = .reinterpret, .value = x } }) else self.func.appendInst(self.block, ty, .{ .convert = .{ .value = x } });
+    }
+    fn choose(self: @This(), op: ir.function.CmpOp, a: Value, b: Value, yes: Value, no: Value) Error!Value {
+        // Scalar floating comparisons have no hardware instruction. A signed
+        // integer key preserves f32 ordering, so this also works for uniform pow.
+        const lhs = try self.orderedBits(a);
+        const rhs = try self.orderedBits(b);
+        const cond = try self.func.appendInst(self.block, try self.func.types.intern(.bool), .{ .icmp = .{ .op = op, .lhs = lhs, .rhs = rhs } });
+        return self.func.appendInst(self.block, self.func.valueType(yes), .{ .select = .{ .cond = cond, .then = yes, .@"else" = no } });
+    }
+    fn orderedBits(self: @This(), x: Value) Error!Value {
+        const bits = try self.cast(self.it, x, true);
+        const sign = try self.bin(.shr, bits, try self.i(31));
+        return self.bin(.bit_xor, bits, try self.bin(.bit_and, sign, try self.i(0x7fffffff)));
+    }
+    fn pow(self: @This(), x: Value, y: Value) Error!Value {
+        const zero = try self.f(0);
+        const one = try self.f(1);
+        const bits = try self.cast(self.it, x, true);
+        var exponent = try self.bin(.sub, try self.bin(.shr, bits, try self.i(23)), try self.i(127));
+        const mantissa_bits = try self.bin(.bit_or, try self.bin(.bit_and, bits, try self.i(0x7fffff)), try self.i(0x3f800000));
+        const raw_m = try self.cast(self.ft, mantissa_bits, true);
+        const threshold = try self.f(@sqrt(2.0));
+        const m = try self.choose(.gt, raw_m, threshold, try self.bin(.mul, raw_m, try self.f(0.5)), raw_m);
+        exponent = try self.choose(.gt, raw_m, threshold, try self.bin(.add, exponent, try self.i(1)), exponent);
+        // Center the mantissa around one to avoid cancellation near powers of two.
+        // ln(m) = 2*(z + z^3/3 + ...), z=(m-1)/(m+1), |z| < 0.172.
+        const z = try self.bin(.div, try self.bin(.sub, m, one), try self.bin(.add, m, one));
+        const zz = try self.bin(.mul, z, z);
+        var poly = try self.f(1.0 / 15.0);
+        inline for (.{ 13, 11, 9, 7, 5, 3, 1 }) |d| {
+            poly = try self.bin(.add, try self.f(1.0 / @as(f64, d)), try self.bin(.mul, zz, poly));
+        }
+        const log = try self.bin(.add, try self.cast(self.ft, exponent, false), try self.bin(.mul, try self.bin(.mul, z, poly), try self.f(2.0 / @log(2.0))));
+        const t = try self.bin(.mul, y, log);
+        // Bound before conversion so extreme exponents never overflow an integer conversion.
+        var bounded = try self.choose(.lt, t, try self.f(-126), try self.f(-126), t);
+        bounded = try self.choose(.gt, bounded, try self.f(127.99999), try self.f(127.99999), bounded);
+        // The core converts f32 only to unsigned integers. Bias into a nonnegative
+        // range first; subtracting the bias gives floor(t), including for t < 0.
+        const uint_t = try self.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const biased = try self.cast(uint_t, try self.bin(.add, bounded, try self.f(126)), false);
+        const biased_signed = try self.cast(self.it, biased, true);
+        const max_biased = try self.i(253);
+        const at_limit = try self.func.appendInst(self.block, try self.func.types.intern(.bool), .{ .icmp = .{ .op = .gt, .lhs = biased_signed, .rhs = max_biased } });
+        // Adding the bias can round a value just below 128 up to 254.
+        const capped = try self.func.appendInst(self.block, self.it, .{ .select = .{ .cond = at_limit, .then = max_biased, .@"else" = biased_signed } });
+        const n = try self.bin(.sub, capped, try self.i(126));
+        const r = try self.bin(.mul, try self.bin(.sub, bounded, try self.cast(self.ft, n, false)), try self.f(@log(2.0)));
+        // exp(r), |r| < ln(2), with a ninth-degree Taylor polynomial.
+        var ep = try self.f(1.0 / 362880.0);
+        inline for (.{ 40320, 5040, 720, 120, 24, 6, 2, 1, 1 }) |d| {
+            ep = try self.bin(.add, try self.f(1.0 / @as(f64, d)), try self.bin(.mul, r, ep));
+        }
+        const scale = try self.cast(self.ft, try self.bin(.shl, try self.bin(.add, n, try self.i(127)), try self.i(23)), true);
+        var result = try self.bin(.mul, scale, ep);
+        result = try self.choose(.lt, t, try self.f(-126), zero, result);
+        result = try self.choose(.ge, t, try self.f(128), try self.f(std.math.inf(f32)), result);
+        result = try self.choose(.le, x, zero, zero, result);
+        return result;
+    }
+};
+
+fn lowerPow(allocator: std.mem.Allocator, func: *Function) Error!void {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const original = try allocator.dupe(Inst, func.blockInsts(block));
+        defer allocator.free(original);
+        func.blockInstsMut(block).clearRetainingCapacity();
+        for (original) |inst| {
+            const operation = func.opcode(inst);
+            if (operation != .call_indirect or !hasGpuKey(func, operation.call_indirect.target, "math_fn")) {
+                try func.blockInstsMut(block).append(func.allocator, inst);
+                continue;
+            }
+            const args = func.valueList(operation.call_indirect.args);
+            if (args.len != 3) return error.Unsupported;
+            const selector = func.definingInst(args[0]) orelse return error.Unsupported;
+            if (func.opcode(selector) != .iconst or func.opcode(selector).iconst != 0) return error.Unsupported;
+            const pb: PowBuilder = .{ .func = func, .block = block, .ft = func.valueType(args[1]), .it = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }) };
+            if (!isF32(func, pb.ft) or !isF32(func, func.valueType(args[2]))) return error.Unsupported;
+            // Copy before appending: valueList storage can move as the function grows.
+            const x = args[1];
+            const y = args[2];
+            const result = try pb.pow(x, y);
+            func.replaceAllUses(func.instResult(inst) orelse return error.Unsupported, result);
+        }
+    }
+}
+
 fn lowerSquareRoot(allocator: std.mem.Allocator, func: *Function) Error!void {
     for (0..func.blockCount()) |block_index| {
         const block: Block = @fromBackingInt(@intCast(block_index));
@@ -1895,13 +2046,14 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
             const regular_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_fn");
             const array_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_2darray_fn");
             const cube_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_cube_fn");
+            const volume_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_3d_fn");
             const shadow_sample = operation == .call_indirect and hasGpuKey(func, operation.call_indirect.target, "sampler_shadow_fn");
-            if (!regular_sample and !array_sample and !cube_sample and !shadow_sample) {
+            if (!regular_sample and !array_sample and !cube_sample and !volume_sample and !shadow_sample) {
                 try func.blockInstsMut(block).append(func.allocator, inst);
                 continue;
             }
             const args = func.valueList(operation.call_indirect.args);
-            const expected_arg_count: usize = if (array_sample or cube_sample) 6 else 5;
+            const expected_arg_count: usize = if (array_sample or cube_sample or volume_sample) 6 else 5;
             if (args.len != expected_arg_count) return error.Unsupported;
             var desc = args[0];
             const nullable = hasGpuKey(func, desc, "nullable_desc");
@@ -1909,7 +2061,7 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
             const bool_t = try func.types.intern(.bool);
             const ptr_ty = func.valueType(desc);
             const f32_t = func.valueType(args[1]);
-            const lod_index: usize = if (array_sample or cube_sample) 4 else 3;
+            const lod_index: usize = if (array_sample or cube_sample or volume_sample) 4 else 3;
             const lod = args[lod_index];
             const zero_f = try func.appendInst(block, f32_t, .{ .fconst = 0 });
             const constant_lod: ?f64 = if (func.definingInst(lod)) |lod_inst| blk: {
@@ -1950,6 +2102,14 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
             const nearest_y = try lowerSampleCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_address_v_offset);
             const linear_x = try lowerLinearCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_width_reciprocal_offset, sampler_address_u_offset);
             const linear_y = try lowerLinearCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset, sampler_address_v_offset);
+            const nearest_z = if (volume_sample)
+                try lowerSampleCoordinate(func, block, desc, args[3], sampler_depth_offset, sampler_depth_float_offset, sampler_address_w_offset)
+            else
+                null;
+            const linear_z = if (volume_sample)
+                try lowerLinearCoordinate(func, block, desc, args[3], sampler_depth_offset, sampler_depth_float_offset, sampler_depth_reciprocal_offset, sampler_address_w_offset)
+            else
+                null;
             const mag_filter_ptr = try appendOffset(func, block, desc, sampler_mag_filter_offset, int_ty);
             const mag_filter = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = mag_filter_ptr } });
             const min_filter_ptr = try appendOffset(func, block, desc, sampler_min_filter_offset, int_ty);
@@ -1968,6 +2128,12 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
             const y1 = try selectSampleCoordinate(func, block, linear, linear_y.second, nearest_y);
             const x_weight = try func.appendInst(block, f32_t, .{ .select = .{ .cond = linear, .then = linear_x.weight, .@"else" = zero_f } });
             const y_weight = try func.appendInst(block, f32_t, .{ .select = .{ .cond = linear, .then = linear_y.weight, .@"else" = zero_f } });
+            const z0 = if (volume_sample) try selectSampleCoordinate(func, block, linear, linear_z.?.first, nearest_z.?) else null;
+            const z1 = if (volume_sample) try selectSampleCoordinate(func, block, linear, linear_z.?.second, nearest_z.?) else null;
+            const z_weight = if (volume_sample)
+                try func.appendInst(block, f32_t, .{ .select = .{ .cond = linear, .then = linear_z.?.weight, .@"else" = zero_f } })
+            else
+                zero_f;
             var base = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = desc } });
             if (array_sample) {
                 const half = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
@@ -1982,6 +2148,15 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
                 const pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = pitch_ptr } });
                 const face_offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = coordinate.face, .rhs = pitch } });
                 base = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = face_offset } });
+            }
+            var second_base = base;
+            if (volume_sample) {
+                const pitch_ptr = try appendOffset(func, block, desc, sampler_array_pitch_offset, int_ty);
+                const pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = pitch_ptr } });
+                const first_offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = z0.?.index, .rhs = pitch } });
+                const second_offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = z1.?.index, .rhs = pitch } });
+                second_base = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = second_offset } });
+                base = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = first_offset } });
             }
             const row_ptr = try appendOffset(func, block, desc, sampler_row_pitch_offset, int_ty);
             const row_pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = row_ptr } });
@@ -2012,10 +2187,24 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
                 .f32_t = f32_t,
                 .bool_t = bool_t,
             };
-            const texel00 = try lowerSampleTexel(func, block, image, x0, y0);
-            const texel10 = try lowerSampleTexel(func, block, image, x1, y0);
-            const texel01 = try lowerSampleTexel(func, block, image, x0, y1);
-            const texel11 = try lowerSampleTexel(func, block, image, x1, y1);
+            const z_border00 = if (volume_sample) z0.?.border else x0.border;
+            const z_border10 = if (volume_sample) z0.?.border else x1.border;
+            const texel00 = try lowerSampleTexel(func, block, image, x0, y0, z_border00);
+            const texel10 = try lowerSampleTexel(func, block, image, x1, y0, z_border10);
+            const texel01 = try lowerSampleTexel(func, block, image, x0, y1, z_border00);
+            const texel11 = try lowerSampleTexel(func, block, image, x1, y1, z_border10);
+            var second_texel00 = texel00;
+            var second_texel10 = texel10;
+            var second_texel01 = texel01;
+            var second_texel11 = texel11;
+            if (volume_sample) {
+                var second_image = image;
+                second_image.base = second_base;
+                second_texel00 = try lowerSampleTexel(func, block, second_image, x0, y0, z1.?.border);
+                second_texel10 = try lowerSampleTexel(func, block, second_image, x1, y0, z1.?.border);
+                second_texel01 = try lowerSampleTexel(func, block, second_image, x0, y1, z1.?.border);
+                second_texel11 = try lowerSampleTexel(func, block, second_image, x1, y1, z1.?.border);
+            }
             if (shadow_sample) {
                 const compare_ptr = try appendOffset(func, block, desc, sampler_compare_op_offset, int_ty);
                 const compare_op = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = compare_ptr } });
@@ -2029,9 +2218,9 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
                 if (nullable) {
                     const valid_ptr = try appendOffset(func, block, desc, sampler_valid_offset, int_ty);
                     const valid = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = valid_ptr } });
-                    const zero_u = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+                    const absent = try func.appendInst(block, int_ty, .{ .iconst = 0 });
                     const present = try func.appendInst(block, bool_t, .{
-                        .icmp = .{ .op = .ne, .lhs = valid, .rhs = zero_u },
+                        .icmp = .{ .op = .ne, .lhs = valid, .rhs = absent },
                     });
                     value = try func.appendInst(block, f32_t, .{
                         .select = .{ .cond = present, .then = value, .@"else" = zero_f },
@@ -2044,9 +2233,13 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
             for (0..4) |component| {
                 const top = try lerp(func, block, texel00[component], texel10[component], x_weight);
                 const bottom = try lerp(func, block, texel01[component], texel11[component], x_weight);
-                values[component] = try lerp(func, block, top, bottom, y_weight);
+                const first_slice = try lerp(func, block, top, bottom, y_weight);
+                const second_top = try lerp(func, block, second_texel00[component], second_texel10[component], x_weight);
+                const second_bottom = try lerp(func, block, second_texel01[component], second_texel11[component], x_weight);
+                const second_slice = try lerp(func, block, second_top, second_bottom, y_weight);
+                values[component] = try lerp(func, block, first_slice, second_slice, z_weight);
             }
-            const out_index: usize = if (array_sample or cube_sample) 5 else 4;
+            const out_index: usize = if (array_sample or cube_sample or volume_sample) 5 else 4;
             const out = args[out_index];
             try sampled.put(allocator, out, try lowerSampleSwizzle(func, block, desc, values));
             try elements.put(allocator, out, .{ .base = out, .component = 0 });
@@ -2303,7 +2496,12 @@ fn forEachOperand(func: *const Function, inst: Inst, ctx: anytype, comptime f: f
 /// Which values are per-lane. Seeded from the lane-varying entry builtins and propagated forward
 /// to a fixpoint, because a loop can carry divergence backwards into a block parameter.
 ///
-/// This propagates through OPERANDS only. That is sound ONLY BECAUSE `checkSupported` refuses a
+/// Float comparisons always produce lane masks, including when both operands are uniform:
+/// Glacier has no scalar floating compare. Their operands can stay scalar and are broadcast by
+/// the compare emitter. Treating the result as per-lane also sends dependent branches through
+/// if-conversion and propagates the mask register class to its consumers.
+///
+/// Otherwise this propagates through OPERANDS only. That is sound ONLY BECAUSE `checkSupported` refuses a
 /// branch on a per-lane condition: with no divergent branch there is no control divergence, so a
 /// value cannot become per-lane by being defined on one side of a split. ADDING MASK SUPPORT
 /// WITHOUT ADDING THE CONTROL RULE HERE WOULD BE A SILENT MISCOMPILE.
@@ -2337,6 +2535,8 @@ fn analyzeDivergence(allocator: std.mem.Allocator, func: *const Function) Error!
             for (func.blockInsts(block)) |inst| {
                 var s: Spread = .{ .div = div };
                 forEachOperand(func, inst, &s, Spread.see);
+                const operation = func.opcode(inst);
+                if (operation == .icmp and isFloat(func, func.valueType(operation.icmp.lhs))) s.any = true;
                 // An operand that varies per lane makes the result vary too.
                 if (func.instResult(inst)) |r| {
                     if (s.any and !div[@backingInt(r)]) {
@@ -5663,10 +5863,9 @@ fn checkInst(
         // A per-lane compare writes a MASK, one bit per lane, and a per-lane select reads one.
         .icmp => |c| {
             const ty = func.valueType(c.lhs);
-            // A WARP-UNIFORM float compare has nothing to do it: the compares write a mask, so
-            // they are vector instructions, and the scalar path has no float compare at all. An
-            // integer compare over float bits answers a different relation and is wrong for a
-            // negative value and for NaN, so it is a refusal rather than a substitution.
+            // Float comparisons must have a mask result, even with uniform operands.
+            // analyzeDivergence assigns that register class; keep the scalar refusal as
+            // an invariant check, since the scalar emitter only compares integers.
             if (resultDivergent(func, inst, divergent)) {
                 _ = vectorCmpOp(func, c.op, ty) orelse
                     return Refusal.at(why, func, block, i, inst, "a per-lane compare the core has no instruction for");
