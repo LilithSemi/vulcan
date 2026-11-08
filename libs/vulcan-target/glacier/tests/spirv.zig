@@ -768,7 +768,7 @@ test "SPIR-V fragment varyings are written to color records" {
     const output_base = data_base + 1024 * 4;
     for (0..4) |lane| {
         const fragment = 4 + lane;
-        const varying = fragment * (glacier.isel.fragment_record_stride / 4) + 0x80 / 4;
+        const varying = fragment * (glacier.isel.fragment_input_stride / 4) + 0x80 / 4;
         memory[varying..][0..4].* = .{
             @intCast(0x3f800000 + fragment),
             @intCast(0x40000000 + fragment),
@@ -783,8 +783,8 @@ test "SPIR-V fragment varyings are written to color records" {
     _ = try warp.run(code, &mem, &one, 10_000);
     for (0..4) |lane| {
         const fragment = 4 + lane;
-        const input_at = fragment * (glacier.isel.fragment_record_stride / 4) + 32;
-        const output_at = 1024 + fragment * (glacier.isel.fragment_record_stride / 4);
+        const input_at = fragment * (glacier.isel.fragment_input_stride / 4) + 32;
+        const output_at = 1024 + fragment * (glacier.isel.fragment_output_stride / 4);
         try std.testing.expectEqualSlices(u32, memory[input_at..][0..4], memory[output_at..][0..4]);
     }
 }
@@ -826,7 +826,7 @@ test "SPIR-V fragment derivatives read the per-fragment gradient record" {
     const output_word = 1280;
     for (0..4) |lane| {
         const fragment = 4 + lane;
-        const gradient = fragment * (glacier.isel.fragment_record_stride / 4) +
+        const gradient = fragment * (glacier.isel.fragment_input_stride / 4) +
             glacier.isel.fragment_input_gradient_offset / 4;
         memory[gradient..][0..6].* = .{
             @bitCast(@as(f32, 1)),
@@ -844,7 +844,7 @@ test "SPIR-V fragment derivatives read the per-fragment gradient record" {
     _ = try warp.run(code, &mem, &one, 20_000);
     for (0..4) |lane| {
         const fragment = 4 + lane;
-        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        const output = output_word + fragment * (glacier.isel.fragment_output_stride / 4);
         try std.testing.expectEqualSlices(u32, &.{
             @bitCast(@as(f32, 5)),
             @bitCast(@as(f32, 7)),
@@ -951,7 +951,8 @@ fn runNormalizedSamplingWithDescriptors(separate: bool, explicit_lod: bool, dyna
         memory[texture_word..][0..4].* = packed_texels;
     }
     if (mipmapped) {
-        const second_descriptor = 25;
+        // Each mip descriptor occupies 128 bytes, including the 3D sampling fields.
+        const second_descriptor = 128 / @sizeOf(u32);
         const second_texture_word = 128;
         memory[second_descriptor] = data_base + second_texture_word * 4;
         memory[second_descriptor + 1] = texel_bytes;
@@ -979,11 +980,11 @@ fn runNormalizedSamplingWithDescriptors(separate: bool, explicit_lod: bool, dyna
     }
     for (coordinates, 0..) |u, lane| {
         const fragment = 4 + lane;
-        const input = input_word + fragment * (glacier.isel.fragment_record_stride / 4) + 0x80 / 4;
+        const input = input_word + fragment * (glacier.isel.fragment_input_stride / 4) + 0x80 / 4;
         memory[input] = @bitCast(u);
         memory[input + 1] = @bitCast(@as(f32, 0.5));
         if (implicit_mip) {
-            const gradient = input_word + fragment * (glacier.isel.fragment_record_stride / 4) +
+            const gradient = input_word + fragment * (glacier.isel.fragment_input_stride / 4) +
                 glacier.isel.fragment_input_gradient_offset / 4;
             memory[gradient..][0..4].* = .{
                 @bitCast(@as(f32, 0.5)),
@@ -1013,7 +1014,7 @@ fn runNormalizedSamplingWithDescriptors(separate: bool, explicit_lod: bool, dyna
     _ = try warp.run(code, &mem, &one, 200_000);
     for (0..4) |lane| {
         const fragment = 4 + lane;
-        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        const output = output_word + fragment * (glacier.isel.fragment_output_stride / 4);
         for (0..4) |component| {
             try std.testing.expectEqual(@as(u32, @bitCast(expected[lane][component])), memory[output + component]);
         }
@@ -1142,7 +1143,7 @@ test "SPIR-V 2D array sampling selects the requested layer" {
     }
     for (0..4) |lane| {
         const fragment = 4 + lane;
-        const input = input_word + fragment * (glacier.isel.fragment_record_stride / 4) + 0x80 / 4;
+        const input = input_word + fragment * (glacier.isel.fragment_input_stride / 4) + 0x80 / 4;
         memory[input] = @bitCast((@as(f32, @floatFromInt(lane)) + 0.5) * 0.25);
         memory[input + 1] = @bitCast(@as(f32, 0.5));
     }
@@ -1154,7 +1155,7 @@ test "SPIR-V 2D array sampling selects the requested layer" {
     _ = try warp.run(code, &mem, &one, 300_000);
     for (0..4) |lane| {
         const fragment = 4 + lane;
-        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        const output = output_word + fragment * (glacier.isel.fragment_output_stride / 4);
         try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(lane + 5)))), memory[output]);
     }
 }
@@ -1234,7 +1235,7 @@ test "SPIR-V cube sampling selects all six faces" {
     };
     for (directions, 0..) |direction, lane| {
         const fragment = 8 + lane;
-        const input = input_word + fragment * (glacier.isel.fragment_record_stride / 4) + 0x80 / 4;
+        const input = input_word + fragment * (glacier.isel.fragment_input_stride / 4) + 0x80 / 4;
         for (direction, 0..) |component, index| memory[input + index] = @bitCast(component);
     }
     var mem: warp.Memory = .{ .base = data_base, .words = &memory };
@@ -1246,7 +1247,7 @@ test "SPIR-V cube sampling selects all six faces" {
     const expected = [8]f32{ 1, 2, 3, 4, 5, 6, 1, 2 };
     for (expected, 0..) |value, lane| {
         const fragment = 8 + lane;
-        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        const output = output_word + fragment * (glacier.isel.fragment_output_stride / 4);
         try std.testing.expectEqual(@as(u32, @bitCast(value)), memory[output]);
     }
 }
@@ -1322,7 +1323,7 @@ test "SPIR-V depth comparison sampling runs on Glacier" {
     };
     for (0..4) |lane| {
         const fragment = 4 + lane;
-        const input = input_word + fragment * (glacier.isel.fragment_record_stride / 4) + 0x80 / 4;
+        const input = input_word + fragment * (glacier.isel.fragment_input_stride / 4) + 0x80 / 4;
         memory[input] = @bitCast((@as(f32, @floatFromInt(lane)) + 0.5) * 0.25);
         memory[input + 1] = @bitCast(@as(f32, 0.5));
     }
@@ -1335,7 +1336,7 @@ test "SPIR-V depth comparison sampling runs on Glacier" {
     const expected = [4]f32{ 0, 0, 1, 1 };
     for (expected, 0..) |value, lane| {
         const fragment = 4 + lane;
-        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        const output = output_word + fragment * (glacier.isel.fragment_output_stride / 4);
         try std.testing.expectEqual(@as(u32, @bitCast(value)), memory[output]);
     }
 
@@ -1347,7 +1348,7 @@ test "SPIR-V depth comparison sampling runs on Glacier" {
     _ = try warp.run(code, &mem, &null_one, 300_000);
     for (0..4) |lane| {
         const fragment = 4 + lane;
-        const output = output_word + fragment * (glacier.isel.fragment_record_stride / 4);
+        const output = output_word + fragment * (glacier.isel.fragment_output_stride / 4);
         try std.testing.expectEqual(@as(u32, 0), memory[output]);
     }
 }
@@ -1478,7 +1479,7 @@ test "SPIR-V fragment discard marks only killed lanes" {
     const output_base = data_base + 1024 * 4;
     for (0..4) |lane| {
         const fragment = 4 + lane;
-        const coord = fragment * (glacier.isel.fragment_record_stride / 4) +
+        const coord = fragment * (glacier.isel.fragment_input_stride / 4) +
             glacier.isel.fragment_input_coord_offset / 4;
         memory[coord] = @bitCast(@as(f32, @floatFromInt(lane)));
     }
@@ -1489,7 +1490,7 @@ test "SPIR-V fragment discard marks only killed lanes" {
     _ = try warp.run(code, &mem, &one, 10_000);
     for (0..4) |lane| {
         const fragment = 4 + lane;
-        const discard = 1024 + fragment * (glacier.isel.fragment_record_stride / 4) +
+        const discard = 1024 + fragment * (glacier.isel.fragment_output_stride / 4) +
             glacier.isel.fragment_output_discard_offset / 4;
         try std.testing.expectEqual(@as(u32, if (lane < 2) 1 else 0), memory[discard]);
     }
@@ -3303,4 +3304,217 @@ test "a device-scope control barrier reaches the hardware warp barrier" {
     var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1 };
     _ = try warp.run(words, &mem, &one, 10_000);
     try std.testing.expectEqual(@as(u32, 1), data[0]);
+}
+
+// Both operands come from memory: this exercises runtime exponents as well as gamma 2.4.
+fn powModule(allocator: std.mem.Allocator, components: u32, constant_exponent: bool, uniform: bool) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 80);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.ExtInstImport, &.{ 30, 0x4c534c47, 0x6474732e, 0x3035342e, 0 });
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 16, 0x6e69616d, 0, 14, 15 });
+    try b.emit(allocator, op.Name, &.{ 15, 0x0074756f });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.builtin, if (uniform) op.BuiltIn.workgroup_id else op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 7, 3 });
+    try b.emit(allocator, op.TypeStruct, &.{ 8, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 3 });
+    try b.emit(allocator, op.TypeFunction, &.{ 11, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 12, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 13, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 31, 8 });
+    if (constant_exponent) try b.emit(allocator, op.Constant, &.{ 3, 24, @as(u32, @bitCast(@as(f32, 2.4))) });
+    if (components > 1) try b.emit(allocator, op.TypeVector, &.{ 32, 3, components });
+    try b.emit(allocator, op.Variable, &.{ 5, 14, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 9, 15, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 16, 0, 11 });
+    try b.emit(allocator, op.Label, &.{17});
+    try b.emit(allocator, op.AccessChain, &.{ 6, 60, 14, 12 });
+    try b.emit(allocator, op.Load, &.{ 2, 18, 60 });
+    try b.emit(allocator, op.IMul, &.{ 2, 19, 18, 31 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 20, 19, 13 });
+    try b.emit(allocator, op.AccessChain, &.{ 10, 21, 15, 12, 19 });
+    try b.emit(allocator, op.AccessChain, &.{ 10, 22, 15, 12, 20 });
+    try b.emit(allocator, op.Load, &.{ 3, 23, 21 });
+    if (!constant_exponent) try b.emit(allocator, op.Load, &.{ 3, 24, 22 });
+    if (components == 1) {
+        try b.emit(allocator, op.ExtInst, &.{ 3, 25, 30, op.Glsl.pow, 23, 24 });
+        try b.emit(allocator, op.Store, &.{ 21, 25 });
+    } else {
+        var a: [6]u32 = .{ 32, 33, 23, 24, 23, 24 };
+        var e: [6]u32 = .{ 32, 34, 24, 23, 24, 23 };
+        try b.emit(allocator, op.CompositeConstruct, a[0 .. components + 2]);
+        try b.emit(allocator, op.CompositeConstruct, e[0 .. components + 2]);
+        try b.emit(allocator, op.ExtInst, &.{ 32, 35, 30, op.Glsl.pow, 33, 34 });
+        for (0..components) |i| {
+            const id: u32 = @intCast(40 + i * 4);
+            try b.emit(allocator, op.CompositeExtract, &.{ 3, id, 35, @intCast(i) });
+            // Alternate stores to the base and exponent slots, checking both vector components.
+            try b.emit(allocator, op.Store, &.{ if (i % 2 == 0) @as(u32, 21) else 22, id });
+        }
+    }
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "SPIR-V scalar and vector pow run on Glacier with runtime exponents" {
+    const allocator = std.testing.allocator;
+    const cases = [_][2]f32{
+        .{ 0, 2.4 },            .{ 0.0031308, 2.4 }, .{ 0.25, 2.4 },   .{ 0.5, 2.4 },
+        .{ 1, 2.4 },            .{ 2, 2.4 },         .{ 10, -2.4 },    .{ 0.8, 0 },
+        .{ 0.1, 1.0 / 2.4 },    .{ 4, 0.5 },         .{ 1.75, -3.25 }, .{ 100, 3.1 },
+        .{ 2, 127.5 },          .{ 2, -125.5 },      .{ 2, 200 },      .{ 2, -200 },
+        .{ 2, 127.99999 },      .{ 2, -126 },        .{ -0.0, 2.4 },   .{ 0.99999994, 10000 },
+        .{ 1.0000001, -10000 },
+    };
+    const modes = [_]struct { components: u32, constant_exponent: bool = false, uniform: bool = false }{
+        .{ .components = 1 },                            .{ .components = 2 },                            .{ .components = 3 },                  .{ .components = 4 },
+        .{ .components = 1, .constant_exponent = true }, .{ .components = 4, .constant_exponent = true }, .{ .components = 1, .uniform = true },
+    };
+    for (modes) |mode| {
+        const components = mode.components;
+        var b = try powModule(allocator, components, mode.constant_exponent, mode.uniform);
+        defer b.deinit(allocator);
+        var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+        defer func.deinit();
+        const words = try glacier.isel.compileKernel(allocator, &func, .{
+            .profile = .@"gc1.mi",
+            .globals = &.{.{ .name = "out", .address = data_base }},
+        });
+        defer allocator.free(words);
+        for (cases) |input| {
+            const pair = [2]f32{ input[0], if (mode.constant_exponent) 2.4 else input[1] };
+            var data: [32]u32 = @splat(0xdeadbeef);
+            for (0..4) |lane| {
+                data[lane * 8] = @bitCast(pair[0] * (1 + @as(f32, @floatFromInt(lane)) / 8));
+                data[lane * 8 + 1] = @bitCast(pair[1]);
+            }
+            var mem: warp.Memory = .{ .base = data_base, .words = &data };
+            var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+            _ = try warp.run(words, &mem, &one, 100_000);
+            for (0..if (mode.uniform) @as(usize, 1) else 4) |lane| {
+                const base = pair[0] * (1 + @as(f32, @floatFromInt(lane)) / 8);
+                const expected = std.math.pow(f32, base, pair[1]);
+                const actual: f32 = @bitCast(data[lane * 8]);
+                if (std.math.isInf(expected)) {
+                    try std.testing.expectEqual(expected, actual);
+                } else if (expected < std.math.floatMin(f32)) {
+                    try std.testing.expectEqual(@as(f32, 0), actual);
+                } else {
+                    try std.testing.expectApproxEqRel(expected, actual, 0.00005);
+                }
+                if (components > 1 and pair[1] >= 0 and !(pair[1] == 0 and pair[0] <= 0)) {
+                    const reverse = std.math.pow(f32, pair[1], base);
+                    const got: f32 = @bitCast(data[lane * 8 + 1]);
+                    if (std.math.isInf(reverse)) try std.testing.expectEqual(reverse, got) else if (reverse == 0) try std.testing.expectEqual(reverse, got) else try std.testing.expectApproxEqRel(reverse, got, 0.00005);
+                }
+            }
+        }
+    }
+}
+
+/// The alpha check in wlroots' output.frag / texture.frag: extract alpha from an
+/// image read, compare with zero, and merge zero or an unpremultiplied component.
+/// Constant texel coordinates deliberately leave the alpha load warp-uniform.
+fn alphaUnpremultiplyModule(allocator: std.mem.Allocator, uniform: bool) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 41);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 21, 0x6e69616d, 0, 18, 19, 20 });
+    try b.emit(allocator, op.ExecutionMode, &.{ 21, op.ExecutionModeKind.local_size, 4, 1, 1 });
+    try b.emit(allocator, op.Decorate, &.{ 18, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 18, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 19, op.Decoration.builtin, op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.Decorate, &.{ 20, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 20, op.Decoration.binding, 1 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFloat, &.{ 2, 32 });
+    try b.emit(allocator, op.TypeInt, &.{ 3, 32, 1 });
+    try b.emit(allocator, op.TypeInt, &.{ 4, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 3, 2 });
+    try b.emit(allocator, op.TypeVector, &.{ 6, 4, 3 });
+    try b.emit(allocator, op.TypeVector, &.{ 7, 2, 4 });
+    try b.emit(allocator, op.TypeImage, &.{ 8, 2, op.Dim.dim_2d, 0, 0, 0, 2, 1 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.uniform_constant, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.input, 6 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 11, 4 });
+    try b.emit(allocator, op.TypeStruct, &.{ 12, 11 });
+    try b.emit(allocator, op.TypePointer, &.{ 13, op.StorageClass.storage_buffer, 12 });
+    try b.emit(allocator, op.TypePointer, &.{ 14, op.StorageClass.storage_buffer, 4 });
+    try b.emit(allocator, op.TypeFunction, &.{ 15, 1 });
+    try b.emit(allocator, op.TypeBool, &.{39});
+    try b.emit(allocator, op.Constant, &.{ 3, 16, 0 });
+    try b.emit(allocator, op.Constant, &.{ 4, 17, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 40, 0 });
+    try b.emit(allocator, op.Variable, &.{ 9, 18, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.Variable, &.{ 10, 19, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 13, 20, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 21, 0, 15 });
+    try b.emit(allocator, op.Label, &.{22});
+    try b.emit(allocator, op.Load, &.{ 8, 23, 18 });
+    try b.emit(allocator, op.Load, &.{ 6, 24, 19 });
+    try b.emit(allocator, op.CompositeExtract, &.{ 4, 25, 24, 0 });
+    try b.emit(allocator, op.Bitcast, &.{ 3, 26, 25 });
+    try b.emit(allocator, op.CompositeConstruct, &.{ 5, 27, if (uniform) @as(u32, 16) else 26, 16 });
+    try b.emit(allocator, op.ImageRead, &.{ 7, 28, 23, 27 });
+    try b.emit(allocator, op.CompositeExtract, &.{ 2, 29, 28, 3 });
+    try b.emit(allocator, op.FOrdEqual, &.{ 39, 30, 29, 40 });
+    try b.emit(allocator, op.SelectionMerge, &.{ 31, 0 });
+    try b.emit(allocator, op.BranchConditional, &.{ 30, 32, 33 });
+    try b.emit(allocator, op.Label, &.{32});
+    try b.emit(allocator, op.Branch, &.{31});
+    try b.emit(allocator, op.Label, &.{33});
+    try b.emit(allocator, op.CompositeExtract, &.{ 2, 34, 28, 0 });
+    try b.emit(allocator, op.FDiv, &.{ 2, 35, 34, 29 });
+    try b.emit(allocator, op.Branch, &.{31});
+    try b.emit(allocator, op.Label, &.{31});
+    try b.emit(allocator, op.Phi, &.{ 2, 36, 40, 32, 35, 33 });
+    try b.emit(allocator, op.AccessChain, &.{ 14, 37, 20, 17, 25 });
+    try b.emit(allocator, op.Bitcast, &.{ 4, 38, 36 });
+    try b.emit(allocator, op.Store, &.{ 37, 38 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "SPIR-V alpha equality branches use lane masks even for a uniform image read" {
+    const allocator = std.testing.allocator;
+    const alphas = [_]f32{ 0.0, -0.0, 0.5, std.math.nan(f32) };
+    for ([_]bool{ true, false }) |uniform| {
+        var module = try alphaUnpremultiplyModule(allocator, uniform);
+        defer module.deinit(allocator);
+        var func = try spirv.lowerModule(allocator, module.words.items);
+        defer func.deinit();
+        const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+        defer allocator.free(code);
+        for (0..if (uniform) alphas.len else 1) |sample| {
+            var memory: [32]u32 = @splat(0xdeadbeef);
+            memory[0] = data_base + 8 * 4;
+            memory[1] = 4 * 16;
+            for (0..4) |lane| {
+                memory[8 + lane * 4] = @bitCast(@as(f32, 0.25));
+                memory[11 + lane * 4] = @bitCast(alphas[if (uniform) sample else lane]);
+            }
+            var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+            var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+            one.launch_args[0] = data_base;
+            one.launch_args[1] = data_base + 24 * 4;
+            _ = try warp.run(code, &mem, &one, 10_000);
+            for (0..4) |lane| {
+                const alpha = alphas[if (uniform) sample else lane];
+                const got: f32 = @bitCast(memory[24 + lane]);
+                if (std.math.isNan(alpha)) {
+                    try std.testing.expect(std.math.isNan(got));
+                } else {
+                    try std.testing.expectEqual(@as(f32, if (alpha == 0) 0 else 0.25 / alpha), got);
+                }
+            }
+            try std.testing.expectEqualSlices(u32, &(@as([4]u32, @splat(0xdeadbeef))), memory[28..32]);
+        }
+    }
 }
