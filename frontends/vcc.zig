@@ -16,6 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cc = @import("vulcan-cc");
+const ir = @import("vulcan-ir");
 const target = @import("vulcan-target");
 const link = @import("vulcan-link");
 const mm = @import("vulcan-opt").microarch;
@@ -93,6 +94,7 @@ const Options = struct {
     target_arch: ?link.Arch = null,
     target_os: ?TargetOs = null,
     emit_ir: bool = false,
+    emit_netlist: bool = false,
     preprocess_only: bool = false,
     /// `-c`: compile to a relocatable ELF `.o` object instead of linking. See
     /// `target.native.writeObjectData`.
@@ -264,6 +266,14 @@ fn derivedOutputName(allocator: std.mem.Allocator, input: []const u8) std.mem.Al
     return std.fmt.allocPrint(allocator, "{s}.o", .{stem});
 }
 
+/// The default `-target netlist` output name when `-o` is absent: the input's basename
+/// with its extension replaced by `.v`.
+fn derivedNetlistName(allocator: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]const u8 {
+    const base = std.fs.path.basename(input);
+    const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
+    return std.fmt.allocPrint(allocator, "{s}.v", .{stem});
+}
+
 /// The default depfile name when `-MF` is absent: `out`'s basename with its extension (if
 /// any) replaced by `.d`. Mirrors `derivedOutputName`'s `.o` convention.
 fn derivedDepfileName(allocator: std.mem.Allocator, out: []const u8) std.mem.Allocator.Error![]const u8 {
@@ -295,12 +305,16 @@ fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (e
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o")) {
             opts.output = it.next() orelse return fail(errw, "-o requires an argument", .{});
-        } else if (std.mem.eql(u8, arg, "-target")) {
+        } else if (std.mem.eql(u8, arg, "-target") or std.mem.eql(u8, arg, "--target")) {
             const spec = it.next() orelse return fail(errw, "-target requires an argument", .{});
             opts.target_triple = spec;
-            opts.target_arch = parseTargetArch(spec) orelse
-                return fail(errw, "unknown -target architecture '{s}' (expected aarch64/x86_64/x86/riscv64, or a triple starting with one)", .{spec});
-            opts.target_os = parseTargetOs(spec);
+            if (std.mem.eql(u8, spec, "netlist")) {
+                opts.emit_netlist = true;
+            } else {
+                opts.target_arch = parseTargetArch(spec) orelse
+                    return fail(errw, "unknown -target architecture '{s}' (expected netlist, aarch64/x86_64/x86/riscv64, or a triple starting with one)", .{spec});
+                opts.target_os = parseTargetOs(spec);
+            }
         } else if (std.mem.eql(u8, arg, "--emit-ir")) {
             opts.emit_ir = true;
         } else if (std.mem.eql(u8, arg, "-E")) {
@@ -1620,7 +1634,7 @@ pub fn main(init: std.process.Init) !void {
     // `-E`/`-c`/`--emit-ir` each require exactly one `.c`/`.i` source, expressed over
     // `opts.inputs`.
     const single_source: ?[]const u8 = blk: {
-        if (!opts.preprocess_only and !opts.compile_only and !opts.emit_ir) break :blk null;
+        if (!opts.preprocess_only and !opts.compile_only and !opts.emit_ir and !opts.emit_netlist) break :blk null;
         if (opts.inputs.items.len != 1) return fail(errw, "this mode requires exactly one input file", .{});
         break :blk switch (opts.inputs.items[0]) {
             .path => |p| p,
@@ -1635,6 +1649,23 @@ pub fn main(init: std.process.Init) !void {
         pp_opts.filename = try filenameForPreproc(allocator, input);
         const text = try preproc.preprocessToText(allocator, source, pp_opts);
         defer allocator.free(text);
+        const out = opts.output orelse try derivedNetlistName(allocator, input);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = text });
+        return;
+    }
+
+    if (opts.emit_netlist) {
+        const input = single_source.?;
+        if (classifyExt(input) != .c) return fail(errw, "-target netlist requires a .c/.i source file, got '{s}'", .{input});
+        const source = try std.Io.Dir.cwd().readFileAlloc(io, input, allocator, .limited(16 * 1024 * 1024));
+        var pp_opts = pp_base;
+        pp_opts.filename = try filenameForPreproc(allocator, input);
+        var mod = try cc.compileForTarget(allocator, source, targetLayout(arch, target_os), pp_opts);
+        defer mod.deinit(allocator);
+        if (mod.funcs.len != 1) return fail(errw, "-target netlist currently requires exactly one C function", .{});
+        _ = try opt.optimizeEarly(allocator, &mod.funcs[0].func);
+        _ = try opt.optimizeLate(allocator, &mod.funcs[0].func);
+        const text = try ir.netlist.emitVerilog(allocator, &mod.funcs[0].func, mod.funcs[0].name);
         if (opts.output) |out_path| {
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = text });
         } else {

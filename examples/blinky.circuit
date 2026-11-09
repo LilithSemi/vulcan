@@ -1,0 +1,11 @@
+# Board-neutral sequential example for vulcan-irc.
+# The counter output can be connected to an LED or inspected in simulation.
+circuit blinky
+input clk 1
+input reset 1
+reg count 24 clk reset 0
+const one 24 1
+add count_next count one
+next count count_next
+output led count
+end

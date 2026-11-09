@@ -85,6 +85,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "vulcan-ir", .module = vulcan_ir },
             .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-link", .module = vulcan_link },
         },
     });
 
@@ -142,6 +143,29 @@ pub fn build(b: *std.Build) void {
     }) });
     b.installArtifact(glsl_cli);
 
+    const irc_cli = b.addExecutable(.{ .name = "vulcan-irc", .root_module = b.createModule(.{
+        .root_source_file = b.path("frontends/vulcan-irc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-link", .module = vulcan_link },
+        },
+    }) });
+    b.installArtifact(irc_cli);
+
+    const blinky_example = b.addExecutable(.{ .name = "blinky-example", .root_module = b.createModule(.{
+        .root_source_file = b.path("examples/blinky.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "vulcan-ir", .module = vulcan_ir }},
+    }) });
+    const run_blinky = b.addRunArtifact(blinky_example);
+    run_blinky.addPassthruArgs();
+    const run_blinky_step = b.step("run-blinky", "Generate the board-neutral blinky example");
+    run_blinky_step.dependOn(&run_blinky.step);
+
     // The Vulcan C Compiler driver executable (clang-compatible CLI surface, SM1).
     // Hoisted into a `const` module (SM15 M5a) so both the exe and its in-file `parseArgs`
     // tests below share one module, same pattern as `vulcan_ld_module`.
@@ -152,6 +176,7 @@ pub fn build(b: *std.Build) void {
         .strip = optimize != .debug,
         .imports = &.{
             .{ .name = "vulcan-cc", .module = vulcan_cc },
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
             .{ .name = "vulcan-target", .module = vulcan_target },
             .{ .name = "vulcan-link", .module = vulcan_link },
             .{ .name = "vulcan-opt", .module = vulcan_opt },
@@ -305,6 +330,14 @@ pub fn build(b: *std.Build) void {
 
     const ir_tests = b.addTest(.{ .root_module = vulcan_ir });
     test_step.dependOn(&b.addRunArtifact(ir_tests).step);
+
+    const blinky_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("examples/blinky.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "vulcan-ir", .module = vulcan_ir }},
+    }) });
+    test_step.dependOn(&b.addRunArtifact(blinky_tests).step);
 
     const opt_tests = b.addTest(.{ .root_module = vulcan_opt });
     test_step.dependOn(&b.addRunArtifact(opt_tests).step);
@@ -924,6 +957,7 @@ fn addBenchVcc(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.
         .strip = true,
         .imports = &.{
             .{ .name = "vulcan-cc", .module = bench_cc },
+            .{ .name = "vulcan-ir", .module = bench_ir },
             .{ .name = "vulcan-target", .module = bench_target },
             .{ .name = "vulcan-link", .module = bench_link },
             .{ .name = "vulcan-opt", .module = bench_opt },
