@@ -18,6 +18,9 @@ pub const critical_edge = @import("vulcan-ir/critical_edge.zig");
 pub const reachable = @import("vulcan-ir/reachable.zig");
 pub const expand = @import("vulcan-ir/expand.zig");
 pub const bitcode = @import("vulcan-ir/bitcode.zig");
+pub const netlist = @import("vulcan-ir/netlist.zig");
+pub const circuit = @import("vulcan-ir/circuit.zig");
+pub const circuit_parser = @import("vulcan-ir/circuit_parser.zig");
 
 test {
     std.testing.refAllDecls(@This());
