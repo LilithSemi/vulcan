@@ -5,6 +5,7 @@
 const std = @import("std");
 const encode = @import("encode.zig");
 const disasm = @import("disasm.zig");
+const compress = @import("compress.zig");
 
 /// One decoded instruction. Fields a given operation does not use are left at zero, because a
 /// reader that has the operation knows which ones it reads.
@@ -34,8 +35,9 @@ pub const Decoded = struct {
 /// A compressed instruction decodes to the tag of the wide instruction it stands for, so there
 /// is no tag for a compressed form. A dot in a mnemonic becomes an underscore in the tag.
 pub const Op = enum {
-    /// The table does not cover this word. The length is still correct, and the caller decides
-    /// whether to trap or to hand the word elsewhere.
+    /// The table does not cover this word. The length is two or four. It is wrong for a word
+    /// longer than four bytes, which River never runs. The caller decides whether to trap or to
+    /// hand the word elsewhere.
     unknown,
 
     // RV64I.
@@ -219,16 +221,207 @@ pub const Error = error{
 };
 
 /// Decodes the instruction at the start of `bytes`. A word the table does not cover returns
-/// `.unknown` with the correct length, which is not an error. Only a slice too short for the
+/// `.unknown` with a length of two or four, which is not an error. Only a slice too short for the
 /// instruction it starts returns `error.Truncated`.
 pub fn decode(bytes: []const u8) Error!Decoded {
     if (bytes.len < 2) return error.Truncated;
-    // Bits 4 to 2 all set means an instruction of forty eight bits or more in the base
-    // specification. River implements none of those, so such a word decodes as unknown and the
-    // caller traps on it rather than stepping by this length.
-    if (bytes[0] & 3 != 3) return .{ .op = .unknown, .len = 2 };
+    // The length rule here reports two or four and nothing else. A word whose bits 4 to 2 are all
+    // set is longer than four bytes in the base specification, and this reports four for it, which
+    // is wrong for such a word. River implements none of those encodings, so one cannot appear in
+    // an image it runs, and the operation comes back as unknown either way.
+    if (bytes[0] & 3 != 3) return decode16(std.mem.readInt(u16, bytes[0..2], .little));
     if (bytes.len < 4) return error.Truncated;
     return decode32(std.mem.readInt(u32, bytes[0..4], .little));
+}
+
+/// Decodes a halfword whose two low bits are not both set. Each form takes the tag and operands
+/// of the wide instruction it expands to, so `c.mv` is `add` with `rs1` of zero.
+fn decode16(half: u16) Decoded {
+    const h: u32 = half;
+    const unknown: Decoded = .{ .op = .unknown, .len = 2 };
+    return switch (@as(u2, @truncate(h))) {
+        0b00 => quadrant0(h) orelse unknown,
+        0b01 => quadrant1(h) orelse unknown,
+        0b10 => quadrant2(h) orelse unknown,
+        0b11 => unreachable,
+    };
+}
+
+fn bit(h: u32, comptime n: u5) u32 {
+    return (h >> n) & 1;
+}
+
+/// The bits `hi` down to `lo` of `h`, placed with their lowest bit at position `at`.
+fn span(h: u32, comptime hi: u5, comptime lo: u5, comptime at: u5) u32 {
+    return ((h >> lo) & ((1 << (hi - lo + 1)) - 1)) << at;
+}
+
+fn signExtend(value: u32, comptime bits: u5) i64 {
+    const shift: u5 = @intCast(32 - @as(u6, bits));
+    return @as(i32, @bitCast(value << shift)) >> shift;
+}
+
+/// A three bit register field names one of x8 to x15.
+fn smallReg(h: u32, comptime lo: u5) u5 {
+    return @as(u5, 8) + @as(u3, @truncate(h >> lo));
+}
+
+fn fullRd(h: u32) u5 {
+    return @truncate(h >> 7);
+}
+
+fn fullRs2(h: u32) u5 {
+    return @truncate(h >> 2);
+}
+
+fn immCi(h: u32) i64 {
+    return signExtend(span(h, 12, 12, 5) | span(h, 6, 2, 0), 6);
+}
+
+fn shamtCi(h: u32) i64 {
+    return span(h, 12, 12, 5) | span(h, 6, 2, 0);
+}
+
+fn wordOffsetCl(h: u32) i64 {
+    return span(h, 12, 10, 3) | bit(h, 6) << 2 | bit(h, 5) << 6;
+}
+
+fn doubleOffsetCl(h: u32) i64 {
+    return span(h, 12, 10, 3) | span(h, 6, 5, 6);
+}
+
+fn doubleLoadOffsetCi(h: u32) i64 {
+    return span(h, 12, 12, 5) | span(h, 6, 5, 3) | span(h, 4, 2, 6);
+}
+
+fn doubleStoreOffsetCss(h: u32) i64 {
+    return span(h, 12, 10, 3) | span(h, 9, 7, 6);
+}
+
+fn quadrant0(h: u32) ?Decoded {
+    const rd = smallReg(h, 2);
+    const rs1 = smallReg(h, 7);
+    return switch (@as(u3, @truncate(h >> 13))) {
+        0b000 => blk: {
+            const imm = span(h, 12, 11, 4) | span(h, 10, 7, 6) | bit(h, 6) << 2 | bit(h, 5) << 3;
+            break :blk if (imm == 0) null else .{ .op = .addi, .len = 2, .rd = rd, .rs1 = 2, .imm = imm };
+        },
+        0b001 => .{ .op = .fld, .len = 2, .rd = rd, .rs1 = rs1, .imm = doubleOffsetCl(h) },
+        0b010 => .{ .op = .lw, .len = 2, .rd = rd, .rs1 = rs1, .imm = wordOffsetCl(h) },
+        0b011 => .{ .op = .ld, .len = 2, .rd = rd, .rs1 = rs1, .imm = doubleOffsetCl(h) },
+        0b100 => null,
+        0b101 => .{ .op = .fsd, .len = 2, .rs1 = rs1, .rs2 = rd, .imm = doubleOffsetCl(h) },
+        0b110 => .{ .op = .sw, .len = 2, .rs1 = rs1, .rs2 = rd, .imm = wordOffsetCl(h) },
+        0b111 => .{ .op = .sd, .len = 2, .rs1 = rs1, .rs2 = rd, .imm = doubleOffsetCl(h) },
+    };
+}
+
+fn quadrant1(h: u32) ?Decoded {
+    const rd = fullRd(h);
+    return switch (@as(u3, @truncate(h >> 13))) {
+        0b000 => .{ .op = .addi, .len = 2, .rd = rd, .rs1 = rd, .imm = immCi(h) },
+        // This slot is `c.jal` in RV32 and `c.addiw` in RV64.
+        0b001 => if (rd == 0) null else .{ .op = .addiw, .len = 2, .rd = rd, .rs1 = rd, .imm = immCi(h) },
+        0b010 => .{ .op = .addi, .len = 2, .rd = rd, .rs1 = 0, .imm = immCi(h) },
+        0b011 => if (rd == 2) addi16sp(h) else cLui(h, rd),
+        0b100 => miscAlu(h),
+        0b101 => .{ .op = .jal, .len = 2, .rd = 0, .imm = jumpOffsetCj(h) },
+        0b110 => .{ .op = .beq, .len = 2, .rs1 = smallReg(h, 7), .rs2 = 0, .imm = branchOffsetCb(h) },
+        0b111 => .{ .op = .bne, .len = 2, .rs1 = smallReg(h, 7), .rs2 = 0, .imm = branchOffsetCb(h) },
+    };
+}
+
+fn addi16sp(h: u32) ?Decoded {
+    const raw = bit(h, 12) << 9 | bit(h, 6) << 4 | bit(h, 5) << 6 | span(h, 4, 3, 7) |
+        bit(h, 2) << 5;
+    if (raw == 0) return null;
+    return .{ .op = .addi, .len = 2, .rd = 2, .rs1 = 2, .imm = signExtend(raw, 10) };
+}
+
+fn cLui(h: u32, rd: u5) ?Decoded {
+    const raw = bit(h, 12) << 17 | span(h, 6, 2, 12);
+    if (raw == 0) return null;
+    return .{ .op = .lui, .len = 2, .rd = rd, .imm = signExtend(raw, 18) };
+}
+
+fn miscAlu(h: u32) ?Decoded {
+    const rd = smallReg(h, 7);
+    switch (@as(u2, @truncate(h >> 10))) {
+        0b00 => return .{ .op = .srli, .len = 2, .rd = rd, .rs1 = rd, .imm = shamtCi(h) },
+        0b01 => return .{ .op = .srai, .len = 2, .rd = rd, .rs1 = rd, .imm = shamtCi(h) },
+        0b10 => return .{ .op = .andi, .len = 2, .rd = rd, .rs1 = rd, .imm = immCi(h) },
+        0b11 => {},
+    }
+    const op: Op = switch (bit(h, 12) == 1) {
+        false => switch (@as(u2, @truncate(h >> 5))) {
+            0b00 => .sub,
+            0b01 => .xor,
+            0b10 => .@"or",
+            0b11 => .@"and",
+        },
+        true => switch (@as(u2, @truncate(h >> 5))) {
+            0b00 => .subw,
+            0b01 => .addw,
+            0b10, 0b11 => return null,
+        },
+    };
+    return .{ .op = op, .len = 2, .rd = rd, .rs1 = rd, .rs2 = smallReg(h, 2) };
+}
+
+fn jumpOffsetCj(h: u32) i64 {
+    const raw = bit(h, 12) << 11 | bit(h, 11) << 4 | span(h, 10, 9, 8) | bit(h, 8) << 10 |
+        bit(h, 7) << 6 | bit(h, 6) << 7 | span(h, 5, 3, 1) | bit(h, 2) << 5;
+    return signExtend(raw, 12);
+}
+
+fn branchOffsetCb(h: u32) i64 {
+    const raw = bit(h, 12) << 8 | span(h, 11, 10, 3) | span(h, 6, 5, 6) | span(h, 4, 3, 1) |
+        bit(h, 2) << 5;
+    return signExtend(raw, 9);
+}
+
+fn quadrant2(h: u32) ?Decoded {
+    const rd = fullRd(h);
+    const rs2 = fullRs2(h);
+    return switch (@as(u3, @truncate(h >> 13))) {
+        0b000 => .{ .op = .slli, .len = 2, .rd = rd, .rs1 = rd, .imm = shamtCi(h) },
+        0b001 => .{ .op = .fld, .len = 2, .rd = rd, .rs1 = 2, .imm = doubleLoadOffsetCi(h) },
+        0b010 => if (rd == 0) null else .{
+            .op = .lw,
+            .len = 2,
+            .rd = rd,
+            .rs1 = 2,
+            .imm = span(h, 12, 12, 5) | span(h, 6, 4, 2) | span(h, 3, 2, 6),
+        },
+        0b011 => if (rd == 0) null else .{
+            .op = .ld,
+            .len = 2,
+            .rd = rd,
+            .rs1 = 2,
+            .imm = doubleLoadOffsetCi(h),
+        },
+        0b100 => registerJump(h, rd, rs2),
+        0b101 => .{ .op = .fsd, .len = 2, .rs1 = 2, .rs2 = rs2, .imm = doubleStoreOffsetCss(h) },
+        0b110 => .{
+            .op = .sw,
+            .len = 2,
+            .rs1 = 2,
+            .rs2 = rs2,
+            .imm = span(h, 12, 9, 2) | span(h, 8, 7, 6),
+        },
+        0b111 => .{ .op = .sd, .len = 2, .rs1 = 2, .rs2 = rs2, .imm = doubleStoreOffsetCss(h) },
+    };
+}
+
+fn registerJump(h: u32, rd: u5, rs2: u5) ?Decoded {
+    if (bit(h, 12) == 0) {
+        if (rs2 != 0) return .{ .op = .add, .len = 2, .rd = rd, .rs1 = 0, .rs2 = rs2 };
+        if (rd == 0) return null;
+        return .{ .op = .jalr, .len = 2, .rd = 0, .rs1 = rd };
+    }
+    if (rs2 != 0) return .{ .op = .add, .len = 2, .rd = rd, .rs1 = rd, .rs2 = rs2 };
+    if (rd == 0) return .{ .op = .ebreak, .len = 2 };
+    return .{ .op = .jalr, .len = 2, .rd = 1, .rs1 = rd };
 }
 
 const opcode_load: u7 = 0b0000011;
@@ -458,7 +651,7 @@ fn parseText(text: []const u8) TextError!Expected {
     var tokens = std.mem.tokenizeAny(u8, text[space..], ", ()");
     while (tokens.next()) |token| : (count += 1) {
         if (count == values.len) return error.BadOperand;
-        values[count] = if (token[0] == 'x')
+        values[count] = if (token[0] == 'x' or token[0] == 'f')
             std.fmt.parseInt(i64, token[1..], 10) catch return error.BadOperand
         else if (token[0] == '.')
             std.fmt.parseInt(i64, token[1..], 10) catch return error.BadOperand
@@ -521,13 +714,13 @@ fn parseText(text: []const u8) TextError!Expected {
             .imm = @as(i32, @bitCast(@as(u32, @intCast(a[1])) << 12)),
         },
         .jal => .{ .op = op, .rd = reg(a[0]), .imm = a[1] },
-        .jalr, .lb, .lh, .lw, .ld, .lbu, .lhu, .lwu => .{
+        .jalr, .lb, .lh, .lw, .ld, .lbu, .lhu, .lwu, .fld => .{
             .op = op,
             .rd = reg(a[0]),
             .imm = a[1],
             .rs1 = reg(a[2]),
         },
-        .sb, .sh, .sw, .sd => .{ .op = op, .rs2 = reg(a[0]), .imm = a[1], .rs1 = reg(a[2]) },
+        .sb, .sh, .sw, .sd, .fsd => .{ .op = op, .rs2 = reg(a[0]), .imm = a[1], .rs1 = reg(a[2]) },
         .beq, .bne, .blt, .bge, .bltu, .bgeu => .{
             .op = op,
             .rs1 = reg(a[0]),
@@ -798,4 +991,276 @@ test "a slice shorter than the instruction is truncated" {
     try std.testing.expectError(error.Truncated, decode(wide[0..2]));
     try std.testing.expectError(error.Truncated, decode(wide[0..3]));
     try std.testing.expectError(error.Truncated, decode(&.{0x01}));
+}
+
+fn halfBytes(value: u16) [2]u8 {
+    var out: [2]u8 = undefined;
+    std.mem.writeInt(u16, &out, value, .little);
+    return out;
+}
+
+fn decodeHalf(value: u16) !Decoded {
+    return decode(&halfBytes(value));
+}
+
+/// The encodings the oracle renders as an instruction although the specification reserves them.
+fn reservedCompressed(half: u16) bool {
+    const h: u32 = half;
+    const rd = (h >> 7) & 0x1F;
+    const rs2 = (h >> 2) & 0x1F;
+    const imm6 = ((h >> 12) & 1) << 5 | rs2;
+    return switch (h & 3) {
+        0b00 => switch (h >> 13) {
+            0b000 => (h >> 5) & 0xFF == 0,
+            // A later extension uses this slot. `zca` and `zcd` do not.
+            0b100 => true,
+            else => false,
+        },
+        0b01 => switch (h >> 13) {
+            0b001 => rd == 0,
+            // `c.subw` and `c.addw` use funct2 00 and 01. The other two values are reserved.
+            0b100 => (h >> 10) & 7 == 0b111 and (h >> 6) & 1 == 1,
+            0b011 => if (rd == 2)
+                (h & 0x107C) == 0
+            else
+                imm6 == 0,
+            else => false,
+        },
+        0b10 => switch (h >> 13) {
+            0b010, 0b011 => rd == 0,
+            0b100 => (h >> 12) & 1 == 0 and rs2 == 0 and rd == 0,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Decodes `half` and checks it against what `disasm.oneCompressed` renders for it.
+fn expectCompressedAgreesWithDisasm(half: u16, unlisted: *usize) !void {
+    const text = try disasm.oneCompressed(std.testing.allocator, half);
+    defer std.testing.allocator.free(text);
+    const got = try decodeHalf(half);
+    errdefer std.debug.print("half 0x{x:0>4} renders as \"{s}\"\n", .{ half, text });
+
+    if (text.len == 0 or got.op == .unknown) {
+        try std.testing.expectEqual(Decoded{ .op = .unknown, .len = 2 }, got);
+        if (!reservedCompressed(half)) {
+            std.debug.print("unlisted reserved half 0x{x:0>4}\n", .{half});
+            unlisted.* += 1;
+        }
+        return;
+    }
+    if (std.mem.eql(u8, text, "nop")) {
+        // The oracle prints every `c.addi` on x0 as `nop`, whatever its immediate.
+        const imm6: u32 = ((half >> 12) & 1) << 5 | ((half >> 2) & 0x1F);
+        const want_imm: i64 = if (imm6 & 0x20 != 0) @as(i64, imm6) - 64 else imm6;
+        try std.testing.expectEqual(Decoded{ .op = .addi, .len = 2, .imm = want_imm }, got);
+        return;
+    }
+    if (std.mem.eql(u8, text, "ebreak")) {
+        try std.testing.expectEqual(Decoded{ .op = .ebreak, .len = 2 }, got);
+        return;
+    }
+    var expected = try parseText(text);
+    if (std.mem.startsWith(u8, text, "mv ")) {
+        // The specification expands `c.mv` to `add rd, x0, rs2`, and the oracle prints `mv`.
+        const source = expected.rs1;
+        expected = .{ .op = .add, .rd = expected.rd, .rs1 = 0, .rs2 = source };
+    }
+    try std.testing.expectEqual(Decoded{
+        .op = expected.op,
+        .len = 2,
+        .rd = expected.rd,
+        .rs1 = expected.rs1,
+        .rs2 = expected.rs2,
+        .imm = expected.imm,
+    }, got);
+}
+
+/// What the immediate field of a `c.lui` holds, worked out from the specification rather than
+/// from the disassembler, whose own rendering of this field drops one bit. Bit 12 carries
+/// `nzimm[17]` and bits 6 to 2 carry `nzimm[16:12]`, sign extended from bit 17.
+fn expectedCluiField(half: u16) ?u32 {
+    const hi: u32 = (half >> 12) & 1;
+    const lo: u32 = (half >> 2) & 0x1F;
+    const nzimm: u32 = (hi << 5) | lo;
+    // A zero field is reserved, so there is no immediate to expect.
+    if (nzimm == 0) return null;
+    const sign: u32 = if (hi == 1) 0xFFFFC0 else 0;
+    return (sign | nzimm) & 0xFFFFF;
+}
+
+/// Checks a `c.lui` halfword against the model. The decoder holds `imm` already shifted left by
+/// twelve and sign extended, so the low twenty bits of `imm >> 12` are the model's field.
+fn expectCluiAgreesWithModel(half: u16) !void {
+    const got = try decodeHalf(half);
+    errdefer std.debug.print("c.lui half 0x{x:0>4}\n", .{half});
+    const field = expectedCluiField(half) orelse {
+        try std.testing.expectEqual(Decoded{ .op = .unknown, .len = 2 }, got);
+        return;
+    };
+    try std.testing.expectEqual(Op.lui, got.op);
+    try std.testing.expectEqual(@as(u5, @intCast((half >> 7) & 0x1F)), got.rd);
+    try std.testing.expectEqual(@as(u3, 2), got.len);
+    try std.testing.expectEqual(@as(i64, @as(i32, @bitCast(field << 12))), got.imm);
+}
+
+test "every compressed halfword agrees with the disassembler" {
+    var unlisted: usize = 0;
+    var half: u32 = 0;
+    while (half <= std.math.maxInt(u16)) : (half += 1) {
+        if (half & 3 == 3) continue;
+        const narrow: u16 = @intCast(half);
+        // The oracle drops bit 16 of the `c.lui` immediate, so the model checks these instead.
+        const rd = (half >> 7) & 0x1F;
+        if (half >> 13 == 0b011 and half & 3 == 1 and rd != 2) {
+            try expectCluiAgreesWithModel(narrow);
+            continue;
+        }
+        try expectCompressedAgreesWithDisasm(narrow, &unlisted);
+    }
+    try std.testing.expectEqual(@as(usize, 0), unlisted);
+}
+
+/// Decodes a wide word and the halfword it compressed to, and checks they differ only in `len`.
+fn expectSameAsWide(word: u32, half: u16) !void {
+    var wide = try decodeWord(word);
+    const narrow = try decodeHalf(half);
+    errdefer std.debug.print("word 0x{x:0>8} and half 0x{x:0>4}\n", .{ word, half });
+    // The specification expands `c.mv` to `add`, while the compressor also takes `addi rd, rs, 0`.
+    if (wide.op == .addi and wide.imm == 0 and wide.rs1 != 0 and narrow.op == .add) {
+        const source = wide.rs1;
+        wide.op = .add;
+        wide.rs1 = 0;
+        wide.rs2 = source;
+    }
+    wide.len = 2;
+    try std.testing.expectEqual(wide, narrow);
+}
+
+test "a compressed word decodes like the wide word it came from" {
+    var compressed: usize = 0;
+    inline for (.{ encode.addi, encode.andi }) |emit| {
+        for (reg_triples) |t| {
+            for ([_]i12{ 0, 1, -1, 31, -32, 32, -33, 16, -16, 496, -512, 508, 1020 }) |imm| {
+                const word = emit(t[0], t[1], imm);
+                const half = compress.tryCompress(word) orelse continue;
+                try expectSameAsWide(word, half);
+                compressed += 1;
+            }
+        }
+    }
+    inline for (.{ encode.slli, encode.srli, encode.srai }) |emit| {
+        for (reg_triples) |t| {
+            for ([_]u6{ 0, 1, 31, 32, 63 }) |shamt| {
+                const word = emit(t[0], t[1], shamt);
+                const half = compress.tryCompress(word) orelse continue;
+                try expectSameAsWide(word, half);
+                compressed += 1;
+            }
+        }
+    }
+    inline for (.{ encode.add, encode.sub, encode.xor_, encode.or_, encode.and_ }) |emit| {
+        for (reg_triples) |t| {
+            const word = emit(t[0], t[1], t[2]);
+            const half = compress.tryCompress(word) orelse continue;
+            try expectSameAsWide(word, half);
+            compressed += 1;
+        }
+    }
+    inline for (.{ encode.lw, encode.ld, encode.jalr }) |emit| {
+        for (reg_triples) |t| {
+            for ([_]i12{ 0, 4, 8, 24, 124, 128, 252, 256, 504, 508, 512, -8 }) |imm| {
+                const word = emit(t[0], t[1], imm);
+                const half = compress.tryCompress(word) orelse continue;
+                try expectSameAsWide(word, half);
+                compressed += 1;
+            }
+        }
+    }
+    inline for (.{ encode.sw, encode.sd }) |emit| {
+        for (reg_triples) |t| {
+            for ([_]i12{ 0, 4, 8, 24, 124, 128, 252, 256, 504, 508, 512, -8 }) |imm| {
+                const word = emit(t[0], t[1], imm);
+                const half = compress.tryCompress(word) orelse continue;
+                try expectSameAsWide(word, half);
+                compressed += 1;
+            }
+        }
+    }
+    try std.testing.expect(compressed > 50);
+}
+
+test "lui words decode like the compressed lui they came from" {
+    for ([_]Reg{ .x1, .x5, .x31 }) |rd| {
+        for ([_]u20{ 1, 15, 16, 31, 0xFFFE0, 0xFFFEF, 0xFFFFF }) |imm| {
+            const word = encode.lui(rd, imm);
+            try expectSameAsWide(word, compress.tryCompress(word).?);
+        }
+    }
+}
+
+test "control transfers keep their operands and recompute their offsets" {
+    const words = [_]u32{
+        encode.beq(.x8, .x0, 12),
+        encode.addi(.x10, .x0, 1),
+        encode.jal(.x0, 8),
+        encode.addi(.x11, .x0, 2),
+        encode.bne(.x9, .x0, -16),
+        encode.jalr(.x0, .x1, 0),
+        encode.jalr(.x1, .x5, 0),
+    };
+    const targets = [_]?usize{ 3, null, 4, null, 0, null, null };
+    const bytes = try compress.compress(std.testing.allocator, &words);
+    defer std.testing.allocator.free(bytes);
+
+    var starts: [words.len + 1]usize = undefined;
+    var at: usize = 0;
+    for (0..words.len) |i| {
+        starts[i] = at;
+        at += (try decode(bytes[at..])).len;
+    }
+    starts[words.len] = at;
+    try std.testing.expectEqual(bytes.len, at);
+
+    for (words, targets, 0..) |word, target, i| {
+        const wide = try decodeWord(word);
+        var narrow = try decode(bytes[starts[i]..]);
+        try std.testing.expectEqual(starts[i + 1] - starts[i], narrow.len);
+        if (target) |t| {
+            const offset: i64 = @intCast(starts[t]);
+            try std.testing.expectEqual(offset - @as(i64, @intCast(starts[i])), narrow.imm);
+            narrow.imm = wide.imm;
+        }
+        narrow.len = wide.len;
+        try std.testing.expectEqual(wide, narrow);
+    }
+}
+
+test "compressed encodings with scrambled immediates decode to known values" {
+    const cases = [_]struct { half: u16, want: Decoded }{
+        .{ .half = 0x1141, .want = .{ .op = .addi, .len = 2, .rd = 2, .rs1 = 2, .imm = -16 } },
+        .{ .half = 0x6105, .want = .{ .op = .addi, .len = 2, .rd = 2, .rs1 = 2, .imm = 32 } },
+        .{ .half = 0x0080, .want = .{ .op = .addi, .len = 2, .rd = 8, .rs1 = 2, .imm = 64 } },
+        .{ .half = 0x4501, .want = .{ .op = .addi, .len = 2, .rd = 10, .rs1 = 0, .imm = 0 } },
+        .{ .half = 0x2501, .want = .{ .op = .addiw, .len = 2, .rd = 10, .rs1 = 10, .imm = 0 } },
+        .{ .half = 0x9001, .want = .{ .op = .srli, .len = 2, .rd = 8, .rs1 = 8, .imm = 32 } },
+        .{ .half = 0xE406, .want = .{ .op = .sd, .len = 2, .rs1 = 2, .rs2 = 1, .imm = 8 } },
+        .{ .half = 0x60A2, .want = .{ .op = .ld, .len = 2, .rd = 1, .rs1 = 2, .imm = 8 } },
+        .{ .half = 0x8082, .want = .{ .op = .jalr, .len = 2, .rd = 0, .rs1 = 1 } },
+        .{ .half = 0x9002, .want = .{ .op = .ebreak, .len = 2 } },
+        .{ .half = 0x6041, .want = .{ .op = .lui, .len = 2, .rd = 0, .imm = 0x10000 } },
+        .{ .half = 0x757D, .want = .{ .op = .lui, .len = 2, .rd = 10, .imm = -0x1000 } },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.want, try decodeHalf(case.half));
+    }
+}
+
+test "a reserved compressed encoding decodes as unknown with a length of two" {
+    // The all zero halfword, then `c.addiw` and `c.lwsp` on x0, `c.jr` on x0, and the reserved
+    // `c.addi4spn`, `c.addi16sp` and `c.lui` immediates.
+    for ([_]u16{ 0x0000, 0x2001, 0x4002, 0x8002, 0x0004, 0x6101, 0x6081, 0x9C61 }) |half| {
+        try std.testing.expectEqual(Decoded{ .op = .unknown, .len = 2 }, try decodeHalf(half));
+    }
 }
