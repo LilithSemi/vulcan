@@ -409,6 +409,13 @@ pub const Error = error{
     Truncated,
 };
 
+/// How many bytes the instruction that starts with this halfword takes. The low two bits carry
+/// it, so a caller reads one halfword out of guest memory and learns how much more to fetch
+/// rather than reading `error.Truncated` as an answer.
+pub fn length(first: u16) u3 {
+    return if (first & 3 == 3) 4 else 2;
+}
+
 /// Decodes the instruction at the start of `bytes`. A word the table does not cover returns
 /// `.unknown` with a length of two or four, which is not an error. Only a slice too short for the
 /// instruction it starts returns `error.Truncated`.
@@ -2606,5 +2613,23 @@ test "every word seen in the Weir images decodes" {
         const got = try decodeWord(word);
         try std.testing.expect(got.op != .unknown);
         try std.testing.expectEqual(@as(u3, 4), got.len);
+    }
+}
+
+test "the length of an instruction comes from its first halfword" {
+    // `ecall` is four bytes and a `c.lui` is two.
+    try std.testing.expectEqual(@as(u3, 4), length(0x0073));
+    try std.testing.expectEqual(@as(u3, 2), length(0x6541));
+
+    var half: u32 = 0;
+    while (half <= std.math.maxInt(u16)) : (half += 1) {
+        const narrow: u16 = @intCast(half);
+        if (half & 3 == 3) {
+            try std.testing.expectEqual(@as(u3, 4), length(narrow));
+            continue;
+        }
+        // Every other halfword is a whole instruction, and the decoder says how long it is.
+        const got = try decodeHalf(narrow);
+        try std.testing.expectEqual(got.len, length(narrow));
     }
 }
