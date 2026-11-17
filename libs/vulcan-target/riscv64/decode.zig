@@ -217,6 +217,193 @@ pub const Op = enum {
     fmv_d_x,
 };
 
+/// Which register file each operand of an operation names. A float operation may read one file and
+/// write the other, and `Decoded` holds a plain number for each operand, so this is how a caller
+/// knows which file to read and which to write.
+pub const Files = struct {
+    pub const File = enum { integer, float };
+
+    rd: File = .integer,
+    rs1: File = .integer,
+    rs2: File = .integer,
+    rs3: File = .float,
+};
+
+/// The register file of each operand of `op`. A position the operation does not use still holds a
+/// value, which comes from the arm of that operation. A caller does not read such a position, so
+/// the value makes no claim. Only the fused operations use `rs3`, and it is float everywhere.
+/// The switch has no `else` arm, so a new operation does not compile until it is placed here.
+pub fn files(op: Op) Files {
+    const float: Files = .{ .rd = .float, .rs1 = .float, .rs2 = .float };
+    const float_to_integer: Files = .{ .rd = .integer, .rs1 = .float, .rs2 = .float };
+    const integer_to_float: Files = .{ .rd = .float, .rs1 = .integer, .rs2 = .float };
+    return switch (op) {
+        .unknown,
+        .lui,
+        .auipc,
+        .jal,
+        .jalr,
+        .beq,
+        .bne,
+        .blt,
+        .bge,
+        .bltu,
+        .bgeu,
+        .lb,
+        .lh,
+        .lw,
+        .ld,
+        .lbu,
+        .lhu,
+        .lwu,
+        .sb,
+        .sh,
+        .sw,
+        .sd,
+        .addi,
+        .slti,
+        .sltiu,
+        .xori,
+        .ori,
+        .andi,
+        .slli,
+        .srli,
+        .srai,
+        .add,
+        .sub,
+        .sll,
+        .slt,
+        .sltu,
+        .xor,
+        .@"or",
+        .@"and",
+        .srl,
+        .sra,
+        .addiw,
+        .slliw,
+        .srliw,
+        .sraiw,
+        .addw,
+        .subw,
+        .sllw,
+        .srlw,
+        .sraw,
+        .ecall,
+        .ebreak,
+        .csrrw,
+        .csrrs,
+        .csrrc,
+        .csrrwi,
+        .csrrsi,
+        .csrrci,
+        .mret,
+        .sret,
+        .wfi,
+        .fence,
+        .fence_i,
+        .sfence_vma,
+        .mul,
+        .mulh,
+        .mulhsu,
+        .mulhu,
+        .div,
+        .divu,
+        .rem,
+        .remu,
+        .mulw,
+        .divw,
+        .divuw,
+        .remw,
+        .remuw,
+        .lr_w,
+        .sc_w,
+        .amoswap_w,
+        .amoadd_w,
+        .amoxor_w,
+        .amoand_w,
+        .amoor_w,
+        .amomin_w,
+        .amomax_w,
+        .amominu_w,
+        .amomaxu_w,
+        .lr_d,
+        .sc_d,
+        .amoswap_d,
+        .amoadd_d,
+        .amoxor_d,
+        .amoand_d,
+        .amoor_d,
+        .amomin_d,
+        .amomax_d,
+        .amominu_d,
+        .amomaxu_d,
+        => .{},
+        .flw, .fld => .{ .rd = .float },
+        .fsw, .fsd => .{ .rs2 = .float },
+        .fmadd_s,
+        .fmsub_s,
+        .fnmsub_s,
+        .fnmadd_s,
+        .fadd_s,
+        .fsub_s,
+        .fmul_s,
+        .fdiv_s,
+        .fsqrt_s,
+        .fsgnj_s,
+        .fsgnjn_s,
+        .fsgnjx_s,
+        .fmin_s,
+        .fmax_s,
+        .fmadd_d,
+        .fmsub_d,
+        .fnmsub_d,
+        .fnmadd_d,
+        .fadd_d,
+        .fsub_d,
+        .fmul_d,
+        .fdiv_d,
+        .fsqrt_d,
+        .fsgnj_d,
+        .fsgnjn_d,
+        .fsgnjx_d,
+        .fmin_d,
+        .fmax_d,
+        .fcvt_s_d,
+        .fcvt_d_s,
+        => float,
+        .fcvt_w_s,
+        .fcvt_wu_s,
+        .fcvt_l_s,
+        .fcvt_lu_s,
+        .fmv_x_w,
+        .feq_s,
+        .flt_s,
+        .fle_s,
+        .fclass_s,
+        .feq_d,
+        .flt_d,
+        .fle_d,
+        .fclass_d,
+        .fcvt_w_d,
+        .fcvt_wu_d,
+        .fcvt_l_d,
+        .fcvt_lu_d,
+        .fmv_x_d,
+        => float_to_integer,
+        .fcvt_s_w,
+        .fcvt_s_wu,
+        .fcvt_s_l,
+        .fcvt_s_lu,
+        .fmv_w_x,
+        .fcvt_d_w,
+        .fcvt_d_wu,
+        .fcvt_d_l,
+        .fcvt_d_lu,
+        .fmv_d_x,
+        => integer_to_float,
+    };
+}
+
 pub const Error = error{
     /// The slice holds fewer bytes than the instruction at its start needs.
     Truncated,
@@ -440,6 +627,13 @@ const opcode_jal: u7 = 0b1101111;
 const opcode_misc_mem: u7 = 0b0001111;
 const opcode_amo: u7 = 0b0101111;
 const opcode_system: u7 = 0b1110011;
+const opcode_load_fp: u7 = 0b0000111;
+const opcode_store_fp: u7 = 0b0100111;
+const opcode_fmadd: u7 = 0b1000011;
+const opcode_fmsub: u7 = 0b1000111;
+const opcode_fnmsub: u7 = 0b1001011;
+const opcode_fnmadd: u7 = 0b1001111;
+const opcode_op_fp: u7 = 0b1010011;
 
 fn decode32(word: u32) Decoded {
     const unknown: Decoded = .{ .op = .unknown, .len = 4 };
@@ -461,6 +655,10 @@ fn decode32(word: u32) Decoded {
         opcode_misc_mem => miscMem(word) orelse unknown,
         opcode_system => system(word) orelse unknown,
         opcode_amo => amo(word) orelse unknown,
+        opcode_load_fp => loadFp(word) orelse unknown,
+        opcode_store_fp => storeFp(word) orelse unknown,
+        opcode_fmadd, opcode_fmsub, opcode_fnmsub, opcode_fnmadd => fused(word) orelse unknown,
+        opcode_op_fp => opFp(word) orelse unknown,
         else => unknown,
     };
 }
@@ -677,6 +875,167 @@ fn amo(word: u32) ?Decoded {
         .aq = (word >> 26) & 1 != 0,
         .rl = (word >> 25) & 1 != 0,
     };
+}
+
+fn loadFp(word: u32) ?Decoded {
+    const op: Op = switch (funct3(word)) {
+        0b010 => .flw,
+        0b011 => .fld,
+        else => return null,
+    };
+    return .{ .op = op, .len = 4, .rd = rdOf(word), .rs1 = rs1Of(word), .imm = iImm(word) };
+}
+
+fn storeFp(word: u32) ?Decoded {
+    const op: Op = switch (funct3(word)) {
+        0b010 => .fsw,
+        0b011 => .fsd,
+        else => return null,
+    };
+    return .{ .op = op, .len = 4, .rs1 = rs1Of(word), .rs2 = rs2Of(word), .imm = sImm(word) };
+}
+
+/// The rounding mode in bits 14 to 12. Values 5 and 6 are reserved and the specification makes
+/// an instruction that names one illegal, so the decoder reports such a word as unknown. Value 7
+/// means the mode in `frm`, which only a running hart knows, so it passes through.
+fn roundingMode(word: u32) ?u3 {
+    const mode = funct3(word);
+    if (mode == 0b101 or mode == 0b110) return null;
+    return mode;
+}
+
+/// The four fused multiply add forms. Bits 26 and 25 pick single or double precision and bits 31
+/// to 27 hold the third source.
+fn fused(word: u32) ?Decoded {
+    const double = switch (@as(u2, @truncate(word >> 25))) {
+        0b00 => false,
+        0b01 => true,
+        else => return null,
+    };
+    const op: Op = switch (@as(u7, @truncate(word))) {
+        opcode_fmadd => if (double) .fmadd_d else .fmadd_s,
+        opcode_fmsub => if (double) .fmsub_d else .fmsub_s,
+        opcode_fnmsub => if (double) .fnmsub_d else .fnmsub_s,
+        else => if (double) .fnmadd_d else .fnmadd_s,
+    };
+    return .{
+        .op = op,
+        .len = 4,
+        .rd = rdOf(word),
+        .rs1 = rs1Of(word),
+        .rs2 = rs2Of(word),
+        .rs3 = @truncate(word >> 27),
+        .rm = roundingMode(word) orelse return null,
+    };
+}
+
+/// Which fields of an OP-FP word a form reads. Bits 14 to 12 are a rounding mode for some forms
+/// and part of the operation for the others, and `rm` stays zero for the others.
+const FpForm = enum { binary_rm, unary_rm, binary, unary };
+
+fn fpForm(word: u32, op: Op, form: FpForm) ?Decoded {
+    const has_rm = form == .binary_rm or form == .unary_rm;
+    const has_rs2 = form == .binary_rm or form == .binary;
+    return .{
+        .op = op,
+        .len = 4,
+        .rd = rdOf(word),
+        .rs1 = rs1Of(word),
+        .rs2 = if (has_rs2) rs2Of(word) else 0,
+        .rm = if (has_rm) roundingMode(word) orelse return null else 0,
+    };
+}
+
+/// OP-FP. `funct7` splits into `funct5` in bits 31 to 27 and the format in bits 26 and 25. The
+/// conversions name their operation in `rs2`. `fsqrt`, `fclass` and the moves have an `rs2`
+/// field fixed at zero. The specification has no rule to ignore that field, so a word with any
+/// other value is not one of these instructions. `rs2` stays zero in the result for all of them.
+fn opFp(word: u32) ?Decoded {
+    const double = switch (@as(u2, @truncate(word >> 25))) {
+        0b00 => false,
+        0b01 => true,
+        else => return null,
+    };
+    const rs2 = rs2Of(word);
+    const f3 = funct3(word);
+    switch (@as(u5, @truncate(word >> 27))) {
+        0b00000 => return fpForm(word, if (double) .fadd_d else .fadd_s, .binary_rm),
+        0b00001 => return fpForm(word, if (double) .fsub_d else .fsub_s, .binary_rm),
+        0b00010 => return fpForm(word, if (double) .fmul_d else .fmul_s, .binary_rm),
+        0b00011 => return fpForm(word, if (double) .fdiv_d else .fdiv_s, .binary_rm),
+        0b01011 => {
+            if (rs2 != 0) return null;
+            return fpForm(word, if (double) .fsqrt_d else .fsqrt_s, .unary_rm);
+        },
+        0b00100 => {
+            const op: Op = switch (f3) {
+                0b000 => if (double) .fsgnj_d else .fsgnj_s,
+                0b001 => if (double) .fsgnjn_d else .fsgnjn_s,
+                0b010 => if (double) .fsgnjx_d else .fsgnjx_s,
+                else => return null,
+            };
+            return fpForm(word, op, .binary);
+        },
+        0b00101 => {
+            const op: Op = switch (f3) {
+                0b000 => if (double) .fmin_d else .fmin_s,
+                0b001 => if (double) .fmax_d else .fmax_s,
+                else => return null,
+            };
+            return fpForm(word, op, .binary);
+        },
+        0b01000 => {
+            const op: Op = switch (rs2) {
+                0b00001 => if (double) return null else .fcvt_s_d,
+                0b00000 => if (double) .fcvt_d_s else return null,
+                else => return null,
+            };
+            return fpForm(word, op, .unary_rm);
+        },
+        0b10100 => {
+            const op: Op = switch (f3) {
+                0b010 => if (double) .feq_d else .feq_s,
+                0b001 => if (double) .flt_d else .flt_s,
+                0b000 => if (double) .fle_d else .fle_s,
+                else => return null,
+            };
+            return fpForm(word, op, .binary);
+        },
+        0b11000 => {
+            const op: Op = switch (rs2) {
+                0 => if (double) .fcvt_w_d else .fcvt_w_s,
+                1 => if (double) .fcvt_wu_d else .fcvt_wu_s,
+                2 => if (double) .fcvt_l_d else .fcvt_l_s,
+                3 => if (double) .fcvt_lu_d else .fcvt_lu_s,
+                else => return null,
+            };
+            return fpForm(word, op, .unary_rm);
+        },
+        0b11010 => {
+            const op: Op = switch (rs2) {
+                0 => if (double) .fcvt_d_w else .fcvt_s_w,
+                1 => if (double) .fcvt_d_wu else .fcvt_s_wu,
+                2 => if (double) .fcvt_d_l else .fcvt_s_l,
+                3 => if (double) .fcvt_d_lu else .fcvt_s_lu,
+                else => return null,
+            };
+            return fpForm(word, op, .unary_rm);
+        },
+        0b11100 => {
+            if (rs2 != 0) return null;
+            const op: Op = switch (f3) {
+                0b000 => if (double) .fmv_x_d else .fmv_x_w,
+                0b001 => if (double) .fclass_d else .fclass_s,
+                else => return null,
+            };
+            return fpForm(word, op, .unary);
+        },
+        0b11110 => {
+            if (rs2 != 0 or f3 != 0) return null;
+            return fpForm(word, if (double) .fmv_d_x else .fmv_w_x, .unary);
+        },
+        else => return null,
+    }
 }
 
 fn rdOf(word: u32) u5 {
@@ -1735,4 +2094,391 @@ test "multiply and divide words with another funct7 or width decode as unknown" 
         try std.testing.expectEqual(unknown, try decodeWord(rType(0b0000001, f3, opcode_op_32, 10, 11, 12)));
     }
     try std.testing.expectEqual(unknown, try decodeWord(rType(0b0000011, 0b000, opcode_op, 10, 11, 12)));
+}
+
+fn fpWant(op: Op, rm: u3, rs2: u5, rs3: u5) Decoded {
+    return .{ .op = op, .len = 4, .rd = 10, .rs1 = 11, .rs2 = rs2, .rs3 = rs3, .rm = rm };
+}
+
+test "words assembled by llvm for F and D decode to the expected fields" {
+    // Each word comes from assembling the named instruction with
+    // `zig cc --target=riscv64-linux-musl -c` after `.option norvc`. Registers are fa0 (f10),
+    // fa1 (f11), fa2 (f12), fa3 (f13), a0 (x10) and a1 (x11). The assembler writes `dyn`, which
+    // is 7, for an instruction that takes a rounding mode and names none. It writes 0 for the
+    // conversions that are exact.
+    const cases = [_]struct { word: u32, want: Decoded }{
+        // flw fa0, 8(a1)
+        .{ .word = 0x0085a507, .want = .{ .op = .flw, .len = 4, .rd = 10, .rs1 = 11, .imm = 8 } },
+        // fld fa0, 8(a1)
+        .{ .word = 0x0085b507, .want = .{ .op = .fld, .len = 4, .rd = 10, .rs1 = 11, .imm = 8 } },
+        // fsw fa0, 8(a1)
+        .{ .word = 0x00a5a427, .want = .{ .op = .fsw, .len = 4, .rs1 = 11, .rs2 = 10, .imm = 8 } },
+        // fsd fa0, 8(a1)
+        .{ .word = 0x00a5b427, .want = .{ .op = .fsd, .len = 4, .rs1 = 11, .rs2 = 10, .imm = 8 } },
+        // flw ft11, -4(s11)
+        .{ .word = 0xffcdaf87, .want = .{ .op = .flw, .len = 4, .rd = 31, .rs1 = 27, .imm = -4 } },
+        // fsd ft11, -2048(s11)
+        .{ .word = 0x81fdb027, .want = .{ .op = .fsd, .len = 4, .rs1 = 27, .rs2 = 31, .imm = -2048 } },
+        // fsw fa0, 2047(sp)
+        .{ .word = 0x7ea12fa7, .want = .{ .op = .fsw, .len = 4, .rs1 = 2, .rs2 = 10, .imm = 2047 } },
+        // fmadd.s ft11, ft10, ft9, ft8
+        .{ .word = 0xe1df7fc3, .want = .{ .op = .fmadd_s, .len = 4, .rd = 31, .rs1 = 30, .rs2 = 29, .rs3 = 28, .rm = 7 } },
+        .{ .word = 0x00c5f553, .want = fpWant(.fadd_s, 7, 12, 0) },
+        .{ .word = 0x08c5f553, .want = fpWant(.fsub_s, 7, 12, 0) },
+        .{ .word = 0x10c5f553, .want = fpWant(.fmul_s, 7, 12, 0) },
+        .{ .word = 0x18c5f553, .want = fpWant(.fdiv_s, 7, 12, 0) },
+        .{ .word = 0x5805f553, .want = fpWant(.fsqrt_s, 7, 0, 0) },
+        .{ .word = 0x02c5f553, .want = fpWant(.fadd_d, 7, 12, 0) },
+        .{ .word = 0x0ac5f553, .want = fpWant(.fsub_d, 7, 12, 0) },
+        .{ .word = 0x12c5f553, .want = fpWant(.fmul_d, 7, 12, 0) },
+        .{ .word = 0x1ac5f553, .want = fpWant(.fdiv_d, 7, 12, 0) },
+        .{ .word = 0x5a05f553, .want = fpWant(.fsqrt_d, 7, 0, 0) },
+        .{ .word = 0x68c5f543, .want = fpWant(.fmadd_s, 7, 12, 13) },
+        .{ .word = 0x68c5f547, .want = fpWant(.fmsub_s, 7, 12, 13) },
+        .{ .word = 0x68c5f54b, .want = fpWant(.fnmsub_s, 7, 12, 13) },
+        .{ .word = 0x68c5f54f, .want = fpWant(.fnmadd_s, 7, 12, 13) },
+        .{ .word = 0x6ac5f543, .want = fpWant(.fmadd_d, 7, 12, 13) },
+        .{ .word = 0x20c58553, .want = fpWant(.fsgnj_s, 0, 12, 0) },
+        .{ .word = 0x20c59553, .want = fpWant(.fsgnjn_s, 0, 12, 0) },
+        .{ .word = 0x20c5a553, .want = fpWant(.fsgnjx_s, 0, 12, 0) },
+        .{ .word = 0x28c58553, .want = fpWant(.fmin_s, 0, 12, 0) },
+        .{ .word = 0x28c59553, .want = fpWant(.fmax_s, 0, 12, 0) },
+        .{ .word = 0xa0c5a553, .want = fpWant(.feq_s, 0, 12, 0) },
+        .{ .word = 0xa0c59553, .want = fpWant(.flt_s, 0, 12, 0) },
+        .{ .word = 0xa0c58553, .want = fpWant(.fle_s, 0, 12, 0) },
+        .{ .word = 0xe0059553, .want = fpWant(.fclass_s, 0, 0, 0) },
+        .{ .word = 0xc005f553, .want = fpWant(.fcvt_w_s, 7, 0, 0) },
+        .{ .word = 0xc015f553, .want = fpWant(.fcvt_wu_s, 7, 0, 0) },
+        .{ .word = 0xc025f553, .want = fpWant(.fcvt_l_s, 7, 0, 0) },
+        .{ .word = 0xc035f553, .want = fpWant(.fcvt_lu_s, 7, 0, 0) },
+        .{ .word = 0xd005f553, .want = fpWant(.fcvt_s_w, 7, 0, 0) },
+        .{ .word = 0xd025f553, .want = fpWant(.fcvt_s_l, 7, 0, 0) },
+        .{ .word = 0x4015f553, .want = fpWant(.fcvt_s_d, 7, 0, 0) },
+        .{ .word = 0x42058553, .want = fpWant(.fcvt_d_s, 0, 0, 0) },
+        .{ .word = 0xe0058553, .want = fpWant(.fmv_x_w, 0, 0, 0) },
+        .{ .word = 0xf0058553, .want = fpWant(.fmv_w_x, 0, 0, 0) },
+        .{ .word = 0xe2058553, .want = fpWant(.fmv_x_d, 0, 0, 0) },
+        .{ .word = 0xf2058553, .want = fpWant(.fmv_d_x, 0, 0, 0) },
+        .{ .word = 0x00c59553, .want = fpWant(.fadd_s, 1, 12, 0) },
+        .{ .word = 0x22c58553, .want = fpWant(.fsgnj_d, 0, 12, 0) },
+        .{ .word = 0x22c59553, .want = fpWant(.fsgnjn_d, 0, 12, 0) },
+        .{ .word = 0x22c5a553, .want = fpWant(.fsgnjx_d, 0, 12, 0) },
+        .{ .word = 0x2ac58553, .want = fpWant(.fmin_d, 0, 12, 0) },
+        .{ .word = 0x2ac59553, .want = fpWant(.fmax_d, 0, 12, 0) },
+        .{ .word = 0xa2c5a553, .want = fpWant(.feq_d, 0, 12, 0) },
+        .{ .word = 0xa2c59553, .want = fpWant(.flt_d, 0, 12, 0) },
+        .{ .word = 0xa2c58553, .want = fpWant(.fle_d, 0, 12, 0) },
+        .{ .word = 0xe2059553, .want = fpWant(.fclass_d, 0, 0, 0) },
+        .{ .word = 0xc205f553, .want = fpWant(.fcvt_w_d, 7, 0, 0) },
+        .{ .word = 0xc215f553, .want = fpWant(.fcvt_wu_d, 7, 0, 0) },
+        .{ .word = 0xc225f553, .want = fpWant(.fcvt_l_d, 7, 0, 0) },
+        .{ .word = 0xc235f553, .want = fpWant(.fcvt_lu_d, 7, 0, 0) },
+        .{ .word = 0xd2058553, .want = fpWant(.fcvt_d_w, 0, 0, 0) },
+        .{ .word = 0xd2158553, .want = fpWant(.fcvt_d_wu, 0, 0, 0) },
+        .{ .word = 0xd225f553, .want = fpWant(.fcvt_d_l, 7, 0, 0) },
+        .{ .word = 0xd235f553, .want = fpWant(.fcvt_d_lu, 7, 0, 0) },
+        .{ .word = 0xd015f553, .want = fpWant(.fcvt_s_wu, 7, 0, 0) },
+        .{ .word = 0xd035f553, .want = fpWant(.fcvt_s_lu, 7, 0, 0) },
+        .{ .word = 0x6ac5f547, .want = fpWant(.fmsub_d, 7, 12, 13) },
+        .{ .word = 0x6ac5f54b, .want = fpWant(.fnmsub_d, 7, 12, 13) },
+        .{ .word = 0x6ac5f54f, .want = fpWant(.fnmadd_d, 7, 12, 13) },
+        .{ .word = 0x4015a553, .want = fpWant(.fcvt_s_d, 2, 0, 0) },
+        .{ .word = 0x5a05b553, .want = fpWant(.fsqrt_d, 3, 0, 0) },
+        .{ .word = 0xc005c553, .want = fpWant(.fcvt_w_s, 4, 0, 0) },
+        .{ .word = 0x02c58553, .want = fpWant(.fadd_d, 0, 12, 0) },
+        .{ .word = 0x68c5a543, .want = fpWant(.fmadd_s, 2, 12, 13) },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("word 0x{x:0>8}\n", .{case.word});
+        try std.testing.expectEqual(case.want, try decodeWord(case.word));
+    }
+}
+
+/// Each conversion `funct7` with the operation it gives for `rs2` of 0, 1, 2 and 3. A null entry
+/// is a value the specification leaves unassigned.
+const conversion_groups = [_]struct { f7: u7, ops: [4]?Op }{
+    .{ .f7 = 0b1100000, .ops = .{ .fcvt_w_s, .fcvt_wu_s, .fcvt_l_s, .fcvt_lu_s } },
+    .{ .f7 = 0b1100001, .ops = .{ .fcvt_w_d, .fcvt_wu_d, .fcvt_l_d, .fcvt_lu_d } },
+    .{ .f7 = 0b1101000, .ops = .{ .fcvt_s_w, .fcvt_s_wu, .fcvt_s_l, .fcvt_s_lu } },
+    .{ .f7 = 0b1101001, .ops = .{ .fcvt_d_w, .fcvt_d_wu, .fcvt_d_l, .fcvt_d_lu } },
+    .{ .f7 = 0b0100000, .ops = .{ null, .fcvt_s_d, null, null } },
+    .{ .f7 = 0b0100001, .ops = .{ .fcvt_d_s, null, null, null } },
+};
+
+test "a conversion decodes only for the rs2 values the specification assigns" {
+    const unknown = Decoded{ .op = .unknown, .len = 4 };
+    for (conversion_groups) |group| {
+        for (0..32) |value| {
+            const field: u5 = @intCast(value);
+            const word = rType(group.f7, 0b111, opcode_op_fp, 10, 11, field);
+            errdefer std.debug.print("funct7 0b{b:0>7} rs2 {d}\n", .{ group.f7, field });
+            const want = if (field < 4) group.ops[field] else null;
+            if (want) |op| {
+                try std.testing.expectEqual(Decoded{ .op = op, .len = 4, .rd = 10, .rs1 = 11, .rm = 7 }, try decodeWord(word));
+            } else {
+                try std.testing.expectEqual(unknown, try decodeWord(word));
+            }
+        }
+    }
+}
+
+test "fsqrt, fclass and the moves decode only with rs2 zero" {
+    const unknown = Decoded{ .op = .unknown, .len = 4 };
+    const cases = [_]struct { f7: u7, f3: u3, op: Op }{
+        .{ .f7 = 0b0101100, .f3 = 0b111, .op = .fsqrt_s },
+        .{ .f7 = 0b0101101, .f3 = 0b111, .op = .fsqrt_d },
+        .{ .f7 = 0b1110000, .f3 = 0b001, .op = .fclass_s },
+        .{ .f7 = 0b1110001, .f3 = 0b001, .op = .fclass_d },
+        .{ .f7 = 0b1110000, .f3 = 0b000, .op = .fmv_x_w },
+        .{ .f7 = 0b1110001, .f3 = 0b000, .op = .fmv_x_d },
+        .{ .f7 = 0b1111000, .f3 = 0b000, .op = .fmv_w_x },
+        .{ .f7 = 0b1111001, .f3 = 0b000, .op = .fmv_d_x },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("{s}\n", .{@tagName(case.op)});
+        try std.testing.expectEqual(case.op, (try decodeWord(rType(case.f7, case.f3, opcode_op_fp, 10, 11, 0))).op);
+        for (1..32) |value| {
+            const word = rType(case.f7, case.f3, opcode_op_fp, 10, 11, @intCast(value));
+            try std.testing.expectEqual(unknown, try decodeWord(word));
+        }
+    }
+}
+
+test "a reserved rounding mode decodes as unknown and the rest reach rm" {
+    const unknown = Decoded{ .op = .unknown, .len = 4 };
+    const words = [_]struct { f7: u7, rs2: u5, op: Op }{
+        .{ .f7 = 0b0000000, .rs2 = 12, .op = .fadd_s },
+        .{ .f7 = 0b0001101, .rs2 = 12, .op = .fdiv_d },
+        .{ .f7 = 0b0101101, .rs2 = 0, .op = .fsqrt_d },
+        .{ .f7 = 0b1100000, .rs2 = 2, .op = .fcvt_l_s },
+        .{ .f7 = 0b1101001, .rs2 = 0, .op = .fcvt_d_w },
+        .{ .f7 = 0b0100000, .rs2 = 1, .op = .fcvt_s_d },
+        .{ .f7 = 0b0100001, .rs2 = 0, .op = .fcvt_d_s },
+    };
+    for (words) |entry| {
+        for (0..8) |value| {
+            const mode: u3 = @intCast(value);
+            const word = rType(entry.f7, mode, opcode_op_fp, 10, 11, entry.rs2);
+            errdefer std.debug.print("{s} rm {d}\n", .{ @tagName(entry.op), mode });
+            const got = try decodeWord(word);
+            if (mode == 5 or mode == 6) {
+                try std.testing.expectEqual(unknown, got);
+            } else {
+                try std.testing.expectEqual(entry.op, got.op);
+                try std.testing.expectEqual(mode, got.rm);
+            }
+        }
+    }
+    for ([_]u7{ opcode_fmadd, opcode_fmsub, opcode_fnmsub, opcode_fnmadd }) |opcode| {
+        for (0..8) |value| {
+            const mode: u3 = @intCast(value);
+            const word = rType(0b0000000, mode, opcode, 10, 11, 12);
+            const got = try decodeWord(word);
+            if (mode == 5 or mode == 6) {
+                try std.testing.expectEqual(unknown, got);
+            } else {
+                try std.testing.expectEqual(mode, got.rm);
+            }
+        }
+    }
+}
+
+test "forms whose funct3 is part of the operation keep rm at zero" {
+    for ([_]u32{
+        rType(0b0010000, 0b010, opcode_op_fp, 10, 11, 12),
+        rType(0b0010101, 0b001, opcode_op_fp, 10, 11, 12),
+        rType(0b1010001, 0b010, opcode_op_fp, 10, 11, 12),
+        rType(0b1110000, 0b001, opcode_op_fp, 10, 11, 0),
+    }) |word| {
+        const got = try decodeWord(word);
+        try std.testing.expect(got.op != .unknown);
+        try std.testing.expectEqual(@as(u3, 0), got.rm);
+    }
+}
+
+test "float words with an unassigned funct3, format or funct5 decode as unknown" {
+    const unknown = Decoded{ .op = .unknown, .len = 4 };
+    for ([_]u3{ 0b000, 0b001, 0b100, 0b101, 0b110, 0b111 }) |width| {
+        try std.testing.expectEqual(unknown, try decodeWord(iType(width, opcode_load_fp, 10, 11, 8)));
+        try std.testing.expectEqual(unknown, try decodeWord(rType(0, width, opcode_store_fp, 10, 11, 12)));
+    }
+    const unassigned = [_]struct { f7: u7, f3: u3 }{
+        .{ .f7 = 0b0010000, .f3 = 0b011 },
+        .{ .f7 = 0b0010001, .f3 = 0b111 },
+        .{ .f7 = 0b0010100, .f3 = 0b010 },
+        .{ .f7 = 0b0010101, .f3 = 0b100 },
+        .{ .f7 = 0b1010000, .f3 = 0b011 },
+        .{ .f7 = 0b1010001, .f3 = 0b111 },
+        .{ .f7 = 0b1110000, .f3 = 0b010 },
+        .{ .f7 = 0b1110001, .f3 = 0b111 },
+        .{ .f7 = 0b1111000, .f3 = 0b001 },
+        .{ .f7 = 0b1111001, .f3 = 0b111 },
+    };
+    for (unassigned) |case| {
+        try std.testing.expectEqual(unknown, try decodeWord(rType(case.f7, case.f3, opcode_op_fp, 10, 11, 0)));
+    }
+    for ([_]u2{ 0b10, 0b11 }) |format| {
+        for (0..32) |value| {
+            const f7 = (@as(u7, @intCast(value)) << 2) | format;
+            try std.testing.expectEqual(unknown, try decodeWord(rType(f7, 0, opcode_op_fp, 10, 11, 0)));
+        }
+        for ([_]u7{ opcode_fmadd, opcode_fmsub, opcode_fnmsub, opcode_fnmadd }) |opcode| {
+            try std.testing.expectEqual(unknown, try decodeWord(rType(@as(u7, 0b01101 << 2) | format, 0, opcode, 10, 11, 12)));
+        }
+    }
+}
+
+test "every funct5 value in the float opcode decodes or is unknown" {
+    // With rs2 of zero and funct3 of zero, `funct5` 0b01000 is `fcvt.d.s` for the double format
+    // only. The compare group reads funct3 0 as `fle`.
+    const single = [_]u5{ 0b00000, 0b00001, 0b00010, 0b00011, 0b01011, 0b00100, 0b00101, 0b10100, 0b11000, 0b11010, 0b11100, 0b11110 };
+    for ([_]u2{ 0b00, 0b01 }) |format| {
+        var seen: usize = 0;
+        for (0..32) |value| {
+            const f5: u5 = @intCast(value);
+            const got = try decodeWord(rType((@as(u7, f5) << 2) | format, 0, opcode_op_fp, 10, 11, 0));
+            const assigned = std.mem.indexOfScalar(u5, &single, f5) != null or
+                (format == 0b01 and f5 == 0b01000);
+            try std.testing.expectEqual(assigned, got.op != .unknown);
+            if (assigned) seen += 1;
+        }
+        try std.testing.expectEqual(single.len + format, seen);
+    }
+}
+
+test "fused words keep rs3 in bits 31 to 27" {
+    for ([_]u5{ 0, 1, 13, 31 }) |third| {
+        const base = rType(@as(u7, third) << 2, 0b000, opcode_fmadd, 10, 11, 12);
+        const got = try decodeWord(base);
+        try std.testing.expectEqual(Decoded{ .op = .fmadd_s, .len = 4, .rd = 10, .rs1 = 11, .rs2 = 12, .rs3 = third }, got);
+        const double = try decodeWord(base | (1 << 25));
+        try std.testing.expectEqual(Op.fmadd_d, double.op);
+        try std.testing.expectEqual(third, double.rs3);
+    }
+}
+
+fn mnemonicOf(op: Op, buffer: []u8) []const u8 {
+    const name = @tagName(op);
+    @memcpy(buffer[0..name.len], name);
+    std.mem.replaceScalar(u8, buffer[0..name.len], '_', '.');
+    return buffer[0..name.len];
+}
+
+test "float arithmetic, fused and compare words agree with the disassembler" {
+    const triples = [_][3]u5{ .{ 1, 2, 3 }, .{ 0, 5, 6 }, .{ 31, 30, 29 }, .{ 10, 11, 12 } };
+    const arithmetic = [_]struct { op: Op, f7: u7 }{
+        .{ .op = .fadd_s, .f7 = 0b0000000 },
+        .{ .op = .fsub_s, .f7 = 0b0000100 },
+        .{ .op = .fmul_s, .f7 = 0b0001000 },
+        .{ .op = .fdiv_s, .f7 = 0b0001100 },
+        .{ .op = .fadd_d, .f7 = 0b0000001 },
+        .{ .op = .fsub_d, .f7 = 0b0000101 },
+        .{ .op = .fmul_d, .f7 = 0b0001001 },
+        .{ .op = .fdiv_d, .f7 = 0b0001101 },
+    };
+    const compare = [_]struct { op: Op, f7: u7, f3: u3 }{
+        .{ .op = .feq_s, .f7 = 0b1010000, .f3 = 0b010 },
+        .{ .op = .flt_s, .f7 = 0b1010000, .f3 = 0b001 },
+        .{ .op = .fle_s, .f7 = 0b1010000, .f3 = 0b000 },
+        .{ .op = .feq_d, .f7 = 0b1010001, .f3 = 0b010 },
+        .{ .op = .flt_d, .f7 = 0b1010001, .f3 = 0b001 },
+        .{ .op = .fle_d, .f7 = 0b1010001, .f3 = 0b000 },
+    };
+    const fused_forms = [_]struct { op: Op, opcode: u7, fmt: u7 }{
+        .{ .op = .fmadd_s, .opcode = opcode_fmadd, .fmt = 0 },
+        .{ .op = .fmsub_s, .opcode = opcode_fmsub, .fmt = 0 },
+        .{ .op = .fnmsub_s, .opcode = opcode_fnmsub, .fmt = 0 },
+        .{ .op = .fnmadd_s, .opcode = opcode_fnmadd, .fmt = 0 },
+        .{ .op = .fmadd_d, .opcode = opcode_fmadd, .fmt = 1 },
+        .{ .op = .fmsub_d, .opcode = opcode_fmsub, .fmt = 1 },
+        .{ .op = .fnmsub_d, .opcode = opcode_fnmsub, .fmt = 1 },
+        .{ .op = .fnmadd_d, .opcode = opcode_fnmadd, .fmt = 1 },
+    };
+    var name: [16]u8 = undefined;
+    var line: [64]u8 = undefined;
+    for (triples) |t| {
+        for (arithmetic) |entry| {
+            const word = rType(entry.f7, 0b111, opcode_op_fp, t[0], t[1], t[2]);
+            const want = try std.fmt.bufPrint(&line, "{s} f{d}, f{d}, f{d}", .{ mnemonicOf(entry.op, &name), t[0], t[1], t[2] });
+            try expectRendersAs(word, entry.op, want);
+        }
+        for (compare) |entry| {
+            const word = rType(entry.f7, entry.f3, opcode_op_fp, t[0], t[1], t[2]);
+            const want = try std.fmt.bufPrint(&line, "{s} x{d}, f{d}, f{d}", .{ mnemonicOf(entry.op, &name), t[0], t[1], t[2] });
+            try expectRendersAs(word, entry.op, want);
+        }
+        for (fused_forms) |entry| {
+            const word = rType((@as(u7, 29) << 2) | entry.fmt, 0b111, entry.opcode, t[0], t[1], t[2]);
+            const want = try std.fmt.bufPrint(&line, "{s} f{d}, f{d}, f{d}, f29", .{ mnemonicOf(entry.op, &name), t[0], t[1], t[2] });
+            try expectRendersAs(word, entry.op, want);
+        }
+    }
+}
+
+fn expectRendersAs(word: u32, op: Op, want: []const u8) !void {
+    const text = try disasm.one(std.testing.allocator, word);
+    defer std.testing.allocator.free(text);
+    errdefer std.debug.print("word 0x{x:0>8} renders as \"{s}\"\n", .{ word, text });
+    try std.testing.expectEqualStrings(want, text);
+    try std.testing.expectEqual(op, (try decodeWord(word)).op);
+}
+
+fn expectFiles(op: Op, rd: Files.File, rs1: Files.File, rs2: Files.File) !void {
+    const got = files(op);
+    errdefer std.debug.print("operation {s}\n", .{@tagName(op)});
+    try std.testing.expectEqual(rd, got.rd);
+    try std.testing.expectEqual(rs1, got.rs1);
+    try std.testing.expectEqual(rs2, got.rs2);
+}
+
+test "an operation that writes an integer register from a float input reports so" {
+    const converts = [_]Op{
+        .fcvt_w_s, .fcvt_wu_s, .fcvt_l_s, .fcvt_lu_s,
+        .fcvt_w_d, .fcvt_wu_d, .fcvt_l_d, .fcvt_lu_d,
+    };
+    for (converts) |op| try expectFiles(op, .integer, .float, .float);
+    try expectFiles(.fmv_x_w, .integer, .float, .float);
+    try expectFiles(.fmv_x_d, .integer, .float, .float);
+    try expectFiles(.fclass_s, .integer, .float, .float);
+    try expectFiles(.fclass_d, .integer, .float, .float);
+    const compares = [_]Op{ .feq_s, .flt_s, .fle_s, .feq_d, .flt_d, .fle_d };
+    for (compares) |op| try expectFiles(op, .integer, .float, .float);
+}
+
+test "an operation that reads an integer register to make a float reports so" {
+    const converts = [_]Op{
+        .fcvt_s_w, .fcvt_s_wu, .fcvt_s_l, .fcvt_s_lu,
+        .fcvt_d_w, .fcvt_d_wu, .fcvt_d_l, .fcvt_d_lu,
+    };
+    for (converts) |op| try expectFiles(op, .float, .integer, .float);
+    try expectFiles(.fmv_w_x, .float, .integer, .float);
+    try expectFiles(.fmv_d_x, .float, .integer, .float);
+}
+
+test "arithmetic and fused forms name float registers for every operand" {
+    const arithmetic = [_]Op{
+        .fadd_s,   .fsub_s,   .fmul_s,   .fdiv_s,   .fsqrt_s,
+        .fsgnj_s,  .fsgnjn_s, .fsgnjx_s, .fmin_s,   .fmax_s,
+        .fadd_d,   .fsub_d,   .fmul_d,   .fdiv_d,   .fsqrt_d,
+        .fsgnj_d,  .fsgnjn_d, .fsgnjx_d, .fmin_d,   .fmax_d,
+        .fcvt_s_d, .fcvt_d_s, .fmadd_s,  .fmsub_s,  .fnmsub_s,
+        .fnmadd_s, .fmadd_d,  .fmsub_d,  .fnmsub_d, .fnmadd_d,
+    };
+    for (arithmetic) |op| {
+        try expectFiles(op, .float, .float, .float);
+        try std.testing.expectEqual(Files.File.float, files(op).rs3);
+    }
+}
+
+test "an integer operation names integer registers" {
+    try expectFiles(.addi, .integer, .integer, .integer);
+    try expectFiles(.add, .integer, .integer, .integer);
+    try expectFiles(.sd, .integer, .integer, .integer);
+    try expectFiles(.amoadd_d, .integer, .integer, .integer);
+    try expectFiles(.unknown, .integer, .integer, .integer);
+}
+
+test "float loads and stores take an integer base and mix files" {
+    for ([_]Op{ .flw, .fld }) |op| try expectFiles(op, .float, .integer, .integer);
+    for ([_]Op{ .fsw, .fsd }) |op| try expectFiles(op, .integer, .integer, .float);
 }
