@@ -24,7 +24,7 @@ pub const Decoded = struct {
     /// twelve, which is what the instruction means, so a reader uses it as it is and does not
     /// shift it again. `fence` holds instruction bits 31 to 20 unsigned: `fm` in bits 11 to 8,
     /// `pred` in bits 7 to 4 and `succ` in bits 3 to 0. `csrrwi`, `csrrsi` and `csrrci` hold their
-    /// five bit unsigned value, and `rs1` stays 0.
+    /// five bit unsigned value in `rs1`, because that is the field it occupies. The same `rs1` test then decides a write for all six.
     imm: i64 = 0,
     csr: u12 = 0,
     /// The rounding mode a float operation names, which is `dyn` for most of them.
@@ -455,10 +455,6 @@ fn smallReg(h: u32, comptime lo: u5) u5 {
     return @as(u5, 8) + @as(u3, @truncate(h >> lo));
 }
 
-fn fullRd(h: u32) u5 {
-    return @truncate(h >> 7);
-}
-
 fn fullRs2(h: u32) u5 {
     return @truncate(h >> 2);
 }
@@ -506,7 +502,7 @@ fn quadrant0(h: u32) ?Decoded {
 }
 
 fn quadrant1(h: u32) ?Decoded {
-    const rd = fullRd(h);
+    const rd = rdOf(h);
     return switch (@as(u3, @truncate(h >> 13))) {
         0b000 => .{ .op = .addi, .len = 2, .rd = rd, .rs1 = rd, .imm = immCi(h) },
         // This slot is `c.jal` in RV32 and `c.addiw` in RV64.
@@ -570,7 +566,7 @@ fn branchOffsetCb(h: u32) i64 {
 }
 
 fn quadrant2(h: u32) ?Decoded {
-    const rd = fullRd(h);
+    const rd = rdOf(h);
     const rs2 = fullRs2(h);
     return switch (@as(u3, @truncate(h >> 13))) {
         0b000 => .{ .op = .slli, .len = 2, .rd = rd, .rs1 = rd, .imm = shamtCi(h) },
@@ -667,6 +663,9 @@ fn decode32(word: u32) Decoded {
 /// predecessor set in bits 7 to 4 and the successor set in bits 3 to 0. The register fields are
 /// reserved and a reader ignores them, so they stay zero. `fence.i` ignores `imm`, `rs1` and `rd`
 /// in the same way, because a later extension may define them.
+/// A reserved `fm` passes through in `imm`, although a float operation with a reserved rounding mode
+/// is rejected. The float chapter makes a reserved rounding mode an illegal instruction. This
+/// chapter lets an implementation treat a reserved `fm` as a plain fence.
 fn miscMem(word: u32) ?Decoded {
     return switch (funct3(word)) {
         0b000 => .{ .op = .fence, .len = 4, .imm = word >> 20 },
@@ -675,8 +674,10 @@ fn miscMem(word: u32) ?Decoded {
     };
 }
 
-/// The immediate forms of the CSR operations hold their five bit unsigned value in `imm`, so
-/// `rs1` is a register only for the three register forms.
+/// The immediate forms of the CSR operations hold their five bit unsigned value in `rs1`, because
+/// that is the field it occupies. A CSR write happens when `rs1` is non-zero, for the register forms
+/// and for the immediate forms. The `csrrs`, `csrrc`, `csrrsi` and `csrrci` operations do not write
+/// the CSR when `rs1` is zero.
 fn system(word: u32) ?Decoded {
     const f3 = funct3(word);
     const op: Op = switch (f3) {
@@ -690,8 +691,7 @@ fn system(word: u32) ?Decoded {
         0b100 => return null,
     };
     const csr: u12 = @truncate(word >> 20);
-    if (f3 < 0b100) return .{ .op = op, .len = 4, .rd = rdOf(word), .rs1 = rs1Of(word), .csr = csr };
-    return .{ .op = op, .len = 4, .rd = rdOf(word), .imm = rs1Of(word), .csr = csr };
+    return .{ .op = op, .len = 4, .rd = rdOf(word), .rs1 = rs1Of(word), .csr = csr };
 }
 
 fn privileged(word: u32) ?Decoded {
@@ -916,7 +916,8 @@ fn fused(word: u32) ?Decoded {
         opcode_fmadd => if (double) .fmadd_d else .fmadd_s,
         opcode_fmsub => if (double) .fmsub_d else .fmsub_s,
         opcode_fnmsub => if (double) .fnmsub_d else .fnmsub_s,
-        else => if (double) .fnmadd_d else .fnmadd_s,
+        opcode_fnmadd => if (double) .fnmadd_d else .fnmadd_s,
+        else => unreachable,
     };
     return .{
         .op = op,
@@ -1064,13 +1065,13 @@ fn iImm(word: u32) i64 {
 
 fn sImm(word: u32) i64 {
     const raw = (word >> 25 << 5) | ((word >> 7) & 0x1F);
-    return @as(i32, @bitCast(raw << 20)) >> 20;
+    return signExtend(raw, 12);
 }
 
 fn bImm(word: u32) i64 {
     const raw = ((word >> 31) << 12) | (((word >> 7) & 1) << 11) |
         (((word >> 25) & 0x3F) << 5) | (((word >> 8) & 0xF) << 1);
-    return @as(i32, @bitCast(raw << 19)) >> 19;
+    return signExtend(raw, 13);
 }
 
 /// The value `lui` and `auipc` add: the 20 bit field already shifted left by twelve.
@@ -1081,7 +1082,7 @@ fn uImm(word: u32) i64 {
 fn jImm(word: u32) i64 {
     const raw = ((word >> 31) << 20) | (((word >> 12) & 0xFF) << 12) |
         (((word >> 20) & 1) << 11) | (((word >> 21) & 0x3FF) << 1);
-    return @as(i32, @bitCast(raw << 11)) >> 11;
+    return signExtend(raw, 21);
 }
 
 fn wordBytes(value: u32) [4]u8 {
@@ -1546,8 +1547,8 @@ fn expectCompressedAgreesWithDisasm(half: u16, unlisted: *usize) !void {
 }
 
 /// What the immediate field of a `c.lui` holds, worked out from the specification rather than
-/// from the disassembler, whose own rendering of this field drops one bit. Bit 12 carries
-/// `nzimm[17]` and bits 6 to 2 carry `nzimm[16:12]`, sign extended from bit 17.
+/// from the disassembler. Bit 12 carries `nzimm[17]` and bits 6 to 2 carry `nzimm[16:12]`,
+/// sign extended from bit 17.
 fn expectedCluiField(half: u16) ?u32 {
     const hi: u32 = (half >> 12) & 1;
     const lo: u32 = (half >> 2) & 0x1F;
@@ -1579,11 +1580,11 @@ test "every compressed halfword agrees with the disassembler" {
     while (half <= std.math.maxInt(u16)) : (half += 1) {
         if (half & 3 == 3) continue;
         const narrow: u16 = @intCast(half);
-        // The oracle drops bit 16 of the `c.lui` immediate, so the model checks these instead.
+        // The specification is the authority for the `c.lui` immediate. The oracle gets a
+        // second look at the same halfwords below.
         const rd = (half >> 7) & 0x1F;
         if (half >> 13 == 0b011 and half & 3 == 1 and rd != 2) {
             try expectCluiAgreesWithModel(narrow);
-            continue;
         }
         try expectCompressedAgreesWithDisasm(narrow, &unlisted);
     }
@@ -1790,18 +1791,27 @@ test "the six csr operations read the csr number and the source" {
     // unsigned value. Here the value is 31, so bits 19 to 15 are 0xF8000.
     // csrrwi x7, mip 0x344, 31: 0x34400000 | 0xF8000 | 0x5000 | 0x380 | 0x73.
     try std.testing.expectEqual(
-        Decoded{ .op = .csrrwi, .len = 4, .rd = 7, .imm = 31, .csr = 0x344 },
+        Decoded{ .op = .csrrwi, .len = 4, .rd = 7, .rs1 = 31, .csr = 0x344 },
         try decodeWord(0x344FD3F3),
     );
     // csrrsi x7, mepc 0x341, 1: 0x34100000 | 0x8000 | 0x6000 | 0x380 | 0x73.
     try std.testing.expectEqual(
-        Decoded{ .op = .csrrsi, .len = 4, .rd = 7, .imm = 1, .csr = 0x341 },
+        Decoded{ .op = .csrrsi, .len = 4, .rd = 7, .rs1 = 1, .csr = 0x341 },
         try decodeWord(0x3410E3F3),
     );
     // csrrci x7, mcause 0x342, 2: 0x34200000 | 0x10000 | 0x7000 | 0x380 | 0x73.
     try std.testing.expectEqual(
-        Decoded{ .op = .csrrci, .len = 4, .rd = 7, .imm = 2, .csr = 0x342 },
+        Decoded{ .op = .csrrci, .len = 4, .rd = 7, .rs1 = 2, .csr = 0x342 },
         try decodeWord(0x342173F3),
+    );
+}
+
+test "an immediate csr form carries its value in rs1 so one test decides a write" {
+    // csrsi mstatus, 8 is 0x30046073. A non-zero rs1 tells a caller the CSR is written, for the
+    // immediate forms as much as for the register ones.
+    try std.testing.expectEqual(
+        Decoded{ .op = .csrrsi, .len = 4, .rd = 0, .rs1 = 8, .csr = 0x300 },
+        try decodeWord(0x30046073),
     );
 }
 
@@ -1846,7 +1856,7 @@ test "csr pseudo instructions decode as their real encodings" {
     );
     // csrci mstatus, 8 is csrrci x0, 0x300, 8: 0x30000000 | 0x40000 | 0x7000 | 0x73.
     try std.testing.expectEqual(
-        Decoded{ .op = .csrrci, .len = 4, .rd = 0, .imm = 8, .csr = 0x300 },
+        Decoded{ .op = .csrrci, .len = 4, .rd = 0, .rs1 = 8, .csr = 0x300 },
         try decodeWord(0x30047073),
     );
 }
@@ -1867,7 +1877,7 @@ test "fence keeps its fields in the immediate and fence.i is a separate word" {
     for ([_]u32{ 0x0000100F, 0x0010100F, 0x0001900F, 0x0000108F }) |word| {
         try std.testing.expectEqual(Decoded{ .op = .fence_i, .len = 4 }, try decodeWord(word));
     }
-    // Only funct3 010 and funct3 111 stay reserved in this opcode.
+    // Every funct3 other than 000 and 001 is reserved in this opcode. The words check 010 and 111.
     for ([_]u32{ 0x0000200F, 0x0000700F }) |word| {
         try std.testing.expectEqual(Decoded{ .op = .unknown, .len = 4 }, try decodeWord(word));
     }
@@ -1917,15 +1927,15 @@ test "words assembled by llvm decode to the expected fields" {
         // csrs mstatus, t1
         .{ .word = 0x30032073, .want = .{ .op = .csrrs, .len = 4, .rd = 0, .rs1 = 6, .csr = 0x300 } },
         // csrci mstatus, 8
-        .{ .word = 0x30047073, .want = .{ .op = .csrrci, .len = 4, .rd = 0, .imm = 8, .csr = 0x300 } },
+        .{ .word = 0x30047073, .want = .{ .op = .csrrci, .len = 4, .rd = 0, .rs1 = 8, .csr = 0x300 } },
         // csrwi mtvec, 0
-        .{ .word = 0x30505073, .want = .{ .op = .csrrwi, .len = 4, .rd = 0, .imm = 0, .csr = 0x305 } },
+        .{ .word = 0x30505073, .want = .{ .op = .csrrwi, .len = 4, .rd = 0, .rs1 = 0, .csr = 0x305 } },
         // csrrw a1, mepc, a2
         .{ .word = 0x341615f3, .want = .{ .op = .csrrw, .len = 4, .rd = 11, .rs1 = 12, .csr = 0x341 } },
         // csrrc a3, mcause, a4
         .{ .word = 0x342736f3, .want = .{ .op = .csrrc, .len = 4, .rd = 13, .rs1 = 14, .csr = 0x342 } },
         // csrrsi a5, satp, 31
-        .{ .word = 0x180fe7f3, .want = .{ .op = .csrrsi, .len = 4, .rd = 15, .imm = 31, .csr = 0x180 } },
+        .{ .word = 0x180fe7f3, .want = .{ .op = .csrrsi, .len = 4, .rd = 15, .rs1 = 31, .csr = 0x180 } },
         // csrw stimecmp, t3
         .{ .word = 0x14de1073, .want = .{ .op = .csrrw, .len = 4, .rd = 0, .rs1 = 28, .csr = 0x14D } },
         // mret, sret, wfi, ecall and ebreak
@@ -2489,6 +2499,9 @@ test "float loads and stores take an integer base and mix files" {
 // hold 2789 distinct 16 bit words and 9428 distinct 32 bit words. This table keeps up to eight
 // words for each operation and length, spread evenly over the sorted words. To regenerate, dump
 // the distinct words of both `.text` sections, repeat that selection and sort each list. The
+// The test checks only that each word is not unknown and that its length matches. The table proves
+// that these words decode to something and says nothing about whether the fields are right. The
+// tables derived from an assembler check the fields.
 // words show what one real compiler emitted. They make no claim about the whole instruction set.
 const weir_words16 = [_]u16{
     0x0001, 0x00e2, 0x0512, 0x060a, 0x0722, 0x0809, 0x08e2, 0x0e62,
