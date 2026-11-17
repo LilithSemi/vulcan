@@ -598,7 +598,12 @@ fn decode16(a: std.mem.Allocator, b: *std.ArrayList(u8), h: u16, ctx: ?Context) 
                     const raw = (cb(h, 12) << 9) | (cb(h, 6) << 4) | (cb(h, 5) << 6) | (((h >> 3) & 3) << 7) | (cb(h, 2) << 5);
                     try b.print(a, "addi x2, x2, {d}", .{signext(raw, 10)});
                 } else {
-                    const raw = (cb(h, 12) << 17) | (((h >> 2) & 0x1F) << 12);
+                    // The field widens before it shifts, or bit 16 falls off a u16. A zero
+                    // immediate is reserved. `rd` x0 with a value is a hint and prints as a lui.
+                    const field: u32 = (h >> 2) & 0x1F;
+                    const nzimm = (cb(h, 12) << 5) | field;
+                    if (nzimm == 0) return false;
+                    const raw = (cb(h, 12) << 17) | (field << 12);
                     try b.print(a, "lui x{d}, {d}", .{ rdn, @as(u32, @bitCast(signext(raw, 18))) >> 12 });
                 }
             },
@@ -798,6 +803,19 @@ test "decodes RVC compressed instructions (verified against llvm-objdump)" {
     try expectC(0x0001, "nop"); // c.nop
     try expectC(0xca09, "beqz x12, .+18"); // c.beqz
     try expectC(0xfa75, "bnez x12, .-12"); // c.bnez
+}
+
+test "decodes c.lui over both immediate polarities (verified against the assembler)" {
+    try expectC(0x6541, "lui x10, 16");
+    try expectC(0x65fd, "lui x11, 31");
+    try expectC(0x6445, "lui x8, 17");
+    try expectC(0x76fd, "lui x13, 1048575");
+    try expectC(0x7701, "lui x14, 1048544");
+
+    // A zero immediate is reserved, and the caller falls back on it.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try std.testing.expect(!try decode16(std.testing.allocator, &buf, 0x6081, null));
 }
 
 test "decodes RV64 word ops, FMA, and base pseudos (verified against llvm-objdump)" {
