@@ -22,7 +22,9 @@ pub const Decoded = struct {
     /// Sign extended where the operation's immediate is signed, so a reader adds it without
     /// knowing which form it came from. `lui` and `auipc` hold the value already shifted left by
     /// twelve, which is what the instruction means, so a reader uses it as it is and does not
-    /// shift it again.
+    /// shift it again. `fence` holds instruction bits 31 to 20 unsigned: `fm` in bits 11 to 8,
+    /// `pred` in bits 7 to 4 and `succ` in bits 3 to 0. `csrrwi`, `csrrsi` and `csrrci` hold their
+    /// five bit unsigned value, and `rs1` stays 0.
     imm: i64 = 0,
     csr: u12 = 0,
     /// The rounding mode a float operation names, which is `dyn` for most of them.
@@ -435,6 +437,8 @@ const opcode_op_32: u7 = 0b0111011;
 const opcode_branch: u7 = 0b1100011;
 const opcode_jalr: u7 = 0b1100111;
 const opcode_jal: u7 = 0b1101111;
+const opcode_misc_mem: u7 = 0b0001111;
+const opcode_system: u7 = 0b1110011;
 
 fn decode32(word: u32) Decoded {
     const unknown: Decoded = .{ .op = .unknown, .len = 4 };
@@ -453,8 +457,56 @@ fn decode32(word: u32) Decoded {
         opcode_op => opReg(word) orelse unknown,
         opcode_op_imm_32 => opImm32(word) orelse unknown,
         opcode_op_32 => opReg32(word) orelse unknown,
+        opcode_misc_mem => miscMem(word) orelse unknown,
+        opcode_system => system(word) orelse unknown,
         else => unknown,
     };
+}
+
+/// `fence` keeps its twelve immediate bits unsigned in `imm`: `fm` in bits 11 to 8, the
+/// predecessor set in bits 7 to 4 and the successor set in bits 3 to 0. The register fields are
+/// reserved and a reader ignores them, so they stay zero. `fence.i` ignores `imm`, `rs1` and `rd`
+/// in the same way, because a later extension may define them.
+fn miscMem(word: u32) ?Decoded {
+    return switch (funct3(word)) {
+        0b000 => .{ .op = .fence, .len = 4, .imm = word >> 20 },
+        0b001 => .{ .op = .fence_i, .len = 4 },
+        else => null,
+    };
+}
+
+/// The immediate forms of the CSR operations hold their five bit unsigned value in `imm`, so
+/// `rs1` is a register only for the three register forms.
+fn system(word: u32) ?Decoded {
+    const f3 = funct3(word);
+    const op: Op = switch (f3) {
+        0b001 => .csrrw,
+        0b010 => .csrrs,
+        0b011 => .csrrc,
+        0b101 => .csrrwi,
+        0b110 => .csrrsi,
+        0b111 => .csrrci,
+        0b000 => return privileged(word),
+        0b100 => return null,
+    };
+    const csr: u12 = @truncate(word >> 20);
+    if (f3 < 0b100) return .{ .op = op, .len = 4, .rd = rdOf(word), .rs1 = rs1Of(word), .csr = csr };
+    return .{ .op = op, .len = 4, .rd = rdOf(word), .imm = rs1Of(word), .csr = csr };
+}
+
+fn privileged(word: u32) ?Decoded {
+    if (funct7(word) == 0b0001001 and rdOf(word) == 0) {
+        return .{ .op = .sfence_vma, .len = 4, .rs1 = rs1Of(word), .rs2 = rs2Of(word) };
+    }
+    const op: Op = switch (word) {
+        0x00000073 => .ecall,
+        0x00100073 => .ebreak,
+        0x10200073 => .sret,
+        0x30200073 => .mret,
+        0x10500073 => .wfi,
+        else => return null,
+    };
+    return .{ .op = op, .len = 4 };
 }
 
 fn branch(word: u32) ?Decoded {
@@ -1262,5 +1314,224 @@ test "a reserved compressed encoding decodes as unknown with a length of two" {
     // `c.addi4spn`, `c.addi16sp` and `c.lui` immediates.
     for ([_]u16{ 0x0000, 0x2001, 0x4002, 0x8002, 0x0004, 0x6101, 0x6081, 0x9C61 }) |half| {
         try std.testing.expectEqual(Decoded{ .op = .unknown, .len = 2 }, try decodeHalf(half));
+    }
+}
+
+fn csrWord(csr: u12, f3: u3, rd: u5, rs1: u5) u32 {
+    return iType(f3, opcode_system, rd, rs1, @bitCast(csr));
+}
+
+test "ecall and ebreak differ in bit 20 alone" {
+    // I type, opcode 1110011, funct3 000, rd and rs1 zero, imm[11:0] 0 for ecall and 1 for ebreak.
+    try std.testing.expectEqual(Decoded{ .op = .ecall, .len = 4 }, try decodeWord(0x00000073));
+    try std.testing.expectEqual(Decoded{ .op = .ebreak, .len = 4 }, try decodeWord(0x00100073));
+    try std.testing.expectEqual(@as(u32, 1) << 20, 0x00000073 ^ 0x00100073);
+}
+
+test "mret, sret and wfi decode as whole words" {
+    // imm[11:0] is 0011000 00010 for mret, 0001000 00010 for sret and 0001000 00101 for wfi.
+    // Then rs1 00000, funct3 000, rd 00000 and opcode 1110011.
+    try std.testing.expectEqual(Decoded{ .op = .mret, .len = 4 }, try decodeWord(0x30200073));
+    try std.testing.expectEqual(Decoded{ .op = .sret, .len = 4 }, try decodeWord(0x10200073));
+    try std.testing.expectEqual(Decoded{ .op = .wfi, .len = 4 }, try decodeWord(0x10500073));
+}
+
+test "privileged lookalikes with another field set decode as unknown" {
+    // rd = x1 on ecall, mret, sret and wfi, then rs1 = x1 on mret, sret and wfi, then three
+    // immediates that no instruction uses.
+    const words = [_]u32{
+        0x000000F3, 0x302000F3, 0x102000F3, 0x105000F3,
+        0x30208073, 0x10208073, 0x10508073, 0x30300073,
+        0x10600073, 0x20200073,
+    };
+    for (words) |word| {
+        try std.testing.expectEqual(Decoded{ .op = .unknown, .len = 4 }, try decodeWord(word));
+    }
+}
+
+test "a system word with funct3 100 decodes as unknown" {
+    try std.testing.expectEqual(Decoded{ .op = .unknown, .len = 4 }, try decodeWord(0x00004073));
+    try std.testing.expectEqual(Decoded{ .op = .unknown, .len = 4 }, try decodeWord(0x30004573));
+}
+
+test "the six csr operations read the csr number and the source" {
+    // csr[11:0] in bits 31 to 20, rs1 in 19 to 15, funct3 in 14 to 12, rd in 11 to 7, opcode
+    // 1110011. Here csr 0x305 (mtvec), rd x5 and rs1 x6, so the base is 0x30500000 | 0x30000 |
+    // 0x280 | 0x73 = 0x305302F3 and funct3 adds 0x1000 per step.
+    try std.testing.expectEqual(
+        Decoded{ .op = .csrrw, .len = 4, .rd = 5, .rs1 = 6, .csr = 0x305 },
+        try decodeWord(0x305312F3),
+    );
+    try std.testing.expectEqual(
+        Decoded{ .op = .csrrs, .len = 4, .rd = 5, .rs1 = 6, .csr = 0x305 },
+        try decodeWord(0x305322F3),
+    );
+    try std.testing.expectEqual(
+        Decoded{ .op = .csrrc, .len = 4, .rd = 5, .rs1 = 6, .csr = 0x305 },
+        try decodeWord(0x305332F3),
+    );
+    // The immediate forms take funct3 101, 110 and 111, and bits 19 to 15 are a five bit
+    // unsigned value. Here the value is 31, so bits 19 to 15 are 0xF8000.
+    // csrrwi x7, mip 0x344, 31: 0x34400000 | 0xF8000 | 0x5000 | 0x380 | 0x73.
+    try std.testing.expectEqual(
+        Decoded{ .op = .csrrwi, .len = 4, .rd = 7, .imm = 31, .csr = 0x344 },
+        try decodeWord(0x344FD3F3),
+    );
+    // csrrsi x7, mepc 0x341, 1: 0x34100000 | 0x8000 | 0x6000 | 0x380 | 0x73.
+    try std.testing.expectEqual(
+        Decoded{ .op = .csrrsi, .len = 4, .rd = 7, .imm = 1, .csr = 0x341 },
+        try decodeWord(0x3410E3F3),
+    );
+    // csrrci x7, mcause 0x342, 2: 0x34200000 | 0x10000 | 0x7000 | 0x380 | 0x73.
+    try std.testing.expectEqual(
+        Decoded{ .op = .csrrci, .len = 4, .rd = 7, .imm = 2, .csr = 0x342 },
+        try decodeWord(0x342173F3),
+    );
+}
+
+test "the csr numbers the firmware uses decode from bits 31 to 20" {
+    // Numbers from the privileged specification: mstatus 0x300, mie 0x304, mtvec 0x305,
+    // mepc 0x341, mcause 0x342, mip 0x344, satp 0x180 and stimecmp 0x14D. Each word is
+    // `csrrw x0, csr, x5`, which is csr << 20 | 0x28000 | 0x1000 | 0x73.
+    const cases = [_]struct { word: u32, csr: u12 }{
+        .{ .word = 0x30029073, .csr = 0x300 },
+        .{ .word = 0x30429073, .csr = 0x304 },
+        .{ .word = 0x30529073, .csr = 0x305 },
+        .{ .word = 0x34129073, .csr = 0x341 },
+        .{ .word = 0x34229073, .csr = 0x342 },
+        .{ .word = 0x34429073, .csr = 0x344 },
+        .{ .word = 0x18029073, .csr = 0x180 },
+        .{ .word = 0x14D29073, .csr = 0x14D },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            Decoded{ .op = .csrrw, .len = 4, .rd = 0, .rs1 = 5, .csr = case.csr },
+            try decodeWord(case.word),
+        );
+        try std.testing.expectEqual(case.word, csrWord(case.csr, 0b001, 0, 5));
+    }
+}
+
+test "csr pseudo instructions decode as their real encodings" {
+    // csrr a0, mstatus is csrrs x10, 0x300, x0: 0x30000000 | 0x2000 | 0x500 | 0x73.
+    try std.testing.expectEqual(
+        Decoded{ .op = .csrrs, .len = 4, .rd = 10, .rs1 = 0, .csr = 0x300 },
+        try decodeWord(0x30002573),
+    );
+    // csrw mtvec, t0 is csrrw x0, 0x305, x5: 0x30500000 | 0x28000 | 0x1000 | 0x73.
+    try std.testing.expectEqual(
+        Decoded{ .op = .csrrw, .len = 4, .rd = 0, .rs1 = 5, .csr = 0x305 },
+        try decodeWord(0x30529073),
+    );
+    // csrs mie, a0 is csrrs x0, 0x304, x10: 0x30400000 | 0x50000 | 0x2000 | 0x73.
+    try std.testing.expectEqual(
+        Decoded{ .op = .csrrs, .len = 4, .rd = 0, .rs1 = 10, .csr = 0x304 },
+        try decodeWord(0x30452073),
+    );
+    // csrci mstatus, 8 is csrrci x0, 0x300, 8: 0x30000000 | 0x40000 | 0x7000 | 0x73.
+    try std.testing.expectEqual(
+        Decoded{ .op = .csrrci, .len = 4, .rd = 0, .imm = 8, .csr = 0x300 },
+        try decodeWord(0x30047073),
+    );
+}
+
+test "fence keeps its fields in the immediate and fence.i is a separate word" {
+    // imm[11:0] is fm[3:0] pred[3:0] succ[3:0], with the bits i, o, r and w from high to low.
+    // Then rs1 00000, funct3 000, rd 00000 and opcode 0001111.
+    // fence rw, rw: fm 0000, pred 0011, succ 0011.
+    try std.testing.expectEqual(Decoded{ .op = .fence, .len = 4, .imm = 0x033 }, try decodeWord(0x0330000F));
+    // fence iorw, iorw: pred 1111, succ 1111.
+    try std.testing.expectEqual(Decoded{ .op = .fence, .len = 4, .imm = 0x0FF }, try decodeWord(0x0FF0000F));
+    // fence w, r: pred 0001, succ 0010.
+    try std.testing.expectEqual(Decoded{ .op = .fence, .len = 4, .imm = 0x012 }, try decodeWord(0x0120000F));
+    // fence.tso: fm 1000, pred 0011, succ 0011. The field stays unsigned.
+    try std.testing.expectEqual(Decoded{ .op = .fence, .len = 4, .imm = 0x833 }, try decodeWord(0x8330000F));
+    // fence.i: funct3 001 and opcode 0001111. Its imm, rs1 and rd are ignored, because a later
+    // extension may define them. The words set none of them, then imm, rs1 and rd in turn.
+    for ([_]u32{ 0x0000100F, 0x0010100F, 0x0001900F, 0x0000108F }) |word| {
+        try std.testing.expectEqual(Decoded{ .op = .fence_i, .len = 4 }, try decodeWord(word));
+    }
+    // Only funct3 010 and funct3 111 stay reserved in this opcode.
+    for ([_]u32{ 0x0000200F, 0x0000700F }) |word| {
+        try std.testing.expectEqual(Decoded{ .op = .unknown, .len = 4 }, try decodeWord(word));
+    }
+}
+
+test "ecall and ebreak need every other field zero" {
+    // The fence pair has a rule that says to ignore the reserved fields. These two have no such
+    // rule. The specification fixes their other fields at zero, so a word that sets one is not
+    // ecall or ebreak. Do not make them ignore those fields to match fence and fence.i.
+    // The words are ebreak with rd 1, ebreak with rs1 1 and ecall with rs1 1.
+    for ([_]u32{ 0x001000F3, 0x00108073, 0x00008073 }) |word| {
+        try std.testing.expectEqual(Decoded{ .op = .unknown, .len = 4 }, try decodeWord(word));
+    }
+}
+
+test "sfence.vma carries its two register operands" {
+    // funct7 0001001, rs2, rs1, funct3 000, rd 00000, opcode 1110011.
+    // sfence.vma x0, x0: 0x12000073.
+    try std.testing.expectEqual(Decoded{ .op = .sfence_vma, .len = 4 }, try decodeWord(0x12000073));
+    // sfence.vma a0, x0: rs1 x10 is 0x50000.
+    try std.testing.expectEqual(
+        Decoded{ .op = .sfence_vma, .len = 4, .rs1 = 10 },
+        try decodeWord(0x12050073),
+    );
+    // sfence.vma a0, a1: rs2 x11 is 0xB00000.
+    try std.testing.expectEqual(
+        Decoded{ .op = .sfence_vma, .len = 4, .rs1 = 10, .rs2 = 11 },
+        try decodeWord(0x12B50073),
+    );
+    // A nonzero rd is reserved.
+    try std.testing.expectEqual(Decoded{ .op = .unknown, .len = 4 }, try decodeWord(0x120500F3));
+}
+
+test "words assembled by llvm decode to the expected fields" {
+    // Each word comes from assembling the named instruction with
+    // `zig cc --target=riscv64-linux-musl -c` and reading the .text bytes of the object file.
+    // To regenerate a word, assemble the same line and dump the object with `llvm-objdump -d`.
+    const cases = [_]struct { word: u32, want: Decoded }{
+        // csrw mtvec, t0
+        .{ .word = 0x30529073, .want = .{ .op = .csrrw, .len = 4, .rd = 0, .rs1 = 5, .csr = 0x305 } },
+        // csrr a0, mstatus
+        .{ .word = 0x30002573, .want = .{ .op = .csrrs, .len = 4, .rd = 10, .rs1 = 0, .csr = 0x300 } },
+        // csrw mie, zero
+        .{ .word = 0x30401073, .want = .{ .op = .csrrw, .len = 4, .rd = 0, .rs1 = 0, .csr = 0x304 } },
+        // csrw mip, zero
+        .{ .word = 0x34401073, .want = .{ .op = .csrrw, .len = 4, .rd = 0, .rs1 = 0, .csr = 0x344 } },
+        // csrs mstatus, t1
+        .{ .word = 0x30032073, .want = .{ .op = .csrrs, .len = 4, .rd = 0, .rs1 = 6, .csr = 0x300 } },
+        // csrci mstatus, 8
+        .{ .word = 0x30047073, .want = .{ .op = .csrrci, .len = 4, .rd = 0, .imm = 8, .csr = 0x300 } },
+        // csrwi mtvec, 0
+        .{ .word = 0x30505073, .want = .{ .op = .csrrwi, .len = 4, .rd = 0, .imm = 0, .csr = 0x305 } },
+        // csrrw a1, mepc, a2
+        .{ .word = 0x341615f3, .want = .{ .op = .csrrw, .len = 4, .rd = 11, .rs1 = 12, .csr = 0x341 } },
+        // csrrc a3, mcause, a4
+        .{ .word = 0x342736f3, .want = .{ .op = .csrrc, .len = 4, .rd = 13, .rs1 = 14, .csr = 0x342 } },
+        // csrrsi a5, satp, 31
+        .{ .word = 0x180fe7f3, .want = .{ .op = .csrrsi, .len = 4, .rd = 15, .imm = 31, .csr = 0x180 } },
+        // csrw stimecmp, t3
+        .{ .word = 0x14de1073, .want = .{ .op = .csrrw, .len = 4, .rd = 0, .rs1 = 28, .csr = 0x14D } },
+        // mret, sret, wfi, ecall and ebreak
+        .{ .word = 0x30200073, .want = .{ .op = .mret, .len = 4 } },
+        .{ .word = 0x10200073, .want = .{ .op = .sret, .len = 4 } },
+        .{ .word = 0x10500073, .want = .{ .op = .wfi, .len = 4 } },
+        .{ .word = 0x00000073, .want = .{ .op = .ecall, .len = 4 } },
+        .{ .word = 0x00100073, .want = .{ .op = .ebreak, .len = 4 } },
+        // fence rw, rw
+        .{ .word = 0x0330000f, .want = .{ .op = .fence, .len = 4, .imm = 0x033 } },
+        // fence iorw, iorw
+        .{ .word = 0x0ff0000f, .want = .{ .op = .fence, .len = 4, .imm = 0x0FF } },
+        // fence.i
+        .{ .word = 0x0000100f, .want = .{ .op = .fence_i, .len = 4 } },
+        // sfence.vma
+        .{ .word = 0x12000073, .want = .{ .op = .sfence_vma, .len = 4 } },
+        // sfence.vma a0, a1
+        .{ .word = 0x12b50073, .want = .{ .op = .sfence_vma, .len = 4, .rs1 = 10, .rs2 = 11 } },
+        // fence r, w
+        .{ .word = 0x0210000f, .want = .{ .op = .fence, .len = 4, .imm = 0x021 } },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.want, try decodeWord(case.word));
     }
 }
