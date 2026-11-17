@@ -438,6 +438,7 @@ const opcode_branch: u7 = 0b1100011;
 const opcode_jalr: u7 = 0b1100111;
 const opcode_jal: u7 = 0b1101111;
 const opcode_misc_mem: u7 = 0b0001111;
+const opcode_amo: u7 = 0b0101111;
 const opcode_system: u7 = 0b1110011;
 
 fn decode32(word: u32) Decoded {
@@ -459,6 +460,7 @@ fn decode32(word: u32) Decoded {
         opcode_op_32 => opReg32(word) orelse unknown,
         opcode_misc_mem => miscMem(word) orelse unknown,
         opcode_system => system(word) orelse unknown,
+        opcode_amo => amo(word) orelse unknown,
         else => unknown,
     };
 }
@@ -599,6 +601,16 @@ fn opReg(word: u32) ?Decoded {
             0b101 => .sra,
             else => return null,
         },
+        0b0000001 => switch (funct3(word)) {
+            0b000 => .mul,
+            0b001 => .mulh,
+            0b010 => .mulhsu,
+            0b011 => .mulhu,
+            0b100 => .div,
+            0b101 => .divu,
+            0b110 => .rem,
+            0b111 => .remu,
+        },
         else => return null,
     };
     return .{ .op = op, .len = 4, .rd = rdOf(word), .rs1 = rs1Of(word), .rs2 = rs2Of(word) };
@@ -617,9 +629,54 @@ fn opReg32(word: u32) ?Decoded {
             0b101 => .sraw,
             else => return null,
         },
+        0b0000001 => switch (funct3(word)) {
+            0b000 => .mulw,
+            0b100 => .divw,
+            0b101 => .divuw,
+            0b110 => .remw,
+            0b111 => .remuw,
+            else => return null,
+        },
         else => return null,
     };
     return .{ .op = op, .len = 4, .rd = rdOf(word), .rs1 = rs1Of(word), .rs2 = rs2Of(word) };
+}
+
+/// The atomics. Bit 26 is `aq` and bit 25 is `rl`. `lr` has no second source and the
+/// specification fixes its `rs2` field at zero, so a nonzero field is not an `lr`. The other
+/// operations take their `funct5` from bits 31 to 27 and the width from `funct3`.
+fn amo(word: u32) ?Decoded {
+    const double = switch (funct3(word)) {
+        0b010 => false,
+        0b011 => true,
+        else => return null,
+    };
+    const op: Op = switch (@as(u5, @truncate(word >> 27))) {
+        0b00010 => blk: {
+            if (rs2Of(word) != 0) return null;
+            break :blk if (double) .lr_d else .lr_w;
+        },
+        0b00011 => if (double) .sc_d else .sc_w,
+        0b00001 => if (double) .amoswap_d else .amoswap_w,
+        0b00000 => if (double) .amoadd_d else .amoadd_w,
+        0b00100 => if (double) .amoxor_d else .amoxor_w,
+        0b01100 => if (double) .amoand_d else .amoand_w,
+        0b01000 => if (double) .amoor_d else .amoor_w,
+        0b10000 => if (double) .amomin_d else .amomin_w,
+        0b10100 => if (double) .amomax_d else .amomax_w,
+        0b11000 => if (double) .amominu_d else .amominu_w,
+        0b11100 => if (double) .amomaxu_d else .amomaxu_w,
+        else => return null,
+    };
+    return .{
+        .op = op,
+        .len = 4,
+        .rd = rdOf(word),
+        .rs1 = rs1Of(word),
+        .rs2 = rs2Of(word),
+        .aq = (word >> 26) & 1 != 0,
+        .rl = (word >> 25) & 1 != 0,
+    };
 }
 
 fn rdOf(word: u32) u5 {
@@ -1534,4 +1591,148 @@ test "words assembled by llvm decode to the expected fields" {
     for (cases) |case| {
         try std.testing.expectEqual(case.want, try decodeWord(case.word));
     }
+}
+
+test "words assembled by llvm for M and A decode to the expected fields" {
+    // Each word comes from assembling the named instruction with
+    // `zig cc --target=riscv64-linux-musl -c` after `.option norvc`, then reading the .text
+    // bytes of the object file. Registers are a0 (x10), a1 (x11) and a2 (x12).
+    const r3 = Decoded{ .op = .unknown, .len = 4, .rd = 10, .rs1 = 11, .rs2 = 12 };
+    const lr = Decoded{ .op = .unknown, .len = 4, .rd = 10, .rs1 = 11 };
+    const cases = [_]struct { word: u32, want: Decoded }{
+        .{ .word = 0x02c58533, .want = with(r3, .mul) },
+        .{ .word = 0x02c59533, .want = with(r3, .mulh) },
+        .{ .word = 0x02c5a533, .want = with(r3, .mulhsu) },
+        .{ .word = 0x02c5b533, .want = with(r3, .mulhu) },
+        .{ .word = 0x02c5c533, .want = with(r3, .div) },
+        .{ .word = 0x02c5d533, .want = with(r3, .divu) },
+        .{ .word = 0x02c5e533, .want = with(r3, .rem) },
+        .{ .word = 0x02c5f533, .want = with(r3, .remu) },
+        .{ .word = 0x02c5853b, .want = with(r3, .mulw) },
+        .{ .word = 0x02c5c53b, .want = with(r3, .divw) },
+        .{ .word = 0x02c5d53b, .want = with(r3, .divuw) },
+        .{ .word = 0x02c5e53b, .want = with(r3, .remw) },
+        .{ .word = 0x02c5f53b, .want = with(r3, .remuw) },
+        // lr.w, lr.w.aq
+        .{ .word = 0x1005a52f, .want = with(lr, .lr_w) },
+        .{ .word = 0x1405a52f, .want = aqrl(with(lr, .lr_w), true, false) },
+        // sc.w, sc.w.rl
+        .{ .word = 0x18c5a52f, .want = with(r3, .sc_w) },
+        .{ .word = 0x1ac5a52f, .want = aqrl(with(r3, .sc_w), false, true) },
+        .{ .word = 0x08c5a52f, .want = with(r3, .amoswap_w) },
+        .{ .word = 0x00c5a52f, .want = with(r3, .amoadd_w) },
+        .{ .word = 0x20c5a52f, .want = with(r3, .amoxor_w) },
+        .{ .word = 0x60c5a52f, .want = with(r3, .amoand_w) },
+        .{ .word = 0x40c5a52f, .want = with(r3, .amoor_w) },
+        .{ .word = 0x80c5a52f, .want = with(r3, .amomin_w) },
+        .{ .word = 0xa0c5a52f, .want = with(r3, .amomax_w) },
+        .{ .word = 0xc0c5a52f, .want = with(r3, .amominu_w) },
+        .{ .word = 0xe0c5a52f, .want = with(r3, .amomaxu_w) },
+        .{ .word = 0x1005b52f, .want = with(lr, .lr_d) },
+        .{ .word = 0x18c5b52f, .want = with(r3, .sc_d) },
+        .{ .word = 0x08c5b52f, .want = with(r3, .amoswap_d) },
+        .{ .word = 0x00c5b52f, .want = with(r3, .amoadd_d) },
+        // amoadd.d.aqrl
+        .{ .word = 0x06c5b52f, .want = aqrl(with(r3, .amoadd_d), true, true) },
+        .{ .word = 0x20c5b52f, .want = with(r3, .amoxor_d) },
+        .{ .word = 0x60c5b52f, .want = with(r3, .amoand_d) },
+        .{ .word = 0x40c5b52f, .want = with(r3, .amoor_d) },
+        .{ .word = 0x80c5b52f, .want = with(r3, .amomin_d) },
+        .{ .word = 0xa0c5b52f, .want = with(r3, .amomax_d) },
+        .{ .word = 0xc0c5b52f, .want = with(r3, .amominu_d) },
+        .{ .word = 0xe0c5b52f, .want = with(r3, .amomaxu_d) },
+        // lr.d.aqrl a0, (a1)
+        .{ .word = 0x1605b52f, .want = aqrl(with(lr, .lr_d), true, true) },
+        // lr.d.rl a3, (a4)
+        .{ .word = 0x120736af, .want = aqrl(.{ .op = .lr_d, .len = 4, .rd = 13, .rs1 = 14 }, false, true) },
+        // sc.d.aq a0, a2, (a1)
+        .{ .word = 0x1cc5b52f, .want = aqrl(with(r3, .sc_d), true, false) },
+        // sc.d.aqrl a5, a6, (a7)
+        .{ .word = 0x1f08b7af, .want = aqrl(.{ .op = .sc_d, .len = 4, .rd = 15, .rs1 = 17, .rs2 = 16 }, true, true) },
+        // amoswap.w.aq a0, a2, (a1)
+        .{ .word = 0x0cc5a52f, .want = aqrl(with(r3, .amoswap_w), true, false) },
+        // amoor.w.rl t0, t1, (t2)
+        .{ .word = 0x4263a2af, .want = aqrl(.{ .op = .amoor_w, .len = 4, .rd = 5, .rs1 = 7, .rs2 = 6 }, false, true) },
+        // amomaxu.w.aqrl a0, a2, (a1)
+        .{ .word = 0xe6c5a52f, .want = aqrl(with(r3, .amomaxu_w), true, true) },
+        // amomin.d.aq s1, s2, (s3)
+        .{ .word = 0x8529b4af, .want = aqrl(.{ .op = .amomin_d, .len = 4, .rd = 9, .rs1 = 19, .rs2 = 18 }, true, false) },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.want, try decodeWord(case.word));
+    }
+}
+
+fn with(base: Decoded, op: Op) Decoded {
+    var out = base;
+    out.op = op;
+    return out;
+}
+
+fn aqrl(base: Decoded, aq: bool, rl: bool) Decoded {
+    var out = base;
+    out.aq = aq;
+    out.rl = rl;
+    return out;
+}
+
+test "every funct5 value in the atomic opcode decodes or is unknown" {
+    const assigned = [_]struct { f5: u5, w: Op, d: Op }{
+        .{ .f5 = 0b00010, .w = .lr_w, .d = .lr_d },
+        .{ .f5 = 0b00011, .w = .sc_w, .d = .sc_d },
+        .{ .f5 = 0b00001, .w = .amoswap_w, .d = .amoswap_d },
+        .{ .f5 = 0b00000, .w = .amoadd_w, .d = .amoadd_d },
+        .{ .f5 = 0b00100, .w = .amoxor_w, .d = .amoxor_d },
+        .{ .f5 = 0b01100, .w = .amoand_w, .d = .amoand_d },
+        .{ .f5 = 0b01000, .w = .amoor_w, .d = .amoor_d },
+        .{ .f5 = 0b10000, .w = .amomin_w, .d = .amomin_d },
+        .{ .f5 = 0b10100, .w = .amomax_w, .d = .amomax_d },
+        .{ .f5 = 0b11000, .w = .amominu_w, .d = .amominu_d },
+        .{ .f5 = 0b11100, .w = .amomaxu_w, .d = .amomaxu_d },
+    };
+    const unknown = Decoded{ .op = .unknown, .len = 4 };
+    var seen: usize = 0;
+    for (0..32) |value| {
+        const f5: u5 = @intCast(value);
+        var want_w: Op = .unknown;
+        var want_d: Op = .unknown;
+        for (assigned) |entry| {
+            if (entry.f5 == f5) {
+                want_w = entry.w;
+                want_d = entry.d;
+                seen += 1;
+            }
+        }
+        const word_w = rType(@as(u7, f5) << 2, 0b010, opcode_amo, 10, 11, 0);
+        const word_d = rType(@as(u7, f5) << 2, 0b011, opcode_amo, 10, 11, 0);
+        try std.testing.expectEqual(want_w, (try decodeWord(word_w)).op);
+        try std.testing.expectEqual(want_d, (try decodeWord(word_d)).op);
+        if (want_w == .unknown) {
+            try std.testing.expectEqual(unknown, try decodeWord(word_w));
+            try std.testing.expectEqual(unknown, try decodeWord(word_d));
+        }
+    }
+    try std.testing.expectEqual(assigned.len, seen);
+}
+
+test "atomic widths other than word and double word decode as unknown" {
+    const unknown = Decoded{ .op = .unknown, .len = 4 };
+    for ([_]u3{ 0b000, 0b001, 0b100, 0b101, 0b110, 0b111 }) |width| {
+        try std.testing.expectEqual(unknown, try decodeWord(rType(0, width, opcode_amo, 10, 11, 12)));
+    }
+}
+
+test "lr with a nonzero rs2 decodes as unknown" {
+    // The specification fixes the rs2 field of lr at zero and has no rule to ignore it.
+    const unknown = Decoded{ .op = .unknown, .len = 4 };
+    try std.testing.expectEqual(unknown, try decodeWord(0x1005a52f | (1 << 20)));
+    try std.testing.expectEqual(unknown, try decodeWord(0x1005b52f | (31 << 20)));
+}
+
+test "multiply and divide words with another funct7 or width decode as unknown" {
+    const unknown = Decoded{ .op = .unknown, .len = 4 };
+    for ([_]u3{ 0b001, 0b010, 0b011 }) |f3| {
+        try std.testing.expectEqual(unknown, try decodeWord(rType(0b0000001, f3, opcode_op_32, 10, 11, 12)));
+    }
+    try std.testing.expectEqual(unknown, try decodeWord(rType(0b0000011, 0b000, opcode_op, 10, 11, 12)));
 }
