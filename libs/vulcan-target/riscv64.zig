@@ -5,6 +5,7 @@ const std = @import("std");
 
 pub const encode = @import("riscv64/encode.zig");
 pub const disasm = @import("riscv64/disasm.zig");
+pub const decode = @import("riscv64/decode.zig");
 pub const isel = @import("riscv64/isel.zig");
 pub const emit = @import("riscv64/emit.zig");
 pub const schedule = @import("riscv64/schedule.zig");
