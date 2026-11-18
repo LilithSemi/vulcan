@@ -32,7 +32,8 @@ const Run = *const fn (state: *lift.Warp) callconv(.c) u32;
 fn native(allocator: std.mem.Allocator, program: []const u32, entry: u32, state: *lift.Warp) !lift.Exit {
     var func = Function.init(allocator);
     defer func.deinit();
-    try lift.region(allocator, &func, program, entry);
+    // A region is compiled for the lanes the warp it will run on holds.
+    try lift.region(allocator, &func, program, entry, if (state.lane_count == 0) 1 else state.lane_count);
 
     // A function the backend would refuse is worth catching here, where the diagnostic says which
     // instruction is wrong.
@@ -600,7 +601,7 @@ test "a jump outside the program is refused rather than compiled" {
     defer func.deinit();
     // A jump forwards past the end of what the build holds.
     const program = [_]u32{ rv.jal(.x0, 64), target.glacier.encode.ebreak };
-    try std.testing.expectError(error.Outside, lift.region(allocator, &func, &program, 0));
+    try std.testing.expectError(error.Outside, lift.region(allocator, &func, &program, 0, 0));
 }
 
 test "a word the core does not decode is refused rather than ignored" {
@@ -610,5 +611,5 @@ test "a word the core does not decode is refused rather than ignored" {
     // A float word with a scalar operand, a form the core has and no kernel has needed, so
     // nothing decodes it.
     const program = [_]u32{ 0x0000_5057, target.glacier.encode.ebreak };
-    try std.testing.expectError(error.Illegal, lift.region(allocator, &func, &program, 0));
+    try std.testing.expectError(error.Illegal, lift.region(allocator, &func, &program, 0, 0));
 }
