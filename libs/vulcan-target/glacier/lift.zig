@@ -58,6 +58,19 @@ pub const Exit = enum(u32) {
 /// core has, so one engine serves every profile.
 pub const max_lanes = 16;
 
+/// How many words one region covers at most.
+///
+/// A region is one function for the backend, and the backend's cost grows faster than the size of
+/// what it is given: 770 words of one lane take seven seconds to compile, which no host can wait
+/// for while a guest holds a kernel open. A long kernel becomes several regions instead, each
+/// compiled once and kept, and a warp that steps out of one asks the host for the next. The number
+/// is a balance: smaller regions compile faster, and a loop cut in half pays a host round trip
+/// every turn.
+///
+/// A word this cannot lift is now refused when a warp reaches the region holding it rather than
+/// when the kernel is first compiled, so a kernel can write memory before it is refused.
+pub const region_words: u32 = 32;
+
 pub const Warp = extern struct {
     /// The scalar registers. Register zero is here and never used, so an index needs no case of
     /// its own at run time.
@@ -186,6 +199,8 @@ const Lifter = struct {
     /// one of them, so the count is a fact about the card that the lift is given rather than a
     /// number it reads out of the warp at run time.
     lanes: u32,
+    /// The first word of this region, which with `region_words` says what it covers.
+    first: u32,
     bool_t: Type,
     ptr_t: Type,
 
@@ -1079,6 +1094,27 @@ const Lifter = struct {
         self.at = merge;
     }
 
+    /// Whether a word is one this region covers. A word outside it is somewhere the warp leaves
+    /// for, not somewhere this function goes.
+    fn covers(self: *const Lifter, at: u32) bool {
+        if (at < self.first or at >= self.program.len) return false;
+        return at - self.first < region_words;
+    }
+
+    /// The block an edge goes to: the word's own block where this region covers it, or a block
+    /// that leaves for the host to enter the region the word starts.
+    fn edgeTo(self: *Lifter, at: u32) Error!Block {
+        if (self.covers(at)) {
+            if (self.blocks[at]) |block| return block;
+        }
+        const out = try self.func.appendBlock();
+        const held = self.at;
+        self.at = out;
+        try self.leave(.jumped, try self.constant(at * 4));
+        self.at = held;
+        return out;
+    }
+
     fn leave(self: *Lifter, why: Exit, pc: Value) Error!void {
         try self.writeField("pc", pc);
         for (1..self.slots.len) |which| {
@@ -1087,6 +1123,18 @@ const Lifter = struct {
         }
         const reason = try self.func.appendInst(self.at, self.u32_t, .{ .iconst = @as(i64, @backingInt(why)) });
         self.func.setTerminator(self.at, .{ .ret = ir.function.Ret.one(reason) });
+    }
+
+    /// A word that starts a block, where this region covers it.
+    fn mark(self: *Lifter, at: u32) void {
+        if (self.covers(at)) self.leaders[at] = true;
+    }
+
+    /// A word to look at next, where this region covers it. A word outside the window belongs to
+    /// the region that begins there.
+    fn reach(self: *Lifter, stack: *std.ArrayList(u32), at: u32) Error!void {
+        if (!self.covers(at)) return;
+        try stack.append(self.allocator, at);
     }
 
     /// Every word the region reaches from its entry, and every word that starts a block.
@@ -1105,13 +1153,13 @@ const Lifter = struct {
                 // Nowhere else in the region. Where the warp goes next is the caller's to decide.
                 .retire, .fault, .jalr => {},
                 // The word after it, because a warp that was released carries on from there.
-                .barrier => try stack.append(self.allocator, at + 1),
-                .jal => |each| try stack.append(self.allocator, try self.target(pc, each.offset)),
+                .barrier => try self.reach(&stack, at + 1),
+                .jal => |each| try self.reach(&stack, try self.target(pc, each.offset)),
                 .branch => |each| {
-                    try stack.append(self.allocator, try self.target(pc, each.offset));
-                    try stack.append(self.allocator, at + 1);
+                    try self.reach(&stack, try self.target(pc, each.offset));
+                    try self.reach(&stack, at + 1);
                 },
-                else => try stack.append(self.allocator, at + 1),
+                else => try self.reach(&stack, at + 1),
             }
         }
 
@@ -1120,12 +1168,12 @@ const Lifter = struct {
             if (!self.reached[at]) continue;
             const pc: u32 = @intCast(at * 4);
             switch (try decode.one(self.program[at])) {
-                .jal => |each| self.leaders[try self.target(pc, each.offset)] = true,
+                .jal => |each| self.mark(try self.target(pc, each.offset)),
                 .branch => |each| {
-                    self.leaders[try self.target(pc, each.offset)] = true;
-                    self.leaders[at + 1] = true;
+                    self.mark(try self.target(pc, each.offset));
+                    self.mark(@intCast(at + 1));
                 },
-                .barrier => self.leaders[at + 1] = true,
+                .barrier => self.mark(@intCast(at + 1)),
                 else => {},
             }
         }
@@ -1185,6 +1233,8 @@ const Lifter = struct {
                     // A jump backwards is where a kernel loops, and a kernel that waits for work from
                     // its host loops forever. So the stop the host asks for is read here, which is the
                     // only place a region can be left without the kernel saying so.
+                    // A jump out of the window is where this region ends and the next begins.
+                    if (!self.covers(to)) return self.leave(.jumped, try self.constant(to * 4));
                     if (to <= index) return self.jumpChecked(to);
                     try self.func.setJump(self.at, self.blocks[to].?, &.{});
                     return;
@@ -1194,24 +1244,22 @@ const Lifter = struct {
                     const b = try self.get(each.rs2);
                     const cond = try self.compare(each.on, a, b);
                     const to = try self.target(pc, each.offset);
-                    if (to <= index) {
+                    const next = try self.edgeTo(index + 1);
+                    if (self.covers(to) and to <= index) {
                         const taken = try self.func.appendBlock();
-                        try self.func.appendIf(self.at, cond, .{ .target = taken }, .{ .target = self.blocks[index + 1].? });
+                        try self.func.appendIf(self.at, cond, .{ .target = taken }, .{ .target = next });
                         self.at = taken;
                         return self.jumpChecked(to);
                     }
-                    try self.func.appendIf(
-                        self.at,
-                        cond,
-                        .{ .target = self.blocks[to].? },
-                        .{ .target = self.blocks[index + 1].? },
-                    );
+                    try self.func.appendIf(self.at, cond, .{ .target = try self.edgeTo(to) }, .{ .target = next });
                     return;
                 },
             }
 
             index += 1;
             if (index >= self.program.len) return error.Outside;
+            // The word after the last one this region covers is where the next region starts.
+            if (!self.covers(index)) return self.leave(.jumped, try self.constant(index * 4));
             if (self.leaders[index]) {
                 try self.func.setJump(self.at, self.blocks[index].?, &.{});
                 return;
@@ -1270,6 +1318,7 @@ pub fn region(allocator: std.mem.Allocator, func: *Function, program: []const u3
         .bool_t = try func.types.intern(.bool),
         .ptr_t = try func.types.ptrGlobal(),
         .lanes = lanes,
+        .first = entry / 4,
         .ctx = undefined,
         .slots = undefined,
         .carry = undefined,
