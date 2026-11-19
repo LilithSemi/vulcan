@@ -106,6 +106,49 @@ fn expectSame(program: []const u32) !void {
     try std.testing.expectEqual(@as(u32, 0), state.bus_error);
 }
 
+/// Run one program both ways where it is longer than one region covers, so the compiled side is
+/// several regions and the warp crosses from one to the next the way a host carries it.
+fn expectSameAcross(program: []const u32) !void {
+    const allocator = std.testing.allocator;
+
+    var model_memory: [words]u32 = @splat(0);
+    var memory: warp.Memory = .{ .base = base, .words = &model_memory };
+    var model: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 1 };
+    _ = try warp.run(program, &memory, &model, 100_000);
+
+    var native_memory: [words]u32 = @splat(0);
+    var served: Served = .{ .words = &native_memory, .base = base };
+    var state: lift.Warp = .{
+        .hart_count = 1,
+        .fabric = @ptrCast(&native_memory),
+        .fabric_at = base,
+        .fabric_size = native_memory.len * 4,
+        .away = Served.answer,
+        .away_ctx = &served,
+    };
+
+    var regions: usize = 0;
+    while (true) {
+        regions += 1;
+        const left = try native(allocator, program, state.pc, &state);
+        if (left == .jumped) continue;
+        try std.testing.expectEqual(lift.Exit.retired, left);
+        break;
+    }
+    // A program this long is more than one region. Without this the test would still pass if the
+    // window stopped cutting anything, and the crossing it is here for would go uncovered.
+    try std.testing.expect(regions > 1);
+
+    for (1..32) |which| {
+        if (model.x[which] == state.x[which]) continue;
+        std.debug.print(
+            "register x{d}: the model says {x}, the compiled code says {x}\n",
+            .{ which, model.x[which], state.x[which] },
+        );
+        return error.TestExpectedEqual;
+    }
+    try std.testing.expectEqualSlices(u32, &model_memory, &native_memory);
+}
 /// Run one program both ways on a warp of `lanes` lanes, and diff the lane registers as well.
 ///
 /// The lane registers start where the model starts them, recognisably stale, so a write to a lane
@@ -652,4 +695,34 @@ test "a word the core does not decode is refused rather than ignored" {
     // nothing decodes it.
     const program = [_]u32{ 0x0000_5057, target.glacier.encode.ebreak };
     try std.testing.expectError(error.Illegal, lift.region(allocator, &func, &program, 0, 0));
+}
+
+test "a kernel longer than one region runs as several and answers the same" {
+    // The backend's cost grows faster than the size of what it is given, so a region covers only
+    // so many words and a long kernel is several of them. The cut here lands in the middle of
+    // straight line code, which is the case a jump would otherwise hide.
+    const counting = lift.region_words + 40;
+    var program: [counting + 3]u32 = undefined;
+    for (program[0..counting]) |*word| word.* = rv.addi(.x1, .x1, 1);
+    program[counting] = rv.lui(.x2, base_high);
+    program[counting + 1] = rv.sw(.x1, .x2, 0);
+    program[counting + 2] = target.glacier.encode.ebreak;
+    try expectSameAcross(&program);
+}
+
+test "a loop cut by a region boundary still ends" {
+    // A loop whose body crosses the window asks the host for the next region every turn. A host
+    // that answers is what keeps it going, and the count it leaves says it ran the loop rather
+    // than falling out of it.
+    const body = lift.region_words - 2;
+    var program: [body + 7]u32 = undefined;
+    program[0] = rv.addi(.x1, .x0, 5);
+    program[1] = rv.addi(.x2, .x0, 0);
+    for (program[2 .. body + 2]) |*word| word.* = rv.addi(.x2, .x2, 1);
+    program[body + 2] = rv.addi(.x1, .x1, -1);
+    program[body + 3] = rv.bne(.x1, .x0, -@as(i13, @intCast((body + 1) * 4)));
+    program[body + 4] = rv.lui(.x3, base_high);
+    program[body + 5] = rv.sw(.x2, .x3, 0);
+    program[body + 6] = target.glacier.encode.ebreak;
+    try expectSameAcross(&program);
 }
