@@ -726,3 +726,30 @@ test "a loop cut by a region boundary still ends" {
     program[body + 6] = target.glacier.encode.ebreak;
     try expectSameAcross(&program);
 }
+
+/// One word of the convert group, whose second operand field picks which convert it is.
+fn convert(vd: u5, vs2: u5, pick: u5) u32 {
+    return (@as(u32, 0x12) << 26) | (1 << 25) | (@as(u32, vs2) << 20) |
+        (@as(u32, pick) << 15) | (0b001 << 12) | (@as(u32, vd) << 7) | 0x57;
+}
+
+test "the half converts, against the warp that says what they mean" {
+    // A half lives in the low sixteen bits of a lane, so these three move a lane between the two
+    // formats. The model is what says so, and the diff is the whole test.
+    try expectSameLanes(&.{
+        rv.lui(.x1, base_high),
+        rv.addi(.x2, .x0, -7),
+        rv.vmv_v_x(.v1, .x2),
+        rv.vid_v(.v2),
+        rv.vadd_vv(.v3, .v1, .v2),
+        // A signed lane to a half, the half back to a float, and the float narrowed to a half
+        // again, so a run covers all three and the rounding between them.
+        convert(4, 3, 0b00011),
+        convert(5, 4, 0b01100),
+        convert(6, 5, 0b10100),
+        rv.vse32(.v4, .x1),
+        rv.vadd_vx(.v7, .v5, .x0),
+        rv.vse32(.v6, .x1),
+        target.glacier.encode.ebreak,
+    }, 4);
+}

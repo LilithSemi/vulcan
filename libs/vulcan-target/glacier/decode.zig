@@ -204,6 +204,12 @@ pub const VectorOp = enum {
     fcvt_f_xu_v,
     /// A float lane to an unsigned integer lane, toward zero, saturating at either end.
     fcvt_rtz_xu_f_v,
+    /// A signed integer to a half, which arrives in the low sixteen bits of the lane.
+    fcvt_h_x_v,
+    /// A half in the low sixteen bits of the lane, widened to a float.
+    fcvt_f_h_v,
+    /// A float narrowed to a half, which arrives in the low sixteen bits of the lane.
+    fcvt_h_f_w,
     /// A word per lane from one address upwards.
     le32,
     se32,
@@ -379,6 +385,9 @@ fn vector(word: u32) Error!Instruction {
             0x04 => .fmin_vv,
             0x06 => .fmax_vv,
             0x12 => switch (vs1(word)) {
+                0b00011 => .fcvt_h_x_v,
+                0b01100 => .fcvt_f_h_v,
+                0b10100 => .fcvt_h_f_w,
                 0b00110 => .fcvt_rtz_xu_f_v,
                 0b01010 => .fcvt_f_xu_v,
                 0b01011 => .fcvt_f_x_v,
