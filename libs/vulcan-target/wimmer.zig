@@ -3812,6 +3812,10 @@ fn occupiedReg(it: *const Interval) ?u16 {
     };
 }
 
+fn baseKey(class: u16, reg: u16) u32 {
+    return (@as(u32, class) << 16) | reg;
+}
+
 /// True iff the pair is a value interval and its OWN entry-parameter fixed interval, the single
 /// legitimate same-(class, reg) overlap (the ABI register they share at entry over `[0, 1)`). Exactly
 /// one of the pair is a fixed interval (`fixed_reg != null`) and both carry the same pinned value.
@@ -3843,12 +3847,10 @@ fn occupancyConflict(a: *const Interval, b: *const Interval) ?u32 {
     return a.nextIntersection(b);
 }
 
-/// True iff some `.reg`-located interval of value `v` covers `pos` (i.e. `v` is in a register there).
-fn valueInRegAt(intervals: []const Interval, v: Value, pos: u32) bool {
-    for (intervals) |*it| {
-        if (it.fixed_reg != null) continue;
-        const iv = it.value orelse continue;
-        if (iv != v) continue;
+/// True iff some `.reg`-located piece covers `pos`. `pieces` indexes every non-fixed interval of one value.
+fn valueInRegAt(intervals: []const Interval, pieces: []const u32, pos: u32) bool {
+    for (pieces) |index| {
+        const it = &intervals[index];
         const loc = it.location orelse continue;
         switch (loc) {
             .reg => if (it.covers(pos)) return true,
@@ -3893,9 +3895,38 @@ pub fn verifyIntervals(allocator: std.mem.Allocator, intervals: []const Interval
     // CHECK 1: register exclusivity. Every pair of same-class intervals whose register SPANS overlap
     // must have disjoint live ranges, except a value interval and its own entry-param fixed interval
     // sharing the ABI register span at entry, or a coalesced copy pair.
+    //
+    // Only intervals whose spans share a register can conflict, so each interval is compared with the
+    // ones based at a register its own span reaches, in index order.
+    var by_base: std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)) = .empty;
+    defer {
+        var lists = by_base.valueIterator();
+        while (lists.next()) |list| list.deinit(allocator);
+        by_base.deinit(allocator);
+    }
+    var widest: u16 = 1;
+    for (intervals, 0..) |*it, i| {
+        const base = occupiedReg(it) orelse continue;
+        widest = @max(widest, it.regs);
+        const slot = try by_base.getOrPut(allocator, baseKey(it.class, base));
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(allocator, @intCast(i));
+    }
+    var candidates: std.ArrayList(u32) = .empty;
+    defer candidates.deinit(allocator);
     for (intervals, 0..) |*ia, i| {
         const ra = occupiedReg(ia) orelse continue;
-        for (intervals[i + 1 ..], i + 1..) |*ib, j| {
+        candidates.clearRetainingCapacity();
+        var base = ra -| (widest - 1);
+        while (base < ra +| ia.regs) : (base += 1) {
+            const list = by_base.get(baseKey(ia.class, base)) orelse continue;
+            for (list.items) |j| {
+                if (j > i) try candidates.append(allocator, j);
+            }
+        }
+        std.mem.sort(u32, candidates.items, {}, std.sort.asc(u32));
+        for (candidates.items) |j| {
+            const ib = &intervals[j];
             if (ia.class != ib.class) continue;
             const rb = occupiedReg(ib) orelse continue;
             // The FULL span, not just the base. A two-register value based at R4 occupies R4 AND R5,
@@ -3918,12 +3949,25 @@ pub fn verifyIntervals(allocator: std.mem.Allocator, intervals: []const Interval
     // CHECK 2: must_have_register satisfaction. Every `must_have_register` use of a value must
     // fall in a `.reg`-located interval of that same value. A use covered ONLY by a `.slot`
     // interval would read an operand from memory where the target forbids it.
+    var pieces: std.AutoHashMapUnmanaged(Value, std.ArrayList(u32)) = .empty;
+    defer {
+        var lists = pieces.valueIterator();
+        while (lists.next()) |list| list.deinit(allocator);
+        pieces.deinit(allocator);
+    }
+    for (intervals, 0..) |*it, i| {
+        if (it.fixed_reg != null) continue;
+        const v = it.value orelse continue;
+        const slot = try pieces.getOrPut(allocator, v);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(allocator, @intCast(i));
+    }
     for (intervals, 0..) |*ia, i| {
         if (ia.fixed_reg != null) continue;
         const va = ia.value orelse continue;
         for (ia.uses) |u| {
             if (u.kind != .must_have_register) continue;
-            if (!valueInRegAt(intervals, va, u.pos)) {
+            if (!valueInRegAt(intervals, pieces.get(va).?.items, u.pos)) {
                 try violations.append(allocator, .{ .kind = .must_have_spilled, .a = i, .b = i, .pos = u.pos });
             }
         }

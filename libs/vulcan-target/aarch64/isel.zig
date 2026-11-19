@@ -1160,17 +1160,17 @@ fn applyFoldRewrite(func: *Function, fold: *const addrfold.Analysis) Error!void 
     // before removing it. Removal order is irrelevant: no dead add's result feeds another instruction.
     for (0..func.blockCount()) |bi| {
         const list = func.blockInstsMut(@fromBackingInt(@intCast(bi)));
-        var i: usize = 0;
-        while (i < list.items.len) {
-            const inst = list.items[i];
-            if (!fold.isDeadAdd(inst)) {
-                i += 1;
+        var kept: usize = 0;
+        for (list.items) |inst| {
+            if (fold.isDeadAdd(inst)) {
+                const result = func.instResult(inst).?; // an arith_imm always defines a result
+                std.debug.assert(countUses(func, result) == 0);
                 continue;
             }
-            const result = func.instResult(inst).?; // an arith_imm always defines a result
-            std.debug.assert(countUses(func, result) == 0);
-            _ = list.orderedRemove(i); // the next inst slides into i, so do not advance
+            list.items[kept] = inst;
+            kept += 1;
         }
+        list.shrinkRetainingCapacity(kept);
     }
 }
 
@@ -1187,7 +1187,7 @@ fn applyFoldRewrite(func: *Function, fold: *const addrfold.Analysis) Error!void 
 /// is translated into this backend's own representation by `translateAllocation`, and the
 /// battle-tested `emitFromAllocation` turns it into machine code. There is NO fallback to the
 /// retired native linear scan.
-pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps) Error!Compiled {
+pub fn compileFunction(backing: std.mem.Allocator, func: *const Function, caps: ModelCaps) Error!Compiled {
     // aarch64 is the reference f16 backend. By default f16 is EMULATED: an
     // f16 value lives in an S register as its f32 WIDENING (a value exactly representable in
     // half). The boundaries do the rounding via base-ISA `fcvt` (no FEAT_FP16): a memory
@@ -1209,6 +1209,12 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // does exactly this), so we must not touch the input. We split on an independently-owned deep
     // `clone` and compile that. The caller's function is left byte-for-byte pristine. This keeps every
     // public *const signature (`selectFunction`, `selectFunctionForModel`, link/object) unchanged.
+    // Every pass below makes many small allocations and frees them together at the end. One arena
+    // takes them all, so the caller's allocator sees only the finished code.
+    var arena: std.heap.ArenaAllocator = .init(backing);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     var work = try func.clone(allocator);
     defer work.deinit();
     try lowerPopcounts(allocator, &work);
@@ -1254,6 +1260,9 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     defer fold.deinit(allocator);
     try applyFoldRewrite(&work, &fold);
 
+    var use_scope = try UseScope.enter(allocator, &work);
+    defer use_scope.exit(allocator);
+
     var desc = try aarch64RegDescription(allocator, &work);
     defer desc.deinit(allocator);
     var walloc = try wimmer.allocate(allocator, &work, &desc);
@@ -1266,8 +1275,9 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // emission seams and ARE threaded: the differential corpus proved the fusions execution-equivalent
     // under the Wimmer allocation, and alignment/f16 only change placement/encoding of an already-
     // correct allocation.
-    var compiled = try emitBestFromAllocation(allocator, &work, caps, &alloc, &fold);
-    errdefer compiled.deinit(allocator);
+    const emitted = try emitBestFromAllocation(allocator, &work, caps, &alloc, &fold);
+    var compiled = try copyCompiled(backing, emitted);
+    errdefer compiled.deinit(backing);
 
     // Every `Reloc.symbol` is a BORROWED slice into the emitting function's symbol storage. The
     // contract is that those names outlive `Compiled` (the caller's function does). Emission borrowed
@@ -1277,6 +1287,15 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // whole `Compiled` own its names.
     for (compiled.relocs) |*r| r.symbol = rebindSymbolName(func, r.symbol);
     return compiled;
+}
+
+fn copyCompiled(allocator: std.mem.Allocator, from: Compiled) Error!Compiled {
+    const code = try allocator.dupe(u32, from.code);
+    errdefer allocator.free(code);
+    const relocs = try allocator.dupe(Reloc, from.relocs);
+    errdefer allocator.free(relocs);
+    const lines = try allocator.dupe(LineEntry, from.lines);
+    return .{ .code = code, .relocs = relocs, .lines = lines };
 }
 
 /// The longer-lived symbol string equal to `name`. Most relocations name a callee the function
@@ -1418,6 +1437,8 @@ fn emitBestFromAllocation(allocator: std.mem.Allocator, func: *const Function, c
 }
 
 fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, alloc: *Allocation, fold: *const addrfold.Analysis, compact_switch_tables: bool) EmitError!Compiled {
+    var use_scope = try UseScope.enter(allocator, func);
+    defer use_scope.exit(allocator);
     // Emission can retry table widths or branch layout with the same allocation.
     for (alloc.edge_moves) |*set| set.consumed = false;
     const fetch_align = caps.fetch_align;
@@ -4418,12 +4439,16 @@ fn isFoldedIndexedScale(func: *const Function, value: Value) bool {
 
 /// Read an address sum directly in an integer load. Only a single-use address can disappear;
 /// both original inputs are reported to allocation at the load itself.
-fn indexedIntegerLoad(func: *const Function, inst: ir.function.Inst) ?IndexedIntegerLoad {
+fn hasImmediateAddress(func: *const Function, inst: ir.function.Inst) bool {
     var attrs = func.attributesOf(.{ .inst = inst });
     while (attrs.next()) |attr| switch (attr) {
-        .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.aarch64") and std.mem.eql(u8, c.key, "immediate-address")) return null,
+        .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.aarch64") and std.mem.eql(u8, c.key, "immediate-address")) return true,
         else => {},
     };
+    return false;
+}
+
+fn indexedIntegerLoad(func: *const Function, inst: ir.function.Inst) ?IndexedIntegerLoad {
     const load = switch (func.opcode(inst)) {
         .load => |l| l,
         else => return null,
@@ -4444,6 +4469,8 @@ fn indexedIntegerLoad(func: *const Function, inst: ir.function.Inst) ?IndexedInt
         if (constantShift(func, def) != null) return null;
         if (func.opcode(def) == .arith and func.opcode(def).arith.op == .mul) return null;
     };
+    // The attribute list is the longest scan here, so it runs after the cheap checks.
+    if (hasImmediateAddress(func, inst)) return null;
     if (func.types.type_kind(func.valueType(add.lhs)) == .ptr and func.types.type_kind(func.valueType(add.rhs)) == .int and intBitsOf(func, add.rhs) == 64)
         return indexedIntegerAddress(func, add.lhs, add.rhs, ty.int.bits);
     if (func.types.type_kind(func.valueType(add.rhs)) == .ptr and func.types.type_kind(func.valueType(add.lhs)) == .int and intBitsOf(func, add.lhs) == 64)
@@ -4453,10 +4480,10 @@ fn indexedIntegerLoad(func: *const Function, inst: ir.function.Inst) ?IndexedInt
 
 fn isIndexedIntegerAddress(func: *const Function, value: Value) bool {
     if (func.types.type_kind(func.valueType(value)) != .ptr) return false;
-    for (0..func.blockCount()) |bi| for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
-        if (func.opcode(inst) == .load and func.opcode(inst).load.ptr == value and indexedIntegerLoad(func, inst) != null) return true;
-    };
-    return false;
+    // `indexedIntegerLoad` accepts only an address read once, so the one reader must be the load.
+    if (countUses(func, value) != 1) return false;
+    const inst = soleUser(func, value) orelse return false;
+    return func.opcode(inst) == .load and func.opcode(inst).load.ptr == value and indexedIntegerLoad(func, inst) != null;
 }
 
 fn wideningShiftAmount(func: *const Function, inst: ir.function.Inst) ?u6 {
@@ -5036,6 +5063,9 @@ pub fn compileFunctionWimmerAbi(allocator: std.mem.Allocator, func: *Function, c
     // no-critical-edge precondition holds and the RegDescription/scan/emission all see one CFG.
     try ir.critical_edge.splitCriticalEdges(allocator, func);
 
+    var use_scope = try UseScope.enter(allocator, func);
+    defer use_scope.exit(allocator);
+
     var desc = try aarch64RegDescription(allocator, func);
     defer desc.deinit(allocator);
     var walloc = try wimmer.allocate(allocator, func, &desc);
@@ -5593,16 +5623,27 @@ fn machinePrefersParity(model: peephole.MachineModel, wide: bool) bool {
 }
 
 fn parityForLaterSelect(func: *const Function, insts: []const ir.function.Inst, result: Value, model: peephole.MachineModel) bool {
-    for (insts, 0..) |inst, idx| {
-        const select = switch (func.opcode(inst)) {
-            .select => |value| value,
-            else => continue,
-        };
-        const cmp = fusedCmpForSelect(func, insts, idx) orelse continue;
-        const parity = paritySelect(func, select, cmp) orelse continue;
-        if ((parity.increment == result or parity.masked == result) and machinePrefersParity(model, isWide(func, parity.value))) return true;
-    }
-    return false;
+    // Both roles in a parity select need a value read once. The one reader is either the select
+    // itself or the compare that feeds it, so only that select needs a look.
+    if (countUses(func, result) != 1) return false;
+    const reader = soleUser(func, result) orelse return false;
+    const select_inst = switch (func.opcode(reader)) {
+        .select => reader,
+        .icmp => blk: {
+            const flag = func.instResult(reader) orelse return false;
+            if (countUses(func, flag) != 1) return false;
+            break :blk soleUser(func, flag) orelse return false;
+        },
+        else => return false,
+    };
+    const select = switch (func.opcode(select_inst)) {
+        .select => |value| value,
+        else => return false,
+    };
+    const idx = std.mem.indexOfScalar(ir.function.Inst, insts, select_inst) orelse return false;
+    const cmp = fusedCmpForSelect(func, insts, idx) orelse return false;
+    const parity = paritySelect(func, select, cmp) orelse return false;
+    return (parity.increment == result or parity.masked == result) and machinePrefersParity(model, isWide(func, parity.value));
 }
 
 fn parityForCmp(func: *const Function, insts: []const ir.function.Inst, cmp_idx: usize) ?ParitySelect {
@@ -6006,18 +6047,15 @@ fn bitfieldExtractFold(func: *const Function, a: ir.function.Arith, result: Valu
 
 fn foldsAsBitfieldExtractSource(func: *const Function, value: Value) bool {
     if (countUses(func, value) != 1) return false;
-    for (0..func.blockCount()) |bi| {
-        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
-            const arith = switch (func.opcode(inst)) {
-                .arith => |candidate| candidate,
-                else => continue,
-            };
-            const result = func.instResult(inst) orelse continue;
-            const fold = bitfieldExtractFold(func, arith, result) orelse continue;
-            if (fold.shifted == value) return true;
-        }
-    }
-    return false;
+    // The fold names an operand of the masking `and`, so with one reader that reader is the `and`.
+    const inst = soleUser(func, value) orelse return false;
+    const arith = switch (func.opcode(inst)) {
+        .arith => |candidate| candidate,
+        else => return false,
+    };
+    const result = func.instResult(inst) orelse return false;
+    const fold = bitfieldExtractFold(func, arith, result) orelse return false;
+    return fold.shifted == value;
 }
 
 fn shiftImmFold(func: *const Function, a: ir.function.Arith, result: Value) ?ShiftImmFold {
@@ -6252,132 +6290,219 @@ test "cross-block shift immediate skips constant materialization" {
     try std.testing.expectEqual(@as(i64, 7), fold.imm);
 }
 
+/// How many times each value is read in the function being compiled, or null outside a compile.
+/// Many selection checks ask `countUses` once per instruction, so the table turns a whole-function
+/// scan into one lookup. It lives for one compile on one thread.
+threadlocal var use_table: ?UseTable = null;
+
+const UseTable = struct {
+    func: *const Function,
+    counts: []u32,
+    /// The last instruction that read each value, null for a terminator. For a value read once this
+    /// is its only reader.
+    users: []?ir.function.Inst,
+};
+
 fn countUses(func: *const Function, v: Value) usize {
-    var count: usize = 0;
-    for (0..func.blockCount()) |bi| {
-        const block: Block = @fromBackingInt(@intCast(bi));
-        for (func.blockInsts(block)) |inst| count += usesOfInInst(func, inst, v);
-        if (func.terminator(block)) |term| count += usesOfInTerm(func, term, v);
+    if (use_table) |table| {
+        if (table.func == func) return table.counts[@backingInt(v)];
     }
-    return count;
+    var counter: UseCounter = .{ .target = v };
+    forEachFunctionUse(func, &counter, UseCounter.visit);
+    return counter.count;
 }
 
-fn usesOfInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
-    var c: usize = 0;
+/// The instruction that reads `v`, for a value `countUses` reports as read once. Null when a
+/// terminator reads it.
+fn soleUser(func: *const Function, v: Value) ?ir.function.Inst {
+    if (use_table) |table| {
+        if (table.func == func) return table.users[@backingInt(v)];
+    }
+    var counter: UseCounter = .{ .target = v };
+    forEachFunctionUse(func, &counter, UseCounter.visit);
+    return counter.user;
+}
+
+/// Installs the use table for one function. A scope that finds the table already installed for the
+/// same function owns nothing and leaves it in place.
+const UseScope = struct {
+    owned: ?UseTable,
+
+    fn enter(allocator: std.mem.Allocator, func: *const Function) Error!UseScope {
+        if (use_table) |table| {
+            if (table.func == func) return .{ .owned = null };
+        }
+        const counts = try allocator.alloc(u32, func.valueCount());
+        errdefer allocator.free(counts);
+        const users = try allocator.alloc(?ir.function.Inst, func.valueCount());
+        errdefer allocator.free(users);
+        @memset(counts, 0);
+        @memset(users, null);
+        var tally: UseTally = .{ .counts = counts, .users = users };
+        forEachFunctionUse(func, &tally, UseTally.visit);
+        const table: UseTable = .{ .func = func, .counts = counts, .users = users };
+        use_table = table;
+        return .{ .owned = table };
+    }
+
+    fn exit(self: UseScope, allocator: std.mem.Allocator) void {
+        const table = self.owned orelse return;
+        use_table = null;
+        allocator.free(table.counts);
+        allocator.free(table.users);
+    }
+};
+
+const UseCounter = struct {
+    target: Value,
+    count: usize = 0,
+    user: ?ir.function.Inst = null,
+    at: ?ir.function.Inst = null,
+
+    fn visit(self: *UseCounter, v: Value) void {
+        if (v != self.target) return;
+        self.count += 1;
+        self.user = self.at;
+    }
+};
+
+const UseTally = struct {
+    counts: []u32,
+    users: []?ir.function.Inst,
+    at: ?ir.function.Inst = null,
+
+    fn visit(self: *UseTally, v: Value) void {
+        self.counts[@backingInt(v)] += 1;
+        self.users[@backingInt(v)] = self.at;
+    }
+};
+
+/// Calls `emit` for every value read by the function. `ctx.at` names the reading instruction, or
+/// is null while a terminator is read.
+fn forEachFunctionUse(func: *const Function, ctx: anytype, comptime emit: fn (@TypeOf(ctx), Value) void) void {
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @fromBackingInt(@intCast(bi));
+        for (func.blockInsts(block)) |inst| {
+            ctx.at = inst;
+            forEachUseOperand(func, inst, ctx, emit);
+        }
+        ctx.at = null;
+        if (func.terminator(block)) |term| forEachUseOperandTerm(func, term, ctx, emit);
+    }
+}
+
+fn forEachUseOperand(func: *const Function, inst: ir.function.Inst, ctx: anytype, comptime emit: fn (@TypeOf(ctx), Value) void) void {
     switch (func.opcode(inst)) {
         .atomic_rmw => |a| {
-            if (a.ptr == v) c += 1;
-            if (a.value == v) c += 1;
+            emit(ctx, a.ptr);
+            emit(ctx, a.value);
             if (a.compare) |cv| {
-                if (cv == v) c += 1;
+                emit(ctx, cv);
             }
         },
         // A barrier reads no Value operand.
         .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
-            if (a.lhs == v) c += 1;
-            if (a.rhs == v) c += 1;
+            emit(ctx, a.lhs);
+            emit(ctx, a.rhs);
         },
         .arith_imm => |a| {
-            if (a.lhs == v) c += 1;
+            emit(ctx, a.lhs);
         },
         .icmp => |cc| {
-            if (cc.lhs == v) c += 1;
-            if (cc.rhs == v) c += 1;
+            emit(ctx, cc.lhs);
+            emit(ctx, cc.rhs);
         },
         .select => |s| {
-            if (s.cond == v) c += 1;
-            if (s.then == v) c += 1;
-            if (s.@"else" == v) c += 1;
+            emit(ctx, s.cond);
+            emit(ctx, s.then);
+            emit(ctx, s.@"else");
         },
         .extract => |e| {
-            if (e.aggregate == v) c += 1;
+            emit(ctx, e.aggregate);
         },
         .convert => |cv| {
-            if (cv.value == v) c += 1;
+            emit(ctx, cv.value);
         },
         .decode_low_float, .encode_low_float => |cv| {
-            if (cv.value == v) c += 1;
+            emit(ctx, cv.value);
         },
         .dequantize_nvfp4, .quantize_nvfp4 => |cv| {
-            if (cv.value == v) c += 1;
-            if (cv.block_scale == v) c += 1;
-            if (cv.global_scale == v) c += 1;
+            emit(ctx, cv.value);
+            emit(ctx, cv.block_scale);
+            emit(ctx, cv.global_scale);
         },
         .unary => |u| {
-            if (u.value == v) c += 1;
+            emit(ctx, u.value);
         },
         .load => |l| {
-            if (l.ptr == v) c += 1;
+            emit(ctx, l.ptr);
         },
         .store => |st| {
-            if (st.value == v) c += 1;
-            if (st.ptr == v) c += 1;
+            emit(ctx, st.value);
+            emit(ctx, st.ptr);
         },
         .prefetch => |pf| {
-            if (pf.ptr == v) c += 1;
+            emit(ctx, pf.ptr);
         },
         .va_start => |vs| {
-            if (vs.list == v) c += 1;
+            emit(ctx, vs.list);
         },
         .va_arg => |va| {
-            if (va.list == v) c += 1;
+            emit(ctx, va.list);
         },
         .va_end => |ve| {
-            if (ve.list == v) c += 1;
+            emit(ctx, ve.list);
         },
         .dot => |d| {
-            if (d.acc == v) c += 1;
-            if (d.a == v) c += 1;
-            if (d.b == v) c += 1;
+            emit(ctx, d.acc);
+            emit(ctx, d.a);
+            emit(ctx, d.b);
         },
         .reduce => |red| {
-            if (red.vector == v) c += 1;
+            emit(ctx, red.vector);
         },
         .splat => |spv| {
-            if (spv.scalar == v) c += 1;
+            emit(ctx, spv.scalar);
         },
         .matmul => |mmv| {
-            if (mmv.a == v) c += 1;
-            if (mmv.b == v) c += 1;
-            if (mmv.c == v) c += 1;
+            emit(ctx, mmv.a);
+            emit(ctx, mmv.b);
+            emit(ctx, mmv.c);
         },
         .struct_new => |sn| for (func.valueList(sn.fields)) |f| {
-            if (f == v) c += 1;
+            emit(ctx, f);
         },
         .call => |cl| for (func.valueList(cl.args)) |a| {
-            if (a == v) c += 1;
+            emit(ctx, a);
         },
         .call_indirect => |cl| {
-            if (cl.target == v) c += 1;
+            emit(ctx, cl.target);
             for (func.valueList(cl.args)) |a| {
-                if (a == v) c += 1;
+                emit(ctx, a);
             }
         },
         .@"if" => |cf| {
-            if (cf.cond == v) c += 1;
+            emit(ctx, cf.cond);
             for (func.blockArgs(cf.then)) |a| {
-                if (a == v) c += 1;
+                emit(ctx, a);
             }
             for (func.blockArgs(cf.@"else")) |a| {
-                if (a == v) c += 1;
+                emit(ctx, a);
             }
         },
     }
-    return c;
 }
 
-fn usesOfInTerm(func: *const Function, term: Terminator, v: Value) usize {
-    var c: usize = 0;
+fn forEachUseOperandTerm(func: *const Function, term: Terminator, ctx: anytype, comptime emit: fn (@TypeOf(ctx), Value) void) void {
     switch (term) {
         .ret => |r| for (r.slice()) |xx| {
-            if (xx == v) c += 1;
+            emit(ctx, xx);
         },
         .jump => |j| for (func.blockArgs(j)) |a| {
-            if (a == v) c += 1;
+            emit(ctx, a);
         },
     }
-    return c;
 }
 
 fn setUsed(row: []bool, v: Value) void {
