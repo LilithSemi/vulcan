@@ -607,7 +607,8 @@ test "a word the core does not decode is refused rather than ignored" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    // A float lane word, which is real and not lifted yet.
-    const program = [_]u32{ 0x0000_1057, target.glacier.encode.ebreak };
+    // A float word with a scalar operand, a form the core has and no kernel has needed, so
+    // nothing decodes it.
+    const program = [_]u32{ 0x0000_5057, target.glacier.encode.ebreak };
     try std.testing.expectError(error.Illegal, lift.region(allocator, &func, &program, 0));
 }

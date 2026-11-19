@@ -179,6 +179,9 @@ const Lifter = struct {
     i32_t: Type,
     u64_t: Type,
     i64_t: Type,
+    /// A lane read as a float. The core has no float register file: a lane is thirty two bits
+    /// and what reads it decides whether they are a number or a float.
+    f32_t: Type,
     bool_t: Type,
     ptr_t: Type,
 
@@ -269,6 +272,55 @@ const Lifter = struct {
     /// The arithmetic of one word. The divides carry their own cases because a host divide traps
     /// where the core answers: the core gives all ones for a division by zero and wraps the most
     /// negative value over minus one, and both of those would stop the process here.
+    /// A lane's bits read as a float.
+    fn asFloat(self: *Lifter, value: Value) Error!Value {
+        return self.func.appendInst(self.at, self.f32_t, .{ .unary = .{ .op = .reinterpret, .value = value } });
+    }
+
+    /// A float answer as the bits a lane holds, with a subnormal flushed to a zero of its own
+    /// sign. The core's rounding block does that rather than carrying subnormals, so a model that
+    /// kept them would answer a different low bit from the hardware on the smallest numbers.
+    fn fromFloat(self: *Lifter, value: Value) Error!Value {
+        const f = self.func;
+        const bits = try f.appendInst(self.at, self.u32_t, .{ .unary = .{ .op = .reinterpret, .value = value } });
+        const magnitude = try f.appendArithImm(self.at, self.u32_t, .bit_and, bits, 0x7fff_ffff);
+        const sign = try f.appendArithImm(self.at, self.u32_t, .bit_and, bits, @as(i64, 0x8000_0000));
+        // Smaller than the smallest number with a one in front of the point. A zero is smaller
+        // than that too and keeps its own sign, which is the same answer.
+        const smallest = try self.constant(0x0080_0000);
+        const under = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .lt, .lhs = magnitude, .rhs = smallest } });
+        return f.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = under, .then = sign, .@"else" = bits } });
+    }
+
+    /// One float lane word of two others.
+    fn floatArithmetic(self: *Lifter, op: ir.function.BinOp, a: Value, b: Value) Error!Value {
+        const answer = try self.func.appendInst(self.at, self.f32_t, .{ .arith = .{
+            .op = op,
+            .lhs = try self.asFloat(a),
+            .rhs = try self.asFloat(b),
+        } });
+        return self.fromFloat(answer);
+    }
+
+    /// The smaller or the larger of two float lanes. A NaN on one side answers the other side,
+    /// which is what the reference warp does and is not what a bare compare gives.
+    fn floatPick(self: *Lifter, smaller: bool, a: Value, b: Value) Error!Value {
+        const f = self.func;
+        const x = try self.asFloat(a);
+        const y = try self.asFloat(b);
+        const x_is_number = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = x } });
+        const y_is_number = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .eq, .lhs = y, .rhs = y } });
+        const takes_x = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{
+            .op = if (smaller) .lt else .gt,
+            .lhs = x,
+            .rhs = y,
+        } });
+        // Where both are numbers the relation decides; where one is not, the other side wins.
+        const both = try f.appendInst(self.at, self.f32_t, .{ .select = .{ .cond = takes_x, .then = x, .@"else" = y } });
+        const without_y = try f.appendInst(self.at, self.f32_t, .{ .select = .{ .cond = y_is_number, .then = both, .@"else" = x } });
+        const picked = try f.appendInst(self.at, self.f32_t, .{ .select = .{ .cond = x_is_number, .then = without_y, .@"else" = y } });
+        return self.fromFloat(picked);
+    }
     fn arithmetic(self: *Lifter, op: decode.Alu, a: Value, b: Value) Error!Value {
         const f = self.func;
         return switch (op) {
@@ -710,6 +762,8 @@ const Lifter = struct {
         return switch (one.op) {
             .add_vx, .sub_vx, .sll_vx, .srl_vx, .sra_vx, .mul_vx, .mv_v_x, .merge_vxm, .mseq_vx, .msne_vx => self.get(one.rs),
             .add_vi, .and_vi, .or_vi, .sll_vi, .srl_vi, .sra_vi, .mv_v_i, .merge_vim, .mseq_vi => self.constant(@bitCast(one.imm)),
+            // A convert has no second operand: the field that would name one picked the convert.
+            .fcvt_f_x_v, .fcvt_f_xu_v, .fcvt_rtz_xu_f_v => self.constant(0),
             else => self.laneLoad(one.vs1, index),
         };
     }
@@ -723,7 +777,7 @@ const Lifter = struct {
             .cpop_m, .first_m => return self.lowerMaskRead(one),
             .redor_vs => return self.lowerReduceOr(one),
             .le32, .se32, .luxei32, .suxei32 => return self.lowerLaneMemory(one),
-            .mseq_vv, .mseq_vx, .mseq_vi, .msne_vv, .msne_vx, .msltu_vv, .mslt_vv, .msleu_vv, .msle_vv => return self.lowerLaneCompare(one),
+            .mseq_vv, .mseq_vx, .mseq_vi, .msne_vv, .msne_vx, .msltu_vv, .mslt_vv, .msleu_vv, .msle_vv, .mfeq_vv, .mfle_vv, .mflt_vv => return self.lowerLaneCompare(one),
             else => {},
         }
 
@@ -747,6 +801,45 @@ const Lifter = struct {
                 } });
             },
             .id_v => loop.index,
+            .fadd_vv, .fsub_vv, .fmul_vv, .fdiv_vv => blk: {
+                const base = try self.laneLoad(one.vs2, loop.index);
+                break :blk try self.floatArithmetic(switch (one.op) {
+                    .fadd_vv => .add,
+                    .fsub_vv => .sub,
+                    .fmul_vv => .mul,
+                    else => .div,
+                }, base, other);
+            },
+            .fmin_vv, .fmax_vv => blk: {
+                const base = try self.laneLoad(one.vs2, loop.index);
+                break :blk try self.floatPick(one.op == .fmin_vv, base, other);
+            },
+            // A whole lane of integer to a lane of float. The field that names a second operand
+            // elsewhere picked which convert this is, so there is no second operand to read.
+            .fcvt_rtz_xu_f_v => blk: {
+                const f = self.func;
+                const x = try self.asFloat(try self.laneLoad(one.vs2, loop.index));
+                const raw = try f.appendInst(self.at, self.u32_t, .{ .convert = .{ .value = x } });
+                // Toward zero, and a value the range cannot hold saturates rather than wrapping.
+                // A NaN is in no relation at all, so it is caught by its own inequality and
+                // answers the largest number, which is what the reference warp answers.
+                const zero = try f.appendInst(self.at, self.f32_t, .{ .fconst = 0.0 });
+                const over = try f.appendInst(self.at, self.f32_t, .{ .fconst = 4294967296.0 });
+                const biggest = try self.constant(0xffff_ffff);
+                const low = try self.constant(0);
+                const is_number = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = x } });
+                const positive = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = zero } });
+                const inside = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = over } });
+                const held = try f.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = inside, .then = raw, .@"else" = biggest } });
+                const above = try f.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = positive, .then = held, .@"else" = low } });
+                break :blk try f.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = is_number, .then = above, .@"else" = biggest } });
+            },
+            .fcvt_f_x_v, .fcvt_f_xu_v => blk: {
+                const base = try self.laneLoad(one.vs2, loop.index);
+                const from = if (one.op == .fcvt_f_x_v) try self.signed(base) else base;
+                const answer = try self.func.appendInst(self.at, self.f32_t, .{ .convert = .{ .value = from } });
+                break :blk try self.fromFloat(answer);
+            },
             else => blk: {
                 const base = try self.laneLoad(one.vs2, loop.index);
                 break :blk try self.arithmetic(laneArithmetic(one.op) orelse return error.Illegal, base, other);
@@ -778,6 +871,11 @@ const Lifter = struct {
             .mslt_vv => try self.compare(.lt, a, b),
             .msleu_vv => try self.compare(.ge_unsigned, b, a),
             .msle_vv => try self.compare(.ge, b, a),
+            // The float relations read the same two lanes as floats. Ordered, so a NaN answers
+            // false against everything, which is what an equality against itself tests for.
+            .mfeq_vv => try self.func.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .eq, .lhs = try self.asFloat(a), .rhs = try self.asFloat(b) } }),
+            .mfle_vv => try self.func.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .le, .lhs = try self.asFloat(a), .rhs = try self.asFloat(b) } }),
+            .mflt_vv => try self.func.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .lt, .lhs = try self.asFloat(a), .rhs = try self.asFloat(b) } }),
             else => return error.Illegal,
         };
 
@@ -1051,6 +1149,13 @@ const Lifter = struct {
                     try self.set(each.rd, try self.arithmetic(each.op, a, b));
                 },
                 .csr => |each| try self.set(each.rd, try self.control(each.which)),
+                // The one float the core does not do per lane. Its registers are the ordinary
+                // ones, so this reads and writes them like any other arithmetic.
+                .float_divide => |each| try self.set(each.rd, try self.floatArithmetic(
+                    .div,
+                    try self.get(each.rs1),
+                    try self.get(each.rs2),
+                )),
                 .vector => |each| try self.lowerVector(each),
                 .load => try self.lower(one),
                 .store => try self.lowerStore(one),
@@ -1157,6 +1262,7 @@ pub fn region(allocator: std.mem.Allocator, func: *Function, program: []const u3
         .i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }),
         .u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } }),
         .i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } }),
+        .f32_t = try func.types.intern(.{ .float = .f32 }),
         .bool_t = try func.types.intern(.bool),
         .ptr_t = try func.types.ptrGlobal(),
         .ctx = undefined,

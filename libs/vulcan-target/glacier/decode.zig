@@ -88,6 +88,11 @@ pub const Instruction = union(enum) {
     /// `ecall`, which retires it as faulted. The code is the value the register holds at the time
     /// and not the register number.
     fault: struct { rs1: Reg },
+    /// `fdiv.s`, the one scalar float operation the core decodes and the only float operation that
+    /// is not per lane. Its register fields name the ordinary registers, because the core has no
+    /// float register file, and the rounding mode the word carries is accepted and dropped: the
+    /// divider is tied to nearest even.
+    float_divide: struct { rd: Reg, rs1: Reg, rs2: Reg },
     /// A lane word. The core's vector length IS its lane count, so no word sets a length and the
     /// shape comes from the core rather than from the program.
     vector: Vector,
@@ -178,6 +183,27 @@ pub const VectorOp = enum {
     id_v,
     /// Every lane of `vs2` ored together, into lane zero of `vd`.
     redor_vs,
+    /// The float lanes. Every one of these reads whole lanes as `f32`: the element width is fixed
+    /// at thirty two bits, so no form of them is half width. They round to nearest even and flush
+    /// a subnormal result to a zero of its own sign, which is what the core's rounding block does.
+    fadd_vv,
+    fsub_vv,
+    fmul_vv,
+    fdiv_vv,
+    fmin_vv,
+    fmax_vv,
+    /// A float compare, which writes a mask as the integer ones do. Three and not six: a greater
+    /// than is a less than with the operands the other way round, and an unequal is an equal
+    /// inverted. Ordered, so a NaN answers false against everything, itself included.
+    mfeq_vv,
+    mfle_vv,
+    mflt_vv,
+    /// An integer lane to a float lane, nearest even. One `funct6` holds every convert and the
+    /// field that names a source register elsewhere picks which, so these two are selectors.
+    fcvt_f_x_v,
+    fcvt_f_xu_v,
+    /// A float lane to an unsigned integer lane, toward zero, saturating at either end.
+    fcvt_rtz_xu_f_v,
     /// A word per lane from one address upwards.
     le32,
     se32,
@@ -198,6 +224,7 @@ const opcode_branch = 0x63;
 const opcode_jalr = 0x67;
 const opcode_jal = 0x6f;
 const opcode_system = 0x73;
+const opcode_float = 0x53;
 
 /// The whole barrier word, so a fence with a mode of one is one comparison. RISC-V gives mode
 /// zero to a plain fence and eight to `fence.tso`, which leaves this encoding for a core to claim.
@@ -344,6 +371,26 @@ fn vector(word: u32) Error!Instruction {
             0x29 => .sra_vv,
             else => return error.Illegal,
         },
+        // The float lanes. One funct6 holds every convert, so its selector lives in the field that
+        // names a source register everywhere else.
+        1 => switch (six) {
+            0x00 => .fadd_vv,
+            0x02 => .fsub_vv,
+            0x04 => .fmin_vv,
+            0x06 => .fmax_vv,
+            0x12 => switch (vs1(word)) {
+                0b00110 => .fcvt_rtz_xu_f_v,
+                0b01010 => .fcvt_f_xu_v,
+                0b01011 => .fcvt_f_x_v,
+                else => return error.Illegal,
+            },
+            0x18 => .mfeq_vv,
+            0x19 => .mfle_vv,
+            0x1b => .mflt_vv,
+            0x20 => .fdiv_vv,
+            0x24 => .fmul_vv,
+            else => return error.Illegal,
+        },
         // The mask set, the lane multiplies and divides, and the reads back to the scalar side.
         2 => switch (six) {
             0x0a => .redor_vs,
@@ -406,7 +453,7 @@ fn vector(word: u32) Error!Instruction {
             0x25 => .mul_vx,
             else => return error.Illegal,
         },
-        // The float forms, which nothing lifts yet.
+        // The float forms with a scalar operand, which no kernel has needed yet.
         else => return error.Illegal,
     };
 
@@ -461,6 +508,12 @@ pub fn one(word: u32) Error!Instruction {
 
     return switch (@as(u7, @truncate(word))) {
         opcode_vector => vector(word),
+        opcode_float => blk: {
+            // One operation, and the funct7 that names it. Anything else on this opcode is a float
+            // the core does not have.
+            if (word >> 25 != 0b0001100) return error.Illegal;
+            break :blk .{ .float_divide = .{ .rd = rd(word), .rs1 = rs1(word), .rs2 = rs2(word) } };
+        },
         opcode_vector_load => vectorMemory(word, false),
         opcode_vector_store => vectorMemory(word, true),
         opcode_lui => .{ .lui = .{ .rd = rd(word), .value = word & 0xffff_f000 } },
