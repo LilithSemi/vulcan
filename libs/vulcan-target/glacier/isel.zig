@@ -8410,6 +8410,33 @@ const Emitter = struct {
         return into;
     }
 
+    /// A bool operand as a mask. A warp-uniform bool sits in a scalar register as 0 or 1, and
+    /// true has to name every lane, so the broadcast is turned into a mask by comparing it
+    /// against zero and complementing the answer.
+    fn boolMask(self: *Emitter, v: Value, pool: *Pool, pos: u32) Error!VReg {
+        if (self.isDivergent(v)) return self.vreg(v, pos);
+        const into = try pool.take();
+        try self.put(rv.vmv_v_x(into, try self.reg(v, pos)));
+        try self.put(rv.vmseq_vx(into, into, .x0));
+        try self.put(rv.vmnand_mm(into, into, into));
+        return into;
+    }
+
+    /// A select between bools is mask logic, `else ^ ((else ^ then) & cond)`, because `vmerge`
+    /// picks whole elements and a mask lives in element 0. The scratch holds the middle value and
+    /// `dst` is written last, so `dst` may be any of the three operands.
+    fn emitMaskSelect(self: *Emitter, s: ir.function.Select, inst: Inst, pos: u32) Error!void {
+        var pool: Pool = .{};
+        const dst = try self.vreg(self.func.instResult(inst).?, pos);
+        const cond = try self.boolMask(s.cond, &pool, pos);
+        const then_v = try self.boolMask(s.then, &pool, pos);
+        const else_v = try self.boolMask(s.@"else", &pool, pos);
+        const tmp = try pool.take();
+        try self.put(rv.vmxor_mm(tmp, else_v, then_v));
+        try self.put(rv.vmand_mm(tmp, tmp, cond));
+        try self.put(rv.vmxor_mm(dst, else_v, tmp));
+    }
+
     /// A per-lane select: `vmerge.vvm`, which reads its mask from v0 and nowhere else.
     ///
     /// The mask is moved into v0 with a mask AND against itself. `vmv.v.v` would also work on this
@@ -8418,6 +8445,8 @@ const Emitter = struct {
     /// meant and stays right at any lane count. v0 is never allocatable, so writing it displaces
     /// nothing. NOTE the warp model cannot tell the two apart, for the same reason.
     fn emitVectorSelect(self: *Emitter, s: ir.function.Select, inst: Inst, pos: u32) Error!void {
+        if (isBool(self.func, self.func.valueType(self.func.instResult(inst).?)))
+            return self.emitMaskSelect(s, inst, pos);
         var pool: Pool = .{};
         const dst = try self.vreg(self.func.instResult(inst).?, pos);
         const then_v = try self.maskOperand(s.then, &pool, pos);

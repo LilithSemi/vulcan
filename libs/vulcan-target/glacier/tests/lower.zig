@@ -2301,6 +2301,116 @@ test "a warp-uniform condition still merges when the sides are per-lane" {
     }
 }
 
+/// One side of a bool select: the lanes below a bound, or the same answer in every lane.
+const BoolSide = union(enum) { below: i64, uniform: bool };
+
+fn boolSideAt(side: BoolSide, lane: usize) bool {
+    return switch (side) {
+        .below => |n| @as(i64, @intCast(lane)) < n,
+        .uniform => |b| b,
+    };
+}
+
+/// Run `pick = select(select(cond, then, other) ? 100 : 200)` over one warp and check that every
+/// lane follows its own bit of the inner bool select.
+fn checkBoolSelect(cond: BoolSide, then: BoolSide, other: BoolSide) !void {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    var sides: [3]Value = undefined;
+    for ([_]BoolSide{ cond, then, other }, &sides) |side, *out| {
+        out.* = switch (side) {
+            .below => |n| blk: {
+                const bound = try f.appendInst(entry, u32_t, .{ .iconst = n });
+                break :blk try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = bound } });
+            },
+            .uniform => |b| try f.appendInst(entry, bool_t, .{ .iconst = @intFromBool(b) }),
+        };
+    }
+    const joined = try f.appendInst(entry, bool_t, .{ .select = .{ .cond = sides[0], .then = sides[1], .@"else" = sides[2] } });
+    const hit = try f.appendInst(entry, u32_t, .{ .iconst = 100 });
+    const miss = try f.appendInst(entry, u32_t, .{ .iconst = 200 });
+    const pick = try f.appendInst(entry, u32_t, .{ .select = .{ .cond = joined, .then = hit, .@"else" = miss } });
+    try f.appendStore(entry, pick, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        const bit = if (boolSideAt(cond, i)) boolSideAt(then, i) else boolSideAt(other, i);
+        try std.testing.expectEqual(@as(u32, if (bit) 100 else 200), data[i]);
+    }
+    // Only the outer select merges. The inner one is mask logic.
+    try std.testing.expectEqual(@as(usize, 1), countMerges(words));
+}
+
+test "a per-lane bool select decides each lane on its own condition bit" {
+    // Lane 0 takes `then` and the others take `else`. Merging whole mask words on lane 0's bit
+    // gave every lane the `then` word.
+    try checkBoolSelect(.{ .below = 1 }, .{ .below = 100 }, .{ .below = 1 });
+    try checkBoolSelect(.{ .below = 2 }, .{ .below = 1 }, .{ .below = 3 });
+    try checkBoolSelect(.{ .below = 3 }, .{ .below = 0 }, .{ .below = 100 });
+}
+
+test "a bool select on a warp-uniform condition returns one side whole" {
+    for ([_]bool{ false, true }) |flag| {
+        try checkBoolSelect(.{ .uniform = flag }, .{ .below = 1 }, .{ .below = 3 });
+    }
+}
+
+test "a bool select with a warp-uniform side names every lane for true" {
+    for ([_]bool{ false, true }) |flag| {
+        try checkBoolSelect(.{ .below = 2 }, .{ .uniform = flag }, .{ .below = 1 });
+        try checkBoolSelect(.{ .below = 2 }, .{ .below = 1 }, .{ .uniform = flag });
+        try checkBoolSelect(.{ .below = 2 }, .{ .uniform = flag }, .{ .uniform = !flag });
+    }
+}
+
+test "an element select still merges and picks per lane" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const ten = try f.appendArithImm(entry, u32_t, .mul, tid, 10);
+    const hundred = try f.appendArithImm(entry, u32_t, .mul, tid, 100);
+    const pick = try f.appendInst(entry, u32_t, .{ .select = .{ .cond = cond, .then = ten, .@"else" = hundred } });
+    try f.appendStore(entry, pick, at);
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    try std.testing.expectEqual(@as(usize, 1), countMerges(words));
+
+    var data: [8]u32 = @splat(0xFFFF_FFFF);
+    try runOnce(words, &data, 0, 1);
+    for (0..glacier.encode.Profile.@"gc1.n".lanes()) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i * (if (i < 2) @as(usize, 10) else 100))), data[i]);
+    }
+}
+
 test "a per-lane compare takes its signedness from the operand type" {
     // The lane index is small, so signed and unsigned compares agree on it and a test against a
     // small bound cannot tell them apart. These bounds are chosen so they disagree on every lane:
