@@ -746,6 +746,10 @@ test "a word outside what the core decodes is refused rather than ignored" {
     try std.testing.expectEqual(@as(Instruction, .fence), try one(0x0ff0_000f));
     try std.testing.expectError(error.Illegal, one(0x0000_0000));
     try std.testing.expectError(error.Illegal, one(0xffff_ffff));
-    // A float lane word. Real, and not lifted yet, which is a refusal and not a no-op.
-    try std.testing.expectError(error.Illegal, one(0x0000_1057));
+    // A float word with a scalar operand: a form the core has and nothing has needed, so it is
+    // refused rather than taken as one of the lane forms beside it.
+    try std.testing.expectError(error.Illegal, one(0x0000_5057));
+    // And the float lane words that are decoded now, so the two cannot be confused later.
+    try std.testing.expectEqual(VectorOp.fadd_vv, (try one(0x0200_1057)).vector.op);
+    try std.testing.expectEqual(VectorOp.fcvt_f_x_v, (try one(0x4a15_9157)).vector.op);
 }
