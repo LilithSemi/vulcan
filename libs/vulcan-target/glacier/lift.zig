@@ -195,6 +195,7 @@ const Lifter = struct {
     /// A lane read as a float. The core has no float register file: a lane is thirty two bits
     /// and what reads it decides whether they are a number or a float.
     f32_t: Type,
+    f16_t: Type,
     /// Lanes the core this region is compiled for holds. A lane word is lowered once for every
     /// one of them, so the count is a fact about the card that the lift is given rather than a
     /// number it reads out of the warp at run time.
@@ -212,6 +213,9 @@ const Lifter = struct {
     /// A value a lane operation carries across the lanes. One for the whole function, because
     /// the lanes of one word are lowered one after another and never nest.
     carry: Value,
+    /// Two bytes of stack where a half is written and read back. A backend keeps a half widened
+    /// in a register, so its bits are only a half where they land in memory.
+    half_slot: Value,
     /// Which words start a block, and which words the region reaches at all.
     leaders: []bool,
     reached: []bool,
@@ -324,6 +328,17 @@ const Lifter = struct {
         return f.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = under, .then = sign, .@"else" = bits } });
     }
 
+    /// A half lane flushes a subnormal answer to a zero of the same sign, the way a float lane
+    /// does. A half keeps its exponent from bit ten, so the smallest number with a one in front of
+    /// the point is 0x0400.
+    fn flushHalf(self: *Lifter, bits: Value) Error!Value {
+        const f = self.func;
+        const magnitude = try f.appendArithImm(self.at, self.u32_t, .bit_and, bits, 0x7fff);
+        const sign = try f.appendArithImm(self.at, self.u32_t, .bit_and, bits, 0x8000);
+        const smallest = try self.constant(0x0400);
+        const under = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .lt, .lhs = magnitude, .rhs = smallest } });
+        return f.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = under, .then = sign, .@"else" = bits } });
+    }
     /// One float lane word of two others.
     fn floatArithmetic(self: *Lifter, op: ir.function.BinOp, a: Value, b: Value) Error!Value {
         const answer = try self.func.appendInst(self.at, self.f32_t, .{ .arith = .{
@@ -839,6 +854,28 @@ const Lifter = struct {
                     const above = try f.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = positive, .then = held, .@"else" = low } });
                     break :blk try f.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = is_number, .then = above, .@"else" = biggest } });
                 },
+                // A half lives in the low sixteen bits of a lane. A backend keeps a half widened
+                // in a register, so the only place its bits are really sixteen wide is memory:
+                // these go through two bytes of stack rather than through a bitcast.
+                .fcvt_f_h_v => blk: {
+                    const cut = try self.func.appendInst(self.at, self.u16_t, .{ .convert = .{ .value = try self.laneLoad(one.vs2, loop.index) } });
+                    try self.func.appendStore(self.at, cut, self.half_slot);
+                    const small = try self.func.appendInst(self.at, self.f16_t, .{ .load = .{ .ptr = self.half_slot } });
+                    const wide = try self.func.appendInst(self.at, self.f32_t, .{ .convert = .{ .value = small } });
+                    break :blk try self.fromFloat(wide);
+                },
+                .fcvt_h_f_w, .fcvt_h_x_v => blk: {
+                    const base = try self.laneLoad(one.vs2, loop.index);
+                    const from = if (one.op == .fcvt_h_x_v)
+                        try self.func.appendInst(self.at, self.f32_t, .{ .convert = .{ .value = try self.signed(base) } })
+                    else
+                        try self.asFloat(base);
+                    const small = try self.func.appendInst(self.at, self.f16_t, .{ .convert = .{ .value = from } });
+                    try self.func.appendStore(self.at, small, self.half_slot);
+                    const bits = try self.func.appendInst(self.at, self.u16_t, .{ .load = .{ .ptr = self.half_slot } });
+                    const wide = try self.func.appendInst(self.at, self.u32_t, .{ .convert = .{ .value = bits } });
+                    break :blk try self.flushHalf(wide);
+                },
                 .fcvt_f_x_v, .fcvt_f_xu_v => blk: {
                     const base = try self.laneLoad(one.vs2, loop.index);
                     const from = if (one.op == .fcvt_f_x_v) try self.signed(base) else base;
@@ -1315,6 +1352,7 @@ pub fn region(allocator: std.mem.Allocator, func: *Function, program: []const u3
         .u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } }),
         .i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } }),
         .f32_t = try func.types.intern(.{ .float = .f32 }),
+        .f16_t = try func.types.intern(.{ .float = .f16 }),
         .bool_t = try func.types.intern(.bool),
         .ptr_t = try func.types.ptrGlobal(),
         .lanes = lanes,
@@ -1322,6 +1360,7 @@ pub fn region(allocator: std.mem.Allocator, func: *Function, program: []const u3
         .ctx = undefined,
         .slots = undefined,
         .carry = undefined,
+        .half_slot = undefined,
         .leaders = leaders,
         .reached = reached,
         .blocks = blocks,
@@ -1338,6 +1377,7 @@ pub fn region(allocator: std.mem.Allocator, func: *Function, program: []const u3
         self.slots[which] = try func.appendInst(prologue, self.ptr_t, .{ .alloca = .{ .elem = self.u32_t } });
     }
     self.carry = try func.appendInst(prologue, self.ptr_t, .{ .alloca = .{ .elem = self.u32_t } });
+    self.half_slot = try func.appendInst(prologue, self.ptr_t, .{ .alloca = .{ .elem = self.u16_t } });
     for (1..self.slots.len) |which| {
         const held = try func.appendInst(prologue, self.u32_t, .{ .load = .{ .ptr = try self.slotOf(which) } });
         try func.appendStore(prologue, held, self.slots[which]);
