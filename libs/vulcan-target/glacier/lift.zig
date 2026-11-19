@@ -238,6 +238,20 @@ const Lifter = struct {
         return self.func.appendInst(self.at, ty, .{ .load = .{ .ptr = try self.field(name) } });
     }
 
+    /// The stop a host asks for, read where control flows backwards.
+    ///
+    /// Volatile on purpose. Another thread writes this while the loop runs, and nothing inside the
+    /// loop writes it, so a plain load is loop invariant: the optimiser lifts it out and the warp
+    /// reads the flag once, before the loop it is meant to leave. A kernel that waits for work
+    /// from its host then cannot be stopped at all, and whoever runs the machine waits for a warp
+    /// that will never come back.
+    fn readStop(self: *Lifter) Error!Value {
+        return self.func.appendInst(self.at, self.u32_t, .{ .load = .{
+            .ptr = try self.field("stop"),
+            .@"volatile" = true,
+        } });
+    }
+
     fn writeField(self: *Lifter, comptime name: []const u8, value: Value) Error!void {
         try self.func.appendStore(self.at, value, try self.field(name));
     }
@@ -1208,7 +1222,7 @@ const Lifter = struct {
     /// A jump backwards, with the host's stop read first. A kernel cannot see this and a host could
     /// not take a spinning core down without it.
     fn jumpChecked(self: *Lifter, to: u32) Error!void {
-        const stop = try self.read("stop", self.u32_t);
+        const stop = try self.readStop();
         const zero = try self.constant(0);
         const asked_to = try self.func.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .ne, .lhs = stop, .rhs = zero } });
 

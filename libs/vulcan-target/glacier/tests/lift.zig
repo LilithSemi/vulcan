@@ -487,6 +487,46 @@ test "a barrier gives the warp back, and the word after it is where it carries o
     try std.testing.expectEqual(@as(u32, 2), state.x[1]);
 }
 
+test "a kernel reads the stop a host writes while it is already looping" {
+    const allocator = std.testing.allocator;
+    // A host writes the stop from another thread, with the kernel already inside its loop, which
+    // is the only way it is ever written. Nothing in the loop writes it, so a plain load of it is
+    // loop invariant and the optimiser lifts it out: the kernel would read the flag once, on its
+    // way in, and never leave a loop it was asked to leave. The count is large enough that a
+    // kernel which misses the flag runs on for seconds and then retires, so this fails loudly
+    // rather than hanging.
+    const program = [_]u32{
+        rv.lui(.x1, base_high),
+        rv.lw(.x2, .x1, 0),
+        rv.addi(.x2, .x2, -1),
+        rv.sw(.x2, .x1, 0),
+        rv.bne(.x2, .x0, -12),
+        rv.addi(.x3, .x0, 7),
+        target.glacier.encode.ebreak,
+    };
+
+    var memory: [words]u32 = @splat(0);
+    memory[0] = 0x4000_0000;
+    var state: lift.Warp = .{
+        .hart_count = 1,
+        .fabric = @ptrCast(&memory),
+        .fabric_at = base,
+        .fabric_size = memory.len * 4,
+    };
+
+    const asker = try std.Thread.spawn(.{}, struct {
+        fn ask(one: *lift.Warp) void {
+            const wait: std.os.linux.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+            _ = std.os.linux.nanosleep(&wait, null);
+            @atomicStore(u32, &one.stop, 1, .release);
+        }
+    }.ask, .{&state});
+    defer asker.join();
+
+    try std.testing.expectEqual(lift.Exit.stopped, try native(allocator, &program, 0, &state));
+    // It left where it was asked rather than finishing the count.
+    try std.testing.expect(memory[0] > 0);
+}
 test "a host can take a spinning kernel down" {
     const allocator = std.testing.allocator;
     // The shape a resident kernel has: wait for a word to change, then do the work. Nothing here
