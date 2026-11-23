@@ -204,6 +204,7 @@ pub const Options = struct {
     fragment_output_stride: u32 = 80,
     /// Permit a guarded sampler path in a fragment that can discard.
     discard_sampler_fast_path: bool = false,
+    zero_exp_fast_path: bool = true,
     /// Byte order the generated rasteriser packs a colour into. It must agree with the format of
     /// the image the rasteriser writes, because the store goes straight to the pixel.
     raster_colour_order: RasterColourOrder = .bgra,
@@ -483,7 +484,7 @@ fn compileKernelInternal(
     phase = "lowerImageSize";
     try lowerImageSize(allocator, &work);
     phase = "lowerPow";
-    try lowerPow(allocator, &work);
+    try lowerPow(allocator, &work, opts.zero_exp_fast_path);
     phase = "lowerSquareRoot";
     try lowerSquareRoot(allocator, &work);
     // After the lowerings above, so the converts they introduce are rewritten too.
@@ -3077,9 +3078,10 @@ const PowBuilder = struct {
     }
 };
 
-fn lowerPow(allocator: std.mem.Allocator, func: *Function) Error!void {
+fn lowerPow(allocator: std.mem.Allocator, func: *Function, zero_fast: bool) Error!void {
     for (0..func.blockCount()) |bi| {
-        const block: Block = @fromBackingInt(@intCast(bi));
+        const original_block: Block = @fromBackingInt(@intCast(bi));
+        var block = original_block;
         const original = try allocator.dupe(Inst, func.blockInsts(block));
         defer allocator.free(original);
         func.blockInstsMut(block).clearRetainingCapacity();
@@ -3089,11 +3091,12 @@ fn lowerPow(allocator: std.mem.Allocator, func: *Function) Error!void {
                 try func.blockInstsMut(block).append(func.allocator, inst);
                 continue;
             }
-            const args = func.valueList(operation.call_indirect.args);
-            if (args.len != 3) return error.Unsupported;
+            const args_list = func.valueList(operation.call_indirect.args);
+            if (args_list.len != 3) return error.Unsupported;
+            const args: [3]Value = args_list[0..3].*;
             const selector = func.definingInst(args[0]) orelse return error.Unsupported;
             if (func.opcode(selector) != .iconst) return error.Unsupported;
-            const pb: PowBuilder = .{ .func = func, .block = block, .ft = func.valueType(args[1]), .it = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }) };
+            var pb: PowBuilder = .{ .func = func, .block = block, .ft = func.valueType(args[1]), .it = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }) };
             if (!isF32(func, pb.ft) or !isF32(func, func.valueType(args[2]))) return error.Unsupported;
             const selector_value = func.opcode(selector).iconst;
             if (selector_value == 5 or selector_value == 6) {
@@ -3105,6 +3108,23 @@ fn lowerPow(allocator: std.mem.Allocator, func: *Function) Error!void {
                 func.replaceAllUses(func.instResult(inst) orelse return error.Unsupported, result);
                 continue;
             }
+            var joined: ?Block = null;
+            var joined_value: ?Value = null;
+            if (zero_fast and (selector_value == 1 or selector_value == 3)) {
+                const bits = try pb.cast(pb.it, args[1], true);
+                const magnitude = try pb.bin(.bit_and, bits, try pb.i(0x7fffffff));
+                const nonzero = try func.appendInst(block, try func.types.intern(.bool), .{ .icmp = .{ .op = .ne, .lhs = magnitude, .rhs = try pb.i(0) } });
+                const one = try pb.f(1);
+                const calculate = try func.appendBlock();
+                const join = try func.appendBlock();
+                joined = join;
+                joined_value = try func.appendBlockParam(join, pb.ft);
+                try func.appendIf(block, nonzero, .{ .target = calculate, .args = &.{} }, .{ .target = join, .args = &.{one} });
+                const instructions = func.blockInsts(block);
+                try func.addAttr(.{ .inst = instructions[instructions.len - 1] }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "raster_any_covered", .value = .flag } });
+                block = calculate;
+                pb.block = calculate;
+            }
             // Copy before appending: valueList storage can move as the function grows.
             const x, const y = switch (func.opcode(selector).iconst) {
                 0 => .{ args[1], args[2] }, // pow(a, b)
@@ -3113,12 +3133,21 @@ fn lowerPow(allocator: std.mem.Allocator, func: *Function) Error!void {
                 2, 4 => .{ args[1], args[2] }, // log and log2 are lowered directly below.
                 else => return error.Unsupported,
             };
-            const result = switch (func.opcode(selector).iconst) {
+            var result = switch (func.opcode(selector).iconst) {
                 2 => try pb.bin(.mul, try pb.log2(args[1]), try pb.f(@log(2.0))), // log(a)
                 4 => try pb.log2(args[1]), // log2(a)
                 else => try pb.pow(x, y),
             };
+            if (joined) |join| {
+                try func.setJump(block, join, &.{result});
+                block = join;
+                result = joined_value.?;
+            }
             func.replaceAllUses(func.instResult(inst) orelse return error.Unsupported, result);
+        }
+        if (block != original_block) {
+            func.terminatorPtr(block).* = func.terminator(original_block);
+            func.terminatorPtr(original_block).* = null;
         }
     }
 }

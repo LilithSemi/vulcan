@@ -4355,3 +4355,106 @@ test "hardware coverage records honor a missing sampled image" {
         }
     }
 }
+
+fn zeroExpModule(allocator: std.mem.Allocator, components: u32, constant_exponent: bool, uniform: bool, which: u32) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 80);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.ExtInstImport, &.{ 30, 0x4c534c47, 0x6474732e, 0x3035342e, 0 });
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 16, 0x6e69616d, 0, 14, 15 });
+    try b.emit(allocator, op.Name, &.{ 15, 0x0074756f });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.builtin, if (uniform) op.BuiltIn.workgroup_id else op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeInt, &.{ 2, 32, 0 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 2, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 5, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 2 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 7, 3 });
+    try b.emit(allocator, op.TypeStruct, &.{ 8, 7 });
+    try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.storage_buffer, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 3 });
+    try b.emit(allocator, op.TypeFunction, &.{ 11, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 12, 0 });
+    try b.emit(allocator, op.Constant, &.{ 2, 13, 1 });
+    try b.emit(allocator, op.Constant, &.{ 2, 31, 8 });
+    if (constant_exponent) try b.emit(allocator, op.Constant, &.{ 3, 24, @as(u32, @bitCast(@as(f32, 2.4))) });
+    if (components > 1) try b.emit(allocator, op.TypeVector, &.{ 32, 3, components });
+    try b.emit(allocator, op.Variable, &.{ 5, 14, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 9, 15, op.StorageClass.storage_buffer });
+    try b.emit(allocator, op.Function, &.{ 1, 16, 0, 11 });
+    try b.emit(allocator, op.Label, &.{17});
+    try b.emit(allocator, op.AccessChain, &.{ 6, 60, 14, 12 });
+    try b.emit(allocator, op.Load, &.{ 2, 18, 60 });
+    try b.emit(allocator, op.IMul, &.{ 2, 19, 18, 31 });
+    try b.emit(allocator, op.IAdd, &.{ 2, 20, 19, 13 });
+    try b.emit(allocator, op.AccessChain, &.{ 10, 21, 15, 12, 19 });
+    try b.emit(allocator, op.AccessChain, &.{ 10, 22, 15, 12, 20 });
+    try b.emit(allocator, op.Load, &.{ 3, 23, 21 });
+    if (!constant_exponent) try b.emit(allocator, op.Load, &.{ 3, 24, 22 });
+    if (components == 1) {
+        try b.emit(allocator, op.ExtInst, &.{ 3, 25, 30, which, 23 });
+        try b.emit(allocator, op.Store, &.{ 21, 25 });
+    } else {
+        var a: [6]u32 = .{ 32, 33, 23, 24, 23, 24 };
+        var e: [6]u32 = .{ 32, 34, 24, 23, 24, 23 };
+        try b.emit(allocator, op.CompositeConstruct, a[0 .. components + 2]);
+        try b.emit(allocator, op.CompositeConstruct, e[0 .. components + 2]);
+        try b.emit(allocator, op.ExtInst, &.{ 32, 35, 30, which, 33 });
+        for (0..components) |i| {
+            const id: u32 = @intCast(40 + i * 4);
+            try b.emit(allocator, op.CompositeExtract, &.{ 3, id, 35, @intCast(i) });
+            // Alternate stores to the base and exponent slots, checking both vector components.
+            try b.emit(allocator, op.Store, &.{ if (i % 2 == 0) @as(u32, 21) else 22, id });
+        }
+    }
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+test "zero exponential warp guard matches unguarded lanes" {
+    const allocator = std.testing.allocator;
+    const inputs = [_][4]u32{
+        .{ 0, 0, 0, 0 },                                     .{ 0x80000000, 0, 0x80000000, 0 },
+        .{ 0, 0x3f800000, 0xbf800000, 0 },                   .{ 0x7f800000, 0xff800000, 0x7fc00000, 0 },
+        .{ 0xc2c80000, 0x42c80000, 0x3dcccccd, 0xbdcccccd },
+    };
+    for ([_]bool{ false, true }) |uniform| {
+        for ([_]u32{ op.Glsl.exp, op.Glsl.exp2 }) |which| {
+            const components: u32 = 1;
+            var b = try zeroExpModule(allocator, components, false, uniform, which);
+            defer b.deinit(allocator);
+            var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+            defer func.deinit();
+            var reference: [inputs.len][32]u32 = undefined;
+            var baseline_steps: [inputs.len]usize = undefined;
+            for ([_]bool{ false, true }) |guard| {
+                const code = try glacier.isel.compileKernel(allocator, &func, .{
+                    .profile = .@"gc1.mi",
+                    .zero_exp_fast_path = guard,
+                    .globals = &.{.{ .name = "out", .address = data_base }},
+                });
+                defer allocator.free(code);
+                for (inputs, 0..) |values, case| {
+                    const scratch_bytes = comptime glacier.encode.Profile.@"gc1.mi".scratchBytes();
+                    var data: [32 + scratch_bytes / 4]u32 = @splat(0xdeadbeef);
+                    for (values, 0..) |value, lane| {
+                        data[lane * 8] = value;
+                        data[lane * 8 + 1] = value;
+                    }
+                    var mem: warp.Memory = .{ .base = data_base, .words = &data, .scratch = .{ .base = data_base + 128, .stride = scratch_bytes, .harts = 1 } };
+                    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .stack_top = data_base + 128 + scratch_bytes, .scratch_bytes = scratch_bytes };
+                    const steps = try warp.run(code, &mem, &one, 100000);
+                    if (!guard) {
+                        @memcpy(&reference[case], data[0..32]);
+                        baseline_steps[case] = steps;
+                    } else {
+                        try std.testing.expectEqualSlices(u32, &reference[case], data[0..32]);
+                        if (case < 2) try std.testing.expect(steps < baseline_steps[case]);
+                        std.debug.print("zero-exp components={d} case={d} baseline={d} candidate={d} words={d} exact=true\n", .{ components, case, baseline_steps[case], steps, code.len });
+                    }
+                }
+            }
+        }
+    }
+}
