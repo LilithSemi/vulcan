@@ -200,6 +200,8 @@ pub const Options = struct {
     fragment_input_stride: u32 = 512,
     /// Stride of fragment output records. 80 preserves the full color/depth/discard ABI.
     fragment_output_stride: u32 = 80,
+    /// Permit a guarded sampler path in a fragment that can discard.
+    discard_sampler_fast_path: bool = false,
     /// Byte order the generated rasteriser packs a colour into. It must agree with the format of
     /// the image the rasteriser writes, because the store goes straight to the pixel.
     raster_colour_order: RasterColourOrder = .bgra,
@@ -356,7 +358,17 @@ pub fn compileFragmentExplained(
     var work = try func.clone(allocator);
     defer work.deinit();
     try lowerFragmentIO(allocator, &work, opts.fragment_input_stride, opts.fragment_output_stride, why);
-    return compileKernelInternal(allocator, &work, opts, why);
+    var fast_opts = opts;
+    fast_opts.discard_sampler_fast_path = true;
+    return compileKernelInternal(allocator, &work, fast_opts, why) catch |err| switch (err) {
+        error.Unsupported => blk: {
+            if (why) |r| r.* = .{};
+            var fallback_opts = opts;
+            fallback_opts.discard_sampler_fast_path = false;
+            break :blk compileKernelInternal(allocator, &work, fallback_opts, why);
+        },
+        else => return err,
+    };
 }
 
 /// `compileFragment`, with a generated rasteriser around the body. See `lowerFragmentRaster`.
@@ -443,7 +455,7 @@ fn compileKernelInternal(
     phase = "lowerFloor";
     try lowerFloor(allocator, &work);
     phase = "lowerImageSample";
-    try lowerImageSample(allocator, &work);
+    try lowerImageSample(allocator, &work, opts.discard_sampler_fast_path);
     phase = "lowerTexelFetch";
     try lowerTexelFetch(allocator, &work);
     phase = "lowerStorageImageWrite";
@@ -481,6 +493,16 @@ fn compileKernelInternal(
         // table of them holds every one at once and spills the lot. A warp has little scratch, so
         // that is a refusal rather than slow code.
         _ = try opt.sink.run(allocator, &work, &analyses);
+    }
+    const expanded_images = for (func.blockParams(@fromBackingInt(0))) |param| {
+        if (isSamplerFunction(func, param)) break true;
+    } else false;
+    if (expanded_images) {
+        _ = try opt.pass.runToFixpoint(allocator, &work, &.{
+            opt.constfold.pass_def,
+            opt.simplify.pass_def,
+            opt.dce.pass_def,
+        }, 4);
     }
     try ir.critical_edge.splitCriticalEdges(allocator, &work);
     const reachable = try ir.reachable.neutralizeUnreachable(allocator, &work);
@@ -592,6 +614,8 @@ fn compileKernelInternal(
         defer allocator.free(d);
         try lowerUniformBoolMasks(allocator, &work, d);
     }
+
+    _ = try opt.layout(allocator, &work, null);
 
     const divergent = try analyzeDivergence(allocator, &work);
     defer allocator.free(divergent);
@@ -2272,6 +2296,28 @@ fn lowerFloorF32(func: *Function, block: Block, value: Value) Error!Value {
     return func.appendInst(block, f32_t, .{ .select = .{ .cond = already_whole, .then = value, .@"else" = finite_floor } });
 }
 
+fn lowerClampCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64) Error!SampleCoordinate {
+    const it = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bt = try func.types.intern(.bool);
+    const ft = func.valueType(coord);
+    const size_ptr = try appendOffset(func, block, desc, size_offset, it);
+    const size = try func.appendInst(block, it, .{ .load = .{ .ptr = size_ptr } });
+    const float_ptr = try appendOffset(func, block, desc, size_float_offset, it);
+    const size_float = try func.appendInst(block, ft, .{ .load = .{ .ptr = float_ptr } });
+    const zero = try func.appendInst(block, ft, .{ .fconst = 0 });
+    const one = try func.appendInst(block, ft, .{ .fconst = 1 });
+    const negative = try func.appendInst(block, bt, .{ .icmp = .{ .op = .lt, .lhs = coord, .rhs = zero } });
+    const high = try func.appendInst(block, bt, .{ .icmp = .{ .op = .ge, .lhs = coord, .rhs = one } });
+    const lower = try func.appendInst(block, ft, .{ .select = .{ .cond = negative, .then = zero, .@"else" = coord } });
+    const clamped = try func.appendInst(block, ft, .{ .select = .{ .cond = high, .then = one, .@"else" = lower } });
+    const scaled = try func.appendInst(block, ft, .{ .arith = .{ .op = .mul, .lhs = clamped, .rhs = size_float } });
+    const converted = try func.appendInst(block, it, .{ .convert = .{ .value = scaled } });
+    const last = try func.appendInst(block, it, .{ .arith_imm = .{ .op = .sub, .lhs = size, .imm = 1 } });
+    const past = try func.appendInst(block, bt, .{ .icmp = .{ .op = .ge, .lhs = converted, .rhs = size } });
+    const index = try func.appendInst(block, it, .{ .select = .{ .cond = past, .then = last, .@"else" = converted } });
+    return .{ .index = index, .border = try func.appendInst(block, bt, .{ .iconst = 0 }) };
+}
+
 fn lowerSampleCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64, mode_offset: i64) Error!SampleCoordinate {
     const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
@@ -2338,6 +2384,28 @@ fn lowerLinearCoordinate(func: *Function, block: Block, desc: Value, coord: Valu
     return .{
         .first = try lowerSampleCoordinate(func, block, desc, first_normalized, size_offset, size_float_offset, mode_offset),
         .second = try lowerSampleCoordinate(func, block, desc, second_normalized, size_offset, size_float_offset, mode_offset),
+        .weight = weight,
+    };
+}
+
+fn lowerLinearClampCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64, reciprocal_offset: i64) Error!LinearCoordinate {
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = func.valueType(coord);
+    const size_ptr = try appendOffset(func, block, desc, size_float_offset, u32_t);
+    const size = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = size_ptr } });
+    const reciprocal_ptr = try appendOffset(func, block, desc, reciprocal_offset, u32_t);
+    const reciprocal = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = reciprocal_ptr } });
+    const half = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
+    const scaled = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = coord, .rhs = size } });
+    const centered = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = scaled, .rhs = half } });
+    const floor = try lowerFloorF32(func, block, centered);
+    const weight = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = centered, .rhs = floor } });
+    const first_center = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = floor, .rhs = half } });
+    const first_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = first_center, .rhs = reciprocal } });
+    const second_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = first_normalized, .rhs = reciprocal } });
+    return .{
+        .first = try lowerClampCoordinate(func, block, desc, first_normalized, size_offset, size_float_offset),
+        .second = try lowerClampCoordinate(func, block, desc, second_normalized, size_offset, size_float_offset),
         .weight = weight,
     };
 }
@@ -2490,6 +2558,45 @@ fn lowerSampleTexel(func: *Function, block: Block, image: SampleImage, x: Sample
     const byte_offset = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column } });
     const texel = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = image.base, .rhs = byte_offset } });
     const decoded = try decodeTexel(func, block, image, texel, byte_offset);
+    var values: [4]Value = undefined;
+    for (0..4) |component| {
+        const offset: i64 = @intCast(component * 4);
+        const border_ptr = try appendOffset(func, block, image.desc, sampler_border_offset + offset, image.int_ty);
+        const border = try func.appendInst(block, image.f32_t, .{ .load = .{ .ptr = border_ptr } });
+        values[component] = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = outside, .then = border, .@"else" = decoded[component] } });
+    }
+    return values;
+}
+
+fn lowerSampleTexelRGBA8(func: *Function, block: Block, image: SampleImage, x: SampleCoordinate, y: SampleCoordinate, z_border: Value) Error![4]Value {
+    const outside_xy = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = x.border, .rhs = y.border } });
+    const outside = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = outside_xy, .rhs = z_border } });
+    const row = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = y.index, .rhs = image.row_pitch } });
+    const column = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = x.index, .rhs = image.texel_bytes } });
+    const byte_offset = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column } });
+    const texel = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = image.base, .rhs = byte_offset } });
+    const packed_ptr = try nullableImagePointer(func, block, image.desc, texel, false, 0, image.int_ty);
+    const rgba_word = try func.appendInst(block, image.int_ty, .{ .load = .{ .ptr = packed_ptr } });
+    var decoded: [4]Value = undefined;
+    for (0..4) |component| {
+        const shifted = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .shr, .lhs = rgba_word, .imm = @intCast(component * 8) } });
+        const byte = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .bit_and, .lhs = shifted, .imm = 255 } });
+        const biased_bits = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .bit_or, .lhs = byte, .imm = 0x4b00_0000 } });
+        const biased = try func.appendInst(block, image.f32_t, .{ .unary = .{ .op = .reinterpret, .value = biased_bits } });
+        const value = try func.appendInst(block, image.f32_t, .{ .arith = .{ .op = .sub, .lhs = biased, .rhs = image.integer_bias } });
+        decoded[component] = try func.appendInst(block, image.f32_t, .{ .arith = .{ .op = .mul, .lhs = value, .rhs = image.unorm_scale } });
+        if (component < 3) {
+            const table_field = try appendOffset(func, block, image.desc, sampler_srgb_table_offset, image.int_ty);
+            const table = try func.appendInst(block, image.ptr_ty, .{ .load = .{ .ptr = table_field } });
+            const safe_table = try func.appendInst(block, image.ptr_ty, .{ .select = .{ .cond = image.srgb_format, .then = table, .@"else" = packed_ptr } });
+            const zero = try func.appendInst(block, image.int_ty, .{ .iconst = 0 });
+            const offset = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .shl, .lhs = byte, .imm = 2 } });
+            const safe_offset = try func.appendInst(block, image.int_ty, .{ .select = .{ .cond = image.srgb_format, .then = offset, .@"else" = zero } });
+            const entry = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = safe_table, .rhs = safe_offset } });
+            const srgb = try func.appendInst(block, image.f32_t, .{ .load = .{ .ptr = entry } });
+            decoded[component] = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = image.srgb_format, .then = srgb, .@"else" = decoded[component] } });
+        }
+    }
     var values: [4]Value = undefined;
     for (0..4) |component| {
         const offset: i64 = @intCast(component * 4);
@@ -2932,9 +3039,10 @@ fn lowerSquareRoot(allocator: std.mem.Allocator, func: *Function) Error!void {
     }
 }
 
-fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
+fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast: bool) Error!void {
     for (0..func.blockCount()) |bi| {
-        const block: Block = @fromBackingInt(@intCast(bi));
+        const original_block: Block = @fromBackingInt(@intCast(bi));
+        var block = original_block;
         const original = try allocator.dupe(Inst, func.blockInsts(block));
         defer allocator.free(original);
         var sampled = std.AutoHashMapUnmanaged(Value, [4]Value){};
@@ -2973,7 +3081,8 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
                 try func.blockInstsMut(block).append(func.allocator, inst);
                 continue;
             }
-            const args = func.valueList(operation.call_indirect.args);
+            const args = try allocator.dupe(Value, func.valueList(operation.call_indirect.args));
+            defer allocator.free(args);
             const expected_arg_count: usize = if (array_sample or cube_sample or volume_sample) 6 else 5;
             if (args.len != expected_arg_count) return error.Unsupported;
             var desc = args[0];
@@ -3015,6 +3124,90 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
                 });
                 const descriptor_offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = level, .rhs = stride } });
                 desc = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = desc, .rhs = descriptor_offset } });
+                if (nullable) try func.addAttr(.{ .value = desc }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "nullable_desc", .value = .flag } });
+            }
+            var fast_join: ?Block = null;
+            var fast_params: [4]Value = undefined;
+            if (regular_sample and (discard_fast or !hasDiscardParam(func))) {
+                const format_ptr = try appendOffset(func, block, args[0], sampler_format_offset, int_ty);
+                const format = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = format_ptr } });
+                const rgba8 = try func.appendInst(block, int_ty, .{ .iconst = 1 });
+                const is_unorm = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = rgba8 } });
+                const srgb = try func.appendInst(block, int_ty, .{ .iconst = 6 });
+                const is_srgb = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = format, .rhs = srgb } });
+                const is_rgba8 = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_or, .lhs = is_unorm, .rhs = is_srgb } });
+                const mag_ptr = try appendOffset(func, block, args[0], sampler_mag_filter_offset, int_ty);
+                const min_ptr = try appendOffset(func, block, args[0], sampler_min_filter_offset, int_ty);
+                const mag = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = mag_ptr } });
+                const min = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = min_ptr } });
+                const either = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .bit_or, .lhs = mag, .rhs = min } });
+                const nearest = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+                const is_nearest = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = either, .rhs = nearest } });
+                const format_filter = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = is_rgba8, .rhs = is_nearest } });
+                const u_ptr = try appendOffset(func, block, args[0], sampler_address_u_offset, int_ty);
+                const v_ptr = try appendOffset(func, block, args[0], sampler_address_v_offset, int_ty);
+                const u_mode = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = u_ptr } });
+                const v_mode = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = v_ptr } });
+                const clamp = try func.appendInst(block, int_ty, .{ .iconst = 2 });
+                const u_clamp = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = u_mode, .rhs = clamp } });
+                const v_clamp = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = v_mode, .rhs = clamp } });
+                const both_clamp = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = u_clamp, .rhs = v_clamp } });
+                const fast = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = format_filter, .rhs = both_clamp } });
+                const quick = try func.appendBlock();
+                const address_check = try func.appendBlock();
+                const address_quick = try func.appendBlock();
+                const linear_check = try func.appendBlock();
+                const linear_quick = try func.appendBlock();
+                const general = try func.appendBlock();
+                const joined = try func.appendBlock();
+                for (&fast_params) |*param| param.* = try func.appendBlockParam(joined, f32_t);
+                try func.appendIf(block, fast, .{ .target = quick, .args = &.{} }, .{ .target = address_check, .args = &.{} });
+                const quick_x = try lowerClampCoordinate(func, quick, desc, args[1], sampler_width_offset, sampler_width_float_offset);
+                const quick_y = try lowerClampCoordinate(func, quick, desc, args[2], sampler_height_offset, sampler_height_float_offset);
+                const quick_base = try func.appendInst(quick, ptr_ty, .{ .load = .{ .ptr = desc } });
+                const quick_pitch_ptr = try appendOffset(func, quick, desc, sampler_row_pitch_offset, int_ty);
+                const quick_pitch = try func.appendInst(quick, int_ty, .{ .load = .{ .ptr = quick_pitch_ptr } });
+                const quick_bytes = try func.appendInst(quick, int_ty, .{ .iconst = 4 });
+                const quick_image = try sampleImageFormats(func, quick, desc, quick_base, quick_pitch, quick_bytes, int_ty, ptr_ty);
+                const quick_values = try lowerSampleTexelRGBA8(func, quick, quick_image, quick_x, quick_y, quick_x.border);
+                try func.setJump(quick, joined, &quick_values);
+                try func.appendIf(address_check, format_filter, .{ .target = address_quick, .args = &.{} }, .{ .target = linear_check, .args = &.{} });
+                const address_quick_x = try lowerSampleCoordinate(func, address_quick, desc, args[1], sampler_width_offset, sampler_width_float_offset, sampler_address_u_offset);
+                const address_quick_y = try lowerSampleCoordinate(func, address_quick, desc, args[2], sampler_height_offset, sampler_height_float_offset, sampler_address_v_offset);
+                const address_quick_base = try func.appendInst(address_quick, ptr_ty, .{ .load = .{ .ptr = desc } });
+                const address_quick_pitch_ptr = try appendOffset(func, address_quick, desc, sampler_row_pitch_offset, int_ty);
+                const address_quick_pitch = try func.appendInst(address_quick, int_ty, .{ .load = .{ .ptr = address_quick_pitch_ptr } });
+                const address_quick_bytes = try func.appendInst(address_quick, int_ty, .{ .iconst = 4 });
+                const address_quick_image = try sampleImageFormats(func, address_quick, desc, address_quick_base, address_quick_pitch, address_quick_bytes, int_ty, ptr_ty);
+                const address_quick_values = try lowerSampleTexelRGBA8(func, address_quick, address_quick_image, address_quick_x, address_quick_y, address_quick_x.border);
+                try func.setJump(address_quick, joined, &address_quick_values);
+                const linear_filter = try func.appendInst(linear_check, int_ty, .{ .iconst = 1 });
+                const mag_linear = try func.appendInst(linear_check, bool_t, .{ .icmp = .{ .op = .eq, .lhs = mag, .rhs = linear_filter } });
+                const min_linear = try func.appendInst(linear_check, bool_t, .{ .icmp = .{ .op = .eq, .lhs = min, .rhs = linear_filter } });
+                const both_linear = try func.appendInst(linear_check, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = mag_linear, .rhs = min_linear } });
+                const linear_format = try func.appendInst(linear_check, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = both_linear, .rhs = is_rgba8 } });
+                const linear_fast = try func.appendInst(linear_check, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = linear_format, .rhs = both_clamp } });
+                try func.appendIf(linear_check, linear_fast, .{ .target = linear_quick, .args = &.{} }, .{ .target = general, .args = &.{} });
+                const lx = try lowerLinearClampCoordinate(func, linear_quick, desc, args[1], sampler_width_offset, sampler_width_float_offset, sampler_width_reciprocal_offset);
+                const ly = try lowerLinearClampCoordinate(func, linear_quick, desc, args[2], sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset);
+                const linear_base = try func.appendInst(linear_quick, ptr_ty, .{ .load = .{ .ptr = desc } });
+                const linear_pitch_ptr = try appendOffset(func, linear_quick, desc, sampler_row_pitch_offset, int_ty);
+                const linear_pitch = try func.appendInst(linear_quick, int_ty, .{ .load = .{ .ptr = linear_pitch_ptr } });
+                const linear_bytes = try func.appendInst(linear_quick, int_ty, .{ .iconst = 4 });
+                const linear_image = try sampleImageFormats(func, linear_quick, desc, linear_base, linear_pitch, linear_bytes, int_ty, ptr_ty);
+                const c00 = try lowerSampleTexelRGBA8(func, linear_quick, linear_image, lx.first, ly.first, lx.first.border);
+                const c10 = try lowerSampleTexelRGBA8(func, linear_quick, linear_image, lx.second, ly.first, lx.second.border);
+                const c01 = try lowerSampleTexelRGBA8(func, linear_quick, linear_image, lx.first, ly.second, lx.first.border);
+                const c11 = try lowerSampleTexelRGBA8(func, linear_quick, linear_image, lx.second, ly.second, lx.second.border);
+                var linear_values: [4]Value = undefined;
+                for (0..4) |component| {
+                    const top = try lerp(func, linear_quick, c00[component], c10[component], lx.weight);
+                    const bottom = try lerp(func, linear_quick, c01[component], c11[component], lx.weight);
+                    linear_values[component] = try lerp(func, linear_quick, top, bottom, ly.weight);
+                }
+                try func.setJump(linear_quick, joined, &linear_values);
+                fast_join = joined;
+                block = general;
             }
             const cube = if (cube_sample) try lowerCubeCoordinate(func, block, args[1], args[2], args[3]) else null;
             const u = if (cube) |coordinate| coordinate.u else args[1];
@@ -3087,6 +3280,23 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
             const z_border00 = if (volume_sample) z0.?.border else x0.border;
             const z_border10 = if (volume_sample) z0.?.border else x1.border;
             const texel00 = try lowerSampleTexel(func, block, image, x0, y0, z_border00);
+            var sample_join: ?Block = null;
+            var sample_params: [4]Value = undefined;
+            if (!shadow_sample and !volume_sample) {
+                const filtered = try func.appendBlock();
+                const joined = try func.appendBlock();
+                for (&sample_params) |*param| param.* = try func.appendBlockParam(joined, f32_t);
+                const sampler_mag_ptr = try appendOffset(func, block, args[0], sampler_mag_filter_offset, int_ty);
+                const sampler_min_ptr = try appendOffset(func, block, args[0], sampler_min_filter_offset, int_ty);
+                const sampler_mag = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = sampler_mag_ptr } });
+                const sampler_min = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = sampler_min_ptr } });
+                const either_filter = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .bit_or, .lhs = sampler_mag, .rhs = sampler_min } });
+                const nearest_filter = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+                const any_linear = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ne, .lhs = either_filter, .rhs = nearest_filter } });
+                try func.appendIf(block, any_linear, .{ .target = filtered, .args = &.{} }, .{ .target = joined, .args = &texel00 });
+                sample_join = joined;
+                block = filtered;
+            }
             const texel10 = try lowerSampleTexel(func, block, image, x1, y0, z_border10);
             const texel01 = try lowerSampleTexel(func, block, image, x0, y1, z_border00);
             const texel11 = try lowerSampleTexel(func, block, image, x1, y1, z_border10);
@@ -3136,10 +3346,24 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function) Error!void {
                 const second_slice = try lerp(func, block, second_top, second_bottom, y_weight);
                 values[component] = try lerp(func, block, first_slice, second_slice, z_weight);
             }
+            if (sample_join) |joined| {
+                try func.setJump(block, joined, &values);
+                block = joined;
+                values = sample_params;
+            }
+            if (fast_join) |joined| {
+                try func.setJump(block, joined, &values);
+                block = joined;
+                values = fast_params;
+            }
             const out_index: usize = if (array_sample or cube_sample or volume_sample) 5 else 4;
             const out = args[out_index];
             try sampled.put(allocator, out, try lowerSampleSwizzle(func, block, desc, values));
             try elements.put(allocator, out, .{ .base = out, .component = 0 });
+        }
+        if (block != original_block) {
+            func.terminatorPtr(block).* = func.terminator(original_block);
+            func.terminatorPtr(original_block).* = null;
         }
     }
 }
@@ -4086,7 +4310,9 @@ fn region(func: *const Function, head: Block, divergent: []const bool, uses: []c
     if (r.count == 0) return null;
     // Flatten only small uniform diamonds. This keeps their single shared path intact while
     // removing tiny control-flow diamonds from the body of a loop being converted.
-    if (!branch_divergent and (r.loop_count != 0 or r.count > 2)) return null;
+    if (!branch_divergent) {
+        if (r.loop_count != 0 or r.count > 2) return null;
+    }
     if (r.exit == head or @backingInt(r.exit) == 0) return null;
     // Every way into the region is the head's branch, and every way out is the exit. A block with
     // an outside predecessor would be reached on a path this does not control.

@@ -4019,21 +4019,31 @@ fn implicitImageLod(
     const total = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = absolute_difference } });
     const half = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
     const rho_squared = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = total, .rhs = half } });
-    // Pick the nearest integer mip without an integer-to-f32 conversion. GC1 only converts i32
-    // to f16, and converting the raw IEEE exponent bits through f16 would overflow. For level N,
-    // the nearest-level boundary is rho^2 = 2^(2N - 1). Descending selects keep the first matching
-    // level while naturally clamping magnification and very small gradients to level zero.
+    return nearestImplicitMip(func, block, rho_squared);
+}
+
+/// Integer mip selection at exact power-of-four boundaries, without integer-to-float conversion.
+pub fn nearestImplicitMip(func: *Function, block: Block, rho_squared: Value) Error!Value {
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
-    var lod = try func.appendInst(block, f32_t, .{ .fconst = 0 });
-    var threshold_value: f64 = 2;
-    for (1..16) |level| {
-        const threshold = try func.appendInst(block, f32_t, .{ .fconst = threshold_value });
-        const below = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = rho_squared, .rhs = threshold } });
-        const selected = try func.appendInst(block, f32_t, .{ .fconst = @floatFromInt(level) });
-        lod = try func.appendInst(block, f32_t, .{ .select = .{ .cond = below, .then = lod, .@"else" = selected } });
-        threshold_value *= 4;
-    }
-    return lod;
+    const bits = try func.appendInst(block, u32_t, .{ .unary = .{ .op = .reinterpret, .value = rho_squared } });
+    const shifted = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .shr, .lhs = bits, .imm = 23 } });
+    const exponent = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .bit_and, .lhs = shifted, .imm = 255 } });
+    const unbiased = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .sub, .lhs = exponent, .imm = 126 } });
+    const level = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .shr, .lhs = unbiased, .imm = 1 } });
+    const limit = try func.appendInst(block, u32_t, .{ .iconst = 15 });
+    const above = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .gt, .lhs = level, .rhs = limit } });
+    const capped = try func.appendInst(block, u32_t, .{ .select = .{ .cond = above, .then = limit, .@"else" = level } });
+    // [0,15] fits exactly in the mantissa of 2^23, whose ULP is one.
+    const biased_bits = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .add, .lhs = capped, .imm = 0x4b000000 } });
+    const biased_float = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .reinterpret, .value = biased_bits } });
+    const bias = try func.appendInst(block, f32_t, .{ .fconst = 8388608 });
+    const result = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = biased_float, .rhs = bias } });
+    const threshold = try func.appendInst(block, f32_t, .{ .fconst = 2 });
+    const below = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .lt, .lhs = rho_squared, .rhs = threshold } });
+    const zero = try func.appendInst(block, f32_t, .{ .fconst = 0 });
+    return func.appendInst(block, f32_t, .{ .select = .{ .cond = below, .then = zero, .@"else" = result } });
 }
 
 /// Lower `OpImageSampleImplicitLod` / `OpImageSampleExplicitLod`:

@@ -1028,10 +1028,14 @@ fn normalizedSamplingModule(allocator: std.mem.Allocator, separate: bool, explic
 }
 
 fn runNormalizedSamplingWithDescriptors(separate: bool, explicit_lod: bool, dynamic_lod: bool, implicit_mip: bool, address_mode_u: u32, sampler_format: u32, texel_bytes: u32, filters: [2]u32, swizzle: ?[4]u32, packed_texels: [4]u32, coordinates: [4]f32, border: [4]f32, expected: [4][4]f32) !void {
+    return runNormalizedSamplingWithNullability(separate, explicit_lod, dynamic_lod, implicit_mip, address_mode_u, sampler_format, texel_bytes, filters, swizzle, packed_texels, coordinates, border, expected, false);
+}
+
+fn runNormalizedSamplingWithNullability(separate: bool, explicit_lod: bool, dynamic_lod: bool, implicit_mip: bool, address_mode_u: u32, sampler_format: u32, texel_bytes: u32, filters: [2]u32, swizzle: ?[4]u32, packed_texels: [4]u32, coordinates: [4]f32, border: [4]f32, expected: [4][4]f32, nullable: bool) !void {
     const allocator = std.testing.allocator;
     var b = try normalizedSamplingModule(allocator, separate, explicit_lod, dynamic_lod);
     defer b.deinit(allocator);
-    var func = try spirv.lowerModule(allocator, b.words.items);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .nullable_image_descriptors = nullable });
     defer func.deinit();
     const code = try glacier.isel.compileFragment(allocator, &func, .{ .profile = .@"gc1.n" });
     defer allocator.free(code);
@@ -1063,6 +1067,7 @@ fn runNormalizedSamplingWithDescriptors(separate: bool, explicit_lod: bool, dyna
     memory[18..][0..4].* = component_mapping;
     const mipmapped = explicit_lod or implicit_mip;
     memory[24] = if (mipmapped) 2 else 1;
+    memory[25] = 1;
     if (sampler_format == 0) {
         for (0..4) |texel| {
             memory[texture_word + texel * 4 ..][0..4].* = .{
@@ -1080,7 +1085,7 @@ fn runNormalizedSamplingWithDescriptors(separate: bool, explicit_lod: bool, dyna
         // sRGB table and the 3D sampling fields landed.
         const second_descriptor = glacier.isel.sampler_descriptor_size / @sizeOf(u32);
         const second_texture_word = 128;
-        memory[second_descriptor] = data_base + second_texture_word * 4;
+        memory[second_descriptor] = if (nullable) 0xdead0000 else data_base + second_texture_word * 4;
         memory[second_descriptor + 1] = texel_bytes;
         memory[second_descriptor + 2] = 1;
         memory[second_descriptor + 3] = 1;
@@ -1097,6 +1102,8 @@ fn runNormalizedSamplingWithDescriptors(separate: bool, explicit_lod: bool, dyna
         memory[second_descriptor + 17] = filters[1];
         memory[second_descriptor + 18 ..][0..4].* = component_mapping;
         memory[second_descriptor + 24] = 2;
+        memory[second_descriptor + 25] = if (nullable) 0 else 1;
+        memory[second_descriptor + 26] = data_base + second_texture_word * 4;
         memory[second_texture_word..][0..4].* = .{
             @bitCast(@as(f32, 9)),
             @bitCast(@as(f32, 8)),
@@ -1140,7 +1147,8 @@ fn runNormalizedSamplingWithDescriptors(separate: bool, explicit_lod: bool, dyna
     one.launch_args[0] = data_base;
     one.launch_args[1] = data_base + input_word * 4;
     one.launch_args[2] = data_base + output_word * 4;
-    _ = try warp.run(code, &mem, &one, 200_000);
+    const sample_steps = try warp.run(code, &mem, &one, 200_000);
+    std.debug.print("sample-cost mode={d} format={d} filters={d},{d} words={d} steps={d}\n", .{ address_mode_u, sampler_format, filters[0], filters[1], code.len, sample_steps });
     for (0..4) |lane| {
         const fragment = 4 + lane;
         const output = output_word + fragment * (glacier.isel.fragment_output_stride / 4);
@@ -1244,7 +1252,8 @@ test "SPIR-V 2D array sampling selects the requested layer" {
     const code = try glacier.isel.compileFragment(allocator, &func, .{ .profile = .@"gc1.n" });
     defer allocator.free(code);
 
-    var memory: [2048]u32 = @splat(0);
+    const scratch_bytes = comptime glacier.encode.Profile.@"gc1.n".scratchBytes();
+    var memory: [2048 + scratch_bytes / 4]u32 = @splat(0);
     const texture_word = 64;
     const input_word = 256;
     const output_word = 1024;
@@ -1276,8 +1285,10 @@ test "SPIR-V 2D array sampling selects the requested layer" {
         memory[input] = @bitCast((@as(f32, @floatFromInt(lane)) + 0.5) * 0.25);
         memory[input + 1] = @bitCast(@as(f32, 0.5));
     }
-    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory, .scratch = .{ .base = data_base + 2048 * 4, .stride = scratch_bytes, .harts = 1 } };
     var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .workgroup_base = 1, .grid_dim = 2 };
+    one.stack_top = data_base + memory.len * 4;
+    one.scratch_bytes = scratch_bytes;
     one.launch_args[0] = data_base;
     one.launch_args[1] = data_base + input_word * 4;
     one.launch_args[2] = data_base + output_word * 4;
@@ -1326,7 +1337,8 @@ test "SPIR-V cube sampling selects all six faces" {
     const code = try glacier.isel.compileFragment(allocator, &func, .{ .profile = .@"gc1.s" });
     defer allocator.free(code);
 
-    var memory: [4096]u32 = @splat(0);
+    const scratch_bytes = comptime glacier.encode.Profile.@"gc1.s".scratchBytes();
+    var memory: [4096 + scratch_bytes / 4]u32 = @splat(0);
     const texture_word = 64;
     const input_word = 512;
     const output_word = 2048;
@@ -1367,8 +1379,10 @@ test "SPIR-V cube sampling selects all six faces" {
         const input = input_word + fragment * (glacier.isel.fragment_input_stride / 4) + 0x80 / 4;
         for (direction, 0..) |component, index| memory[input + index] = @bitCast(component);
     }
-    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory, .scratch = .{ .base = data_base + 4096 * 4, .stride = scratch_bytes, .harts = 1 } };
     var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8, .workgroup_base = 1, .grid_dim = 2 };
+    one.stack_top = data_base + memory.len * 4;
+    one.scratch_bytes = scratch_bytes;
     one.launch_args[0] = data_base;
     one.launch_args[1] = data_base + input_word * 4;
     one.launch_args[2] = data_base + output_word * 4;
@@ -1423,7 +1437,8 @@ test "SPIR-V depth comparison sampling runs on Glacier" {
     const code = try glacier.isel.compileFragment(allocator, &func, .{ .profile = .@"gc1.n" });
     defer allocator.free(code);
 
-    var memory: [2048]u32 = @splat(0);
+    const scratch_bytes = comptime glacier.encode.Profile.@"gc1.n".scratchBytes();
+    var memory: [2048 + scratch_bytes / 4]u32 = @splat(0);
     const texture_word = 64;
     const input_word = 256;
     const output_word = 1024;
@@ -1460,8 +1475,10 @@ test "SPIR-V depth comparison sampling runs on Glacier" {
         memory[input] = @bitCast((@as(f32, @floatFromInt(lane)) + 0.5) * 0.25);
         memory[input + 1] = @bitCast(@as(f32, 0.5));
     }
-    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory, .scratch = .{ .base = data_base + 2048 * 4, .stride = scratch_bytes, .harts = 1 } };
     var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .workgroup_base = 1, .grid_dim = 2 };
+    one.stack_top = data_base + memory.len * 4;
+    one.scratch_bytes = scratch_bytes;
     one.launch_args[0] = data_base;
     one.launch_args[1] = data_base + input_word * 4;
     one.launch_args[2] = data_base + output_word * 4;
@@ -1475,6 +1492,8 @@ test "SPIR-V depth comparison sampling runs on Glacier" {
 
     memory[25] = 0;
     var null_one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .workgroup_base = 1, .grid_dim = 2 };
+    null_one.stack_top = one.stack_top;
+    null_one.scratch_bytes = one.scratch_bytes;
     null_one.launch_args[0] = data_base;
     null_one.launch_args[1] = data_base + input_word * 4;
     null_one.launch_args[2] = data_base + output_word * 4;
@@ -3653,6 +3672,133 @@ test "SPIR-V alpha equality branches use lane masks even for a uniform image rea
     }
 }
 
+test "textured fused rasterisation keeps sampled colour with perspective" {
+    const allocator = std.testing.allocator;
+    var b = try normalizedSamplingModule(allocator, false, false, false);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .nullable_image_descriptors = true });
+    defer func.deinit();
+    const profile = glacier.encode.Profile.@"gc1.s";
+    const scratch_bytes = comptime profile.scratchBytes();
+    const frame_word = 128;
+    const vertex_word = 512;
+    const scratch_word = 1024;
+    const stride = glacier.isel.vertex_output_stride / 4;
+    for ([_]bool{ false, true }) |perspective| {
+        const code = try glacier.isel.compileFragmentRaster(allocator, &func, .{ .profile = profile, .raster_perspective = perspective });
+        defer allocator.free(code);
+        for ([_]u32{ 0, 1 }) |format| {
+            var memory: [scratch_word + scratch_bytes / 4]u32 = @splat(0);
+            memory[0] = data_base + 64 * 4;
+            memory[1] = if (format == 0) 16 else 4;
+            memory[2] = 1;
+            memory[3] = 1;
+            memory[4] = @bitCast(@as(f32, 1));
+            memory[5] = @bitCast(@as(f32, 1));
+            memory[6] = 2;
+            memory[7] = 2;
+            memory[12] = memory[1];
+            memory[13] = format;
+            memory[14] = @bitCast(@as(f32, 1));
+            memory[15] = @bitCast(@as(f32, 1));
+            memory[18..22].* = .{ 3, 4, 5, 6 };
+            memory[24] = 1;
+            memory[25] = 1;
+            memory[26] = data_base + 80 * 4;
+            memory[27] = data_base + 84 * 4;
+            memory[32] = memory[0];
+            if (format == 0) memory[64..68].* = .{ 0, 0x3f800000, 0, 0x3f800000 } else memory[64] = 0xff00ff00;
+            for ([3][2]u32{ .{ 2, 3 }, .{ 2, 13 }, .{ 14, 3 } }, 0..) |corner, i| {
+                const at = vertex_word + i * stride;
+                memory[at + glacier.isel.raster_vertex_x_offset / 4] = corner[0];
+                memory[at + glacier.isel.raster_vertex_y_offset / 4] = corner[1];
+                memory[at + glacier.isel.raster_vertex_w_offset / 4] = @bitCast(@as(f32, 1));
+                memory[at + 0x80 / 4] = @bitCast(@as(f32, 0.5));
+                memory[at + 0x84 / 4] = @bitCast(@as(f32, 0.5));
+            }
+            var mem: warp.Memory = .{ .base = data_base, .words = &memory, .scratch = .{ .base = data_base + scratch_word * 4, .stride = scratch_bytes, .harts = 1 } };
+            var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8, .scratch_bytes = scratch_bytes, .stack_top = data_base + memory.len * 4, .stall_cycles = 20 };
+            one.launch_args[0] = data_base;
+            one.launch_args[1] = data_base + frame_word * 4;
+            one.launch_args[2] = data_base + vertex_word * 4;
+            one.launch_args[3] = 16;
+            one.launch_args[4] = 16;
+            one.launch_args[5] = 16 * 4;
+            const steps = try warp.run(code, &mem, &one, 3_000_000);
+            std.debug.print("textured fused perspective={} format={d} words={d} steps={d} model_cycles={d} pixel={x}\n", .{ perspective, format, code.len, steps, one.cycles, memory[frame_word + 4 * 16 + 3] });
+            try std.testing.expectEqual(@as(u32, 0xff00ff00), memory[frame_word + 4 * 16 + 3]);
+            try std.testing.expectEqual(@as(u32, 0), memory[frame_word]);
+        }
+    }
+}
+
+test "actual cube shader lights a textured fused triangle" {
+    const allocator = std.testing.allocator;
+    const bytes = @embedFile("cube-real-fragment.spv");
+    const words = try allocator.alloc(u32, bytes.len / 4);
+    defer allocator.free(words);
+    for (words, 0..) |*word, i| word.* = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+    var func = try spirv.lowerModuleFor(allocator, words, .{ .nullable_image_descriptors = true });
+    defer func.deinit();
+    const profile = glacier.encode.Profile.@"gc1.s";
+    const scratch_bytes = comptime profile.scratchBytes();
+    const frame_word = 128;
+    const vertex_word = 512;
+    const scratch_word = 1024;
+    const stride = glacier.isel.vertex_output_stride / 4;
+    for ([_]bool{ false, true }) |perspective| {
+        const code = try glacier.isel.compileFragmentRaster(allocator, &func, .{ .profile = profile, .raster_perspective = perspective });
+        defer allocator.free(code);
+        for ([_]u32{ 0, 1 }) |format| {
+            var memory: [scratch_word + scratch_bytes / 4]u32 = @splat(0);
+            memory[0] = data_base + 64 * 4;
+            memory[1] = if (format == 0) 16 else 4;
+            memory[2] = 1;
+            memory[3] = 1;
+            memory[4] = @bitCast(@as(f32, 1));
+            memory[5] = @bitCast(@as(f32, 1));
+            memory[6] = 2;
+            memory[7] = 2;
+            memory[12] = memory[1];
+            memory[13] = format;
+            memory[14] = @bitCast(@as(f32, 1));
+            memory[15] = @bitCast(@as(f32, 1));
+            memory[18..22].* = .{ 3, 4, 5, 6 };
+            memory[24] = 1;
+            memory[25] = 1;
+            memory[26] = data_base + 80 * 4;
+            memory[27] = data_base + 84 * 4;
+            memory[32] = memory[0];
+            if (format == 0) memory[64..68].* = .{ 0, 0x3f800000, 0, 0x3f800000 } else memory[64] = 0xff00ff00;
+            for ([3][2]u32{ .{ 2, 3 }, .{ 2, 13 }, .{ 14, 3 } }, 0..) |corner, i| {
+                const at = vertex_word + i * stride;
+                memory[at + glacier.isel.raster_vertex_x_offset / 4] = corner[0];
+                memory[at + glacier.isel.raster_vertex_y_offset / 4] = corner[1];
+                memory[at + glacier.isel.raster_vertex_w_offset / 4] = @bitCast(@as(f32, 1));
+                memory[at + 0x80 / 4] = @bitCast(@as(f32, 0.5));
+                memory[at + 0x84 / 4] = @bitCast(@as(f32, 0.5));
+                memory[at + 0x90 / 4] = @bitCast(@as(f32, @floatFromInt(corner[0])));
+                memory[at + 0x94 / 4] = @bitCast(@as(f32, @floatFromInt(corner[1])));
+                memory[at + 0x98 / 4] = 0;
+            }
+            var mem: warp.Memory = .{ .base = data_base, .words = &memory, .scratch = .{ .base = data_base + scratch_word * 4, .stride = scratch_bytes, .harts = 1 } };
+            var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8, .scratch_bytes = scratch_bytes, .stack_top = data_base + memory.len * 4, .stall_cycles = 20 };
+            one.launch_args[0] = data_base;
+            one.launch_args[1] = data_base + frame_word * 4;
+            one.launch_args[2] = data_base + vertex_word * 4;
+            one.launch_args[3] = 16;
+            one.launch_args[4] = 16;
+            one.launch_args[5] = 16 * 4;
+            const steps = try warp.run(code, &mem, &one, 3_000_000);
+            std.debug.print("actual cube perspective={} format={d} words={d} steps={d} model_cycles={d} pixel={x}\n", .{ perspective, format, code.len, steps, one.cycles, memory[frame_word + 4 * 16 + 3] });
+            const pixel = memory[frame_word + 4 * 16 + 3];
+            const green: i32 = @intCast((pixel >> 8) & 255);
+            try std.testing.expect(@abs(green - 218) <= 3);
+            try std.testing.expectEqual(@as(u32, 0), memory[frame_word]);
+        }
+    }
+}
+
 test "image descriptor pointer arrays keep independent images" {
     const allocator = std.testing.allocator;
     const bytes = @embedFile("image-descriptor-array.spv");
@@ -3729,4 +3875,72 @@ test "image descriptor pointer arrays keep independent mip levels" {
     one.launch_args[1] = data_base + 16 * 4;
     _ = try warp.run(code, &mem, &one, 100_000);
     try std.testing.expectEqual(@as(u32, 136), memory[64]);
+}
+
+test "nearest RGBA8 clamp keeps coordinates at both edges in bounds" {
+    try runNormalizedSampling(2, 1, 4, 0, null, .{ 0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffffff }, .{ -10, 0.25, 1, 10 }, @splat(0), .{
+        .{ 1, 0, 0, 1 },
+        .{ 0, 1, 0, 1 },
+        .{ 1, 1, 1, 1 },
+        .{ 1, 1, 1, 1 },
+    });
+}
+
+test "implicit mip exponent lowering matches thresholds on Glacier lanes" {
+    const allocator = std.testing.allocator;
+    var func = ir.function.Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const input = try func.appendBlockParam(entry, ptr_t);
+    const output = try func.appendBlockParam(entry, ptr_t);
+    const lane = try func.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&func, lane, .thread_id_x);
+    const offset = try func.appendInst(entry, u32_t, .{ .arith_imm = .{ .op = .shl, .lhs = lane, .imm = 2 } });
+    const source = try func.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = input, .rhs = offset } });
+    const rho = try func.appendInst(entry, f32_t, .{ .load = .{ .ptr = source } });
+    const result = try spirv.lower.nearestImplicitMip(&func, entry, rho);
+    const dest = try func.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = output, .rhs = offset } });
+    try func.appendStore(entry, result, dest);
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+    // Exercise every exponent, both signs, and both sides of each representable boundary.
+    for (0..512) |signed_exponent| {
+        const base: u32 = @as(u32, @intCast(signed_exponent)) << 23;
+        var memory = [8]u32{ base, base + 1, base + 0x3fffff, base + 0x7fffff, 0, 0, 0, 0 };
+        var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+        var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+        one.launch_args[0] = data_base;
+        one.launch_args[1] = data_base + 16;
+        _ = try warp.run(code, &mem, &one, 10000);
+        for (memory[0..4], memory[4..8]) |raw, got| {
+            const x: f32 = @bitCast(raw);
+            var expected: f32 = 0;
+            var threshold: f32 = 2;
+            for (1..16) |n| {
+                if (!(x < threshold)) expected = @floatFromInt(n);
+                threshold *= 4;
+            }
+            try std.testing.expectEqual(@as(u32, @bitCast(expected)), got);
+        }
+    }
+}
+
+test "nearest RGBA8 repeat mirror and border paths preserve edge samples" {
+    const texels = [4]u32{ 0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffffff };
+    const red = [4]f32{ 1, 0, 0, 1 };
+    const green = [4]f32{ 0, 1, 0, 1 };
+    const blue = [4]f32{ 0, 0, 1, 1 };
+    const white = [4]f32{ 1, 1, 1, 1 };
+    const border = [4]f32{ 0.25, 0.5, 0.75, 1 };
+    try runNormalizedSampling(0, 1, 4, 0, null, texels, .{ -0.25, 1, 1.25, -1.5 }, border, .{ white, red, green, blue });
+    try runNormalizedSampling(1, 1, 4, 0, null, texels, .{ -0.25, 1, 1.25, -1.5 }, border, .{ green, white, white, blue });
+    try runNormalizedSampling(3, 1, 4, 0, null, texels, .{ -0.25, 1, 0.25, 0.5 }, border, .{ border, border, green, blue });
+}
+
+test "nullable mip descriptor uses fallback without reading the absent image" {
+    try runNormalizedSamplingWithNullability(false, true, false, false, 2, 0, 16, .{ 0, 0 }, null, @splat(0), @splat(0.5), @splat(0), @splat(.{ 9, 8, 7, 1 }), true);
 }
