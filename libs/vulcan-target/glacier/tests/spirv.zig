@@ -381,6 +381,10 @@ test "SPIR-V image fetch runs on Glacier" {
 }
 
 fn storageImageWriteModule(allocator: std.mem.Allocator, integer: bool) !spirv.binary.Builder {
+    return storageImageWriteModuleFormat(allocator, integer, false);
+}
+
+fn storageImageWriteModuleFormat(allocator: std.mem.Allocator, integer: bool, rgba8: bool) !spirv.binary.Builder {
     var b = try spirv.binary.Builder.init(allocator, 25);
     errdefer b.deinit(allocator);
     try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 16, 0x6e69616d, 0, 14, 15 });
@@ -395,7 +399,7 @@ fn storageImageWriteModule(allocator: std.mem.Allocator, integer: bool) !spirv.b
     try b.emit(allocator, op.TypeVector, &.{ 5, 3, 2 });
     try b.emit(allocator, op.TypeVector, &.{ 6, 4, 3 });
     try b.emit(allocator, op.TypeVector, &.{ 7, if (integer) 4 else 2, 4 });
-    try b.emit(allocator, op.TypeImage, &.{ 8, if (integer) 4 else 2, op.Dim.dim_2d, 0, 0, 0, 2, if (integer) 30 else 1 });
+    try b.emit(allocator, op.TypeImage, &.{ 8, if (integer) 4 else 2, op.Dim.dim_2d, 0, 0, 0, 2, if (integer) 30 else if (rgba8) 4 else 1 });
     try b.emit(allocator, op.TypePointer, &.{ 9, op.StorageClass.uniform_constant, 8 });
     try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.input, 6 });
     try b.emit(allocator, op.TypeFunction, &.{ 11, 1 });
@@ -410,7 +414,7 @@ fn storageImageWriteModule(allocator: std.mem.Allocator, integer: bool) !spirv.b
     try b.emit(allocator, op.CompositeExtract, &.{ 4, 20, 19, 0 });
     try b.emit(allocator, op.Bitcast, &.{ 3, 21, 20 });
     try b.emit(allocator, op.CompositeConstruct, &.{ 5, 22, 21, 12 });
-    try b.emit(allocator, op.Bitcast, &.{ if (integer) 4 else 2, 23, 20 });
+    try b.emit(allocator, if (rgba8) op.ConvertUToF else op.Bitcast, &.{ if (integer) 4 else 2, 23, 20 });
     try b.emit(allocator, op.CompositeConstruct, &.{ 7, 24, 23, 13, 13, 13 });
     try b.emit(allocator, op.ImageWrite, &.{ 18, 22, 24 });
     try b.emit(allocator, op.Return, &.{});
@@ -427,11 +431,11 @@ test "SPIR-V storage image write runs on Glacier" {
     const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
     defer allocator.free(code);
 
-    var memory: [32]u32 = @splat(0);
+    var memory: [4160]u32 = @splat(0);
     memory[0] = data_base + 8 * 4;
     memory[1] = 4 * 16;
     var mem: warp.Memory = .{ .base = data_base, .words = &memory };
-    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .stack_top = data_base + 4160 * 4, .scratch_bytes = 16384 };
     one.launch_args[0] = data_base;
     _ = try warp.run(code, &mem, &one, 10_000);
     for (0..4) |lane| {
@@ -439,6 +443,28 @@ test "SPIR-V storage image write runs on Glacier" {
         try std.testing.expectEqual(@as(u32, @intCast(lane)), texel[0]);
         try std.testing.expectEqualSlices(u32, &.{ 0x3f800000, 0x3f800000, 0x3f800000 }, texel[1..]);
     }
+}
+
+test "RGBA8 storage writes pack pixels without overwriting adjacent memory" {
+    const allocator = std.testing.allocator;
+    var module = try storageImageWriteModuleFormat(allocator, false, true);
+    defer module.deinit(allocator);
+    var func = try spirv.lowerModule(allocator, module.words.items);
+    defer func.deinit();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+    var memory: [4160]u32 = @splat(0xdeadbeef);
+    memory[0] = data_base + 40 * 4;
+    memory[1] = 16;
+    memory[12] = 4;
+    memory[13] = 1;
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .stack_top = data_base + 4160 * 4, .scratch_bytes = 16384 };
+    one.launch_args[0] = data_base;
+    _ = try warp.run(code, &mem, &one, 10_000);
+    try std.testing.expectEqualSlices(u32, &.{ 0xffffff00, 0xffffffff, 0xffffffff, 0xffffffff }, memory[40..44]);
+    try std.testing.expectEqual(@as(u32, 0xdeadbeef), memory[39]);
+    for (memory[44..64]) |word| try std.testing.expectEqual(@as(u32, 0xdeadbeef), word);
 }
 
 test "SPIR-V integer storage image write preserves component types" {
@@ -450,11 +476,11 @@ test "SPIR-V integer storage image write preserves component types" {
     const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
     defer allocator.free(code);
 
-    var memory: [32]u32 = @splat(0);
+    var memory: [4160]u32 = @splat(0);
     memory[0] = data_base + 8 * 4;
     memory[1] = 4 * 16;
     var mem: warp.Memory = .{ .base = data_base, .words = &memory };
-    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .stack_top = data_base + 4160 * 4, .scratch_bytes = 16384 };
     one.launch_args[0] = data_base;
     _ = try warp.run(code, &mem, &one, 10_000);
     for (0..4) |lane| {
@@ -475,7 +501,7 @@ test "a null storage image discards writes" {
     const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = .@"gc1.n" });
     defer allocator.free(code);
 
-    var memory: [64]u32 = @splat(0xcccccccc);
+    var memory: [4160]u32 = @splat(0xcccccccc);
     memory[0] = data_base + 40 * 4;
     memory[1] = 4 * 16;
     memory[2] = 4;
@@ -486,7 +512,7 @@ test "a null storage image discards writes" {
     memory[28..32].* = @splat(0);
     memory[40..56].* = @splat(0xdeadbeef);
     var mem: warp.Memory = .{ .base = data_base, .words = &memory };
-    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .stack_top = data_base + 4160 * 4, .scratch_bytes = 16384 };
     one.launch_args[0] = data_base;
     _ = try warp.run(code, &mem, &one, 10_000);
 

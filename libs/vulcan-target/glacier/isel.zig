@@ -3296,7 +3296,8 @@ fn lowerTexelFetch(allocator: std.mem.Allocator, func: *Function) Error!void {
 
 fn lowerStorageImageWrite(allocator: std.mem.Allocator, func: *Function) Error!void {
     for (0..func.blockCount()) |bi| {
-        const block: Block = @fromBackingInt(@intCast(bi));
+        const original_block: Block = @fromBackingInt(@intCast(bi));
+        var block = original_block;
         const original = try allocator.dupe(Inst, func.blockInsts(block));
         defer allocator.free(original);
         func.blockInstsMut(block).clearRetainingCapacity();
@@ -3319,12 +3320,58 @@ fn lowerStorageImageWrite(allocator: std.mem.Allocator, func: *Function) Error!v
             const column = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = args[1], .rhs = texel_bytes } });
             const offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column } });
             const texel = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+            var joined: ?Block = null;
+            if (func.types.type_kind(func.valueType(args[3])) == .float) {
+                const bool_t = try func.types.intern(.bool);
+                const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+                const f32_t = func.valueType(args[3]);
+                const bytes_ptr = try appendOffset(func, block, desc, sampler_texel_bytes_offset, int_ty);
+                const bytes = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = bytes_ptr } });
+                const four = try func.appendInst(block, int_ty, .{ .iconst = 4 });
+                const is_packed = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = bytes, .rhs = four } });
+                const rgba8 = try func.appendBlock();
+                const wide = try func.appendBlock();
+                joined = try func.appendBlock();
+                try func.appendIf(block, is_packed, .{ .target = rgba8, .args = &.{} }, .{ .target = wide, .args = &.{} });
+                const column8 = try func.appendInst(rgba8, int_ty, .{ .arith = .{ .op = .mul, .lhs = args[1], .rhs = four } });
+                const offset8 = try func.appendInst(rgba8, int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column8 } });
+                const pixel = try func.appendInst(rgba8, ptr_ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset8 } });
+                const low = try func.appendInst(rgba8, f32_t, .{ .fconst = 0 });
+                const high = try func.appendInst(rgba8, f32_t, .{ .fconst = 1 });
+                const scale = try func.appendInst(rgba8, f32_t, .{ .fconst = 255 });
+                const half = try func.appendInst(rgba8, f32_t, .{ .fconst = 0.5 });
+                var word = try func.appendInst(rgba8, u32_t, .{ .iconst = 0 });
+                for (0..4) |component| {
+                    const value = args[3 + component];
+                    const under = try func.appendInst(rgba8, bool_t, .{ .icmp = .{ .op = .lt, .lhs = value, .rhs = low } });
+                    const lifted = try func.appendInst(rgba8, f32_t, .{ .select = .{ .cond = under, .then = low, .@"else" = value } });
+                    const over = try func.appendInst(rgba8, bool_t, .{ .icmp = .{ .op = .lt, .lhs = high, .rhs = lifted } });
+                    const clamped = try func.appendInst(rgba8, f32_t, .{ .select = .{ .cond = over, .then = high, .@"else" = lifted } });
+                    const scaled = try func.appendInst(rgba8, f32_t, .{ .arith = .{ .op = .mul, .lhs = clamped, .rhs = scale } });
+                    const rounded = try func.appendInst(rgba8, f32_t, .{ .arith = .{ .op = .add, .lhs = scaled, .rhs = half } });
+                    const byte = try func.appendInst(rgba8, u32_t, .{ .convert = .{ .value = rounded } });
+                    const shifted = try func.appendArithImm(rgba8, u32_t, .shl, byte, @intCast(component * 8));
+                    word = try func.appendInst(rgba8, u32_t, .{ .arith = .{ .op = .bit_or, .lhs = word, .rhs = shifted } });
+                }
+                const write_ptr = try nullableImagePointer(func, rgba8, desc, pixel, true, 0, int_ty);
+                try func.appendStore(rgba8, word, write_ptr);
+                try func.setJump(rgba8, joined.?, &.{});
+                block = wide;
+            }
             for (0..4) |component| {
                 const byte_offset: i64 = @intCast(component * 4);
                 const destination = try appendOffset(func, block, texel, byte_offset, int_ty);
                 const write_ptr = try nullableImagePointer(func, block, desc, destination, true, byte_offset, int_ty);
                 try func.appendStore(block, args[3 + component], write_ptr);
             }
+            if (joined) |next| {
+                try func.setJump(block, next, &.{});
+                block = next;
+            }
+        }
+        if (block != original_block) {
+            func.terminatorPtr(block).* = func.terminator(original_block);
+            func.terminatorPtr(original_block).* = null;
         }
     }
 }
