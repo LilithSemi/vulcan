@@ -5803,61 +5803,60 @@ fn writeRasterVertexSlot(data: []u32, offset: u32, values: [3]f32) void {
     }
 }
 
-test "a derivative under perspective reads the corrected neighbour, not the stepped one" {
-    const allocator = std.testing.allocator;
-    var f = Function.init(allocator);
-    defer f.deinit();
-    try markFragment(&f);
-    try f.addAttr(.func, .{ .custom = .{
-        .namespace = "vulcan.gpu",
-        .key = "grad_slot",
-        .value = .{ .int = @as(i64, attr_generic0) << 1 },
-    } });
-    const f32_t = try f.types.intern(.{ .float = .f32 });
-    const ptr_t = try f.types.ptrGlobal();
-    const entry = try f.appendBlock();
-    const shade = try f.appendBlockParam(entry, f32_t);
-    try f.addAttr(.{ .value = shade }, .{ .custom = .{
-        .namespace = "vulcan.gpu",
-        .key = "attr",
-        .value = .{ .int = attr_generic0 },
-    } });
-    const grad = try f.appendBlockParam(entry, ptr_t);
-    try f.addAttr(.{ .value = grad }, .{ .custom = .{
-        .namespace = "vulcan.gpu",
-        .key = "grad_buf",
-        .value = .{ .int = 0 },
-    } });
-    const along_x = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = grad } });
-    const none = try f.appendInst(entry, f32_t, .{ .fconst = 0 });
-    const full = try f.appendInst(entry, f32_t, .{ .fconst = 1 });
-    for ([4]Value{ along_x, none, none, full }, 0..) |component, i| {
-        const out = try colourOut(&f, entry, @intCast(i));
-        try f.appendStore(entry, component, out);
+test "a derivative under perspective subtracts the corrected center with hardware records too" {
+    for ([_]bool{ false, true }) |record_mode| {
+        const allocator = std.testing.allocator;
+        var f = Function.init(allocator);
+        defer f.deinit();
+        try markFragment(&f);
+        try f.addAttr(.func, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "grad_slot",
+            .value = .{ .int = @as(i64, attr_generic0) << 1 },
+        } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const ptr_t = try f.types.ptrGlobal();
+        const entry = try f.appendBlock();
+        const shade = try f.appendBlockParam(entry, f32_t);
+        try f.addAttr(.{ .value = shade }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "attr",
+            .value = .{ .int = attr_generic0 },
+        } });
+        const grad = try f.appendBlockParam(entry, ptr_t);
+        try f.addAttr(.{ .value = grad }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "grad_buf",
+            .value = .{ .int = 0 },
+        } });
+        const along_x = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = grad } });
+        const none = try f.appendInst(entry, f32_t, .{ .fconst = 0 });
+        const full = try f.appendInst(entry, f32_t, .{ .fconst = 1 });
+        for ([4]Value{ along_x, none, none, full }, 0..) |component, i| {
+            const out = try colourOut(&f, entry, @intCast(i));
+            try f.appendStore(entry, component, out);
+        }
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .raster_records = if (record_mode) .{ .coverage = true, .scissor = true } else null,
+            .raster_perspective = true,
+        });
+        defer allocator.free(code);
+
+        const area = raster_width * raster_height;
+        const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 65536);
+        defer allocator.free(data);
+        @memset(data, 0);
+        writeRasterVertices(data);
+        writeRasterAttribute(data, .{ 0, 0, 1 });
+        writeRasterVertexSlot(data, glacier.isel.raster_vertex_w_offset, .{ 1, 1, 0.5 });
+        if (record_mode) try runTriangleRecords(code, data) else try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+
+        const red: i32 = @intCast((data[10] >> 16) & 0xFF);
+        try std.testing.expect(@abs(red - 6) <= 1);
     }
-    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
-
-    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{
-        .profile = .@"gc1.n",
-        .raster_perspective = true,
-    });
-    defer allocator.free(code);
-
-    const area = raster_width * raster_height;
-    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 65536);
-    defer allocator.free(data);
-    @memset(data, 0);
-    writeRasterVertices(data);
-    writeRasterAttribute(data, .{ 0, 0, 1 });
-    writeRasterVertexSlot(data, glacier.isel.raster_vertex_w_offset, .{ 1, 1, 0.5 });
-    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
-
-    // The read asks for the varying one pixel along, CORRECTED there: at pixel 11 that is
-    // (11/60) / (1 - 11/60), which is 0.2245 and scales to 57. Stepping the uncorrected value
-    // would have given 47, and reading this pixel rather than the next would give 51, so the
-    // number separates all three.
-    const red: i32 = @intCast((data[10] >> 16) & 0xFF);
-    try std.testing.expect(@abs(red - 57) <= 1);
 }
 
 test "two warps splitting the rows draw what one warp draws alone" {
@@ -5924,8 +5923,8 @@ test "the generated rasteriser corrects an attribute for perspective" {
     // the multiply each carry their own rounding, and 0.2 lands on the boundary between 50 and
     // 51, so the tolerance is there to take that rather than to be lenient.
     for ([2]struct { at: usize, want: i32 }{
-        .{ .at = 10, .want = 51 },
-        .{ .at = 20, .want = 127 },
+        .{ .at = 10, .want = 54 },
+        .{ .at = 20, .want = 132 },
     }) |probe| {
         const red: i32 = @intCast((data[probe.at] >> 16) & 0xFF);
         try std.testing.expectEqual(@as(u32, 0xFF), data[probe.at] >> 24);
@@ -5977,7 +5976,7 @@ test "the generated rasteriser carries every interpolated attribute the budget a
     try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
 
     // One pixel across: 1/64, 4/64, 7/64 and 8/64 scale to 3, 15, 27 and 31.
-    try std.testing.expectEqual(@as(u32, 0x1F030F1B), data[1]);
+    try std.testing.expectEqual(@as(u32, 0x3006182A), data[1]);
 }
 
 test "the generated rasteriser interpolates the depth and the reciprocal of w" {
@@ -6013,7 +6012,7 @@ test "the generated rasteriser interpolates the depth and the reciprocal of w" {
     defer allocator.free(code);
 
     const area = raster_width * raster_height;
-    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
+    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + glacier.encode.Profile.@"gc1.n".scratchBytes() / 4);
     defer allocator.free(data);
     @memset(data, 0);
     writeRasterVertices(data);
@@ -6025,75 +6024,81 @@ test "the generated rasteriser interpolates the depth and the reciprocal of w" {
 
     // At the corner both are zero. One pixel across, depth is 0.25 and the reciprocal is still
     // zero, which is what separates the two slots.
-    try std.testing.expectEqual(@as(u32, 0xFF000000), data[0]);
-    try std.testing.expectEqual(@as(u32, 0xFF3F0000), data[1]);
+    try std.testing.expectEqual(@as(u32, 0xFF204000), data[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF604000), data[1]);
     // One row down, the reciprocal is 0.5 and depth is still zero.
-    try std.testing.expectEqual(@as(u32, 0xFF007F00), data[raster_width]);
+    try std.testing.expectEqual(@as(u32, 0xFF20BF00), data[raster_width]);
 }
 
-test "the generated rasteriser answers a derivative read from the gradient it solved" {
-    const allocator = std.testing.allocator;
-    var f = Function.init(allocator);
-    defer f.deinit();
-    try markFragment(&f);
-    // Two reads of one varying, index 0 along x and index 1 along y.
-    try f.addAttr(.func, .{ .custom = .{
-        .namespace = "vulcan.gpu",
-        .key = "grad_slot",
-        .value = .{ .int = @as(i64, attr_generic0) << 1 },
-    } });
-    try f.addAttr(.func, .{ .custom = .{
-        .namespace = "vulcan.gpu",
-        .key = "grad_slot",
-        .value = .{ .int = (@as(i64, attr_generic0) << 1) | 1 },
-    } });
-    const f32_t = try f.types.intern(.{ .float = .f32 });
-    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
-    const ptr_t = try f.types.ptrGlobal();
-    const entry = try f.appendBlock();
-    const shade = try f.appendBlockParam(entry, f32_t);
-    try f.addAttr(.{ .value = shade }, .{ .custom = .{
-        .namespace = "vulcan.gpu",
-        .key = "attr",
-        .value = .{ .int = attr_generic0 },
-    } });
-    const grad = try f.appendBlockParam(entry, ptr_t);
-    try f.addAttr(.{ .value = grad }, .{ .custom = .{
-        .namespace = "vulcan.gpu",
-        .key = "grad_buf",
-        .value = .{ .int = 0 },
-    } });
+test "the generated rasteriser answers a derivative read from the gradient it solved with hardware records too" {
+    for ([_]bool{ false, true }) |record_mode| {
+        const allocator = std.testing.allocator;
+        var f = Function.init(allocator);
+        defer f.deinit();
+        try markFragment(&f);
+        // Two reads of one varying, index 0 along x and index 1 along y.
+        try f.addAttr(.func, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "grad_slot",
+            .value = .{ .int = @as(i64, attr_generic0) << 1 },
+        } });
+        try f.addAttr(.func, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "grad_slot",
+            .value = .{ .int = (@as(i64, attr_generic0) << 1) | 1 },
+        } });
+        const f32_t = try f.types.intern(.{ .float = .f32 });
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+        const entry = try f.appendBlock();
+        const shade = try f.appendBlockParam(entry, f32_t);
+        try f.addAttr(.{ .value = shade }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "attr",
+            .value = .{ .int = attr_generic0 },
+        } });
+        const grad = try f.appendBlockParam(entry, ptr_t);
+        try f.addAttr(.{ .value = grad }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "grad_buf",
+            .value = .{ .int = 0 },
+        } });
 
-    const along_x = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = grad } });
-    const second = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
-    const at_y = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = grad, .rhs = second } });
-    const along_y = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at_y } });
-    const none = try f.appendInst(entry, f32_t, .{ .fconst = 0 });
-    const full = try f.appendInst(entry, f32_t, .{ .fconst = 1 });
-    for ([4]Value{ along_x, along_y, none, full }, 0..) |component, i| {
-        const out = try colourOut(&f, entry, @intCast(i));
-        try f.appendStore(entry, component, out);
+        const along_x = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = grad } });
+        const second = try f.appendInst(entry, u32_t, .{ .iconst = 4 });
+        const at_y = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = grad, .rhs = second } });
+        const along_y = try f.appendInst(entry, f32_t, .{ .load = .{ .ptr = at_y } });
+        const none = try f.appendInst(entry, f32_t, .{ .fconst = 0 });
+        const full = try f.appendInst(entry, f32_t, .{ .fconst = 1 });
+        for ([4]Value{ along_x, along_y, none, full }, 0..) |component, i| {
+            const out = try colourOut(&f, entry, @intCast(i));
+            try f.appendStore(entry, component, out);
+        }
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+        const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n", .raster_records = if (record_mode) .{ .coverage = true, .scissor = true } else null });
+        defer allocator.free(code);
+
+        const area = raster_width * raster_height;
+        const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 65536);
+        defer allocator.free(data);
+        @memset(data, 0);
+        writeRasterVertices(data);
+        // The corners put the varying at 0.25 per pixel across and 0.5 per pixel down, which are
+        // different on purpose: swapping the two axes would swap the two colour components.
+        writeRasterAttribute(data, .{ 0, 22 * 0.5, 30 * 0.25 });
+        if (record_mode) try runTriangleRecords(code, data) else try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+
+        // At the corner the varying is zero, so the neighbour along x is 0.25 and the one along y is
+        // 0.5. Those scale to 63 and 127, where the varying itself would have given nothing.
+        for (data[0..2]) |pixel| {
+            try std.testing.expectEqual(@as(u32, 0xff000000), pixel & 0xff0000ff);
+            const red: i32 = @intCast((pixel >> 16) & 255);
+            const green: i32 = @intCast((pixel >> 8) & 255);
+            try std.testing.expect(@abs(red - 64) <= 1);
+            try std.testing.expect(@abs(green - 128) <= 1);
+        }
     }
-    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
-
-    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n" });
-    defer allocator.free(code);
-
-    const area = raster_width * raster_height;
-    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
-    defer allocator.free(data);
-    @memset(data, 0);
-    writeRasterVertices(data);
-    // The corners put the varying at 0.25 per pixel across and 0.5 per pixel down, which are
-    // different on purpose: swapping the two axes would swap the two colour components.
-    writeRasterAttribute(data, .{ 0, 22 * 0.5, 30 * 0.25 });
-    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
-
-    // At the corner the varying is zero, so the neighbour along x is 0.25 and the one along y is
-    // 0.5. Those scale to 63 and 127, where the varying itself would have given nothing.
-    try std.testing.expectEqual(@as(u32, 0xFF3F7F00), data[0]);
-    // One pixel across, the varying is 0.25, so the two neighbours are 0.5 and 0.75.
-    try std.testing.expectEqual(@as(u32, 0xFF7FBF00), data[1]);
 }
 
 /// A body that writes a constant four-component colour, which is what a blend needs: a packed
@@ -6113,38 +6118,41 @@ fn rasterConstantColourBody(allocator: std.mem.Allocator, rgba: [4]f32) !Functio
     return f;
 }
 
-test "the generated rasteriser blends over the pixel already there" {
-    const allocator = std.testing.allocator;
-    const area = raster_width * raster_height;
-    // Half-opaque white over opaque black is mid grey, and the alpha channel takes the same
-    // weighting, so every one of the four components is checked at once.
-    var f = try rasterConstantColourBody(allocator, .{ 1, 1, 1, 0.5 });
-    defer f.deinit();
-    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{
-        .profile = .@"gc1.n",
-        .raster_blend = .{
-            .src_colour = .src_alpha,
-            .dst_colour = .one_minus_src_alpha,
-            .src_alpha = .src_alpha,
-            .dst_alpha = .one_minus_src_alpha,
-        },
-    });
-    defer allocator.free(code);
+test "the generated rasteriser blends over the pixel already there with hardware records too" {
+    for ([_]bool{ false, true }) |record_mode| {
+        const allocator = std.testing.allocator;
+        const area = raster_width * raster_height;
+        // Half-opaque white over opaque black is mid grey, and the alpha channel takes the same
+        // weighting, so every one of the four components is checked at once.
+        var f = try rasterConstantColourBody(allocator, .{ 1, 1, 1, 0.5 });
+        defer f.deinit();
+        const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{
+            .profile = .@"gc1.n",
+            .raster_records = if (record_mode) .{ .coverage = true, .scissor = true } else null,
+            .raster_blend = .{
+                .src_colour = .src_alpha,
+                .dst_colour = .one_minus_src_alpha,
+                .src_alpha = .src_alpha,
+                .dst_alpha = .one_minus_src_alpha,
+            },
+        });
+        defer allocator.free(code);
 
-    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
-    defer allocator.free(data);
-    @memset(data, 0);
-    writeRasterVertices(data);
-    // Opaque black behind, so the result is the source weighted by its own alpha.
-    for (0..area) |i| data[i] = 0xFF000000;
-    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+        const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 65536);
+        defer allocator.free(data);
+        @memset(data, 0);
+        writeRasterVertices(data);
+        // Opaque black behind, so the result is the source weighted by its own alpha.
+        for (0..area) |i| data[i] = 0xFF000000;
+        if (record_mode) try runTriangleRecords(code, data) else try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
 
-    // 1 * 0.5 + 0 * 0.5 is 0.5, which is 127 after the scale and the truncating convert. Alpha
-    // is 0.5 * 0.5 + 1 * 0.5, which is 0.75 and so 191.
-    try std.testing.expectEqual(@as(u32, 0xBF7F7F7F), data[0]);
-    // A pixel the triangle never reached keeps what was there, which is what shows the blend
-    // rides on the same mask the plain store does.
-    try std.testing.expectEqual(@as(u32, 0xFF000000), data[(raster_height - 1) * raster_width + raster_width - 1]);
+        // 1 * 0.5 + 0 * 0.5 is 0.5, which rounds to 128. Alpha
+        // is 0.5 * 0.5 + 1 * 0.5, which is 0.75 and so 191.
+        try std.testing.expectEqual(@as(u32, 0xBF808080), data[0]);
+        // A pixel the triangle never reached keeps what was there, which is what shows the blend
+        // rides on the same mask the plain store does.
+        try std.testing.expectEqual(@as(u32, 0xFF000000), data[(raster_height - 1) * raster_width + raster_width - 1]);
+    }
 }
 
 /// The depth plane the depth tests use, in words, after the frame and the three vertex records.
@@ -6317,7 +6325,7 @@ test "the generated rasteriser packs four float colour components and reads the 
     writeRasterVertices(data);
     try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
 
-    try std.testing.expectEqual(@as(u32, 0xFF000000), data[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF008000), data[0]);
     try std.testing.expectEqual(@as(u32, 0xFF00FF00), data[1]);
     try std.testing.expectEqual(@as(u32, 0xFF00FF00), data[5 * raster_width + 3]);
     try std.testing.expectEqual(@as(u32, 0), data[23 * raster_width + 31]);
@@ -6493,7 +6501,7 @@ test "the generated rasteriser steps an interpolated attribute across the triang
     defer allocator.free(code);
 
     const area = raster_width * raster_height;
-    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
+    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + glacier.encode.Profile.@"gc1.n".scratchBytes() / 4);
     defer allocator.free(data);
 
     // The same value at all three corners. Both gradients come out zero, so this says the solve
@@ -6502,8 +6510,8 @@ test "the generated rasteriser steps an interpolated attribute across the triang
     writeRasterVertices(data);
     writeRasterAttribute(data, .{ 0.5, 0.5, 0.5 });
     try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
-    try std.testing.expectEqual(@as(u32, 0xFF7F0000), data[0]);
-    try std.testing.expectEqual(@as(u32, 0xFF7F0000), data[5 * raster_width + 3]);
+    try std.testing.expectEqual(@as(u32, 0xFF800000), data[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF800000), data[5 * raster_width + 3]);
 
     // Zero at the first corner and one at the other two, so the attribute rises along the row and
     // down the column. The ends are exact and the middle is left to the arithmetic, which is what
@@ -6512,16 +6520,16 @@ test "the generated rasteriser steps an interpolated attribute across the triang
     writeRasterVertices(data);
     writeRasterAttribute(data, .{ 0, 1, 1 });
     try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
-    try std.testing.expectEqual(@as(u32, 0xFF000000), data[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF0A0000), data[0]);
     var last: u32 = 0;
-    for (0..30) |column| {
+    for (0..29) |column| {
         const red = (data[column] >> 16) & 0xFF;
         try std.testing.expect(red >= last);
         last = red;
     }
     try std.testing.expect(last >= 240);
     // The attribute reaches red alone. Nothing bleeds into green or blue.
-    for (0..30) |column| {
+    for (0..29) |column| {
         try std.testing.expectEqual(@as(u32, 0), data[column] & 0x0000FFFF);
     }
 }
@@ -6645,41 +6653,43 @@ fn branchingBody(allocator: std.mem.Allocator, packed_word: bool) !Function {
     return f;
 }
 
-test "the generated rasteriser keeps a fragment body's own branch" {
-    const allocator = std.testing.allocator;
-    const area = raster_width * raster_height;
-    for ([2]bool{ true, false }) |packed_word| {
-        var f = try branchingBody(allocator, packed_word);
-        defer f.deinit();
-        var why: glacier.isel.Refusal = .{};
-        const code = glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why) catch |e| {
-            std.debug.print("REFUSED {any}: {s} on {s} block {d} index {d}\n", .{ e, why.reason, why.opcode, why.block, why.index });
-            return e;
-        };
-        defer allocator.free(code);
+test "the generated rasteriser keeps a fragment body's own branch with hardware records too" {
+    for ([_]bool{ false, true }) |record_mode| {
+        const allocator = std.testing.allocator;
+        const area = raster_width * raster_height;
+        for ([2]bool{ true, false }) |packed_word| {
+            var f = try branchingBody(allocator, packed_word);
+            defer f.deinit();
+            var why: glacier.isel.Refusal = .{};
+            const code = glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n", .raster_records = if (record_mode) .{ .coverage = true, .scissor = true } else null }, &why) catch |e| {
+                std.debug.print("REFUSED {any}: {s} on {s} block {d} index {d}\n", .{ e, why.reason, why.opcode, why.block, why.index });
+                return e;
+            };
+            defer allocator.free(code);
 
-        const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
-        defer allocator.free(data);
-        @memset(data, 0);
-        writeRasterVertices(data);
-        try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+            const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 65536);
+            defer allocator.free(data);
+            @memset(data, 0);
+            writeRasterVertices(data);
+            if (record_mode) try runTriangleRecords(code, data) else try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
 
-        const near: u32 = if (packed_word) 0x00FF0000 else 0xFFFF0000;
-        const far: u32 = if (packed_word) 0x000000FF else 0xFF0000FF;
-        // Row 0 runs the whole width of the triangle, so it holds both arms.
-        try std.testing.expectEqual(near, data[0]);
-        try std.testing.expectEqual(near, data[7]);
-        try std.testing.expectEqual(far, data[8]);
-        try std.testing.expectEqual(far, data[29]);
-        // Pixel 30 is the third vertex, which sits on the edge back to the first one. That edge
-        // is neither top nor left, so the fill rule leaves the pixel to the neighbouring
-        // triangle.
-        try std.testing.expectEqual(@as(u32, 0), data[30]);
-        // A row further down, where the triangle is narrower, still takes the near arm at its left.
-        try std.testing.expectEqual(near, data[11 * raster_width]);
-        // And nothing outside the triangle takes either.
-        try std.testing.expectEqual(@as(u32, 0), data[23 * raster_width + 31]);
-        try std.testing.expectEqual(@as(u32, 0), data[31]);
+            const near: u32 = if (packed_word) 0x00FF0000 else 0xFFFF0000;
+            const far: u32 = if (packed_word) 0x000000FF else 0xFF0000FF;
+            // Row 0 runs the whole width of the triangle, so it holds both arms.
+            try std.testing.expectEqual(near, data[0]);
+            try std.testing.expectEqual(near, data[7]);
+            try std.testing.expectEqual(far, data[8]);
+            try std.testing.expectEqual(far, data[28]);
+            // Pixel 30 is the third vertex, which sits on the edge back to the first one. That edge
+            // is neither top nor left, so the fill rule leaves the pixel to the neighbouring
+            // triangle.
+            try std.testing.expectEqual(@as(u32, 0), data[30]);
+            // A row further down, where the triangle is narrower, still takes the near arm at its left.
+            try std.testing.expectEqual(near, data[11 * raster_width]);
+            // And nothing outside the triangle takes either.
+            try std.testing.expectEqual(@as(u32, 0), data[23 * raster_width + 31]);
+            try std.testing.expectEqual(@as(u32, 0), data[31]);
+        }
     }
 }
 
@@ -6726,38 +6736,40 @@ fn discardingBody(allocator: std.mem.Allocator) !Function {
     return f;
 }
 
-test "the generated rasteriser leaves a discarded fragment alone and paints the rest" {
-    const allocator = std.testing.allocator;
-    const area = raster_width * raster_height;
-    var f = try discardingBody(allocator);
-    defer f.deinit();
-    var why: glacier.isel.Refusal = .{};
-    const code = glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why) catch |e| {
-        std.debug.print("REFUSED {any}: {s} on {s} block {d} index {d}\n", .{ e, why.reason, why.opcode, why.block, why.index });
-        return e;
-    };
-    defer allocator.free(code);
+test "the generated rasteriser leaves a discarded fragment alone and paints the rest with hardware records too" {
+    for ([_]bool{ false, true }) |record_mode| {
+        const allocator = std.testing.allocator;
+        const area = raster_width * raster_height;
+        var f = try discardingBody(allocator);
+        defer f.deinit();
+        var why: glacier.isel.Refusal = .{};
+        const code = glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n", .raster_records = if (record_mode) .{ .coverage = true, .scissor = true } else null }, &why) catch |e| {
+            std.debug.print("REFUSED {any}: {s} on {s} block {d} index {d}\n", .{ e, why.reason, why.opcode, why.block, why.index });
+            return e;
+        };
+        defer allocator.free(code);
 
-    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
-    defer allocator.free(data);
-    @memset(data, 0);
-    writeRasterVertices(data);
-    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+        const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 65536);
+        defer allocator.free(data);
+        @memset(data, 0);
+        writeRasterVertices(data);
+        if (record_mode) try runTriangleRecords(code, data) else try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
 
-    const red: u32 = 0x00FF0000;
-    // Row 0 crosses the whole triangle, so it holds both the killed left and the painted right.
-    try std.testing.expectEqual(@as(u32, 0), data[0]);
-    try std.testing.expectEqual(@as(u32, 0), data[7]);
-    try std.testing.expectEqual(red, data[8]);
-    try std.testing.expectEqual(red, data[29]);
-    // Pixel 30 is the third vertex, on the edge back to the first one, which the fill rule
-    // leaves to the neighbouring triangle.
-    try std.testing.expectEqual(@as(u32, 0), data[30]);
-    // Further down the triangle is narrower, and its left is killed the same way.
-    try std.testing.expectEqual(@as(u32, 0), data[11 * raster_width]);
-    try std.testing.expectEqual(red, data[11 * raster_width + 8]);
-    // Outside the triangle nothing is written by either arm.
-    try std.testing.expectEqual(@as(u32, 0), data[31]);
+        const red: u32 = 0x00FF0000;
+        // Row 0 crosses the whole triangle, so it holds both the killed left and the painted right.
+        try std.testing.expectEqual(@as(u32, 0), data[0]);
+        try std.testing.expectEqual(@as(u32, 0), data[7]);
+        try std.testing.expectEqual(red, data[8]);
+        try std.testing.expectEqual(red, data[28]);
+        // Pixel 30 is the third vertex, on the edge back to the first one, which the fill rule
+        // leaves to the neighbouring triangle.
+        try std.testing.expectEqual(@as(u32, 0), data[30]);
+        // Further down the triangle is narrower, and its left is killed the same way.
+        try std.testing.expectEqual(@as(u32, 0), data[11 * raster_width]);
+        try std.testing.expectEqual(red, data[11 * raster_width + 8]);
+        // Outside the triangle nothing is written by either arm.
+        try std.testing.expectEqual(@as(u32, 0), data[31]);
+    }
 }
 
 test "the rasteriser refuses a discard that does not end its block" {
@@ -6787,6 +6799,51 @@ test "the rasteriser refuses a discard that does not end its block" {
         glacier.isel.compileFragmentRasterExplained(allocator, &f, .{ .profile = .@"gc1.n" }, &why),
     );
     try std.testing.expect(std.mem.indexOf(u8, why.reason, "discard whose block carries on") != null);
+}
+
+test "bounded rasterisation preserves translated and clipped triangle coverage" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    try markFragment(&f);
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const entry = try f.appendBlock();
+    const colour = try f.appendInst(entry, u32_t, .{ .iconst = 0x00FF2020 });
+    try f.appendStore(entry, colour, try colourOut(&f, entry, 0));
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+    const area = raster_width * raster_height;
+    const stride = glacier.isel.vertex_output_stride / 4;
+    const scratch_words = glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    const data = try allocator.alloc(u32, area + 3 * stride + 2 * scratch_words);
+    defer allocator.free(data);
+    const origins = [_][2]i32{ .{ 5, 7 }, .{ -4, -3 }, .{ 28, 20 }, .{ -20, 5 }, .{ 40, 5 }, .{ 5, -20 }, .{ 5, 30 } };
+    for (origins) |origin| {
+        const corners = [3][2]i32{ origin, .{ origin[0], origin[1] + 6 }, .{ origin[0] + 8, origin[1] } };
+        for ([_]u32{ 1, 2 }) |harts| {
+            @memset(data, 0);
+            for (corners, 0..) |corner, i| {
+                data[area + i * stride + glacier.isel.raster_vertex_x_offset / 4] = @bitCast(corner[0]);
+                data[area + i * stride + glacier.isel.raster_vertex_y_offset / 4] = @bitCast(corner[1]);
+            }
+            for (0..harts) |hart| try runOnceWithArgs(code, data, @intCast(hart), harts, rasterArgs(data.len));
+            for (0..raster_height) |y| {
+                for (0..raster_width) |x| {
+                    var covered = true;
+                    for (corners, 0..) |a, i| {
+                        const b = corners[(i + 1) % 3];
+                        const dx = b[0] - a[0];
+                        const dy = b[1] - a[1];
+                        const edge = (2 * (@as(i32, @intCast(x)) - a[0]) + 1) * dy - (2 * (@as(i32, @intCast(y)) - a[1]) + 1) * dx;
+                        const inclusive = dy > 0 or (dy == 0 and dx < 0);
+                        covered = covered and (edge > 0 or (edge == 0 and inclusive));
+                    }
+                    try std.testing.expectEqual(@as(u32, if (covered) 0x00FF2020 else 0), data[y * raster_width + x]);
+                }
+            }
+        }
+    }
 }
 
 test "vector OR reduction encoding matches the hardware and preserves its seed" {
@@ -6895,4 +6952,421 @@ test "an atomic add in a divergent arm makes no access for a lane that is off" {
     var data: [8 + glacier.encode.Profile.@"gc1.n".scratchBytes() / 4]u32 = @splat(0);
     try runOnce(words, &data, 0, 1);
     try std.testing.expectEqual(@as(u32, 2), data[0]);
+}
+
+test "hardware coverage records shade only supplied covered_pixels across partial batches and warps" {
+    const allocator = std.testing.allocator;
+    const area = raster_width * raster_height;
+    const record_word = raster_depth_word + area;
+    const words = record_word + area * 8 + 65536;
+    for ([_]bool{ false, true }) |perspective| {
+        var f = try attributeBody(allocator);
+        defer f.deinit();
+        const software = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n", .raster_perspective = perspective });
+        defer allocator.free(software);
+        const hardware = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n", .raster_perspective = perspective, .raster_records = .{ .coverage = true, .scissor = true } });
+        defer allocator.free(hardware);
+        const expected_frame = try allocator.alloc(u32, words);
+        defer allocator.free(expected_frame);
+        @memset(expected_frame, 0);
+        writeRasterVertices(expected_frame);
+        writeRasterAttribute(expected_frame, .{ 0.2, 0.7, 0.4 });
+        writeRasterVertexSlot(expected_frame, glacier.isel.raster_vertex_w_offset, .{ 1, 0.5, 0.75 });
+        try runOnceWithArgs(software, expected_frame, 0, 1, rasterArgs(words));
+        var covered_pixels: [area]usize = undefined;
+        var count: usize = 0;
+        for (expected_frame[0..area], 0..) |pixel, index| {
+            if (pixel == 0) continue;
+            covered_pixels[count] = index;
+            count += 1;
+        }
+        try std.testing.expect(count > 300);
+        for ([_]usize{ 0, 1, 7, 9, 33, count }) |batch| {
+            const result = try allocator.dupe(u32, expected_frame);
+            defer allocator.free(result);
+            @memset(result[0..area], 0);
+            for (0..batch) |i| {
+                const pixel = covered_pixels[count - 1 - i];
+                result[record_word + i * 8] = @intCast(pixel % raster_width);
+                result[record_word + i * 8 + 1] = @intCast(pixel / raster_width);
+                @memset(result[record_word + i * 8 + 2 ..][0..6], 0xdeadbeef);
+            }
+            var args = rasterArgs(words);
+            args[5] = data_base + record_word * 4;
+            args[6] = @intCast(batch);
+            for (0..3) |hart| try runOnceWithArgs(hardware, result, @intCast(hart), 3, args);
+            var expected: [area]bool = @splat(false);
+            for (0..batch) |i| expected[covered_pixels[count - 1 - i]] = true;
+            for (result[0..area], 0..) |pixel, i| {
+                if (!expected[i]) {
+                    try std.testing.expectEqual(@as(u32, 0), pixel);
+                } else {
+                    for ([_]u5{ 0, 8, 16, 24 }) |shift| {
+                        const got: i32 = @intCast((pixel >> shift) & 255);
+                        const want: i32 = @intCast((expected_frame[i] >> shift) & 255);
+                        try std.testing.expect(@abs(got - want) <= 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "record compilation refuses absent coverage instead of silently drawing a bounding box" {
+    const allocator = std.testing.allocator;
+    var f = try rasterOpaqueBody(allocator);
+    defer f.deinit();
+    var why: glacier.isel.Refusal = .{};
+    try std.testing.expectError(error.Unsupported, glacier.isel.compileFragmentRasterExplained(allocator, &f, .{
+        .profile = .@"gc1.n",
+        .raster_records = .{ .coverage = false, .scissor = true },
+    }, &why));
+}
+
+test "hardware records retain software depth and reject off-frame coordinates" {
+    const allocator = std.testing.allocator;
+    const area = raster_width * raster_height;
+    const record_word = raster_depth_word + area;
+    var f = try rasterOpaqueBody(allocator);
+    defer f.deinit();
+    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{
+        .profile = .@"gc1.n",
+        .raster_depth = .{ .compare = .less, .write = true },
+        .raster_records = .{ .coverage = true, .scissor = false },
+    });
+    defer allocator.free(code);
+    const data = try allocator.alloc(u32, record_word + 64 + 65536);
+    defer allocator.free(data);
+    @memset(data, 0);
+    writeRasterVertices(data);
+    writeRasterDepthVertices(data, 0.25);
+    @memset(data[raster_depth_word..][0..area], @bitCast(@as(f32, 0.5)));
+    data[raster_depth_word + 1] = @bitCast(@as(f32, 0.125));
+    const positions = [_][2]u32{ .{ 0, 0 }, .{ 1, 0 }, .{ 2, 0 }, .{ 0xffffffff, 0 }, .{ 0, 0xffffffff }, .{ raster_width, 0 }, .{ 0, raster_height } };
+    for (positions, 0..) |xy, i| {
+        data[record_word + i * 8] = xy[0];
+        data[record_word + i * 8 + 1] = xy[1];
+    }
+    var args = rasterDepthArgs();
+    args[8] = data_base + record_word * 4;
+    args[9] = positions.len;
+    try runOnceWithArgs(code, data, 0, 1, args);
+    for (data[0..area], 0..) |pixel, i| {
+        try std.testing.expectEqual(@as(u32, if (i == 0 or i == 2) 0x00ff2020 else 0), pixel);
+        const want: f32 = if (i == 0 or i == 2) 0.25 else if (i == 1) 0.125 else 0.5;
+        try std.testing.expectEqual(want, @as(f32, @bitCast(data[raster_depth_word + i])));
+    }
+}
+
+fn runTriangleRecords(code: []const u32, data: []u32) !void {
+    const at = raster_depth_word + raster_width * raster_height;
+    var count: u32 = 0;
+    for (0..raster_height) |y| {
+        for (0..raster_width) |x| {
+            if ((2 * x + 1) * 22 + (2 * y + 1) * 30 >= 1320) continue;
+            data[at + count * 8] = @intCast(x);
+            data[at + count * 8 + 1] = @intCast(y);
+            count += 1;
+        }
+    }
+    var args = rasterArgs(data.len);
+    args[5] = data_base + at * 4;
+    args[6] = count;
+    try runOnceWithArgs(code, data, 0, 1, args);
+}
+
+test "bounded hardware records admit nine varyings while the unbounded raster keeps its limit" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    try markFragment(&f);
+    const ty = try f.types.intern(.{ .float = .f32 });
+    const entry = try f.appendBlock();
+    var sum = try f.appendInst(entry, ty, .{ .fconst = 0 });
+    for (0..9) |i| {
+        const param = try f.appendBlockParam(entry, ty);
+        try f.addAttr(.{ .value = param }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "attr",
+            .value = .{ .int = @intCast(attr_generic0 + i * 4) },
+        } });
+        sum = try f.appendInst(entry, ty, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = param } });
+    }
+    const full = try f.appendInst(entry, ty, .{ .fconst = 1 });
+    for ([_]Value{ sum, sum, sum, full }, 0..) |value, i| try f.appendStore(entry, value, try colourOut(&f, entry, @intCast(i)));
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    try std.testing.expectError(error.Unsupported, glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n" }));
+    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{
+        .profile = .@"gc1.n",
+        .raster_records = .{ .coverage = true, .scissor = false },
+    });
+    defer allocator.free(code);
+    const data = try allocator.alloc(u32, raster_depth_word + raster_width * raster_height + 65536);
+    defer allocator.free(data);
+    @memset(data, 0);
+    writeRasterVertices(data);
+    for (0..9) |i| writeRasterVertexSlot(data, @intCast(attr_generic0 + i * 4), .{ 0.0625, 0.0625, 0.0625 });
+    try runTriangleRecords(code, data);
+    try std.testing.expectEqual(@as(u32, 0xff8f8f8f), data[0]);
+    try std.testing.expectEqual(@as(u32, 0xff8f8f8f), data[28]);
+    try std.testing.expectEqual(@as(u32, 0), data[29]);
+    try std.testing.expectEqual(@as(u32, 0), data[30]);
+}
+
+test "RTL coverage record bytes drive perspective shading and depth like software rasterization" {
+    const allocator = std.testing.allocator;
+    const area = raster_width * raster_height;
+    const record_word = raster_depth_word + area;
+    const words = record_word + area * 8 + 65536;
+    var f = try attributeBody(allocator);
+    defer f.deinit();
+    const depth = glacier.isel.RasterDepth{ .compare = .less, .write = true };
+    const sw_code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n", .raster_depth = depth, .raster_perspective = true });
+    defer allocator.free(sw_code);
+    const hw_code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n", .raster_depth = depth, .raster_perspective = true, .raster_records = .{ .coverage = true, .scissor = true } });
+    defer allocator.free(hw_code);
+    const expected_frame = try allocator.alloc(u32, words);
+    defer allocator.free(expected_frame);
+    @memset(expected_frame, 0);
+    writeRasterVertices(expected_frame);
+    writeRasterAttribute(expected_frame, .{ 0.1, 0.9, 0.4 });
+    writeRasterVertexSlot(expected_frame, glacier.isel.raster_vertex_w_offset, .{ 1, 0.5, 0.25 });
+    writeRasterVertexSlot(expected_frame, glacier.isel.raster_vertex_z_offset, .{ 0.1, 0.9, 0.4 });
+    @memset(expected_frame[raster_depth_word..][0..area], @bitCast(@as(f32, 0.5)));
+    try runOnceWithArgs(sw_code, expected_frame, 0, 1, rasterDepthArgs());
+    for ([_][]const u8{ @embedFile("coverage-rtl.bin"), @embedFile("coverage-rtl-clipped.bin") }, 0..) |records, variant| {
+        try std.testing.expect(records.len > 0 and records.len % 32 == 0);
+        const actual_frame = try allocator.dupe(u32, expected_frame);
+        defer allocator.free(actual_frame);
+        @memset(actual_frame[0..area], 0);
+        @memset(actual_frame[raster_depth_word..][0..area], @bitCast(@as(f32, 0.5)));
+        for (0..records.len / 4) |i| actual_frame[record_word + i] = std.mem.readInt(u32, records[i * 4 ..][0..4], .little);
+        var args = rasterDepthArgs();
+        args[8] = data_base + record_word * 4;
+        args[9] = @intCast(records.len / 32);
+        for (0..3) |hart| try runOnceWithArgs(hw_code, actual_frame, @intCast(hart), 3, args);
+        for (actual_frame[0..area], 0..) |color, i| {
+            const x = i % raster_width;
+            const y = i / raster_width;
+            const clipped = variant == 1 and (x < 3 or y < 4 or x >= 18 or y >= 17);
+            const expected_color = if (clipped) 0 else expected_frame[i];
+            for ([_]u5{ 0, 8, 16, 24 }) |shift| {
+                const got: i32 = @intCast((color >> shift) & 255);
+                const want: i32 = @intCast((expected_color >> shift) & 255);
+                try std.testing.expect(@abs(got - want) <= 1);
+            }
+            const expected_z: f32 = if (clipped) 0.5 else @bitCast(expected_frame[raster_depth_word + i]);
+            const actual_z: f32 = @bitCast(actual_frame[raster_depth_word + i]);
+            try std.testing.expect(@abs(expected_z - actual_z) < 0.000001);
+        }
+    }
+}
+
+test "pixel-center rasterisation preserves translated and clipped triangle coverage" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    try markFragment(&f);
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const entry = try f.appendBlock();
+    const colour = try f.appendInst(entry, u32_t, .{ .iconst = 0x00FF2020 });
+    try f.appendStore(entry, colour, try colourOut(&f, entry, 0));
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+    const area = raster_width * raster_height;
+    const stride = glacier.isel.vertex_output_stride / 4;
+    const scratch_words = glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    const data = try allocator.alloc(u32, area + 3 * stride + 2 * scratch_words);
+    defer allocator.free(data);
+    const origins = [_][2]i32{ .{ 5, 7 }, .{ -4, -3 }, .{ 28, 20 }, .{ -20, 5 }, .{ 40, 5 }, .{ 5, -20 }, .{ 5, 30 } };
+    for (origins) |origin| {
+        const corners = [3][2]i32{ origin, .{ origin[0], origin[1] + 5 }, .{ origin[0] + 7, origin[1] } };
+        for ([_]u32{ 1, 2 }) |harts| {
+            @memset(data, 0);
+            for (corners, 0..) |corner, i| {
+                data[area + i * stride + glacier.isel.raster_vertex_x_offset / 4] = @bitCast(corner[0]);
+                data[area + i * stride + glacier.isel.raster_vertex_y_offset / 4] = @bitCast(corner[1]);
+            }
+            for (0..harts) |hart| try runOnceWithArgs(code, data, @intCast(hart), harts, rasterArgs(data.len));
+            for (0..raster_height) |y| {
+                for (0..raster_width) |x| {
+                    var covered = true;
+                    for (corners, 0..) |a, i| {
+                        const b = corners[(i + 1) % 3];
+                        const dx = b[0] - a[0];
+                        const dy = b[1] - a[1];
+                        const edge = (2 * (@as(i32, @intCast(x)) - a[0]) + 1) * dy - (2 * (@as(i32, @intCast(y)) - a[1]) + 1) * dx;
+                        const inclusive = dy > 0 or (dy == 0 and dx < 0);
+                        covered = covered and (edge > 0 or (edge == 0 and inclusive));
+                    }
+                    try std.testing.expectEqual(@as(u32, if (covered) 0x00FF2020 else 0), data[y * raster_width + x]);
+                }
+            }
+        }
+    }
+}
+
+test "pixel-center rasterisation exposes centered fragment coordinates" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    try markFragment(&f);
+    const f32_t = try f.types.intern(.{ .float = .f32 });
+    const entry = try f.appendBlock();
+    const coord = try f.appendBlockParam(entry, f32_t);
+    try gpu.attrs.setBuiltin(&f, coord, .frag_coord);
+    try f.addAttr(.{ .value = coord }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "bicomp",
+        .value = .{ .int = 0 },
+    } });
+    // Red is below the range, so the clamp owes a zero rather than whatever a convert makes of a
+    // negative. Green is the coordinate, which saturates one pixel in.
+    const below = try f.appendInst(entry, f32_t, .{ .fconst = -1 });
+    const none = try f.appendInst(entry, f32_t, .{ .fconst = 0 });
+    const full = try f.appendInst(entry, f32_t, .{ .fconst = 1 });
+    for ([4]Value{ below, coord, none, full }, 0..) |component, i| {
+        const out = try colourOut(&f, entry, @intCast(i));
+        try f.appendStore(entry, component, out);
+    }
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+
+    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+
+    const area = raster_width * raster_height;
+    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + 512);
+    defer allocator.free(data);
+    @memset(data, 0);
+    writeRasterVertices(data);
+    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+
+    try std.testing.expectEqual(@as(u32, 0xFF008000), data[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), data[1]);
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), data[5 * raster_width + 3]);
+    try std.testing.expectEqual(@as(u32, 0), data[23 * raster_width + 31]);
+}
+
+test "pixel-center rasterisation interpolates at the covered sample" {
+    const allocator = std.testing.allocator;
+    var f = try attributeBody(allocator);
+    defer f.deinit();
+    const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n" });
+    defer allocator.free(code);
+    const area = raster_width * raster_height;
+    const data = try allocator.alloc(u32, area + 3 * (glacier.isel.vertex_output_stride / 4) + glacier.encode.Profile.@"gc1.n".scratchBytes() / 4);
+    defer allocator.free(data);
+    @memset(data, 0);
+    writeRasterVertices(data);
+    writeRasterAttribute(data, .{ 0, 1, 1 });
+    try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+    for ([_][2]usize{ .{ 0, 0 }, .{ 3, 5 }, .{ 10, 2 } }) |xy| {
+        const expected: f32 = ((@as(f32, @floatFromInt(xy[0])) + 0.5) / 30.0 + (@as(f32, @floatFromInt(xy[1])) + 0.5) / 22.0) * 255.0;
+        const red = (data[xy[1] * raster_width + xy[0]] >> 16) & 255;
+        try std.testing.expectApproxEqAbs(expected, @as(f32, @floatFromInt(red)), 1.0);
+    }
+}
+
+test "raster color rounding agrees for constant and interpolated components" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { value: f32, byte: u32 }{
+        .{ .value = 0.5, .byte = 128 },  .{ .value = 0.25, .byte = 64 },
+        .{ .value = 0.75, .byte = 191 }, .{ .value = 0.1, .byte = 26 },
+        .{ .value = 0.9, .byte = 230 },  .{ .value = -1, .byte = 0 },
+        .{ .value = 2, .byte = 255 },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |varying| {
+            var f = if (varying) try attributeBody(allocator) else Function.init(allocator);
+            defer f.deinit();
+            if (!varying) {
+                try markFragment(&f);
+                const ty = try f.types.intern(.{ .float = .f32 });
+                const entry = try f.appendBlock();
+                for ([_]f32{ case.value, 0, 0, 1 }, 0..) |value, i| {
+                    const component = try f.appendInst(entry, ty, .{ .fconst = value });
+                    try f.appendStore(entry, component, try colourOut(&f, entry, @intCast(i)));
+                }
+                f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+            }
+            const code = try glacier.isel.compileFragmentRaster(allocator, &f, .{ .profile = .@"gc1.n" });
+            defer allocator.free(code);
+            const data = try allocator.alloc(u32, raster_width * raster_height + 3 * (glacier.isel.vertex_output_stride / 4) + 65536);
+            defer allocator.free(data);
+            @memset(data, 0);
+            writeRasterVertices(data);
+            if (varying) writeRasterAttribute(data, .{ case.value, case.value, case.value });
+            try runOnceWithArgs(code, data, 0, 1, rasterArgs(data.len));
+            try std.testing.expectEqual(@as(u32, 0xff000000) | (case.byte << 16), data[0]);
+        }
+    }
+}
+
+test "empty-span guards preserve depth discard and multiwarp raster output" {
+    const allocator = std.testing.allocator;
+    const area = raster_width * raster_height;
+    const vertex_stride = glacier.isel.vertex_output_stride / 4;
+    const words = raster_depth_word + area + 1024 + 8 * glacier.encode.Profile.@"gc1.n".scratchBytes() / 4;
+    const geometry = [_][3][2]i32{
+        .{ .{ 0, 0 }, .{ 0, 22 }, .{ 30, 0 } },
+        .{ .{ 2, 1 }, .{ 3, 23 }, .{ 4, 1 } },
+        .{ .{ -4, 1 }, .{ 1, 20 }, .{ 20, -5 } },
+        .{ .{ 40, 1 }, .{ 40, 20 }, .{ 60, 1 } },
+    };
+    var writes: usize = 0;
+    var unchanged: usize = 0;
+    for (0..3) |shader| {
+        var f = switch (shader) {
+            0 => try attributeBody(allocator),
+            1 => try branchingBody(allocator, false),
+            else => try discardingBody(allocator),
+        };
+        defer f.deinit();
+        const options: glacier.isel.Options = .{ .profile = .@"gc1.n", .raster_depth = .{ .compare = .less, .write = true }, .raster_skip_empty = true };
+        const guarded = try glacier.isel.compileFragmentRaster(allocator, &f, options);
+        defer allocator.free(guarded);
+        var baseline_options = options;
+        baseline_options.raster_skip_empty = false;
+        const baseline = try glacier.isel.compileFragmentRaster(allocator, &f, baseline_options);
+        defer allocator.free(baseline);
+        const expected_data = try allocator.alloc(u32, words);
+        defer allocator.free(expected_data);
+        const candidate = try allocator.alloc(u32, words);
+        defer allocator.free(candidate);
+        for (geometry) |triangle| {
+            for ([_]u32{ 1, 2, 8 }) |warps| {
+                for (0..3) |depth_case| {
+                    @memset(expected_data, 0);
+                    @memset(expected_data[0..area], 0x12345678);
+                    for (triangle, 0..) |corner, vertex| {
+                        expected_data[area + vertex * vertex_stride + glacier.isel.raster_vertex_x_offset / 4] = @bitCast(corner[0]);
+                        expected_data[area + vertex * vertex_stride + glacier.isel.raster_vertex_y_offset / 4] = @bitCast(corner[1]);
+                    }
+                    writeRasterAttribute(expected_data, .{ 0.2, 0.6, 0.9 });
+                    writeRasterDepthVertices(expected_data, 0.5);
+                    for (0..area) |pixel| {
+                        const z: f32 = if (depth_case == 0 or (depth_case == 2 and pixel % raster_width < 16)) 0.25 else 0.75;
+                        expected_data[raster_depth_word + pixel] = @bitCast(z);
+                    }
+                    @memcpy(candidate, expected_data);
+                    for (0..warps) |hart| {
+                        try runOnceWithArgs(baseline, expected_data, @intCast(hart), warps, rasterDepthArgs());
+                        try runOnceWithArgs(guarded, candidate, @intCast(hart), warps, rasterDepthArgs());
+                    }
+                    try std.testing.expectEqualSlices(u32, expected_data[0 .. raster_depth_word + area], candidate[0 .. raster_depth_word + area]);
+                    var touched: usize = 0;
+                    for (candidate[0..area]) |pixel| {
+                        if (pixel != 0x12345678) {
+                            touched += 1;
+                        }
+                    }
+                    if (depth_case == 0) try std.testing.expectEqual(@as(usize, 0), touched);
+                    if (touched == 0) unchanged += 1 else writes += 1;
+                }
+            }
+        }
+    }
+    try std.testing.expect(writes > 0 and unchanged > 0);
+    std.debug.print("empty-span-differential cases=108 writes={d} unchanged={d} exact=true\n", .{ writes, unchanged });
 }

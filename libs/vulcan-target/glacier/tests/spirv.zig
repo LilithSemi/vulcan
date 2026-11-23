@@ -3803,6 +3803,75 @@ test "actual cube shader lights a textured fused triangle" {
     }
 }
 
+test "captured cube triangle lighting" {
+    const allocator = std.testing.allocator;
+    const bytes = @embedFile("cube-real-fragment.spv");
+    const words = try allocator.alloc(u32, bytes.len / 4);
+    defer allocator.free(words);
+    for (words, 0..) |*word, i| word.* = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+    var func = try spirv.lowerModuleFor(allocator, words, .{ .nullable_image_descriptors = true });
+    defer func.deinit();
+    const profile = glacier.encode.Profile.@"gc1.s";
+    const scratch_bytes = comptime profile.scratchBytes();
+    const frame_word = 128;
+    const vertex_word = 512;
+    const scratch_word = 2048;
+    for ([_]bool{ false, true }) |perspective| {
+        const code = try glacier.isel.compileFragmentRaster(allocator, &func, .{ .profile = profile, .raster_perspective = perspective });
+        defer allocator.free(code);
+        for ([_]u32{ 0, 1, 6 }) |format| {
+            var memory: [scratch_word + scratch_bytes / 4]u32 = @splat(0);
+            @memset(memory[frame_word .. frame_word + 256], 0x11223344);
+            memory[0] = data_base + 64 * 4;
+            memory[1] = if (format == 0) 16 else 4;
+            memory[2] = 1;
+            memory[3] = 1;
+            memory[4] = @bitCast(@as(f32, 1));
+            memory[5] = @bitCast(@as(f32, 1));
+            memory[6] = 2;
+            memory[7] = 2;
+            memory[12] = memory[1];
+            memory[13] = format;
+            for (0..256) |j| {
+                const encoded: f32 = @as(f32, @floatFromInt(j)) / 255;
+                const linear: f32 = if (encoded <= 0.04045) encoded / 12.92 else std.math.pow(f32, (encoded + 0.055) / 1.055, 2.4);
+                memory[1024 + j] = @bitCast(linear);
+            }
+            memory[14] = @bitCast(@as(f32, 1));
+            memory[15] = @bitCast(@as(f32, 1));
+            memory[18..22].* = .{ 3, 4, 5, 6 };
+            memory[24] = 1;
+            memory[25] = 1;
+            memory[26] = data_base + 80 * 4;
+            memory[27] = data_base + 84 * 4;
+            memory[32] = if (format == 6) data_base + 1024 * 4 else memory[0];
+            if (format == 0) memory[64..68].* = .{ 0, 0x3f800000, 0, 0x3f800000 } else memory[64] = if (format == 6) 0xff008000 else 0xff00ff00;
+            const captured = @embedFile("cube-captured-triangle.bin");
+            for (0..captured.len / 4) |j| memory[vertex_word + j] = std.mem.readInt(u32, captured[j * 4 ..][0..4], .little);
+            var access_words: [scratch_word + scratch_bytes / 4]u64 = @splat(0);
+            var mem: warp.Memory = .{ .base = data_base, .words = &memory, .access_words = &access_words, .scratch = .{ .base = data_base + scratch_word * 4, .stride = scratch_bytes, .harts = 1 } };
+            var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8, .scratch_bytes = scratch_bytes, .stack_top = data_base + memory.len * 4, .stall_cycles = 20 };
+            one.launch_args[0] = data_base;
+            one.launch_args[1] = data_base + frame_word * 4;
+            one.launch_args[2] = data_base + vertex_word * 4;
+            one.launch_args[3] = 16;
+            one.launch_args[4] = 16;
+            one.launch_args[5] = 16 * 4;
+            const steps = try warp.run(code, &mem, &one, 3_000_000);
+            std.debug.print("captured cube perspective={} format={d} words={d} steps={d} model_cycles={d} pixel={x}\n", .{ perspective, format, code.len, steps, one.cycles, memory[frame_word + 4 * 16 + 3] });
+            var totals: [4]u64 = @splat(0);
+            for (access_words, 0..) |count, j| totals[if (j >= 1024 and j < 1280) 0 else if (j >= scratch_word) 3 else if (j >= vertex_word) 2 else if (j >= frame_word) 1 else 0] += count;
+            std.debug.print("accesses descriptor_texture={d} frame={d} vertices={d} scratch={d}\n", .{ totals[0], totals[1], totals[2], totals[3] });
+            std.debug.print("scratch vector accesses={d} unaligned={d}\n", .{ one.scratch_vector_accesses, one.unaligned_scratch_vectors });
+            try std.testing.expect(one.scratch_vector_accesses > 0);
+            try std.testing.expectEqual(@as(usize, 0), one.unaligned_scratch_vectors);
+            const pixel = memory[frame_word + 4 * 16 + 3];
+            const green: i32 = @intCast((pixel >> 8) & 255);
+            try std.testing.expect(@abs(green - @as(i32, if (format == 6) 122 else 244)) <= 3);
+        }
+    }
+}
+
 test "image descriptor pointer arrays keep independent images" {
     const allocator = std.testing.allocator;
     const bytes = @embedFile("image-descriptor-array.spv");
@@ -3947,4 +4016,342 @@ test "nearest RGBA8 repeat mirror and border paths preserve edge samples" {
 
 test "nullable mip descriptor uses fallback without reading the absent image" {
     try runNormalizedSamplingWithNullability(false, true, false, false, 2, 0, 16, .{ 0, 0 }, null, @splat(0), @splat(0.5), @splat(0), @splat(.{ 9, 8, 7, 1 }), true);
+}
+
+test "textured fused rasterisation keeps sampled colour with perspective with hardware coverage records" {
+    const allocator = std.testing.allocator;
+    var b = try normalizedSamplingModule(allocator, false, false, false);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .nullable_image_descriptors = true });
+    defer func.deinit();
+    const profile = glacier.encode.Profile.@"gc1.s";
+    const scratch_bytes = comptime profile.scratchBytes();
+    const frame_word = 128;
+    const vertex_word = 512;
+    const scratch_word = 1024;
+    const stride = glacier.isel.vertex_output_stride / 4;
+    for ([_]bool{ false, true }) |perspective| {
+        const code = try glacier.isel.compileFragmentRaster(allocator, &func, .{ .profile = profile, .raster_perspective = perspective, .raster_records = .{ .coverage = true, .scissor = true } });
+        defer allocator.free(code);
+        for ([_]u32{ 0, 1 }) |format| {
+            var memory: [scratch_word + scratch_bytes / 4]u32 = @splat(0);
+            memory[0] = data_base + 64 * 4;
+            memory[1] = if (format == 0) 16 else 4;
+            memory[2] = 1;
+            memory[3] = 1;
+            memory[4] = @bitCast(@as(f32, 1));
+            memory[5] = @bitCast(@as(f32, 1));
+            memory[6] = 2;
+            memory[7] = 2;
+            memory[12] = memory[1];
+            memory[13] = format;
+            memory[14] = @bitCast(@as(f32, 1));
+            memory[15] = @bitCast(@as(f32, 1));
+            memory[18..22].* = .{ 3, 4, 5, 6 };
+            memory[24] = 1;
+            memory[25] = 1;
+            memory[26] = data_base + 80 * 4;
+            memory[27] = data_base + 84 * 4;
+            memory[32] = memory[0];
+            if (format == 0) memory[64..68].* = .{ 0, 0x3f800000, 0, 0x3f800000 } else memory[64] = 0xff00ff00;
+            for ([3][2]u32{ .{ 2, 3 }, .{ 2, 13 }, .{ 14, 3 } }, 0..) |corner, i| {
+                const at = vertex_word + i * stride;
+                memory[at + glacier.isel.raster_vertex_x_offset / 4] = corner[0];
+                memory[at + glacier.isel.raster_vertex_y_offset / 4] = corner[1];
+                memory[at + glacier.isel.raster_vertex_w_offset / 4] = @bitCast(@as(f32, 1));
+                memory[at + 0x80 / 4] = @bitCast(@as(f32, 0.5));
+                memory[at + 0x84 / 4] = @bitCast(@as(f32, 0.5));
+            }
+            var mem: warp.Memory = .{ .base = data_base, .words = &memory, .scratch = .{ .base = data_base + scratch_word * 4, .stride = scratch_bytes, .harts = 1 } };
+            var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8, .scratch_bytes = scratch_bytes, .stack_top = data_base + memory.len * 4, .stall_cycles = 20 };
+            one.launch_args[0] = data_base;
+            one.launch_args[1] = data_base + frame_word * 4;
+            one.launch_args[2] = data_base + vertex_word * 4;
+            one.launch_args[3] = 16;
+            one.launch_args[4] = 16;
+            one.launch_args[5] = 16 * 4;
+            const record_word = 400;
+            for (0..9) |record| {
+                memory[record_word + record * 8] = @intCast(3 + record);
+                memory[record_word + record * 8 + 1] = 4;
+            }
+            one.launch_args[6] = data_base + record_word * 4;
+            one.launch_args[7] = 9;
+            const steps = try warp.run(code, &mem, &one, 3_000_000);
+            std.debug.print("textured fused perspective={} format={d} words={d} steps={d} model_cycles={d} pixel={x}\n", .{ perspective, format, code.len, steps, one.cycles, memory[frame_word + 4 * 16 + 3] });
+            try std.testing.expectEqual(@as(u32, 0xff00ff00), memory[frame_word + 4 * 16 + 3]);
+            try std.testing.expectEqual(@as(u32, 0), memory[frame_word]);
+        }
+    }
+}
+
+test "actual cube shader lights a textured fused triangle with hardware coverage records" {
+    const allocator = std.testing.allocator;
+    const bytes = @embedFile("cube-real-fragment.spv");
+    const words = try allocator.alloc(u32, bytes.len / 4);
+    defer allocator.free(words);
+    for (words, 0..) |*word, i| word.* = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+    var func = try spirv.lowerModuleFor(allocator, words, .{ .nullable_image_descriptors = true });
+    defer func.deinit();
+    const profile = glacier.encode.Profile.@"gc1.s";
+    const scratch_bytes = comptime profile.scratchBytes();
+    const frame_word = 128;
+    const vertex_word = 512;
+    const scratch_word = 1024;
+    const stride = glacier.isel.vertex_output_stride / 4;
+    for ([_]bool{ false, true }) |perspective| {
+        const code = try glacier.isel.compileFragmentRaster(allocator, &func, .{ .profile = profile, .raster_perspective = perspective, .raster_records = .{ .coverage = true, .scissor = true } });
+        defer allocator.free(code);
+        for ([_]u32{ 0, 1 }) |format| {
+            var memory: [scratch_word + scratch_bytes / 4]u32 = @splat(0);
+            memory[0] = data_base + 64 * 4;
+            memory[1] = if (format == 0) 16 else 4;
+            memory[2] = 1;
+            memory[3] = 1;
+            memory[4] = @bitCast(@as(f32, 1));
+            memory[5] = @bitCast(@as(f32, 1));
+            memory[6] = 2;
+            memory[7] = 2;
+            memory[12] = memory[1];
+            memory[13] = format;
+            memory[14] = @bitCast(@as(f32, 1));
+            memory[15] = @bitCast(@as(f32, 1));
+            memory[18..22].* = .{ 3, 4, 5, 6 };
+            memory[24] = 1;
+            memory[25] = 1;
+            memory[26] = data_base + 80 * 4;
+            memory[27] = data_base + 84 * 4;
+            memory[32] = memory[0];
+            if (format == 0) memory[64..68].* = .{ 0, 0x3f800000, 0, 0x3f800000 } else memory[64] = 0xff00ff00;
+            for ([3][2]u32{ .{ 2, 3 }, .{ 2, 13 }, .{ 14, 3 } }, 0..) |corner, i| {
+                const at = vertex_word + i * stride;
+                memory[at + glacier.isel.raster_vertex_x_offset / 4] = corner[0];
+                memory[at + glacier.isel.raster_vertex_y_offset / 4] = corner[1];
+                memory[at + glacier.isel.raster_vertex_w_offset / 4] = @bitCast(@as(f32, 1));
+                memory[at + 0x80 / 4] = @bitCast(@as(f32, 0.5));
+                memory[at + 0x84 / 4] = @bitCast(@as(f32, 0.5));
+                memory[at + 0x90 / 4] = @bitCast(@as(f32, @floatFromInt(corner[0])));
+                memory[at + 0x94 / 4] = @bitCast(@as(f32, @floatFromInt(corner[1])));
+                memory[at + 0x98 / 4] = 0;
+            }
+            var mem: warp.Memory = .{ .base = data_base, .words = &memory, .scratch = .{ .base = data_base + scratch_word * 4, .stride = scratch_bytes, .harts = 1 } };
+            var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8, .scratch_bytes = scratch_bytes, .stack_top = data_base + memory.len * 4, .stall_cycles = 20 };
+            one.launch_args[0] = data_base;
+            one.launch_args[1] = data_base + frame_word * 4;
+            one.launch_args[2] = data_base + vertex_word * 4;
+            one.launch_args[3] = 16;
+            one.launch_args[4] = 16;
+            one.launch_args[5] = 16 * 4;
+            const record_word = 400;
+            for (0..9) |record| {
+                memory[record_word + record * 8] = @intCast(3 + record);
+                memory[record_word + record * 8 + 1] = 4;
+            }
+            one.launch_args[6] = data_base + record_word * 4;
+            one.launch_args[7] = 9;
+            const steps = try warp.run(code, &mem, &one, 3_000_000);
+            std.debug.print("actual cube perspective={} format={d} words={d} steps={d} model_cycles={d} pixel={x}\n", .{ perspective, format, code.len, steps, one.cycles, memory[frame_word + 4 * 16 + 3] });
+            const pixel = memory[frame_word + 4 * 16 + 3];
+            const green: i32 = @intCast((pixel >> 8) & 255);
+            try std.testing.expect(@abs(green - 218) <= 3);
+            try std.testing.expectEqual(@as(u32, 0), memory[frame_word]);
+        }
+    }
+}
+
+test "actual cube equal coverage compares record shading against software raster" {
+    const allocator = std.testing.allocator;
+    const bytes = @embedFile("cube-real-fragment.spv");
+    const words = try allocator.alloc(u32, bytes.len / 4);
+    defer allocator.free(words);
+    for (words, 0..) |*word, i| word.* = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+    var func = try spirv.lowerModuleFor(allocator, words, .{ .nullable_image_descriptors = true });
+    defer func.deinit();
+    const profile = glacier.encode.Profile.@"gc1.s";
+    const scratch_bytes = comptime profile.scratchBytes();
+    const frame_word = 128;
+    const vertex_word = 512;
+    const scratch_word = 4096;
+    const stride = glacier.isel.vertex_output_stride / 4;
+    for ([_]bool{ false, true }) |perspective| {
+        const code = try glacier.isel.compileFragmentRaster(allocator, &func, .{ .profile = profile, .raster_perspective = perspective, .raster_records = .{ .coverage = true, .scissor = true } });
+        defer allocator.free(code);
+        const reference_code = try glacier.isel.compileFragmentRaster(allocator, &func, .{ .profile = profile, .raster_perspective = perspective, .raster_skip_empty = true });
+        defer allocator.free(reference_code);
+        const baseline_code = try glacier.isel.compileFragmentRaster(allocator, &func, .{ .profile = profile, .raster_perspective = perspective, .raster_skip_empty = false });
+        defer allocator.free(baseline_code);
+        for ([_]u32{ 0, 1 }) |format| {
+            var memory: [scratch_word + scratch_bytes / 4]u32 = @splat(0);
+            memory[0] = data_base + 64 * 4;
+            memory[1] = if (format == 0) 16 else 4;
+            memory[2] = 1;
+            memory[3] = 1;
+            memory[4] = @bitCast(@as(f32, 1));
+            memory[5] = @bitCast(@as(f32, 1));
+            memory[6] = 2;
+            memory[7] = 2;
+            memory[12] = memory[1];
+            memory[13] = format;
+            memory[14] = @bitCast(@as(f32, 1));
+            memory[15] = @bitCast(@as(f32, 1));
+            memory[18..22].* = .{ 3, 4, 5, 6 };
+            memory[24] = 1;
+            memory[25] = 1;
+            memory[26] = data_base + 80 * 4;
+            memory[27] = data_base + 84 * 4;
+            memory[32] = memory[0];
+            if (format == 0) memory[64..68].* = .{ 0, 0x3f800000, 0, 0x3f800000 } else memory[64] = 0xff00ff00;
+            for ([3][2]u32{ .{ 2, 3 }, .{ 2, 13 }, .{ 14, 3 } }, 0..) |corner, i| {
+                const at = vertex_word + i * stride;
+                memory[at + glacier.isel.raster_vertex_x_offset / 4] = corner[0];
+                memory[at + glacier.isel.raster_vertex_y_offset / 4] = corner[1];
+                memory[at + glacier.isel.raster_vertex_w_offset / 4] = @bitCast(@as(f32, 1));
+                memory[at + 0x80 / 4] = @bitCast(@as(f32, 0.5));
+                memory[at + 0x84 / 4] = @bitCast(@as(f32, 0.5));
+                memory[at + 0x90 / 4] = @bitCast(@as(f32, @floatFromInt(corner[0])));
+                memory[at + 0x94 / 4] = @bitCast(@as(f32, @floatFromInt(corner[1])));
+                memory[at + 0x98 / 4] = 0;
+            }
+            var accesses: [memory.len]u64 = @splat(0);
+            var mem: warp.Memory = .{ .base = data_base, .words = &memory, .access_words = &accesses, .scratch = .{ .base = data_base + scratch_word * 4, .stride = scratch_bytes, .harts = 1 } };
+            var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8, .scratch_bytes = scratch_bytes, .stack_top = data_base + memory.len * 4, .stall_cycles = 20 };
+            one.launch_args[0] = data_base;
+            one.launch_args[1] = data_base + frame_word * 4;
+            one.launch_args[2] = data_base + vertex_word * 4;
+            one.launch_args[3] = 16;
+            one.launch_args[4] = 16;
+            one.launch_args[5] = 16 * 4;
+            const initial_memory = try allocator.dupe(u32, &memory);
+            defer allocator.free(initial_memory);
+            var baseline_warp = one;
+            const baseline_steps = try warp.run(baseline_code, &mem, &baseline_warp, 3_000_000);
+            const baseline_frame = memory[frame_word..][0..256].*;
+            @memcpy(&memory, initial_memory);
+            @memset(&accesses, 0);
+            var reference_warp = one;
+            const reference_steps = try warp.run(reference_code, &mem, &reference_warp, 3_000_000);
+            try std.testing.expectEqualSlices(u32, &baseline_frame, memory[frame_word..][0..256]);
+            std.debug.print("empty-span-compare perspective={} format={d} baseline_steps={d} guarded_steps={d} baseline_cycles={d} guarded_cycles={d} exact=true\n", .{ perspective, format, baseline_steps, reference_steps, baseline_warp.cycles, reference_warp.cycles });
+            var reference_scratch: u64 = 0;
+            var reference_accesses: u64 = 0;
+            for (accesses, 0..) |count_access, i| {
+                reference_accesses += count_access;
+                if (i >= scratch_word) reference_scratch += count_access;
+            }
+            const reference_counts = accesses;
+            @memset(&accesses, 0);
+            const expected = memory[frame_word..][0..256].*;
+            @memset(memory[frame_word..][0..256], 0);
+            @memset(memory[scratch_word..], 0);
+            const record_word = 1024;
+            var count: u32 = 0;
+            for (expected, 0..) |color, pixel| {
+                if (color == 0) continue;
+                memory[record_word + count * 8] = @intCast(pixel % 16);
+                memory[record_word + count * 8 + 1] = @intCast(pixel / 16);
+                count += 1;
+            }
+            try std.testing.expect(count > 9);
+            one.launch_args[6] = data_base + record_word * 4;
+            one.launch_args[7] = count;
+            const steps = try warp.run(code, &mem, &one, 3_000_000);
+            std.debug.print("equal-coverage cube perspective={} format={d} records={d} sw_steps={d} hw_steps={d} sw_model_cycles={d} hw_model_cycles={d}\n", .{ perspective, format, count, reference_steps, steps, reference_warp.cycles, one.cycles });
+            var record_scratch: u64 = 0;
+            var record_accesses: u64 = 0;
+            for (accesses, 0..) |count_access, i| {
+                record_accesses += count_access;
+                if (i >= scratch_word) record_scratch += count_access;
+            }
+            std.debug.print("equal-coverage memory perspective={} format={d} sw_words={d} hw_words={d} sw_scratch={d} hw_scratch={d}\n", .{ perspective, format, reference_accesses, record_accesses, reference_scratch, record_scratch });
+            for ([_][]const u64{ &reference_counts, &accesses }, 0..) |counts, path| {
+                var classified: [6]u64 = @splat(0);
+                for (counts, 0..) |n, at| {
+                    const category: usize = if (at >= scratch_word) 5 else if (at >= record_word) 4 else if (at >= vertex_word) 3 else if (at >= frame_word) 2 else if (at >= 64 and at < 68) 1 else 0;
+                    classified[category] += n;
+                }
+                std.debug.print("raster-memory-profile perspective={} format={d} path={d} descriptor_words={d} texture_words={d} framebuffer_words={d} vertex_words={d} coverage_words={d} scratch_words={d} scratch_vector_instructions={d}\n", .{ perspective, format, path, classified[0], classified[1], classified[2], classified[3], classified[4], classified[5], if (path == 0) reference_warp.scratch_vector_accesses else one.scratch_vector_accesses });
+            }
+            for (expected, memory[frame_word..][0..256]) |want, got| {
+                for ([_]u5{ 0, 8, 16, 24 }) |shift| {
+                    const want_channel: i32 = @intCast((want >> shift) & 255);
+                    const got_channel: i32 = @intCast((got >> shift) & 255);
+                    try std.testing.expect(@abs(want_channel - got_channel) <= 3);
+                }
+            }
+            const pixel = memory[frame_word + 4 * 16 + 3];
+            const green: i32 = @intCast((pixel >> 8) & 255);
+            try std.testing.expect(@abs(green - 218) <= 3);
+            try std.testing.expectEqual(@as(u32, 0), memory[frame_word]);
+        }
+    }
+}
+
+test "hardware coverage records honor a missing sampled image" {
+    const allocator = std.testing.allocator;
+    var b = try normalizedSamplingModule(allocator, false, false, false);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .nullable_image_descriptors = true });
+    defer func.deinit();
+    const profile = glacier.encode.Profile.@"gc1.s";
+    const scratch_bytes = comptime profile.scratchBytes();
+    const frame_word = 128;
+    const vertex_word = 512;
+    const scratch_word = 1024;
+    const stride = glacier.isel.vertex_output_stride / 4;
+    for ([_]bool{ false, true }) |perspective| {
+        const code = try glacier.isel.compileFragmentRaster(allocator, &func, .{ .profile = profile, .raster_perspective = perspective, .raster_records = .{ .coverage = true, .scissor = true } });
+        defer allocator.free(code);
+        for ([_]u32{0}) |format| {
+            var memory: [scratch_word + scratch_bytes / 4]u32 = @splat(0);
+            memory[0] = data_base + 64 * 4;
+            memory[1] = if (format == 0) 16 else 4;
+            memory[2] = 1;
+            memory[3] = 1;
+            memory[4] = @bitCast(@as(f32, 1));
+            memory[5] = @bitCast(@as(f32, 1));
+            memory[6] = 2;
+            memory[7] = 2;
+            memory[12] = memory[1];
+            memory[13] = format;
+            memory[14] = @bitCast(@as(f32, 1));
+            memory[15] = @bitCast(@as(f32, 1));
+            memory[18..22].* = .{ 3, 4, 5, 6 };
+            memory[24] = 1;
+            memory[25] = 1;
+            memory[26] = data_base + 80 * 4;
+            memory[27] = data_base + 84 * 4;
+            memory[32] = memory[0];
+            if (format == 0) memory[64..68].* = .{ 0, 0x3f800000, 0, 0x3f800000 } else memory[64] = 0xff00ff00;
+            for ([3][2]u32{ .{ 2, 3 }, .{ 2, 13 }, .{ 14, 3 } }, 0..) |corner, i| {
+                const at = vertex_word + i * stride;
+                memory[at + glacier.isel.raster_vertex_x_offset / 4] = corner[0];
+                memory[at + glacier.isel.raster_vertex_y_offset / 4] = corner[1];
+                memory[at + glacier.isel.raster_vertex_w_offset / 4] = @bitCast(@as(f32, 1));
+                memory[at + 0x80 / 4] = @bitCast(@as(f32, 0.5));
+                memory[at + 0x84 / 4] = @bitCast(@as(f32, 0.5));
+            }
+            memory[0] = 0xdead0000;
+            memory[25] = 0;
+            memory[80..84].* = .{ 0, 0x3f800000, 0, 0x3f800000 };
+            var mem: warp.Memory = .{ .base = data_base, .words = &memory, .scratch = .{ .base = data_base + scratch_word * 4, .stride = scratch_bytes, .harts = 1 } };
+            var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8, .scratch_bytes = scratch_bytes, .stack_top = data_base + memory.len * 4, .stall_cycles = 20 };
+            one.launch_args[0] = data_base;
+            one.launch_args[1] = data_base + frame_word * 4;
+            one.launch_args[2] = data_base + vertex_word * 4;
+            one.launch_args[3] = 16;
+            one.launch_args[4] = 16;
+            one.launch_args[5] = 16 * 4;
+            const record_word = 400;
+            for (0..9) |record| {
+                memory[record_word + record * 8] = @intCast(3 + record);
+                memory[record_word + record * 8 + 1] = 4;
+            }
+            one.launch_args[6] = data_base + record_word * 4;
+            one.launch_args[7] = 9;
+            const steps = try warp.run(code, &mem, &one, 3_000_000);
+            std.debug.print("textured fused perspective={} format={d} words={d} steps={d} model_cycles={d} pixel={x}\n", .{ perspective, format, code.len, steps, one.cycles, memory[frame_word + 4 * 16 + 3] });
+            try std.testing.expectEqual(@as(u32, 0xff00ff00), memory[frame_word + 4 * 16 + 3]);
+            try std.testing.expectEqual(@as(u32, 0), memory[frame_word]);
+        }
+    }
 }
