@@ -8642,7 +8642,11 @@ const Emitter = struct {
                     try self.emitScalarFloatBinOp(encode, a, dst, pos);
                 } else {
                     const f = binOp(self.func, a.op, ty) orelse return error.Unsupported;
-                    try self.put(f(dst, try self.reg(a.lhs, pos), try self.reg(a.rhs, pos)));
+                    const lhs = if (localIndexGroup(self.func, a.op, a.lhs, constantInt(self.func, a.rhs)) and self.isDivergent(a.lhs)) blk: {
+                        try self.put(rv.vmv_x_s(scratch, try self.vreg(a.lhs, pos)));
+                        break :blk scratch;
+                    } else try self.reg(a.lhs, pos);
+                    try self.put(f(dst, lhs, try self.reg(a.rhs, pos)));
                 }
             },
             .arith_imm => |a| try self.emitArithImm(a, dst, pos),
@@ -8765,7 +8769,10 @@ const Emitter = struct {
     }
 
     fn emitArithImm(self: *Emitter, a: ir.function.ArithImm, dst: Reg, pos: u32) Error!void {
-        const lhs = try self.reg(a.lhs, pos);
+        const lhs = if (localIndexGroup(self.func, a.op, a.lhs, a.imm) and self.isDivergent(a.lhs)) blk: {
+            try self.put(rv.vmv_x_s(scratch, try self.vreg(a.lhs, pos)));
+            break :blk scratch;
+        } else try self.reg(a.lhs, pos);
         const ty = self.func.valueType(a.lhs);
         const signed = isSigned(self.func, ty);
         // A shift amount above the register width is not an encodable shift on RV32.

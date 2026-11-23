@@ -6805,3 +6805,52 @@ test "vector OR reduction encoding matches the hardware and preserves its seed" 
         try std.testing.expectEqual(@as(u32, if (masked) 21 else 31), one.v[31][0]);
     }
 }
+
+test "a uniform local index group reads its vector source" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |immediate| {
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const ptr_t = try f.types.ptrGlobal();
+        try gpu.attrs.setLocalSize(&f, .{ 64, 1, 1 });
+        const entry = try f.appendBlock();
+        const tid = try f.appendBlockParam(entry, u32_t);
+        try gpu.attrs.setBuiltin(&f, tid, .local_invocation_index);
+        const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+        const group = if (immediate)
+            try f.appendArithImm(entry, u32_t, .shr, tid, 5)
+        else blk: {
+            const shift = try f.appendInst(entry, u32_t, .{ .iconst = 5 });
+            break :blk try f.appendInst(entry, u32_t, .{ .arith = .{ .op = .shr, .lhs = tid, .rhs = shift } });
+        };
+        const offset = try f.appendArithImm(entry, u32_t, .shl, tid, 2);
+        const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+        try f.appendStore(entry, group, at);
+        f.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+        const code = try glacier.isel.compileKernel(allocator, &f, .{
+            .profile = .@"gc1.s",
+            .resident_warps = 8,
+            .globals = &.{.{ .name = "data", .address = data_base }},
+        });
+        defer allocator.free(code);
+        const stride = glacier.encode.Profile.@"gc1.s".scratchBytes();
+        const data = try allocator.alloc(u32, 64 + stride * 8 / 4);
+        defer allocator.free(data);
+        @memset(data, 0xcccccccc);
+        const scratch_base = data_base + 64 * 4;
+        var mem: warp.Memory = .{ .base = data_base, .words = data, .scratch = .{ .base = scratch_base, .stride = stride, .harts = 8 } };
+        for (0..8) |hart| {
+            var one: warp.Warp = .{
+                .hart_id = @intCast(hart),
+                .hart_count = 8,
+                .lanes = 8,
+                .stack_top = scratch_base + (@as(u32, @intCast(hart)) + 1) * stride,
+                .scratch_bytes = stride,
+            };
+            @memset(one.x[1..], 0xdeadbeef);
+            _ = try warp.run(code, &mem, &one, budget);
+        }
+        for (data[0..64], 0..) |value, lane| try std.testing.expectEqual(@as(u32, @intCast(lane / 32)), value);
+    }
+}
