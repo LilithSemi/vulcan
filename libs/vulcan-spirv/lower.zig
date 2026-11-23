@@ -487,6 +487,7 @@ pub const Options = struct {
     /// Byte stride of a sampled-image descriptor record. The Glacier runtime
     /// ABI uses the 128-byte `gcv_device_sampler_descriptor` layout.
     image_descriptor_stride: u32 = 128,
+    image_descriptor_array_indirect: bool = false,
     /// Lower each storage buffer to a `global_addr` naming the variable, instead of to a pointer
     /// entry parameter.
     ///
@@ -3635,9 +3636,13 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
                 const base_ptr = try valueOf(module, base);
                 const idx = try coerceTo(func, block, module.i32_t, try valueOf(module, indices[0]));
                 if (module.opts.image_descriptor_stride == 0) return error.MalformedModule;
-                const stride = try func.appendInst(block, module.i32_t, .{ .iconst = module.opts.image_descriptor_stride });
+                const stride = try func.appendInst(block, module.i32_t, .{ .iconst = if (module.opts.image_descriptor_array_indirect) 4 else module.opts.image_descriptor_stride });
                 const offset = try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .mul, .lhs = idx, .rhs = stride } });
-                const pointer = try func.appendInst(block, func.valueType(base_ptr), .{ .arith = .{ .op = .add, .lhs = base_ptr, .rhs = offset } });
+                const element = try func.appendInst(block, func.valueType(base_ptr), .{ .arith = .{ .op = .add, .lhs = base_ptr, .rhs = offset } });
+                const pointer = if (module.opts.image_descriptor_array_indirect)
+                    try func.appendInst(block, func.valueType(base_ptr), .{ .load = .{ .ptr = element } })
+                else
+                    element;
                 module.value_of[result] = pointer;
                 module.var_kind[result] = .sampler;
                 module.sampler_ptr_of[result] = pointer;

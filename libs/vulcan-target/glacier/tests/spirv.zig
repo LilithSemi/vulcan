@@ -3626,3 +3626,81 @@ test "SPIR-V alpha equality branches use lane masks even for a uniform image rea
         }
     }
 }
+
+test "image descriptor pointer arrays keep independent images" {
+    const allocator = std.testing.allocator;
+    const bytes = @embedFile("image-descriptor-array.spv");
+    const words = try allocator.alloc(u32, bytes.len / 4);
+    defer allocator.free(words);
+    for (words, 0..) |*word, i| word.* = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+    var func = try spirv.lowerModuleFor(allocator, words, .{
+        .buffer_descriptors = true,
+        .nullable_image_descriptors = true,
+        .image_descriptor_array_indirect = true,
+    });
+    defer func.deinit();
+    const profile = glacier.encode.Profile.@"gc1.s";
+    const scratch_bytes = comptime profile.scratchBytes();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = profile });
+    defer allocator.free(code);
+    var memory: [512 + scratch_bytes / 4]u32 = @splat(0);
+    memory[0..4].* = .{ data_base + 64 * 4, 4, data_base + 65 * 4, data_base + 66 * 4 };
+    for (0..3) |j| {
+        const at = 100 + j * 80;
+        memory[16 + j] = data_base + @as(u32, @intCast(at * 4));
+        writeSamplerDescriptor(memory[at..], data_base + @as(u32, @intCast((400 + j) * 4)), 1, 1, 4, 5);
+        memory[at + 25] = 1;
+        memory[at + 26] = data_base + 65 * 4;
+        memory[at + 27] = data_base + 66 * 4;
+        memory[400 + j] = @intCast(41 + j);
+    }
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory, .scratch = .{ .base = data_base + 512 * 4, .stride = scratch_bytes, .harts = 1 } };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8, .scratch_bytes = scratch_bytes, .stack_top = data_base + memory.len * 4 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + 16 * 4;
+    _ = try warp.run(code, &mem, &one, 100_000);
+    try std.testing.expectEqual(@as(u32, 126), memory[64]);
+}
+
+test "image descriptor pointer arrays keep independent mip levels" {
+    const allocator = std.testing.allocator;
+    const bytes = @embedFile("image-descriptor-array-mips.spv");
+    const words = try allocator.alloc(u32, bytes.len / 4);
+    defer allocator.free(words);
+    for (words, 0..) |*word, i| word.* = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+    var func = try spirv.lowerModuleFor(allocator, words, .{
+        .buffer_descriptors = true,
+        .nullable_image_descriptors = true,
+        .image_descriptor_array_indirect = true,
+    });
+    defer func.deinit();
+    const profile = glacier.encode.Profile.@"gc1.s";
+    const scratch_bytes = comptime profile.scratchBytes();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{ .profile = profile });
+    defer allocator.free(code);
+    var memory: [512 + scratch_bytes / 4]u32 = @splat(0);
+    memory[0..4].* = .{ data_base + 64 * 4, 4, data_base + 65 * 4, data_base + 66 * 4 };
+    for (0..3) |j| {
+        const at = 100 + j * 80;
+        memory[16 + j] = data_base + @as(u32, @intCast(at * 4));
+        writeSamplerDescriptor(memory[at..], data_base + @as(u32, @intCast((400 + j * 4) * 4)), 1, 1, 16, 0);
+        memory[at + 25] = 1;
+        memory[at + 26] = data_base + 65 * 4;
+        memory[at + 27] = data_base + 66 * 4;
+        memory[400 + j * 4] = @bitCast(@as(f32, @floatFromInt(41 + j)));
+        if (j == 1) {
+            memory[at + 24] = 2;
+            writeSamplerDescriptor(memory[at + 36 ..], data_base + 416 * 4, 1, 1, 16, 0);
+            memory[at + 36 + 25] = 1;
+            memory[at + 36 + 26] = data_base + 65 * 4;
+            memory[at + 36 + 27] = data_base + 66 * 4;
+            memory[416] = @bitCast(@as(f32, 52));
+        }
+    }
+    var mem: warp.Memory = .{ .base = data_base, .words = &memory, .scratch = .{ .base = data_base + 512 * 4, .stride = scratch_bytes, .harts = 1 } };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8, .scratch_bytes = scratch_bytes, .stack_top = data_base + memory.len * 4 };
+    one.launch_args[0] = data_base;
+    one.launch_args[1] = data_base + 16 * 4;
+    _ = try warp.run(code, &mem, &one, 100_000);
+    try std.testing.expectEqual(@as(u32, 136), memory[64]);
+}
