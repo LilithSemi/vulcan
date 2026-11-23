@@ -426,8 +426,17 @@ fn vectorOp(word: u32, warp: *Warp) Error!void {
     // else with `vm` clear is predicated, which nothing emits yet, so it is an error rather than a
     // quietly unpredicated write.
     const masked = (word >> 25) & 1 == 0;
-    if (masked and funct6 != 0b010111) return error.Illegal;
+    if (masked and funct6 != 0b010111 and !(funct3 == 0b010 and funct6 == 0b000010)) return error.Illegal;
 
+    if (funct3 == 0b010 and funct6 == 0b000010) {
+        var result = warp.v[src][0];
+        const active = warp.mask(0);
+        for (0..warp.lanes) |i| {
+            if (!masked or (active >> @intCast(i)) & 1 != 0) result |= warp.v[vs2][i];
+        }
+        warp.v[vd][0] = result;
+        return;
+    }
     // vid.v and vmv.v.x write a value that does not come from vs2, so they are taken first.
     if (funct3 == 0b010 and funct6 == 0b010100) {
         if (src != 17) return error.Illegal; // only vid.v in this group

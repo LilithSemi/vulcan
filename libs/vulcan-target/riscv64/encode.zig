@@ -321,7 +321,7 @@ fn opmvx(funct6: u6, vd: VReg, vs2: VReg, rs1: Reg) u32 {
 
 /// `vredor.vs`: reduce the active vector elements with bitwise OR into element zero of `vd`.
 pub fn vredor_vs(vd: VReg, vs2: VReg, vs1: VReg) u32 {
-    return opmvv(0b010000, vd, vs2, vs1);
+    return opmvv(0b000010, vd, vs2, vs1);
 }
 
 pub fn vadd_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {

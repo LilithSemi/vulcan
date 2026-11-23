@@ -1013,7 +1013,7 @@ const Lifter = struct {
         try self.func.appendStore(self.at, try self.maskLoad(one.vs1), self.carry);
         var which: u32 = 0;
         while (which < self.lanes) : (which += 1) {
-            const loop = try self.laneOne(false, which);
+            const loop = try self.laneOne(one.masked, which);
             const value = try self.laneLoad(one.vs2, loop.index);
             const held = try self.func.appendInst(self.at, self.u32_t, .{ .load = .{ .ptr = self.carry } });
             const joined = try self.func.appendInst(self.at, self.u32_t, .{ .arith = .{ .op = .bit_or, .lhs = held, .rhs = value } });

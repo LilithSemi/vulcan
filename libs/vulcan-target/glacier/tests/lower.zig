@@ -6787,3 +6787,21 @@ test "the rasteriser refuses a discard that does not end its block" {
     );
     try std.testing.expect(std.mem.indexOf(u8, why.reason, "discard whose block carries on") != null);
 }
+
+test "vector OR reduction encoding matches the hardware and preserves its seed" {
+    const encoded = glacier.encode.rv.vredor_vs(.v31, .v4, .v30);
+    try std.testing.expectEqual(@as(u32, 0x0a4f2fd7), encoded);
+    try std.testing.expectEqual(glacier.decode.VectorOp.redor_vs, (try glacier.decode.one(encoded)).vector.op);
+    try std.testing.expectError(error.Illegal, glacier.decode.one(0x424f2fd7));
+    for ([_]bool{ false, true }) |masked| {
+        var memory = [_]u32{0};
+        var mem: warp.Memory = .{ .base = 0, .words = &memory };
+        var one: warp.Warp = .{ .lanes = 4, .hart_id = 0, .hart_count = 1 };
+        one.v[4][0..4].* = .{ 1, 2, 4, 8 };
+        one.v[30][0] = 16;
+        one.v[0][0] = 0b0101;
+        const code = [_]u32{ if (masked) encoded & ~@as(u32, 1 << 25) else encoded, glacier.encode.ebreak };
+        _ = try warp.run(&code, &mem, &one, 100);
+        try std.testing.expectEqual(@as(u32, if (masked) 21 else 31), one.v[31][0]);
+    }
+}

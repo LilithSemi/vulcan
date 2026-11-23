@@ -402,7 +402,7 @@ fn vector(word: u32) Error!Instruction {
         },
         // The mask set, the lane multiplies and divides, and the reads back to the scalar side.
         2 => switch (six) {
-            0x0a => .redor_vs,
+            0x02 => .redor_vs,
             0x10 => switch (vs1(word)) {
                 0 => .mv_x_s,
                 16 => .cpop_m,
@@ -761,4 +761,14 @@ test "a word outside what the core decodes is refused rather than ignored" {
     // And the float lane words that are decoded now, so the two cannot be confused later.
     try std.testing.expectEqual(VectorOp.fadd_vv, (try one(0x0200_1057)).vector.op);
     try std.testing.expectEqual(VectorOp.fcvt_f_x_v, (try one(0x4a15_9157)).vector.op);
+}
+
+test "vector OR reduction uses the hardware reduction encoding" {
+    try std.testing.expectEqual(@as(u32, 0x0a4f2fd7), rv.vredor_vs(.v31, .v4, .v30));
+    const inst = try one(0x0a4f2fd7);
+    try std.testing.expectEqual(VectorOp.redor_vs, inst.vector.op);
+    try std.testing.expectEqual(@as(u5, 31), inst.vector.vd);
+    try std.testing.expectEqual(@as(u5, 4), inst.vector.vs2);
+    try std.testing.expectEqual(@as(u5, 30), inst.vector.vs1);
+    try std.testing.expectError(error.Illegal, one(0x424f2fd7));
 }
