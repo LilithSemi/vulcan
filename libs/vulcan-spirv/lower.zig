@@ -2261,7 +2261,7 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                     out.comps[i] = try func.appendInst(block, fty, .{ .load = .{ .ptr = slot } });
                 }
                 module.vec_of[result] = out;
-            } else if (builtinScalarOf(module, ptr_id) != null and vectorInfo(module.types, inst.operands[0]) != null) {
+            } else if (builtinScalarOf(module, ptr_id) != null and module.var_kind[ptr_id] != .global_id and vectorInfo(module.types, inst.operands[0]) != null) {
                 // A WHOLE-VECTOR load of a uvec3 builtin, which a following OpCompositeExtract
                 // then narrows. Zig's SPIR-V backend writes it this way where glslang reads `.x`
                 // through an access chain, so both spellings reach the same synthesized param.
