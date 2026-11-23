@@ -4528,6 +4528,13 @@ fn moveBlock(
         // that depended on it. The exit keeps its own branch, because the region ends before it,
         // and for a loop that branch is the latch.
         if (func.opcode(inst) == .@"if" and branch == .drop_branch) continue;
+        if (func.opcode(inst) == .atomic_rmw) {
+            if (mask) |m| {
+                const bits = try m.mask(func, dest, divergent, bool_ty);
+                try appendMasked(allocator, func, dest, inst, bits);
+                continue;
+            }
+        }
         const carried: ?Value = switch (func.opcode(inst)) {
             .store => |st| st.mask,
             .load => |l| l.mask,
@@ -5409,10 +5416,19 @@ fn appendMasked(
     switch (func.opcodeMut(inst).*) {
         .store => |*st| st.mask = both,
         .load => |*l| l.mask = both,
-        .atomic_rmw => |*a| {
+        .atomic_rmw => |a| {
+            _ = func.blockInstsMut(block).pop();
             const ty = func.valueType(a.value);
             const zero = try func.appendInst(block, ty, .{ .iconst = 0 });
-            a.value = try func.appendInst(block, ty, .{ .select = .{ .cond = mask, .then = a.value, .@"else" = zero } });
+            const value = try func.appendInst(block, ty, .{ .select = .{ .cond = mask, .then = a.value, .@"else" = zero } });
+            const ptr = if (a.op == .add) blk: {
+                const ptr_ty = func.valueType(a.ptr);
+                const null_ptr = try func.appendInst(block, ptr_ty, .{ .iconst = 0 });
+                break :blk try func.appendInst(block, ptr_ty, .{ .select = .{ .cond = mask, .then = a.ptr, .@"else" = null_ptr } });
+            } else a.ptr;
+            func.opcodeMut(inst).atomic_rmw.value = value;
+            func.opcodeMut(inst).atomic_rmw.ptr = ptr;
+            try func.blockInstsMut(block).append(allocator, inst);
         },
         else => {},
     }
@@ -8362,6 +8378,8 @@ const Emitter = struct {
             } else {
                 try self.put(rv.addi(stack_addr_scratch, try self.reg(a.ptr, pos), 0));
             }
+            const skip = self.words.items.len;
+            try self.put(rv.beq(stack_addr_scratch, .x0, 0));
             if (value_vector) {
                 const offset = (try self.vectorSlotOffset(value_slot)) + @as(i64, @intCast(lane * 4));
                 try self.putStackLoad(scratch, offset);
@@ -8382,6 +8400,7 @@ const Emitter = struct {
                 self.v0_mask = null;
                 try self.put(rv.vmerge_vxm(dst, dst, scratch));
             }
+            self.words.items[skip] = rv.beq(stack_addr_scratch, .x0, @intCast((self.words.items.len - skip) * 4));
         }
     }
 

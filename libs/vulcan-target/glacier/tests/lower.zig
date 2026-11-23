@@ -6854,3 +6854,44 @@ test "a uniform local index group reads its vector source" {
         for (data[0..64], 0..) |value, lane| try std.testing.expectEqual(@as(u32, @intCast(lane / 32)), value);
     }
 }
+
+test "an atomic add in a divergent arm makes no access for a lane that is off" {
+    // Lanes 0 and 1 add one to data[0]. The other lanes hold an address outside memory, and
+    // the warp model faults on any access to it, so an off lane must not touch the bus.
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const u32_t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr_t = try f.types.ptrGlobal();
+
+    const entry = try f.appendBlock();
+    const then_b = try f.appendBlock();
+    const join = try f.appendBlock();
+
+    const tid = try f.appendBlockParam(entry, u32_t);
+    try gpu.attrs.setBuiltin(&f, tid, .thread_id_x);
+    const base = try f.appendGlobalAddr(entry, ptr_t, "data");
+    const two = try f.appendInst(entry, u32_t, .{ .iconst = 2 });
+    const cond = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = two } });
+    const pair = try f.appendArithImm(entry, u32_t, .shr, tid, 1);
+    const far = try f.appendArithImm(entry, u32_t, .shl, pair, 30);
+    const at = try f.appendInst(entry, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = far } });
+    const one = try f.appendInst(entry, u32_t, .{ .iconst = 1 });
+    try f.appendAtomicRmwStmt(then_b, .{
+        .op = .add,
+        .ptr = at,
+        .value = one,
+        .ordering = .relaxed,
+        .scope = .device,
+    });
+    try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = join });
+    try f.setJump(then_b, join, &.{});
+    f.setTerminator(join, .{ .ret = ir.function.Ret.none() });
+
+    const words = try compile(allocator, &f);
+    defer allocator.free(words);
+    var data: [8 + glacier.encode.Profile.@"gc1.n".scratchBytes() / 4]u32 = @splat(0);
+    try runOnce(words, &data, 0, 1);
+    try std.testing.expectEqual(@as(u32, 2), data[0]);
+}
