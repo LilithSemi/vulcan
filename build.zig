@@ -812,7 +812,7 @@ pub fn build(b: *std.Build) void {
     // The same image, lowered from Vulcan IR instead of hand-assembled. A compiler picks other
     // registers and another instruction order, so the two word streams differ by design. Both run
     // on a warp model and the FRAMES are diffed, which is the statement that matters.
-    const glacier_lower = b.addTest(.{ .root_module = b.createModule(.{
+    const glacier_lower = b.addTest(.{ .filters = if (b.option([]const u8, "glacier-test-filter", "Glacier lowering test name filter")) |filter| &.{filter} else &.{}, .root_module = b.createModule(.{
         .root_source_file = b.path("libs/vulcan-target/glacier/tests/lower.zig"),
         .target = target,
         .optimize = optimize,
@@ -823,6 +823,7 @@ pub fn build(b: *std.Build) void {
         },
     }) });
     test_step.dependOn(&b.addRunArtifact(glacier_lower).step);
+    b.step("test-glacier-lower", "Run Glacier lowering tests").dependOn(&b.addRunArtifact(glacier_lower).step);
 
     // The `glacierctl exec kernel.spv` path: a SPIR-V compute module through the SPIR-V lowering,
     // through the Glacier selector, executed on the warp model.
@@ -840,7 +841,7 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(glacier_lift).step);
 
-    const glacier_spirv = b.addTest(.{ .root_module = b.createModule(.{
+    const glacier_spirv = b.addTest(.{ .filters = if (b.option([]const u8, "glacier-spirv-test-filter", "Glacier SPIR-V test name filter")) |filter| &.{filter} else &.{}, .root_module = b.createModule(.{
         .root_source_file = b.path("libs/vulcan-target/glacier/tests/spirv.zig"),
         .target = target,
         .optimize = optimize,
@@ -852,6 +853,7 @@ pub fn build(b: *std.Build) void {
         },
     }) });
     test_step.dependOn(&b.addRunArtifact(glacier_spirv).step);
+    b.step("test-glacier-spirv", "Run Glacier SPIR-V tests").dependOn(&b.addRunArtifact(glacier_spirv).step);
 
     // Scalar-expanded matmul over deliberately odd global pointers. The expansion is test-owned:
     // NVIDIA production codegen receives the ordinary scalar IR, then real hardware proves its
