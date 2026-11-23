@@ -223,31 +223,16 @@ pub const Profile = enum {
         };
     }
 
-    /// Bytes of private scratch one hart owns, which is the whole stack a kernel gets.
+    /// Bytes of private scratch per hart, which is the whole stack a kernel gets.
     ///
-    /// A kernel never reads this number: `mscratch` gives it one past the top of its own region
-    /// and the stack grows down from there, so the size can change without a kernel changing. A
-    /// COMPILER does read it, because it must know when a spill would walk out of the region and
-    /// into the hart below, and the generation is in the profile name so a later core cannot
-    /// quietly move it.
-    /// Two kilobytes on every GC1 profile. The region is carved from the top of the largest memory
-    /// device, SDRAM or DDR3 and not on-chip SRAM, so the size costs address space and no logic:
-    /// sixteen resident warps on gc1.mi reserve 128 KiB out of 32 MiB. A board whose largest memory
-    /// IS on-chip pays visibly, and the answer there is fewer resident warps rather than a smaller
-    /// region.
-    ///
-    /// THIS NUMBER MUST MATCH `GlacierConfig.scratchBytesPerHart` IN THE CORE, and the two
-    /// directions are not equally bad. A core that reserves MORE than this wastes address space. A
-    /// core that reserves LESS lets a spill walk into the hart below and corrupt a neighbour,
-    /// which surfaces as that hart's wrong answer somewhere else. So the core is raised first and
-    /// this follows, never the other way round.
-    ///
-    /// That makes a NEW compiler against an OLD bitstream the dangerous pairing, and nothing in
-    /// either half detects it: the number is fixed at compile time, so no CSR a kernel could read
-    /// would help. Pairing a kernel with the core generation it was built for is the host's job.
+    /// The size per profile must match `scratchBytesPerHart` in glacier_hdl's `config.dart`. A
+    /// core that reserves less lets a spill walk into the scratch of the next hart, and nothing
+    /// detects it. So raise the core first, then this number.
     pub fn scratchBytes(self: Profile) u32 {
         return switch (self) {
-            .@"gc1.n", .@"gc1.mi", .@"gc1.s", .@"gc1.f", .@"gc1.ma" => 8192,
+            .@"gc1.n", .@"gc1.mi" => 8192,
+            .@"gc1.s" => 16384,
+            .@"gc1.f", .@"gc1.ma" => 32768,
         };
     }
 };
