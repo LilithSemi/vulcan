@@ -6958,6 +6958,10 @@ test {
     _ = @import("compute_batch.zig");
 }
 
+test {
+    _ = @import("raster_multiwarp.zig");
+}
+
 test "hardware coverage records shade only supplied covered_pixels across partial batches and warps" {
     const allocator = std.testing.allocator;
     const area = raster_width * raster_height;
