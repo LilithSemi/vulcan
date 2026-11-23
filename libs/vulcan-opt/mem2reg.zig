@@ -491,6 +491,18 @@ fn findPromotable(allocator: std.mem.Allocator, func: *const Function) pass.Erro
     }
     // Clear any whose address escapes: used anywhere but as a load/store `ptr`.
     markEscapes(func, promotable);
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const access: struct { ptr: Value, ty: ir.types.Type } = switch (func.opcode(inst)) {
+                .load => |ld| .{ .ptr = ld.ptr, .ty = func.valueType(func.instResult(inst).?) },
+                .store => |st| .{ .ptr = st.ptr, .ty = func.valueType(st.value) },
+                else => continue,
+            };
+            if (@backingInt(access.ptr) >= promotable.len or !promotable[@backingInt(access.ptr)]) continue;
+            const allocation = func.definingInst(access.ptr) orelse continue;
+            if (func.opcode(allocation).alloca.elem != access.ty) promotable[@backingInt(access.ptr)] = false;
+        }
+    }
     return promotable;
 }
 
@@ -1233,5 +1245,24 @@ test "a slot written by a masked store is left in memory" {
         const s = try buildMaskedSlotRoundTrip(&func, false);
         try testing.expect(try runOnce(allocator, &func));
         try testing.expectEqual(s.stored, func.terminator(s.block).?.ret.values[0]);
+    }
+}
+
+test "mixed integer and float views retain their memory bit interpretation" {
+    const allocator = testing.allocator;
+    inline for (.{ false, true }) |reverse| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const integer = try intTy(&func, 16, .unsigned);
+        const half = try func.types.intern(.{ .float = .f16 });
+        const ptr_t = try func.types.ptrGlobal();
+        const b = try func.appendBlock();
+        const x = try func.appendBlockParam(b, if (reverse) half else integer);
+        const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = integer } });
+        try func.appendStore(b, x, slot);
+        const y = try func.appendInst(b, if (reverse) integer else half, .{ .load = .{ .ptr = slot } });
+        func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+        try testing.expect(!try runOnce(allocator, &func));
+        try testing.expectEqual(y, func.terminator(b).?.ret.values[0]);
     }
 }
