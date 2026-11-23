@@ -6954,6 +6954,10 @@ test "an atomic add in a divergent arm makes no access for a lane that is off" {
     try std.testing.expectEqual(@as(u32, 2), data[0]);
 }
 
+test {
+    _ = @import("compute_batch.zig");
+}
+
 test "hardware coverage records shade only supplied covered_pixels across partial batches and warps" {
     const allocator = std.testing.allocator;
     const area = raster_width * raster_height;
