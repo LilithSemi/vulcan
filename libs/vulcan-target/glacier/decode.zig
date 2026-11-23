@@ -208,6 +208,7 @@ pub const VectorOp = enum {
     fcvt_h_x_v,
     /// A half in the low sixteen bits of the lane, widened to a float.
     fcvt_f_h_v,
+    fwmacc_vv,
     /// A float narrowed to a half, which arrives in the low sixteen bits of the lane.
     fcvt_h_f_w,
     /// A word per lane from one address upwards.
@@ -398,6 +399,7 @@ fn vector(word: u32) Error!Instruction {
             0x1b => .mflt_vv,
             0x20 => .fdiv_vv,
             0x24 => .fmul_vv,
+            0x3c => .fwmacc_vv,
             else => return error.Illegal,
         },
         // The mask set, the lane multiplies and divides, and the reads back to the scalar side.

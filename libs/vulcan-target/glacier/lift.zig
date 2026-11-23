@@ -339,6 +339,36 @@ const Lifter = struct {
         const under = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .lt, .lhs = magnitude, .rhs = smallest } });
         return f.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = under, .then = sign, .@"else" = bits } });
     }
+    fn halfFloat(self: *Lifter, bits: Value) Error!Value {
+        const cut = try self.func.appendInst(self.at, self.u16_t, .{ .convert = .{ .value = bits } });
+        try self.func.appendStore(self.at, cut, self.half_slot);
+        const small = try self.func.appendInst(self.at, self.f16_t, .{ .load = .{ .ptr = self.half_slot } });
+        return self.func.appendInst(self.at, self.f32_t, .{ .convert = .{ .value = small } });
+    }
+
+    fn wideningAccumulate(self: *Lifter, a: Value, b: Value, acc: Value) Error!Value {
+        const f = self.func;
+        const double = try f.types.intern(.{ .float = .f64 });
+        const product = try f.appendInst(self.at, self.f32_t, .{ .arith = .{ .op = .mul, .lhs = try self.halfFloat(a), .rhs = try self.halfFloat(b) } });
+        const wide_product = try f.appendInst(self.at, double, .{ .convert = .{ .value = try self.asFloat(try self.fromFloat(product)) } });
+        const wide_acc = try f.appendInst(self.at, double, .{ .convert = .{ .value = try self.asFloat(acc) } });
+        const sum = try f.appendInst(self.at, double, .{ .arith = .{ .op = .add, .lhs = wide_product, .rhs = wide_acc } });
+        const near = try f.appendInst(self.at, self.f32_t, .{ .convert = .{ .value = sum } });
+        const back = try f.appendInst(self.at, double, .{ .convert = .{ .value = near } });
+        const bits = try f.appendInst(self.at, self.u32_t, .{ .unary = .{ .op = .reinterpret, .value = near } });
+        const sign = try f.appendArithImm(self.at, self.u32_t, .bit_and, bits, 0x8000_0000);
+        const magnitude = try f.appendArithImm(self.at, self.u32_t, .bit_and, bits, 0x7fff_ffff);
+        const positive = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .eq, .lhs = sign, .rhs = try self.constant(0) } });
+        const above = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .gt, .lhs = back, .rhs = sum } });
+        const below = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .lt, .lhs = back, .rhs = sum } });
+        const overshot = try f.appendInst(self.at, self.bool_t, .{ .select = .{ .cond = positive, .then = above, .@"else" = below } });
+        const finite = try f.appendInst(self.at, self.bool_t, .{ .icmp = .{ .op = .lt, .lhs = magnitude, .rhs = try self.constant(0x7f80_0000) } });
+        const adjust = try f.appendInst(self.at, self.bool_t, .{ .arith = .{ .op = .bit_and, .lhs = overshot, .rhs = finite } });
+        const previous = try f.appendArithImm(self.at, self.u32_t, .sub, bits, 1);
+        const result = try f.appendInst(self.at, self.u32_t, .{ .select = .{ .cond = adjust, .then = previous, .@"else" = bits } });
+        return self.fromFloat(try self.asFloat(result));
+    }
+
     /// One float lane word of two others.
     fn floatArithmetic(self: *Lifter, op: ir.function.BinOp, a: Value, b: Value) Error!Value {
         const answer = try self.func.appendInst(self.at, self.f32_t, .{ .arith = .{
@@ -830,6 +860,7 @@ const Lifter = struct {
                         else => .div,
                     }, base, other);
                 },
+                .fwmacc_vv => try self.wideningAccumulate(other, try self.laneLoad(one.vs2, loop.index), old),
                 .fmin_vv, .fmax_vv => blk: {
                     const base = try self.laneLoad(one.vs2, loop.index);
                     break :blk try self.floatPick(one.op == .fmin_vv, base, other);
