@@ -89,6 +89,7 @@ pub const Memory = struct {
     words: []u32,
     /// The scratch region, when the core has one. It lies inside `words` like any other memory.
     scratch: ?Scratch = null,
+    access_words: ?[]u64 = null,
 
     /// Whether `addr` falls in a hart's scratch slice other than `hart_id`'s own.
     fn crossesHart(self: Memory, addr: u32, hart_id: u32) bool {
@@ -103,6 +104,7 @@ pub const Memory = struct {
         if (addr < self.base) return error.OutOfRange;
         const at = (addr - self.base) / 4;
         if (at >= self.words.len) return error.OutOfRange;
+        if (self.access_words) |counts| counts[at] += 1;
         return at;
     }
 };
@@ -117,6 +119,8 @@ pub const stale_lane: u32 = 0xBAD0_BAD0;
 
 /// One warp: a register file, a program counter, and the identity the hardware gives it.
 pub const Warp = struct {
+    scratch_vector_accesses: usize = 0,
+    unaligned_scratch_vectors: usize = 0,
     x: [32]u32 = @splat(0),
     /// The vector registers, `lanes` elements of each in use. Lanes past the launch mask hold
     /// `stale_lane`: every vector write is gated by that mask, so they are never written.
@@ -296,6 +300,10 @@ fn step(word: u32, mem: *Memory, warp: *Warp) Error!void {
             const mop = (word >> 26) & 0b11;
             if (mop != 0b00 and mop != 0b01) return error.Illegal;
             const unit = mop == 0b00;
+            if (unit and a >= warp.stack_top -| warp.scratch_bytes and a < warp.stack_top) {
+                warp.scratch_vector_accesses += 1;
+                if (a % (@as(u32, warp.lanes) * 4) != 0) warp.unaligned_scratch_vectors += 1;
+            }
             // A clear `vm` predicates the access on v0. A lane whose bit is clear makes NO access:
             // it does not read, it does not write, and the hardware skips it on the bus rather
             // than driving a harmless cycle. That is what a store under divergent control flow

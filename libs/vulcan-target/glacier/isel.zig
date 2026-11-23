@@ -692,11 +692,15 @@ fn compileKernelInternal(
     const vector_width = @as(u32, opts.profile.lanes()) * 4;
     const vector_bytes = walloc.slot_count_per_class[1] * vector_width;
     const atomic_bytes = if (vector_atomics) 2 * vector_width else 0;
-    if ((!core_shared and shared_bytes + slots * 4 + vector_bytes + atomic_bytes > opts.profile.scratchBytes()) or (core_shared and slots * 4 + vector_bytes + atomic_bytes > opts.profile.scratchBytes())) {
+    const local_shared_bytes = if (core_shared) 0 else shared_bytes;
+    const scalar_end = local_shared_bytes + slots * 4;
+    const vector_start = if (vector_bytes + atomic_bytes != 0) std.mem.alignForward(u32, scalar_end, vector_width) else scalar_end;
+    const frame_bytes = vector_start + vector_bytes + atomic_bytes;
+    if (frame_bytes > opts.profile.scratchBytes()) {
         return Refusal.tooBig(
             why,
             "more spill space and workgroup memory than the hart's scratch region holds",
-            (if (core_shared) @as(u64, 0) else @as(u64, shared_bytes)) + slots * 4 + vector_bytes + atomic_bytes,
+            frame_bytes,
             opts.profile.scratchBytes(),
         );
     }
@@ -725,7 +729,7 @@ fn compileKernelInternal(
         .core_shared = core_shared,
         .remat = remat,
         .elide = try elidableSlots(allocator, &walloc, remat, slots),
-        .vector_slot_base = slots * 4,
+        .vector_slot_base = vector_start - local_shared_bytes,
         .vector_atomics = vector_atomics,
     };
     defer e.deinit();
@@ -8177,8 +8181,9 @@ const Emitter = struct {
     /// The bytes of the hart's scratch region this kernel uses: the workgroup window plus both
     /// classes of spill slot.
     fn scratchNeeded(self: *const Emitter) u32 {
-        const vector_bytes = self.alloc.slot_count_per_class[1] * @as(u32, self.opts.profile.lanes()) * 4;
-        return (if (self.core_shared) 0 else self.shared_bytes) + self.alloc.slot_count_per_class[0] * 4 + vector_bytes;
+        const vector_width = @as(u32, self.opts.profile.lanes()) * 4;
+        const vector_bytes = (self.alloc.slot_count_per_class[1] + @as(u32, if (self.vector_atomics) 2 else 0)) * vector_width;
+        return (if (self.core_shared) 0 else self.shared_bytes) + self.vector_slot_base + vector_bytes;
     }
 
     /// The window offset of the workgroup slot `value` names, or null when it names none, which
