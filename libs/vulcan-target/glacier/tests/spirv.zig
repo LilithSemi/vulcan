@@ -3542,14 +3542,18 @@ test "SPIR-V scalar and vector pow run on Glacier with runtime exponents" {
         defer allocator.free(words);
         for (cases) |input| {
             const pair = [2]f32{ input[0], if (mode.constant_exponent) 2.4 else input[1] };
-            var data: [32]u32 = @splat(0xdeadbeef);
+            const scratch_bytes = comptime glacier.encode.Profile.@"gc1.mi".scratchBytes();
+            var data: [32 + scratch_bytes / 4]u32 = @splat(0xdeadbeef);
             for (0..4) |lane| {
                 data[lane * 8] = @bitCast(pair[0] * (1 + @as(f32, @floatFromInt(lane)) / 8));
                 data[lane * 8 + 1] = @bitCast(pair[1]);
             }
-            var mem: warp.Memory = .{ .base = data_base, .words = &data };
-            var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4 };
-            _ = try warp.run(words, &mem, &one, 100_000);
+            var mem: warp.Memory = .{ .base = data_base, .words = &data, .scratch = .{ .base = data_base + 128, .stride = scratch_bytes, .harts = 1 } };
+            var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 4, .stack_top = data_base + 128 + scratch_bytes, .scratch_bytes = scratch_bytes };
+            _ = warp.run(words, &mem, &one, 100_000) catch |err| {
+                std.debug.print("pow fault code={d} pc={x} mode={any} prefix={any}\n", .{ one.fault_code, one.pc, mode, words[0..@min(16, words.len)] });
+                return err;
+            };
             for (0..if (mode.uniform) @as(usize, 1) else 4) |lane| {
                 const base = pair[0] * (1 + @as(f32, @floatFromInt(lane)) / 8);
                 const expected = std.math.pow(f32, base, pair[1]);

@@ -442,6 +442,7 @@ fn runOnceWithArgs(
 
 fn compile(allocator: std.mem.Allocator, f: *const Function) ![]u32 {
     return glacier.isel.compileKernel(allocator, f, .{
+        .optimize_compute = false,
         .profile = .@"gc1.n",
         .globals = &.{.{ .name = "data", .address = data_base }},
     });

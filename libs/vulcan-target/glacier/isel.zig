@@ -215,6 +215,7 @@ pub const Options = struct {
     /// step by a constant, which is exact only where w does not vary, so a draw with a projection
     /// needs it or its attributes slide across the triangle.
     raster_perspective: bool = false,
+    optimize_compute: ?bool = null,
 };
 
 /// The colour blend the generated rasteriser applies, which is `src * src_factor + dst *
@@ -314,7 +315,9 @@ pub fn fragmentOutputStride(func: *const Function) u32 {
 
 /// Lower `func` to a Glacier word stream. The caller owns the result.
 pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, opts: Options) Error![]u32 {
-    return compileKernelInternal(allocator, func, opts, null);
+    var selected = opts;
+    selected.optimize_compute = opts.optimize_compute orelse true;
+    return compileKernelInternal(allocator, func, selected, null);
 }
 
 /// Lower a vertex stage to a kernel over a record array. The entry takes the invocation index
@@ -398,7 +401,9 @@ pub fn compileKernelExplained(
     why: *Refusal,
 ) Error![]u32 {
     why.* = .{};
-    return compileKernelInternal(allocator, func, opts, why);
+    var selected = opts;
+    selected.optimize_compute = opts.optimize_compute orelse true;
+    return compileKernelInternal(allocator, func, selected, why);
 }
 
 fn compileKernelInternal(
@@ -471,6 +476,13 @@ fn compileKernelInternal(
     try lowerSignedFloatToInt(allocator, &work);
     phase = "unifyDiscardReturns";
     try unifyDiscardReturns(allocator, &work);
+    if (opts.optimize_compute orelse false) {
+        const stages = [_]opt.pass.Pass{
+            opt.mem2reg.pass_def,  opt.loadfwd.pass_def, opt.constfold.pass_def,
+            opt.simplify.pass_def, opt.gvn.pass_def,     opt.dce.pass_def,
+        };
+        _ = try opt.pass.runToFixpoint(allocator, &work, &stages, 16);
+    }
 
     // Promote every stack slot to an SSA value BEFORE anything else looks at the function. A
     // warp has no stack, so an `alloca` that survives is refused below, and a frontend that keeps
