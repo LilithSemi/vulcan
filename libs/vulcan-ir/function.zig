@@ -572,6 +572,15 @@ pub const AttrTarget = union(enum) {
     block: Block,
     inst: Inst,
     value: Value,
+
+    fn eql(self: AttrTarget, other: AttrTarget) bool {
+        return switch (self) {
+            .func => other == .func,
+            .block => |b| other == .block and other.block == b,
+            .inst => |i| other == .inst and other.inst == i,
+            .value => |v| other == .value and other.value == v,
+        };
+    }
 };
 
 /// One attribute attached to one target.
@@ -587,7 +596,7 @@ pub const AttrIterator = struct {
         while (self.index < self.entries.len) {
             const entry = self.entries[self.index];
             self.index += 1;
-            if (std.meta.eql(entry.target, self.target)) return entry.attr;
+            if (entry.target.eql(self.target)) return entry.attr;
         }
         return null;
     }
