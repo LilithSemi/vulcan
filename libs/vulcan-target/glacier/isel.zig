@@ -2962,6 +2962,33 @@ fn lerp(func: *Function, block: Block, from: Value, to: Value, amount: Value) Er
     return func.appendInst(block, func.valueType(from), .{ .arith = .{ .op = .add, .lhs = from, .rhs = scaled } });
 }
 
+/// Skips the swizzle when the base descriptor maps every component to itself. Mesa writes the
+/// view's one swizzle into every mip level, so the base words decide for the whole warp.
+fn lowerSampleSwizzleGuarded(func: *Function, block: *Block, base_desc: Value, desc: Value, input: [4]Value) Error![4]Value {
+    const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const identity_code = try func.appendInst(block.*, int_ty, .{ .iconst = 0 });
+    var remapped: ?Value = null;
+    for (0..4) |component| {
+        const swizzle_ptr = try appendOffset(func, block.*, base_desc, sampler_swizzle_offset + @as(i64, @intCast(component * 4)), int_ty);
+        const swizzle = try func.appendInst(block.*, int_ty, .{ .load = .{ .ptr = swizzle_ptr } });
+        const own_code = try func.appendInst(block.*, int_ty, .{ .iconst = @as(i64, @intCast(component + 3)) });
+        const not_identity = try func.appendInst(block.*, bool_t, .{ .icmp = .{ .op = .ne, .lhs = swizzle, .rhs = identity_code } });
+        const not_own = try func.appendInst(block.*, bool_t, .{ .icmp = .{ .op = .ne, .lhs = swizzle, .rhs = own_code } });
+        const moved = try func.appendInst(block.*, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = not_identity, .rhs = not_own } });
+        remapped = if (remapped) |prior| try func.appendInst(block.*, bool_t, .{ .arith = .{ .op = .bit_or, .lhs = prior, .rhs = moved } }) else moved;
+    }
+    const remap = try func.appendBlock();
+    const joined = try func.appendBlock();
+    var output: [4]Value = undefined;
+    for (&output) |*value| value.* = try func.appendBlockParam(joined, func.valueType(input[0]));
+    try func.appendIf(block.*, remapped.?, .{ .target = remap, .args = &.{} }, .{ .target = joined, .args = &input });
+    const values = try lowerSampleSwizzle(func, remap, desc, input);
+    try func.setJump(remap, joined, &values);
+    block.* = joined;
+    return output;
+}
+
 fn lowerSampleSwizzle(func: *Function, block: Block, desc: Value, input: [4]Value) Error![4]Value {
     const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
@@ -3632,7 +3659,7 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast:
             }
             const out_index: usize = if (array_sample or cube_sample or volume_sample) 5 else 4;
             const out = args[out_index];
-            try sampled.put(allocator, out, try lowerSampleSwizzle(func, block, desc, values));
+            try sampled.put(allocator, out, try lowerSampleSwizzleGuarded(func, &block, args[0], desc, values));
             try elements.put(allocator, out, .{ .base = out, .component = 0 });
         }
         if (block != original_block) {
