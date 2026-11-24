@@ -2492,14 +2492,29 @@ fn lowerFloorF32(func: *Function, block: Block, value: Value) Error!Value {
     return func.appendInst(block, f32_t, .{ .select = .{ .cond = already_whole, .then = value, .@"else" = finite_floor } });
 }
 
-fn lowerClampCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64) Error!SampleCoordinate {
+/// An axis's size as an integer and as a float, read once and shared by every coordinate on it.
+const SampleExtent = struct {
+    size: Value,
+    size_float: Value,
+};
+
+fn loadExtent(func: *Function, block: Block, desc: Value, size_offset: i64, size_float_offset: i64) Error!SampleExtent {
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const size_ptr = try appendOffset(func, block, desc, size_offset, u32_t);
+    const size_float_ptr = try appendOffset(func, block, desc, size_float_offset, u32_t);
+    return .{
+        .size = try func.appendInst(block, u32_t, .{ .load = .{ .ptr = size_ptr } }),
+        .size_float = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = size_float_ptr } }),
+    };
+}
+
+fn lowerClampCoordinate(func: *Function, block: Block, extent: SampleExtent, coord: Value) Error!SampleCoordinate {
     const it = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const bt = try func.types.intern(.bool);
     const ft = func.valueType(coord);
-    const size_ptr = try appendOffset(func, block, desc, size_offset, it);
-    const size = try func.appendInst(block, it, .{ .load = .{ .ptr = size_ptr } });
-    const float_ptr = try appendOffset(func, block, desc, size_float_offset, it);
-    const size_float = try func.appendInst(block, ft, .{ .load = .{ .ptr = float_ptr } });
+    const size = extent.size;
+    const size_float = extent.size_float;
     const zero = try func.appendInst(block, ft, .{ .fconst = 0 });
     const one = try func.appendInst(block, ft, .{ .fconst = 1 });
     const negative = try func.appendInst(block, bt, .{ .icmp = .{ .op = .lt, .lhs = coord, .rhs = zero } });
@@ -2514,14 +2529,12 @@ fn lowerClampCoordinate(func: *Function, block: Block, desc: Value, coord: Value
     return .{ .index = index, .border = try func.appendInst(block, bt, .{ .iconst = 0 }) };
 }
 
-fn lowerSampleCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64, mode_offset: i64) Error!SampleCoordinate {
+fn lowerSampleCoordinate(func: *Function, block: Block, desc: Value, coord: Value, extent: SampleExtent, mode_offset: i64) Error!SampleCoordinate {
     const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
     const f32_t = func.valueType(coord);
-    const size_ptr = try appendOffset(func, block, desc, size_offset, u32_t);
-    const size = try func.appendInst(block, u32_t, .{ .load = .{ .ptr = size_ptr } });
-    const size_float_ptr = try appendOffset(func, block, desc, size_float_offset, u32_t);
-    const size_float = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = size_float_ptr } });
+    const size = extent.size;
+    const size_float = extent.size_float;
     const zero_f = try func.appendInst(block, f32_t, .{ .fconst = 0 });
     const one_f = try func.appendInst(block, f32_t, .{ .fconst = 1 });
     const two_f = try func.appendInst(block, f32_t, .{ .fconst = 2 });
@@ -2564,14 +2577,12 @@ fn lowerSampleCoordinate(func: *Function, block: Block, desc: Value, coord: Valu
 
 /// The repeat arm of `lowerSampleCoordinate` alone, with the same float steps, for a sampler
 /// whose address mode is known to be repeat.
-fn lowerRepeatCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64) Error!SampleCoordinate {
+fn lowerRepeatCoordinate(func: *Function, block: Block, extent: SampleExtent, coord: Value) Error!SampleCoordinate {
     const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
     const f32_t = func.valueType(coord);
-    const size_ptr = try appendOffset(func, block, desc, size_offset, u32_t);
-    const size = try func.appendInst(block, u32_t, .{ .load = .{ .ptr = size_ptr } });
-    const size_float_ptr = try appendOffset(func, block, desc, size_float_offset, u32_t);
-    const size_float = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = size_float_ptr } });
+    const size = extent.size;
+    const size_float = extent.size_float;
     const floor = try lowerFloorF32(func, block, coord);
     const repeat = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = coord, .rhs = floor } });
     const scaled = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = repeat, .rhs = size_float } });
@@ -2585,19 +2596,19 @@ fn lowerRepeatCoordinate(func: *Function, block: Block, desc: Value, coord: Valu
 /// Address modes a fast path can know ahead of the sample. `any` reads the mode word.
 const SampleAddress = enum { clamp, repeat, any };
 
-fn lowerAddressedCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64, mode_offset: i64, comptime address: SampleAddress) Error!SampleCoordinate {
+fn lowerAddressedCoordinate(func: *Function, block: Block, desc: Value, coord: Value, extent: SampleExtent, mode_offset: i64, comptime address: SampleAddress) Error!SampleCoordinate {
     return switch (address) {
-        .clamp => lowerClampCoordinate(func, block, desc, coord, size_offset, size_float_offset),
-        .repeat => lowerRepeatCoordinate(func, block, desc, coord, size_offset, size_float_offset),
-        .any => lowerSampleCoordinate(func, block, desc, coord, size_offset, size_float_offset, mode_offset),
+        .clamp => lowerClampCoordinate(func, block, extent, coord),
+        .repeat => lowerRepeatCoordinate(func, block, extent, coord),
+        .any => lowerSampleCoordinate(func, block, desc, coord, extent, mode_offset),
     };
 }
 
 fn lowerLinearCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64, reciprocal_offset: i64, mode_offset: i64, comptime address: SampleAddress) Error!LinearCoordinate {
     const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const f32_t = func.valueType(coord);
-    const size_ptr = try appendOffset(func, block, desc, size_float_offset, u32_t);
-    const size = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = size_ptr } });
+    const extent = try loadExtent(func, block, desc, size_offset, size_float_offset);
+    const size = extent.size_float;
     const reciprocal_ptr = try appendOffset(func, block, desc, reciprocal_offset, u32_t);
     const reciprocal = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = reciprocal_ptr } });
     const half = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
@@ -2609,8 +2620,8 @@ fn lowerLinearCoordinate(func: *Function, block: Block, desc: Value, coord: Valu
     const first_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = first_center, .rhs = reciprocal } });
     const second_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = first_normalized, .rhs = reciprocal } });
     return .{
-        .first = try lowerAddressedCoordinate(func, block, desc, first_normalized, size_offset, size_float_offset, mode_offset, address),
-        .second = try lowerAddressedCoordinate(func, block, desc, second_normalized, size_offset, size_float_offset, mode_offset, address),
+        .first = try lowerAddressedCoordinate(func, block, desc, first_normalized, extent, mode_offset, address),
+        .second = try lowerAddressedCoordinate(func, block, desc, second_normalized, extent, mode_offset, address),
         .weight = weight,
     };
 }
@@ -2773,16 +2784,39 @@ fn lowerSampleTexel(func: *Function, block: Block, image: SampleImage, x: Sample
     return values;
 }
 
+/// Where a read goes when the host bound no image, read once for every texel of a sample.
+const ImageFallback = struct {
+    present: Value,
+    pointer: Value,
+};
+
+/// Null for a descriptor that is never absent. See `nullableImagePointer`.
+fn imageFallback(func: *Function, block: Block, descriptor: Value) Error!?ImageFallback {
+    if (!hasGpuKey(func, descriptor, "nullable_desc")) return null;
+    const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const valid_ptr = try appendOffset(func, block, descriptor, sampler_valid_offset, int_ty);
+    const valid = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = valid_ptr } });
+    const zero = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+    const fallback_ptr = try appendOffset(func, block, descriptor, sampler_read_fallback_offset, int_ty);
+    return .{
+        .present = try func.appendInst(block, try func.types.intern(.bool), .{ .icmp = .{ .op = .ne, .lhs = valid, .rhs = zero } }),
+        .pointer = try func.appendInst(block, func.valueType(descriptor), .{ .load = .{ .ptr = fallback_ptr } }),
+    };
+}
+
 /// One RGBA8 texel. `srgb_table` is the sRGB table pointer when the format is sRGB, or null for
 /// UNORM. The caller branches on the format, so a UNORM texture never reads the table.
-fn lowerSampleTexelRGBA8(func: *Function, block: Block, image: SampleImage, x: SampleCoordinate, y: SampleCoordinate, z_border: Value, srgb_table: ?Value) Error![4]Value {
+fn lowerSampleTexelRGBA8(func: *Function, block: Block, image: SampleImage, x: SampleCoordinate, y: SampleCoordinate, z_border: Value, srgb_table: ?Value, fallback: ?ImageFallback) Error![4]Value {
     const outside_xy = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = x.border, .rhs = y.border } });
     const outside = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = outside_xy, .rhs = z_border } });
     const row = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = y.index, .rhs = image.row_pitch } });
     const column = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = x.index, .rhs = image.texel_bytes } });
     const byte_offset = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .add, .lhs = row, .rhs = column } });
     const texel = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = image.base, .rhs = byte_offset } });
-    const packed_ptr = try nullableImagePointer(func, block, image.desc, texel, false, 0, image.int_ty);
+    const packed_ptr = if (fallback) |absent|
+        try func.appendInst(block, image.ptr_ty, .{ .select = .{ .cond = absent.present, .then = texel, .@"else" = absent.pointer } })
+    else
+        texel;
     const rgba_word = try func.appendInst(block, image.int_ty, .{ .load = .{ .ptr = packed_ptr } });
     var decoded: [4]Value = undefined;
     for (0..4) |component| {
@@ -2838,26 +2872,27 @@ fn lowerSampleRGBA8Fast(func: *Function, block: Block, desc: Value, u: Value, v:
         try lowerLinearCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset, sampler_address_v_offset, address),
     } else undefined;
     const nearest = if (filter == .nearest) .{
-        try lowerAddressedCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_address_u_offset, address),
-        try lowerAddressedCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_address_v_offset, address),
+        try lowerAddressedCoordinate(func, block, desc, u, try loadExtent(func, block, desc, sampler_width_offset, sampler_width_float_offset), sampler_address_u_offset, address),
+        try lowerAddressedCoordinate(func, block, desc, v, try loadExtent(func, block, desc, sampler_height_offset, sampler_height_float_offset), sampler_address_v_offset, address),
     } else undefined;
     const base = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = desc } });
     const pitch_ptr = try appendOffset(func, block, desc, sampler_row_pitch_offset, int_ty);
     const pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = pitch_ptr } });
     const bytes = try func.appendInst(block, int_ty, .{ .iconst = 4 });
     const image = try sampleImageFormats(func, block, desc, base, pitch, bytes, int_ty, ptr_ty);
+    const fallback = try imageFallback(func, block, desc);
     const arms = try rgba8Arms(func, block, is_unorm, desc, int_ty, ptr_ty);
     for (arms.blocks, arms.tables) |arm, table| {
         var values: [4]Value = undefined;
         switch (filter) {
-            .nearest => values = try lowerSampleTexelRGBA8(func, arm, image, nearest[0], nearest[1], nearest[0].border, table),
+            .nearest => values = try lowerSampleTexelRGBA8(func, arm, image, nearest[0], nearest[1], nearest[0].border, table, fallback),
             .linear => {
                 const lx = linear[0];
                 const ly = linear[1];
-                const c00 = try lowerSampleTexelRGBA8(func, arm, image, lx.first, ly.first, lx.first.border, table);
-                const c10 = try lowerSampleTexelRGBA8(func, arm, image, lx.second, ly.first, lx.second.border, table);
-                const c01 = try lowerSampleTexelRGBA8(func, arm, image, lx.first, ly.second, lx.first.border, table);
-                const c11 = try lowerSampleTexelRGBA8(func, arm, image, lx.second, ly.second, lx.second.border, table);
+                const c00 = try lowerSampleTexelRGBA8(func, arm, image, lx.first, ly.first, lx.first.border, table, fallback);
+                const c10 = try lowerSampleTexelRGBA8(func, arm, image, lx.second, ly.first, lx.second.border, table, fallback);
+                const c01 = try lowerSampleTexelRGBA8(func, arm, image, lx.first, ly.second, lx.first.border, table, fallback);
+                const c11 = try lowerSampleTexelRGBA8(func, arm, image, lx.second, ly.second, lx.second.border, table, fallback);
                 for (0..4) |component| {
                     const top = try lerp(func, arm, c00[component], c10[component], lx.weight);
                     const bottom = try lerp(func, arm, c01[component], c11[component], lx.weight);
@@ -3513,12 +3548,12 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast:
             const cube = if (cube_sample) try lowerCubeCoordinate(func, block, args[1], args[2], args[3]) else null;
             const u = if (cube) |coordinate| coordinate.u else args[1];
             const v = if (cube) |coordinate| coordinate.v else args[2];
-            const nearest_x = try lowerSampleCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_address_u_offset);
-            const nearest_y = try lowerSampleCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_address_v_offset);
+            const nearest_x = try lowerSampleCoordinate(func, block, desc, u, try loadExtent(func, block, desc, sampler_width_offset, sampler_width_float_offset), sampler_address_u_offset);
+            const nearest_y = try lowerSampleCoordinate(func, block, desc, v, try loadExtent(func, block, desc, sampler_height_offset, sampler_height_float_offset), sampler_address_v_offset);
             const linear_x = try lowerLinearCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_width_reciprocal_offset, sampler_address_u_offset, .any);
             const linear_y = try lowerLinearCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset, sampler_address_v_offset, .any);
             const nearest_z = if (volume_sample)
-                try lowerSampleCoordinate(func, block, desc, args[3], sampler_depth_offset, sampler_depth_float_offset, sampler_address_w_offset)
+                try lowerSampleCoordinate(func, block, desc, args[3], try loadExtent(func, block, desc, sampler_depth_offset, sampler_depth_float_offset), sampler_address_w_offset)
             else
                 null;
             const linear_z = if (volume_sample)
