@@ -63,6 +63,10 @@ pub const Glsl = struct {
     pub const smooth_step = 49;
     pub const fma = 50;
     pub const find_ilsb = 73;
+    // The NaN-aware forms: a NaN operand gives the other operand.
+    pub const n_min = 79;
+    pub const n_max = 80;
+    pub const n_clamp = 81;
 };
 
 // Types.

@@ -2625,6 +2625,20 @@ fn lowerIsNan(func: *Function, block: Block, value: Value) Error!Value {
     return func.appendInst(block, bool_ty, .{ .select = .{ .cond = exponent_all_ones, .then = mantissa_nonzero, .@"else" = try func.appendInst(block, bool_ty, .{ .iconst = 0 }) } });
 }
 
+/// GLSL.std.450 NMin and NMax: a NaN operand gives the other operand, and the result is NaN only
+/// when both are. Float compares are ordered, so `a == a` is false only for a NaN `a`, and a NaN
+/// `b` already loses the `<` compare.
+fn lowerNanMinMax(func: *Function, block: Block, a: Value, b: Value, max: bool) Error!Value {
+    const bool_ty = try func.types.intern(.bool);
+    const ty = func.valueType(a);
+    const lhs = if (max) a else b;
+    const rhs = if (max) b else a;
+    const take_b = try func.appendInst(block, bool_ty, .{ .icmp = .{ .op = .lt, .lhs = lhs, .rhs = rhs } });
+    const ordered = try func.appendInst(block, ty, .{ .select = .{ .cond = take_b, .then = b, .@"else" = a } });
+    const a_number = try func.appendInst(block, bool_ty, .{ .icmp = .{ .op = .eq, .lhs = a, .rhs = a } });
+    return func.appendInst(block, ty, .{ .select = .{ .cond = a_number, .then = ordered, .@"else" = b } });
+}
+
 /// Detect either sign of infinity from its IEEE-754 exponent and mantissa.
 fn lowerIsInf(func: *Function, block: Block, value: Value) Error!Value {
     const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
@@ -3230,6 +3244,35 @@ fn lowerMathExtInst(func: *Function, module: *Module, block: Block, which: u32, 
             module.vec_of[result] = out;
             return true;
         },
+        op.Glsl.n_min, op.Glsl.n_max => {
+            const a = try vecOf(module, try operandAt(args, 0));
+            if (a.len == 0) return false;
+            const b = try vecOf(module, try operandAt(args, 1));
+            if (a.len != b.len) return error.Unsupported;
+            var out: Vec = .{ .len = a.len };
+            for (0..a.len) |i| out.comps[i] = try lowerNanMinMax(func, block, a.comps[i], b.comps[i], which == op.Glsl.n_max);
+            module.vec_of[result] = out;
+            return true;
+        },
+        op.Glsl.n_clamp => {
+            const x = try vecOf(module, try operandAt(args, 0));
+            if (x.len == 0) return false;
+            const lo_id = try operandAt(args, 1);
+            const hi_id = try operandAt(args, 2);
+            const lo_vec = try vecOf(module, lo_id);
+            const hi_vec = try vecOf(module, hi_id);
+            if ((lo_vec.len != 0 and lo_vec.len != x.len) or
+                (hi_vec.len != 0 and hi_vec.len != x.len)) return error.Unsupported;
+            var out: Vec = .{ .len = x.len };
+            for (0..x.len) |i| {
+                const lo = if (lo_vec.len == 0) try valueOf(module, lo_id) else lo_vec.comps[i];
+                const hi = if (hi_vec.len == 0) try valueOf(module, hi_id) else hi_vec.comps[i];
+                const raised = try lowerNanMinMax(func, block, x.comps[i], lo, true);
+                out.comps[i] = try lowerNanMinMax(func, block, raised, hi, false);
+            }
+            module.vec_of[result] = out;
+            return true;
+        },
         // The vector overloads of GLSL.std.450 Clamp are also scalarized here;
         // SPIR-V producers may supply scalar bounds for a vector value.
         op.Glsl.f_clamp, op.Glsl.u_clamp, op.Glsl.s_clamp => {
@@ -3564,6 +3607,15 @@ fn lowerExtInst(allocator: std.mem.Allocator, func: *Function, module: *Module, 
                 const x = try arg(module, args, 0);
                 const fl = try func.appendInst(block, ty, .{ .unary = .{ .op = .floor, .value = x } });
                 break :blk try func.appendInst(block, ty, .{ .arith = .{ .op = .sub, .lhs = x, .rhs = fl } });
+            },
+            op.Glsl.n_min, op.Glsl.n_max => blk: {
+                const a = try arg(module, args, 0);
+                const b = try arg(module, args, 1);
+                break :blk try lowerNanMinMax(func, block, a, b, which == op.Glsl.n_max);
+            },
+            op.Glsl.n_clamp => blk: {
+                const raised = try lowerNanMinMax(func, block, try arg(module, args, 0), try arg(module, args, 1), true);
+                break :blk try lowerNanMinMax(func, block, raised, try arg(module, args, 2), false);
             },
             op.Glsl.f_clamp, op.Glsl.u_clamp, op.Glsl.s_clamp => blk: {
                 // clamp(x, lo, hi) = min(max(x, lo), hi), each min/max in the spec `<`-and-

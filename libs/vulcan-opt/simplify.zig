@@ -15,8 +15,9 @@
 //! arms collapse (`select(c, x, x) -> x`). Both hold for any type since they only choose a value, and
 //! commonly fire once constant folding has resolved an `icmp` condition.
 //!
-//! A self-comparison folds to a constant bool: `x == x -> 1`, `x < x -> 0`, and so on. icmp is
-//! integer, so there is no NaN caveat, and the resulting constant can go on to feed branch folding.
+//! A self-comparison folds to a constant bool: `x == x -> 1`, `x < x -> 0`, and so on, and the
+//! constant can go on to feed branch folding. A float self-comparison stays, because a NaN is not
+//! equal to itself and `x == x` is how a lowering tests for one.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -195,7 +196,8 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 .icmp => |cmp| blk: {
                     const lhs = canonical(replacements, cmp.lhs);
                     const rhs = canonical(replacements, cmp.rhs);
-                    if (lhs == rhs) break :blk .{ .constant = switch (cmp.op) {
+                    const float_operands = func.types.type_kind(func.valueType(lhs)) == .float;
+                    if (lhs == rhs and !float_operands) break :blk .{ .constant = switch (cmp.op) {
                         .eq, .le, .ge => @as(i64, 1),
                         .ne, .lt, .gt => @as(i64, 0),
                     } };
@@ -444,6 +446,20 @@ test "self-comparison folds to a constant bool" {
         try testing.expect(try runOnce(allocator, &func));
         try testing.expectEqual(case.expect, func.opcode(func.definingInst(cmp).?).iconst);
     }
+}
+
+test "a float self-comparison does not fold" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const b = try func.appendBlock();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const x = try func.appendBlockParam(b, f32_t);
+    const bool_t = try func.types.intern(.bool);
+    const cmp = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = x } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(cmp) });
+    _ = try runOnce(allocator, &func);
+    try testing.expect(func.opcode(func.definingInst(cmp).?) == .icmp);
 }
 
 test "a double negation of a compare simplifies back to the compare" {

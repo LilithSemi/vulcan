@@ -4696,3 +4696,110 @@ test "linear repeat RGBA8 sampling takes the fast path" {
         try std.testing.expect(steps[1] * 2 < steps[0]);
     }
 }
+
+/// `out[32 + i] = NMin(a, b)`, `out[40 + i] = NMax(a, b)`, `out[48 + i] = NClamp(a, b, c)` and
+/// `out[56 + i] = isnan(a) ? 1 : 0`, where `a`, `b` and `c` are `out[i]`, `out[8 + i]` and
+/// `out[16 + i]` for local invocation `i`.
+fn nanMinMaxModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 49);
+    errdefer b.deinit(allocator);
+    const glsl = 100;
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.gl_compute, 24, 0x6E69616D, 0, 13, 14 });
+    try b.emit(allocator, op.ExecutionMode, &.{ 24, op.ExecutionModeKind.local_size, 8, 1, 1 });
+    try b.emit(allocator, op.Name, &.{ 14, 0x0074756F });
+    try b.emit(allocator, op.Decorate, &.{ 13, op.Decoration.builtin, op.BuiltIn.local_invocation_id });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFunction, &.{ 2, 1 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeInt, &.{ 4, 32, 0 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 4, 3 });
+    try b.emit(allocator, op.TypePointer, &.{ 6, op.StorageClass.input, 5 });
+    try b.emit(allocator, op.TypePointer, &.{ 7, op.StorageClass.input, 4 });
+    try b.emit(allocator, op.TypeRuntimeArray, &.{ 8, 3 });
+    try b.emit(allocator, op.TypeStruct, &.{ 9, 8 });
+    try b.emit(allocator, op.TypePointer, &.{ 10, op.StorageClass.storage_buffer, 9 });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.storage_buffer, 3 });
+    try b.emit(allocator, op.TypeBool, &.{12});
+    try b.emit(allocator, op.Variable, &.{ 6, 13, op.StorageClass.input });
+    try b.emit(allocator, op.Variable, &.{ 10, 14, op.StorageClass.storage_buffer });
+    for ([_]u32{ 0, 8, 16, 32, 40, 48, 56 }, 15..) |value, id| try b.emit(allocator, op.Constant, &.{ 4, @intCast(id), value });
+    try b.emit(allocator, op.Constant, &.{ 3, 22, 0 });
+    try b.emit(allocator, op.Constant, &.{ 3, 23, 0x3f800000 });
+    try b.emit(allocator, op.Function, &.{ 1, 24, 0, 2 });
+    try b.emit(allocator, op.Label, &.{25});
+    try b.emit(allocator, op.AccessChain, &.{ 7, 26, 13, 15 });
+    try b.emit(allocator, op.Load, &.{ 4, 27, 26 });
+    try b.emit(allocator, op.IAdd, &.{ 4, 28, 27, 16 });
+    try b.emit(allocator, op.IAdd, &.{ 4, 29, 27, 17 });
+    try b.emit(allocator, op.AccessChain, &.{ 11, 30, 14, 15, 27 });
+    try b.emit(allocator, op.Load, &.{ 3, 31, 30 });
+    try b.emit(allocator, op.AccessChain, &.{ 11, 32, 14, 15, 28 });
+    try b.emit(allocator, op.Load, &.{ 3, 33, 32 });
+    try b.emit(allocator, op.AccessChain, &.{ 11, 34, 14, 15, 29 });
+    try b.emit(allocator, op.Load, &.{ 3, 35, 34 });
+    try b.emit(allocator, op.ExtInst, &.{ 3, 36, glsl, op.Glsl.n_min, 31, 33 });
+    try b.emit(allocator, op.ExtInst, &.{ 3, 37, glsl, op.Glsl.n_max, 31, 33 });
+    try b.emit(allocator, op.ExtInst, &.{ 3, 38, glsl, op.Glsl.n_clamp, 31, 33, 35 });
+    try b.emit(allocator, op.IsNan, &.{ 12, 39, 31 });
+    try b.emit(allocator, op.Select, &.{ 3, 40, 39, 23, 22 });
+    for ([_]u32{ 36, 37, 38, 40 }, [_]u32{ 18, 19, 20, 21 }, 0..) |value, base, k| {
+        const index: u32 = 41 + @as(u32, @intCast(k)) * 2;
+        try b.emit(allocator, op.IAdd, &.{ 4, index, 27, base });
+        try b.emit(allocator, op.AccessChain, &.{ 11, index + 1, 14, 15, index });
+        try b.emit(allocator, op.Store, &.{ index + 1, value });
+    }
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+fn referenceNanMinMax(a: f32, b: f32, max: bool) f32 {
+    if (std.math.isNan(a)) return b;
+    if (std.math.isNan(b)) return a;
+    return if (max) @max(a, b) else @min(a, b);
+}
+
+test "NMin, NMax and NClamp give the other operand for a NaN" {
+    const allocator = std.testing.allocator;
+    var b = try nanMinMaxModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{ .buffers_as_globals = true });
+    defer func.deinit();
+    const code = try glacier.isel.compileKernel(allocator, &func, .{
+        .profile = .@"gc1.s",
+        .globals = &.{.{ .name = "out", .address = data_base }},
+    });
+    defer allocator.free(code);
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    const a = [8]f32{ nan, 3, nan, 0, 1, -7, inf, -inf };
+    const lo = [8]f32{ 2, nan, nan, -0.0, 5, -2, nan, 4 };
+    const hi = [8]f32{ 10, 1, nan, 1, 3, nan, 0, -10 };
+    var data: [64]u32 = @splat(0xdeadbeef);
+    for (0..8) |i| {
+        data[i] = @bitCast(a[i]);
+        data[8 + i] = @bitCast(lo[i]);
+        data[16 + i] = @bitCast(hi[i]);
+    }
+    var mem: warp.Memory = .{ .base = data_base, .words = &data };
+    var one: warp.Warp = .{ .hart_id = 0, .hart_count = 1, .lanes = 8 };
+    const steps = try warp.run(code, &mem, &one, 10_000);
+    std.debug.print("nan min max words={d} steps={d}\n", .{ code.len, steps });
+    for (0..8) |i| {
+        const expected = [4]f32{
+            referenceNanMinMax(a[i], lo[i], false),
+            referenceNanMinMax(a[i], lo[i], true),
+            referenceNanMinMax(referenceNanMinMax(a[i], lo[i], true), hi[i], false),
+            if (std.math.isNan(a[i])) 1 else 0,
+        };
+        for (expected, 0..) |want, k| {
+            const got: f32 = @bitCast(data[32 + k * 8 + i]);
+            if (std.math.isNan(want)) {
+                try std.testing.expect(std.math.isNan(got));
+            } else {
+                // Either zero answers a min or max of +0 and -0.
+                try std.testing.expectEqual(want, got);
+            }
+        }
+    }
+}
