@@ -4661,3 +4661,38 @@ test "a lit texture samples the same colours as the reference sampler" {
     std.debug.print("lit texture reference={d} steps fresh={d} steps\n", .{ reference_steps, fresh_steps });
     try std.testing.expect(fresh_steps < reference_steps);
 }
+
+test "linear repeat RGBA8 sampling takes the fast path" {
+    const allocator = std.testing.allocator;
+    const fresh = try litTextureProgram(allocator);
+    defer allocator.free(fresh);
+    const raw = @embedFile("lit-texture-reference.bin");
+    const reference = try allocator.alloc(u32, raw.len / 4);
+    defer allocator.free(reference);
+    for (reference, 0..) |*word, i| word.* = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
+    const memory = try allocator.alloc(u32, 0x40000 / 4);
+    defer allocator.free(memory);
+    var steps: [2]usize = undefined;
+    var expected: [160]u32 = undefined;
+    for ([_]u32{ 1, 6 }) |format| {
+        for ([_][]const u32{ reference, fresh }, 0..) |code, variant| {
+            var prng = std.Random.DefaultPrng.init(7);
+            litRandomMemory(memory, prng.random(), true);
+            for (0..2) |sampler| for (0..3) |level| {
+                const d = sampler * 128 + level * 36;
+                memory[d + 6] = if (sampler == 0) 0 else 2;
+                memory[d + 7] = if (sampler == 0) 0 else 2;
+                memory[d + 13] = format;
+                memory[d + 12] = 4;
+                memory[d + 16] = 1;
+                memory[d + 17] = 1;
+                memory[d + 18 ..][0..4].* = .{ 3, 4, 5, 6 };
+                memory[d + 25] = 1;
+            };
+            steps[variant] = try runLitTexture(code, memory);
+            if (variant == 0) @memcpy(&expected, memory[4096..][0..160]) else try std.testing.expectEqualSlices(u32, &expected, memory[4096..][0..160]);
+        }
+        std.debug.print("linear repeat format={d} reference={d} fresh={d}\n", .{ format, steps[0], steps[1] });
+        try std.testing.expect(steps[1] * 2 < steps[0]);
+    }
+}

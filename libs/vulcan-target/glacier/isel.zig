@@ -2562,29 +2562,38 @@ fn lowerSampleCoordinate(func: *Function, block: Block, desc: Value, coord: Valu
     return .{ .index = index, .border = effective_border };
 }
 
-fn lowerLinearCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64, reciprocal_offset: i64, mode_offset: i64) Error!LinearCoordinate {
+/// The repeat arm of `lowerSampleCoordinate` alone, with the same float steps, for a sampler
+/// whose address mode is known to be repeat.
+fn lowerRepeatCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64) Error!SampleCoordinate {
     const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
     const f32_t = func.valueType(coord);
-    const size_ptr = try appendOffset(func, block, desc, size_float_offset, u32_t);
-    const size = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = size_ptr } });
-    const reciprocal_ptr = try appendOffset(func, block, desc, reciprocal_offset, u32_t);
-    const reciprocal = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = reciprocal_ptr } });
-    const half = try func.appendInst(block, f32_t, .{ .fconst = 0.5 });
-    const scaled = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = coord, .rhs = size } });
-    const centered = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = scaled, .rhs = half } });
-    const floor = try lowerFloorF32(func, block, centered);
-    const weight = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = centered, .rhs = floor } });
-    const first_center = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = floor, .rhs = half } });
-    const first_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = first_center, .rhs = reciprocal } });
-    const second_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = first_normalized, .rhs = reciprocal } });
-    return .{
-        .first = try lowerSampleCoordinate(func, block, desc, first_normalized, size_offset, size_float_offset, mode_offset),
-        .second = try lowerSampleCoordinate(func, block, desc, second_normalized, size_offset, size_float_offset, mode_offset),
-        .weight = weight,
+    const size_ptr = try appendOffset(func, block, desc, size_offset, u32_t);
+    const size = try func.appendInst(block, u32_t, .{ .load = .{ .ptr = size_ptr } });
+    const size_float_ptr = try appendOffset(func, block, desc, size_float_offset, u32_t);
+    const size_float = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = size_float_ptr } });
+    const floor = try lowerFloorF32(func, block, coord);
+    const repeat = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .sub, .lhs = coord, .rhs = floor } });
+    const scaled = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = repeat, .rhs = size_float } });
+    const converted = try func.appendInst(block, u32_t, .{ .convert = .{ .value = scaled } });
+    const size_last = try func.appendInst(block, u32_t, .{ .arith_imm = .{ .op = .sub, .lhs = size, .imm = 1 } });
+    const index_past_end = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .ge, .lhs = converted, .rhs = size } });
+    const index = try func.appendInst(block, u32_t, .{ .select = .{ .cond = index_past_end, .then = size_last, .@"else" = converted } });
+    return .{ .index = index, .border = try func.appendInst(block, bool_t, .{ .iconst = 0 }) };
+}
+
+/// Address modes a fast path can know ahead of the sample. `any` reads the mode word.
+const SampleAddress = enum { clamp, repeat, any };
+
+fn lowerAddressedCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64, mode_offset: i64, comptime address: SampleAddress) Error!SampleCoordinate {
+    return switch (address) {
+        .clamp => lowerClampCoordinate(func, block, desc, coord, size_offset, size_float_offset),
+        .repeat => lowerRepeatCoordinate(func, block, desc, coord, size_offset, size_float_offset),
+        .any => lowerSampleCoordinate(func, block, desc, coord, size_offset, size_float_offset, mode_offset),
     };
 }
 
-fn lowerLinearClampCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64, reciprocal_offset: i64) Error!LinearCoordinate {
+fn lowerLinearCoordinate(func: *Function, block: Block, desc: Value, coord: Value, size_offset: i64, size_float_offset: i64, reciprocal_offset: i64, mode_offset: i64, comptime address: SampleAddress) Error!LinearCoordinate {
     const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const f32_t = func.valueType(coord);
     const size_ptr = try appendOffset(func, block, desc, size_float_offset, u32_t);
@@ -2600,8 +2609,8 @@ fn lowerLinearClampCoordinate(func: *Function, block: Block, desc: Value, coord:
     const first_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = first_center, .rhs = reciprocal } });
     const second_normalized = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = first_normalized, .rhs = reciprocal } });
     return .{
-        .first = try lowerClampCoordinate(func, block, desc, first_normalized, size_offset, size_float_offset),
-        .second = try lowerClampCoordinate(func, block, desc, second_normalized, size_offset, size_float_offset),
+        .first = try lowerAddressedCoordinate(func, block, desc, first_normalized, size_offset, size_float_offset, mode_offset, address),
+        .second = try lowerAddressedCoordinate(func, block, desc, second_normalized, size_offset, size_float_offset, mode_offset, address),
         .weight = weight,
     };
 }
@@ -2814,6 +2823,50 @@ fn rgba8Arms(func: *Function, block: Block, is_unorm: Value, desc: Value, int_ty
     const table_field = try appendOffset(func, srgb, desc, sampler_srgb_table_offset, int_ty);
     const table = try func.appendInst(srgb, ptr_ty, .{ .load = .{ .ptr = table_field } });
     return .{ .blocks = .{ unorm, srgb }, .tables = .{ null, table } };
+}
+
+/// Filters a fast path can know ahead of the sample.
+const SampleFilter = enum { nearest, linear };
+
+/// An RGBA8 sample whose filter and address mode the dispatch already knows. It ends in a jump
+/// to `joined` with the four components.
+fn lowerSampleRGBA8Fast(func: *Function, block: Block, desc: Value, u: Value, v: Value, is_unorm: Value, joined: Block, comptime filter: SampleFilter, comptime address: SampleAddress) Error!void {
+    const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_ty = func.valueType(desc);
+    const linear = if (filter == .linear) .{
+        try lowerLinearCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_width_reciprocal_offset, sampler_address_u_offset, address),
+        try lowerLinearCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset, sampler_address_v_offset, address),
+    } else undefined;
+    const nearest = if (filter == .nearest) .{
+        try lowerAddressedCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_address_u_offset, address),
+        try lowerAddressedCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_address_v_offset, address),
+    } else undefined;
+    const base = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = desc } });
+    const pitch_ptr = try appendOffset(func, block, desc, sampler_row_pitch_offset, int_ty);
+    const pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = pitch_ptr } });
+    const bytes = try func.appendInst(block, int_ty, .{ .iconst = 4 });
+    const image = try sampleImageFormats(func, block, desc, base, pitch, bytes, int_ty, ptr_ty);
+    const arms = try rgba8Arms(func, block, is_unorm, desc, int_ty, ptr_ty);
+    for (arms.blocks, arms.tables) |arm, table| {
+        var values: [4]Value = undefined;
+        switch (filter) {
+            .nearest => values = try lowerSampleTexelRGBA8(func, arm, image, nearest[0], nearest[1], nearest[0].border, table),
+            .linear => {
+                const lx = linear[0];
+                const ly = linear[1];
+                const c00 = try lowerSampleTexelRGBA8(func, arm, image, lx.first, ly.first, lx.first.border, table);
+                const c10 = try lowerSampleTexelRGBA8(func, arm, image, lx.second, ly.first, lx.second.border, table);
+                const c01 = try lowerSampleTexelRGBA8(func, arm, image, lx.first, ly.second, lx.first.border, table);
+                const c11 = try lowerSampleTexelRGBA8(func, arm, image, lx.second, ly.second, lx.second.border, table);
+                for (0..4) |component| {
+                    const top = try lerp(func, arm, c00[component], c10[component], lx.weight);
+                    const bottom = try lerp(func, arm, c01[component], c11[component], lx.weight);
+                    values[component] = try lerp(func, arm, top, bottom, ly.weight);
+                }
+            },
+        }
+        try func.setJump(arm, joined, &values);
+    }
 }
 
 fn lowerShadowCompare(func: *Function, block: Block, compare_op: Value, reference: Value, depth: Value) Error!Value {
@@ -3389,85 +3442,60 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast:
                 const u_clamp = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = u_mode, .rhs = clamp } });
                 const v_clamp = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = v_mode, .rhs = clamp } });
                 const both_clamp = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = u_clamp, .rhs = v_clamp } });
-                const fast = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = format_filter, .rhs = both_clamp } });
-                const quick = try func.appendBlock();
-                const address_check = try func.appendBlock();
-                const address_quick = try func.appendBlock();
-                const linear_check = try func.appendBlock();
-                const linear_quick = try func.appendBlock();
-                const general = try func.appendBlock();
                 const joined = try func.appendBlock();
                 for (&fast_params) |*param| param.* = try func.appendBlockParam(joined, f32_t);
-                try func.appendIf(block, fast, .{ .target = quick, .args = &.{} }, .{ .target = address_check, .args = &.{} });
-                const quick_x = try lowerClampCoordinate(func, quick, desc, args[1], sampler_width_offset, sampler_width_float_offset);
-                const quick_y = try lowerClampCoordinate(func, quick, desc, args[2], sampler_height_offset, sampler_height_float_offset);
-                const quick_base = try func.appendInst(quick, ptr_ty, .{ .load = .{ .ptr = desc } });
-                const quick_pitch_ptr = try appendOffset(func, quick, desc, sampler_row_pitch_offset, int_ty);
-                const quick_pitch = try func.appendInst(quick, int_ty, .{ .load = .{ .ptr = quick_pitch_ptr } });
-                const quick_bytes = try func.appendInst(quick, int_ty, .{ .iconst = 4 });
-                const quick_image = try sampleImageFormats(func, quick, desc, quick_base, quick_pitch, quick_bytes, int_ty, ptr_ty);
-                const quick_arms = try rgba8Arms(func, quick, is_unorm, desc, int_ty, ptr_ty);
-                for (quick_arms.blocks, quick_arms.tables) |arm, table| {
-                    const values = try lowerSampleTexelRGBA8(func, arm, quick_image, quick_x, quick_y, quick_x.border, table);
-                    try func.setJump(arm, joined, &values);
-                }
-                try func.appendIf(address_check, format_filter, .{ .target = address_quick, .args = &.{} }, .{ .target = linear_check, .args = &.{} });
-                const address_quick_x = try lowerSampleCoordinate(func, address_quick, desc, args[1], sampler_width_offset, sampler_width_float_offset, sampler_address_u_offset);
-                const address_quick_y = try lowerSampleCoordinate(func, address_quick, desc, args[2], sampler_height_offset, sampler_height_float_offset, sampler_address_v_offset);
-                const address_quick_base = try func.appendInst(address_quick, ptr_ty, .{ .load = .{ .ptr = desc } });
-                const address_quick_pitch_ptr = try appendOffset(func, address_quick, desc, sampler_row_pitch_offset, int_ty);
-                const address_quick_pitch = try func.appendInst(address_quick, int_ty, .{ .load = .{ .ptr = address_quick_pitch_ptr } });
-                const address_quick_bytes = try func.appendInst(address_quick, int_ty, .{ .iconst = 4 });
-                const address_quick_image = try sampleImageFormats(func, address_quick, desc, address_quick_base, address_quick_pitch, address_quick_bytes, int_ty, ptr_ty);
-                const address_arms = try rgba8Arms(func, address_quick, is_unorm, desc, int_ty, ptr_ty);
-                for (address_arms.blocks, address_arms.tables) |arm, table| {
-                    const values = try lowerSampleTexelRGBA8(func, arm, address_quick_image, address_quick_x, address_quick_y, address_quick_x.border, table);
-                    try func.setJump(arm, joined, &values);
-                }
-                const linear_filter = try func.appendInst(linear_check, int_ty, .{ .iconst = 1 });
-                const mag_linear = try func.appendInst(linear_check, bool_t, .{ .icmp = .{ .op = .eq, .lhs = mag, .rhs = linear_filter } });
-                const min_linear = try func.appendInst(linear_check, bool_t, .{ .icmp = .{ .op = .eq, .lhs = min, .rhs = linear_filter } });
-                const both_linear = try func.appendInst(linear_check, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = mag_linear, .rhs = min_linear } });
-                const linear_format = try func.appendInst(linear_check, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = both_linear, .rhs = is_rgba8 } });
-                const linear_fast = try func.appendInst(linear_check, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = linear_format, .rhs = both_clamp } });
-                try func.appendIf(linear_check, linear_fast, .{ .target = linear_quick, .args = &.{} }, .{ .target = general, .args = &.{} });
-                const lx = try lowerLinearClampCoordinate(func, linear_quick, desc, args[1], sampler_width_offset, sampler_width_float_offset, sampler_width_reciprocal_offset);
-                const ly = try lowerLinearClampCoordinate(func, linear_quick, desc, args[2], sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset);
-                const linear_base = try func.appendInst(linear_quick, ptr_ty, .{ .load = .{ .ptr = desc } });
-                const linear_pitch_ptr = try appendOffset(func, linear_quick, desc, sampler_row_pitch_offset, int_ty);
-                const linear_pitch = try func.appendInst(linear_quick, int_ty, .{ .load = .{ .ptr = linear_pitch_ptr } });
-                const linear_bytes = try func.appendInst(linear_quick, int_ty, .{ .iconst = 4 });
-                const linear_image = try sampleImageFormats(func, linear_quick, desc, linear_base, linear_pitch, linear_bytes, int_ty, ptr_ty);
-                const linear_arms = try rgba8Arms(func, linear_quick, is_unorm, desc, int_ty, ptr_ty);
-                for (linear_arms.blocks, linear_arms.tables) |arm, table| {
-                    const c00 = try lowerSampleTexelRGBA8(func, arm, linear_image, lx.first, ly.first, lx.first.border, table);
-                    const c10 = try lowerSampleTexelRGBA8(func, arm, linear_image, lx.second, ly.first, lx.second.border, table);
-                    const c01 = try lowerSampleTexelRGBA8(func, arm, linear_image, lx.first, ly.second, lx.first.border, table);
-                    const c11 = try lowerSampleTexelRGBA8(func, arm, linear_image, lx.second, ly.second, lx.second.border, table);
-                    var linear_values: [4]Value = undefined;
-                    for (0..4) |component| {
-                        const top = try lerp(func, arm, c00[component], c10[component], lx.weight);
-                        const bottom = try lerp(func, arm, c01[component], c11[component], lx.weight);
-                        linear_values[component] = try lerp(func, arm, top, bottom, ly.weight);
+                // Each condition is warp uniform, so the chain is real branches and only one path
+                // runs. A condition is built in the first block that needs it.
+                var both_repeat: ?Value = null;
+                var linear_format: ?Value = null;
+                const paths = .{
+                    .{ SampleFilter.linear, SampleAddress.clamp },
+                    .{ SampleFilter.linear, SampleAddress.repeat },
+                    .{ SampleFilter.nearest, SampleAddress.clamp },
+                    .{ SampleFilter.nearest, SampleAddress.repeat },
+                    .{ SampleFilter.nearest, SampleAddress.any },
+                };
+                inline for (paths) |path| {
+                    if (path[0] == .linear and linear_format == null) {
+                        const linear_filter = try func.appendInst(block, int_ty, .{ .iconst = 1 });
+                        const mag_linear = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = mag, .rhs = linear_filter } });
+                        const min_linear = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = min, .rhs = linear_filter } });
+                        const both_linear = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = mag_linear, .rhs = min_linear } });
+                        linear_format = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = both_linear, .rhs = is_rgba8 } });
                     }
-                    try func.setJump(arm, joined, &linear_values);
+                    if (path[1] == .repeat and both_repeat == null) {
+                        const repeat = try func.appendInst(block, int_ty, .{ .iconst = 0 });
+                        const u_repeat = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = u_mode, .rhs = repeat } });
+                        const v_repeat = try func.appendInst(block, bool_t, .{ .icmp = .{ .op = .eq, .lhs = v_mode, .rhs = repeat } });
+                        both_repeat = try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = u_repeat, .rhs = v_repeat } });
+                    }
+                    const filter_ok = if (path[0] == .nearest) format_filter else linear_format.?;
+                    const cond = switch (path[1]) {
+                        .clamp => try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = filter_ok, .rhs = both_clamp } }),
+                        .repeat => try func.appendInst(block, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = filter_ok, .rhs = both_repeat.? } }),
+                        .any => filter_ok,
+                    };
+                    const taken = try func.appendBlock();
+                    const next = try func.appendBlock();
+                    try func.appendIf(block, cond, .{ .target = taken, .args = &.{} }, .{ .target = next, .args = &.{} });
+                    try lowerSampleRGBA8Fast(func, taken, desc, args[1], args[2], is_unorm, joined, path[0], path[1]);
+                    block = next;
                 }
                 fast_join = joined;
-                block = general;
             }
             const cube = if (cube_sample) try lowerCubeCoordinate(func, block, args[1], args[2], args[3]) else null;
             const u = if (cube) |coordinate| coordinate.u else args[1];
             const v = if (cube) |coordinate| coordinate.v else args[2];
             const nearest_x = try lowerSampleCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_address_u_offset);
             const nearest_y = try lowerSampleCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_address_v_offset);
-            const linear_x = try lowerLinearCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_width_reciprocal_offset, sampler_address_u_offset);
-            const linear_y = try lowerLinearCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset, sampler_address_v_offset);
+            const linear_x = try lowerLinearCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_width_reciprocal_offset, sampler_address_u_offset, .any);
+            const linear_y = try lowerLinearCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset, sampler_address_v_offset, .any);
             const nearest_z = if (volume_sample)
                 try lowerSampleCoordinate(func, block, desc, args[3], sampler_depth_offset, sampler_depth_float_offset, sampler_address_w_offset)
             else
                 null;
             const linear_z = if (volume_sample)
-                try lowerLinearCoordinate(func, block, desc, args[3], sampler_depth_offset, sampler_depth_float_offset, sampler_depth_reciprocal_offset, sampler_address_w_offset)
+                try lowerLinearCoordinate(func, block, desc, args[3], sampler_depth_offset, sampler_depth_float_offset, sampler_depth_reciprocal_offset, sampler_address_w_offset, .any)
             else
                 null;
             const mag_filter_ptr = try appendOffset(func, block, desc, sampler_mag_filter_offset, int_ty);
