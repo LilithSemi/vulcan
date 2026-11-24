@@ -2764,7 +2764,9 @@ fn lowerSampleTexel(func: *Function, block: Block, image: SampleImage, x: Sample
     return values;
 }
 
-fn lowerSampleTexelRGBA8(func: *Function, block: Block, image: SampleImage, x: SampleCoordinate, y: SampleCoordinate, z_border: Value) Error![4]Value {
+/// One RGBA8 texel. `srgb_table` is the sRGB table pointer when the format is sRGB, or null for
+/// UNORM. The caller branches on the format, so a UNORM texture never reads the table.
+fn lowerSampleTexelRGBA8(func: *Function, block: Block, image: SampleImage, x: SampleCoordinate, y: SampleCoordinate, z_border: Value, srgb_table: ?Value) Error![4]Value {
     const outside_xy = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = x.border, .rhs = y.border } });
     const outside = try func.appendInst(block, image.bool_t, .{ .arith = .{ .op = .bit_or, .lhs = outside_xy, .rhs = z_border } });
     const row = try func.appendInst(block, image.int_ty, .{ .arith = .{ .op = .mul, .lhs = y.index, .rhs = image.row_pitch } });
@@ -2777,21 +2779,16 @@ fn lowerSampleTexelRGBA8(func: *Function, block: Block, image: SampleImage, x: S
     for (0..4) |component| {
         const shifted = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .shr, .lhs = rgba_word, .imm = @intCast(component * 8) } });
         const byte = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .bit_and, .lhs = shifted, .imm = 255 } });
+        if (srgb_table != null and component < 3) {
+            const offset = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .shl, .lhs = byte, .imm = 2 } });
+            const entry = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = srgb_table.?, .rhs = offset } });
+            decoded[component] = try func.appendInst(block, image.f32_t, .{ .load = .{ .ptr = entry } });
+            continue;
+        }
         const biased_bits = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .bit_or, .lhs = byte, .imm = 0x4b00_0000 } });
         const biased = try func.appendInst(block, image.f32_t, .{ .unary = .{ .op = .reinterpret, .value = biased_bits } });
         const value = try func.appendInst(block, image.f32_t, .{ .arith = .{ .op = .sub, .lhs = biased, .rhs = image.integer_bias } });
         decoded[component] = try func.appendInst(block, image.f32_t, .{ .arith = .{ .op = .mul, .lhs = value, .rhs = image.unorm_scale } });
-        if (component < 3) {
-            const table_field = try appendOffset(func, block, image.desc, sampler_srgb_table_offset, image.int_ty);
-            const table = try func.appendInst(block, image.ptr_ty, .{ .load = .{ .ptr = table_field } });
-            const safe_table = try func.appendInst(block, image.ptr_ty, .{ .select = .{ .cond = image.srgb_format, .then = table, .@"else" = packed_ptr } });
-            const zero = try func.appendInst(block, image.int_ty, .{ .iconst = 0 });
-            const offset = try func.appendInst(block, image.int_ty, .{ .arith_imm = .{ .op = .shl, .lhs = byte, .imm = 2 } });
-            const safe_offset = try func.appendInst(block, image.int_ty, .{ .select = .{ .cond = image.srgb_format, .then = offset, .@"else" = zero } });
-            const entry = try func.appendInst(block, image.ptr_ty, .{ .arith = .{ .op = .add, .lhs = safe_table, .rhs = safe_offset } });
-            const srgb = try func.appendInst(block, image.f32_t, .{ .load = .{ .ptr = entry } });
-            decoded[component] = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = image.srgb_format, .then = srgb, .@"else" = decoded[component] } });
-        }
     }
     var values: [4]Value = undefined;
     for (0..4) |component| {
@@ -2801,6 +2798,22 @@ fn lowerSampleTexelRGBA8(func: *Function, block: Block, image: SampleImage, x: S
         values[component] = try func.appendInst(block, image.f32_t, .{ .select = .{ .cond = outside, .then = border, .@"else" = decoded[component] } });
     }
     return values;
+}
+
+const Rgba8Arms = struct {
+    blocks: [2]Block,
+    tables: [2]?Value,
+};
+
+/// Two arms behind a branch on the warp-uniform format, UNORM first. The sRGB arm starts with
+/// the table pointer.
+fn rgba8Arms(func: *Function, block: Block, is_unorm: Value, desc: Value, int_ty: Type, ptr_ty: Type) Error!Rgba8Arms {
+    const unorm = try func.appendBlock();
+    const srgb = try func.appendBlock();
+    try func.appendIf(block, is_unorm, .{ .target = unorm, .args = &.{} }, .{ .target = srgb, .args = &.{} });
+    const table_field = try appendOffset(func, srgb, desc, sampler_srgb_table_offset, int_ty);
+    const table = try func.appendInst(srgb, ptr_ty, .{ .load = .{ .ptr = table_field } });
+    return .{ .blocks = .{ unorm, srgb }, .tables = .{ null, table } };
 }
 
 fn lowerShadowCompare(func: *Function, block: Block, compare_op: Value, reference: Value, depth: Value) Error!Value {
@@ -3393,8 +3406,11 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast:
                 const quick_pitch = try func.appendInst(quick, int_ty, .{ .load = .{ .ptr = quick_pitch_ptr } });
                 const quick_bytes = try func.appendInst(quick, int_ty, .{ .iconst = 4 });
                 const quick_image = try sampleImageFormats(func, quick, desc, quick_base, quick_pitch, quick_bytes, int_ty, ptr_ty);
-                const quick_values = try lowerSampleTexelRGBA8(func, quick, quick_image, quick_x, quick_y, quick_x.border);
-                try func.setJump(quick, joined, &quick_values);
+                const quick_arms = try rgba8Arms(func, quick, is_unorm, desc, int_ty, ptr_ty);
+                for (quick_arms.blocks, quick_arms.tables) |arm, table| {
+                    const values = try lowerSampleTexelRGBA8(func, arm, quick_image, quick_x, quick_y, quick_x.border, table);
+                    try func.setJump(arm, joined, &values);
+                }
                 try func.appendIf(address_check, format_filter, .{ .target = address_quick, .args = &.{} }, .{ .target = linear_check, .args = &.{} });
                 const address_quick_x = try lowerSampleCoordinate(func, address_quick, desc, args[1], sampler_width_offset, sampler_width_float_offset, sampler_address_u_offset);
                 const address_quick_y = try lowerSampleCoordinate(func, address_quick, desc, args[2], sampler_height_offset, sampler_height_float_offset, sampler_address_v_offset);
@@ -3403,8 +3419,11 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast:
                 const address_quick_pitch = try func.appendInst(address_quick, int_ty, .{ .load = .{ .ptr = address_quick_pitch_ptr } });
                 const address_quick_bytes = try func.appendInst(address_quick, int_ty, .{ .iconst = 4 });
                 const address_quick_image = try sampleImageFormats(func, address_quick, desc, address_quick_base, address_quick_pitch, address_quick_bytes, int_ty, ptr_ty);
-                const address_quick_values = try lowerSampleTexelRGBA8(func, address_quick, address_quick_image, address_quick_x, address_quick_y, address_quick_x.border);
-                try func.setJump(address_quick, joined, &address_quick_values);
+                const address_arms = try rgba8Arms(func, address_quick, is_unorm, desc, int_ty, ptr_ty);
+                for (address_arms.blocks, address_arms.tables) |arm, table| {
+                    const values = try lowerSampleTexelRGBA8(func, arm, address_quick_image, address_quick_x, address_quick_y, address_quick_x.border, table);
+                    try func.setJump(arm, joined, &values);
+                }
                 const linear_filter = try func.appendInst(linear_check, int_ty, .{ .iconst = 1 });
                 const mag_linear = try func.appendInst(linear_check, bool_t, .{ .icmp = .{ .op = .eq, .lhs = mag, .rhs = linear_filter } });
                 const min_linear = try func.appendInst(linear_check, bool_t, .{ .icmp = .{ .op = .eq, .lhs = min, .rhs = linear_filter } });
@@ -3419,17 +3438,20 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast:
                 const linear_pitch = try func.appendInst(linear_quick, int_ty, .{ .load = .{ .ptr = linear_pitch_ptr } });
                 const linear_bytes = try func.appendInst(linear_quick, int_ty, .{ .iconst = 4 });
                 const linear_image = try sampleImageFormats(func, linear_quick, desc, linear_base, linear_pitch, linear_bytes, int_ty, ptr_ty);
-                const c00 = try lowerSampleTexelRGBA8(func, linear_quick, linear_image, lx.first, ly.first, lx.first.border);
-                const c10 = try lowerSampleTexelRGBA8(func, linear_quick, linear_image, lx.second, ly.first, lx.second.border);
-                const c01 = try lowerSampleTexelRGBA8(func, linear_quick, linear_image, lx.first, ly.second, lx.first.border);
-                const c11 = try lowerSampleTexelRGBA8(func, linear_quick, linear_image, lx.second, ly.second, lx.second.border);
-                var linear_values: [4]Value = undefined;
-                for (0..4) |component| {
-                    const top = try lerp(func, linear_quick, c00[component], c10[component], lx.weight);
-                    const bottom = try lerp(func, linear_quick, c01[component], c11[component], lx.weight);
-                    linear_values[component] = try lerp(func, linear_quick, top, bottom, ly.weight);
+                const linear_arms = try rgba8Arms(func, linear_quick, is_unorm, desc, int_ty, ptr_ty);
+                for (linear_arms.blocks, linear_arms.tables) |arm, table| {
+                    const c00 = try lowerSampleTexelRGBA8(func, arm, linear_image, lx.first, ly.first, lx.first.border, table);
+                    const c10 = try lowerSampleTexelRGBA8(func, arm, linear_image, lx.second, ly.first, lx.second.border, table);
+                    const c01 = try lowerSampleTexelRGBA8(func, arm, linear_image, lx.first, ly.second, lx.first.border, table);
+                    const c11 = try lowerSampleTexelRGBA8(func, arm, linear_image, lx.second, ly.second, lx.second.border, table);
+                    var linear_values: [4]Value = undefined;
+                    for (0..4) |component| {
+                        const top = try lerp(func, arm, c00[component], c10[component], lx.weight);
+                        const bottom = try lerp(func, arm, c01[component], c11[component], lx.weight);
+                        linear_values[component] = try lerp(func, arm, top, bottom, ly.weight);
+                    }
+                    try func.setJump(arm, joined, &linear_values);
                 }
-                try func.setJump(linear_quick, joined, &linear_values);
                 fast_join = joined;
                 block = general;
             }

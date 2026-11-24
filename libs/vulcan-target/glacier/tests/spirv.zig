@@ -4458,3 +4458,206 @@ test "zero exponential warp guard matches unguarded lanes" {
         }
     }
 }
+
+/// A lit texture: a diffuse texture at set 0 times a lightmap at set 1, both sampled with an
+/// implicit LOD. The diffuse coordinate is the input's xy and the lightmap's is its zw.
+fn litTextureModule(allocator: std.mem.Allocator) !spirv.binary.Builder {
+    var b = try spirv.binary.Builder.init(allocator, 25);
+    errdefer b.deinit(allocator);
+    try b.emit(allocator, op.EntryPoint, &.{ op.ExecutionModel.fragment, 15, 0x6e69616d, 0, 12, 14 });
+    try b.emit(allocator, op.Decorate, &.{ 9, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 9, op.Decoration.descriptor_set, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 10, op.Decoration.binding, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 10, op.Decoration.descriptor_set, 1 });
+    try b.emit(allocator, op.Decorate, &.{ 12, op.Decoration.location, 0 });
+    try b.emit(allocator, op.Decorate, &.{ 14, op.Decoration.location, 0 });
+    try b.emit(allocator, op.TypeVoid, &.{1});
+    try b.emit(allocator, op.TypeFunction, &.{ 2, 1 });
+    try b.emit(allocator, op.TypeFloat, &.{ 3, 32 });
+    try b.emit(allocator, op.TypeVector, &.{ 4, 3, 2 });
+    try b.emit(allocator, op.TypeVector, &.{ 5, 3, 4 });
+    try b.emit(allocator, op.TypeImage, &.{ 6, 3, op.Dim.dim_2d, 0, 0, 0, 1, 0 });
+    try b.emit(allocator, op.TypeSampledImage, &.{ 7, 6 });
+    try b.emit(allocator, op.TypePointer, &.{ 8, op.StorageClass.uniform_constant, 7 });
+    try b.emit(allocator, op.Variable, &.{ 8, 9, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.Variable, &.{ 8, 10, op.StorageClass.uniform_constant });
+    try b.emit(allocator, op.TypePointer, &.{ 11, op.StorageClass.input, 5 });
+    try b.emit(allocator, op.Variable, &.{ 11, 12, op.StorageClass.input });
+    try b.emit(allocator, op.TypePointer, &.{ 13, op.StorageClass.output, 5 });
+    try b.emit(allocator, op.Variable, &.{ 13, 14, op.StorageClass.output });
+    try b.emit(allocator, op.Function, &.{ 1, 15, 0, 2 });
+    try b.emit(allocator, op.Label, &.{16});
+    try b.emit(allocator, op.Load, &.{ 7, 17, 9 });
+    try b.emit(allocator, op.Load, &.{ 5, 18, 12 });
+    try b.emit(allocator, op.VectorShuffle, &.{ 4, 19, 18, 18, 0, 1 });
+    try b.emit(allocator, op.ImageSampleImplicitLod, &.{ 5, 20, 17, 19 });
+    try b.emit(allocator, op.Load, &.{ 7, 21, 10 });
+    try b.emit(allocator, op.VectorShuffle, &.{ 4, 22, 18, 18, 2, 3 });
+    try b.emit(allocator, op.ImageSampleImplicitLod, &.{ 5, 23, 21, 22 });
+    try b.emit(allocator, op.FMul, &.{ 5, 24, 20, 23 });
+    try b.emit(allocator, op.Store, &.{ 14, 24 });
+    try b.emit(allocator, op.Return, &.{});
+    try b.emit(allocator, op.FunctionEnd, &.{});
+    return b;
+}
+
+fn litTextureProgram(allocator: std.mem.Allocator) ![]u32 {
+    var b = try litTextureModule(allocator);
+    defer b.deinit(allocator);
+    const words = b.words.items;
+    var func = try spirv.lowerModuleFor(allocator, words, .{
+        .buffer_descriptors = true,
+        .nullable_image_descriptors = true,
+        .image_descriptor_stride = glacier.isel.sampler_descriptor_size,
+        .image_descriptor_array_indirect = true,
+    });
+    defer func.deinit();
+    var gradient_count: usize = 0;
+    var attrs = func.attributesOf(.func);
+    while (attrs.next()) |attr| switch (attr) {
+        .custom => |custom| {
+            if (std.mem.eql(u8, custom.namespace, "vulcan.gpu") and std.mem.eql(u8, custom.key, "grad_slot")) gradient_count += 1;
+        },
+        else => {},
+    };
+    return glacier.isel.compileFragment(allocator, &func, .{
+        .profile = .@"gc1.s",
+        .fragment_input_stride = @intCast(std.mem.alignForward(usize, glacier.isel.fragment_input_gradient_offset + gradient_count * 4, 16)),
+        .fragment_output_stride = glacier.isel.fragmentOutputStride(&func),
+    });
+}
+
+fn litSrgbTable(memory: []u32) void {
+    for (0..256) |i| {
+        const x: f32 = @as(f32, @floatFromInt(i)) / 255;
+        const decoded = if (x <= 0.04045) x / 12.92 else std.math.pow(f32, (x + 0.055) / 1.055, 2.4);
+        memory[8192 + i] = @bitCast(decoded);
+    }
+}
+
+fn pickFloat(random: std.Random, choices: []const f32) f32 {
+    return choices[random.uintLessThan(usize, choices.len)];
+}
+
+/// Two samplers with random sizes, formats, address modes, filters, mip chains and swizzles, and
+/// eight fragments with random coordinates and gradients. Every mip level carries the same
+/// format, modes, filters and swizzle, as the driver writes them.
+fn litRandomMemory(memory: []u32, random: std.Random, shared_gradients: bool) void {
+    @memset(memory, 0);
+    litSrgbTable(memory);
+    const sizes = [_]u32{ 1, 2, 3, 4, 5, 8, 13, 16, 64 };
+    const formats = [_]u32{ 1, 1, 1, 6, 6, 6, 2, 7, 0, 4 };
+    const swizzles = [_][4]u32{ .{ 3, 4, 5, 6 }, .{ 3, 4, 5, 6 }, .{ 0, 0, 0, 0 }, .{ 0, 4, 0, 6 }, .{ 5, 4, 3, 6 }, .{ 1, 2, 3, 6 }, .{ 6, 5, 4, 3 } };
+    for (0..2) |sampler| {
+        const levels: u32 = 1 + random.uintLessThan(u32, 3);
+        const format = formats[random.uintLessThan(usize, formats.len)];
+        const texel_bytes: u32 = switch (format) {
+            0 => 16,
+            4 => 8,
+            else => 4,
+        };
+        const size_limit: u32 = if (texel_bytes > 4) 16 else 64;
+        var width = @min(size_limit, sizes[random.uintLessThan(usize, sizes.len)]);
+        var height = @min(size_limit, sizes[random.uintLessThan(usize, sizes.len)]);
+        const mode_u = random.uintLessThan(u32, 4);
+        const mode_v = if (random.boolean()) mode_u else random.uintLessThan(u32, 4);
+        const mag = random.uintLessThan(u32, 2);
+        const min = if (random.boolean()) mag else random.uintLessThan(u32, 2);
+        const swizzle = swizzles[random.uintLessThan(usize, swizzles.len)];
+        const valid: u32 = if (random.uintLessThan(u32, 8) == 0) 0 else 1;
+        var border: [4]u32 = undefined;
+        for (&border) |*b| b.* = @bitCast(pickFloat(random, &.{ 0, 1, 0.25, 0.5, 0.75 }));
+        // The scratch region ends at word 49152, so the texels sit above it.
+        var tex: usize = if (sampler == 0) 49152 else 57344;
+        for (0..levels) |level| {
+            const d = sampler * 128 + level * 36;
+            const pitch = width * texel_bytes + if (random.boolean()) 0 else texel_bytes;
+            memory[d] = data_base + @as(u32, @intCast(tex * 4));
+            memory[d + 1] = pitch;
+            memory[d + 2] = width;
+            memory[d + 3] = height;
+            memory[d + 4] = @bitCast(@as(f32, @floatFromInt(width)));
+            memory[d + 5] = @bitCast(@as(f32, @floatFromInt(height)));
+            memory[d + 6] = mode_u;
+            memory[d + 7] = mode_v;
+            memory[d + 8 ..][0..4].* = border;
+            memory[d + 12] = texel_bytes;
+            memory[d + 13] = format;
+            memory[d + 14] = @bitCast(1 / @as(f32, @floatFromInt(width)));
+            memory[d + 15] = @bitCast(1 / @as(f32, @floatFromInt(height)));
+            memory[d + 16] = mag;
+            memory[d + 17] = min;
+            memory[d + 18 ..][0..4].* = swizzle;
+            memory[d + 23] = pitch * height;
+            memory[d + 24] = levels;
+            memory[d + 25] = valid;
+            memory[d + 26] = data_base + 9000 * 4;
+            memory[d + 27] = data_base + 9100 * 4;
+            memory[d + 32] = data_base + 8192 * 4;
+            const words = pitch * height / 4;
+            for (memory[tex..][0..words]) |*word| {
+                word.* = if (format == 0) @bitCast(pickFloat(random, &.{ 0, 1, 0.5, 0.25, 2, -1, 0.125 })) else random.int(u32);
+            }
+            tex += words + 4;
+            width = @max(1, width / 2);
+            height = @max(1, height / 2);
+        }
+    }
+    for (9000..9032) |i| memory[i] = @bitCast(@as(f32, @floatFromInt(i - 8990)));
+    const coords = [_]f32{ 0, -0.0, 1, 0.5, -0.25, 0.125, 0.75, 1.25, -1.5, 2.5, 0.999, 0.001, -0.001, 1.001, 0.3, 0.6, 7.25, -3.75 };
+    const grads = [_]f32{ 0, 0.1, 0.5, 1, 2, 3.3, 4, 8, 20 };
+    var shared: [8]f32 = undefined;
+    for (&shared) |*g| g.* = pickFloat(random, &grads);
+    for (0..8) |lane| {
+        const record = 512 + lane * 72;
+        for (0..4) |c| {
+            const v: f32 = if (random.boolean()) pickFloat(random, &coords) else random.float(f32) * 4 - 2;
+            memory[record + 32 + c] = @bitCast(v);
+        }
+        for (0..8) |slot| memory[record + 64 + slot] = @bitCast(if (shared_gradients) shared[slot] else pickFloat(random, &grads));
+    }
+    @memset(memory[4096..][0..160], 0xa5a5a5a5);
+}
+
+fn runLitTexture(code: []const u32, memory: []u32) !usize {
+    var mem: warp.Memory = .{ .base = data_base, .words = memory, .scratch = .{ .base = data_base + 0x10000, .stride = 16384, .harts = 8 } };
+    var w: warp.Warp = .{ .hart_id = 0, .hart_count = 8, .grid_dim = 1, .lanes = 8, .stack_top = data_base + 0x14000, .scratch_bytes = 16384 };
+    w.launch_args[0..4].* = .{ data_base, data_base + 512, data_base + 2048, data_base + 16384 };
+    return warp.run(code, &mem, &w, 4_000_000);
+}
+
+// `lit-texture-reference.bin` is `litTextureModule` compiled at ec11728, before these fast paths.
+test "a lit texture samples the same colours as the reference sampler" {
+    const allocator = std.testing.allocator;
+    const fresh = try litTextureProgram(allocator);
+    defer allocator.free(fresh);
+    const raw = @embedFile("lit-texture-reference.bin");
+    const reference = try allocator.alloc(u32, raw.len / 4);
+    defer allocator.free(reference);
+    for (reference, 0..) |*word, i| word.* = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
+    const memory = try allocator.alloc(u32, 0x40000 / 4);
+    defer allocator.free(memory);
+    var expected: [160]u32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x5eed_7e47);
+    const random = prng.random();
+    var reference_steps: usize = 0;
+    var fresh_steps: usize = 0;
+    for (0..300) |case| {
+        const seed = random.int(u64);
+        for ([_][]const u32{ reference, fresh }, 0..) |code, variant| {
+            var case_prng = std.Random.DefaultPrng.init(seed);
+            litRandomMemory(memory, case_prng.random(), case % 2 == 0);
+            const steps = try runLitTexture(code, memory);
+            try std.testing.expect(memory[4096] != 0xa5a5a5a5);
+            if (variant == 0) {
+                reference_steps += steps;
+                @memcpy(&expected, memory[4096..][0..160]);
+            } else {
+                fresh_steps += steps;
+                try std.testing.expectEqualSlices(u32, &expected, memory[4096..][0..160]);
+            }
+        }
+    }
+    std.debug.print("lit texture reference={d} steps fresh={d} steps\n", .{ reference_steps, fresh_steps });
+    try std.testing.expect(fresh_steps < reference_steps);
+}
