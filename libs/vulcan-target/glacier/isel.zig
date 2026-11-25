@@ -204,6 +204,9 @@ pub const Options = struct {
     fragment_output_stride: u32 = 80,
     /// Permit a guarded sampler path in a fragment that can discard.
     discard_sampler_fast_path: bool = false,
+    /// Skip the swizzle remap when the view maps every component to itself. The skip is a
+    /// warp-uniform branch, and a per-lane region around the sample cannot flatten it.
+    sampler_swizzle_guard: bool = true,
     zero_exp_fast_path: bool = true,
     /// Byte order the generated rasteriser packs a colour into. It must agree with the format of
     /// the image the rasteriser writes, because the store goes straight to the pixel.
@@ -370,17 +373,23 @@ pub fn compileFragmentExplained(
     var work = try func.clone(allocator);
     defer work.deinit();
     try lowerFragmentIO(allocator, &work, opts.fragment_input_stride, opts.fragment_output_stride, why);
-    var fast_opts = opts;
-    fast_opts.discard_sampler_fast_path = true;
-    return compileKernelInternal(allocator, &work, fast_opts, why) catch |err| switch (err) {
-        error.Unsupported => blk: {
-            if (why) |r| r.* = .{};
-            var fallback_opts = opts;
-            fallback_opts.discard_sampler_fast_path = false;
-            break :blk compileKernelInternal(allocator, &work, fallback_opts, why);
-        },
-        else => return err,
+    // Each refusal drops one more guarded sampler branch, until only the general path is left.
+    const attempts = [_]struct { discard_fast: bool, swizzle_guard: bool }{
+        .{ .discard_fast = true, .swizzle_guard = true },
+        .{ .discard_fast = false, .swizzle_guard = true },
+        .{ .discard_fast = false, .swizzle_guard = false },
     };
+    for (attempts, 0..) |attempt, i| {
+        if (why) |r| r.* = .{};
+        var attempt_opts = opts;
+        attempt_opts.discard_sampler_fast_path = attempt.discard_fast;
+        attempt_opts.sampler_swizzle_guard = attempt.swizzle_guard and opts.sampler_swizzle_guard;
+        return compileKernelInternal(allocator, &work, attempt_opts, why) catch |err| switch (err) {
+            error.Unsupported => if (i + 1 < attempts.len) continue else return err,
+            else => return err,
+        };
+    }
+    unreachable;
 }
 
 /// `compileFragment`, with a generated rasteriser around the body. See `lowerFragmentRaster`.
@@ -476,7 +485,7 @@ fn compileKernelInternal(
     phase = "lowerFloor";
     try lowerFloor(allocator, &work);
     phase = "lowerImageSample";
-    try lowerImageSample(allocator, &work, opts.discard_sampler_fast_path);
+    try lowerImageSample(allocator, &work, opts.discard_sampler_fast_path, opts.sampler_swizzle_guard);
     phase = "lowerTexelFetch";
     try lowerTexelFetch(allocator, &work);
     phase = "lowerStorageImageWrite";
@@ -3391,7 +3400,7 @@ fn lowerSquareRoot(allocator: std.mem.Allocator, func: *Function) Error!void {
     }
 }
 
-fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast: bool) Error!void {
+fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast: bool, swizzle_guard: bool) Error!void {
     for (0..func.blockCount()) |bi| {
         const original_block: Block = @fromBackingInt(@intCast(bi));
         var block = original_block;
@@ -3694,7 +3703,11 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast:
             }
             const out_index: usize = if (array_sample or cube_sample or volume_sample) 5 else 4;
             const out = args[out_index];
-            try sampled.put(allocator, out, try lowerSampleSwizzleGuarded(func, &block, args[0], desc, values));
+            const swizzled = if (swizzle_guard)
+                try lowerSampleSwizzleGuarded(func, &block, args[0], desc, values)
+            else
+                try lowerSampleSwizzle(func, block, desc, values);
+            try sampled.put(allocator, out, swizzled);
             try elements.put(allocator, out, .{ .base = out, .component = 0 });
         }
         if (block != original_block) {
