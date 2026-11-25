@@ -228,6 +228,30 @@ pub const Options = struct {
     /// The producer must guarantee coverage and draw-compatible clipping.
     raster_records: ?RasterRecordCapabilities = null,
     optimize_compute: ?bool = null,
+    /// Sampler state the draw already knows. A 2D sample from a descriptor named here takes the
+    /// one path its state selects, with no branch on the descriptor words. The caller must
+    /// compile again when the bound state changes.
+    sampler_keys: []const SamplerKey = &.{},
+};
+
+/// The state of one bound combined image sampler, as the host knows it at draw time.
+pub const SamplerKey = struct {
+    /// Launch argument that holds the descriptor. This is the resource's position among the
+    /// kernel parameters, in the order the module declares them.
+    argument: u32,
+    /// An RGBA8 image. The sRGB form decodes colour through the descriptor's table.
+    srgb: bool,
+    /// Magnification and minification filter. A key needs both to be the same.
+    filter: SampleFilter,
+    /// Address mode of both axes. `any` reads the mode words.
+    address: SampleAddress,
+    /// The view has one mip level, so the level is not computed and the descriptor stays
+    /// uniform across the warp.
+    single_level: bool,
+    /// The view maps every component to itself.
+    identity_swizzle: bool,
+    /// The host bound an image, so the sample does not read the fallback pointer.
+    present: bool,
 };
 
 /// The colour blend the generated rasteriser applies, which is `src * src_factor + dst *
@@ -485,7 +509,7 @@ fn compileKernelInternal(
     phase = "lowerFloor";
     try lowerFloor(allocator, &work);
     phase = "lowerImageSample";
-    try lowerImageSample(allocator, &work, opts.discard_sampler_fast_path, opts.sampler_swizzle_guard);
+    try lowerImageSample(allocator, &work, opts.discard_sampler_fast_path, opts.sampler_swizzle_guard, opts.sampler_keys);
     phase = "lowerTexelFetch";
     try lowerTexelFetch(allocator, &work);
     phase = "lowerStorageImageWrite";
@@ -2603,7 +2627,7 @@ fn lowerRepeatCoordinate(func: *Function, block: Block, extent: SampleExtent, co
 }
 
 /// Address modes a fast path can know ahead of the sample. `any` reads the mode word.
-const SampleAddress = enum { clamp, repeat, any };
+pub const SampleAddress = enum { clamp, repeat, any };
 
 fn lowerAddressedCoordinate(func: *Function, block: Block, desc: Value, coord: Value, extent: SampleExtent, mode_offset: i64, comptime address: SampleAddress) Error!SampleCoordinate {
     return switch (address) {
@@ -2869,21 +2893,14 @@ fn rgba8Arms(func: *Function, block: Block, is_unorm: Value, desc: Value, int_ty
 }
 
 /// Filters a fast path can know ahead of the sample.
-const SampleFilter = enum { nearest, linear };
+pub const SampleFilter = enum { nearest, linear };
 
 /// An RGBA8 sample whose filter and address mode the dispatch already knows. It ends in a jump
 /// to `joined` with the four components.
 fn lowerSampleRGBA8Fast(func: *Function, block: Block, desc: Value, u: Value, v: Value, is_unorm: Value, joined: Block, comptime filter: SampleFilter, comptime address: SampleAddress) Error!void {
     const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
     const ptr_ty = func.valueType(desc);
-    const linear = if (filter == .linear) .{
-        try lowerLinearCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_width_reciprocal_offset, sampler_address_u_offset, address),
-        try lowerLinearCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset, sampler_address_v_offset, address),
-    } else undefined;
-    const nearest = if (filter == .nearest) .{
-        try lowerAddressedCoordinate(func, block, desc, u, try loadExtent(func, block, desc, sampler_width_offset, sampler_width_float_offset), sampler_address_u_offset, address),
-        try lowerAddressedCoordinate(func, block, desc, v, try loadExtent(func, block, desc, sampler_height_offset, sampler_height_float_offset), sampler_address_v_offset, address),
-    } else undefined;
+    const coordinates = try rgba8Coordinates(func, block, desc, u, v, filter, address);
     const base = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = desc } });
     const pitch_ptr = try appendOffset(func, block, desc, sampler_row_pitch_offset, int_ty);
     const pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = pitch_ptr } });
@@ -2892,24 +2909,108 @@ fn lowerSampleRGBA8Fast(func: *Function, block: Block, desc: Value, u: Value, v:
     const fallback = try imageFallback(func, block, desc);
     const arms = try rgba8Arms(func, block, is_unorm, desc, int_ty, ptr_ty);
     for (arms.blocks, arms.tables) |arm, table| {
-        var values: [4]Value = undefined;
-        switch (filter) {
-            .nearest => values = try lowerSampleTexelRGBA8(func, arm, image, nearest[0], nearest[1], nearest[0].border, table, fallback),
-            .linear => {
-                const lx = linear[0];
-                const ly = linear[1];
-                const c00 = try lowerSampleTexelRGBA8(func, arm, image, lx.first, ly.first, lx.first.border, table, fallback);
-                const c10 = try lowerSampleTexelRGBA8(func, arm, image, lx.second, ly.first, lx.second.border, table, fallback);
-                const c01 = try lowerSampleTexelRGBA8(func, arm, image, lx.first, ly.second, lx.first.border, table, fallback);
-                const c11 = try lowerSampleTexelRGBA8(func, arm, image, lx.second, ly.second, lx.second.border, table, fallback);
-                for (0..4) |component| {
-                    const top = try lerp(func, arm, c00[component], c10[component], lx.weight);
-                    const bottom = try lerp(func, arm, c01[component], c11[component], lx.weight);
-                    values[component] = try lerp(func, arm, top, bottom, ly.weight);
-                }
-            },
-        }
+        const values = try sampleRGBA8(func, arm, image, coordinates, table, fallback);
         try func.setJump(arm, joined, &values);
+    }
+}
+
+const Rgba8Coordinates = union(SampleFilter) {
+    nearest: [2]SampleCoordinate,
+    linear: [2]LinearCoordinate,
+};
+
+fn rgba8Coordinates(func: *Function, block: Block, desc: Value, u: Value, v: Value, comptime filter: SampleFilter, comptime address: SampleAddress) Error!Rgba8Coordinates {
+    return switch (filter) {
+        .linear => .{ .linear = .{
+            try lowerLinearCoordinate(func, block, desc, u, sampler_width_offset, sampler_width_float_offset, sampler_width_reciprocal_offset, sampler_address_u_offset, address),
+            try lowerLinearCoordinate(func, block, desc, v, sampler_height_offset, sampler_height_float_offset, sampler_height_reciprocal_offset, sampler_address_v_offset, address),
+        } },
+        .nearest => .{ .nearest = .{
+            try lowerAddressedCoordinate(func, block, desc, u, try loadExtent(func, block, desc, sampler_width_offset, sampler_width_float_offset), sampler_address_u_offset, address),
+            try lowerAddressedCoordinate(func, block, desc, v, try loadExtent(func, block, desc, sampler_height_offset, sampler_height_float_offset), sampler_address_v_offset, address),
+        } },
+    };
+}
+
+fn sampleRGBA8(func: *Function, block: Block, image: SampleImage, coordinates: Rgba8Coordinates, table: ?Value, fallback: ?ImageFallback) Error![4]Value {
+    switch (coordinates) {
+        .nearest => |n| return lowerSampleTexelRGBA8(func, block, image, n[0], n[1], n[0].border, table, fallback),
+        .linear => |l| {
+            const lx = l[0];
+            const ly = l[1];
+            const c00 = try lowerSampleTexelRGBA8(func, block, image, lx.first, ly.first, lx.first.border, table, fallback);
+            const c10 = try lowerSampleTexelRGBA8(func, block, image, lx.second, ly.first, lx.second.border, table, fallback);
+            const c01 = try lowerSampleTexelRGBA8(func, block, image, lx.first, ly.second, lx.first.border, table, fallback);
+            const c11 = try lowerSampleTexelRGBA8(func, block, image, lx.second, ly.second, lx.second.border, table, fallback);
+            var values: [4]Value = undefined;
+            for (0..4) |component| {
+                const top = try lerp(func, block, c00[component], c10[component], lx.weight);
+                const bottom = try lerp(func, block, c01[component], c11[component], lx.weight);
+                values[component] = try lerp(func, block, top, bottom, ly.weight);
+            }
+            return values;
+        },
+    }
+}
+
+/// The key that names `desc`, when `desc` is a kernel parameter the caller keyed.
+fn samplerKeyFor(func: *const Function, desc: Value, keys: []const SamplerKey) ?SamplerKey {
+    if (keys.len == 0) return null;
+    var argument: u32 = 0;
+    for (func.blockParams(@fromBackingInt(0))) |param| {
+        if (isIgnoredEntryParam(func, param) or gpu.attrs.builtinOf(func, param) != null) continue;
+        if (param == desc) {
+            for (keys) |key| if (key.argument == argument) return key;
+            return null;
+        }
+        argument += 1;
+    }
+    return null;
+}
+
+/// An RGBA8 sample whose whole state is in `key`. It is straight-line code in `block`, so it
+/// needs no branch and reads only the size, pitch and base words of the descriptor.
+fn lowerKeyedSample(func: *Function, block: Block, desc: Value, u: Value, v: Value, key: SamplerKey) Error![4]Value {
+    switch (key.filter) {
+        inline else => |filter| switch (key.address) {
+            inline else => |address| {
+                const int_ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+                const bool_t = try func.types.intern(.bool);
+                const f32_t = try func.types.intern(.{ .float = .f32 });
+                const ptr_ty = func.valueType(desc);
+                const coordinates = try rgba8Coordinates(func, block, desc, u, v, filter, address);
+                const base = try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = desc } });
+                try func.addAttr(.{ .value = base }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "keyed_sample", .value = .flag } });
+                const pitch_ptr = try appendOffset(func, block, desc, sampler_row_pitch_offset, int_ty);
+                const pitch = try func.appendInst(block, int_ty, .{ .load = .{ .ptr = pitch_ptr } });
+                const no = try func.appendInst(block, bool_t, .{ .iconst = 0 });
+                const image: SampleImage = .{
+                    .desc = desc,
+                    .base = base,
+                    .row_pitch = pitch,
+                    .texel_bytes = try func.appendInst(block, int_ty, .{ .iconst = 4 }),
+                    .float_format = no,
+                    .half_float_format = no,
+                    .depth_format = no,
+                    .bgra_format = no,
+                    .int_format = no,
+                    .srgb_format = no,
+                    .r8_format = no,
+                    .integer_bias = try func.appendInst(block, f32_t, .{ .fconst = 8388608 }),
+                    .unorm_scale = try func.appendInst(block, f32_t, .{ .fconst = 1.0 / 255.0 }),
+                    .int_ty = int_ty,
+                    .ptr_ty = ptr_ty,
+                    .f32_t = f32_t,
+                    .bool_t = bool_t,
+                };
+                const fallback = if (key.present) null else try imageFallback(func, block, desc);
+                const table = if (key.srgb) blk: {
+                    const table_field = try appendOffset(func, block, desc, sampler_srgb_table_offset, int_ty);
+                    break :blk try func.appendInst(block, ptr_ty, .{ .load = .{ .ptr = table_field } });
+                } else null;
+                return sampleRGBA8(func, block, image, coordinates, table, fallback);
+            },
+        },
     }
 }
 
@@ -3400,7 +3501,7 @@ fn lowerSquareRoot(allocator: std.mem.Allocator, func: *Function) Error!void {
     }
 }
 
-fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast: bool, swizzle_guard: bool) Error!void {
+fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast: bool, swizzle_guard: bool, keys: []const SamplerKey) Error!void {
     for (0..func.blockCount()) |bi| {
         const original_block: Block = @fromBackingInt(@intCast(bi));
         var block = original_block;
@@ -3460,7 +3561,9 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast:
                 break :blk if (lod_op == .fconst) lod_op.fconst else null;
             } else null;
             const base_lod = if (constant_lod) |value| value <= 0 else false;
-            if (!base_lod) {
+            const key = if (regular_sample) samplerKeyFor(func, args[0], keys) else null;
+            const single_level = if (key) |k| k.single_level else false;
+            if (!base_lod and !single_level) {
                 const requested_level = if (constant_lod) |value|
                     try func.appendInst(block, int_ty, .{ .iconst = @intFromFloat(@floor(value + 0.5)) })
                 else blk: {
@@ -3486,6 +3589,13 @@ fn lowerImageSample(allocator: std.mem.Allocator, func: *Function, discard_fast:
                 const descriptor_offset = try func.appendInst(block, int_ty, .{ .arith = .{ .op = .mul, .lhs = level, .rhs = stride } });
                 desc = try func.appendInst(block, ptr_ty, .{ .arith = .{ .op = .add, .lhs = desc, .rhs = descriptor_offset } });
                 if (nullable) try func.addAttr(.{ .value = desc }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "nullable_desc", .value = .flag } });
+            }
+            if (key) |k| {
+                const values = try lowerKeyedSample(func, block, desc, args[1], args[2], k);
+                const swizzled = if (k.identity_swizzle) values else try lowerSampleSwizzle(func, block, desc, values);
+                try sampled.put(allocator, args[4], swizzled);
+                try elements.put(allocator, args[4], .{ .base = args[4], .component = 0 });
+                continue;
             }
             var fast_join: ?Block = null;
             var fast_params: [4]Value = undefined;
@@ -4574,6 +4684,16 @@ const Region = struct {
 };
 
 /// The region the `if` ending `head` opens, or null when this cannot flatten it.
+fn holdsKeyedSample(func: *const Function, r: *const Region) bool {
+    for (r.inside[0..r.count]) |b| {
+        for (func.blockInsts(b)) |inst| {
+            const result = func.instResult(inst) orelse continue;
+            if (hasGpuKey(func, result, "keyed_sample")) return true;
+        }
+    }
+    return false;
+}
+
 fn region(func: *const Function, head: Block, divergent: []const bool, uses: []const u32) ?Region {
     const insts = func.blockInsts(head);
     if (insts.len == 0) return null;
@@ -4666,6 +4786,9 @@ fn region(func: *const Function, head: Block, divergent: []const bool, uses: []c
     // removing tiny control-flow diamonds from the body of a loop being converted.
     if (!branch_divergent) {
         if (r.loop_count != 0 or r.count > 2) return null;
+        // A flattened arm runs whichever way the warp goes. A keyed sample is one long block,
+        // so flattening it would run the sample for a warp that skips it.
+        if (holdsKeyedSample(func, &r)) return null;
     }
     if (r.exit == head or @backingInt(r.exit) == 0) return null;
     // Every way into the region is the head's branch, and every way out is the exit. A block with

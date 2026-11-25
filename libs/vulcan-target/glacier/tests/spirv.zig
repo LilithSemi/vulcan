@@ -4810,6 +4810,177 @@ test "linear repeat RGBA8 sampling takes the fast path" {
     }
 }
 
+fn litKeyedProgram(allocator: std.mem.Allocator, keys: []const glacier.isel.SamplerKey) ![]u32 {
+    var b = try litTextureModule(allocator);
+    defer b.deinit(allocator);
+    var func = try spirv.lowerModuleFor(allocator, b.words.items, .{
+        .buffer_descriptors = true,
+        .nullable_image_descriptors = true,
+        .image_descriptor_stride = glacier.isel.sampler_descriptor_size,
+        .image_descriptor_array_indirect = true,
+    });
+    defer func.deinit();
+    var gradient_count: usize = 0;
+    var attrs = func.attributesOf(.func);
+    while (attrs.next()) |attr| switch (attr) {
+        .custom => |custom| {
+            if (std.mem.eql(u8, custom.namespace, "vulcan.gpu") and std.mem.eql(u8, custom.key, "grad_slot")) gradient_count += 1;
+        },
+        else => {},
+    };
+    return glacier.isel.compileFragment(allocator, &func, .{
+        .profile = .@"gc1.s",
+        .fragment_input_stride = @intCast(std.mem.alignForward(usize, glacier.isel.fragment_input_gradient_offset + gradient_count * 4, 16)),
+        .fragment_output_stride = glacier.isel.fragmentOutputStride(&func),
+        .sampler_keys = keys,
+    });
+}
+
+/// Random lit-texture memory limited to state a key can name, and the keys the driver would
+/// derive from it.
+fn litKeyedMemory(memory: []u32, random: std.Random) [2]glacier.isel.SamplerKey {
+    litRandomMemory(memory, random, random.boolean());
+    var keys: [2]glacier.isel.SamplerKey = undefined;
+    for (0..2) |sampler| {
+        const srgb = random.boolean();
+        const filter: u32 = random.uintLessThan(u32, 2);
+        const mode: u32 = if (random.boolean()) 0 else 2;
+        const base = sampler * 128;
+        const levels = memory[base + 24];
+        for (0..levels) |level| {
+            const d = base + level * 36;
+            memory[d + 6] = mode;
+            memory[d + 7] = mode;
+            memory[d + 12] = 4;
+            memory[d + 13] = if (srgb) 6 else 1;
+            memory[d + 16] = filter;
+            memory[d + 17] = filter;
+        }
+        const swizzle = memory[base + 18 ..][0..4];
+        keys[sampler] = .{
+            .argument = @intCast(sampler),
+            .srgb = srgb,
+            .filter = if (filter == 1) .linear else .nearest,
+            .address = if (mode == 0) .repeat else .clamp,
+            .single_level = levels == 1,
+            .identity_swizzle = std.mem.eql(u32, swizzle, &.{ 3, 4, 5, 6 }),
+            .present = memory[base + 25] != 0,
+        };
+    }
+    return keys;
+}
+
+test "a keyed sample matches the general sampler and runs fewer instructions" {
+    const allocator = std.testing.allocator;
+    const general = try litTextureProgram(allocator);
+    defer allocator.free(general);
+    const memory = try allocator.alloc(u32, 0x40000 / 4);
+    defer allocator.free(memory);
+    var expected: [160]u32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x6b65_7965);
+    const random = prng.random();
+    var general_steps: usize = 0;
+    var keyed_steps: usize = 0;
+    for (0..48) |_| {
+        const seed = random.int(u64);
+        var case_prng = std.Random.DefaultPrng.init(seed);
+        const keys = litKeyedMemory(memory, case_prng.random());
+        general_steps += try runLitTexture(general, memory);
+        @memcpy(&expected, memory[4096..][0..160]);
+        const keyed = try litKeyedProgram(allocator, &keys);
+        defer allocator.free(keyed);
+        case_prng = std.Random.DefaultPrng.init(seed);
+        _ = litKeyedMemory(memory, case_prng.random());
+        keyed_steps += try runLitTexture(keyed, memory);
+        try std.testing.expectEqualSlices(u32, &expected, memory[4096..][0..160]);
+        try std.testing.expect(keyed.len * 4 < general.len);
+    }
+    std.debug.print("keyed sampler general={d} steps keyed={d} steps\n", .{ general_steps, keyed_steps });
+    try std.testing.expect(keyed_steps * 10 < general_steps * 9);
+}
+
+// `keyed-branch-fragment.spv` samples a second texture only when bit 0 of a push constant is
+// set. Its resources are the first texture, the push block and the second texture, in that order.
+test "a keyed sample behind a uniform branch stays behind it" {
+    const allocator = std.testing.allocator;
+    const bytes = @embedFile("keyed-branch-fragment.spv");
+    const words = try allocator.alloc(u32, bytes.len / 4);
+    defer allocator.free(words);
+    for (words, 0..) |*word, i| word.* = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+    var func = try spirv.lowerModuleFor(allocator, words, .{
+        .buffer_descriptors = true,
+        .nullable_image_descriptors = true,
+        .image_descriptor_stride = glacier.isel.sampler_descriptor_size,
+        .image_descriptor_array_indirect = true,
+    });
+    defer func.deinit();
+    var gradient_count: usize = 0;
+    var attrs = func.attributesOf(.func);
+    while (attrs.next()) |attr| switch (attr) {
+        .custom => |custom| {
+            if (std.mem.eql(u8, custom.namespace, "vulcan.gpu") and std.mem.eql(u8, custom.key, "grad_slot")) gradient_count += 1;
+        },
+        else => {},
+    };
+    const input_stride: u32 = @intCast(std.mem.alignForward(usize, glacier.isel.fragment_input_gradient_offset + gradient_count * 4, 16));
+    const output_stride = glacier.isel.fragmentOutputStride(&func);
+    const key: glacier.isel.SamplerKey = .{ .argument = 0, .srgb = false, .filter = .nearest, .address = .repeat, .single_level = true, .identity_swizzle = true, .present = true };
+    var glow_key = key;
+    glow_key.argument = 2;
+    var programs: [2][]u32 = undefined;
+    for ([_][]const glacier.isel.SamplerKey{ &.{}, &.{ key, glow_key } }, 0..) |keys, i| {
+        programs[i] = try glacier.isel.compileFragment(allocator, &func, .{
+            .profile = .@"gc1.s",
+            .fragment_input_stride = input_stride,
+            .fragment_output_stride = output_stride,
+            .sampler_keys = keys,
+        });
+    }
+    defer for (programs) |program| allocator.free(program);
+    const memory = try allocator.alloc(u32, 0x40000 / 4);
+    defer allocator.free(memory);
+    var steps: [2][2]usize = undefined;
+    for ([_]u32{ 0, 1 }) |flags| {
+        var expected: [32]u32 = undefined;
+        for (programs, 0..) |code, variant| {
+            @memset(memory, 0);
+            for ([_]usize{ 0, 128 }, 0..) |d, texture| {
+                const tex: u32 = @intCast(2048 + texture * 64);
+                memory[d] = data_base + tex * 4;
+                memory[d + 1] = 16;
+                memory[d + 2] = 4;
+                memory[d + 3] = 4;
+                memory[d + 4] = @bitCast(@as(f32, 4));
+                memory[d + 5] = @bitCast(@as(f32, 4));
+                memory[d + 12] = 4;
+                memory[d + 13] = 1;
+                memory[d + 14] = @bitCast(@as(f32, 0.25));
+                memory[d + 15] = @bitCast(@as(f32, 0.25));
+                memory[d + 18 ..][0..4].* = .{ 3, 4, 5, 6 };
+                memory[d + 24] = 1;
+                memory[d + 25] = 1;
+                for (0..16) |t| memory[tex + t] = @intCast(0x1020_3040 + t * 0x0101_0101 + texture * 0x0800_0000);
+            }
+            memory[256] = flags;
+            for (0..8) |lane| {
+                const record = 512 + lane * input_stride / 4;
+                memory[record + 32] = @bitCast(@as(f32, @floatFromInt(lane)) * 0.3 - 0.4);
+                memory[record + 33] = @bitCast(@as(f32, @floatFromInt(lane)) * 0.15 + 0.1);
+            }
+            var mem: warp.Memory = .{ .base = data_base, .words = memory, .scratch = .{ .base = data_base + 0x10000, .stride = 16384, .harts = 8 } };
+            var w: warp.Warp = .{ .hart_id = 0, .hart_count = 8, .grid_dim = 1, .lanes = 8, .stack_top = data_base + 0x14000, .scratch_bytes = 16384 };
+            w.launch_args[0..5].* = .{ data_base, data_base + 256 * 4, data_base + 128 * 4, data_base + 2048, data_base + 16384 };
+            steps[flags][variant] = try warp.run(code, &mem, &w, 1_000_000);
+            if (variant == 0) @memcpy(&expected, memory[4096..][0..32]) else try std.testing.expectEqualSlices(u32, &expected, memory[4096..][0..32]);
+        }
+    }
+    std.debug.print("keyed branch flags=0 general={d} keyed={d}, flags=1 general={d} keyed={d}\n", .{ steps[0][0], steps[0][1], steps[1][0], steps[1][1] });
+    try std.testing.expect(steps[0][1] < steps[0][0]);
+    try std.testing.expect(steps[1][1] < steps[1][0]);
+    // A flattened arm would cost the same with the bit clear as with it set.
+    try std.testing.expect(steps[0][1] + 100 < steps[1][1]);
+}
+
 /// `out[32 + i] = NMin(a, b)`, `out[40 + i] = NMax(a, b)`, `out[48 + i] = NClamp(a, b, c)` and
 /// `out[56 + i] = isnan(a) ? 1 : 0`, where `a`, `b` and `c` are `out[i]`, `out[8 + i]` and
 /// `out[16 + i]` for local invocation `i`.
