@@ -841,6 +841,18 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(glacier_lift).step);
 
+    // Geyser words lifted into IR and compiled for the host, checked against results worked out by hand.
+    const geyser_lift = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/geyser/tests/lift.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(geyser_lift).step);
+
     const glacier_spirv = b.addTest(.{ .filters = if (b.option([]const u8, "glacier-spirv-test-filter", "Glacier SPIR-V test name filter")) |filter| &.{filter} else &.{}, .root_module = b.createModule(.{
         .root_source_file = b.path("libs/vulcan-target/glacier/tests/spirv.zig"),
         .target = target,

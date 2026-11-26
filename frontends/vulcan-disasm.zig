@@ -7,6 +7,7 @@
 //!
 //! Usage:
 //!   vulcan-disasm <file>        an ELF or SPIR-V binary
+//!   vulcan-disasm --target geyser <image>   a Geyser image of little endian 16 bit words
 //!
 //! The listing goes to stderr, one instruction per line.
 
@@ -28,11 +29,24 @@ pub fn main(init: std.process.Init) !void {
     var it = try init.minimal.args.iterateAllocator(allocator);
     defer it.deinit();
     _ = it.skip(); // argv0
-    const input = it.next() orelse return usage(errw);
+    var input = it.next() orelse return usage(errw);
+    var geyser = false;
+    if (std.mem.eql(u8, input, "--target")) {
+        const name = it.next() orelse return usage(errw);
+        if (!std.mem.eql(u8, name, "geyser")) {
+            errw.print("vulcan-disasm: unknown target '{s}'\n", .{name}) catch {};
+            errw.flush() catch {};
+            return error.Usage;
+        }
+        geyser = true;
+        input = it.next() orelse return usage(errw);
+    }
 
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, input, allocator, .limited(64 * 1024 * 1024));
 
-    const listing = if (isElf(bytes))
+    const listing = if (geyser)
+        try disassembleGeyser(allocator, errw, bytes)
+    else if (isElf(bytes))
         try disassembleElf(allocator, errw, bytes)
     else if (isSpirv(bytes))
         try spirv.disassembleBytes(allocator, bytes)
@@ -49,8 +63,19 @@ pub fn main(init: std.process.Init) !void {
     try w.interface.flush();
 }
 
+fn disassembleGeyser(allocator: std.mem.Allocator, errw: *std.Io.Writer, image: []const u8) ![]u8 {
+    const words = target.geyser.encode.readImage(allocator, image) catch |err| {
+        errw.print("vulcan-disasm: {s}\n", .{@errorName(err)}) catch {};
+        errw.flush() catch {};
+        return error.BadImage;
+    };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    try target.geyser.disasm.writeListing(&out.writer, words);
+    return out.toOwnedSlice();
+}
+
 fn usage(errw: *std.Io.Writer) error{Usage} {
-    errw.print("usage: vulcan-disasm <file>   (an ELF or SPIR-V binary)\n", .{}) catch {};
+    errw.print("usage: vulcan-disasm [--target geyser] <file>   (an ELF or SPIR-V binary, or a Geyser image)\n", .{}) catch {};
     errw.flush() catch {};
     return error.Usage;
 }
