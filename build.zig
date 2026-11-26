@@ -89,6 +89,17 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // The Forth frontend: parse Forth source, infer stack effects, lower to IR, and run on the host JIT.
+    const vulcan_forth = b.addModule("vulcan-forth", .{
+        .root_source_file = b.path("libs/vulcan-forth.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    });
+
     // The GLSL frontend: parse GLSL source and lower it to Vulcan IR, and (via the
     // SPIR-V writer) emit SPIR-V.
     const vulcan_glsl = b.addModule("vulcan-glsl", .{
@@ -262,6 +273,20 @@ pub fn build(b: *std.Build) void {
             run_cli.addPassthruArgs();
             const run_step = b.step("run-wasm", "Run the host Wasm CLI: -- <file.wasm> [export] [i32 args]");
             run_step.dependOn(&run_cli.step);
+
+            if (target.result.os.tag != .uefi) {
+                const forth_cli = b.addExecutable(.{ .name = "vulcan-forth", .root_module = b.createModule(.{
+                    .root_source_file = b.path("frontends/vulcan-forth.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "vulcan-forth", .module = vulcan_forth }},
+                }) });
+                b.installArtifact(forth_cli);
+                const run_forth = b.addRunArtifact(forth_cli);
+                run_forth.addPassthruArgs();
+                const run_forth_step = b.step("run-forth", "Run the Forth CLI: -- --target host <file.fs>");
+                run_forth_step.dependOn(&run_forth.step);
+            }
         }
 
         // The GLSL -> SPIR-V shader compiler CLI runner (glsl_cli is declared above).
@@ -440,6 +465,22 @@ pub fn build(b: *std.Build) void {
         },
     }) });
     test_step.dependOn(&b.addRunArtifact(wasm_exec).step);
+
+    // The Forth frontend: unit tests in the library, then programs run on the host JIT.
+    const forth_tests = b.addTest(.{ .root_module = vulcan_forth });
+    test_step.dependOn(&b.addRunArtifact(forth_tests).step);
+
+    const forth_exec = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-forth/tests/host.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-forth", .module = vulcan_forth },
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(forth_exec).step);
 
     // Wasm tests over modules a REAL toolchain produced: `zig cc` builds them at test time,
     // and the WASI one runs through the freshly built CLI. Every other Wasm test assembles
