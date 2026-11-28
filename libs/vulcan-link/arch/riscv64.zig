@@ -230,6 +230,8 @@ pub fn computeDefaultPlacement(allocator: std.mem.Allocator, parsed: []ParsedObj
     if (compress_text) {
         for (0..nobj) |oi| {
             const p = &parsed[oi];
+            // EF_RISCV_RVC: the input may already mix halfwords and words.
+            if (p.flags & 1 != 0) continue;
             // The object's executable section (its code): the only section carrying compressible
             // instructions and call/PC-relative relocs.
             var exec_sec: ?*elf.ObjSection = null;

@@ -397,7 +397,7 @@ pub const Fixup = struct {
     at: usize,
     target: u32,
     cond: ?encode.Cond = null,
-    test_reg: ?struct { reg: Reg, nonzero: bool } = null,
+    test_reg: ?struct { reg: Reg, nonzero: bool, wide: bool = false } = null,
     /// Word index named by an `adr` placeholder. Unlike a branch fixup, this names emitted code
     /// directly instead of an IR block.
     adr_target: ?usize = null,
@@ -804,6 +804,8 @@ pub const ModelCaps = struct {
     /// comment). When false, it falls back to materializing the boolean with `cset` then testing it with
     /// `cbnz`, exactly as if the icmp/if pair were never eligible to fuse.
     fuse_cmp_branch: bool = true,
+    sign_extend_loads: bool = false,
+    wide_zero_branch: bool = false,
     /// Fuse an arithmetic op's flag-setting form into its consumer branch (e.g. ADDS+Bcc). Base-
     /// ISA on every aarch64 core, so true by default. Gates `Ctx.fuse_arith_branch`, which the
     /// arith-branch fold (`fusesArithIntoBranch`) reads at both the arith-skip site and the S-form
@@ -863,7 +865,10 @@ pub fn capsForModel(model: *const mm.Model) ModelCaps {
         .fetch_align = model.fetch_align,
         .fp16 = model.arch == .aarch64 and model.features.aarch64.fp16,
         .machine_model = machineModelFor(model),
-        .fuse_cmp_branch = model.fuses(.cmp_branch),
+        // On A53, consume the comparison directly to avoid materializing a boolean.
+        .fuse_cmp_branch = model.fuses(.cmp_branch) or model.tag == .@"cortex-a53",
+        .sign_extend_loads = model.tag == .@"cortex-a53",
+        .wide_zero_branch = model.tag == .@"cortex-a53",
         .fuse_arith_branch = model.fuses(.arith_branch),
         .fuse_shift_add = model.fuses(.shift_add),
         .fuse_addr_hi_lo = model.fuses(.addr_hi_lo),
@@ -906,6 +911,42 @@ test "capsForModel reads ampere-altra's fusion table: cmp/arith/shift on, addr_h
     try std.testing.expect(caps.fuse_arith_branch);
     try std.testing.expect(caps.fuse_shift_add);
     try std.testing.expect(!caps.fuse_addr_hi_lo);
+}
+
+test "cortex-a53 lowers compare and branch directly without a hardware fusion rule" {
+    const model = mm.modelFor(.@"cortex-a53");
+    try std.testing.expect(!model.fuses(.cmp_branch));
+    try std.testing.expect(capsForModel(model).fuse_cmp_branch);
+}
+
+test "wide zero branches check bits above the low word" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const word = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const boolean = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const zero_block = try func.appendBlock();
+    const nonzero_block = try func.appendBlock();
+    const input = try func.appendBlockParam(entry, word);
+    const zero = try func.appendInst(entry, word, .{ .iconst = 0 });
+    const condition = try func.appendInst(entry, boolean, .{ .icmp = .{ .op = .eq, .lhs = input, .rhs = zero } });
+    try func.appendIf(entry, condition, .{ .target = zero_block }, .{ .target = nonzero_block });
+    const one = try func.appendInst(nonzero_block, word, .{ .iconst = 1 });
+    func.setTerminator(zero_block, .{ .ret = ir.function.Ret.one(zero) });
+    func.setTerminator(nonzero_block, .{ .ret = ir.function.Ret.one(one) });
+    var compiled = try compileFunction(allocator, &func, .{ .wide_zero_branch = true });
+    defer compiled.deinit(allocator);
+    var found = false;
+    for (compiled.code) |word_bits| found = found or word_bits & 0xfe000000 == 0xb4000000;
+    try std.testing.expect(found);
+    if (@import("builtin").cpu.arch == .aarch64) {
+        var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+        defer code.deinit();
+        const call = code.entry(*const fn (u64) callconv(.c) u64, 0);
+        try std.testing.expectEqual(@as(u64, 0), call(0));
+        try std.testing.expectEqual(@as(u64, 1), call(1 << 32));
+    }
 }
 
 /// Compiled code plus its source-line table (from the `debug.line` IR attributes).
@@ -1259,6 +1300,7 @@ pub fn compileFunction(backing: std.mem.Allocator, func: *const Function, caps: 
     var fold = try addrfold.analyze(allocator, &work, {}, aarch64FoldOffset);
     defer fold.deinit(allocator);
     try applyFoldRewrite(&work, &fold);
+    if (caps.sign_extend_loads) try lowerSignedWordLoads(allocator, &work, &fold);
 
     var use_scope = try UseScope.enter(allocator, &work);
     defer use_scope.exit(allocator);
@@ -1774,6 +1816,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         .abi = caps.abi,
         .fp16 = fp16,
         .fuse_cmp_branch = caps.fuse_cmp_branch,
+        .wide_zero_branch = caps.wide_zero_branch,
         .fuse_arith_branch = caps.fuse_arith_branch,
         .coalescable_edge_moves = &coalescable_edge_moves,
         .dead_source_edge_moves = &dead_source_edge_moves,
@@ -2453,7 +2496,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
                     const base = try ctx.loadOp(allocator, &code, fold.baseOf(func, inst), spill_op[0]); // ptr is a gpr
                     const rd = ctx.resultReg(result);
-                    try emitLoad(allocator, &code, func, result, rd, base, @intCast(fold.offOf(inst)), fp16);
+                    if (isSignedWordLoad(func, inst)) {
+                        try code.append(allocator, encode.ldrsw(rd, base, @intCast(fold.offOf(inst))));
+                    } else {
+                        try emitLoad(allocator, &code, func, result, rd, base, @intCast(fold.offOf(inst)), fp16);
+                    }
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .store => |st| {
@@ -2955,10 +3002,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             const short = std.math.cast(i21, off) orelse return error.ConditionalBranchOverflow;
             code.items[f.at] = if (f.cond) |cond|
                 encode.bcc(cond, short)
-            else if (f.test_reg.?.nonzero)
-                encode.cbnz(f.test_reg.?.reg, short)
             else
-                encode.cbz(f.test_reg.?.reg, short);
+                encode.compareBranch(f.test_reg.?.reg, short, f.test_reg.?.nonzero, f.test_reg.?.wide);
         } else code.items[f.at] = encode.b(off);
     }
 
@@ -3027,6 +3072,7 @@ const Ctx = struct {
     /// with the icmp-skip site's `caps.fuse_cmp_branch` check in `emitFromAllocation` (the dual-check
     /// pair around `fusesIntoNextIf`), so the two never disagree on whether a given icmp/if fuses.
     fuse_cmp_branch: bool = true,
+    wide_zero_branch: bool = false,
     /// Whether to fold a flag-setting arithmetic op into its consumer branch (the arith-branch
     /// fold: `arith; icmp ==/!= 0; if` -> one S-form `adds`/`subs`/`ands` plus `b.cc`). Threaded
     /// from `compileFunction`'s `caps.fuse_arith_branch`. It is true for every non-model caller. This
@@ -3485,6 +3531,7 @@ const Ctx = struct {
         // `cbnz`. condFor here mirrors the icmp lowering's cset condition, so the branch takes the
         // then-edge under exactly the same condition.
         var branch: IfBranch = undefined;
+        var branch_wide = false;
         if (if_idx >= 1 and self.fuse_cmp_branch and fusesIntoNextIf(self.func, insts, if_idx - 1)) {
             const cmp = self.func.opcode(insts[if_idx - 1]).icmp;
             const cond = condFor(cmp.op, isSignedInt(self.func, cmp.lhs));
@@ -3494,10 +3541,9 @@ const Ctx = struct {
             // eq/ne `b.cc` below then branches on that Z flag. The SAME predicate skipped the
             // arith's own materialization, so it is emitted exactly once. Otherwise fall back to
             // the plain compare-and-branch (load the icmp operands, `cmp`).
-            // A narrow eq/ne comparison against constant 0 branches with `cbz`/`cbnz` on the tested
-            // register directly, saving the `cmp #0`. It tests the whole 32-bit register, exactly the
-            // eq/ne-vs-0 relation, so it is equal in effect to `cmp #0; b.cc`. A 64-bit operand is left
-            // to the plain path, since the `cbz`/`cbnz` encoders here are the 32-bit form.
+            // An eq/ne comparison against constant 0 branches with `cbz`/`cbnz` on the tested
+            // register directly, saving the `cmp #0`. The register width must
+            // match the comparison, including pointer null tests.
             const eqz_op: ?Value = if (cmp.op == .eq or cmp.op == .ne) blk: {
                 if (isConstZero(self.func, cmp.rhs)) break :blk cmp.lhs;
                 if (isConstZero(self.func, cmp.lhs)) break :blk cmp.rhs;
@@ -3511,7 +3557,8 @@ const Ctx = struct {
                 // arith's own materialization, so it is emitted exactly once.
                 try self.emitArithBranch(allocator, code, insts, if_idx);
                 branch = .{ .cc = cond };
-            } else if (eqz_op) |v| if (!isWide(self.func, v)) {
+            } else if (eqz_op) |v| if (self.wide_zero_branch or !isWide(self.func, v)) {
+                branch_wide = isWide(self.func, v);
                 const r = try self.loadOp(allocator, code, v, spill_op[0]);
                 branch = if (cmp.op == .ne) .{ .reg = r } else .{ .reg_eqz = r };
             } else {
@@ -3532,13 +3579,16 @@ const Ctx = struct {
         // takes the THEN-fall-through layout (elides one branch, both edges still reach the same block).
         const then_target = cf.then.target;
         const else_target = cf.@"else".target;
-        // A compare has already captured the branch condition in NZCV. If both outcomes carry the
-        // same ordered shuffle, execute it once here. A64 moves and spill traffic preserve NZCV.
-        // The candidate strictly removes one shuffle and can expose a direct fallthrough, so its
-        // machine instruction and branch scores cannot exceed the original layout.
+        // Execute identical edge moves once if they preserve the branch condition.
+        // Moves and spill traffic preserve NZCV. Register branches also require
+        // the tested register to survive the shuffle.
         const matching_moves = switch (branch) {
             .cc => self.matchingEdgeMoves(cf.then, cf.@"else"),
-            else => null,
+            .reg, .reg_eqz => |reg| sets: {
+                if (!branch_wide) break :sets null;
+                const sets = self.matchingEdgeMoves(cf.then, cf.@"else") orelse break :sets null;
+                break :sets if (edgeMovesPreserveReg(sets.lhs, reg)) sets else null;
+            },
         };
         if (matching_moves) |sets| {
             try self.emitEdgeMoves(allocator, code, sets.lhs.pred, sets.lhs.succ);
@@ -3564,15 +3614,15 @@ const Ctx = struct {
                 .reg => |reg| if (edgeMovesPreserveReg(set, reg)) {
                     try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
-                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = false } });
-                    try code.append(allocator, encode.cbz(reg, 0));
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = false, .wide = branch_wide } });
+                    try code.append(allocator, encode.compareBranch(reg, 0, false, branch_wide));
                     return;
                 },
                 .reg_eqz => |reg| if (edgeMovesPreserveReg(set, reg)) {
                     try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
-                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = true } });
-                    try code.append(allocator, encode.cbnz(reg, 0));
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = true, .wide = branch_wide } });
+                    try code.append(allocator, encode.compareBranch(reg, 0, true, branch_wide));
                     return;
                 },
             };
@@ -3587,8 +3637,8 @@ const Ctx = struct {
                 },
                 .reg, .reg_eqz => |reg| {
                     const nonzero = branch == .reg_eqz;
-                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target), .test_reg = .{ .reg = reg, .nonzero = nonzero } });
-                    try code.append(allocator, if (nonzero) encode.cbnz(reg, 0) else encode.cbz(reg, 0));
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target), .test_reg = .{ .reg = reg, .nonzero = nonzero, .wide = branch_wide } });
+                    try code.append(allocator, encode.compareBranch(reg, 0, nonzero, branch_wide));
                     if (!common_moves) try self.emitMoves(allocator, code, cf.then);
                     return;
                 },
@@ -3599,8 +3649,8 @@ const Ctx = struct {
             const bcc_at = code.items.len;
             try code.append(allocator, switch (branch) {
                 .cc => |cond| encode.bcc(cond, 0),
-                .reg => |reg| encode.cbnz(reg, 0),
-                .reg_eqz => |reg| encode.cbz(reg, 0),
+                .reg => |reg| encode.compareBranch(reg, 0, true, branch_wide),
+                .reg_eqz => |reg| encode.compareBranch(reg, 0, false, branch_wide),
             });
             if (!common_moves) try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves on the else path
             try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target) });
@@ -3608,8 +3658,8 @@ const Ctx = struct {
             const then_at = code.items.len;
             try fixups.append(allocator, switch (branch) {
                 .cc => |cond| .{ .at = bcc_at, .target = 0, .word_target = then_at, .cond = cond },
-                .reg => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = true } },
-                .reg_eqz => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = false } },
+                .reg => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = true, .wide = branch_wide } },
+                .reg_eqz => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = false, .wide = branch_wide } },
             });
             if (!common_moves) try self.emitMoves(allocator, code, cf.then); // THEN-moves, then fall through to THEN
             return;
@@ -3627,15 +3677,15 @@ const Ctx = struct {
                 .reg => |reg| if (edgeMovesPreserveReg(set, reg)) {
                     try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
-                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = true } });
-                    try code.append(allocator, encode.cbnz(reg, 0));
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = true, .wide = branch_wide } });
+                    try code.append(allocator, encode.compareBranch(reg, 0, true, branch_wide));
                     return;
                 },
                 .reg_eqz => |reg| if (edgeMovesPreserveReg(set, reg)) {
                     try self.emitSpeculatedEdgeMoves(allocator, code, set.pred, set.succ);
                     set.consumed = true;
-                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = false } });
-                    try code.append(allocator, encode.cbz(reg, 0));
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(set.succ), .test_reg = .{ .reg = reg, .nonzero = false, .wide = branch_wide } });
+                    try code.append(allocator, encode.compareBranch(reg, 0, false, branch_wide));
                     return;
                 },
             };
@@ -3649,8 +3699,8 @@ const Ctx = struct {
                 },
                 .reg, .reg_eqz => |reg| {
                     const nonzero = branch == .reg;
-                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target), .test_reg = .{ .reg = reg, .nonzero = nonzero } });
-                    try code.append(allocator, if (nonzero) encode.cbnz(reg, 0) else encode.cbz(reg, 0));
+                    try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target), .test_reg = .{ .reg = reg, .nonzero = nonzero, .wide = branch_wide } });
+                    try code.append(allocator, encode.compareBranch(reg, 0, nonzero, branch_wide));
                     if (!common_moves) try self.emitMoves(allocator, code, cf.@"else");
                     return;
                 },
@@ -3662,8 +3712,8 @@ const Ctx = struct {
             const bcc_at = code.items.len;
             try code.append(allocator, switch (branch) {
                 .cc => |cond| encode.bcc(encode.invertCond(cond), 0),
-                .reg => |reg| encode.cbz(reg, 0),
-                .reg_eqz => |reg| encode.cbnz(reg, 0),
+                .reg => |reg| encode.compareBranch(reg, 0, false, branch_wide),
+                .reg_eqz => |reg| encode.compareBranch(reg, 0, true, branch_wide),
             });
             if (!common_moves) try self.emitMoves(allocator, code, cf.then); // THEN-moves on the then (not-taken) path
             try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target) });
@@ -3671,8 +3721,8 @@ const Ctx = struct {
             const else_at = code.items.len;
             try fixups.append(allocator, switch (branch) {
                 .cc => |cond| .{ .at = bcc_at, .target = 0, .word_target = else_at, .cond = encode.invertCond(cond) },
-                .reg => |reg| .{ .at = bcc_at, .target = 0, .word_target = else_at, .test_reg = .{ .reg = reg, .nonzero = false } },
-                .reg_eqz => |reg| .{ .at = bcc_at, .target = 0, .word_target = else_at, .test_reg = .{ .reg = reg, .nonzero = true } },
+                .reg => |reg| .{ .at = bcc_at, .target = 0, .word_target = else_at, .test_reg = .{ .reg = reg, .nonzero = false, .wide = branch_wide } },
+                .reg_eqz => |reg| .{ .at = bcc_at, .target = 0, .word_target = else_at, .test_reg = .{ .reg = reg, .nonzero = true, .wide = branch_wide } },
             });
             if (!common_moves) try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves, then fall through to ELSE
             return;
@@ -3684,13 +3734,13 @@ const Ctx = struct {
         if (direct_fallthrough and (common_moves or self.edgeMovesEmpty(cf.then))) {
             try fixups.append(allocator, switch (branch) {
                 .cc => |cond| .{ .at = code.items.len, .target = @backingInt(then_target), .cond = cond },
-                .reg => |reg| .{ .at = code.items.len, .target = @backingInt(then_target), .test_reg = .{ .reg = reg, .nonzero = true } },
-                .reg_eqz => |reg| .{ .at = code.items.len, .target = @backingInt(then_target), .test_reg = .{ .reg = reg, .nonzero = false } },
+                .reg => |reg| .{ .at = code.items.len, .target = @backingInt(then_target), .test_reg = .{ .reg = reg, .nonzero = true, .wide = branch_wide } },
+                .reg_eqz => |reg| .{ .at = code.items.len, .target = @backingInt(then_target), .test_reg = .{ .reg = reg, .nonzero = false, .wide = branch_wide } },
             });
             try code.append(allocator, switch (branch) {
                 .cc => |cond| encode.bcc(cond, 0),
-                .reg => |reg| encode.cbnz(reg, 0),
-                .reg_eqz => |reg| encode.cbz(reg, 0),
+                .reg => |reg| encode.compareBranch(reg, 0, true, branch_wide),
+                .reg_eqz => |reg| encode.compareBranch(reg, 0, false, branch_wide),
             });
             if (!common_moves) try self.emitMoves(allocator, code, cf.@"else");
             try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target) });
@@ -3700,8 +3750,8 @@ const Ctx = struct {
         const bcc_at = code.items.len;
         try code.append(allocator, switch (branch) {
             .cc => |cond| encode.bcc(cond, 0),
-            .reg => |reg| encode.cbnz(reg, 0),
-            .reg_eqz => |reg| encode.cbz(reg, 0),
+            .reg => |reg| encode.compareBranch(reg, 0, true, branch_wide),
+            .reg_eqz => |reg| encode.compareBranch(reg, 0, false, branch_wide),
         });
         if (!common_moves) try self.emitMoves(allocator, code, cf.@"else");
         try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(else_target) });
@@ -3709,8 +3759,8 @@ const Ctx = struct {
         const then_at = code.items.len;
         try fixups.append(allocator, switch (branch) {
             .cc => |cond| .{ .at = bcc_at, .target = 0, .word_target = then_at, .cond = cond },
-            .reg => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = true } },
-            .reg_eqz => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = false } },
+            .reg => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = true, .wide = branch_wide } },
+            .reg_eqz => |reg| .{ .at = bcc_at, .target = 0, .word_target = then_at, .test_reg = .{ .reg = reg, .nonzero = false, .wide = branch_wide } },
         });
         if (!common_moves) try self.emitMoves(allocator, code, cf.then);
         try fixups.append(allocator, .{ .at = code.items.len, .target = @backingInt(then_target) });
@@ -4550,6 +4600,47 @@ fn lowerPopcounts(allocator: std.mem.Allocator, func: *Function) Error!void {
         changed = true;
     };
     if (changed) _ = try @import("vulcan-opt").pass.run(allocator, func, &.{@import("vulcan-opt").dce.pass_def});
+}
+
+fn isSignedWordLoad(func: *const Function, inst: ir.function.Inst) bool {
+    var attrs = func.attributesOf(.{ .inst = inst });
+    while (attrs.next()) |attr| switch (attr) {
+        .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.aarch64") and std.mem.eql(u8, c.key, "sign-extend-word-load")) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// Give the allocator the widened result at the original memory operation.
+/// The private load attribute preserves the original four-byte access width.
+fn lowerSignedWordLoads(allocator: std.mem.Allocator, func: *Function, fold: *const addrfold.Analysis) Error!void {
+    const opt = @import("vulcan-opt");
+    const uses = try allocator.alloc(u32, func.valueCount());
+    defer allocator.free(uses);
+    opt.dce.countUses(func, uses);
+    var changed = false;
+    for (0..func.blockCount()) |bi| for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+        const cv = switch (func.opcode(inst)) {
+            .convert => |cv| cv,
+            else => continue,
+        };
+        if (uses[@backingInt(cv.value)] != 1) continue;
+        const result = func.instResult(inst).?;
+        const src_type = func.types.type_kind(func.valueType(cv.value));
+        const dst_type = func.types.type_kind(func.valueType(result));
+        if (src_type != .int or src_type.int.bits != 32 or src_type.int.signedness != .signed or
+            dst_type != .int or dst_type.int.bits != 64) continue;
+        const load = func.definingInst(cv.value) orelse continue;
+        const op = func.opcode(load);
+        if (op != .load or op.load.@"volatile" or op.load.mask != null or func.isByteOrderTagged(load)) continue;
+        const offset = fold.offOf(load);
+        if (offset < 0 or offset > 16380 or @rem(offset, 4) != 0 or indexedIntegerLoad(func, load) != null) continue;
+        try func.addAttr(.{ .inst = load }, .{ .custom = .{ .namespace = "vulcan.aarch64", .key = "sign-extend-word-load", .value = .{ .int = 1 } } });
+        func.setValueType(cv.value, func.valueType(result));
+        func.replaceAllUses(result, cv.value);
+        changed = true;
+    };
+    if (changed) _ = try opt.pass.run(allocator, func, &.{opt.dce.pass_def});
 }
 
 /// Unsigned byte/halfword loads zero-extend to W, which also clears the upper
@@ -5442,7 +5533,7 @@ fn forEachTermUse(func: *const Function, term: Terminator, last_use: []u32, pos:
 /// This predicate itself carries no model gate. Both call sites (the icmp-skip in
 /// `emitFromAllocation` and the fused branch in `Ctx.emitIf`) additionally require
 /// `caps.fuse_cmp_branch` (threaded onto `Ctx` as `fuse_cmp_branch`) before honoring it, so a
-/// model without the fusion falls back to the materialize-then-test path unchanged.
+/// model with the fold disabled falls back to the materialize-then-test path.
 fn fusesIntoNextIf(func: *const Function, insts: []const ir.function.Inst, idx: usize) bool {
     const cmp = switch (func.opcode(insts[idx])) {
         .icmp => |c| c,
@@ -8098,7 +8189,7 @@ test "move-free non-loop conditionals fall through for flags and boolean branche
     }
 }
 
-test "unsigned load widening reuses zero extension while signed loads retain sign extension" {
+test "loads widen to 64 bits with the original signedness and access width" {
     const allocator = std.testing.allocator;
     for ([_]u16{ 8, 16, 32 }) |bits| for ([_]bool{ false, true }) |signed| {
         var f = Function.init(allocator);
@@ -8112,11 +8203,16 @@ test "unsigned load widening reuses zero extension while signed loads retain sig
         const extended = try f.appendInst(b, wide, .{ .convert = .{ .value = loaded } });
         f.setTerminator(b, .{ .ret = ir.function.Ret.one(extended) });
         try std.testing.expectEqual(!signed, loadAlreadyExtended(&f, loaded));
-        var compiled = try compileFunction(allocator, &f, .{});
+        var compiled = try compileFunction(allocator, &f, .{ .sign_extend_loads = true });
         defer compiled.deinit(allocator);
-        if (!signed) {
+        if (!signed or bits == 32) {
             // No bitfield extension remains after the already-extending load.
             for (compiled.code) |word| try std.testing.expect(word & 0x1f800000 != 0x13000000);
+        }
+        if (signed and bits == 32) {
+            var found = false;
+            for (compiled.code) |word| found = found or word & 0xffc00000 == 0xb9800000;
+            try std.testing.expect(found);
         }
         if (@import("builtin").cpu.arch == .aarch64) {
             var code = try @import("jit.zig").CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));

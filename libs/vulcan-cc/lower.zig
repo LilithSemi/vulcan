@@ -99,14 +99,14 @@ test "signed int arithmetic is marked as not overflowing, unsigned and narrow ar
     }
 }
 
-test "balanced switch dispatch selects every dense case and the default" {
+test "balanced switch dispatch selects sorted cases and defaults across a gap" {
     const allocator = std.testing.allocator;
     var mod = try compile(allocator,
         \\int f(int x) {
         \\  switch (x) {
         \\    case 0: return 100; case 1: return 101; case 2: return 102; case 3: return 103;
         \\    case 4: return 104; case 5: return 105; case 6: return 106; case 7: return 107;
-        \\    case 8: return 108; case 9: return 109; case 10: return 110; case 11: return 111;
+        \\    case 9: return 109; case 10: return 110; case 11: return 111;
         \\    case 12: return 112; case 13: return 113; case 14: return 114; case 15: return 115;
         \\    default: return -1;
         \\  }
@@ -118,7 +118,7 @@ test "balanced switch dispatch selects every dense case and the default" {
     defer jitted.deinit();
     const f = jitted.entry(*const fn (i32) callconv(.c) i32, "f") orelse return error.NoEntry;
     try std.testing.expectEqual(@as(i32, -1), f(-1));
-    for (0..16) |i| try std.testing.expectEqual(@as(i32, @intCast(100 + i)), f(@intCast(i)));
+    for (0..16) |i| try std.testing.expectEqual(if (i == 8) @as(i32, -1) else @as(i32, @intCast(100 + i)), f(@intCast(i)));
     try std.testing.expectEqual(@as(i32, -1), f(16));
 }
 
@@ -906,8 +906,8 @@ fn hasUnsizedDim(ty: ctype.CType) bool {
 }
 
 /// Emit a balanced dispatch tree for sorted switch labels. Each internal node partitions with one
-/// ordered comparison; leaves perform the equality check that distinguishes an exact case from the
-/// default. This keeps dense, non-fallthrough switches logarithmic without requiring an indirect
+/// ordered comparison; leaves check equality when the path hasn't already determined the value.
+/// This keeps dense switches logarithmic without requiring an indirect
 /// branch opcode or target-specific jump-table representation in the IR.
 fn lowerBalancedSwitch(
     l: *L,
@@ -917,9 +917,15 @@ fn lowerBalancedSwitch(
     labels: []const i64,
     targets: []const Block,
     default_target: Block,
+    lower: ?i64,
+    upper: ?i64,
 ) Error!void {
     std.debug.assert(labels.len == targets.len and labels.len != 0);
     if (labels.len == 1) {
+        if (lower == labels[0] and upper == labels[0]) {
+            try l.func.setJump(block, targets[0], &.{});
+            return;
+        }
         const label = try l.func.appendInst(block, ty, .{ .iconst = labels[0] });
         const eq = try l.func.appendInst(block, l.boolt, .{ .icmp = .{ .op = .eq, .lhs = value, .rhs = label } });
         try l.func.appendIf(block, eq, .{ .target = targets[0] }, .{ .target = default_target });
@@ -932,8 +938,8 @@ fn lowerBalancedSwitch(
     const left = try l.func.appendBlock();
     const right = try l.func.appendBlock();
     try l.func.appendIf(block, le, .{ .target = left }, .{ .target = right });
-    try lowerBalancedSwitch(l, left, value, ty, labels[0 .. mid + 1], targets[0 .. mid + 1], default_target);
-    try lowerBalancedSwitch(l, right, value, ty, labels[mid + 1 ..], targets[mid + 1 ..], default_target);
+    try lowerBalancedSwitch(l, left, value, ty, labels[0 .. mid + 1], targets[0 .. mid + 1], default_target, lower, labels[mid]);
+    try lowerBalancedSwitch(l, right, value, ty, labels[mid + 1 ..], targets[mid + 1 ..], default_target, labels[mid] + 1, upper);
 }
 
 /// Lower one statement. Returns whether it terminated the current path.
@@ -1253,8 +1259,13 @@ fn lowerStmt(l: *L, stmt: parser.Stmt) Error!bool {
             };
 
             var test_block = l.block;
-            const balanced = sorted_nonnegative and labels.items.len >= 8;
-            if (balanced) try lowerBalancedSwitch(l, test_block, v.value, vt, labels.items, targets.items, default_target);
+            const label_bits: u16 = switch (l.func.types.type_kind(vt)) {
+                .int => |int| int.bits - @intFromBool(int.signedness == .signed),
+                else => 0,
+            };
+            const balanced = sorted_nonnegative and labels.items.len >= 8 and
+                (label_bits >= 63 or @as(u64, @intCast(labels.items[labels.items.len - 1])) < @as(u64, 1) << @as(u6, @intCast(label_bits)));
+            if (balanced) try lowerBalancedSwitch(l, test_block, v.value, vt, labels.items, targets.items, default_target, null, null);
 
             var i: usize = 0;
             while (!balanced and i < sw.cases.len) {

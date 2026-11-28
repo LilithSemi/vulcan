@@ -174,17 +174,30 @@ pub fn optimizePostInline(allocator: std.mem.Allocator, func: *ir.function.Funct
 
 /// Apply target-aware IR rewrites after generic canonicalization and before instruction selection.
 pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Function, m: *const Model) pass.Error!bool {
+    const rotate_loops = m.arch == .aarch64 or m.tag == .@"thead-c906";
     // x86 encodes any imm32 in place, so hoisting loop immediates only adds register pressure.
     const passes: []const pass.Pass = switch (m.arch) {
         .aarch64 => &.{ rangediv.pass_def, offsetcombine.pass_def, loopimm.pass_def, looprotate.pass_def, gvn.pass_def, dce.pass_def },
         .x86_64 => &.{ rangediv.pass_def, offsetcombine.pass_def, dce.pass_def },
+        .riscv64 => if (!rotate_loops) return false else if (hasLoadedProduct(func, true))
+            &.{ looprotate.pass_def, jumpthread.single_edge_params_pass_def, constfold.pass_def, simplify.pass_def, gvn.pass_def, dce.pass_def }
+        else
+            &.{ looprotate.pass_def, constfold.pass_def, simplify.pass_def, gvn.pass_def, dce.pass_def },
         else => return false,
     };
     // A pointer made from an integer constant, such as null, is that constant, so a compare with
     // it takes an immediate.
     const nulls = pointerConstants(func);
+    const reduced_guarded = m.tag == .@"thead-c906" and try pass.runToFixpoint(allocator, func, &.{ ivsr.guarded_pass_def, dce.pass_def }, 4);
+    if (reduced_guarded) _ = try pass.run(allocator, func, &.{ strength.pass_def, gvn.pass_def, dce.pass_def });
+    const unrolled_dot = switch (m.tag) {
+        .@"cortex-a53" => hasLoadedProduct(func, false) and try pass.run(allocator, func, &.{ lftr.strided_dot_pairs_pass_def, constfold.pass_def, dce.pass_def }),
+        .@"thead-c906" => hasLoadedProduct(func, false) and try pass.run(allocator, func, &.{lftr.dot_pairs_pass_def}),
+        else => false,
+    };
     // A loop that walks a pointer and a counter in step keeps only the pointer.
-    const tested = (m.arch == .x86_64 or m.arch == .aarch64) and try pass.runToFixpoint(allocator, func, &.{ lftr.pass_def, dce.pass_def }, 16);
+    const tested = (m.arch == .x86_64 or rotate_loops) and try pass.runToFixpoint(allocator, func, &.{ lftr.pass_def, dce.pass_def }, 16);
+    const shift_immediates = m.tag == .@"thead-c906" and try pass.run(allocator, func, &.{ immform.shifts_pass_def, dce.pass_def });
     // Sharing one side of a same-width convert removes a register copy, and a constant rebuilt at
     // its edge frees a register. Neither adds work, so they need no score.
     const shared = if (m.arch == .x86_64 or m.arch == .aarch64)
@@ -199,12 +212,31 @@ pub fn optimizePreSelection(allocator: std.mem.Allocator, func: *ir.function.Fun
     defer gate.deinit();
     // Rotation handles one loop per analysis snapshot. Recompute analyses so
     // inner and outer loops can both lose their recurring header branch.
-    const changed = if (m.arch == .aarch64)
+    const changed = if (rotate_loops)
         try pass.runToFixpoint(allocator, gate.candidateFunction(), passes, 8)
     else
         try pass.run(allocator, gate.candidateFunction(), passes);
-    if (!changed) return shared or joined or tested or nulls or call_constants;
-    return try gate.commit(func) or shared or joined or tested or nulls or call_constants;
+    if (!changed) return reduced_guarded or unrolled_dot or shared or joined or tested or nulls or call_constants or shift_immediates;
+    return try gate.commit(func) or reduced_guarded or unrolled_dot or shared or joined or tested or nulls or call_constants or shift_immediates;
+}
+
+/// Joining a product loop to its latch exposes the loads and induction updates
+/// together. Integer dot pairing additionally requires two integer loads.
+fn hasLoadedProduct(func: *const ir.function.Function, allow_float: bool) bool {
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const mul = switch (func.opcode(inst)) {
+                .arith => |a| if (a.op == .mul) a else continue,
+                else => continue,
+            };
+            const ty = func.types.type_kind(func.valueType(mul.lhs));
+            const lhs_load = if (func.definingInst(mul.lhs)) |def| func.opcode(def) == .load else false;
+            const rhs_load = if (func.definingInst(mul.rhs)) |def| func.opcode(def) == .load else false;
+            if (ty == .int and lhs_load and rhs_load) return true;
+            if (allow_float and ty == .float and (lhs_load or rhs_load)) return true;
+        }
+    }
+    return false;
 }
 
 fn pointerConstants(func: *ir.function.Function) bool {

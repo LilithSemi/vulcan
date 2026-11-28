@@ -21,6 +21,8 @@ const Value = ir.function.Value;
 const Inst = ir.function.Inst;
 
 pub const pass_def = pass.Pass{ .name = "lftr", .run = run };
+pub const dot_pairs_pass_def = pass.Pass{ .name = "dot-pairs", .run = dotPairs };
+pub const strided_dot_pairs_pass_def = pass.Pass{ .name = "strided-dot-pairs", .run = stridedDotPairs };
 
 /// `q == base + j << shift` on every trip, with `j` stepping by `step`.
 const Pair = struct {
@@ -36,7 +38,10 @@ const Pair = struct {
     exact: bool,
     /// Only loads, stores and steps read `q`, so its start may be rebuilt.
     address_only: bool,
+    forward_test: ?ForwardTest = null,
 };
+
+const ForwardTest = struct { inst: Inst, first: i64 };
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     for (func.attributeEntries()) |entry| if (entry.target == .block) return false;
@@ -66,7 +71,12 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     }
     var changed = false;
     for (pairs.items) |pair| {
+        const tested_index = if (pair.forward_test) |test_info| func.opcode(test_info.inst).icmp.lhs else null;
         if (try rewrite(allocator, func, doms, pairs.items, pair)) {
+            if (tested_index) |index| {
+                uses[@backingInt(index)] -= 1; // the new compare no longer reads the index
+                _ = try dropCounter(allocator, func, cfg, pair, uses);
+            }
             changed = true;
             break;
         }
@@ -166,9 +176,10 @@ fn findPair(func: *const Function, cfg: anytype, loop: *const loops_mod.Loop, us
     const next = func.blockArgs(back_term.jump);
 
     for (params, 0..) |j, ji| {
-        if (signedInt(func, j) == null) continue;
         const jstep = plusConst(func, next[ji]) orelse continue;
         if (jstep.x != j or (jstep.c != 1 and jstep.c != -1)) continue;
+        const forward_test = forwardTest(func, loop, header, j, next[ji], init[ji], jstep.c);
+        if (forward_test == null and signedInt(func, j) == null) continue;
         for (params, 0..) |q, qi| {
             if (!isPtr(func, q)) continue;
             const qstep = plusConst(func, next[qi]) orelse continue;
@@ -177,7 +188,10 @@ fn findPair(func: *const Function, cfg: anytype, loop: *const loops_mod.Loop, us
             if (!std.math.isPowerOfTwo(size) or size > 16) continue;
             const shift: u6 = @intCast(std.math.log2_int(u64, size));
             if (qstep.c != jstep.c << shift) continue;
-            const start = startOf(func, init[qi], init[ji], shift, known) orelse continue;
+            const start: PointerStart = if (forward_test) |test_info|
+                .{ .base = init[qi], .exact = test_info.first == 0 }
+            else
+                startOf(func, init[qi], init[ji], shift, known) orelse continue;
             return .{
                 .header = header,
                 .preheader = preheader,
@@ -189,14 +203,182 @@ fn findPair(func: *const Function, cfg: anytype, loop: *const loops_mod.Loop, us
                 .step = jstep.c,
                 .exact = start.exact,
                 .address_only = addressOnly(func, q, uses, next[qi]),
+                .forward_test = forward_test,
             };
         }
     }
     return null;
 }
 
+// A counter increasing by one reaches its strict upper bound before it
+// can wrap. A 32-bit index times a stride of at most 16 is
+// injective modulo a 64-bit address, so an end-pointer equality test suffices.
+fn forwardTest(func: *const Function, loop: *const loops_mod.Loop, header: Block, index: Value, next: Value, start: Value, step: i64) ?ForwardTest {
+    const ty = func.types.type_kind(func.valueType(index));
+    if (ty != .int or ty.int.bits == 0 or ty.int.bits > 32 or step != 1) return null;
+    const initial = constOf(func, start) orelse return null;
+    const insts = func.blockInsts(header);
+    if (insts.len == 0) return null;
+    const branch = func.opcode(insts[insts.len - 1]);
+    if (branch != .@"if" or !loop.contains(@backingInt(branch.@"if".then.target)) or
+        loop.contains(@backingInt(branch.@"if".@"else".target))) return null;
+    const test_inst = func.definingInst(branch.@"if".cond) orelse return null;
+    const cmp = func.opcode(test_inst);
+    if (cmp != .icmp or cmp.icmp.op != .lt or
+        func.valueType(cmp.icmp.rhs) != func.valueType(index)) return null;
+    const first = if (cmp.icmp.lhs == index) initial else if (cmp.icmp.lhs == next)
+        std.math.add(i64, initial, 1) catch return null
+    else
+        return null;
+    const limit = @as(i64, 1) << @intCast(ty.int.bits);
+    if (initial < 0 or first >= limit or func.valueType(cmp.icmp.lhs) != func.valueType(index)) return null;
+    if (ty.int.signedness == .signed) {
+        const bound = constOf(func, cmp.icmp.rhs) orelse return null;
+        if (first != 0 or bound < 0 or bound >= limit >> 1) return null;
+    }
+    return .{ .inst = test_inst, .first = first };
+}
+
+/// Run two independent word accumulators up to the even trip count, then
+/// hand any odd element to the original scalar loop.
+fn dotPairs(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    return runDotPairs(allocator, func, analyses, false);
+}
+
+fn stridedDotPairs(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    return runDotPairs(allocator, func, analyses, true);
+}
+
+fn runDotPairs(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses, allow_strided: bool) pass.Error!bool {
+    if (func.attributeEntries().len != 0) return false;
+    const loops = try analyses.loops();
+    const cfg = try analyses.cfg();
+    const doms = try analyses.dominators();
+    const uses = try allocator.alloc(u32, func.valueCount());
+    defer allocator.free(uses);
+    dce.countUses(func, uses);
+    for (loops.loops) |*loop| {
+        const pair = findPair(func, cfg, loop, uses, &.{}) orelse continue;
+        const test_info = pair.forward_test orelse continue;
+        if (test_info.first != 0) continue;
+        const test_inst = test_info.inst;
+        if (pair.shift != 2 or func.blockInsts(pair.header).len != 2) continue;
+        const bound = func.opcode(test_inst).icmp.rhs;
+        if (!definedOutside(func, doms, bound, pair.header)) continue;
+        if (try unrollDot(func, pair, bound, allow_strided)) {
+            analyses.invalidate();
+            return true;
+        }
+    }
+    return false;
+}
+
+fn unrollDot(func: *Function, pair: Pair, bound: Value, allow_strided: bool) !bool {
+    const header_insts = func.blockInsts(pair.header);
+    const branch = func.opcode(header_insts[1]).@"if";
+    const body = branch.then.target;
+    if (func.blockParams(body).len != 0) return false;
+    if (body != pair.latch) {
+        const jump = func.terminator(body) orelse return false;
+        if (jump != .jump or jump.jump.target != pair.latch or func.blockParams(pair.latch).len != 0) return false;
+    }
+    const pre_args = func.blockArgs(func.terminator(pair.preheader).?.jump);
+    const back_args = func.blockArgs(func.terminator(pair.latch).?.jump);
+    const params = func.blockParams(pair.header);
+    if (params.len != 4) return false;
+    var other: ?usize = null;
+    var acc: ?usize = null;
+    for (params, 0..) |p, i| {
+        if (i == pair.j or i == pair.q) continue;
+        if (isPtr(func, p)) other = i else acc = i;
+    }
+    const b = other orelse return false;
+    const s = acc orelse return false;
+    const word_ty = func.valueType(params[s]);
+    const kind = func.types.type_kind(word_ty);
+    if (kind != .int or kind.int.bits != 32 or (!allow_strided and kind.int.signedness != .unsigned)) return false;
+    const step = plusConst(func, back_args[b]) orelse return false;
+    if (step.x != params[b] or step.c < 4 or @rem(step.c, 4) != 0 or (!allow_strided and step.c != 4)) return false;
+    const double_step = std.math.mul(i64, step.c, 2) catch return false;
+    const add_inst = func.definingInst(back_args[s]) orelse return false;
+    const add = func.opcode(add_inst);
+    if (add != .arith or add.arith.op != .add or (!allow_strided and add.arith.nsw)) return false;
+    const product = if (add.arith.lhs == params[s]) add.arith.rhs else if (add.arith.rhs == params[s]) add.arith.lhs else return false;
+    const mul_inst = func.definingInst(product) orelse return false;
+    const mul = func.opcode(mul_inst);
+    if (mul != .arith or mul.arith.op != .mul or (!allow_strided and mul.arith.nsw) or func.valueType(product) != word_ty) return false;
+    const load_a = func.definingInst(mul.arith.lhs) orelse return false;
+    const load_b = func.definingInst(mul.arith.rhs) orelse return false;
+    if (load_a == load_b or func.valueType(mul.arith.lhs) != word_ty or func.valueType(mul.arith.rhs) != word_ty) return false;
+    const pa = func.opcode(load_a);
+    const pb = func.opcode(load_b);
+    if (pa != .load or pb != .load or pa.load.@"volatile" or pb.load.@"volatile" or pa.load.mask != null or pb.load.mask != null) return false;
+    if (!((pa.load.ptr == params[pair.q] and pb.load.ptr == params[b]) or
+        (pb.load.ptr == params[pair.q] and pa.load.ptr == params[b]))) return false;
+
+    const matched = [_]Inst{
+        load_a,                                 load_b,                                 mul_inst,                          add_inst,
+        func.definingInst(back_args[pair.j]).?, func.definingInst(back_args[pair.q]).?, func.definingInst(back_args[b]).?,
+    };
+    const blocks = [_]Block{ body, pair.latch };
+    const members = blocks[0..if (body == pair.latch) 1 else 2];
+    var seen: usize = 0;
+    for (members) |block| for (func.blockInsts(block)) |inst| {
+        if (std.mem.indexOfScalar(Inst, &matched, inst) == null) return false;
+        seen += 1;
+    };
+    if (seen != matched.len) return false;
+
+    const start = [4]Value{ pre_args[0], pre_args[1], pre_args[2], pre_args[3] };
+    const ptr_a_ty = func.valueType(params[pair.q]);
+    const ptr_b_ty = func.valueType(params[b]);
+    const even = try func.appendArithImm(pair.preheader, func.valueType(bound), .bit_and, bound, -2);
+    const end = try exactAddress(func, pair.preheader, start[pair.q], even, 2, ptr_a_ty);
+    const full_end = try forwardEndAddress(func, pair, bound, ptr_a_ty);
+    func.opcodeMut(pair.forward_test.?.inst).icmp = .{ .op = .ne, .lhs = params[pair.q], .rhs = full_end };
+    const zero = try func.appendInst(pair.preheader, word_ty, .{ .iconst = 0 });
+    const bool_ty = try func.types.intern(.bool);
+    const work = try func.appendInst(pair.preheader, bool_ty, .{ .icmp = .{ .op = .ne, .lhs = start[pair.q], .rhs = end } });
+    const main = try func.appendBlock();
+    const tail = try func.appendBlock();
+    func.terminatorPtr(pair.preheader).* = null;
+    try func.appendIf(pair.preheader, work, .{ .target = main, .args = &.{ start[pair.q], start[b], start[s], zero } }, .{ .target = pair.header, .args = &start });
+    const left = try func.appendBlockParam(main, ptr_a_ty);
+    const right = try func.appendBlockParam(main, ptr_b_ty);
+    const sum0 = try func.appendBlockParam(main, word_ty);
+    const sum1 = try func.appendBlockParam(main, word_ty);
+    const left1 = try func.appendArithImm(main, ptr_a_ty, .add, left, 4);
+    const right1 = try func.appendArithImm(main, ptr_b_ty, .add, right, step.c);
+    const a0 = try func.appendInst(main, word_ty, .{ .load = .{ .ptr = left } });
+    // Keep adjacent elements together for AArch64's load-pair selection.
+    const first_right = if (!allow_strided) try func.appendInst(main, word_ty, .{ .load = .{ .ptr = right } }) else null;
+    const a1 = try func.appendInst(main, word_ty, .{ .load = .{ .ptr = left1 } });
+    const b0 = first_right orelse try func.appendInst(main, word_ty, .{ .load = .{ .ptr = right } });
+    const b1 = try func.appendInst(main, word_ty, .{ .load = .{ .ptr = right1 } });
+    // Use wrapping arithmetic for the partial sums. A partial can overflow even
+    // when every sum in the original order fits, and the combined low bits agree.
+    const p0 = try func.appendInst(main, word_ty, .{ .arith = .{ .op = .mul, .lhs = a0, .rhs = b0 } });
+    const s0 = try func.appendInst(main, word_ty, .{ .arith = .{ .op = .add, .lhs = sum0, .rhs = p0 } });
+    const p1 = try func.appendInst(main, word_ty, .{ .arith = .{ .op = .mul, .lhs = a1, .rhs = b1 } });
+    const s1 = try func.appendInst(main, word_ty, .{ .arith = .{ .op = .add, .lhs = sum1, .rhs = p1 } });
+    const left_next = try func.appendArithImm(main, ptr_a_ty, .add, left, 8);
+    const right_next = try func.appendArithImm(main, ptr_b_ty, .add, right, double_step);
+    const more = try func.appendInst(main, bool_ty, .{ .icmp = .{ .op = .ne, .lhs = left_next, .rhs = end } });
+    try func.appendIf(main, more, .{ .target = main, .args = &.{ left_next, right_next, s0, s1 } }, .{ .target = tail });
+
+    var remainder = start;
+    remainder[pair.j] = even;
+    remainder[pair.q] = left_next;
+    remainder[b] = right_next;
+    remainder[s] = try func.appendInst(tail, word_ty, .{ .arith = .{ .op = .add, .lhs = s0, .rhs = s1 } });
+    try func.setJump(tail, pair.header, &remainder);
+    return true;
+}
+
 /// `q0` as `base + j0 << shift`, and whether that sum is exact in pointer width.
-fn startOf(func: *const Function, q0: Value, j0: Value, shift: u6, known: []const Pair) ?struct { base: Value, exact: bool } {
+const PointerStart = struct { base: Value, exact: bool };
+
+fn startOf(func: *const Function, q0: Value, j0: Value, shift: u6, known: []const Pair) ?PointerStart {
     // Started from an outer pair: `q0 = outer_q + c << shift` with `j0 = outer_j + c`.
     if (plusConst(func, q0)) |pq| {
         const jx: Value, const c: i64 = if (plusConst(func, j0)) |pj| .{ pj.x, pj.c } else .{ j0, 0 };
@@ -293,6 +475,15 @@ fn rewrite(allocator: std.mem.Allocator, func: *Function, doms: *const dominator
     const params = func.blockParams(pair.header);
     const j = params[pair.j];
     const q = params[pair.q];
+    if (pair.forward_test) |test_info| {
+        const inst = test_info.inst;
+        const bound = func.opcode(inst).icmp.rhs;
+        if (!definedOutside(func, doms, bound, pair.header)) return false;
+        const ptr_ty = func.valueType(q);
+        const end = try forwardEndAddress(func, pair, bound, ptr_ty);
+        func.opcodeMut(inst).icmp = .{ .op = .ne, .lhs = q, .rhs = end };
+        return true;
+    }
     var changed = false;
 
     // The start: from an outer pair, or rebuilt exactly.
@@ -419,6 +610,25 @@ fn exactAddress(func: *Function, block: Block, base: Value, index: Value, shift:
     return func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
 }
 
+fn forwardEndAddress(func: *Function, pair: Pair, bound: Value, ptr_ty: ir.types.Type) !Value {
+    const first = pair.forward_test.?.first;
+    if (constOf(func, bound)) |c| {
+        const bits = func.types.type_kind(func.valueType(bound)).int.bits;
+        const mask = (@as(i64, 1) << @as(u6, @intCast(bits))) - 1;
+        const offset = @max(0, (c & mask) - first) << pair.shift;
+        return if (offset == 0) pair.base else func.appendArithImm(pair.preheader, ptr_ty, .add, pair.base, offset);
+    }
+    if (first == 0) return exactAddress(func, pair.preheader, pair.base, bound, pair.shift, ptr_ty);
+    const block = pair.preheader;
+    const ty = func.valueType(bound);
+    const first_value = try func.appendInst(block, ty, .{ .iconst = first });
+    const work = try func.appendInst(block, try func.types.intern(.bool), .{ .icmp = .{ .op = .lt, .lhs = first_value, .rhs = bound } });
+    const count = try func.appendArithImm(block, ty, .sub, bound, first);
+    const zero = try func.appendInst(block, ty, .{ .iconst = 0 });
+    const trips = try func.appendInst(block, ty, .{ .select = .{ .cond = work, .then = count, .@"else" = zero } });
+    return exactAddress(func, block, pair.base, trips, pair.shift, ptr_ty);
+}
+
 /// Remove `j` when only its own step reads it.
 fn dropCounter(allocator: std.mem.Allocator, func: *Function, cfg: anytype, pair: Pair, uses: []const u32) !bool {
     const params = func.blockParams(pair.header);
@@ -427,6 +637,14 @@ fn dropCounter(allocator: std.mem.Allocator, func: *Function, cfg: anytype, pair
     const next = func.blockArgs(latch_jump)[pair.j];
     if (uses[@backingInt(j)] != 1 or uses[@backingInt(next)] != 1) return false;
     if (plusConst(func, next).?.x != j) return false;
+    for (cfg.predecessors(@backingInt(pair.header))) |pi| {
+        const pred: Block = @fromBackingInt(@intCast(pi));
+        const term = func.terminator(pred) orelse return false;
+        if (term != .jump or term.jump.target != pair.header) return false;
+        for (func.blockInsts(pred)) |inst| {
+            if (func.opcode(inst) == .@"if") return false;
+        }
+    }
 
     var np: std.ArrayList(Value) = .empty;
     defer np.deinit(allocator);
@@ -444,6 +662,139 @@ fn dropCounter(allocator: std.mem.Allocator, func: *Function, cfg: anytype, pair
 }
 
 const testing = std.testing;
+
+test "a signed strided dot uses wrapping partial sums and retains an odd tail" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const word = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr = try func.types.ptrGlobal();
+    const boolean = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const exit = try func.appendBlock();
+    const left = try func.appendBlockParam(entry, ptr);
+    const right = try func.appendBlockParam(entry, ptr);
+    const zero = try func.appendInst(entry, word, .{ .iconst = 0 });
+    const bound = try func.appendInst(entry, word, .{ .iconst = 129 });
+    const index = try func.appendBlockParam(header, word);
+    const sum = try func.appendBlockParam(header, word);
+    const contiguous = try func.appendBlockParam(header, ptr);
+    const strided = try func.appendBlockParam(header, ptr);
+    try func.setJump(entry, header, &.{ zero, zero, left, right });
+    const more = try func.appendInst(header, boolean, .{ .icmp = .{ .op = .lt, .lhs = index, .rhs = bound } });
+    try func.appendIf(header, more, .{ .target = body }, .{ .target = exit });
+    const a = try func.appendInst(body, word, .{ .load = .{ .ptr = contiguous } });
+    const b = try func.appendInst(body, word, .{ .load = .{ .ptr = strided } });
+    const product = try func.appendInst(body, word, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b, .nsw = true } });
+    const next_sum = try func.appendInst(body, word, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = product, .nsw = true } });
+    const next_index = try func.appendArithImm(body, word, .add, index, 1);
+    const next_left = try func.appendArithImm(body, ptr, .add, contiguous, 4);
+    const next_right = try func.appendArithImm(body, ptr, .add, strided, 64);
+    try func.setJump(body, header, &.{ next_index, next_sum, next_left, next_right });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(sum) });
+
+    try testing.expect(!try pass.run(allocator, &func, &.{dot_pairs_pass_def}));
+    try testing.expect(try pass.run(allocator, &func, &.{strided_dot_pairs_pass_def}));
+    const main = func.opcode(func.blockInsts(entry)[func.blockInsts(entry).len - 1]).@"if".then.target;
+    const main_insts = func.blockInsts(main);
+    var wrapping_updates: usize = 0;
+    for (main_insts) |inst| switch (func.opcode(inst)) {
+        .arith => |op| if (op.op == .add) {
+            try testing.expect(!op.nsw);
+            wrapping_updates += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), wrapping_updates);
+    const tail = func.opcode(main_insts[main_insts.len - 1]).@"if".@"else".target;
+    try testing.expectEqual(header, func.terminator(tail).?.jump.target);
+    try testing.expect(func.opcode(func.definingInst(next_sum).?).arith.nsw);
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
+test "a zero-based unsigned loop can test its end pointer" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const base = try func.appendBlockParam(entry, ptr_t);
+    const count = try func.appendBlockParam(entry, u32_t);
+    const zero = try func.appendInst(entry, u32_t, .{ .iconst = 0 });
+    try func.setJump(entry, header, &.{ zero, base });
+    const i = try func.appendBlockParam(header, u32_t);
+    const q = try func.appendBlockParam(header, ptr_t);
+    const more = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = count } });
+    try func.appendIf(header, more, .{ .target = body }, .{ .target = done });
+    try func.appendStore(body, zero, q);
+    const i_next = try func.appendArithImm(body, u32_t, .add, i, 1);
+    const q_next = try func.appendArithImm(body, ptr_t, .add, q, 4);
+    try func.setJump(body, header, &.{ i_next, q_next });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    const cmp_inst = func.definingInst(more).?;
+    func.opcodeMut(cmp_inst).icmp.op = .le;
+    try testing.expect(!try pass.run(allocator, &func, &.{pass_def}));
+    func.opcodeMut(cmp_inst).icmp.op = .lt;
+
+    var max_bound = try func.clone(allocator);
+    defer max_bound.deinit();
+    const all_bits = try max_bound.appendInst(entry, u32_t, .{ .iconst = -1 });
+    max_bound.opcodeMut(cmp_inst).icmp.rhs = all_bits;
+    try testing.expect(try pass.run(allocator, &max_bound, &.{pass_def}));
+    const end = max_bound.opcode(cmp_inst).icmp.rhs;
+    try testing.expectEqual(@as(i64, 0x3fffffffc), max_bound.opcode(max_bound.definingInst(end).?).arith_imm.imm);
+
+    try testing.expect(try pass.runToFixpoint(allocator, &func, &.{ pass_def, dce.pass_def }, 16));
+    try testing.expectEqualSlices(Value, &.{q}, func.blockParams(header));
+    try testing.expectEqual(.ne, func.opcode(cmp_inst).icmp.op);
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
+
+test "a shifted unsigned loop clamps its pointer distance for empty trips" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const word = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr = try func.types.ptrGlobal();
+    const boolean = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const exit = try func.appendBlock();
+    const base = try func.appendBlockParam(entry, ptr);
+    const first = try func.appendInst(entry, word, .{ .iconst = 1 });
+    const index = try func.appendBlockParam(header, word);
+    const cursor = try func.appendBlockParam(header, ptr);
+    try func.setJump(entry, header, &.{ first, base });
+    const next = try func.appendArithImm(header, word, .add, index, 1);
+    const condition = try func.appendInst(header, boolean, .{ .icmp = .{ .op = .lt, .lhs = next, .rhs = first } });
+    try func.appendIf(header, condition, .{ .target = body }, .{ .target = exit });
+    try func.appendStore(body, first, cursor);
+    const advanced = try func.appendArithImm(body, ptr, .add, cursor, 4);
+    try func.setJump(body, header, &.{ next, advanced });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
+
+    try testing.expect(try pass.runToFixpoint(allocator, &func, &.{ pass_def, dce.pass_def }, 16));
+    const cmp = func.opcode(func.definingInst(condition).?).icmp;
+    try testing.expectEqual(.ne, cmp.op);
+    try testing.expectEqual(base, cmp.rhs);
+    try testing.expectEqualSlices(Value, &.{cursor}, func.blockParams(header));
+    var diags = try ir.verify.verify(allocator, &func, .high);
+    defer diags.deinit();
+    try testing.expect(diags.ok());
+}
 
 test "a counter that steps with a pointer leaves, and its test and exit address use the pointer" {
     const allocator = testing.allocator;

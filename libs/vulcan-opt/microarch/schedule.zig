@@ -15,6 +15,11 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const dce = @import("../dce.zig");
+const cfg = @import("../cfg.zig");
+const pass = @import("../pass.zig");
+const jumpthread = @import("../jumpthread.zig");
+const constfold = @import("../constfold.zig");
+const loadfwd = @import("../loadfwd.zig");
 const mm = @import("model.zig");
 
 const Function = ir.function.Function;
@@ -177,10 +182,17 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
         try simtSchedule(allocator, func);
         return;
     }
+    if (model.tag == .@"cortex-a53") try prepareCountdowns(allocator, func);
     for (0..func.blockCount()) |bi| {
         const block: Block = @fromBackingInt(@intCast(bi));
-        if (model.tag == .@"cortex-a76") hoistPointerLoads(func, block);
+        switch (model.tag) {
+            .@"cortex-a53", .@"cortex-a76" => hoistPointerLoads(func, block, true),
+            .@"thead-c906" => hoistPointerLoads(func, block, false),
+            else => {},
+        }
         try scheduleBlock(allocator, func, block, model);
+        if (model.tag == .@"cortex-a53" or model.tag == .@"thead-c906")
+            try scheduleLoopUpdates(allocator, func, block);
     }
 
     const fuse_cmp = model.arch == .aarch64 or model.fuses(.cmp_branch);
@@ -193,19 +205,283 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) s
             if (model.fuses(.shift_add)) restoreShiftAddPairs(func, block, model, uses);
             if (model.arch == .aarch64) {
                 restoreVectorLoadPairs(func, block);
-                restoreMultiplyAddPairs(func, block, uses);
             }
+            if (model.arch == .aarch64 or model.tag == .@"thead-c906")
+                restoreMultiplyAddPairs(func, block, uses, model.arch == .riscv64);
             if (fuse_cmp) restoreCompareBranchPairs(func, block, uses);
             if (model.arch == .x86_64) restoreCompareSelectPairs(func, block, uses);
         }
     }
 }
 
+const CountUp = struct { branch: ir.function.If, compare: Inst, update: Inst, bound: i64 };
+
+fn countUpTest(func: *const Function, block: Block) ?CountUp {
+    const insts = func.blockInsts(block);
+    if (insts.len == 0) return null;
+    const branch = switch (func.opcode(insts[insts.len - 1])) {
+        .@"if" => |branch| branch,
+        else => return null,
+    };
+    if (branch.then.target != block or branch.@"else".target == block) return null;
+    const compare = func.definingInst(branch.cond) orelse return null;
+    const cmp = switch (func.opcode(compare)) {
+        .icmp => |cmp| cmp,
+        else => return null,
+    };
+    if (cmp.op != .lt) return null;
+    const bound = integerConstant(func, cmp.rhs) orelse return null;
+    if (bound <= 0) return null;
+    const update = func.definingInst(cmp.lhs) orelse return null;
+    const step = switch (func.opcode(update)) {
+        .arith_imm => |step| step,
+        else => return null,
+    };
+    if (step.op != .add or step.imm != 1) return null;
+    return .{ .branch = branch, .compare = compare, .update = update, .bound = bound };
+}
+
+fn prepareCountdowns(allocator: std.mem.Allocator, func: *Function) !void {
+    if (func.blockCount() < 2) return;
+    for (1..func.blockCount()) |bi| {
+        if (countUpTest(func, @fromBackingInt(@intCast(bi))) != null) break;
+    } else return;
+    var candidate = try func.clone(allocator);
+    defer candidate.deinit();
+    // Rotating the loop can leave a constant entry guard and dead parameters
+    // on the exit. Keep the CFG cleanup only if it exposes a countdown.
+    _ = try pass.runToFixpoint(allocator, &candidate, &.{
+        jumpthread.pass_def,
+        jumpthread.single_edge_params_pass_def,
+        constfold.pass_def,
+        dce.pass_def,
+    }, 4);
+    if (try countDownConstantLoops(allocator, &candidate)) std.mem.swap(Function, func, &candidate);
+}
+
+/// A private, zero-based counter in a rotated loop can test zero directly.
+fn countDownConstantLoops(allocator: std.mem.Allocator, func: *Function) !bool {
+    var graph = try cfg.build(allocator, func);
+    defer graph.deinit(allocator);
+    const order = try graph.reversePostorder(allocator);
+    defer allocator.free(order);
+    const reachable = try allocator.alloc(bool, func.blockCount());
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+    for (order) |bi| reachable[bi] = true;
+    const uses = try allocator.alloc(u32, func.valueCount());
+    defer allocator.free(uses);
+    dce.countUses(func, uses);
+    var changed = false;
+    for (1..func.blockCount()) |bi| {
+        if (!reachable[bi]) continue;
+        const block: Block = @fromBackingInt(@intCast(bi));
+        const test_loop = countUpTest(func, block) orelse continue;
+        const branch = test_loop.branch;
+        const cmp = func.opcode(test_loop.compare).icmp;
+        const step = func.opcode(test_loop.update).arith_imm;
+        if (uses[@backingInt(branch.cond)] != 1 or uses[@backingInt(cmp.lhs)] != 2 or uses[@backingInt(step.lhs)] != 1) continue;
+        const bound = test_loop.bound;
+        const ty = func.valueType(step.lhs);
+        const kind = func.types.type_kind(ty);
+        if (kind != .int or kind.int.bits != 32 or func.valueType(cmp.rhs) != ty) continue;
+        if (bound > (if (kind.int.signedness == .signed) @as(i64, std.math.maxInt(i32)) else std.math.maxInt(u32))) continue;
+        const index = std.mem.indexOfScalar(Value, func.blockParams(block), step.lhs) orelse continue;
+        if (func.blockArgs(branch.then)[index] != cmp.lhs) continue;
+        var entry: ?u32 = null;
+        for (graph.predecessors(bi)) |pred| {
+            if (pred == bi or !reachable[pred]) continue;
+            if (entry != null) {
+                entry = null;
+                break;
+            }
+            entry = pred;
+        }
+        const predecessor: Block = @fromBackingInt(entry orelse continue);
+        const pre_insts = func.blockInsts(predecessor);
+        const pre_if = if (pre_insts.len > 0 and func.opcode(pre_insts[pre_insts.len - 1]) == .@"if") pre_insts[pre_insts.len - 1] else null;
+        const edge_ptr = if (pre_if) |inst| edge: {
+            const incoming = &func.opcodeMut(inst).@"if";
+            if (incoming.then.target == block and incoming.@"else".target != block) break :edge &incoming.then;
+            if (incoming.@"else".target == block and incoming.then.target != block) break :edge &incoming.@"else";
+            continue;
+        } else edge: {
+            const term = func.terminatorPtr(predecessor);
+            if (term.* == null or term.*.? != .jump or term.*.?.jump.target != block) continue;
+            break :edge &term.*.?.jump;
+        };
+        const incoming = func.blockArgs(edge_ptr.*);
+        if (integerConstant(func, incoming[index]) != 0) continue;
+        const args = try allocator.dupe(Value, incoming);
+        defer allocator.free(args);
+        const zero = args[index];
+        // Reacquire the edge after appending, which can move opcode storage.
+        const initial = try func.appendInst(predecessor, ty, .{ .iconst = bound });
+        if (pre_if != null) {
+            const list = func.blockInstsMut(predecessor).items;
+            std.mem.swap(Inst, &list[list.len - 2], &list[list.len - 1]);
+        }
+        args[index] = initial;
+        const new_args = try func.internValues(args);
+        if (pre_if) |inst| {
+            const incoming_branch = &func.opcodeMut(inst).@"if";
+            if (incoming_branch.then.target == block) incoming_branch.then.args = new_args else incoming_branch.@"else".args = new_args;
+        } else {
+            func.terminatorPtr(predecessor).*.?.jump.args = new_args;
+        }
+        func.opcodeMut(test_loop.update).arith_imm.imm = -1;
+        func.opcodeMut(test_loop.compare).icmp = .{ .op = .ne, .lhs = cmp.lhs, .rhs = zero };
+        changed = true;
+    }
+    return changed;
+}
+
+fn integerConstant(func: *const Function, value: Value) ?i64 {
+    const inst = func.definingInst(value) orelse return null;
+    return switch (func.opcode(inst)) {
+        .iconst => |literal| literal,
+        else => null,
+    };
+}
+
+test "countdown keeps the trip count and preserves an observed counter" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |observed| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const word = try func.types.intern(.{ .int = .{ .bits = 32, .signedness = .unsigned } });
+        const boolean = try func.types.intern(.bool);
+        const entry = try func.appendBlock();
+        const loop = try func.appendBlock();
+        const exit = try func.appendBlock();
+        const zero = try func.appendInst(entry, word, .{ .iconst = 0 });
+        const bound = try func.appendInst(entry, word, .{ .iconst = 64 });
+        const counter = try func.appendBlockParam(loop, word);
+        try func.setJump(entry, loop, &.{zero});
+        const next = try func.appendArithImm(loop, word, .add, counter, 1);
+        const more = try func.appendInst(loop, boolean, .{ .icmp = .{ .op = .lt, .lhs = next, .rhs = bound } });
+        try func.appendIf(loop, more, .{ .target = loop, .args = &.{next} }, .{ .target = exit });
+        func.setTerminator(exit, .{ .ret = ir.function.Ret.one(if (observed) next else zero) });
+        try std.testing.expectEqual(!observed, try countDownConstantLoops(allocator, &func));
+        const initial = func.blockArgs(func.terminator(entry).?.jump)[0];
+        try std.testing.expectEqual(@as(?i64, if (observed) 0 else 64), integerConstant(&func, initial));
+        try std.testing.expectEqual(@as(i64, if (observed) 1 else -1), func.opcode(func.definingInst(next).?).arith_imm.imm);
+        try std.testing.expectEqual(if (observed) ir.function.CmpOp.lt else .ne, func.opcode(func.definingInst(more).?).icmp.op);
+        var diags = try ir.verify.verify(allocator, &func, .high);
+        defer diags.deinit();
+        try std.testing.expect(diags.ok());
+    }
+}
+
+/// Keep the old induction value live through its final reader, then compute
+/// the next value in the same register. Only self-edges identify a definite
+/// carried value here.
+fn scheduleLoopUpdates(allocator: std.mem.Allocator, func: *Function, block: Block) std.mem.Allocator.Error!void {
+    const insts = func.blockInstsMut(block).items;
+    if (insts.len < 2) return;
+    const branch = switch (func.opcode(insts[insts.len - 1])) {
+        .@"if" => |branch| branch,
+        else => return,
+    };
+    const edge = if (branch.then.target == block) branch.then else if (branch.@"else".target == block) branch.@"else" else return;
+    const params = func.blockParams(block);
+    const args = func.blockArgs(edge);
+    if (params.len != args.len) return;
+    const delay_pointer_steps = hasIndependentWordAccesses(func, insts);
+    var operands: std.ArrayList(Value) = .empty;
+    defer operands.deinit(allocator);
+    // Schedule derived updates before direct recurrences so a direct
+    // recurrence can respect any reader moved by the first pass.
+    for ([_]bool{ false, true }) |direct_pass| for (params, args) |old, next| {
+        const update = func.definingInst(next) orelse continue;
+        if (delay_pointer_steps and direct_pass and func.types.type_kind(func.valueType(next)) == .ptr) {
+            const op = func.opcode(update);
+            if (op == .arith_imm and op.arith_imm.op == .add and op.arith_imm.lhs == old) {
+                try delayUpdatePastReaders(allocator, func, insts, update, old, next, &operands);
+            }
+            continue;
+        }
+        const add = switch (func.opcode(update)) {
+            .arith => |add| if (add.op == .add) add else continue,
+            else => continue,
+        };
+        if (func.types.type_kind(func.valueType(next)) != .int) continue;
+        const direct = add.lhs == old or add.rhs == old;
+        if (direct != direct_pass) continue;
+        const source = if (direct) invariant: {
+            const step = if (add.lhs == old) add.rhs else add.lhs;
+            if (std.mem.indexOfScalar(Value, params, step) != null) continue;
+            if (func.definingInst(step)) |def|
+                if (std.mem.indexOfScalar(Inst, insts, def) != null) continue;
+            break :invariant old;
+        } else intermediate: {
+            // The other input is a different carried value. Look through
+            // the immediately preceding arithmetic chain for this one.
+            const derived = if (std.mem.indexOfScalar(Value, params, add.lhs) != null)
+                add.rhs
+            else if (std.mem.indexOfScalar(Value, params, add.rhs) != null)
+                add.lhs
+            else
+                continue;
+            if (!readsThroughArithmetic(func, derived, old, 4)) continue;
+            break :intermediate derived;
+        };
+        try delayUpdatePastReaders(allocator, func, insts, update, source, next, &operands);
+    };
+}
+
+fn delayUpdatePastReaders(allocator: std.mem.Allocator, func: *const Function, insts: []Inst, update: Inst, source: Value, next: Value, operands: *std.ArrayList(Value)) !void {
+    const start = std.mem.indexOfScalar(Inst, insts, update) orelse return;
+    var end = start;
+    for (insts[start + 1 .. insts.len - 1], start + 1..) |inst, index| {
+        try collectOperands(allocator, func, inst, operands);
+        if (std.mem.indexOfScalar(Value, operands.items, next) != null) break;
+        if (std.mem.indexOfScalar(Value, operands.items, source) != null) end = index;
+    }
+    if (end != start) std.mem.rotate(Inst, insts[start .. end + 1], 1);
+}
+
+fn readsThroughArithmetic(func: *const Function, value: Value, needle: Value, depth: u3) bool {
+    if (value == needle) return true;
+    if (depth == 0) return false;
+    const def = func.definingInst(value) orelse return false;
+    return switch (func.opcode(def)) {
+        .arith => |a| readsThroughArithmetic(func, a.lhs, needle, depth - 1) or readsThroughArithmetic(func, a.rhs, needle, depth - 1),
+        .arith_imm => |a| readsThroughArithmetic(func, a.lhs, needle, depth - 1),
+        else => false,
+    };
+}
+
+test "a carried integer update follows the last read of its old value" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_ty = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const initial = try func.appendBlockParam(entry, ty);
+    const step = try func.appendBlockParam(entry, ty);
+    const cond = try func.appendBlockParam(entry, bool_ty);
+    const current = try func.appendBlockParam(body, ty);
+    try func.setJump(entry, body, &.{initial});
+    const next = try func.appendInst(body, ty, .{ .arith = .{ .op = .add, .lhs = current, .rhs = step } });
+    const use = try func.appendArithImm(body, ty, .bit_xor, current, 1);
+    try func.appendIf(body, cond, .{ .target = body, .args = &.{next} }, .{ .target = done });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(use) });
+
+    try scheduleLoopUpdates(allocator, &func, body);
+    const insts = func.blockInsts(body);
+    try std.testing.expectEqual(func.definingInst(use).?, insts[0]);
+    try std.testing.expectEqual(func.definingInst(next).?, insts[1]);
+}
+
 /// Start a pointer chase before independent work on the current object. Ordinary
 /// reads may pass other ordinary reads, but never a write, volatile access,
 /// control transfer, or potentially trapping division. Keep pointer reads in
 /// their original relative order to avoid inflating several live pointer chains.
-fn hoistPointerLoads(func: *Function, block: Block) void {
+fn hoistPointerLoads(func: *Function, block: Block, cross_loads: bool) void {
     const insts = func.blockInstsMut(block).items;
     if (insts.len < 2) return;
     for (1..insts.len) |index| {
@@ -223,7 +499,7 @@ fn hoistPointerLoads(func: *Function, block: Block) void {
             if (func.instResult(prior) == load.ptr) break;
             switch (func.opcode(prior)) {
                 .load => |other| {
-                    if (other.@"volatile" or other.mask != null or func.isByteOrderTagged(prior)) break;
+                    if (!cross_loads or other.@"volatile" or other.mask != null or func.isByteOrderTagged(prior)) break;
                     const value = func.instResult(prior).?;
                     if (func.types.type_kind(func.valueType(value)) == .ptr) break;
                 },
@@ -255,7 +531,7 @@ test "pointer loads start before independent work without crossing writes or dep
     f.setTerminator(block, .{ .ret = ir.function.Ret.one(after) });
     const original = try allocator.dupe(Inst, f.blockInsts(block));
     defer allocator.free(original);
-    hoistPointerLoads(&f, block);
+    hoistPointerLoads(&f, block, true);
     try std.testing.expectEqualSlices(Inst, &.{ original[2], original[0], original[1], original[3], original[4] }, f.blockInsts(block));
 }
 
@@ -275,7 +551,7 @@ test "pointer loads do not cross volatile reads or divisions" {
     f.setTerminator(block, .{ .ret = ir.function.Ret.one(after) });
     const original = try allocator.dupe(Inst, f.blockInsts(block));
     defer allocator.free(original);
-    hoistPointerLoads(&f, block);
+    hoistPointerLoads(&f, block, true);
     try std.testing.expectEqualSlices(Inst, original, f.blockInsts(block));
 }
 
@@ -421,12 +697,12 @@ fn restoreCompareBranchPairs(func: *Function, block: Block, uses: []const u32) v
 }
 
 /// The resource scheduler separates independent multiplies to cover their latency. AArch64's
-/// MLA/FMLA selection and post-allocation integer MADD peephole instead need each single-use product
+/// MLA/FMLA selection, its integer MADD peephole, and RISC-V's scalar FMADD need a single-use product
 /// adjacent to its add, so restore those pairs after scoreboarding. This is the handoff from the IR
 /// resource schedule to the stricter machine rewrite: moving a pure producer later preserves every
 /// dependency, and the machine layer only accepts the pair when it can replace two instructions by
 /// one exact target instruction.
-fn restoreMultiplyAddPairs(func: *Function, block: Block, uses: []const u32) void {
+fn restoreMultiplyAddPairs(func: *Function, block: Block, uses: []const u32, c906: bool) void {
     const Consumer = struct {
         op: ir.function.BinOp,
         candidates: [2]Value,
@@ -449,6 +725,9 @@ fn restoreMultiplyAddPairs(func: *Function, block: Block, uses: []const u32) voi
         if (consumer.op != .add and consumer.op != .sub) continue;
         const result = func.instResult(insts[consumer_index]) orelse continue;
         const result_kind = func.types.type_kind(func.valueType(result));
+        if (c906 and !(result_kind == .float and
+            (result_kind.float == .f32 or result_kind.float == .f64)) and
+            !(result_kind == .int and result_kind.int.bits == 32 and consumer.op == .add and consumer.candidate_count == 2)) continue;
         const scalar_integer = switch (result_kind) {
             .int => true,
             else => false,
@@ -472,6 +751,19 @@ fn restoreMultiplyAddPairs(func: *Function, block: Block, uses: []const u32) voi
                 else => continue,
             };
             if (multiply.op != .mul) continue;
+            if (c906 and scalar_integer) {
+                const accumulator = if (consumer.candidates[0] == product) consumer.candidates[1] else consumer.candidates[0];
+                const loaded_accumulator = if (func.definingInst(accumulator)) |def|
+                    func.opcode(def) == .load and uses[@backingInt(accumulator)] == 1
+                else
+                    false;
+                if (!loaded_accumulator) {
+                    if (std.mem.indexOfScalar(Value, func.blockParams(block), accumulator) == null) continue;
+                    const left = func.definingInst(multiply.lhs) orelse continue;
+                    const right = func.definingInst(multiply.rhs) orelse continue;
+                    if (func.opcode(left) != .load or func.opcode(right) != .load) continue;
+                }
+            }
             const producer_index = std.mem.indexOfScalar(Inst, insts[0..consumer_index], producer) orelse continue;
             if (producer_index + 1 == consumer_index) break;
             std.mem.rotate(Inst, insts[producer_index..consumer_index], 1);
@@ -703,6 +995,7 @@ fn scheduleBlock(allocator: std.mem.Allocator, func: *Function, block: Block, mo
     const pinned = try allocator.alloc(bool, n);
     defer allocator.free(pinned);
     for (insts, 0..) |inst, i| pinned[i] = !movable(func.opcode(inst));
+    const schedule_word_memory = model.tag == .@"thead-c906" and hasIndependentWordAccesses(func, insts);
 
     const local_of = try allocator.alloc(usize, func.valueCount());
     defer allocator.free(local_of);
@@ -761,19 +1054,20 @@ fn scheduleBlock(allocator: std.mem.Allocator, func: *Function, block: Block, mo
                 if (i >= lo + window) break;
                 if (scheduled[i]) continue;
 
-                // Barrier ordering: a pinned instruction waits for everything before it, and any
-                // instruction waits for every pinned instruction before it. Checking the nearest
-                // preceding barrier suffices, since a barrier itself waits for all earlier ones.
+                // Full barriers wait for everything before them. When ordinary memory
+                // accesses can pass each other, check every earlier conflicting access.
                 var barrier_ok = true;
                 var j = i;
                 while (j > 0) {
                     j -= 1;
-                    if (pinned[i] or pinned[j]) {
+                    if ((pinned[i] or pinned[j]) and (!schedule_word_memory or
+                        !canReorderWordAccess(func, insts[j], insts[i])))
+                    {
                         if (!scheduled[j]) {
                             barrier_ok = false;
                             break;
                         }
-                        if (pinned[j] and !pinned[i]) break;
+                        if (!schedule_word_memory and pinned[j] and !pinned[i]) break;
                     }
                 }
                 if (!barrier_ok) continue;
@@ -829,6 +1123,91 @@ fn scheduleBlock(allocator: std.mem.Allocator, func: *Function, block: Block, mo
     }
 
     try func.setBlockInsts(block, order.items);
+}
+
+const WordAccess = struct { ptr: Value, value: Value, store: bool };
+
+fn wordAccess(func: *const Function, inst: Inst) ?WordAccess {
+    if (func.isByteOrderTagged(inst)) return null;
+    const access: WordAccess = switch (func.opcode(inst)) {
+        .load => |l| if (!l.@"volatile" and l.mask == null)
+            .{ .ptr = l.ptr, .value = func.instResult(inst).?, .store = false }
+        else
+            return null,
+        .store => |s| if (!s.@"volatile" and s.mask == null)
+            .{ .ptr = s.ptr, .value = s.value, .store = true }
+        else
+            return null,
+        else => return null,
+    };
+    const ty = func.types.type_kind(func.valueType(access.value));
+    return if (ty == .int and ty.int.bits == 32) access else null;
+}
+
+fn disjointAccesses(func: *const Function, a: WordAccess, b: WordAccess) bool {
+    return !loadfwd.mayAlias(func, a.ptr, func.valueType(a.value), b.ptr, func.valueType(b.value));
+}
+
+fn hasIndependentWordAccesses(func: *const Function, insts: []const Inst) bool {
+    var reads: usize = 0;
+    for (insts, 0..) |inst, index| {
+        const store = wordAccess(func, inst) orelse {
+            if (!movable(func.opcode(inst))) reads = 0;
+            continue;
+        };
+        if (!store.store) {
+            reads += 1;
+            continue;
+        }
+        // Issue a run of ordinary loads before their arithmetic consumers.
+        if (reads >= 3) return true;
+        reads = 0;
+        for (insts[index + 1 ..]) |later| {
+            const load = wordAccess(func, later) orelse continue;
+            if (!load.store and disjointAccesses(func, store, load)) return true;
+        }
+    }
+    return false;
+}
+
+fn canReorderWordAccess(func: *const Function, a: Inst, b: Inst) bool {
+    const first = wordAccess(func, a);
+    const second = wordAccess(func, b);
+    if (first != null and second != null) {
+        if (first.?.store and second.?.store) return false;
+        return (!first.?.store and !second.?.store) or disjointAccesses(func, first.?, second.?);
+    }
+    if (first == null and second == null) return false;
+    const other = func.opcode(if (first == null) a else b);
+    return switch (other) {
+        .arith => |x| x.op != .div and x.op != .rem,
+        .arith_imm => |x| x.op != .div and x.op != .rem,
+        else => movable(other),
+    };
+}
+
+test "C906 word scheduling preserves overlap and volatile dependencies" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const word_t = try func.types.intern(.{ .int = .{ .bits = 32, .signedness = .unsigned } });
+    const block = try func.appendBlock();
+    const base = try func.appendBlockParam(block, ptr_t);
+    const unknown = try func.appendBlockParam(block, ptr_t);
+    const word = try func.appendBlockParam(block, word_t);
+    const overlapping = try func.appendArithImm(block, ptr_t, .add, base, 2);
+    const adjacent = try func.appendArithImm(block, ptr_t, .add, base, 4);
+    try func.appendStore(block, word, base);
+    const store = func.blockInsts(block)[2];
+    const overlap_load = try func.appendInst(block, word_t, .{ .load = .{ .ptr = overlapping } });
+    const unknown_load = try func.appendInst(block, word_t, .{ .load = .{ .ptr = unknown } });
+    const adjacent_load = try func.appendInst(block, word_t, .{ .load = .{ .ptr = adjacent } });
+    const volatile_load = try func.appendInst(block, word_t, .{ .load = .{ .ptr = adjacent, .@"volatile" = true } });
+    try std.testing.expect(!canReorderWordAccess(&func, store, func.definingInst(overlap_load).?));
+    try std.testing.expect(!canReorderWordAccess(&func, store, func.definingInst(unknown_load).?));
+    try std.testing.expect(canReorderWordAccess(&func, store, func.definingInst(adjacent_load).?));
+    try std.testing.expect(!canReorderWordAccess(&func, store, func.definingInst(volatile_load).?));
 }
 
 test "scheduler keeps a single-use shift beside its fused add" {

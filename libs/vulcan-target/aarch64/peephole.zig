@@ -334,7 +334,7 @@ fn decodeStruct4(word: u32) ?Struct4 {
 
 fn decodePairMemory(word: u32) ?PairMemory {
     return switch (word & 0xFFC00000) {
-        0xA9400000, 0xA9000000, 0x29400000, 0x29000000 => .{ .simd = false },
+        0xA9400000, 0xA9000000, 0x29400000, 0x29000000, 0x69400000 => .{ .simd = false },
         0xAD400000, 0xAD000000 => .{ .simd = true },
         0xACC00000, 0xAC800000 => .{ .simd = true, .writeback = true },
         else => null,
@@ -383,7 +383,7 @@ fn ceilDiv(numerator: u32, denominator: u32) u32 {
 
 /// The offset-form ldr/str encodings the aarch64 isel emits. Anything else is opaque to this
 /// peephole and decodes to null.
-pub const MemKind = enum { ldr_x, str_x, ldr_w, str_w, ldr_s, str_s, ldr_d, str_d, ldr_q, str_q };
+pub const MemKind = enum { ldr_x, str_x, ldr_w, str_w, ldr_sw, ldr_s, str_s, ldr_d, str_d, ldr_q, str_q };
 
 /// A decoded memory instruction. `off` is the BYTE offset: the raw u12 scaled-imm field already
 /// multiplied out by the element size, so two decoded insns can be compared directly regardless
@@ -394,7 +394,7 @@ pub const MemInsn = struct { kind: MemKind, rt: u5, rn: u5, off: u32 };
 fn sizeOf(kind: MemKind) u32 {
     return switch (kind) {
         .ldr_x, .str_x, .ldr_d, .str_d => 8,
-        .ldr_w, .str_w, .ldr_s, .str_s => 4,
+        .ldr_w, .str_w, .ldr_sw, .ldr_s, .str_s => 4,
         .ldr_q, .str_q => 16,
     };
 }
@@ -403,7 +403,7 @@ fn sizeOf(kind: MemKind) u32 {
 /// into memory and never overwrites a register.
 fn isLoad(kind: MemKind) bool {
     return switch (kind) {
-        .ldr_x, .ldr_w, .ldr_s, .ldr_d, .ldr_q => true,
+        .ldr_x, .ldr_w, .ldr_sw, .ldr_s, .ldr_d, .ldr_q => true,
         .str_x, .str_w, .str_s, .str_d, .str_q => false,
     };
 }
@@ -413,6 +413,13 @@ fn isLoad(kind: MemKind) bool {
 /// register-offset addressing modes for the same size/class live at a different bit-24 value
 /// and so never collide with these classes.
 const class_mask: u32 = 0xFFC00000;
+
+test "adjacent signed word loads pair without changing their destination width" {
+    const first = decodeMem(encode.ldrsw(.x5, .x1, 8)).?;
+    const second = decodeMem(encode.ldrsw(.x6, .x1, 12)).?;
+    try std.testing.expectEqual(@as(?u32, 0x69411825), tryFuse(first, second));
+    try std.testing.expectEqual(@as(?u32, null), tryFuse(first, decodeMem(encode.ldrsw(.x5, .x1, 12)).?));
+}
 
 /// Decode `word` if it is one of the recognized offset-form ldr/str encodings, else null.
 /// Classes below are cross-checked one-for-one against encode.zig:
@@ -429,6 +436,7 @@ pub fn decodeMem(word: u32) ?MemInsn {
         0xF9400000 => .ldr_x,
         0xF9000000 => .str_x,
         0xB9400000 => .ldr_w,
+        0xB9800000 => .ldr_sw,
         0xB9000000 => .str_w,
         0xBD400000 => .ldr_s,
         0xBD000000 => .str_s,
@@ -462,7 +470,7 @@ pub fn tryFuse(a: MemInsn, b: MemInsn) ?u32 {
     if (b.off != a.off + size) return null;
     if (isLoad(a.kind)) {
         if (a.rt == b.rt) return null;
-        if ((a.kind == .ldr_x or a.kind == .ldr_w) and a.rt == a.rn) return null;
+        if ((a.kind == .ldr_x or a.kind == .ldr_w or a.kind == .ldr_sw) and a.rt == a.rn) return null;
     }
     const imm7: u32 = a.off / size;
     if (imm7 > 63) return null;
@@ -475,6 +483,7 @@ pub fn tryFuse(a: MemInsn, b: MemInsn) ?u32 {
         .ldr_x => encode.ldpOffX(rt1, rt2, rn, imm),
         .str_x => encode.stpOffX(rt1, rt2, rn, imm),
         .ldr_w => encode.ldpOffW(rt1, rt2, rn, imm),
+        .ldr_sw => encode.ldpsw(rt1, rt2, rn, imm),
         .str_w => encode.stpOffW(rt1, rt2, rn, imm),
         .ldr_q => encode.ldpOffQ(rt1, rt2, rn, imm),
         .str_q => encode.stpOffQ(rt1, rt2, rn, imm),
@@ -1370,6 +1379,7 @@ test "decodeMem recognizes each ldr/str offset form and rejects a non-memory wor
     try t.expectEqual(MemInsn{ .kind = .ldr_x, .rt = 0, .rn = 1, .off = 16 }, decodeMem(encode.ldrOff(.x0, .x1, 16)).?);
     try t.expectEqual(MemInsn{ .kind = .str_x, .rt = 2, .rn = 3, .off = 8 }, decodeMem(encode.strOff(.x2, .x3, 8)).?);
     try t.expectEqual(MemInsn{ .kind = .ldr_w, .rt = 4, .rn = 5, .off = 12 }, decodeMem(encode.ldrW(.x4, .x5, 12)).?);
+    try t.expectEqual(MemInsn{ .kind = .ldr_sw, .rt = 4, .rn = 5, .off = 12 }, decodeMem(encode.ldrsw(.x4, .x5, 12)).?);
     try t.expectEqual(MemInsn{ .kind = .str_w, .rt = 6, .rn = 7, .off = 4 }, decodeMem(encode.strW(.x6, .x7, 4)).?);
     try t.expectEqual(MemInsn{ .kind = .ldr_s, .rt = 0, .rn = 1, .off = 8 }, decodeMem(encode.ldrFp(.x0, .x1, 8, false)).?);
     try t.expectEqual(MemInsn{ .kind = .str_s, .rt = 2, .rn = 3, .off = 4 }, decodeMem(encode.strFp(.x2, .x3, 4, false)).?);

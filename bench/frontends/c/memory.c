@@ -15,20 +15,20 @@ void update_particles(struct particle *particles, unsigned count, int dt) {
   }
 }
 
-int stencil(const int *input, int *output, unsigned count) {
-  int checksum = 0;
+unsigned stencil(const unsigned *input, unsigned *output, unsigned count) {
+  unsigned checksum = 0;
   for (unsigned i = 1; i + 1 < count; ++i) {
-    int value = input[i - 1] + input[i] * 2 + input[i + 1];
+    unsigned value = input[i - 1] + input[i] * 2u + input[i + 1];
     output[i] = value;
     checksum ^= value;
   }
   return checksum;
 }
 
-void copy_scaled(const int *source, int *destination, unsigned count,
-                 int scale) {
+void copy_scaled(const unsigned *source, unsigned *destination, unsigned count,
+                 unsigned scale) {
   for (unsigned i = 0; i < count; ++i)
-    destination[i] = source[i] * scale + (int)i;
+    destination[i] = source[i] * scale + i;
 }
 
 #ifdef BENCH_EXECUTE
@@ -37,23 +37,23 @@ void copy_scaled(const int *source, int *destination, unsigned count,
 int main(void) {
   enum { count = 4096 };
   static struct particle particles[count];
-  static int source[count];
-  static int scratch[count];
-  int checksum = 0;
+  static unsigned source[count];
+  static unsigned scratch[count];
+  unsigned checksum = 0;
   for (unsigned i = 0; i < count; ++i) {
     particles[i].x = (int)i;
     particles[i].y = (int)(i * 3u);
     particles[i].z = (int)(i * 7u);
     particles[i].velocity = (int)(i & 31u) - 16;
-    source[i] = (int)(i & 255u) - 128;
+    source[i] = (i & 255u) - 128u;
   }
   for (unsigned iteration = 0; iteration < 4000; ++iteration) {
     update_particles(particles, count, (int)(iteration & 3u) + 1);
-    copy_scaled(source, scratch, count, (int)(iteration & 7u) + 1);
+    copy_scaled(source, scratch, count, (iteration & 7u) + 1u);
     checksum ^= stencil(scratch, source, count);
   }
   checksum ^= particles[17].x ^ particles[2049].velocity ^ source[1024];
-  printf("%d\n", checksum);
+  printf("%u\n", checksum);
   return 0;
 }
 #endif

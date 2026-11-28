@@ -205,6 +205,7 @@ pub const ObjSection = struct {
 /// relocations (in `ObjSection.relocs`).
 pub const ParsedObject = struct {
     arch: Arch,
+    flags: u32 = 0,
     symbols: []ObjSymbol,
     /// Every `SHF_ALLOC` section of the object, one entry each, in section-header
     /// order, with no same-class collapsing. This is the arbitrary-named-section
@@ -589,6 +590,7 @@ fn parseObject64(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
 
     return .{
         .arch = arch,
+        .flags = try rdInt(u32, buf, 48),
         .symbols = symbols,
         .sections = try sections.toOwnedSlice(allocator),
     };

@@ -238,6 +238,10 @@ fn jimm(w: u32) i32 {
 
 fn decode(a: std.mem.Allocator, b: *std.ArrayList(u8), w: u32, ctx: ?Context) !void {
     switch (w & 0x7F) {
+        0b0001011 => if (w >> 27 == 0 and (w >> 12) & 7 == 1)
+            try b.print(a, "th.addsl x{d}, x{d}, x{d}, {d}", .{ rd(w), rs1(w), rs2(w), (w >> 25) & 3 })
+        else
+            try b.print(a, ".word 0x{x:0>8}", .{w}),
         0b0110011 => try opReg(a, b, w),
         0b0111011 => try opReg32(a, b, w), // OP-32: addw/subw/sllw/... (RV64 word ops)
         0b0010011 => try opImm(a, b, w),

@@ -270,9 +270,34 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 
     var changed = false;
     for (info.loops) |*loop| {
-        if (try reduceLoop(allocator, func, loop, containsLoop(info, loop))) changed = true;
+        if (try reduceLoop(allocator, func, loop, containsLoop(info, loop), null)) changed = true;
     }
     return changed;
+}
+
+pub const guarded_pass_def = pass.Pass{ .name = "ivsr-guarded", .run = runGuarded };
+
+const GuardedEntry = struct { block: Block, branch: ir.function.Inst, is_then: bool };
+
+fn runGuarded(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
+    for (func.attributeEntries()) |entry| if (entry.target == .block) return false;
+    const info = try analyses.loops();
+    for (info.loops) |*loop| {
+        if (loop.preheader != null or containsLoop(info, loop)) continue;
+        const block: Block = @fromBackingInt(@intCast(loop.entry orelse continue));
+        const insts = func.blockInsts(block);
+        if (insts.len == 0) continue;
+        const branch = insts[insts.len - 1];
+        const cf = switch (func.opcode(branch)) {
+            .@"if" => |c| c,
+            else => continue,
+        };
+        const on_then = @backingInt(cf.then.target) == loop.header;
+        const on_else = @backingInt(cf.@"else".target) == loop.header;
+        if (on_then == on_else) continue;
+        if (try reduceLoop(allocator, func, loop, false, .{ .block = block, .branch = branch, .is_then = on_then })) return true;
+    }
+    return false;
 }
 
 fn containsLoop(info: *const loops_mod.LoopInfo, loop: *const loops_mod.Loop) bool {
@@ -315,6 +340,7 @@ const LoopCtx = struct {
     nowrap_bivs: u64 = 0,
     /// Whether another loop is inside this one.
     outer: bool = false,
+    guarded: bool = false,
 
     /// Whether `v` holds one value for the whole loop.
     fn invariant(self: *const LoopCtx, v: Value) bool {
@@ -329,8 +355,8 @@ const LoopCtx = struct {
 };
 
 /// Reduce one loop. Returns whether it changed the function.
-fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_mod.Loop, outer: bool) pass.Error!bool {
-    const preheader_index = loop.preheader orelse return false;
+fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_mod.Loop, outer: bool, guarded: ?GuardedEntry) pass.Error!bool {
+    const preheader: Block = if (guarded) |entry| entry.block else @fromBackingInt(@intCast(loop.preheader orelse return false));
     const latch_index = findLatch(func, loop) orelse return false;
 
     const value_count = func.valueCount();
@@ -357,7 +383,7 @@ fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_
         .loop = loop,
         .header = @fromBackingInt(@intCast(loop.header)),
         .latch = @fromBackingInt(@intCast(latch_index)),
-        .preheader = @fromBackingInt(@intCast(preheader_index)),
+        .preheader = preheader,
         .def_block = def_block,
         .alias = alias,
         .affine = affine,
@@ -367,6 +393,7 @@ fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_
         .chain_safe = chain_safe,
         .substitute = substitute,
         .outer = outer,
+        .guarded = guarded != null,
     };
     fillDefBlocks(func, def_block);
 
@@ -377,9 +404,20 @@ fn reduceLoop(allocator: std.mem.Allocator, func: *Function, loop: *const loops_
     var riders: std.ArrayList(Rider) = .empty;
     defer riders.deinit(allocator);
 
-    try analyzeLoop(allocator, &ctx, &pool, &plan, &riders);
+    const entry_edge = if (guarded) |entry| edge: {
+        const branch = func.opcode(entry.branch).@"if";
+        break :edge if (entry.is_then) branch.then else branch.@"else";
+    } else func.terminator(preheader).?.jump;
+    try analyzeLoop(allocator, &ctx, &pool, &plan, &riders, func.blockArgs(entry_edge));
     if (plan.items.len == 0) return false;
 
+    if (guarded) |entry| {
+        ctx.preheader = try func.appendBlock();
+        func.setTerminator(ctx.preheader, .{ .jump = entry_edge });
+        const branch = &func.opcodeMut(entry.branch).@"if";
+        const edge = if (entry.is_then) &branch.then else &branch.@"else";
+        edge.* = .{ .target = ctx.preheader, .args = try func.internValues(&.{}) };
+    }
     try applyPlan(allocator, func, &ctx, &pool, plan.items, riders.items);
     return true;
 }
@@ -454,7 +492,8 @@ fn termOf(allocator: std.mem.Allocator, ctx: *const LoopCtx, pool: *Pool, ty: Ty
             else => {},
         };
     }
-    if (source != null and target != null and source.?.signedness == .unsigned and target.?.bits > source.?.bits)
+    if (source != null and target != null and target.?.bits > source.?.bits and
+        (ctx.guarded or source.?.signedness == .unsigned))
         return pool.convert(allocator, ty, named);
     return pool.value(allocator, ty, named);
 }
@@ -486,14 +525,13 @@ fn fillSubstitutions(ctx: *LoopCtx, header_params: []const Value, latch_args: []
 
 /// Find the reducible values of one loop and append a `Reduction` for each, coalescing a pointer
 /// candidate onto an existing family instead when `coalescable` finds one (see `Rider`).
-fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *std.ArrayList(Reduction), riders: *std.ArrayList(Rider)) pass.Error!void {
+fn analyzeLoop(allocator: std.mem.Allocator, ctx: *LoopCtx, pool: *Pool, plan: *std.ArrayList(Reduction), riders: *std.ArrayList(Rider), pre_args: []const Value) pass.Error!void {
     const func = ctx.func;
     try fillAliases(allocator, ctx);
 
     @memset(ctx.affine, null);
     const header_params = func.blockParams(ctx.header);
     const latch_args = func.blockArgs(func.terminator(ctx.latch).?.jump);
-    const pre_args = func.blockArgs(func.terminator(ctx.preheader).?.jump);
     if (latch_args.len != header_params.len or pre_args.len != header_params.len) return;
     fillSubstitutions(ctx, header_params, latch_args, pre_args);
 
@@ -2032,6 +2070,41 @@ test "leaves a loop with no preheader alone" {
 
     try testing.expect(!try runPass(allocator, &func));
     try testing.expectEqual(@as(usize, 1), func.blockParams(head).len);
+}
+
+test "a guarded pointer recurrence initializes only on the loop entry edge" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const word = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr = try func.types.ptrGlobal();
+    const boolean = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const base = try func.appendBlockParam(entry, ptr);
+    const bound = try func.appendBlockParam(entry, word);
+    const guard = try func.appendBlockParam(entry, boolean);
+    const loop = try buildCounted(&func, bound, word, entry);
+    const bypass = try func.appendBlock();
+    func.setTerminator(bypass, .{ .ret = ir.function.Ret.one(bound) });
+    const args = try allocator.dupe(Value, func.blockArgs(func.terminator(entry).?.jump));
+    defer allocator.free(args);
+    func.terminatorPtr(entry).* = null;
+    try func.appendIf(entry, guard, .{ .target = loop.head, .args = args }, .{ .target = bypass });
+    const offset = try func.appendArithImm(loop.body, word, .mul, loop.bk, 4);
+    const address = try func.appendInst(loop.body, ptr, .{ .arith = .{ .op = .add, .lhs = base, .rhs = offset } });
+    const item = try func.appendInst(loop.body, word, .{ .load = .{ .ptr = address } });
+    try closeCounted(&func, loop, item);
+
+    try testing.expect(try pass.run(allocator, &func, &.{guarded_pass_def}));
+    const branch = func.opcode(func.blockInsts(entry)[1]).@"if";
+    try testing.expectEqual(bypass, branch.@"else".target);
+    const init = func.terminator(branch.then.target).?.jump;
+    try testing.expectEqual(loop.head, init.target);
+    try testing.expectEqual(base, func.blockArgs(init)[2]);
+    try testing.expectEqual(func.blockParams(loop.head)[2], func.opcode(func.definingInst(item).?).load.ptr);
+    var diagnostics = try ir.verify.verify(allocator, &func, .high);
+    defer diagnostics.deinit();
+    try testing.expect(diagnostics.ok());
 }
 
 test "leaves a product the back edge already carries alone" {

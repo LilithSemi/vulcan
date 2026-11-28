@@ -18,6 +18,7 @@ const isel = @import("isel.zig");
 const link = @import("link.zig");
 const ld = @import("vulcan-link");
 const encode = @import("encode.zig");
+const compress = @import("compress.zig");
 const dwarf = @import("../dwarf.zig");
 const object_emit = @import("../object_emit.zig");
 const harness = @import("tests/harness.zig");
@@ -259,6 +260,62 @@ fn dataSectionName(a: std.mem.Allocator, class: []const u8, name: []const u8) Er
     return std.fmt.allocPrint(a, ".{s}.{s}", .{ class, bare });
 }
 
+fn moduleObjectConfig(module: *const link.Module) object_emit.Config {
+    var cfg: object_emit.Config = .{ .class = .elf64, .machine = EM_RISCV, .use_rela = true };
+    if (module.model) |model| {
+        // The C906 Linux target uses the LP64D calling convention.
+        if (model.tag == .@"thead-c906") cfg.e_flags = 0x5; // EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC
+    }
+    return cfg;
+}
+
+const EncodedText = struct {
+    bytes: []u8,
+    offsets: ?[]usize = null,
+
+    fn byteOffset(self: EncodedText, word: usize) usize {
+        return if (self.offsets) |offsets| offsets[word] else word * 4;
+    }
+};
+
+fn encodeText(allocator: std.mem.Allocator, compiled: isel.Compiled, rvc: bool) Error!EncodedText {
+    if (rvc) {
+        const pinned = try allocator.alloc(usize, compiled.relocs.len);
+        defer allocator.free(pinned);
+        for (compiled.relocs, pinned) |reloc, *site| site.* = reloc.offset;
+        const offsets = try allocator.alloc(usize, compiled.code.len + 1);
+        errdefer allocator.free(offsets);
+        return .{
+            .bytes = try compress.compressPinned(allocator, compiled.code, pinned, offsets),
+            .offsets = offsets,
+        };
+    }
+    const bytes = try allocator.alloc(u8, compiled.code.len * 4);
+    for (compiled.code, 0..) |word, wi| putInt(bytes[wi * 4 ..][0..4], u32, word);
+    return .{ .bytes = bytes };
+}
+
+fn appendModelAttributes(allocator: std.mem.Allocator, sections: *std.ArrayList(object_emit.OutSection), module: *const link.Module) Error!void {
+    const model = module.model orelse return;
+    if (model.tag != .@"thead-c906") return;
+    // Format A, the riscv vendor subsection, then Tag_File and Tag_RISCV_arch.
+    const bytes = comptime attrs: {
+        const arch = "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_zicsr2p0_zifencei2p0_xtheadba1p0_xtheadmac1p0\x00";
+        var section = "A\x00\x00\x00\x00riscv\x00\x01\x00\x00\x00\x00\x05".* ++ arch.*;
+        std.mem.writeInt(u32, section[1..5], section.len - 1, .little);
+        std.mem.writeInt(u32, section[12..16], section.len - 11, .little);
+        break :attrs section;
+    };
+    try sections.append(allocator, .{
+        .name = ".riscv.attributes",
+        .sh_type = 0x70000003, // SHT_RISCV_ATTRIBUTES
+        .flags = 0,
+        .bytes = &bytes,
+        .size = bytes.len,
+        .addralign = 1,
+    });
+}
+
 /// Compile every function in `module`, and serialize them and its data globals into one ELF
 /// relocatable object. Each function becomes its own `.text.<name>` section with a defined
 /// `STT_FUNC` symbol at offset 0. Each data global becomes its own `.rodata.<name>`,
@@ -299,8 +356,8 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
     for (module.entries.items) |entry| {
         var compiled = try isel.compileFunction(allocator, entry.func, caps);
         defer compiled.deinit(allocator);
-        const code = try a.alloc(u8, compiled.code.len * 4);
-        for (compiled.code, 0..) |word, wi| putInt(code[wi * 4 ..][0..4], u32, word);
+        const text = try encodeText(a, compiled, caps.tune_c906);
+        const code = text.bytes;
         const sec_index = sections.items.len;
         try sections.append(a, .{
             .name = try std.fmt.allocPrint(a, ".text.{s}", .{entry.name}),
@@ -315,22 +372,20 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
         // name. Both get LOCAL binding.
         const binding: object_emit.Binding = if (entry.func.is_local or std.mem.startsWith(u8, entry.name, ".")) .local else .global;
         try symbols.append(a, .{ .name = entry.name, .section = @intCast(sec_index), .value = 0, .size = code.len, .binding = binding, .sym_type = .func, .defined = true });
-        // Rebase each relocation section-relative. Its offset was a word index into this
-        // function's own code, so multiply by 4.
+        // Rebase instruction indices to byte offsets within the function section.
         for (compiled.relocs) |r| {
-            const off = @as(u64, r.offset) * 4;
+            const off = text.byteOffset(r.offset);
             switch (r.kind) {
                 .call, .pcrel_hi20, .got_hi20 => try named_relocs.append(a, .{ .sec = sec_index, .offset = off, .name = r.symbol, .r_type = @backingInt(relocTypeOf(r.kind)) }),
                 .pcrel_lo12 => {
                     // Synthesize a local label at the paired `auipc`. It lives in THIS
-                    // function's section, at the `auipc`'s within-section byte offset (the
-                    // paired word index times 4), NOT at 0. The low reloc below targets it by
+                    // function's section at the `auipc`'s byte offset. The low reloc below targets it by
                     // this symbol index, so the high/low pair resolves through the label once
                     // the relocs are section-relative.
                     const aux_index: u32 = @intCast(symbols.items.len);
                     const name = try std.fmt.allocPrint(a, ".Lpcrel_hi{d}", .{aux_counter});
                     aux_counter += 1;
-                    try symbols.append(a, .{ .name = name, .section = @intCast(sec_index), .value = @as(u64, r.pair) * 4, .size = 0, .binding = .local, .sym_type = .notype, .defined = true });
+                    try symbols.append(a, .{ .name = name, .section = @intCast(sec_index), .value = text.byteOffset(r.pair), .size = 0, .binding = .local, .sym_type = .notype, .defined = true });
                     try lo12_relocs.append(a, .{ .sec = sec_index, .offset = off, .sym = aux_index });
                 },
             }
@@ -381,8 +436,9 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
 
     // Attach each section's relocation list.
     for (sections.items, 0..) |*sec, i| sec.relocs = reloc_lists.items[i].items;
+    try appendModelAttributes(a, &sections, module);
 
-    return object_emit.emit(allocator, sections.items, symbols.items, .{ .class = .elf64, .machine = EM_RISCV, .use_rela = true });
+    return object_emit.emit(allocator, sections.items, symbols.items, moduleObjectConfig(module));
 }
 
 /// Like `writeModule`, but also emits inline DWARF: `.debug_abbrev` + `.debug_info` (a subprogram
@@ -418,8 +474,8 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
     for (module.entries.items) |entry| {
         var compiled = try isel.compileFunction(allocator, entry.func, caps);
         defer compiled.deinit(allocator);
-        const code = try a.alloc(u8, compiled.code.len * 4);
-        for (compiled.code, 0..) |word, wi| putInt(code[wi * 4 ..][0..4], u32, word);
+        const text = try encodeText(a, compiled, caps.tune_c906);
+        const code = text.bytes;
         const sec_index = sections.items.len;
         try sections.append(a, .{
             .name = try std.fmt.allocPrint(a, ".text.{s}", .{entry.name}),
@@ -433,14 +489,14 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
         const binding: object_emit.Binding = if (entry.func.is_local or std.mem.startsWith(u8, entry.name, ".")) .local else .global;
         try symbols.append(a, .{ .name = entry.name, .section = @intCast(sec_index), .value = 0, .size = code.len, .binding = binding, .sym_type = .func, .defined = true });
         for (compiled.relocs) |r| {
-            const off = @as(u64, r.offset) * 4;
+            const off = text.byteOffset(r.offset);
             switch (r.kind) {
                 .call, .pcrel_hi20, .got_hi20 => try named_relocs.append(a, .{ .sec = sec_index, .offset = off, .name = r.symbol, .r_type = @backingInt(relocTypeOf(r.kind)) }),
                 .pcrel_lo12 => {
                     const aux_index: u32 = @intCast(symbols.items.len);
                     const name = try std.fmt.allocPrint(a, ".Lpcrel_hi{d}", .{aux_counter});
                     aux_counter += 1;
-                    try symbols.append(a, .{ .name = name, .section = @intCast(sec_index), .value = @as(u64, r.pair) * 4, .size = 0, .binding = .local, .sym_type = .notype, .defined = true });
+                    try symbols.append(a, .{ .name = name, .section = @intCast(sec_index), .value = text.byteOffset(r.pair), .size = 0, .binding = .local, .sym_type = .notype, .defined = true });
                     try lo12_relocs.append(a, .{ .sec = sec_index, .offset = off, .sym = aux_index });
                 },
             }
@@ -448,8 +504,8 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
         // The DWARF PC range and line rows use the running text offset.
         try func_low.append(a, text_off);
         try func_high.append(a, text_off + code.len);
-        for (compiled.lines) |e| try rows.append(a, .{ .address = text_off + e.offset, .line = e.line });
-        text_off += code.len;
+        for (compiled.lines) |e| try rows.append(a, .{ .address = text_off + text.byteOffset(e.offset / 4), .line = e.line });
+        text_off = std.mem.alignForward(u64, text_off + code.len, 4);
     }
 
     // One section per data global (mirrors `writeModule`).
@@ -506,8 +562,9 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
     try sections.append(a, .{ .name = ".debug_abbrev", .sh_type = SHT_PROGBITS, .flags = 0, .bytes = abbrev, .size = abbrev.len, .addralign = 1 });
     try sections.append(a, .{ .name = ".debug_info", .sh_type = SHT_PROGBITS, .flags = 0, .bytes = info, .size = info.len, .addralign = 1 });
     try sections.append(a, .{ .name = ".debug_line", .sh_type = SHT_PROGBITS, .flags = 0, .bytes = line, .size = line.len, .addralign = 1 });
+    try appendModelAttributes(a, &sections, module);
 
-    return object_emit.emit(allocator, sections.items, symbols.items, .{ .class = .elf64, .machine = EM_RISCV, .use_rela = true });
+    return object_emit.emit(allocator, sections.items, symbols.items, moduleObjectConfig(module));
 }
 
 /// Map a function's IR return type to a DWARF base type (C-like names), or null for a void /
@@ -887,6 +944,38 @@ test "our PCREL global-data resolution matches lld byte for byte" {
     defer allocator.free(theirs);
 
     try std.testing.expectEqualSlices(u8, ours.code, theirs);
+}
+
+test "C906 objects preserve PC-relative relocations through compressed placement" {
+    const allocator = std.testing.allocator;
+    const model = @import("vulcan-opt").microarch.modelFor(.@"thead-c906");
+    var entry = Function.init(allocator);
+    defer entry.deinit();
+    const t = try entry.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try entry.types.ptrGlobal();
+    const block = try entry.appendBlock();
+    const adjustment = try entry.appendInst(block, t, .{ .iconst = 7 });
+    const p = try entry.appendGlobalAddr(block, ptr_t, "K");
+    const value = try entry.appendInst(block, t, .{ .load = .{ .ptr = p } });
+    const result = try entry.appendInst(block, t, .{ .arith = .{ .op = .add, .lhs = value, .rhs = adjustment } });
+    entry.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+
+    const k_bytes = [_]u8{ 35, 0, 0, 0 };
+    var module: link.Module = .{ .model = model };
+    defer module.deinit(allocator);
+    try module.addFunction(allocator, "entry", &entry);
+    try module.addData(allocator, "K", &k_bytes);
+    const obj = try writeModule(allocator, &module);
+    defer allocator.free(obj);
+    try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, obj[48..52], .little));
+    var plain = try ld.linkObjects(allocator, &.{obj}, 0x80000000);
+    defer plain.deinit(allocator);
+    var compressed = try ld.linkObjectsCompressed(allocator, &.{obj}, 0x80000000, null);
+    defer compressed.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, plain.code, compressed.code);
+    const theirs = try lldLink(allocator, std.testing.io, &.{obj}, "entry");
+    defer allocator.free(theirs);
+    try std.testing.expectEqualSlices(u8, plain.code, theirs);
 }
 
 test "linker resolves an R_RISCV_CALL far call (matches lld, runs on River)" {

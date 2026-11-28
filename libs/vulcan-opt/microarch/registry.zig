@@ -311,9 +311,9 @@ fn etsocThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
     };
 }
 
-// River in-order profiles (nano, micro, small, full): microcoded. Seeded from
-// riscv64/schedule.zig riverLatency, refine against river_hdl later.
-fn riverInorderArith(op: ir.function.BinOp) u32 {
+// Baseline in-order RISC-V latency estimates, originally seeded from the
+// River schedule. Individual CPU models can override these costs.
+fn riscv64InOrderArith(op: ir.function.BinOp) u32 {
     return switch (op) {
         .mul, .mulh => 3,
         .div, .rem => 6,
@@ -321,18 +321,18 @@ fn riverInorderArith(op: ir.function.BinOp) u32 {
     };
 }
 
-fn riverInorderLatency(op: ir.function.Opcode) u32 {
+fn riscv64InOrderLatency(op: ir.function.Opcode) u32 {
     return switch (op) {
-        .arith => |a| riverInorderArith(a.op),
-        .arith_imm => |a| riverInorderArith(a.op),
+        .arith => |a| riscv64InOrderArith(a.op),
+        .arith_imm => |a| riscv64InOrderArith(a.op),
         .load => 2,
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 2,
         // A dot is a multiply-class op (4-way multiply-accumulate), grouped with `mul`.
-        // River carries no dotprod feature today; this is a placeholder in case one is added.
+        // Fallback cost for models without a dedicated dot-product estimate.
         .dot => 3,
         .reduce => 3, // a cross-lane combine, multiply class like dot above
         .splat => 1, // one lane broadcast, the instruction struct_new's splat form emits
-        // River carries no tensor unit; a placeholder in case one is added.
+        // Fallback cost for models without a dedicated matrix-multiply estimate.
         .matmul => 64,
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
@@ -391,14 +391,10 @@ fn riverMacroLatency(op: ir.function.Opcode) u32 {
     };
 }
 
-// River throughput. The embedded in-order tiers (n/mi/s) are simple cores: the multiplier is NOT
-// pipelined (a small in-order core reuses one multicycle MulDiv), so mul/div throughput == latency,
-// the conservative default the spec asks for when the config does not evidence a pipelined
-// multiplier. These tiers carry NO hardware FPU (f = false, fpsimd = 0 in their models), so there is
-// no pipelined FP multiplier either: the conservative fp-mul price is the same non-pipelined latency
-// as the integer one (elem_float is ignored here). add/logic/shift are single-cycle for both types.
-fn riverInorderArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
-    _ = elem_float; // no FPU on these tiers: FP and integer mul are both the non-pipelined MulDiv
+// The baseline assumes an unpipelined multiplier and divider, so throughput
+// equals latency. Models with their own FPU timings can override these costs.
+fn riscv64InOrderArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
+    _ = elem_float; // the baseline uses the same estimate for integer and FP
     return switch (op) {
         .mul, .mulh => 3, // non-pipelined multiplier: throughput == latency (no evidence of a pipelined FPU)
         .div, .rem => 6, // non-pipelined divide: throughput == latency
@@ -406,10 +402,10 @@ fn riverInorderArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
     };
 }
 
-fn riverInorderThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
+fn riscv64InOrderThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
     return switch (op) {
-        .arith => |a| riverInorderArithThroughput(a.op, elem_float),
-        .arith_imm => |a| riverInorderArithThroughput(a.op, elem_float),
+        .arith => |a| riscv64InOrderArithThroughput(a.op, elem_float),
+        .arith_imm => |a| riscv64InOrderArithThroughput(a.op, elem_float),
         .load => 1, // pipelined load-to-use (latency 2)
         .convert, .decode_low_float, .encode_low_float, .dequantize_nvfp4, .quantize_nvfp4, .unary => 1,
         .dot => 3, // mul-class placeholder, non-pipelined here
@@ -656,7 +652,7 @@ const etsoc = Model{
     .fusion = &.{.{ .kind = .cmp_branch }},
 };
 
-fn riverInorder(comptime tag: Microarch, comptime feats: @FieldType(model.Features, "riscv64")) Model {
+fn riscv64InOrder(comptime tag: Microarch, comptime feats: @FieldType(model.Features, "riscv64")) Model {
     return .{
         .tag = tag,
         .arch = .riscv64,
@@ -668,20 +664,20 @@ fn riverInorder(comptime tag: Microarch, comptime feats: @FieldType(model.Featur
         .cache_line = 64,
         .fetch_align = 4,
         .features = .{ .riscv64 = feats },
-        .latency = riverInorderLatency,
-        .throughput = riverInorderThroughput,
+        .latency = riscv64InOrderLatency,
+        .throughput = riscv64InOrderThroughput,
         .unitOf = unitOfShared,
-        // cmp_branch needs no extension. These embedded tiers have no Zba, so no shift_add.
+        // Compare-and-branch is available in the base ISA.
         .fusion = &.{.{ .kind = .cmp_branch }},
     };
 }
 
 // Nano is RV32IC but modeled here as riscv64 with placeholder latencies, pending an xlen field
 // and a river_hdl derivation.
-const river_n = riverInorder(.@"river-rc1.n", .{ .c = true });
+const river_n = riscv64InOrder(.@"river-rc1.n", .{ .c = true });
 // Micro and small are seeded identical pending the river_hdl re-derivation.
-const river_mi = riverInorder(.@"river-rc1.mi", .{ .m = true, .a = true, .c = true });
-const river_s = riverInorder(.@"river-rc1.s", .{ .m = true, .a = true, .c = true });
+const river_mi = riscv64InOrder(.@"river-rc1.mi", .{ .m = true, .a = true, .c = true });
+const river_s = riscv64InOrder(.@"river-rc1.s", .{ .m = true, .a = true, .c = true });
 // river_f and river_ma are the RV64GC application-class tiers (full in-order, macro
 // dual-issue), the ones River's RVA22/RVA23 profile actually carries Zicbop for
 // (river/packages/river/lib/src/profiles.dart: `rvZicbop`, part of kRva22U64Extensions).
@@ -689,7 +685,7 @@ const river_s = riverInorder(.@"river-rc1.s", .{ .m = true, .a = true, .c = true
 // carry it.
 
 // river_f (RV64GC) has hardware float, so unlike the other in-order profiles it needs its own
-// literal with a nonzero fpsimd port count instead of riverInorder's fpsimd = 0 default.
+// literal with a nonzero fpsimd port count instead of riscv64InOrder's fpsimd = 0 default.
 const river_f = Model{
     .tag = .@"river-rc1.f",
     .arch = .riscv64,
@@ -706,7 +702,7 @@ const river_f = Model{
     // Zba (sh1/2/3add) is also mandatory in River's RVA22 profile, which is what makes shift_add
     // fusion available on this tier.
     .features = .{ .riscv64 = .{ .m = true, .a = true, .f = true, .d = true, .c = true, .zicbop = true, .zfh = true, .zba = true } },
-    .latency = riverInorderLatency,
+    .latency = riscv64InOrderLatency,
     .throughput = riverPipelinedThroughput,
     .unitOf = unitOfShared,
     .fusion = &.{ .{ .kind = .cmp_branch }, .{ .kind = .shift_add } },
@@ -958,6 +954,79 @@ fn a55Throughput(op: ir.function.Opcode, elem_float: bool) u32 {
         else => altraThroughput(op, elem_float),
     };
 }
+// Armv8-A Advanced SIMD and in-order dual issue. Latencies are seeded from
+// LLVM's AArch64SchedA53.td. Shared integer/FP opcodes use the longer FP latency.
+const cortex_a53 = a53: {
+    var m = basedOn(cortex_a55, .@"cortex-a53");
+    m.features = .{ .aarch64 = .{ .neon = true } };
+    m.latency = a53Latency;
+    m.fusion = &.{.{ .kind = .shift_add }};
+    break :a53 m;
+};
+
+fn a53ArithmeticLatency(op: ir.function.BinOp) u32 {
+    return switch (op) {
+        .add, .sub, .mul, .mulh => 6,
+        .div, .rem => 33,
+        else => 1,
+    };
+}
+
+fn a53Latency(op: ir.function.Opcode) u32 {
+    return switch (op) {
+        .arith => |a| a53ArithmeticLatency(a.op),
+        .arith_imm => |a| a53ArithmeticLatency(a.op),
+        .convert, .unary, .reduce, .splat => 6,
+        else => altraLatency(op),
+    };
+}
+
+// OpenC906 documents single-issue, in-order execution and 64-byte cache lines.
+// The C906 supports integer MAC, and its legacy vector
+// ISA uses a different encoding from the ratified RVV instructions Vulcan emits.
+const thead_c906 = c906: {
+    var m = riscv64InOrder(.@"thead-c906", .{ .m = true, .a = true, .f = true, .d = true, .c = true, .xtheadba = true, .xtheadmac = true });
+    m.units.fpsimd = 1;
+    m.latency = c906Latency;
+    m.throughput = c906Throughput;
+    m.fusion = &.{ .{ .kind = .cmp_branch }, .{ .kind = .shift_add } };
+    break :c906 m;
+};
+
+// Initial estimates for the OpenC906 pipeline pending hardware measurements.
+fn c906Latency(op: ir.function.Opcode) u32 {
+    return switch (op) {
+        .arith => |a| c906ArithmeticLatency(a.op),
+        .arith_imm => |a| c906ArithmeticLatency(a.op),
+        .load => 3,
+        .convert, .unary => 4,
+        else => riscv64InOrderLatency(op),
+    };
+}
+
+fn c906ArithmeticLatency(op: ir.function.BinOp) u32 {
+    return switch (op) {
+        .add, .sub, .mul, .mulh => 4,
+        .div, .rem => 32,
+        else => 1,
+    };
+}
+
+fn c906Throughput(op: ir.function.Opcode, elem_float: bool) u32 {
+    return switch (op) {
+        .arith => |a| c906ArithmeticThroughput(a.op, elem_float),
+        .arith_imm => |a| c906ArithmeticThroughput(a.op, elem_float),
+        else => riscv64InOrderThroughput(op, elem_float),
+    };
+}
+
+fn c906ArithmeticThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
+    return switch (op) {
+        .div, .rem => 32,
+        else => riscv64InOrderArithThroughput(op, elem_float),
+    };
+}
+
 // Firestorm resource widths from https://dougallj.github.io/applecpu/firestorm.html.
 // The IR model has one memory class, so use the three load-capable pipes rather
 // than treating the store-only pipe as a fourth load pipe. Latencies not yet
@@ -1003,6 +1072,8 @@ comptime {
     Model.validate(altra);
     Model.validate(cortex_a76);
     Model.validate(cortex_a55);
+    Model.validate(cortex_a53);
+    Model.validate(thead_c906);
     Model.validate(neoverse_n2);
     Model.validate(zen5);
     Model.validate(zen3);
@@ -1023,6 +1094,8 @@ pub fn modelFor(tag: Microarch) *const Model {
         .@"ampere-altra" => &altra,
         .@"cortex-a76" => &cortex_a76,
         .@"cortex-a55" => &cortex_a55,
+        .@"cortex-a53" => &cortex_a53,
+        .@"thead-c906" => &thead_c906,
         .@"neoverse-n2" => &neoverse_n2,
         .@"et-soc" => &etsoc,
         .@"river-rc1.n" => &river_n,
@@ -1058,6 +1131,7 @@ fn armPartModel(part: u12) ?Microarch {
     return switch (part) {
         0xd0b => .@"cortex-a76",
         0xd05 => .@"cortex-a55",
+        0xd03 => .@"cortex-a53",
         0xd0c => .@"ampere-altra",
         0xd49 => .@"neoverse-n2",
         else => null,
@@ -1316,6 +1390,7 @@ test "ARM part detection distinguishes the RK3588 performance and efficiency cor
     try std.testing.expectEqual(Microarch.@"ampere-altra", armPartModel(0xd0c).?);
     try std.testing.expectEqual(Microarch.@"neoverse-n2", armPartModel(0xd49).?);
     try std.testing.expectEqual(Microarch.@"cortex-a55", armPartModel(0xd05).?);
+    try std.testing.expectEqual(Microarch.@"cortex-a53", armPartModel(0xd03).?);
     try std.testing.expectEqual(@as(?Microarch, null), armPartModel(0));
     const m = modelFor(Microarch.parse("cortex-a76").?);
     try std.testing.expectEqual(model.Arch.aarch64, m.arch);
@@ -1332,6 +1407,27 @@ test "Cortex A55 has an in-order dual-issue NEON model" {
     try std.testing.expectEqual(@as(u16, 128), m.vector_bits);
     try std.testing.expect(m.features.aarch64.neon);
     try std.testing.expect(!m.reorders());
+}
+
+test "Duo S models declare the CPU instruction sets" {
+    const arm = modelFor(armPartModel(0xd03).?);
+    try std.testing.expectEqual(model.ExecMode.in_order, arm.exec);
+    try std.testing.expectEqual(@as(u8, 2), arm.issue_width);
+    try std.testing.expectEqual(@TypeOf(arm.features.aarch64){ .neon = true }, arm.features.aarch64);
+
+    const rv = modelFor(.@"thead-c906");
+    try std.testing.expectEqual(model.ExecMode.in_order, rv.exec);
+    try std.testing.expectEqual(@as(u8, 1), rv.issue_width);
+    try std.testing.expectEqual(@as(u16, 0), rv.simdBits());
+    try std.testing.expectEqual(@TypeOf(rv.features.riscv64){
+        .m = true,
+        .a = true,
+        .f = true,
+        .d = true,
+        .c = true,
+        .xtheadba = true,
+        .xtheadmac = true,
+    }, rv.features.riscv64);
 }
 
 test "Apple M1 model is selectable and describes Firestorm resources" {

@@ -698,15 +698,16 @@ fn decode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32, ctx: ?Context) 
     }
 
     // GPR stp/ldp signed offset (bit31 selects 32/64-bit, bit22 selects load).
-    if (w & 0x7FC00000 == 0x29000000 or w & 0x7FC00000 == 0x29400000) {
+    const signed_word_pair = w & 0xFFC00000 == 0x69400000;
+    if (w & 0x7FC00000 == 0x29000000 or w & 0x7FC00000 == 0x29400000 or signed_word_pair) {
         const x64 = (w >> 31) & 1 != 0;
         const load = (w >> 22) & 1 != 0;
         const scale: u5 = if (x64) 3 else 2;
         const imm7: i32 = (@as(i32, @bitCast(w << 10)) >> 25) << scale; // bits[21:15], scaled
-        try buf.print(a, "{s} ", .{if (load) "ldp" else "stp"});
-        try gp(buf, a, x64, rd(w));
+        try buf.print(a, "{s} ", .{if (signed_word_pair) "ldpsw" else if (load) "ldp" else "stp"});
+        try gp(buf, a, x64 or signed_word_pair, rd(w));
         try buf.appendSlice(a, ", ");
-        try gp(buf, a, x64, ra(w)); // rt2 is bits[14:10]
+        try gp(buf, a, x64 or signed_word_pair, ra(w)); // rt2 is bits[14:10]
         try buf.appendSlice(a, ", [");
         try sp(buf, a, true, rn(w));
         if (imm7 != 0) {
@@ -788,6 +789,7 @@ fn memImm(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
         .{ .match = 0xF9400000, .mnem = "ldr", .x64 = true, .scale = 3, .fp = false, .dbl = false },
         .{ .match = 0xB9000000, .mnem = "str", .x64 = false, .scale = 2, .fp = false, .dbl = false },
         .{ .match = 0xB9400000, .mnem = "ldr", .x64 = false, .scale = 2, .fp = false, .dbl = false },
+        .{ .match = 0xB9800000, .mnem = "ldrsw", .x64 = true, .scale = 2, .fp = false, .dbl = false },
         .{ .match = 0x39000000, .mnem = "strb", .x64 = false, .scale = 0, .fp = false, .dbl = false },
         .{ .match = 0x39400000, .mnem = "ldrb", .x64 = false, .scale = 0, .fp = false, .dbl = false },
         .{ .match = 0x39C00000, .mnem = "ldrsb", .x64 = false, .scale = 0, .fp = false, .dbl = false },

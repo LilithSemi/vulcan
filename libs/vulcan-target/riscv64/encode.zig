@@ -1262,6 +1262,21 @@ pub fn mul(rd: Reg, rs1: Reg, rs2: Reg) u32 {
     return rType(0b0110011, 0b000, 0b0000001, rd, rs1, rs2);
 }
 
+/// `mulw rd, rs1, rs2` (M extension).
+pub fn mulw(rd: Reg, rs1: Reg, rs2: Reg) u32 {
+    return rType(0b0111011, 0b000, 0b0000001, rd, rs1, rs2);
+}
+
+/// `th.mula rd, rs1, rs2` (XTheadMac), adds the XLEN product to rd.
+pub fn th_mula(rd: Reg, rs1: Reg, rs2: Reg) u32 {
+    return rType(0b0001011, 0b001, 0b0010000, rd, rs1, rs2);
+}
+
+/// `th.mulaw rd, rs1, rs2` (XTheadMac), adds and sign-extends a word.
+pub fn th_mulaw(rd: Reg, rs1: Reg, rs2: Reg) u32 {
+    return rType(0b0001011, 0b001, 0b0010010, rd, rs1, rs2);
+}
+
 /// `div rd, rs1, rs2` (signed, M extension)
 pub fn div(rd: Reg, rs1: Reg, rs2: Reg) u32 {
     return rType(0b0110011, 0b100, 0b0000001, rd, rs1, rs2);
@@ -1327,6 +1342,15 @@ pub fn sra(rd: Reg, rs1: Reg, rs2: Reg) u32 {
     return rType(0b0110011, 0b101, 0b0100000, rd, rs1, rs2);
 }
 
+/// `th.addsl rd, base, index, shift` (XTheadBa).
+pub fn th_addsl(rd: Reg, base: Reg, index: Reg, shift: u2) u32 {
+    return rType(0b0001011, 0b001, shift, rd, base, index);
+}
+
+test "XTheadBa addsl encoding" {
+    try std.testing.expectEqual(@as(u32, 0x04b5150b), th_addsl(.x10, .x10, .x11, 2));
+}
+
 /// `sh1add rd, rs1, rs2` (Zba): rd = rs2 + (rs1 << 1).
 pub fn sh1add(rd: Reg, rs1: Reg, rs2: Reg) u32 {
     return rType(0b0110011, 0b010, 0b0010000, rd, rs1, rs2);
@@ -1367,6 +1391,11 @@ pub fn addi(rd: Reg, rs1: Reg, imm: i12) u32 {
     return iType(0b0010011, 0b000, rd, rs1, imm);
 }
 
+/// Sign-extend the low word (ADDIW with zero immediate).
+pub fn sextw(rd: Reg, rs1: Reg) u32 {
+    return iType(0b0011011, 0b000, rd, rs1, 0);
+}
+
 /// `nop` (`addi x0, x0, 0`, a no-operation), used to pad a loop header up to the
 /// fetch-alignment boundary.
 pub fn nop() u32 {
@@ -1396,6 +1425,15 @@ pub fn srli(rd: Reg, rs1: Reg, shamt: u6) u32 {
 /// `srai rd, rs1, shamt` (arithmetic right shift by a 6-bit immediate, RV64)
 pub fn srai(rd: Reg, rs1: Reg, shamt: u6) u32 {
     return iType(0b0010011, 0b101, rd, rs1, @as(i12, 0x400) | @as(i12, shamt));
+}
+
+/// Shift the low word right, then sign-extend the result.
+pub fn srliw(rd: Reg, rs1: Reg, shamt: u5) u32 {
+    return iType(0b0011011, 0b101, rd, rs1, shamt);
+}
+
+pub fn sraiw(rd: Reg, rs1: Reg, shamt: u5) u32 {
+    return iType(0b0011011, 0b101, rd, rs1, @as(i12, 0x400) | @as(i12, shamt));
 }
 
 /// `jalr rd, rs1, imm` (jump and link register, `ret` is `jalr x0, ra, 0`).

@@ -376,11 +376,11 @@ fn baseOf(func: *const Function, v: Value) Addr {
             .global_addr => |g| return .{ .root = .{ .global = g.symbol }, .offset = offset },
             .arith_imm => |a| switch (a.op) {
                 .add => {
-                    offset += a.imm;
+                    offset = std.math.add(i64, offset, a.imm) catch return .{ .root = .{ .unknown = v }, .offset = 0 };
                     cur = a.lhs;
                 },
                 .sub => {
-                    offset -= a.imm;
+                    offset = std.math.sub(i64, offset, a.imm) catch return .{ .root = .{ .unknown = v }, .offset = 0 };
                     cur = a.lhs;
                 },
                 else => return .{ .root = .{ .unknown = cur }, .offset = offset },
@@ -394,7 +394,7 @@ fn baseOf(func: *const Function, v: Value) Addr {
 /// Whether a store to `b` may alias the address `a`. Distinct identified roots (two allocas, two
 /// globals, an alloca vs a global) never alias. Disjoint constant-offset ranges from the same root
 /// also cannot alias; unresolved roots or access widths remain conservative.
-fn mayAlias(func: *const Function, a: Value, a_ty: ir.types.Type, b: Value, b_ty: ir.types.Type) bool {
+pub fn mayAlias(func: *const Function, a: Value, a_ty: ir.types.Type, b: Value, b_ty: ir.types.Type) bool {
     if (a == b) return true;
     const aa = baseOf(func, a);
     const ab = baseOf(func, b);

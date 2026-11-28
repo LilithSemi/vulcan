@@ -211,6 +211,7 @@ pub fn build(b: *std.Build) void {
     _ = run_frontend_bench.addOutputDirectoryArg("frontend-bench");
     run_frontend_bench.addPassthruArgs();
     run_frontend_bench.stdio = .inherit;
+    b.step("run-frontend-bench", "Compare C compile time and generated-code runtime").dependOn(&run_frontend_bench.step);
 
     const cuda_bench_cli = addCudaBench(b, target);
     const run_cuda_bench = b.addRunArtifact(cuda_bench_cli);

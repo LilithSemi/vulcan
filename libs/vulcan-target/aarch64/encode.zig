@@ -447,6 +447,12 @@ pub fn cbz(rt: Reg, off: i21) u32 {
     return 0x34000000 | (imm19 << 5) | n(rt);
 }
 
+/// Test the full W or X register for zero and branch without writing NZCV.
+pub fn compareBranch(rt: Reg, off: i21, nonzero: bool, wide: bool) u32 {
+    const word = if (nonzero) cbnz(rt, off) else cbz(rt, off);
+    return word | (if (wide) @as(u32, 1) << 31 else 0);
+}
+
 /// `b.cond label` (conditional branch): branch if `cond` holds. `off` is the signed
 /// byte displacement from this instruction (a multiple of 4), the same convention as
 /// `cbnz`/`b` (patched later). Bit layout: [31:24]=0x54, [23:5]=imm19 (the offset in
@@ -504,6 +510,11 @@ pub fn stpOffX(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
 pub fn ldpOffW(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
     const imm7: u32 = @as(u32, @bitCast(@as(i32, imm) >> 2)) & 0x7F;
     return 0x29400000 | (imm7 << 15) | (n(rt2) << 10) | (n(rn) << 5) | n(rt1);
+}
+
+/// Load two signed 32-bit words into 64-bit registers, without writeback.
+pub fn ldpsw(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
+    return ldpOffW(rt1, rt2, rn, imm) | 0x40000000;
 }
 
 /// `stp rt1, rt2, [rn, #imm]` (32-bit w-regs, signed offset, no writeback). Same imm range as `ldpOffW`.

@@ -105,6 +105,8 @@ pub const Features = union(Arch) {
         /// `.prefetch` lowering (see `isel.zig`'s `ModelCaps.zicbop`) and, transitively,
         /// `Model.prefetches()` below.
         zicbop: bool = false,
+        xtheadba: bool = false,
+        xtheadmac: bool = false,
         /// Zfh: native IEEE half-precision (f16) instructions (fadd.h/flh/fcvt.s.h/...). Gates the
         /// riscv64 backend's NATIVE f16 lowering (see `isel.zig`'s `ModelCaps.zfh`): when set, an
         /// f16 is held natively in a float register instead of emulated as its f32 widening. When
@@ -142,6 +144,8 @@ pub const Microarch = enum {
     @"ampere-altra",
     @"cortex-a76",
     @"cortex-a55",
+    @"cortex-a53",
+    @"thead-c906",
     @"neoverse-n2",
     @"et-soc",
     @"river-rc1.n",
@@ -331,10 +335,8 @@ pub const Model = struct {
             .riscv64 => |f| {
                 if (m.units.fpsimd == 0 and (f.f or f.d or f.v or f.vpu))
                     @compileError("riscv64 model claims f/d/v/vpu but has no fpsimd ports");
-                // sh1add/sh2add/sh3add (the shift_add fusion's concrete instructions) are Zba,
-                // so a riscv64 model cannot declare the fusion without the extension bit.
-                if (m.fuses(.shift_add) and !f.zba)
-                    @compileError("riscv64 model declares shift_add fusion but lacks Zba");
+                if (m.fuses(.shift_add) and !f.zba and !f.xtheadba)
+                    @compileError("riscv64 model declares shift_add fusion but lacks Zba or XTheadBa");
             },
             .x86_64, .nvidia => {},
         }

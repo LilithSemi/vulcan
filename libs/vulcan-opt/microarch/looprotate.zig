@@ -52,7 +52,10 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         // reach the same exit. Every such edge must carry the current values.
         var exit_is_local = true;
         for (graph.predecessors(@backingInt(exit))) |pred| {
-            if (!loop.contains(pred)) exit_is_local = false;
+            if (loop.contains(pred)) continue;
+            const block: Block = @fromBackingInt(@intCast(pred));
+            // Threading may leave an unreachable, empty jump into this exit.
+            if (doms.isReachable(pred) or func.blockInsts(block).len != 0) exit_is_local = false;
         }
         if (!exit_is_local) continue;
 
@@ -105,6 +108,11 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         defer allocator.free(then_args);
         const else_args = try allocator.dupe(Value, func.blockArgs(branch.@"else"));
         defer allocator.free(else_args);
+
+        // Detach the dead edges before changing the exit's argument list.
+        for (graph.predecessors(@backingInt(exit))) |pred| {
+            if (!loop.contains(pred)) func.terminatorPtr(@fromBackingInt(@intCast(pred))).* = null;
+        }
 
         const body_params = try allocator.alloc(Value, header_params.len);
         defer allocator.free(body_params);
@@ -266,6 +274,8 @@ test "rotation preserves early exits and values used after a nested loop" {
     const latch = try f.appendBlock();
     const done = try f.appendBlock();
     const after = try f.appendBlock();
+    const dead = try f.appendBlock();
+    try f.setJump(dead, done, &.{});
     const n = try f.appendBlockParam(entry, t);
     const stop = try f.appendBlockParam(entry, t);
     const zero = try f.appendInst(entry, t, .{ .iconst = 0 });

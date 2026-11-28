@@ -130,6 +130,23 @@ fn simplify(op: BinOp, lhs: Value, rhs: ?Value, lc: ?i64, rc: ?i64, same: bool) 
     return .none;
 }
 
+// In modular arithmetic, multiplying by a word of all ones negates it.
+fn negatedOperand(func: *const Function, consts: []const ?i64, value: Value, bits: u16) ?Value {
+    const def = func.definingInst(value) orelse return null;
+    const opcode = func.opcode(def);
+    const source, const constant = switch (opcode) {
+        .arith => |a| mul: {
+            if (a.op != .mul or a.nsw) return null;
+            if (consts[@backingInt(a.rhs)]) |c| break :mul .{ a.lhs, c };
+            break :mul .{ a.rhs, consts[@backingInt(a.lhs)] orelse return null };
+        },
+        .arith_imm => |a| if (a.op == .mul and !a.nsw) .{ a.lhs, a.imm } else return null,
+        else => return null,
+    };
+    const mask = @as(u64, std.math.maxInt(u64)) >> @as(u6, @intCast(64 - bits));
+    return if (@as(u64, @bitCast(constant)) & mask == mask) source else null;
+}
+
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
 
@@ -187,6 +204,21 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 .arith => |arith| blk: {
                     const lhs = canonical(replacements, arith.lhs);
                     const rhs = canonical(replacements, arith.rhs);
+                    const ty = func.types.type_kind(func.valueType(result));
+                    if (arith.op == .add and !arith.nsw and ty == .int and
+                        ty.int.signedness == .unsigned and ty.int.bits > 0 and ty.int.bits <= 64)
+                    {
+                        if (negatedOperand(func, consts, rhs, ty.int.bits)) |original| {
+                            func.opcodeMut(inst).* = .{ .arith = .{ .op = .sub, .lhs = lhs, .rhs = original } };
+                            changed = true;
+                            break :blk .none;
+                        }
+                        if (negatedOperand(func, consts, lhs, ty.int.bits)) |original| {
+                            func.opcodeMut(inst).* = .{ .arith = .{ .op = .sub, .lhs = rhs, .rhs = original } };
+                            changed = true;
+                            break :blk .none;
+                        }
+                    }
                     break :blk simplify(arith.op, lhs, rhs, consts[@backingInt(lhs)], consts[@backingInt(rhs)], lhs == rhs);
                 },
                 .arith_imm => |arith| blk: {
@@ -256,6 +288,26 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
 }
 
 const testing = std.testing;
+
+test "unsigned addition of a multiply by all ones becomes subtraction" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ty = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const block = try func.appendBlock();
+    const x = try func.appendBlockParam(block, ty);
+    const y = try func.appendBlockParam(block, ty);
+    const all_ones = try func.appendInst(block, ty, .{ .iconst = 0xffffffff });
+    const neg_y = try func.appendInst(block, ty, .{ .arith = .{ .op = .mul, .lhs = all_ones, .rhs = y } });
+    const result = try func.appendInst(block, ty, .{ .arith = .{ .op = .add, .lhs = neg_y, .rhs = x } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(result) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    const op = func.opcode(func.definingInst(result).?).arith;
+    try testing.expectEqual(.sub, op.op);
+    try testing.expectEqual(x, op.lhs);
+    try testing.expectEqual(y, op.rhs);
+}
 
 /// Build a one-block function with an i32 param, returning the block, the param value, and its type.
 fn oneParam(func: *Function) !struct { b: ir.function.Block, x: Value, t: ir.types.Type } {

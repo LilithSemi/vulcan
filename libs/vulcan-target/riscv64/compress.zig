@@ -97,7 +97,12 @@ pub fn tryCompress(w: u32) ?u16 {
                 const dp = crp(d) orelse return null;
                 const shamt = (w >> 20) & 0x3f;
                 if (shamt == 0) return null;
-                const sub: u16 = if (f7(w) == 0b0100000) 0b01 else 0b00; // srai vs srli
+                // Bit 25 is shamt[5], not part of the RV64 shift selector.
+                const sub: u16 = switch (f7(w) >> 1) {
+                    0b000000 => 0b00,
+                    0b010000 => 0b01,
+                    else => return null,
+                };
                 return 0b100_0_00_000_00000_01 | (sub << 10) | (@as(u16, dp) << 7) |
                     (@as(u16, @intCast(shamt >> 5)) << 12) | (@as(u16, @intCast(shamt & 0x1f)) << 2);
             },
@@ -599,6 +604,7 @@ test "each compressed halfword decodes to the same instruction as the original w
         encode.andi(.x9, .x9, 7), // c.andi
         encode.srli(.x8, .x8, 3), // c.srli
         encode.srai(.x9, .x9, 2), // c.srai
+        encode.srai(.x9, .x9, 32), // c.srai with shamt[5] set
         encode.fsd(.f8, .x2, 16), // c.fsdsp (fp save to a stack slot)
         encode.fld(.f9, .x2, 24), // c.fldsp (fp restore)
         encode.fld(.f8, .x9, 8), // c.fld (fp reg + base both x8..15)

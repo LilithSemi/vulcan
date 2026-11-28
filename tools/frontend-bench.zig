@@ -19,6 +19,7 @@ const Compiler = struct {
     environ_map: ?*const std.process.Environ.Map = null,
     /// Its code is the same as another row, so it is only in the compile table.
     compile_only: bool = false,
+    target_flags: []const []const u8 = &.{},
 };
 
 const Result = struct {
@@ -70,10 +71,26 @@ pub fn main(init: std.process.Init) !void {
     const source_dir = args.next() orelse return usage();
     const output_dir = args.next() orelse return usage();
     var format: Format = .text;
+    var cpu: ?[]const u8 = null;
     while (args.next()) |arg| {
-        if (!std.mem.eql(u8, arg, "--format")) return usage();
         const name = args.next() orelse return usage();
-        format = std.meta.stringToEnum(Format, name) orelse return usage();
+        if (std.mem.eql(u8, arg, "--format")) {
+            format = std.meta.stringToEnum(Format, name) orelse return usage();
+        } else if (std.mem.eql(u8, arg, "--cpu")) {
+            cpu = name;
+        } else return usage();
+    }
+
+    const cpu_flags = if (cpu) |name|
+        try cpuFlagsForHost(name)
+    else
+        CpuFlags{};
+    const cpu_model = try cpuModel(allocator, io, vcc, cpu_flags.vcc);
+    if (cpu) |name| {
+        if (!std.mem.eql(u8, cpu_model, name)) {
+            std.debug.print("VCC selected '{s}', expected '{s}'\n", .{ cpu_model, name });
+            return error.InvalidBenchmarkCpu;
+        }
     }
 
     try std.Io.Dir.cwd().createDirPath(io, output_dir);
@@ -85,10 +102,10 @@ pub fn main(init: std.process.Init) !void {
     var cold_env = try init.environ_map.clone(allocator);
     try cold_env.put("VCC_NO_CACHE", "1");
     const candidates = [_]Compiler{
-        .{ .name = "vcc", .command = vcc, .required = true },
-        .{ .name = "vcc-cold", .command = vcc, .required = true, .environ_map = &cold_env, .compile_only = true },
-        .{ .name = "clang", .command = "clang", .required = false },
-        .{ .name = "gcc", .command = "gcc", .required = false },
+        .{ .name = "vcc", .command = vcc, .required = true, .target_flags = cpu_flags.vcc },
+        .{ .name = "vcc-cold", .command = vcc, .required = true, .environ_map = &cold_env, .compile_only = true, .target_flags = cpu_flags.vcc },
+        .{ .name = "clang", .command = "clang", .required = cpu != null, .target_flags = cpu_flags.clang },
+        .{ .name = "gcc", .command = "gcc", .required = cpu != null, .target_flags = cpu_flags.gcc },
         .{ .name = "tcc", .command = "tcc", .required = false },
     };
     var compilers: std.ArrayList(Compiler) = .empty;
@@ -96,10 +113,12 @@ pub fn main(init: std.process.Init) !void {
     var skipped: std.ArrayList([]const u8) = .empty;
     defer skipped.deinit(allocator);
     for (candidates) |compiler| {
+        if (cpu != null and std.mem.eql(u8, compiler.name, "tcc")) continue;
         if (try compilerAvailable(allocator, io, compiler.command)) {
             try compilers.append(allocator, compiler);
         } else if (compiler.required) {
-            return error.VccUnavailable;
+            std.debug.print("required compiler unavailable: {s}\n", .{compiler.command});
+            return error.CompilerUnavailable;
         } else {
             try skipped.append(allocator, compiler.name);
         }
@@ -136,7 +155,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const cpu_model = try cpuModel(allocator, io, vcc);
     const report: Report = .{
         .cpu_model = cpu_model,
         .compilers = compilers.items,
@@ -183,8 +201,9 @@ test "sameChecksum allows a last-bits float difference and nothing else" {
 }
 
 /// The model vcc picks for this CPU, or `unsupported (<cpu>)` when it has none.
-fn cpuModel(allocator: std.mem.Allocator, io: std.Io, vcc: []const u8) ![]const u8 {
-    const result = std.process.run(allocator, io, .{ .argv = &.{ vcc, "-print-cpu-model" } }) catch return "unknown";
+fn cpuModel(allocator: std.mem.Allocator, io: std.Io, vcc: []const u8, flags: []const []const u8) ![]const u8 {
+    const argv = try std.mem.concat(allocator, []const u8, &.{ &.{ vcc, "-print-cpu-model" }, flags });
+    const result = std.process.run(allocator, io, .{ .argv = argv }) catch return "unknown";
     const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
     return if (trimmed.len == 0) "unknown" else trimmed;
 }
@@ -344,8 +363,31 @@ fn writeGithubHeader(writer: *std.Io.Writer, report: Report, execute: bool) !voi
     try writer.writeByte('\n');
 }
 
+const CpuFlags = struct {
+    vcc: []const []const u8 = &.{},
+    clang: []const []const u8 = &.{},
+    gcc: []const []const u8 = &.{},
+};
+
+fn cpuFlagsForHost(name: []const u8) !CpuFlags {
+    if (builtin.os.tag == .linux) {
+        if (builtin.cpu.arch == .aarch64 and std.mem.eql(u8, name, "cortex-a53")) return .{
+            .vcc = &.{"-mtune=cortex-a53"},
+            .clang = &.{ "-march=armv8-a+crc", "-mtune=cortex-a53" },
+            .gcc = &.{ "-march=armv8-a+crc", "-mtune=cortex-a53" },
+        };
+        if (builtin.cpu.arch == .riscv64 and std.mem.eql(u8, name, "thead-c906")) return .{
+            .vcc = &.{"-mcpu=thead-c906"},
+            .clang = &.{ "-march=rv64gc_xtheadba_xtheadmac", "-mabi=lp64d" },
+            .gcc = &.{ "-march=rv64gc_xtheadba_xtheadmac", "-mabi=lp64d", "-mtune=thead-c906" },
+        };
+    }
+    std.debug.print("CPU '{s}' requires a matching Linux host architecture\n", .{name});
+    return error.InvalidBenchmarkCpu;
+}
+
 fn usage() error{InvalidArguments} {
-    std.debug.print("usage: vulcan-frontend-bench <vcc> <source-dir> <output-dir> [--format text|github]\n", .{});
+    std.debug.print("usage: vulcan-frontend-bench <vcc> <source-dir> <output-dir> [--format text|github] [--cpu cortex-a53|thead-c906]\n", .{});
     return error.InvalidArguments;
 }
 
@@ -390,9 +432,13 @@ fn benchmarkCompiler(allocator: std.mem.Allocator, io: std.Io, compiler: Compile
 }
 
 fn compileOnce(allocator: std.mem.Allocator, io: std.Io, compiler: Compiler, source: []const u8, output: []const u8, timed: bool) !u64 {
+    const argv = try std.mem.concat(allocator, []const u8, &.{
+        &.{ compiler.command, "-O2", "-c", source, "-o", output }, compiler.target_flags,
+    });
+    defer allocator.free(argv);
     const start = if (timed) std.Io.Timestamp.now(io, .awake) else undefined;
     const result = try std.process.run(allocator, io, .{
-        .argv = &.{ compiler.command, "-O2", "-c", source, "-o", output },
+        .argv = argv,
         .environ_map = compiler.environ_map,
     });
     const finish = if (timed) std.Io.Timestamp.now(io, .awake) else undefined;
@@ -412,8 +458,12 @@ fn compileOnce(allocator: std.mem.Allocator, io: std.Io, compiler: Compiler, sou
 }
 
 fn buildExecutable(allocator: std.mem.Allocator, io: std.Io, compiler: Compiler, source: []const u8, output: []const u8) !void {
+    const argv = try std.mem.concat(allocator, []const u8, &.{
+        &.{ compiler.command, "-O2", "-DBENCH_EXECUTE", source, "-o", output }, compiler.target_flags,
+    });
+    defer allocator.free(argv);
     const result = try std.process.run(allocator, io, .{
-        .argv = &.{ compiler.command, "-O2", "-DBENCH_EXECUTE", source, "-o", output },
+        .argv = argv,
     });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);

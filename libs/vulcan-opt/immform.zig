@@ -20,6 +20,32 @@ const Value = ir.function.Value;
 const BinOp = ir.function.BinOp;
 
 pub const pass_def = pass.Pass{ .name = "immform", .run = run, .preserves_cfg = true, .preserves_value_defs = true };
+pub const shifts_pass_def = pass.Pass{ .name = "shift-immform", .run = shifts, .preserves_cfg = true, .preserves_value_defs = true };
+
+/// Targets with native immediate shifts can drop the constant operand even
+/// when several shifts share it.
+fn shifts(_: std.mem.Allocator, func: *Function, _: *pass.Analyses) pass.Error!bool {
+    var changed = false;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@fromBackingInt(@intCast(bi)))) |inst| {
+            const a = switch (func.opcode(inst)) {
+                .arith => |a| if (a.op == .shl or a.op == .shr) a else continue,
+                else => continue,
+            };
+            const ty = func.types.type_kind(func.valueType(a.lhs));
+            if (ty != .int or ty.int.bits > 64) continue;
+            const def = func.definingInst(a.rhs) orelse continue;
+            const imm = switch (func.opcode(def)) {
+                .iconst => |imm| imm,
+                else => continue,
+            };
+            if (imm < 0 or imm >= ty.int.bits) continue;
+            func.opcodeMut(inst).* = .{ .arith_imm = .{ .op = a.op, .lhs = a.lhs, .imm = imm, .nsw = a.nsw } };
+            changed = true;
+        }
+    }
+    return changed;
+}
 
 /// Whether `op` has an `arith_imm` form this pass emits, and whether it is commutative (so the
 /// constant may sit on the left). `add` is canonicalized because backends fold it into either a

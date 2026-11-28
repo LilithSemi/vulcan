@@ -81,6 +81,7 @@ pub const Config = struct {
     class: Class,
     machine: u16,
     use_rela: bool,
+    e_flags: u32 = 0,
 };
 
 const ET_REL: u16 = 1;
@@ -450,6 +451,7 @@ fn writeEhdr(buf: []u8, cfg: Config, shoff: u64, w: Widths, section_count: u16, 
     switch (cfg.class) {
         .elf64 => {
             putInt(buf[40..48], u64, shoff);
+            putInt(buf[48..52], u32, cfg.e_flags);
             putInt(buf[52..54], u16, @intCast(w.ehsize));
             putInt(buf[58..60], u16, @intCast(w.shentsize));
             putInt(buf[60..62], u16, section_count);
@@ -457,6 +459,7 @@ fn writeEhdr(buf: []u8, cfg: Config, shoff: u64, w: Widths, section_count: u16, 
         },
         .elf32 => {
             putInt(buf[32..36], u32, @intCast(shoff));
+            putInt(buf[36..40], u32, cfg.e_flags);
             putInt(buf[40..42], u16, @intCast(w.ehsize));
             putInt(buf[46..48], u16, @intCast(w.shentsize));
             putInt(buf[48..50], u16, section_count);
